@@ -16,6 +16,19 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`sbml_to_net` keeps a synthesized rate-law parameter symbolic** (#496).
+  `write_net` emitted every parameter as its evaluated literal, on the stated
+  assumption that a derived parameter is a constant expression. A synthesized
+  `_rateLaw_*` is not: it refers to the model parameters it was built from, and
+  folding it to a number dropped that reference. The parameter stayed declared,
+  so nothing downstream objected, but the ODE right-hand side no longer
+  mentioned the model parameter and a forward sensitivity with respect to it
+  came back identically zero — finite, the right shape, no warning — while the
+  same model through `Model.from_sbml` gave the right answer. A parameter that
+  is not constant is now written as its expression and everything else stays a
+  literal; `codegen_data` lists parameters in dependency order, so anything an
+  expression refers to is already declared above it.
+
 - **A `.net` parameter expression keeps the whitespace it was written with**
   (#498). The `.net` reader split a parameter line on whitespace and then joined
   the value tokens back with nothing between them, so a space separating two
