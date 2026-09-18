@@ -118,6 +118,64 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A derived parameter that reads another derived parameter no longer keeps a
+  stale value — and a stale rate constant (issue #568).** Derived (expression-
+  valued) parameters were re-evaluated in a single pass in *declaration* order,
+  which silently assumes declaration order is dependency order. Nothing enforced
+  that: `ModelBuilder::add_parameter` appends in call order, the `.net` reader
+  hands rows over in file order, and `build()` defines every parameter as an
+  ExprTk variable before compiling any expression — so a chain declared
+  bottom-last built and ran with no complaint, one link at a time.
+
+  With `bb = a*3` declared before `a = base*2`, `set_param("base", 5.0)` moved
+  `a` to 10.0 and left `bb` at its load-time 6.0 instead of 30.0, because the
+  pass read `a` before reaching `a`'s own row; a second, value-identical
+  `set_param("base", 5.0)` then moved `bb` to 30.0, which is the same statement
+  from the other side — the write was one relaxation step, not a solve. Load
+  time had the same hole: on `tests/data/derived_param_reverse_order.net`
+  (`k = k2*2`, `k2 = k3*1.0`, `k3 = kbase*3`, written top-down) the model built
+  with `k = 0.0` — the reader's seed for a row whose value column is an
+  expression — so the one reaction had a zero rate constant, the species did not
+  decay at all, and the run reported success. The finite-difference sensitivity
+  probes carried the same defect: `∂S/∂kbase` on that file came back
+  `-30/-60/-90/-120` against a closed form of `-22.2/-32.9/-36.6/-36.1`. Because
+  a derived parameter is routinely a rate law, every one of these is a plausible
+  wrong number rather than an error. The same file with its four rows written
+  bottom-up was correct throughout.
+
+  `ModelBuilder::build()` now sorts the derived parameters into dependency order
+  once (`SharedModelData::derived_param_order`) and evaluates them in it, and
+  the new `NetworkModel::refresh_derived_params()` is the single pass over that
+  order. The loop it replaces had been hand-copied at seven sites — `set_param`,
+  the interpreted and the codegen CVODES sensitivity RHS sync,
+  `restore_nominal_params`, `rederive_expression_params` (reached from both the
+  state-trigger and the event-sensitivity perturbation syncs), the
+  switch-isolation rebuild, and the steady-state FD probe — each with its own
+  spelling of the same three lines and its own local for the evaluator. That is
+  what made this a seven-way bug rather than a one-way one, and why the fix is
+  one function rather than seven edits: the ordering rule now has exactly one
+  place to be wrong. The seven copies are nine call sites of the one method (two
+  of them were helpers with two callers each), and
+  `CvodeSimulator::Impl::rederive_expression_params` is gone, having become pure
+  delegation. One call converges a chain of any depth, so the order the rows
+  were declared in no longer changes any answer. This is GH #76's fix applied one field over — that
+  issue was the identical single-declaration-order-pass defect for *functions*,
+  and both now share one Kahn sort, which seeds ready nodes in ascending index
+  so a model already in dependency order keeps its original order exactly. A
+  reference cycle (`x = y+1` with `y = x+1`) is unsatisfiable however it is
+  ordered; as with a cyclic function graph it keeps declaration order and the
+  model still builds.
+
+  No shipped model changes, and that is measured rather than assumed: of the
+  2,774 `.net` files in the tree, 1,285 have at least one derived parameter and
+  exactly zero declare one before a derived parameter it reads; of the 1,291
+  vendored BioModels SBML documents that load, 382 do and again exactly zero are
+  out of order. The only file the sort reorders is the new regression fixture.
+  The SBML figure is not luck — the loader had been hand-sorting the parameters
+  it lifts precisely to stay inside the old one-pass rule (its comments named
+  the failure mode and BIOMD0000000569 as the case). That sort stays, but it is
+  no longer what makes the numbers right.
+
 - **An SBML document that declares a `required="true"` package bngsim does not
   interpret is refused by name, instead of loading as its bare core layer
   (issue #592).** SBML Level 3 `multi` is the package rule-based models are

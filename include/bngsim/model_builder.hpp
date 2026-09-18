@@ -47,6 +47,11 @@ class ModelBuilder {
     /// Add a parameter. Returns the 0-based parameter index.
     /// Parameters must be added before species/reactions/functions that
     /// reference them.
+    /// is_expression: `expression` defines this parameter's value, and the
+    /// value passed is only a seed. Call order among such parameters does NOT
+    /// have to be dependency order — `build()` sorts them and every later
+    /// re-derivation walks that order, so a forward reference resolves at load
+    /// and one `set_param` propagates the whole chain (issue #568).
     /// is_compartment_size: this parameter is an SBML compartment size, whose
     /// value the loader folds into constants a later write cannot reach
     /// (`Species::volume_factor`, amount-declared ICs, the Elementary scalar

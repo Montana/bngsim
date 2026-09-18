@@ -158,19 +158,15 @@ class SteadyStateRhs {
     // return a zero column. Holding it and re-deriving everything else is
     // exactly NetworkModel::set_param's rule (it detaches the target from its
     // expression, then refreshes the rest), so the FD probe and an explicit
-    // set_param see the same model.
+    // set_param see the same model — down to walking the same dependency order,
+    // so a probe of `base` reaches `bb = a*3` through `a = base*2` in one call
+    // whatever order the three were declared in (issue #568).
     void sync_params(int held = -1) {
-        auto &params = const_cast<std::vector<Parameter> &>(model_.parameters());
-        auto &evaluator = model_.evaluator();
-        for (size_t i = 0; i < params.size(); ++i) {
-            auto &p = params[i];
-            if (p.is_expression && p.evaluator_id >= 0 && static_cast<int>(i) != held) {
-                p.value = evaluator.evaluate(p.evaluator_id);
-            }
-        }
+        model_.refresh_derived_params(held);
         if (!rhs_fn_) {
             return; // interpreted backend reads the model directly
         }
+        const auto &params = model_.parameters();
         param_buf_.resize(params.size());
         for (size_t i = 0; i < params.size(); ++i) {
             param_buf_[i] = params[i].value;

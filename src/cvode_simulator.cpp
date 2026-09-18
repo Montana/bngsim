@@ -849,13 +849,9 @@ static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) 
         // rate constants pick up the perturbed primary value. Without this,
         // CVODES's finite-difference sensitivity drops the chain-rule
         // contribution and produces wrong-sign sensitivities for the
-        // primary parameter (issue #2).
-        auto &evaluator = const_cast<NetworkModel *>(data->model)->evaluator();
-        for (auto &p : params) {
-            if (p.is_expression && p.evaluator_id >= 0) {
-                p.value = evaluator.evaluate(p.evaluator_id);
-            }
-        }
+        // primary parameter (issue #2). In dependency order, so it carries
+        // through a derived parameter that reads another one (issue #568).
+        const_cast<NetworkModel *>(data->model)->refresh_derived_params();
     }
 
     data->model->compute_derivs(static_cast<double>(t), y_ptr, ydot_ptr);
@@ -912,12 +908,7 @@ static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *use
                                   ? data->sens_param_nominal[i]
                                   : data->sens_p[i];
         }
-        auto &evaluator = const_cast<NetworkModel *>(data->model)->evaluator();
-        for (auto &p : params) {
-            if (p.is_expression && p.evaluator_id >= 0) {
-                p.value = evaluator.evaluate(p.evaluator_id);
-            }
-        }
+        const_cast<NetworkModel *>(data->model)->refresh_derived_params();
         for (int i = 0; i < data->n_params; ++i) {
             data->codegen_param_values[i] = params[i].value;
         }
@@ -1907,17 +1898,6 @@ struct CvodeSimulator::Impl {
     // finite-difference probe left them off. Every derivative either jump
     // reads is taken there, so both call this first.
     void restore_nominal_params(const SensitivityState &sens);
-
-    // Re-evaluate every expression-valued parameter from the current parameter
-    // values, so a finite difference over a *primary* carries into the derived
-    // parameters that read it (`k := 2*kbase` must move when kbase is
-    // perturbed, or its column comes back a flat zero). `skip_param_idx` is the
-    // parameter being perturbed: re-deriving that one would silently undo the
-    // perturbation, which is the failure this exists to prevent, so it is left
-    // alone. Pass -1 to re-derive all. Function-bound parameters (an SBML
-    // assignment rule) are refreshed by evaluate_functions instead, so a caller
-    // sandwiches this between two of its own state syncs.
-    void rederive_expression_params(int skip_param_idx);
 
     // Read s⁻ out of CVODES at t_evt. MUST run before the caller's
     // CVodeReInit — see the ordering note on apply_event_sensitivity_jump.
@@ -4069,7 +4049,6 @@ void CvodeSimulator::Impl::write_final_state_back(const SolverOptions &opts, int
 // re-running the callbacks' own sync is enough; the resumed integration
 // re-syncs on its next RHS call, so nothing needs undoing.
 void CvodeSimulator::Impl::restore_nominal_params(const SensitivityState &sens) {
-    auto &eval_ref_outer = model.evaluator();
     const std::vector<double> &sens_p = sens.p;
 
     if (sens_p.empty()) {
@@ -4080,24 +4059,7 @@ void CvodeSimulator::Impl::restore_nominal_params(const SensitivityState &sens) 
     for (size_t i = 0; i < np; ++i) {
         params_live[i].value = sens_p[i];
     }
-    for (auto &p : params_live) {
-        if (p.is_expression && p.evaluator_id >= 0) {
-            p.value = eval_ref_outer.evaluate(p.evaluator_id);
-        }
-    }
-}
-
-void CvodeSimulator::Impl::rederive_expression_params(int skip_param_idx) {
-    auto &eval_ref = model.evaluator();
-    auto &params_live = const_cast<std::vector<Parameter> &>(model.parameters());
-    for (int i = 0; i < static_cast<int>(params_live.size()); ++i) {
-        if (i == skip_param_idx) {
-            continue;
-        }
-        if (params_live[i].is_expression && params_live[i].evaluator_id >= 0) {
-            params_live[i].value = eval_ref.evaluate(params_live[i].evaluator_id);
-        }
-    }
+    model.refresh_derived_params();
 }
 
 std::vector<std::vector<double>> CvodeSimulator::Impl::capture_event_sens(void *cvode_mem, int ns,
@@ -4528,13 +4490,15 @@ void CvodeSimulator::Impl::residual_dtstar(int gidx, const std::vector<int> &sup
     auto &params = const_cast<std::vector<Parameter> &>(model.parameters());
 
     // Sync after perturbing parameter `skip_idx`: the first sync refreshes the
-    // rule-bound parameters a model function writes, rederive_expression_params
-    // then carries the perturbation into the derived parameters, and the second
-    // sync lets a function read those. A threshold written over a derived
-    // parameter (`v > 2*vth`) would otherwise report a flat ∂g/∂p of zero.
+    // rule-bound parameters a model function writes, refresh_derived_params
+    // then carries the perturbation into the derived parameters — the whole
+    // chain of them, in dependency order — and the second sync lets a function
+    // read those. A threshold written over a derived parameter (`v > 2*vth`)
+    // would otherwise report a flat ∂g/∂p of zero. The perturbed parameter is
+    // held: re-deriving that one would undo the perturbation itself.
     auto perturbed_sync = [&](int skip_idx, double t) {
         sync_model_at(t, x_minus.data(), ns);
-        rederive_expression_params(skip_idx);
+        model.refresh_derived_params(skip_idx);
         sync_model_at(t, x_minus.data(), ns);
     };
 
@@ -4754,7 +4718,7 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
     // chain, then functions again for anything that reads a derived parameter.
     auto perturbed_sync = [&](int skip_idx, double) {
         sync_state();
-        rederive_expression_params(skip_idx);
+        model.refresh_derived_params(skip_idx);
         sync_state();
     };
     sync_state();
@@ -5031,14 +4995,6 @@ void CvodeSimulator::Impl::apply_switch_sensitivity_jump(void *cvode_mem, N_Vect
     const std::vector<double> *jump_from = &sw_f_minus;
     if (!sw.isolate_param_idx0.empty()) {
         auto &params_live = const_cast<std::vector<Parameter> &>(model.parameters());
-        auto &eval_ref = model.evaluator();
-        auto rebuild_derived = [&]() {
-            for (auto &p : params_live) {
-                if (p.is_expression && p.evaluator_id >= 0) {
-                    p.value = eval_ref.evaluate(p.evaluator_id);
-                }
-            }
-        };
         // Saved and put back here rather than through restore_nominal_params():
         // that restores from sens.p, which is empty on a run with no parameter
         // columns to probe, and leaving a bumped threshold behind would corrupt
@@ -5055,12 +5011,12 @@ void CvodeSimulator::Impl::apply_switch_sensitivity_jump(void *cvode_mem, N_Vect
             saved.push_back(params_live[static_cast<size_t>(pi)].value);
             params_live[static_cast<size_t>(pi)].value += sw.isolate_delta[k];
         }
-        rebuild_derived();
+        model.refresh_derived_params();
         rhs_on_branch(+eps_clock, scratch.f_iso);
         for (size_t k = 0; k < sw.isolate_param_idx0.size(); ++k) {
             params_live[static_cast<size_t>(sw.isolate_param_idx0[k])].value = saved[k];
         }
-        rebuild_derived();
+        model.refresh_derived_params();
 
         // An isolated difference of exactly zero is a legitimate answer here and
         // is deliberately not checked for. A condition can flip with no effect

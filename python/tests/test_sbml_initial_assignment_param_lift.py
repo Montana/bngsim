@@ -24,9 +24,12 @@ through it for the sensitivity.
 
 The fixture is deliberately written in the order 569 uses — each target declared
 *before* the parameter it reads — because that is what the lift has to survive.
-Derived parameters are re-evaluated in one pass over the parameter list, so the
-lifted targets have to be emitted in dependency order, not document order; lift
-them in place and ``k0`` reads a stale ``k1`` for one write.
+When this was written, derived parameters were re-evaluated in one declaration-
+order pass, so the loader had to emit the lifted targets in dependency order
+rather than document order; lift them in place and ``k0`` read a stale ``k1``
+for one write. Issue #568 moved that sort into the engine, so the order below is
+no longer what makes the numbers right — but the fixture keeps it, since the
+lift's own ordering is still what this file is about.
 
 The oracle is exact. ``A' = -k0·A`` with ``k0 = k1·c`` and ``k1 = k2·c`` is
 ``A(t) = A0·exp(-k2·c²·t)``, so both the written trajectory and ``dA/dc`` have a

@@ -4205,14 +4205,17 @@ def _build_model_from_sbml_doc(doc):
     # stoichiometry id or `time` is not liftable — those are not parameters at
     # all — nor is one whose target a rate rule or an event promotes to a species.
     #
-    # The declaration order is what makes it work. Derived parameters are
-    # re-evaluated in one pass over the parameter list (`NetworkModel::set_param`
-    # and the four sensitivity/steady-state loops that mirror it), so declaration
-    # order must be dependency order — and SBML's is not: 569 declares `BSk0`
-    # before the `BSk1` it reads, so lifting in place would leave `BSk0` reading a
-    # stale `BSk1` for one write. The lifted targets are therefore held back and
-    # declared after the plain parameters, topologically sorted; a reference cycle
-    # (illegal SBML) simply drops out of the lift and stays folded.
+    # The lifted targets are held back and declared after the plain parameters,
+    # topologically sorted, and a reference cycle (illegal SBML) simply drops out
+    # of the lift and stays folded. SBML's own order is not a dependency order —
+    # 569 declares `BSk0` before the `BSk1` it reads — and this sort predates
+    # issue #568, when re-evaluation was a single declaration-order pass over the
+    # parameter list and lifting 569 in place would have left `BSk0` reading a
+    # stale `BSk1` for one write. The engine sorts for itself now
+    # (`SharedModelData::derived_param_order`), so this no longer has to be
+    # right for the values to come out right; it stays because the declared
+    # order it produces is the one the `.net` round trip and every index-keyed
+    # report read back.
     _param_pool = set(comp_param_idx)
     _param_decl_index: dict[str, int] = {}
     for i in range(sbml_model.getNumParameters()):
@@ -4761,9 +4764,10 @@ def _build_model_from_sbml_doc(doc):
         compartment_write_refused.update(_deps)
 
     # Lower each compound parameter-only IC to a derived parameter. Declared
-    # here, after §2's plain parameters, so the one-pass derived-parameter
-    # re-evaluation (which assumes declaration order is dependency order) sees
-    # its operands already defined.
+    # here, after §2's plain parameters, so the declared order is already a
+    # dependency order — which the engine no longer requires (issue #568 sorts
+    # the derived parameters at build) but which keeps this section's output
+    # stable against the `.net` round trip.
     ia_expr_param: dict[str, str] = {}  # species id → synthetic parameter name
     for sym, expr in ia_param_expr.items():
         pname = _safe_name(f"_ic_{sym}")

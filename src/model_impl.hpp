@@ -44,6 +44,17 @@ struct SharedModelData {
     // (func_idx, param_idx) — both 0-based into their respective vectors.
     std::vector<std::pair<int, int>> var_param_bindings;
 
+    // Derived (expression-valued) parameters in DEPENDENCY order: 0-based
+    // indices into `parameters`, each listed after every derived parameter its
+    // expression reads (issue #568). Exactly the parameters build() left with
+    // `evaluator_id >= 0` — the set `NetworkModel::refresh_derived_params()`
+    // walks, and the only set any re-evaluation pass may walk, since a
+    // declaration-order pass over a chain reads a stale link. Not every
+    // parameter: a constant, a demoted `gamma = 1/7` and a function-bound slot
+    // are all absent. A reference cycle (unsatisfiable however it is ordered)
+    // keeps its nodes in declaration order, as the function sort does.
+    std::vector<int> derived_param_order;
+
     // Species whose initial concentration is set by a parameter (.net "begin
     // species" entries with a parameter name in the IC column). Stored as
     // (species_idx0, param_idx0) pairs. Used by forward-sensitivity setup to

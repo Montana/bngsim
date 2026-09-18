@@ -450,13 +450,10 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
         // Keep param.expression for debugging/introspection
     }
 
-    // Re-evaluate remaining expression-valued parameters (e.g., "a = a__FREE").
-    // This ensures that derived parameters pick up the new value.
-    for (auto &p : impl_->parameters) {
-        if (p.is_expression && p.evaluator_id >= 0) {
-            p.value = impl_->evaluator->evaluate(p.evaluator_id);
-        }
-    }
+    // Re-evaluate remaining expression-valued parameters (e.g., "a = a__FREE"),
+    // so derived parameters pick up the new value — the whole chain of them,
+    // however deep and in whatever order they were declared (issue #568).
+    refresh_derived_params();
 
     // ...the storage convention that a compartment size decides (issue #170),
     // which must also come after the re-evaluation above: an amount-declared IC
@@ -466,9 +463,29 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
         refresh_compartment_volume_state();
 
     // ...and the species initial conditions those parameters name (issue #79).
-    // Must come AFTER the loop above: a species IC may name a *derived*
+    // Must come AFTER the refresh above: a species IC may name a *derived*
     // parameter (`R() Rtot` with `Rtot = 2*R0`), whose value only just moved.
     refresh_param_ref_ics();
+}
+
+// Re-derive every expression-valued parameter, in dependency order (issue
+// #568). See the header for why the order is fixed at build() and what
+// `skip_param_idx` is for.
+//
+// `derived_param_order` lists exactly the parameters build() left with an
+// evaluator, so the guard here is what each of them is still *attached* to its
+// expression: issue #188's value-keyed override keeps the evaluator so the
+// override stays reversible, and re-deriving an overridden parameter would
+// discard the caller's write on the next set_param of anything at all.
+void NetworkModel::refresh_derived_params(int skip_param_idx) {
+    for (int pi : impl_->shared->derived_param_order) {
+        if (pi == skip_param_idx)
+            continue;
+        auto &p = impl_->parameters[pi];
+        if (p.is_expression && p.evaluator_id >= 0) {
+            p.value = impl_->evaluator->evaluate(p.evaluator_id);
+        }
+    }
 }
 
 // Re-resolve every species initial condition that a parameter names, from the

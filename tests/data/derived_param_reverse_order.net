@@ -1,0 +1,38 @@
+# A three-link chain of derived parameters, declared in REVERSE dependency
+# order — the smallest .net reproducer of lanl/bngsim#568.
+#
+#   kbase = 0.1                       (the one primary)
+#   k3    = kbase*3  = 0.3
+#   k2    = k3*1.0   = 0.3
+#   k     = k2*2     = 0.6            (the reaction's rate constant)
+#
+#   S(0) = 10, S' = -k·S  ⟹  S(t) = 10·exp(-0.6 t)
+#
+# Nothing here is order-sensitive as *mathematics* — the four rows are a DAG
+# with one source — but the engine used to re-evaluate derived parameters in a
+# single declaration-order pass, so each pass moved the chain exactly one link.
+# At load that left `k` at 0.0 (the `.net` reader's seed for a row whose value
+# column is an expression): the reaction had a zero rate constant, S did not
+# decay at all, and the run reported success. The same file with the three rows
+# written bottom-up integrated correctly.
+#
+# See tests/data/const_expr_setparam.net for the write-side rule this file's
+# `set_param` test rides on: an expression-backed parameter written by hand is
+# overridden, and everything downstream of it follows the written value.
+begin parameters
+    1 kbase  0.1      # Constant
+    2 k      k2*2     # ConstantExpression
+    3 k2     k3*1.0   # ConstantExpression
+    4 k3     kbase*3  # ConstantExpression
+end parameters
+begin species
+    1 S()  10.0
+    2 Sd() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+end reactions
+begin groups
+    1 S_tot   1
+    2 Sd_tot  2
+end groups
