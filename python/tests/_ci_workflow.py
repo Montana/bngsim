@@ -73,6 +73,37 @@ def paths_filter_selectors(body: str) -> list[str]:
     return re.findall(r"""^\s*-\s*["']?(python/tests/[^"'\s]+)["']?\s*$""", body, re.M)
 
 
+def paths_filter_entries(body: str) -> list[str]:
+    """EVERY entry of a ``paths:`` filter, not only the ``python/tests/`` ones.
+
+    ``paths_filter_selectors`` above answers "which test files does this leg fire
+    on"; this answers "what does it fire on at all", which is what a check about
+    *source* registration needs (issue #619).
+
+    Scoped to the block under a ``paths:`` key rather than matching list items
+    anywhere, because a workflow is full of other YAML lists (matrix entries, pip
+    packages) and a looser regex would read them as triggers. The alias half
+    (``paths: *tail_paths``) carries no list of its own and is skipped; it is the
+    same list by construction.
+    """
+    out: list[str] = []
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if not re.match(r"^\s*paths:\s*(&\w+)?\s*$", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        for nxt in lines[i + 1 :]:
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            item = re.match(r"""^\s*-\s*["']?([^"'\s]+)["']?\s*$""", nxt)
+            if not item:
+                break
+            out.append(item.group(1))
+    return out
+
+
 def pytest_selectors(body: str) -> list[str]:
     """The ``python/tests/`` arguments the run step hands to pytest."""
     lines = body.splitlines()

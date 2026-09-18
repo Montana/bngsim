@@ -98,6 +98,12 @@ on:
       - "src/cvode_simulator.cpp"
       - "src/steady_state.cpp"
       - "src/model.cpp"
+      # Issue #619 — build_jac_sparsity() and compute_coloring() live in
+      # model_builder.cpp, so the CSC pattern this leg's
+      # test_codegen_jacobian_sparse.py asserts on is assembled there. It is
+      # also the other half of the Kahn sort _codegen.py mirrors (see mir.yml),
+      # and a C++ change does not invalidate the codegen cache key.
+      - "src/model_builder.cpp"
       - "include/bngsim/codegen_abi.hpp"
       - "include/bngsim/platform_compat.hpp"
       # The build side: KLU discovery/link, and this leg's SuiteSparse.
