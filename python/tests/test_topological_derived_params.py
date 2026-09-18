@@ -107,15 +107,14 @@ def test_diamond_dependency_converges():
     assert core.get_param("d") == 10.0
 
 
-def test_reference_cycle_still_builds():
-    """A cycle is malformed input that no order satisfies (`x = y+1` with
-    `y = x+1` has no solution). The sort must not drop those rows or spin on
-    them — they keep declaration order, exactly as a cyclic function graph does,
-    and the model still builds."""
-    core = _build([("x", 1.0, "y+1"), ("y", 1.0, "x+1"), ("z", 1.0, "")], rate_law="z")
-    assert core.get_param("z") == 1.0
-    assert np.isfinite(core.get_param("x"))
-    assert np.isfinite(core.get_param("y"))
+def test_reference_cycle_is_refused():
+    """A cycle is input no order satisfies, and it is now refused by name
+    (issue #617). This test used to assert the opposite — that such a model
+    still built — which is what let the value be manufactured from the seeds and
+    drift on every later write. See test_parameter_reference_cycle.py for the
+    full rule."""
+    with pytest.raises(RuntimeError, match=r"reference cycle"):
+        _build([("x", 1.0, "y+1"), ("y", 1.0, "x+1"), ("z", 1.0, "")], rate_law="z")
 
 
 def test_written_derived_parameter_still_overrides_its_dependents():
