@@ -275,6 +275,27 @@ struct DependencyGraph {
 
 // ─── SsaSimulator::Impl ─────────────────────────────────────────────────────
 
+// "R<index> (A + B -> C)": the label a reaction is reported under — the .net's
+// 1-based index, then the reaction written in species names. Shared by the
+// GH #110 reverse-fire diagnostic and the GH #616 reaction-statistics axis.
+static std::string reaction_label(const NetworkModel &model, const Reaction &rxn) {
+    const auto &names = model.species_names();
+    auto join = [&](const std::vector<int> &idx1) {
+        std::string s;
+        for (int idx : idx1) {
+            if (idx <= 0)
+                continue; // a .net null species ("0" on the reaction line)
+            if (!s.empty())
+                s += " + ";
+            int si = idx - 1;
+            s += (si < static_cast<int>(names.size())) ? names[si] : "?";
+        }
+        return s.empty() ? std::string("0") : s;
+    };
+    return "R" + std::to_string(rxn.index) + " (" + join(rxn.reactant_indices) + " -> " +
+           join(rxn.product_indices) + ")";
+}
+
 struct SsaSimulator::Impl {
     NetworkModel &model;
 
@@ -303,6 +324,13 @@ struct SsaSimulator::Impl {
     // model wasn't eligible / codegen was skipped, and the incremental Fenwick
     // path runs unchanged.
     std::string propensity_lib_path;
+
+    // GH #616 — record per-reaction firing counts and propensity integrals at
+    // every output time (set_record_reaction_stats). The labels the result
+    // reports the reaction axis under are built once per simulator, on the
+    // first run that asks for them.
+    bool record_reaction_stats = false;
+    std::vector<std::string> reaction_labels;
 
     Impl(NetworkModel &m) : model(m) {}
 
@@ -339,6 +367,10 @@ static double round_initial_population_to_storage(double storage_value, double v
 SsaSimulator::SsaSimulator(NetworkModel &model) : impl_(std::make_unique<Impl>(model)) {}
 
 SsaSimulator::~SsaSimulator() = default;
+
+void SsaSimulator::set_record_reaction_stats(bool enabled) {
+    impl_->record_reaction_stats = enabled;
+}
 
 void SsaSimulator::set_propensity_library(const std::string &so_path) {
     impl_->propensity_lib_path = so_path;
@@ -674,6 +706,54 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // Observable buffer
     std::vector<double> obs_buf(n_obs);
 
+    // ─── GH #616: per-reaction firing counts and propensity integrals ─────────
+    //
+    // Opt-in (set_record_reaction_stats). For each reaction r the run keeps
+    //   rs_count[r]     — fires of r so far (a reverse fire is a fire of r),
+    //   rs_a[r]         — |a_r| in force since rs_last_t[r],
+    //   rs_integral[r]  — ∫ |a_r| ds from t_start to rs_last_t[r],
+    // so that ∫_{t_start}^{t} |a_r| ds = rs_integral[r] + rs_a[r]·(t − rs_last_t[r])
+    // at any t ≥ rs_last_t[r] before a_r next changes. The integral is banked
+    // lazily, at the moment a propensity is REWRITTEN (set_propensity, or the
+    // fast loop's per-step refill), so the incremental dependency-graph path
+    // pays O(affected) per step for this exactly as it does for the propensities
+    // themselves; the read-out at an output time is one O(nr) pass. |a_r| is the
+    // magnitude the selection used (GH #110 sign-split), so N_r − ∫|a_r| is the
+    // compensated counting process of the channel AS SAMPLED, and its mean is
+    // zero — the identity the Python tests hold the instrumentation to. PSA is
+    // excluded: a scaled channel fires m_r molecules at intensity a_r/m_r, which
+    // is not the exact process these statistics describe.
+    const bool rec_stats = impl_->record_reaction_stats && !use_psa;
+    std::vector<double> rs_count, rs_a, rs_last_t, rs_integral, rs_scratch;
+    if (rec_stats) {
+        rs_count.assign(nr, 0.0);
+        rs_a.assign(nr, 0.0);
+        rs_last_t.assign(nr, times.t_start);
+        rs_integral.assign(nr, 0.0);
+        rs_scratch.assign(nr, 0.0);
+        result.allocate_reaction_stats(n_out, nr);
+        if (impl_->reaction_labels.size() != static_cast<std::size_t>(nr)) {
+            impl_->reaction_labels.clear();
+            impl_->reaction_labels.reserve(nr);
+            for (int r = 0; r < nr; ++r)
+                impl_->reaction_labels.push_back(reaction_label(model, reactions[r]));
+        }
+        result.set_reaction_labels(impl_->reaction_labels);
+    }
+    // Bank the propensity in force over the dwell ending at t_now, then install
+    // the one taking effect.
+    auto rs_bank = [&](int r, double t_now, double a_new) {
+        rs_integral[r] += rs_a[r] * (t_now - rs_last_t[r]);
+        rs_last_t[r] = t_now;
+        rs_a[r] = a_new;
+    };
+    // Write the statistics as of output time t_at into result row idx.
+    auto rs_record = [&](int idx, double t_at) {
+        for (int r = 0; r < nr; ++r)
+            rs_scratch[r] = rs_integral[r] + rs_a[r] * (t_at - rs_last_t[r]);
+        result.record_reaction_stats(idx, rs_count.data(), rs_scratch.data());
+    };
+
     // ─── Event support (SBML L3) ─────────────────────────────────────────────
     //
     // Events under SSA mirror the cvode path's semantics (cvode_simulator.cpp
@@ -736,6 +816,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         double prop = (dir < 0) ? -signed_prop : signed_prop; // |signed_prop|
         rxn_dir[r] = dir;
         propensities[r] = prop;
+        if (rec_stats) // GH #616 — psa_now mirrors t (kept current on every advance)
+            rs_bank(r, psa_now, prop);
 
         double effective_prop = prop;
         if (use_psa && prop > 0.0) {
@@ -1171,6 +1253,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         obs_buf[j] = model.observables()[j].total;
     }
     result.record(0, times.t_start, conc.data(), obs_buf.data());
+    if (rec_stats)
+        rs_record(0, times.t_start);
     if (n_func > 0) {
         auto fvals = model.function_values();
         result.record_expressions(0, fvals.data());
@@ -1300,6 +1384,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             // One native call refills the entire propensity vector from conc[]
             // (param_vals is constant across this events-free fast loop).
             prop_jit_fn(conc.data(), param_vals.data(), a_jit.data());
+            if (rec_stats) { // GH #616 — the refilled vector is in force from t on
+                for (int r = 0; r < nr; ++r)
+                    rs_bank(r, t, (a_jit[r] < 0.0) ? -a_jit[r] : a_jit[r]);
+            }
 
             // Single contiguous pass: total propensity a0 over |a_jit| plus each
             // reaction's firing direction (GH #110 sign-split — store |rate| for
@@ -1323,6 +1411,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     obs_buf[j] = model.observables()[j].total;
                 while (next_output < n_out) {
                     result.record(next_output, t_out[next_output], conc.data(), obs_buf.data());
+                    if (rec_stats)
+                        rs_record(next_output, t_out[next_output]);
                     ++next_output;
                 }
                 break;
@@ -1344,6 +1434,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 for (int j = 0; j < n_obs; ++j)
                     obs_buf[j] = model.observables()[j].total;
                 result.record(next_output, t_out[next_output], conc.data(), obs_buf.data());
+                if (rec_stats)
+                    rs_record(next_output, t_out[next_output]);
                 if (n_func > 0) {
                     model.evaluate_functions(t_out[next_output]);
                     auto fvals = model.function_values();
@@ -1367,6 +1459,9 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     break;
                 }
             }
+
+            if (rec_stats)
+                rs_count[selected] += 1.0;
 
             // Execute (GH #110 sign-split firing, no non-negativity floor;
             // stoich_scale is 1 because PSA is gated out of this path).
@@ -1446,6 +1541,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                             obs_buf[j] = model.observables()[j].total;
                         }
                         result.record(next_output, t_out[next_output], cc, obs_buf.data());
+                        if (rec_stats)
+                            rs_record(next_output, t_out[next_output]);
                         if (n_func > 0) {
                             model.evaluate_functions(t_out[next_output]);
                             auto fvals = model.function_values();
@@ -1496,6 +1593,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                         obs_buf[j] = model.observables()[j].total;
                     }
                     result.record(next_output, t_out[next_output], cc, obs_buf.data());
+                    if (rec_stats)
+                        rs_record(next_output, t_out[next_output]);
                     if (n_func > 0) {
                         model.evaluate_functions(t_out[next_output]);
                         auto fvals = model.function_values();
@@ -1522,6 +1621,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
             while (next_output < n_out) {
                 result.record(next_output, t_out[next_output], conc.data(), obs_buf.data());
+                if (rec_stats)
+                    rs_record(next_output, t_out[next_output]);
                 ++next_output;
             }
             break;
@@ -1570,6 +1671,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 obs_buf[j] = model.observables()[j].total;
             }
             result.record(next_output, t_out[next_output], cc, obs_buf.data());
+            if (rec_stats)
+                rs_record(next_output, t_out[next_output]);
             if (n_func > 0) {
                 model.evaluate_functions(t_out[next_output]);
                 auto fvals = model.function_values();
@@ -1632,6 +1735,9 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             selected = 0;
         if (selected >= nr)
             selected = nr - 1;
+
+        if (rec_stats)
+            rs_count[selected] += 1.0;
 
         // 7. Execute reaction: update species populations
         //    PSA: scale stoichiometric coefficients by 1/λ_r
@@ -1764,23 +1870,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 diag.first_negative_species = names[first_neg_species];
         }
         diag.n_reverse_fires = reverse_fire_count;
-        if (first_reverse_rxn >= 0) {
-            const auto &names = model.species_names();
-            const auto &rrx = reactions[first_reverse_rxn];
-            auto join = [&](const std::vector<int> &idx1) {
-                std::string s;
-                for (size_t i = 0; i < idx1.size(); ++i) {
-                    if (i)
-                        s += " + ";
-                    int si = idx1[i] - 1;
-                    s += (si >= 0 && si < static_cast<int>(names.size())) ? names[si] : "?";
-                }
-                return s.empty() ? std::string("0") : s;
-            };
-            diag.first_reverse_reaction = "R" + std::to_string(rrx.index) + " (" +
-                                          join(rrx.reactant_indices) + " -> " +
-                                          join(rrx.product_indices) + ")";
-        }
+        if (first_reverse_rxn >= 0)
+            diag.first_reverse_reaction = reaction_label(model, reactions[first_reverse_rxn]);
     }
 
     // GH #15 — PSA partial-scaling diagnostics. Close every reaction's dwell over

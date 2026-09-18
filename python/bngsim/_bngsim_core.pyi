@@ -590,6 +590,9 @@ class ResultCore:
     def n_observables(self) -> int:
         ...
     @property
+    def n_reaction_stats(self) -> int:
+        ...
+    @property
     def n_sens_ic_species(self) -> int:
         ...
     @property
@@ -621,6 +624,15 @@ class ResultCore:
         ...
     @property
     def raw_n_expressions(self) -> int:
+        ...
+    @property
+    def reaction_firing_counts(self) -> numpy.typing.NDArray[numpy.float64]:
+        ...
+    @property
+    def reaction_labels(self) -> list[str]:
+        ...
+    @property
+    def reaction_propensity_integrals(self) -> numpy.typing.NDArray[numpy.float64]:
         ...
     @property
     def sens_ic_species_names(self) -> list[str]:
@@ -1030,6 +1042,10 @@ class SsaSimulator:
     def set_propensity_library(self, so_path: str) -> None:
         """
         GH #190: supply a cc-compiled value-specialized propensity .so (symbol bngsim_ssa_propensities). When set and the model is recompute-all eligible (pure mass-action exact SSA, no events, small nr), the run takes the RR-style recompute-all + flat-scan loop by default. No-op for ineligible models; '' clears it.
+        """
+    def set_record_reaction_stats(self, enabled: bool) -> None:
+        """
+        GH #616: record each reaction's cumulative firing count and integrated propensity at every output time (Result.reaction_firing_counts / reaction_propensity_integrals). Exact SSA only; run_psa ignores it. Off by default, and enabling it changes no trajectory.
         """
 class SteadyStateOptions:
     codegen_c_source: str

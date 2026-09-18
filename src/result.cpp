@@ -282,9 +282,39 @@ void Result::truncate(int new_n_times) {
     shrink(expression_sensitivities_);
     shrink(observable_sensitivities_ic_);
     shrink(expression_sensitivities_ic_);
+    if (n_reaction_stats_ > 0) { // GH #616
+        reaction_counts_.resize(static_cast<size_t>(new_n_times) * n_reaction_stats_);
+        reaction_integrals_.resize(static_cast<size_t>(new_n_times) * n_reaction_stats_);
+    }
 
     n_times_ = new_n_times;
 }
+
+// ─── SSA per-reaction event statistics (GH #616) ─────────────────────────────
+
+void Result::allocate_reaction_stats(int n_times, int n_reactions) {
+    n_reaction_stats_ = n_reactions;
+    reaction_counts_.assign(static_cast<size_t>(n_times) * n_reactions, 0.0);
+    reaction_integrals_.assign(static_cast<size_t>(n_times) * n_reactions, 0.0);
+}
+
+void Result::record_reaction_stats(int time_index, const double *counts, const double *integrals) {
+    if (time_index < 0 || time_index >= n_times_ || n_reaction_stats_ == 0)
+        return;
+    const size_t offset = static_cast<size_t>(time_index) * n_reaction_stats_;
+    std::copy(counts, counts + n_reaction_stats_, reaction_counts_.begin() + offset);
+    std::copy(integrals, integrals + n_reaction_stats_, reaction_integrals_.begin() + offset);
+}
+
+void Result::set_reaction_labels(const std::vector<std::string> &labels) {
+    reaction_labels_ = labels;
+}
+int Result::n_reaction_stats() const { return n_reaction_stats_; }
+const std::vector<double> &Result::reaction_firing_counts() const { return reaction_counts_; }
+const std::vector<double> &Result::reaction_propensity_integrals() const {
+    return reaction_integrals_;
+}
+const std::vector<std::string> &Result::reaction_labels() const { return reaction_labels_; }
 
 // ─── Export helpers ──────────────────────────────────────────────────────────
 

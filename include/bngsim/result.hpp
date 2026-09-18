@@ -213,6 +213,24 @@ class Result {
     int n_sens_ic_species() const;
     const std::vector<std::string> &sens_ic_species_names() const;
 
+    // ─── SSA per-reaction event statistics (GH #616) ─────────────────────────
+    //
+    // For each output time t_i and reaction r: the number of firings of r on
+    // [t_start, t_i], and ∫_{t_start}^{t_i} |a_r| ds — the two accumulators a
+    // likelihood-ratio (Girsanov) parameter gradient of an SSA ensemble is built
+    // from. Populated only by an SsaSimulator with set_record_reaction_stats(true);
+    // empty (n_reaction_stats() == 0) otherwise, and on every other backend.
+    //
+    // Layout: [time_idx * n_reactions + reaction_idx] for both blocks. Counts are
+    // stored as doubles (exact below 2^53) so the two blocks share one dtype.
+    void allocate_reaction_stats(int n_times, int n_reactions);
+    void record_reaction_stats(int time_index, const double *counts, const double *integrals);
+    void set_reaction_labels(const std::vector<std::string> &labels);
+    int n_reaction_stats() const;
+    const std::vector<double> &reaction_firing_counts() const;
+    const std::vector<double> &reaction_propensity_integrals() const;
+    const std::vector<std::string> &reaction_labels() const;
+
     // ─── Observable / expression output sensitivities (GH #196) ──────────────
     //
     // Chain-rule sensitivities of observable and expression (function) outputs.
@@ -292,6 +310,12 @@ class Result {
     int n_sens_ic_species_ = 0;
     std::vector<double> sensitivities_ic_; // row-major [time][species][ic_species]
     std::vector<std::string> sens_ic_species_names_;
+
+    // GH #616 — SSA per-reaction event statistics
+    int n_reaction_stats_ = 0;
+    std::vector<double> reaction_counts_;    // row-major [time][reaction]
+    std::vector<double> reaction_integrals_; // row-major [time][reaction]
+    std::vector<std::string> reaction_labels_;
 
     // GH #196 — observable/expression output sensitivities (storage only; empty
     // until a later stage populates them). Parameter axis = sens_param_names_;
