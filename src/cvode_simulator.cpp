@@ -4995,6 +4995,31 @@ void CvodeSimulator::Impl::apply_switch_sensitivity_jump(void *cvode_mem, N_Vect
     const std::vector<double> *jump_from = &sw_f_minus;
     if (!sw.isolate_param_idx0.empty()) {
         auto &params_live = const_cast<std::vector<Parameter> &>(model.parameters());
+        // No hold is passed to refresh_derived_params() below, and that is
+        // correct rather than an oversight — the other three finite-difference
+        // probe sites DO pass one (residual_dtstar, apply_event_sensitivity_jump,
+        // SteadyStateRhs::sync_params), so the asymmetry is worth a sentence.
+        //
+        // Those three perturb a *sensitivity* parameter, which since issue #475
+        // can be a derived one; re-deriving it would undo the probe. This site
+        // perturbs a detector-chosen ISOLATION parameter, and that is
+        // structurally a primary: `_isolation_bump` picks it out of
+        // `cross.partials`, and every `_Crossing` is built with
+        // `partials=_crossing_identity(partials, scope)`, which keeps only
+        // `scope.primary_names`. A derived threshold resolves to the primary
+        // underneath it — `t0 = base*1.0` isolates on `base`, not on `t0`. Since
+        // refresh_derived_params() only touches parameters that are still
+        // attached to an expression, it cannot reach a primary, so there is
+        // nothing here for a hold to protect.
+        //
+        // Pinned by test_coincident_switch_time_isolation.py so that if
+        // `_crossing_identity` ever stops filtering — which issue #475 nearly
+        // did — the failure lands there and names this call site, instead of
+        // silently returning an isolated difference of zero (which the note
+        // below deliberately does not check for). This was filed as a bug
+        // (issue #625) and closed on exactly this evidence; the comment exists
+        // so it is not filed a third time.
+        //
         // Saved and put back here rather than through restore_nominal_params():
         // that restores from sens.p, which is empty on a run with no parameter
         // columns to probe, and leaving a bumped threshold behind would corrupt
