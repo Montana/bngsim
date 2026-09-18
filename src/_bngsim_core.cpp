@@ -2448,7 +2448,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def("add_parameter", &bngsim::ModelBuilder::add_parameter, py::arg("name"),
              py::arg("value"), py::arg("expression") = "", py::arg("is_expression") = false,
              py::arg("is_compartment_size") = false, py::arg("is_internal") = false,
-             "Add a parameter. Returns 0-based index. is_compartment_size=True marks the "
+             "Add a parameter. Returns 0-based index. is_expression=True means expression "
+             "defines the value and `value` is only a seed; call order among such parameters "
+             "need not be dependency order, since build() sorts them and every later "
+             "re-derivation walks that order (issue #568). "
+             "is_compartment_size=True marks the "
              "parameter as an SBML compartment size, whose value the loader folds into "
              "load-time constants a write cannot reach (per-species volume factors, "
              "amount-declared ICs, mass-action rate constants, SSA propensity volumes, the "

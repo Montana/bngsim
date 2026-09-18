@@ -81,6 +81,27 @@ class NetworkModel {
     double get_param(const std::string &name) const;
     std::vector<std::string> param_names() const;
 
+    // Re-derive every expression-valued parameter from the current parameter
+    // values — the propagation step of a parameter write, on its own, for the
+    // callers that move a parameter without going through set_param(): the
+    // CVODES sensitivity RHS mirrors its FD probe straight into the parameter
+    // array, and the steady-state solver probes ∂f/∂p the same way.
+    //
+    // One call converges a chain of any depth (issue #568). The order is
+    // dependency order, fixed at build(), not declaration order: `bb = a*3`
+    // declared before `a = base*2` would otherwise read `a`'s pre-write value
+    // and leave `bb` one link behind per call — a wrong rate constant, silently,
+    // since a derived parameter is routinely a rate law. It is not a fixed-point
+    // iteration and needs no convergence check; a reference cycle is
+    // unsatisfiable and keeps the declaration order build() gave it.
+    //
+    // `skip_param_idx` (0-based into parameters(), -1 for none) holds one
+    // parameter at whatever the caller just wrote, so a finite-difference probe
+    // of a *derived* parameter is not re-derived back to its nominal value and
+    // returned as a zero column. Its dependents still follow the held value —
+    // which is the probe's whole point.
+    void refresh_derived_params(int skip_param_idx = -1);
+
     // ─── State management ────────────────────────────────────────────────────
     void reset(); // restore species to initial concentrations
 

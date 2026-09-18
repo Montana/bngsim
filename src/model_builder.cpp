@@ -26,6 +26,61 @@
 
 namespace bngsim {
 
+// Call `fn(token)` once per identifier in `expr`, in source order, under
+// ExprTk's symbol grammar ([A-Za-z_][A-Za-z0-9_]*). Repeats are not collapsed.
+//
+// Scanned against the *source* text, so the names handed to `fn` are the
+// model's own — the evaluator mangles a name before registering it (`_X` →
+// `u_X`, reserved words → `r_<name>`), and matching post-mangling would miss
+// them.
+template <typename F> static void for_each_identifier(const std::string &expr, F &&fn) {
+    size_t i = 0, n = expr.size();
+    while (i < n) {
+        if (std::isalpha(static_cast<unsigned char>(expr[i])) || expr[i] == '_') {
+            size_t start = i;
+            while (i < n && (std::isalnum(static_cast<unsigned char>(expr[i])) || expr[i] == '_'))
+                ++i;
+            fn(expr.substr(start, i - start));
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Kahn topological sort of `n` nodes given each node's successors and in-degree:
+// every node comes out after the nodes it depends on.
+//
+// Two dependency graphs in build() need exactly this and need it to behave the
+// same way — function evaluation order (GH #76) and derived-parameter
+// evaluation order (issue #568). Ready nodes are seeded in ascending index, so
+// a model already declared in dependency order keeps its original (byte-
+// identical) order and only a model that needs reordering is reordered. A cycle
+// is malformed input that no order satisfies; its nodes are appended in
+// declaration order rather than dropped, so such a model still builds.
+static std::vector<int> dependency_order(int n, const std::vector<std::vector<int>> &successors,
+                                         std::vector<int> in_degree) {
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(n));
+    std::vector<char> placed(static_cast<size_t>(n), 0);
+    std::vector<int> queue;
+    queue.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        if (in_degree[i] == 0)
+            queue.push_back(i);
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        const int u = queue[qi];
+        order.push_back(u);
+        placed[u] = 1;
+        for (int v : successors[u])
+            if (--in_degree[v] == 0)
+                queue.push_back(v);
+    }
+    for (int i = 0; i < n; ++i)
+        if (!placed[i])
+            order.push_back(i);
+    return order;
+}
+
 // Issue #227 — does `expr` name anything in this model whose value can move
 // after load? That, and only that, is what makes a parameter *derived*: an
 // expression that names another parameter carries `∂p_d/∂θ` into every rate law
@@ -34,37 +89,25 @@ namespace bngsim {
 // it annotates the first `# ConstantExpression` and the second `# Constant`, and
 // the rule GH #181 gave the codegen `.net` parser.
 //
-// Scanned against the *source* text, so the names matched are the model's own —
-// the evaluator mangles a name before registering it (`_X` → `u_X`, reserved
-// words → `r_<name>`), and matching post-mangling would miss them.
-//
 // Species are checked even though a parameter expression that reads one cannot
 // compile at the point this is called (species become evaluator variables later
 // in build()) — a caller that reorders those steps should not silently start
 // folding a species reference into a constant.
 static bool references_model_symbol(const std::string &expr, const std::string &self_name,
                                     const SharedModelData &sd) {
-    size_t i = 0, n = expr.size();
-    while (i < n) {
-        if (std::isalpha(static_cast<unsigned char>(expr[i])) || expr[i] == '_') {
-            size_t start = i;
-            while (i < n && (std::isalnum(static_cast<unsigned char>(expr[i])) || expr[i] == '_'))
-                ++i;
-            const std::string token = expr.substr(start, i - start);
-            // `time()` is a registered function and `rate_of__<species>` a
-            // registered variable; both read the running solve, so an expression
-            // naming either is not a load-time constant however it is annotated.
-            if (token == "time" || token.rfind("rate_of__", 0) == 0)
-                return true;
-            if (token != self_name && sd.param_name_to_idx.count(token))
-                return true;
-            if (sd.observable_name_to_idx.count(token) || sd.species_name_to_idx.count(token))
-                return true;
-        } else {
-            ++i;
-        }
-    }
-    return false;
+    bool found = false;
+    for_each_identifier(expr, [&](const std::string &token) {
+        // `time()` is a registered function and `rate_of__<species>` a
+        // registered variable; both read the running solve, so an expression
+        // naming either is not a load-time constant however it is annotated.
+        if (token == "time" || token.rfind("rate_of__", 0) == 0)
+            found = true;
+        else if (token != self_name && sd.param_name_to_idx.count(token))
+            found = true;
+        else if (sd.observable_name_to_idx.count(token) || sd.species_name_to_idx.count(token))
+            found = true;
+    });
+    return found;
 }
 
 // ─── BuilderImpl ─────────────────────────────────────────────────────────────
@@ -1345,52 +1388,20 @@ NetworkModel ModelBuilder::build() {
     std::vector<std::vector<int>> successors(nf); // fj -> functions depending on fj
     std::vector<int> in_degree(nf, 0);
     for (int fi = 0; fi < nf; ++fi) {
-        const std::string &expr = impl.functions[fi].expression;
         std::unordered_set<int> deps;
-        size_t i = 0, n = expr.size();
-        while (i < n) {
-            char c = expr[i];
-            if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
-                size_t start = i;
-                while (i < n &&
-                       (std::isalnum(static_cast<unsigned char>(expr[i])) || expr[i] == '_'))
-                    ++i;
-                auto it = sd->function_name_to_idx.find(expr.substr(start, i - start));
-                if (it != sd->function_name_to_idx.end() && it->second != fi && it->second >= 0 &&
-                    it->second < nf)
-                    deps.insert(it->second);
-            } else {
-                ++i;
-            }
-        }
+        for_each_identifier(impl.functions[fi].expression, [&](const std::string &token) {
+            auto it = sd->function_name_to_idx.find(token);
+            if (it != sd->function_name_to_idx.end() && it->second != fi && it->second >= 0 &&
+                it->second < nf)
+                deps.insert(it->second);
+        });
         for (int fj : deps) {
             successors[fj].push_back(fi);
             ++in_degree[fi];
         }
     }
 
-    // Kahn topological sort; seed ready nodes in ascending index so an already
-    // dependency-ordered model keeps its original (byte-identical) order.
-    std::vector<int> order;
-    order.reserve(nf);
-    std::vector<char> placed(nf, 0);
-    std::vector<int> queue;
-    queue.reserve(nf);
-    for (int fi = 0; fi < nf; ++fi)
-        if (in_degree[fi] == 0)
-            queue.push_back(fi);
-    for (size_t qi = 0; qi < queue.size(); ++qi) {
-        int u = queue[qi];
-        order.push_back(u);
-        placed[u] = 1;
-        for (int v : successors[u])
-            if (--in_degree[v] == 0)
-                queue.push_back(v);
-    }
-    // Cycle fallback: append any unplaced functions in declaration order.
-    for (int fi = 0; fi < nf; ++fi)
-        if (!placed[fi])
-            order.push_back(fi);
+    const std::vector<int> order = dependency_order(nf, successors, in_degree);
 
     sd->var_param_bindings.reserve(nf);
     for (int fi : order)
@@ -1452,11 +1463,68 @@ NetworkModel ModelBuilder::build() {
     // carrying each would be reported under neither reason. The expression is
     // still compiled and evaluated first, because that is what seeds the value
     // this slot holds until the function's first evaluation.
+    //
+    // ...and evaluate them in DEPENDENCY order, not declaration order (issue
+    // #568). This is GH #76's defect one field over: a single declaration-order
+    // pass over a chain (`bb = a*3` declared before `a = base*2`) reads the
+    // link below it at whatever value it happens to hold, so `bb` takes the
+    // front end's seed here rather than `a*3` — and every later pass moves the
+    // chain exactly one link, which is why a second, value-identical
+    // `set_param("base", …)` used to change the answer. Because a derived
+    // parameter is routinely a rate constant, the failure mode is a plausible
+    // wrong number: the model integrates at the pre-write rate and reports
+    // success.
+    //
+    // Nothing enforced the order it assumed. add_parameter() appends in call
+    // order, every parameter is an ExprTk variable before any expression is
+    // compiled, and the `.net`/SBML/`ModelBuilder` front ends all declare in
+    // their own source's order. The one-pass assumption was a precondition on a
+    // public API that the API never stated and no caller could see — the SBML
+    // loader is the only front end that ever knew to hand-sort for it.
+    //
+    // The order is computed once here and stored on the shared data, because
+    // every pass that re-derives these parameters (`set_param`, the CVODES
+    // sensitivity RHS syncs, the steady-state FD probe) must walk the same one:
+    // a chain is only ever as converged as the least-ordered pass over it.
+    // Edges run between derived parameters only. A constant is already at its
+    // final value, and a function-bound slot is not derived from anything —
+    // `evaluate_functions()` overwrites it every step — so neither can be
+    // stale.
     std::unordered_set<int> function_bound(func_param_idx.begin(), func_param_idx.end());
+    std::vector<int> derived_param_idx;              // node -> parameter index
+    std::unordered_map<int, int> derived_param_node; // parameter index -> node
     for (int pi = 0; pi < static_cast<int>(impl.parameters.size()); ++pi) {
+        const auto &p = impl.parameters[pi];
+        if (p.is_expression && !p.expression.empty()) {
+            derived_param_node.emplace(pi, static_cast<int>(derived_param_idx.size()));
+            derived_param_idx.push_back(pi);
+        }
+    }
+    const int nd = static_cast<int>(derived_param_idx.size());
+    std::vector<std::vector<int>> p_successors(nd); // node -> derived params reading it
+    std::vector<int> p_in_degree(nd, 0);
+    for (int k = 0; k < nd; ++k) {
+        std::unordered_set<int> deps;
+        for_each_identifier(impl.parameters[derived_param_idx[k]].expression,
+                            [&](const std::string &token) {
+                                auto it = sd->param_name_to_idx.find(token);
+                                if (it == sd->param_name_to_idx.end())
+                                    return;
+                                auto dit = derived_param_node.find(it->second);
+                                if (dit != derived_param_node.end() && dit->second != k)
+                                    deps.insert(dit->second);
+                            });
+        for (int d : deps) {
+            p_successors[d].push_back(k);
+            ++p_in_degree[k];
+        }
+    }
+
+    const std::vector<int> p_order = dependency_order(nd, p_successors, p_in_degree);
+
+    for (int k : p_order) {
+        const int pi = derived_param_idx[k];
         auto &p = impl.parameters[pi];
-        if (!p.is_expression || p.expression.empty())
-            continue;
         try {
             p.evaluator_id = eval.compile(p.expression);
             p.value = eval.evaluate(p.evaluator_id);
@@ -1484,6 +1552,14 @@ NetworkModel ModelBuilder::build() {
             p.evaluator_id = -1;
         }
     }
+
+    // Publish the order every later re-evaluation walks — the survivors of the
+    // demotion above, which are exactly the parameters that still hold
+    // `evaluate(expression)` and can therefore go stale.
+    sd->derived_param_order.reserve(static_cast<size_t>(nd));
+    for (int k : p_order)
+        if (impl.parameters[derived_param_idx[k]].evaluator_id >= 0)
+            sd->derived_param_order.push_back(derived_param_idx[k]);
 
     // ── 3b. Resolve species parameter references ────────────────────────
     // When a .net file uses a parameter name as a species initial
