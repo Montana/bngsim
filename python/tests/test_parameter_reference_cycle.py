@@ -25,18 +25,33 @@ so refusing aligns bngsim with both rather than trading one disagreement for
 another.
 
 Note the deliberate asymmetry with *functions*, pinned at the bottom of this
-file: a cyclic function graph still builds, because a real vendored model
-(MODEL1006230117) has mutually recursive assignment rules that are linear in
-their two unknowns and therefore a solvable simultaneous system, not nonsense.
+file: a cyclic function graph still builds. Its equations are not nonsense the
+way a parameter cycle's are — MODEL1006230117's mutually recursive assignment
+rules are linear in their unknowns and so have a solution — but the engine does
+not find that solution either. `evaluate_functions()` runs one Gauss-Seidel
+sweep per RHS evaluation with no convergence check, so the RHS depends on how
+many times it has been called, and on that model it diverges outright
+(issue #621). Function cycles keep building because replacing the relaxation is
+a separate change, not because the relaxation works.
+
+A function-bound parameter slot is likewise exempt from the refusals here: the
+function overwrites it every step, so its expression is a seed and not a
+definition, and refusing it would refuse the very shape the function sort
+admits.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import bngsim
 import pytest
 from bngsim._bngsim_core import ModelBuilder
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _source_root import bngsim_source_root  # noqa: E402
 
 
 def _build(rows, rate_law="z"):
@@ -124,10 +139,69 @@ def test_a_cyclic_net_file_is_refused_at_load(tmp_path: Path):
 # ─── What must still build ───────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "name, expr, expected",
+    [
+        ("e", "2*1e-5", 2e-5),
+        ("E", "1.0E+3*2", 2000.0),
+        ("e3", "2.0e3*5", 10000.0),
+        ("E5", "4*1.5E-2", 0.06),
+    ],
+)
+def test_a_numeric_literal_is_not_a_reference_to_a_parameter(name, expr, expected):
+    """The exponent of a scientific-notation constant is not a symbol.
+
+    The scanner is shared with the cycle and self-reference checks, so a token
+    it invents is no longer a harmless over-approximation — it is a refusal.
+    `e` and `E` are ordinary parameter names (`E` is the enzyme in every
+    Michaelis-Menten model), and `E = 1E-5*V` was refused as defining itself.
+    """
+    core = _build([(name, 0.0, expr), ("z", 1.0, "")])
+    assert core.get_param(name) == pytest.approx(expected)
+
+
+def test_a_numeric_literal_does_not_fabricate_a_cycle():
+    """The same phantom token, one step further: it made a real edge into a
+    round trip. `q` never mentions `E` at all."""
+    core = _build([("E", 0.0, "q*2"), ("q", 0.0, "1.0E+3*2"), ("z", 1.0, "")])
+    assert core.get_param("q") == pytest.approx(2000.0)
+    assert core.get_param("E") == pytest.approx(4000.0)
+
+
+def test_a_function_bound_slot_is_exempt_from_the_cycle_refusal():
+    """A parameter a same-named function overwrites is storage, not a
+    definition — `evaluate_functions()` rewrites it every step, so it cannot go
+    stale and cannot be unsatisfiable. Refusing it would refuse the shape the
+    function sort deliberately admits: the `.net` spelling of an SBML
+    `<assignmentRule>` emits both a `# ConstantExpression` row and a same-named
+    function, which is MODEL1006230117's shape and issue #266's."""
+    b = ModelBuilder()
+    b.add_parameter("R_Total", 10.0, "", False)
+    b.add_parameter("R", 1.0, "R_Total - LRG", True)
+    b.add_parameter("LRG", 1.0, "0.5*R", True)
+    b.add_species("S", 1.0, False, 1.0)
+    b.add_function("R", "R_Total - LRG")
+    b.add_function("LRG", "0.5*R")
+    b.add_reaction([0], [], "functional", "R", 1.0, True)
+    assert b.build().get_param("R_Total") == 10.0
+
+
+def test_a_function_bound_slot_is_exempt_from_the_self_reference_refusal():
+    core_builder = ModelBuilder()
+    core_builder.add_parameter("k", 2.0, "k*2", True)
+    core_builder.add_species("S", 1.0, False, 1.0)
+    core_builder.add_function("k", "3.0")
+    core_builder.add_reaction([0], [], "functional", "k", 1.0, True)
+    assert core_builder.build().n_species == 1
+
+
 def test_an_acyclic_chain_out_of_declaration_order_still_builds():
     """The #568 guarantee is untouched: a forward reference is not a cycle. It
     resolves at load and one write still propagates the whole chain."""
-    core = _build([("bb", 6.0, "a*3"), ("a", 2.0, "base*2"), ("base", 1.0, ""), ("z", 1.0, "")])
+    # Seeds are ZERO, not the expected values: seeding 2.0/6.0 would let these
+    # two assertions pass on the pre-#568 single-pass code, and on code that
+    # never evaluated an expression at all.
+    core = _build([("bb", 0.0, "a*3"), ("a", 0.0, "base*2"), ("base", 1.0, ""), ("z", 1.0, "")])
     assert core.get_param("a") == 2.0  # base*2
     assert core.get_param("bb") == 6.0  # a*3
     core.set_param("base", 5.0)
@@ -168,7 +242,10 @@ def test_the_vendored_model_with_mutually_recursive_rules_still_loads():
     """MODEL1006230117 is the model that decided the function-side scope:
     `R = R_Total-LR-LRG-RG` and `LRG = (L_iso*R*Gs)/(K_H*K_C)` read each other.
     If a future change refuses function cycles, this is what it costs."""
-    doc = Path("benchmarks/suites/biomodels/data/sbml_downloads/MODEL1006230117.xml")
+    root = bngsim_source_root()
+    if root is None:
+        pytest.skip("not a source checkout, so the vendored BioModels SBML corpus is absent")
+    doc = root / "benchmarks/suites/biomodels/data/sbml_downloads/MODEL1006230117.xml"
     if not doc.is_file():
         pytest.skip("vendored BioModels SBML corpus not present")
     assert bngsim.Model.from_sbml(str(doc)).n_species > 0

@@ -33,10 +33,40 @@ namespace bngsim {
 // model's own — the evaluator mangles a name before registering it (`_X` →
 // `u_X`, reserved words → `r_<name>`), and matching post-mangling would miss
 // them.
+//
+// A numeric literal is stepped over as a unit, exponent included, so `1e-5`
+// yields nothing and `2.0e3` does not yield `e3`. That distinction was
+// invisible while the only consumer was `references_model_symbol`, where a
+// phantom token merely kept a parameter flagged derived — but issue #617 gave
+// the same scanner two consumers that REFUSE a model, and `e` and `E` are
+// ordinary parameter names (`e` appears in four `.net` files in this tree, `E`
+// is the enzyme in every Michaelis-Menten model). `E = 1E-5*V` was read as
+// `E` defining itself and the build was aborted. An exponent that is not
+// well-formed (`1e`, `1eX`) is left for the identifier branch below, which is
+// what ExprTk itself does with it.
 template <typename F> static void for_each_identifier(const std::string &expr, F &&fn) {
+    const auto digit = [&](size_t k) {
+        return k < expr.size() && std::isdigit(static_cast<unsigned char>(expr[k])) != 0;
+    };
     size_t i = 0, n = expr.size();
     while (i < n) {
-        if (std::isalpha(static_cast<unsigned char>(expr[i])) || expr[i] == '_') {
+        const unsigned char c = static_cast<unsigned char>(expr[i]);
+        if (std::isdigit(c) || (expr[i] == '.' && digit(i + 1))) {
+            while (i < n && (digit(i) || expr[i] == '.'))
+                ++i;
+            if (i < n && (expr[i] == 'e' || expr[i] == 'E')) {
+                size_t j = i + 1;
+                if (j < n && (expr[j] == '+' || expr[j] == '-'))
+                    ++j;
+                if (digit(j)) {
+                    i = j;
+                    while (digit(i))
+                        ++i;
+                }
+            }
+            continue;
+        }
+        if (std::isalpha(c) || expr[i] == '_') {
             size_t start = i;
             while (i < n && (std::isalnum(static_cast<unsigned char>(expr[i])) || expr[i] == '_'))
                 ++i;
@@ -52,18 +82,34 @@ template <typename F> static void for_each_identifier(const std::string &expr, F
 //
 // Two dependency graphs in build() need exactly this and need it to behave the
 // same way — function evaluation order (GH #76) and derived-parameter
-// evaluation order (issue #568). Ready nodes are seeded in ascending index, so
-// a model already declared in dependency order keeps its original (byte-
-// identical) order and only a model that needs reordering is reordered.
+// evaluation order (issue #568). Ready nodes are seeded in ascending index,
+// which keeps the output deterministic and, among nodes that become ready
+// together, in declaration order. It does NOT preserve declaration order
+// wholesale: this is FIFO Kahn, so every root is emitted ahead of every
+// non-root — `a`, `b = f(a)`, `c` comes out `a, c, b` even though the input was
+// already a dependency order. Only a min-heap variant has that property. The
+// values are unaffected, because nodes that swap are by construction
+// independent of each other; what moves is report and emit order.
 //
 // A cycle is a graph no order satisfies. Its nodes are still appended, in
 // declaration order, so the sort itself never drops a node — what to DO about a
 // cycle is the caller's decision, and the two callers decide differently (see
-// each). `cycle_out`, when given, receives one cycle as `v0, v1, …, v0` — the
-// first node repeated at the end — so a caller that refuses can name it.
-static std::vector<int> dependency_order(int n, const std::vector<std::vector<int>> &successors,
-                                         std::vector<int> in_degree,
-                                         std::vector<int> *cycle_out = nullptr) {
+// each).
+//
+// `has_cycle` is the caller's gate, NOT `cycle.empty()`: the two are the same
+// today, but a caller that refused on the reconstruction being non-empty would
+// silently BUILD a cyclic model on any future day the walk failed to close —
+// the one failure this reporting exists to prevent, arriving with no
+// diagnostic. `cycle` is a presentation detail on top; it holds one cycle as
+// `v0, v1, …, v0`, the first node repeated at the end.
+struct DependencyOrder {
+    std::vector<int> order;
+    std::vector<int> cycle; // one cycle, v0 … v0; empty if none was reconstructed
+    bool has_cycle = false; // a node was left unplaced — authoritative
+};
+
+static DependencyOrder dependency_order(int n, const std::vector<std::vector<int>> &successors,
+                                        std::vector<int> in_degree, bool want_cycle = false) {
     std::vector<int> order;
     order.reserve(static_cast<size_t>(n));
     std::vector<char> placed(static_cast<size_t>(n), 0);
@@ -80,47 +126,55 @@ static std::vector<int> dependency_order(int n, const std::vector<std::vector<in
             if (--in_degree[v] == 0)
                 queue.push_back(v);
     }
-    int first_unplaced = -1;
+    DependencyOrder out;
     for (int i = 0; i < n; ++i)
         if (!placed[i]) {
             order.push_back(i);
-            if (first_unplaced < 0)
-                first_unplaced = i;
+            out.has_cycle = true;
         }
+    out.order = std::move(order);
 
-    if (cycle_out == nullptr)
-        return order;
-    cycle_out->clear();
-    if (first_unplaced < 0)
-        return order; // acyclic
+    if (!want_cycle || !out.has_cycle)
+        return out;
     // Kahn decrements a node's in-degree once per PLACED predecessor, so a node
     // left unplaced kept at least one predecessor that was itself never placed.
-    // Walking predecessors from any unplaced node therefore never leaves the
-    // unplaced set, and in a finite graph must revisit a node — the segment
-    // between the two visits is a cycle. (The unplaced set is wider than the
-    // cycle: it also holds everything downstream of one. This walk reports the
-    // cycle itself, not that whole set.)
+    // Walking predecessors from such a node therefore never leaves the unplaced
+    // set, and in a finite graph must revisit one — the segment between the two
+    // visits is a cycle. (The unplaced set is wider than the cycle: it also
+    // holds everything downstream of one. This reports the cycle itself.)
+    //
+    // Every unplaced start is tried rather than only the first. Under the
+    // in-degree argument above the first always closes, but that argument is
+    // the caller's to keep (it needs `in_degree` to count the edges in
+    // `successors`), and a start that dead-ends is not a reason to report
+    // nothing — at least one unplaced node lies ON a cycle, and from there the
+    // walk always closes.
     std::vector<int> pred(static_cast<size_t>(n), -1);
     for (int u = 0; u < n; ++u)
         if (!placed[u])
             for (int v : successors[u])
                 if (!placed[v] && pred[v] < 0)
                     pred[v] = u;
-    std::vector<int> seen_at(static_cast<size_t>(n), -1);
-    std::vector<int> walk;
-    for (int v = first_unplaced; v >= 0; v = pred[v]) {
-        if (seen_at[v] >= 0) {
-            // pred[x] is something x READS, so consecutive entries of `walk`
-            // already run in "reads" direction. The cycle is the segment from
-            // this node's first visit to here, closed back onto itself.
-            cycle_out->assign(walk.begin() + seen_at[v], walk.end());
-            cycle_out->push_back(walk[static_cast<size_t>(seen_at[v])]);
-            break;
+    for (int start = 0; start < n && out.cycle.empty(); ++start) {
+        if (placed[start])
+            continue;
+        std::vector<int> seen_at(static_cast<size_t>(n), -1);
+        std::vector<int> walk;
+        for (int v = start; v >= 0; v = pred[v]) {
+            if (seen_at[v] >= 0) {
+                // pred[x] is something x READS, so consecutive entries of
+                // `walk` already run in "reads" direction. The cycle is the
+                // segment from this node's first visit to here, closed back
+                // onto itself.
+                out.cycle.assign(walk.begin() + seen_at[v], walk.end());
+                out.cycle.push_back(v);
+                break;
+            }
+            seen_at[v] = static_cast<int>(walk.size());
+            walk.push_back(v);
         }
-        seen_at[v] = static_cast<int>(walk.size());
-        walk.push_back(v);
     }
-    return order;
+    return out;
 }
 
 // Issue #227 — does `expr` name anything in this model whose value can move
@@ -1436,12 +1490,15 @@ NetworkModel ModelBuilder::build() {
     //     LRG = (L_iso * R * Gs) / (K_H * K_C)
     //
     // — mutually recursive, but LINEAR in R and LRG and so a simultaneous system
-    // with one solution, which the per-RHS pass relaxes toward rather than
-    // manufactures. Refusing it would drop a real model whose equations mean
-    // something, and solving it needs a simultaneous solve this sort is not.
-    // A parameter cycle has neither excuse: it is refused, and the corpus has
-    // none. Until the linear case is actually solved, a function cycle keeps
-    // the path-dependent RHS GH #76 describes — narrowed to cycles alone.
+    // with one solution. The engine does not find it. `evaluate_functions()`
+    // runs one Gauss-Seidel sweep per RHS evaluation with no convergence check,
+    // so the RHS is a function of how many times it has been called; on this
+    // very model the loop gain is ~36 and it diverges, reaching `inf` before
+    // t = 1e-13 (issue #621). So refusing a function cycle would cost this model
+    // its LOAD, not its results — it has none today. It is left building because
+    // the fix is to solve the system or to iterate it to a checked fixed point,
+    // which is a different change from this sort, and not because the relaxation
+    // works. A parameter cycle has no such open question: it is refused.
     std::vector<std::vector<int>> successors(nf); // fj -> functions depending on fj
     std::vector<int> in_degree(nf, 0);
     for (int fi = 0; fi < nf; ++fi) {
@@ -1458,7 +1515,7 @@ NetworkModel ModelBuilder::build() {
         }
     }
 
-    const std::vector<int> order = dependency_order(nf, successors, in_degree);
+    const std::vector<int> order = dependency_order(nf, successors, in_degree).order;
 
     sd->var_param_bindings.reserve(nf);
     for (int fi : order)
@@ -1550,12 +1607,30 @@ NetworkModel ModelBuilder::build() {
     std::unordered_set<int> function_bound(func_param_idx.begin(), func_param_idx.end());
     std::vector<int> derived_param_idx;              // node -> parameter index
     std::unordered_map<int, int> derived_param_node; // parameter index -> node
+    std::vector<int> function_bound_expr;            // compiled, but not graph nodes
     for (int pi = 0; pi < static_cast<int>(impl.parameters.size()); ++pi) {
         const auto &p = impl.parameters[pi];
-        if (p.is_expression && !p.expression.empty()) {
-            derived_param_node.emplace(pi, static_cast<int>(derived_param_idx.size()));
-            derived_param_idx.push_back(pi);
+        if (!p.is_expression || p.expression.empty())
+            continue;
+        // A function-bound slot is storage, not a definition: `evaluate_functions()`
+        // overwrites it before every derivative evaluation, so its expression is
+        // only the seed it holds until the function's first pass and it cannot go
+        // stale, cannot drift, and cannot be unsatisfiable. It is therefore NOT a
+        // node — it is exempt from the ordering AND from the cycle and
+        // self-reference refusals below, which would otherwise refuse the very
+        // shape the function sort above deliberately admits: the `.net` spelling
+        // of an SBML `<assignmentRule>` emits both a `# ConstantExpression`
+        // parameter row and a same-named function, so `R = R_Total-LRG` with
+        // `LRG = 0.5*R` was refused as a parameter cycle even though both slots
+        // belong to functions (issue #266's shape; MODEL1006230117's). It still
+        // gets compiled and evaluated, after the sorted set, so the seed reads
+        // operands that already hold their own values.
+        if (function_bound.count(pi)) {
+            function_bound_expr.push_back(pi);
+            continue;
         }
+        derived_param_node.emplace(pi, static_cast<int>(derived_param_idx.size()));
+        derived_param_idx.push_back(pi);
     }
     const int nd = static_cast<int>(derived_param_idx.size());
     std::vector<std::vector<int>> p_successors(nd); // node -> derived params reading it
@@ -1616,25 +1691,38 @@ NetworkModel ModelBuilder::build() {
     // the corpus is affected: of the 2,774 `.net` files in the tree and the
     // 1,291 vendored BioModels SBML documents that load, zero have a parameter
     // cycle or a self-reference.
-    std::vector<int> p_cycle;
-    const std::vector<int> p_order = dependency_order(nd, p_successors, p_in_degree, &p_cycle);
-    if (!p_cycle.empty()) {
-        std::string path;
-        for (size_t ci = 0; ci < p_cycle.size(); ++ci) {
-            if (ci)
-                path += " -> ";
-            path += impl.parameters[derived_param_idx[p_cycle[ci]]].name;
+    const DependencyOrder p_sorted =
+        dependency_order(nd, p_successors, p_in_degree, /*want_cycle=*/true);
+    if (p_sorted.has_cycle) {
+        // Gated on has_cycle, not on the reconstruction: a cycle the walk could
+        // not name is still a cycle, and building it is the outcome this refuses.
+        std::string where;
+        if (p_sorted.cycle.empty()) {
+            where = "among its derived parameters";
+        } else {
+            std::string path;
+            for (size_t ci = 0; ci < p_sorted.cycle.size(); ++ci) {
+                if (ci)
+                    path += " -> ";
+                path += impl.parameters[derived_param_idx[p_sorted.cycle[ci]]].name;
+            }
+            where = "(" + path + ", each reading the next)";
         }
         throw std::runtime_error(
-            "ModelBuilder: parameter '" + impl.parameters[derived_param_idx[p_cycle.front()]].name +
-            "' is defined through a reference cycle (" + path +
-            ", each reading the next). No single evaluation of the parameters satisfies it, so "
-            "the values would depend on the order they were declared in and on how many times "
-            "they had been re-derived.");
+            "ModelBuilder: the model's derived parameters contain a reference cycle " + where +
+            ". No single evaluation of the parameters satisfies it, so the values would depend "
+            "on the order they were declared in and on how many times they had been "
+            "re-derived.");
     }
 
-    for (int k : p_order) {
-        const int pi = derived_param_idx[k];
+    std::vector<int> compile_order;
+    compile_order.reserve(p_sorted.order.size() + function_bound_expr.size());
+    for (int k : p_sorted.order)
+        compile_order.push_back(derived_param_idx[k]);
+    compile_order.insert(compile_order.end(), function_bound_expr.begin(),
+                         function_bound_expr.end());
+
+    for (int pi : compile_order) {
         auto &p = impl.parameters[pi];
         try {
             p.evaluator_id = eval.compile(p.expression);
@@ -1668,9 +1756,9 @@ NetworkModel ModelBuilder::build() {
     // demotion above, which are exactly the parameters that still hold
     // `evaluate(expression)` and can therefore go stale.
     sd->derived_param_order.reserve(static_cast<size_t>(nd));
-    for (int k : p_order)
-        if (impl.parameters[derived_param_idx[k]].evaluator_id >= 0)
-            sd->derived_param_order.push_back(derived_param_idx[k]);
+    for (int pi : compile_order)
+        if (impl.parameters[pi].evaluator_id >= 0)
+            sd->derived_param_order.push_back(pi);
 
     // ── 3b. Resolve species parameter references ────────────────────────
     // When a .net file uses a parameter name as a species initial

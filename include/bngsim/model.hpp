@@ -92,8 +92,9 @@ class NetworkModel {
     // declared before `a = base*2` would otherwise read `a`'s pre-write value
     // and leave `bb` one link behind per call — a wrong rate constant, silently,
     // since a derived parameter is routinely a rate law. It is not a fixed-point
-    // iteration and needs no convergence check; a reference cycle is
-    // unsatisfiable and keeps the declaration order build() gave it.
+    // iteration and needs no convergence check: `build()` refuses a reference
+    // cycle (issue #617), so every parameter here has an order in which one
+    // pass is exact.
     //
     // `skip_param_idx` (0-based into parameters(), -1 for none) holds one
     // parameter at whatever the caller just wrote, so a finite-difference probe

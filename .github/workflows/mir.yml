@@ -91,8 +91,10 @@ on:
       # codegen_data() reports are decided (var_param_bindings, GH #76;
       # derived_param_order, #568). Registering _codegen.py and not this file
       # ran the leg on the mirroring half and not on the half being mirrored.
-      # The codegen cache key cannot cover for it — it hashes the Python
-      # emitters only, and says so.
+      # The codegen cache key does not cover for it: the key DOES hash
+      # codegen_data(), but codegen_data() reports functions in declaration
+      # order and never exports the sorted one, so a change to the sort is
+      # invisible to it.
       - "src/model_builder.cpp"
       - "third_party/mir/**"
       - "python/bngsim/_codegen.py"

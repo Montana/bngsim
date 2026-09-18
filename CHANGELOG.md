@@ -171,6 +171,17 @@ in `CMakeLists.txt`) is derived from it.
   vendored BioModels SBML documents that loaded before still load, with the same
   32 unrelated refusals as before.
 
+  Two things are deliberately exempt, because neither can denote nothing.
+  A *numeric literal* is stepped over whole, so the `e` of `1e-5` is not read
+  as a symbol — without that, a parameter named `e` or `E` (the enzyme in every
+  Michaelis-Menten model; `e` appears in four `.net` files here) whose
+  expression carried scientific notation was refused as defining itself. And a
+  *function-bound slot* is not a definition at all: `evaluate_functions()`
+  overwrites it every step, so its expression is only the seed it holds until
+  the first pass, and refusing it would refuse the very shape the function sort
+  admits — the `.net` spelling of an SBML `<assignmentRule>`, which emits both a
+  `# ConstantExpression` row and a same-named function.
+
   **A cyclic *function* graph deliberately still builds.** SBML forbids one, but
   `MODEL1006230117` in the vendored corpus has mutually recursive assignment
   rules — `R = R_Total-LR-LRG-RG` and `LRG = (L_iso*R*Gs)/(K_H*K_C)` — that are
@@ -224,10 +235,11 @@ in `CMakeLists.txt`) is derived from it.
   were declared in no longer changes any answer. This is GH #76's fix applied one field over — that
   issue was the identical single-declaration-order-pass defect for *functions*,
   and both now share one Kahn sort, which seeds ready nodes in ascending index
-  so a model already in dependency order keeps its original order exactly. A
-  reference cycle (`x = y+1` with `y = x+1`) is unsatisfiable however it is
-  ordered; as with a cyclic function graph it keeps declaration order and the
-  model still builds.
+  so the output is deterministic and, among parameters that become ready
+  together, in declaration order. A reference cycle (`x = y+1` with `y = x+1`)
+  is unsatisfiable however it is ordered, and is refused at build time — see
+  the issue #617 entry above, which landed after this one and supersedes what
+  it originally said here about such a model still building.
 
   No shipped model changes, and that is measured rather than assumed: of the
   2,774 `.net` files in the tree, 1,285 have at least one derived parameter and
