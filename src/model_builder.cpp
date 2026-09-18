@@ -54,11 +54,16 @@ template <typename F> static void for_each_identifier(const std::string &expr, F
 // same way — function evaluation order (GH #76) and derived-parameter
 // evaluation order (issue #568). Ready nodes are seeded in ascending index, so
 // a model already declared in dependency order keeps its original (byte-
-// identical) order and only a model that needs reordering is reordered. A cycle
-// is malformed input that no order satisfies; its nodes are appended in
-// declaration order rather than dropped, so such a model still builds.
+// identical) order and only a model that needs reordering is reordered.
+//
+// A cycle is a graph no order satisfies. Its nodes are still appended, in
+// declaration order, so the sort itself never drops a node — what to DO about a
+// cycle is the caller's decision, and the two callers decide differently (see
+// each). `cycle_out`, when given, receives one cycle as `v0, v1, …, v0` — the
+// first node repeated at the end — so a caller that refuses can name it.
 static std::vector<int> dependency_order(int n, const std::vector<std::vector<int>> &successors,
-                                         std::vector<int> in_degree) {
+                                         std::vector<int> in_degree,
+                                         std::vector<int> *cycle_out = nullptr) {
     std::vector<int> order;
     order.reserve(static_cast<size_t>(n));
     std::vector<char> placed(static_cast<size_t>(n), 0);
@@ -75,9 +80,46 @@ static std::vector<int> dependency_order(int n, const std::vector<std::vector<in
             if (--in_degree[v] == 0)
                 queue.push_back(v);
     }
+    int first_unplaced = -1;
     for (int i = 0; i < n; ++i)
-        if (!placed[i])
+        if (!placed[i]) {
             order.push_back(i);
+            if (first_unplaced < 0)
+                first_unplaced = i;
+        }
+
+    if (cycle_out == nullptr)
+        return order;
+    cycle_out->clear();
+    if (first_unplaced < 0)
+        return order; // acyclic
+    // Kahn decrements a node's in-degree once per PLACED predecessor, so a node
+    // left unplaced kept at least one predecessor that was itself never placed.
+    // Walking predecessors from any unplaced node therefore never leaves the
+    // unplaced set, and in a finite graph must revisit a node — the segment
+    // between the two visits is a cycle. (The unplaced set is wider than the
+    // cycle: it also holds everything downstream of one. This walk reports the
+    // cycle itself, not that whole set.)
+    std::vector<int> pred(static_cast<size_t>(n), -1);
+    for (int u = 0; u < n; ++u)
+        if (!placed[u])
+            for (int v : successors[u])
+                if (!placed[v] && pred[v] < 0)
+                    pred[v] = u;
+    std::vector<int> seen_at(static_cast<size_t>(n), -1);
+    std::vector<int> walk;
+    for (int v = first_unplaced; v >= 0; v = pred[v]) {
+        if (seen_at[v] >= 0) {
+            // pred[x] is something x READS, so consecutive entries of `walk`
+            // already run in "reads" direction. The cycle is the segment from
+            // this node's first visit to here, closed back onto itself.
+            cycle_out->assign(walk.begin() + seen_at[v], walk.end());
+            cycle_out->push_back(walk[static_cast<size_t>(seen_at[v])]);
+            break;
+        }
+        seen_at[v] = static_cast<int>(walk.size());
+        walk.push_back(v);
+    }
     return order;
 }
 
@@ -1382,9 +1424,24 @@ NetworkModel ModelBuilder::build() {
     // corrupts the RHS for such models and makes the analytical Jacobian (which
     // assumes fully-resolved function values) diverge from the engine (GH #76).
     // Ordering every function after the functions whose bound params it
-    // references makes one pass converge. SBML assignment/rate-rule dependency
-    // graphs are acyclic; any residual cycle (malformed input) falls back to
-    // declaration order for the nodes involved.
+    // references makes one pass converge.
+    //
+    // A cyclic function graph keeps the fallback order and still builds — the
+    // opposite of what the derived-PARAMETER sort below does with a cycle, and
+    // deliberately so (issue #617). SBML forbids a circular assignment-rule
+    // graph, but MODEL1006230117 in the vendored corpus has one, and it is not
+    // the nonsense the parameter case is: its two rules are
+    //
+    //     R   = R_Total - LR - LRG - RG
+    //     LRG = (L_iso * R * Gs) / (K_H * K_C)
+    //
+    // — mutually recursive, but LINEAR in R and LRG and so a simultaneous system
+    // with one solution, which the per-RHS pass relaxes toward rather than
+    // manufactures. Refusing it would drop a real model whose equations mean
+    // something, and solving it needs a simultaneous solve this sort is not.
+    // A parameter cycle has neither excuse: it is refused, and the corpus has
+    // none. Until the linear case is actually solved, a function cycle keeps
+    // the path-dependent RHS GH #76 describes — narrowed to cycles alone.
     std::vector<std::vector<int>> successors(nf); // fj -> functions depending on fj
     std::vector<int> in_degree(nf, 0);
     for (int fi = 0; fi < nf; ++fi) {
@@ -1504,23 +1561,77 @@ NetworkModel ModelBuilder::build() {
     std::vector<std::vector<int>> p_successors(nd); // node -> derived params reading it
     std::vector<int> p_in_degree(nd, 0);
     for (int k = 0; k < nd; ++k) {
+        const Parameter &pk = impl.parameters[derived_param_idx[k]];
         std::unordered_set<int> deps;
-        for_each_identifier(impl.parameters[derived_param_idx[k]].expression,
-                            [&](const std::string &token) {
-                                auto it = sd->param_name_to_idx.find(token);
-                                if (it == sd->param_name_to_idx.end())
-                                    return;
-                                auto dit = derived_param_node.find(it->second);
-                                if (dit != derived_param_node.end() && dit->second != k)
-                                    deps.insert(dit->second);
-                            });
+        bool self_reference = false;
+        for_each_identifier(pk.expression, [&](const std::string &token) {
+            if (token == pk.name) {
+                self_reference = true;
+                return;
+            }
+            auto it = sd->param_name_to_idx.find(token);
+            if (it == sd->param_name_to_idx.end())
+                return;
+            auto dit = derived_param_node.find(it->second);
+            if (dit != derived_param_node.end() && dit->second != k)
+                deps.insert(dit->second);
+        });
+        // A parameter defined in terms of itself (issue #617). There is no value
+        // it denotes, so there is nothing to build: `s = s*2` has no solution
+        // unless s is 0, and what bngsim used to do with it was quieter than a
+        // wrong answer deserves — `references_model_symbol` skips the
+        // parameter's own name, so the row was demoted to an ordinary
+        // `Constant` holding `seed*2`, with the expression dropped and nothing
+        // to show that the number came from a definition that does not define
+        // anything. BNG2.pl refuses the same model outright: "ABORT: Parameter s
+        // is defined recursively."
+        if (self_reference)
+            throw std::runtime_error("ModelBuilder: parameter '" + pk.name +
+                                     "' is defined in terms of itself: " + pk.name + " = " +
+                                     pk.expression +
+                                     ". A parameter's expression cannot read the parameter it "
+                                     "defines — there is no value that satisfies it.");
         for (int d : deps) {
             p_successors[d].push_back(k);
             ++p_in_degree[k];
         }
     }
 
-    const std::vector<int> p_order = dependency_order(nd, p_successors, p_in_degree);
+    // A reference CYCLE among derived parameters is the same defect one step
+    // wider, and is refused for the same reason (issue #617). `x = y+1` with
+    // `y = x+1` has no solution at all; `a = 10-b` with `b = a` has one but is
+    // not something a single evaluation pass can find. Either way the sort has
+    // no order to produce, and what the fallback order then produced was a
+    // number manufactured from the front end's *seeds* — 2.0, 1.0 or 101.0 for
+    // the same model on three different seed pairs — which then moved by a
+    // fixed step on every later `set_param` of any parameter at all, because
+    // each pass relaxes the cycle one more step. A rate constant that drifts
+    // with the number of writes is not a model. This is the residue #568 left:
+    // that fix made an acyclic chain converge in one pass, and a cycle was the
+    // one place the drift survived.
+    //
+    // BNG2.pl refuses every parameter dependency cycle, solvable or not
+    // ("ABORT: Parameter y has a dependency cycle y->x->y"), and matching it is
+    // what keeps a `.bngl` that BNG2.pl rejects from loading here. Nothing in
+    // the corpus is affected: of the 2,774 `.net` files in the tree and the
+    // 1,291 vendored BioModels SBML documents that load, zero have a parameter
+    // cycle or a self-reference.
+    std::vector<int> p_cycle;
+    const std::vector<int> p_order = dependency_order(nd, p_successors, p_in_degree, &p_cycle);
+    if (!p_cycle.empty()) {
+        std::string path;
+        for (size_t ci = 0; ci < p_cycle.size(); ++ci) {
+            if (ci)
+                path += " -> ";
+            path += impl.parameters[derived_param_idx[p_cycle[ci]]].name;
+        }
+        throw std::runtime_error(
+            "ModelBuilder: parameter '" + impl.parameters[derived_param_idx[p_cycle.front()]].name +
+            "' is defined through a reference cycle (" + path +
+            ", each reading the next). No single evaluation of the parameters satisfies it, so "
+            "the values would depend on the order they were declared in and on how many times "
+            "they had been re-derived.");
+    }
 
     for (int k : p_order) {
         const int pi = derived_param_idx[k];

@@ -118,6 +118,49 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A parameter defined through a reference cycle, or in terms of itself, is
+  refused at build time instead of being assigned a number (issue #617).**
+  `x = y+1` with `y = x+1` denotes no value and `s = s*2` denotes none either,
+  but both used to build. What came out was worse than an error: with no
+  topological order to evaluate the cycle in, the fallback order ran and the
+  values were manufactured from the front end's *seeds* — the same model loaded
+  `x = 2.0`, `1.0` or `101.0` on three different seed pairs — and each later
+  re-derivation relaxed the cycle one more step, so writing an **unrelated**
+  parameter moved `x` by a fixed amount every time. A rate constant that depends
+  on how many writes have happened is not a model, and it reached the solver:
+  the run completed and returned an ordinary-looking trajectory. A
+  self-reference was quieter still, `references_model_symbol` skipping the
+  parameter's own name so the row was demoted to a plain `Constant` holding
+  `seed*2` with the expression dropped.
+
+  This is the residue issue #568 left. That fix made an acyclic chain converge
+  in one pass; a cycle has no topological order, so the drift it removed
+  everywhere else survived in the one place the sort could not help. The
+  refusal names the cycle in reading order — `x -> y -> x`, each reading the
+  next — rather than just listing the parameters involved, and it names the
+  *cycle* rather than a parameter merely downstream of one, which Kahn's
+  algorithm also leaves unplaced and which is perfectly well defined.
+
+  It matches both reference implementations, which is what makes it a fix
+  rather than a preference: BNG2.pl refuses every parameter dependency cycle,
+  solvable or not (`ABORT: Parameter y has a dependency cycle y->x->y`, and
+  `ABORT: Parameter s is defined recursively`), and `run_network` refuses the
+  same `.net`. A *solvable* cycle (`a = 10-b` with `b = a`, i.e. `a = 5`) is
+  refused too: finding it needs a simultaneous solve, which one evaluation pass
+  is not. Nothing in the tree is affected — all 2,774 `.net` files and all 1,291
+  vendored BioModels SBML documents that loaded before still load, with the same
+  32 unrelated refusals as before.
+
+  **A cyclic *function* graph deliberately still builds.** SBML forbids one, but
+  `MODEL1006230117` in the vendored corpus has mutually recursive assignment
+  rules — `R = R_Total-LR-LRG-RG` and `LRG = (L_iso*R*Gs)/(K_H*K_C)` — that are
+  linear in their two unknowns and so a simultaneous system with a solution,
+  which the per-RHS pass relaxes toward rather than invents. Refusing it would
+  drop a real model whose equations mean something, and solving it needs
+  machinery the sort is not; a parameter cycle has neither excuse. Until that
+  linear case is actually solved, a function cycle keeps the path-dependent RHS
+  GH #76 describes, now narrowed to cycles alone.
+
 - **A derived parameter that reads another derived parameter no longer keeps a
   stale value — and a stale rate constant (issue #568).** Derived (expression-
   valued) parameters were re-evaluated in a single pass in *declaration* order,
