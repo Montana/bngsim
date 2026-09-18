@@ -2291,6 +2291,12 @@ class Result:
             Shape ``(n_times, len(selections))``; columns ordered to
             match *selections*. The result subclasses
             :class:`numpy.ndarray`, so all numpy operations work.
+            Indexing carries the column names over — ``arr[:, 1:]`` is
+            labeled with the columns the slice kept — and any other
+            transform (arithmetic, a transpose, a reduction) returns an
+            array with no names at all, so a lookup by name on it raises
+            rather than answering with a column that has moved
+            (issue #561).
 
         Raises
         ------
