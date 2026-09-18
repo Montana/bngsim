@@ -43,6 +43,8 @@ emit no column, but they still flip at that instant and still contaminate
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import bngsim
 import numpy as np
 import pytest
@@ -325,3 +327,100 @@ class TestTheIsolationStep:
             [[2.0, 0.0], [5.0, 5.0]],
             atol=1e-9,
         )
+
+
+class TestIsolationOnlyEverBumpsAPrimary:
+    """The isolation parameter is structurally a primary, and the C++ probe
+    depends on it (issue #625).
+
+    ``apply_switch_sensitivity_jump`` bumps ``isolate_param_idx0`` and then calls
+    ``refresh_derived_params()`` with **no hold**, unlike the other three
+    finite-difference probe sites. That is only safe while the bumped parameter
+    is a primary: ``refresh_derived_params`` re-evaluates every parameter still
+    attached to an expression, so a *derived* one would be re-derived straight
+    back to its unbumped value, and the isolated difference would come back
+    identically zero — which the C++ comment immediately below that call
+    deliberately declines to treat as suspicious.
+
+    The invariant holds because ``_crossing_identity`` reduces partials to
+    ``scope.primary_names`` and every ``_Crossing`` is built through it, so a
+    derived threshold resolves to the primary underneath. Issue #475 nearly kept
+    derived partials in that identity; if a future change does, these tests fail
+    and name the call site rather than letting a sensitivity column go quietly to
+    zero. It was filed as a bug and closed on this evidence — the tests exist so
+    it is not re-derived from scratch a third time.
+    """
+
+    @staticmethod
+    def _derived_threshold_model():
+        """Two coinciding ramps where the FIRST threshold is derived.
+
+        ``t0 = base*0.5`` with ``base = 2.0`` and ``t1`` plain, so both
+        thresholds land on 1.0, the crossings coincide, and the isolation path
+        runs.
+
+        Two details are load-bearing, and both were found by mutating
+        ``_crossing_identity`` to stop filtering and checking these tests go red.
+
+        The derived parameter must be REQUESTED: with ``["base", "t1"]`` the
+        partials are ``{base: 0.5}`` and ``t0`` is not in them at all, so the
+        filter has nothing to remove and the test cannot discriminate. Asking
+        for ``t0`` gives ``{base: 0.5, t0: 1.0}`` — issue #475's "a requested
+        derived parameter also gets a partial".
+
+        And the 0.5 factor decides which one wins: ``_isolation_bump`` takes
+        ``max(private, key=abs)``, so the DERIVED partial has to be the larger
+        (``d t0/d t0 = 1.0`` against ``d t0/d base = 0.5``). With the obvious
+        ``t0 = base*1.0`` the two tie at 1.0, ``max`` returns the primary
+        regardless, and these tests pass whether or not the filter exists.
+        """
+        b = ModelBuilder()
+        b.add_parameter("base", 2.0, "", False)
+        b.add_parameter("t0", 1.0, "base*0.5", True)
+        b.add_parameter("k0", _RATES[0], "", False)
+        b.add_parameter("t1", 1.0, "", False)
+        b.add_parameter("k1", _RATES[1], "", False)
+        i0 = b.add_species("X0()", 0.0)
+        i1 = b.add_species("X1()", 0.0)
+        b.add_function("rate0", "if(time()>=t0,0,k0)")
+        b.add_reaction([], [i0], "functional", "rate0")
+        b.add_function("rate1", "if(time()>=t1,0,k1)")
+        b.add_reaction([], [i1], "functional", "rate1")
+        return bngsim.Model(_core=b.build())
+
+    def test_a_derived_threshold_isolates_on_the_primary_underneath_it(self):
+        core = self._derived_threshold_model()._core
+        names = list(core.param_names)
+        is_expression = list(core.param_is_expression)
+        recs = compute_switch_time_sens(core, ["t0", "t1"], 0.0, 2.0)[0]
+
+        assert recs, "the coinciding crossings should take the isolation path"
+        picked = [names[i] for r in recs for i in r.isolate_param_idx0]
+        assert picked, "each coinciding crossing carries an isolation bump"
+        assert "t0" not in picked, "t0 is derived; isolating on it is what #625 feared"
+        assert "base" in picked, "it should resolve to the primary underneath t0"
+        for r in recs:
+            for i in r.isolate_param_idx0:
+                assert not is_expression[i], (
+                    f"isolation bumps {names[i]}, which is derived — "
+                    "apply_switch_sensitivity_jump would re-derive the bump away"
+                )
+
+    def test_a_plain_model_also_only_isolates_on_primaries(self):
+        """The ordinary #375 shape, asserted on the same axis."""
+        model, _ = _ramps(1.0, 1.0)
+        core = model._core
+        is_expression = list(core.param_is_expression)
+        recs = compute_switch_time_sens(core, ["t0", "t1"], 0.0, 2.0)[0]
+        assert recs
+        for r in recs:
+            for i in r.isolate_param_idx0:
+                assert not is_expression[i]
+
+    def test_the_crossing_identity_is_what_enforces_it(self):
+        """Directly: the filter keeps primaries and drops a derived partial."""
+        from bngsim._switch_sensitivity import _crossing_identity
+
+        scope = SimpleNamespace(primary_names=frozenset({"base", "t1"}))
+        kept = _crossing_identity({"base": 1.0, "t0": 1.0, "t1": 2.0}, scope)
+        assert kept == {"base": 1.0, "t1": 2.0}
