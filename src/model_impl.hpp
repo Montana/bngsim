@@ -51,8 +51,9 @@ struct SharedModelData {
     // walks, and the only set any re-evaluation pass may walk, since a
     // declaration-order pass over a chain reads a stale link. Not every
     // parameter: a constant, a demoted `gamma = 1/7` and a function-bound slot
-    // are all absent. A reference cycle (unsatisfiable however it is ordered)
-    // keeps its nodes in declaration order, as the function sort does.
+    // are all absent. A reference cycle cannot appear here at all — `build()`
+    // refuses one (issue #617) rather than publishing an order that does not
+    // exist — so one pass over this vector is always exact.
     std::vector<int> derived_param_order;
 
     // Species whose initial concentration is set by a parameter (.net "begin

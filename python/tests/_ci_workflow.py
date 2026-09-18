@@ -85,6 +85,13 @@ def paths_filter_entries(body: str) -> list[str]:
     packages) and a looser regex would read them as triggers. The alias half
     (``paths: *tail_paths``) carries no list of its own and is skipped; it is the
     same list by construction.
+
+    An entry this cannot parse is SKIPPED, not treated as the end of the block.
+    It used to ``break``, which meant one trailing ``# comment`` on a path entry
+    truncated the list at that line — and since these workflows carry their
+    rationale in comments, that is an ordinary edit. Every consumer reads a short
+    list as "not registered", so the truncation turned a coverage assertion green
+    rather than red. The item regex now also tolerates a trailing comment.
     """
     out: list[str] = []
     lines = body.splitlines()
@@ -97,9 +104,9 @@ def paths_filter_entries(body: str) -> list[str]:
                 continue
             if len(nxt) - len(nxt.lstrip()) <= indent:
                 break
-            item = re.match(r"""^\s*-\s*["']?([^"'\s]+)["']?\s*$""", nxt)
+            item = re.match(r"""^\s*-\s*["']?([^"'\s]+)["']?(?:\s+#.*)?\s*$""", nxt)
             if not item:
-                break
+                continue
             out.append(item.group(1))
     return out
 
