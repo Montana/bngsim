@@ -31,6 +31,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim._codegen import (
+    CodegenDeclined,
     _codegen_emit_flags,
     _topological_function_order,
     generate_outputs_from_model,
@@ -73,12 +74,34 @@ def test_topological_order_no_dependencies_is_identity():
     assert _topological_function_order(funcs) == [0, 1, 2, 3, 4]
 
 
-def test_topological_order_cycle_falls_back_to_declaration_order():
-    """A malformed self-referential cycle still yields every index exactly once
-    (declaration-order fallback), never dropping a function."""
+def test_topological_order_declines_a_cycle_instead_of_falling_back():
+    """A cyclic function graph is now DECLINED rather than ordered (issue #621).
+
+    This test used to assert the opposite — that the fallback still yielded every
+    index exactly once, "never dropping a function". Not dropping one was the
+    right concern for an order that gets emitted, but the order it produced could
+    not exist: `a` reads `b` and `b` reads `a`, so whichever is emitted first
+    reads an uninitialised `func[]`. On MODEL1006230117 that was 12 use-before-def
+    reads and a compiled RHS that died non-finite at t=0, while the interpreted
+    engine (which solves such a group) was correct. Declining sends the model to
+    the engine that handles it.
+    """
     funcs = [{"name": "a", "expression": "b"}, {"name": "b", "expression": "a"}]
+    with pytest.raises(CodegenDeclined, match=r"reference each other"):
+        _topological_function_order(funcs)
+
+
+def test_topological_order_never_drops_an_acyclic_function():
+    """The half of the old assertion that still applies: where an order exists,
+    every index appears exactly once."""
+    funcs = [
+        {"name": "a", "expression": "b + c"},
+        {"name": "b", "expression": "c * 2"},
+        {"name": "c", "expression": "1"},
+    ]
     order = _topological_function_order(funcs)
-    assert sorted(order) == [0, 1]
+    assert sorted(order) == [0, 1, 2]
+    assert order.index(2) < order.index(1) < order.index(0)
 
 
 # ─── SBML fixtures ───────────────────────────────────────────────────────────

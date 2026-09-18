@@ -177,6 +177,80 @@ static DependencyOrder dependency_order(int n, const std::vector<std::vector<int
     return out;
 }
 
+// Tarjan strongly-connected components, returned in TOPOLOGICAL order (every
+// group after the groups it reads). A singleton group is an ordinary function;
+// a group of two or more is a set of functions that read each other, which no
+// evaluation order can resolve one at a time.
+//
+// The derived-PARAMETER sort above answers a cycle by refusing (issue #617):
+// a parameter denotes one number and a cyclic definition denotes none. A
+// FUNCTION cycle is a different object — a simultaneous system over values the
+// engine recomputes every step, which can have a perfectly good solution — so
+// it is grouped here and solved at evaluation time (issue #621) rather than
+// refused. That is why this exists beside `dependency_order` instead of
+// replacing it: the two callers need different answers to the same question.
+//
+// Iterative rather than recursive: a genome-scale model's assignment-rule graph
+// can be tens of thousands of nodes deep and this runs at load on every model.
+static std::vector<std::vector<int>>
+strongly_connected_components(int n, const std::vector<std::vector<int>> &reads) {
+    std::vector<int> index(static_cast<size_t>(n), -1), low(static_cast<size_t>(n), 0);
+    std::vector<char> on_stack(static_cast<size_t>(n), 0);
+    std::vector<int> stack;
+    std::vector<std::vector<int>> out;
+    int next_index = 0;
+
+    struct Frame {
+        int v;
+        size_t edge;
+    };
+    std::vector<Frame> call;
+
+    for (int root = 0; root < n; ++root) {
+        if (index[root] >= 0)
+            continue;
+        call.push_back({root, 0});
+        index[root] = low[root] = next_index++;
+        stack.push_back(root);
+        on_stack[root] = 1;
+        while (!call.empty()) {
+            Frame &f = call.back();
+            if (f.edge < reads[f.v].size()) {
+                const int w = reads[f.v][f.edge++];
+                if (index[w] < 0) {
+                    index[w] = low[w] = next_index++;
+                    stack.push_back(w);
+                    on_stack[w] = 1;
+                    call.push_back({w, 0});
+                } else if (on_stack[w]) {
+                    low[f.v] = std::min(low[f.v], index[w]);
+                }
+                continue;
+            }
+            const int v = f.v;
+            call.pop_back();
+            if (!call.empty())
+                low[call.back().v] = std::min(low[call.back().v], low[v]);
+            if (low[v] == index[v]) {
+                std::vector<int> group;
+                for (;;) {
+                    const int w = stack.back();
+                    stack.pop_back();
+                    on_stack[w] = 0;
+                    group.push_back(w);
+                    if (w == v)
+                        break;
+                }
+                std::sort(group.begin(), group.end()); // declaration order within a group
+                out.push_back(std::move(group));
+            }
+        }
+    }
+    // Tarjan emits a group only after everything it reads, i.e. already in
+    // topological order for "reads" edges. No reversal.
+    return out;
+}
+
 // Issue #227 — does `expr` name anything in this model whose value can move
 // after load? That, and only that, is what makes a parameter *derived*: an
 // expression that names another parameter carries `∂p_d/∂θ` into every rate law
@@ -1515,11 +1589,23 @@ NetworkModel ModelBuilder::build() {
         }
     }
 
-    const std::vector<int> order = dependency_order(nf, successors, in_degree).order;
+    // `successors[u]` holds the functions that read u; Tarjan wants the edges
+    // the other way round (what each function reads), so invert once.
+    std::vector<std::vector<int>> reads(static_cast<size_t>(nf));
+    for (int u = 0; u < nf; ++u)
+        for (int v : successors[u])
+            reads[static_cast<size_t>(v)].push_back(u);
+
+    const std::vector<std::vector<int>> sccs = strongly_connected_components(nf, reads);
 
     sd->var_param_bindings.reserve(nf);
-    for (int fi : order)
-        sd->var_param_bindings.push_back({fi, func_param_idx[fi]});
+    sd->function_scc_starts.reserve(sccs.size() + 1);
+    for (const auto &group : sccs) {
+        sd->function_scc_starts.push_back(static_cast<int>(sd->var_param_bindings.size()));
+        for (int fi : group)
+            sd->var_param_bindings.push_back({fi, func_param_idx[fi]});
+    }
+    sd->function_scc_starts.push_back(static_cast<int>(sd->var_param_bindings.size()));
 
     // ── 3. Set up ExprTk evaluator ───────────────────────────────────────
     auto &eval = *impl.evaluator;

@@ -42,7 +42,23 @@ struct SharedModelData {
 
     // Variable parameters: indices of parameters whose values come from functions.
     // (func_idx, param_idx) — both 0-based into their respective vectors.
+    //
+    // Ordered by strongly-connected component, each group after the groups it
+    // reads (GH #76, issue #621). `function_scc_starts` cuts it into those
+    // groups: group g is the half-open range
+    // [function_scc_starts[g], function_scc_starts[g+1]), and the vector ends
+    // with a sentinel equal to var_param_bindings.size(), so the group count is
+    // function_scc_starts.size() - 1.
+    //
+    // A group of ONE is an ordinary function: evaluating it once, in this order,
+    // is exact, which is every function in every model in the corpus but one.
+    // A group of two or more is a simultaneous system — functions that read each
+    // other — which no order resolves one at a time; `evaluate_functions()`
+    // solves such a group instead of sweeping it. Keeping the grouping here
+    // rather than rediscovering it per call is what keeps the acyclic path
+    // identical to a plain ordered walk.
     std::vector<std::pair<int, int>> var_param_bindings;
+    std::vector<int> function_scc_starts;
 
     // Derived (expression-valued) parameters in DEPENDENCY order: 0-based
     // indices into `parameters`, each listed after every derived parameter its
@@ -221,6 +237,15 @@ struct NetworkModel::Impl {
     // clone's next evaluate_functions()), so it is exempt from the clone
     // contract below.
     std::vector<double> function_value_cache;
+
+    // Reusable buffers for solve_function_cycle() (issue #621), so a model with
+    // a cyclic function group does not allocate four vectors per RHS evaluation.
+    // Per-instance and pure scratch: every field is overwritten before it is
+    // read, so clone() leaves it empty like function_value_cache.
+    struct FnCycleScratch {
+        std::vector<double> x, f, g, jac;
+    };
+    FnCycleScratch fn_cycle_scratch;
 
     // System time
     double current_time = 0.0;

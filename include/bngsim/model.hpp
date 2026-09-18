@@ -648,6 +648,13 @@ class NetworkModel {
     /// (current_derivs, via the rate_of__<species> accessors) and write.
     void compute_derivs_core(double t, const double *conc, double *derivs);
 
+    /// Solve one strongly-connected group of functions — `var_param_bindings`
+    /// entries [lo, hi) — instead of sweeping it once (issue #621). See
+    /// model.cpp for why it is Newton on g(x) = F(x) - x rather than iteration
+    /// of F. Called only for a group of two or more, so an acyclic model never
+    /// reaches it.
+    void solve_function_cycle(size_t lo, size_t hi);
+
     /// Internal helper: register a TableFunction with the expression evaluator
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);

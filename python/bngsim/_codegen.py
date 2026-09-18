@@ -7085,6 +7085,14 @@ def _emit_observable_lines(observables: list, av_factor: dict, av_param: dict) -
     return lines
 
 
+class CodegenDeclined(RuntimeError):
+    """Codegen cannot emit this model, and the caller should fall back.
+
+    Distinct from a codegen *bug*: the prepare_* entry points turn this into a
+    ``None`` return (decline), while any other exception stays an error.
+    """
+
+
 def _topological_function_order(functions: list) -> list[int]:
     """Declaration indices of ``functions`` in dependency (topological) order.
 
@@ -7132,9 +7140,32 @@ def _topological_function_order(functions: list) -> list[int]:
             in_degree[v] -= 1
             if in_degree[v] == 0:
                 queue.append(v)
-    for i in range(nf):
-        if not placed[i]:
-            order.append(i)
+    unplaced = [i for i in range(nf) if not placed[i]]
+    if unplaced:
+        # Issue #621 — decline, rather than emit an order that cannot exist.
+        #
+        # These functions read each other, so no sequence of `func[i] = ...`
+        # statements assigns each before its readers: appending them in
+        # declaration order (what this did) emits use-before-def against an
+        # uninitialised `double func[N]`, and the compiled RHS then reads
+        # indeterminate stack. On MODEL1006230117 that is 12 such reads, and the
+        # compiled run dies with a non-finite RHS at t=0 while the interpreted
+        # engine returns a correct trajectory — two engines disagreeing in
+        # silence, which is worse than either being wrong alone.
+        #
+        # The interpreted engine SOLVES such a group (NetworkModel::
+        # solve_function_cycle), so declining here is a fallback to a path that
+        # handles the model, not a loss of capability. Emitting the solve in C
+        # would be the way to keep codegen's speed on such a model; nothing in
+        # the corpus needs it yet.
+        names = ", ".join(str(functions[i].get("name", i)) for i in unplaced[:4])
+        raise CodegenDeclined(
+            "codegen declines a model whose functions reference each other "
+            f"({len(unplaced)} involved: {names}"
+            f"{', ...' if len(unplaced) > 4 else ''}): a cyclic function graph has "
+            "no assignment order, so the emitted C would read func[] before it is "
+            "written. The interpreted engine solves the group instead (issue #621)."
+        )
     return order
 
 
@@ -11208,6 +11239,16 @@ def prepare_model_codegen(model) -> Path | None:
     Path or None
         Path to compiled .so, or None if codegen fails.
     """
+    # Issue #621 — a cyclic function graph has no emit order; decline so the
+    # caller falls back to the interpreted engine, which solves the group.
+    try:
+        _topological_function_order(list(model._core.codegen_data()["functions"]))
+    except CodegenDeclined as exc:
+        logger.debug("codegen declined: %s", exc)
+        return None
+    except Exception:  # noqa: BLE001 - the real emit below reports properly
+        pass
+
     t0 = time.perf_counter()
     cache_hit: bool | None = None
     _record_codegen_error(None)
@@ -11363,6 +11404,16 @@ def prepare_model_codegen_source(model) -> str | None:
     compiles, returned as a string for the in-process MIR micro-JIT. Returns
     ``None`` (matching ``prepare_model_codegen``) if source generation fails.
     """
+    # Issue #621 — a cyclic function graph has no emit order; decline so the
+    # caller falls back to the interpreted engine, which solves the group.
+    try:
+        _topological_function_order(list(model._core.codegen_data()["functions"]))
+    except CodegenDeclined as exc:
+        logger.debug("codegen declined: %s", exc)
+        return None
+    except Exception:  # noqa: BLE001 - the real emit below reports properly
+        pass
+
     t0 = time.perf_counter()
     _record_codegen_error(None)
     declines = _reset_sens_declines()
