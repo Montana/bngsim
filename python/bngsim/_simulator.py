@@ -379,6 +379,16 @@ class Simulator:
         Requires the codegen sensitivity RHS path; codegen is auto-enabled
         for any sensitivity workflow. Only valid for ``method="ode"``.
 
+    reaction_stats : bool, optional
+        ``method="ssa"`` only. Record, at every output time, each reaction's
+        cumulative firing count and integrated propensity — the two
+        accumulators a likelihood-ratio (Girsanov) parameter gradient of an
+        ensemble is built from — on ``Result.reaction_firing_counts`` and
+        ``Result.reaction_propensity_integrals`` (``bngsim.girsanov`` turns
+        them into scores and gradients). Default ``False``; enabling it
+        leaves every trajectory byte-identical. Refused for PSA, whose
+        scaled channels are not the exact process, and for ODE and
+        network-free runs, which have no reaction channels (GH #616).
     strict_ssa : bool, optional
         Only used for ``method="ssa"`` / ``"psa"``. Default ``True``.
 
@@ -502,6 +512,7 @@ class Simulator:
     }
 
     __slots__ = (
+        "_reaction_stats",
         "_model",
         "_method",
         "_canonical_method",
@@ -580,12 +591,26 @@ class Simulator:
         sensitivity_ic: list[str] | None = None,
         sensitivity_method: str = "staggered",
         strict_ssa: bool = True,
+        reaction_stats: bool = False,
     ) -> None:
         # Normalize the user-facing method token before backend dispatch.
         # normalize_method() validates the token, checks availability,
         # and returns (canonical, dispatch) where dispatch is the
         # internal backend key (e.g. "nfsim").
         canonical, dispatch = normalize_method(method)
+
+        # GH #616 — per-reaction firing counts and propensity integrals describe
+        # the exact SSA's sampled process. PSA's channels are scaled (a fire moves
+        # m_r molecules at intensity a_r/m_r) and ODE / network-free runs have no
+        # reaction channels, so the request is refused rather than answered with
+        # a block that means something else.
+        if reaction_stats and dispatch != "ssa":
+            raise ValueError(
+                "reaction_stats=True records the exact SSA's per-reaction firing counts "
+                f"and propensity integrals; method={method!r} does not run one "
+                "(use method='ssa')"
+            )
+        self._reaction_stats = bool(reaction_stats)
 
         self._model = model
         # GH #198: stash whether expression output sensitivities will be needed,
@@ -721,6 +746,8 @@ class Simulator:
             from bngsim._bngsim_core import SsaSimulator
 
             self._sim = SsaSimulator(model._core)
+            if self._reaction_stats:
+                self._sim.set_record_reaction_stats(True)
 
             # GH #190 — for exact SSA, hand the C++ simulator a cc-compiled
             # value-specialized propensity .so so eligible small mass-action
@@ -2580,6 +2607,8 @@ class Simulator:
             from bngsim._bngsim_core import SsaSimulator
 
             self._sim = SsaSimulator(self._model._core)
+            if self._reaction_stats:
+                self._sim.set_record_reaction_stats(True)
 
     # ─── Absolute tolerance, scalar or per-species (issue #196) ─────
 
@@ -3631,6 +3660,8 @@ class Simulator:
                 if sim is None:
                     local.model = self._model.clone()
                     local.sim = SsaSimulator(local.model._core)
+                    if self._reaction_stats:
+                        local.sim.set_record_reaction_stats(True)
                     local.times = _make_times()
                     sim = local.sim
                 return _run_one(sim, local.model, local.times, i)

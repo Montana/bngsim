@@ -723,6 +723,58 @@ int test_ssa_reproducibility() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Test: GH #616 — per-reaction firing counts and propensity integrals
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int test_ssa_reaction_stats() {
+    bngsim::TimeSpec times{0.0, 50.0, 51};
+
+    // Off by default: no block, and this run is the reference trajectory.
+    auto model_ref = bngsim::NetworkModel::from_net(data_path("simple_decay.net"));
+    bngsim::SsaSimulator plain(model_ref);
+    auto ref = plain.run(times, 42);
+    CHECK(ref.n_reaction_stats() == 0, "No reaction statistics unless asked for");
+    CHECK(ref.reaction_firing_counts().empty(), "Counts block empty when off");
+    CHECK(ref.reaction_labels().empty(), "No reaction labels when off");
+
+    auto model = bngsim::NetworkModel::from_net(data_path("simple_decay.net"));
+    bngsim::SsaSimulator sim(model);
+    sim.set_record_reaction_stats(true);
+    auto res = sim.run(times, 42);
+
+    // Recording changes nothing about the trajectory.
+    for (int i = 0; i < ref.n_times(); ++i) {
+        for (int j = 0; j < ref.n_species(); ++j) {
+            int idx = i * ref.n_species() + j;
+            CHECK_CLOSE(res.species_data()[idx], ref.species_data()[idx], 1e-15,
+                        "Trajectory identical with statistics on, t index " + std::to_string(i));
+        }
+    }
+
+    CHECK(res.n_reaction_stats() == 1, "One reaction, one column");
+    CHECK(res.reaction_labels().size() == 1 && res.reaction_labels()[0] == "R1 (A() -> B())",
+          "Reaction label is the .net index and the reaction in species names");
+    const auto &counts = res.reaction_firing_counts();
+    const auto &integrals = res.reaction_propensity_integrals();
+    CHECK(counts.size() == 51 && integrals.size() == 51, "One row per output time");
+    CHECK(counts[0] == 0.0 && integrals[0] == 0.0, "Nothing has happened at t_start");
+    for (int i = 0; i < 51; ++i) {
+        // Every fire of A -> B consumes one A, so the count is A(0) - A(t) exactly.
+        double a_t = res.species_data()[i * res.n_species() + 0];
+        CHECK_CLOSE(counts[i], 100.0 - a_t, 1e-12, "Count equals molecules consumed");
+        if (i > 0) {
+            CHECK(counts[i] >= counts[i - 1], "Counts never decrease");
+            CHECK(integrals[i] >= integrals[i - 1], "Integrals never decrease");
+        }
+    }
+    // k1 = 0.1 and A(t) <= 100 bound the integral by 0.1 * 100 * 50; it is positive
+    // once anything has fired.
+    CHECK(integrals[50] > 0.0 && integrals[50] <= 500.0,
+          "Integrated propensity within its trivial bounds");
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Regression: SSA rounds fractional initial molecule populations
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2868,6 +2920,7 @@ int main() {
     RUN_TEST(test_steady_state_linear_solver_routing);
     RUN_TEST(test_ssa_simple_decay);
     RUN_TEST(test_ssa_reproducibility);
+    RUN_TEST(test_ssa_reaction_stats);
     RUN_TEST(test_ssa_fractional_initial_population_rounds);
     RUN_TEST(test_observables);
     RUN_TEST(test_c_api);

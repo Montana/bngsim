@@ -99,6 +99,16 @@ class SsaSimulator {
     // which keep the incremental Fenwick path. Empty string clears it.
     void set_propensity_library(const std::string &so_path);
 
+    // GH #616 — record, at every output time, each reaction's cumulative firing
+    // count N_r(t) and integrated propensity ∫ |a_r| ds: the two accumulators a
+    // likelihood-ratio (Girsanov) parameter gradient of an SSA ensemble is built
+    // from (Result::reaction_firing_counts / reaction_propensity_integrals). Off
+    // by default — the loops are untouched and the result carries no such block.
+    // Enabling it changes no trajectory: the RNG draw order and every propensity
+    // are the same with it on or off. Exact SSA only; run_psa() ignores it,
+    // because a scaled channel's count and intensity are not the exact process's.
+    void set_record_reaction_stats(bool enabled);
+
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

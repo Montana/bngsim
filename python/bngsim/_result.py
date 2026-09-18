@@ -206,6 +206,9 @@ class Result:
         "_expression_sensitivities",
         "_observable_sensitivities_ic",
         "_expression_sensitivities_ic",
+        "_reaction_firing_counts",
+        "_reaction_propensity_integrals",
+        "_reaction_labels",
         "_expression_sens_support",
         "_species_names",
         "_observable_names",
@@ -256,6 +259,15 @@ class Result:
         _expression_sensitivities: NDArray | None = None,
         _observable_sensitivities_ic: NDArray | None = None,
         _expression_sensitivities_ic: NDArray | None = None,
+        # GH #616 — SSA per-reaction event statistics (load / batch). Absent ⇒
+        # the empty (0, 0) block and no labels.
+        _reaction_firing_counts: NDArray | None = None,
+        _reaction_propensity_integrals: NDArray | None = None,
+        _reaction_labels: list[str] | None = None,
+        # SSA diagnostics for a result built from raw arrays. ``squeeze`` passes
+        # the aggregate over its inputs; absent ⇒ the inert zero dict, whose
+        # backend reads "unknown" because nothing ran to say.
+        _ssa_diagnostics: dict[str, Any] | None = None,
     ) -> None:
         self._core = core
 
@@ -308,6 +320,21 @@ class Result:
             self._expression_sensitivities_ic: NDArray[np.float64] = _core_sens_block(
                 core, "expression_sensitivity_ic_data"
             )
+
+            # GH #616 — SSA per-reaction firing counts and propensity integrals,
+            # recorded only when the run asked for them
+            # (Simulator(..., reaction_stats=True)); (0, 0) otherwise and on every
+            # other backend.
+            if getattr(core, "n_reaction_stats", 0) > 0:
+                self._reaction_firing_counts: NDArray[np.float64] = core.reaction_firing_counts
+                self._reaction_propensity_integrals: NDArray[np.float64] = (
+                    core.reaction_propensity_integrals
+                )
+                self._reaction_labels: list[str] = list(core.reaction_labels)
+            else:
+                self._reaction_firing_counts = np.empty((0, 0))
+                self._reaction_propensity_integrals = np.empty((0, 0))
+                self._reaction_labels = []
 
             # Solver stats. ``steady_state_reached`` is the int 0/1 marker
             # for whether the BNG-style early-stop fired (False on every
@@ -380,6 +407,9 @@ class Result:
             self._expression_sensitivities = _empty_sens_block(_expression_sensitivities)
             self._observable_sensitivities_ic = _empty_sens_block(_observable_sensitivities_ic)
             self._expression_sensitivities_ic = _empty_sens_block(_expression_sensitivities_ic)
+            self._reaction_firing_counts = _empty_2d_block(_reaction_firing_counts)
+            self._reaction_propensity_integrals = _empty_2d_block(_reaction_propensity_integrals)
+            self._reaction_labels = _reaction_labels or []
             self._solver_stats = _solver_stats or {
                 "n_steps": 0,
                 "n_rhs_evals": 0,
@@ -393,12 +423,14 @@ class Result:
                 "n_dense_blas_factorizations": 0,
                 "steady_state_reached": 0,
             }
-            self._ssa_diagnostics = {
+            self._ssa_diagnostics = _ssa_diagnostics or {
                 "n_negative_crossings": 0,
                 "first_negative_species": "",
                 "n_reverse_fires": 0,
                 "first_reverse_reaction": "",
-                "propensity_backend": "interpreted",
+                # A loaded or hand-built result ran nothing here, so no backend
+                # is known; "interpreted" would name one that was never used.
+                "propensity_backend": "unknown",
             }
             self._psa_diagnostics = _empty_psa_diagnostics()
 
@@ -1786,6 +1818,51 @@ class Result:
         """Species names whose ICs were differentiated against."""
         return self._sensitivity_ic_species
 
+    # ─── SSA per-reaction event statistics (GH #616) ─────────────────
+
+    @property
+    def reaction_firing_counts(self) -> NDArray[np.float64]:
+        """Cumulative firings of each reaction at each output time, ``N_r(t)``.
+
+        Shape ``(n_times, n_reactions)`` for a single run and
+        ``(n_sims, n_times, n_reactions)`` for a stacked batch, or empty
+        ``(0, 0)`` unless the run was made with
+        ``Simulator(model, method="ssa", reaction_stats=True)``. Column ``r``
+        is labelled by :attr:`reaction_labels`. Integer-valued, held as
+        float64 so it subtracts directly from
+        :attr:`reaction_propensity_integrals`: ``N_r(t) − ∫₀ᵗ a_r ds`` is the
+        compensated counting process of reaction ``r``, whose mean over
+        replicates is zero, and which ``bngsim.girsanov`` turns into
+        likelihood-ratio scores for the rate constants.
+        """
+        return self._reaction_firing_counts
+
+    @property
+    def reaction_propensity_integrals(self) -> NDArray[np.float64]:
+        """Integrated propensity of each reaction at each output time, ``∫₀ᵗ |a_r| ds``.
+
+        Same shape and labelling as :attr:`reaction_firing_counts`. The
+        integrand is the propensity magnitude the sampler used to draw the
+        reaction — a reaction whose rate law goes negative fires in reverse at
+        ``|a_r|`` (GH #110) — so the block describes the process as sampled.
+        """
+        return self._reaction_propensity_integrals
+
+    @property
+    def reaction_labels(self) -> list[str]:
+        """Labels for the reaction axis of the per-reaction statistics.
+
+        ``"R<index> (A + B -> C)"``: the ``.net`` file's 1-based reaction index,
+        then the reaction written in species names, ``0`` standing for no
+        reactant or no product. Empty unless the statistics were recorded.
+        """
+        return self._reaction_labels
+
+    @property
+    def has_reaction_stats(self) -> bool:
+        """Whether per-reaction firing counts and propensity integrals were recorded."""
+        return self._reaction_firing_counts.size > 0
+
     # ─── Observable / expression output sensitivities (GH #196) ─────
     #
     # Storage + API only at this stage; no computation path populates these
@@ -2151,6 +2228,16 @@ class Result:
                 ("time", "expression", "ic_state"),
                 self._expression_sensitivities_ic,
             )
+        # GH #616 — SSA per-reaction event statistics.
+        if self.has_reaction_stats:
+            data_vars["reaction_firing_counts"] = (
+                ("time", "reaction"),
+                self._reaction_firing_counts,
+            )
+            data_vars["reaction_propensity_integrals"] = (
+                ("time", "reaction"),
+                self._reaction_propensity_integrals,
+            )
 
         coords: dict[str, Any] = {"time": self._time}
         if self._species_names:
@@ -2163,6 +2250,8 @@ class Result:
             coords["parameter"] = self._sensitivity_params
         if self._sensitivity_ic_species:
             coords["ic_state"] = self._sensitivity_ic_species
+        if self._reaction_labels:
+            coords["reaction"] = self._reaction_labels
 
         attrs: dict[str, Any] = dict(self.custom_attrs)
         if self._seed is not None:
@@ -2458,6 +2547,13 @@ class Result:
                 )
             if self._sensitivity_params:
                 f.create_dataset("sensitivity_params", data=self._sensitivity_params, dtype=dt)
+            # GH #616 — SSA per-reaction event statistics, written only when recorded.
+            if self._reaction_firing_counts.size > 0:
+                f.create_dataset("reaction_firing_counts", data=self._reaction_firing_counts)
+                f.create_dataset(
+                    "reaction_propensity_integrals", data=self._reaction_propensity_integrals
+                )
+                f.create_dataset("reaction_labels", data=self._reaction_labels, dtype=dt)
             if self._sensitivity_ic_species:
                 f.create_dataset(
                     "sensitivity_ic_species", data=self._sensitivity_ic_species, dtype=dt
@@ -2582,6 +2678,10 @@ class Result:
             sensitivity_params = _names("sensitivity_params")
             sensitivity_ic_species = _names("sensitivity_ic_species")
             ar_sens_refused = _names("ar_sensitivity_refused") or []
+            # GH #616 — absent datasets round-trip to the empty (0, 0) block.
+            reaction_firing_counts = _sens("reaction_firing_counts")
+            reaction_propensity_integrals = _sens("reaction_propensity_integrals")
+            reaction_labels = _names("reaction_labels")
 
         result = cls(
             core=None,
@@ -2603,6 +2703,9 @@ class Result:
             _expression_sensitivities=expression_sensitivities,
             _observable_sensitivities_ic=observable_sensitivities_ic,
             _expression_sensitivities_ic=expression_sensitivities_ic,
+            _reaction_firing_counts=reaction_firing_counts,
+            _reaction_propensity_integrals=reaction_propensity_integrals,
+            _reaction_labels=reaction_labels,
         )
         # GH #221 — the NaN rows this file records as refusals, not as a failed
         # solve, so `gradient` keeps its zero-weight exemption after a round trip.
@@ -2855,6 +2958,25 @@ class Result:
         # If every input used the same seed, surface it; otherwise fall
         # back to None — the per-sim seeds remain on the unsqueezed
         # Result objects.
+        # SSA boundary diagnostics (GH #110): counts add up across replicates,
+        # the first offender is the first replicate's, and the propensity
+        # backend is the one every replicate used, or "mixed". Dropping these
+        # left a batch reporting the default dict's backend as if it had run.
+        diags = [r._ssa_diagnostics for r in results]
+        backends = {d.get("propensity_backend", "unknown") for d in diags}
+        agg_ssa: dict[str, Any] = {
+            "n_negative_crossings": sum(int(d.get("n_negative_crossings", 0)) for d in diags),
+            "first_negative_species": next(
+                (d["first_negative_species"] for d in diags if d.get("n_negative_crossings")),
+                "",
+            ),
+            "n_reverse_fires": sum(int(d.get("n_reverse_fires", 0)) for d in diags),
+            "first_reverse_reaction": next(
+                (d["first_reverse_reaction"] for d in diags if d.get("n_reverse_fires")), ""
+            ),
+            "propensity_backend": next(iter(backends)) if len(backends) == 1 else "mixed",
+        }
+
         seeds = {r._seed for r in results}
         squeeze_seed = next(iter(seeds)) if len(seeds) == 1 else None
 
@@ -2870,6 +2992,14 @@ class Result:
         def stack_sens(attr: str) -> NDArray[np.float64]:
             if getattr(results[0], attr).size == 0:
                 return np.empty((0, 0, 0))
+            return np.stack([getattr(r, attr) for r in results], axis=0)
+
+        # GH #616 — the per-reaction statistics stack the same way, (sims, times,
+        # reactions); an ensemble's covariance of observable and score is exactly
+        # what the stacked block is for.
+        def stack_2d(attr: str) -> NDArray[np.float64]:
+            if getattr(results[0], attr).size == 0:
+                return np.empty((0, 0))
             return np.stack([getattr(r, attr) for r in results], axis=0)
 
         return Result(
@@ -2893,6 +3023,10 @@ class Result:
             _expression_sensitivities=stack_sens("_expression_sensitivities"),
             _observable_sensitivities_ic=stack_sens("_observable_sensitivities_ic"),
             _expression_sensitivities_ic=stack_sens("_expression_sensitivities_ic"),
+            _reaction_firing_counts=stack_2d("_reaction_firing_counts"),
+            _reaction_propensity_integrals=stack_2d("_reaction_propensity_integrals"),
+            _reaction_labels=results[0]._reaction_labels,
+            _ssa_diagnostics=agg_ssa,
         )
 
     # ─── Dunder methods ─────────────────────────────────────────────
@@ -2986,6 +3120,8 @@ class _XarrayAccessor:
         "sensitivities_expressions",
         "sensitivities_observables_ic",
         "sensitivities_expressions_ic",
+        "reaction_firing_counts",
+        "reaction_propensity_integrals",
     )
 
     def __init__(self, result: Result) -> None:
@@ -3044,6 +3180,18 @@ class _XarrayAccessor:
                     "expression": result._expression_names,
                 },
                 name="expressions",
+            )
+        if name in ("reaction_firing_counts", "reaction_propensity_integrals"):
+            # GH #616 — SSA per-reaction event statistics.
+            if not result.has_reaction_stats:
+                raise AttributeError(
+                    "Result has no per-reaction statistics. Run with reaction_stats=True."
+                )
+            return xr.DataArray(
+                getattr(result, name),
+                dims=("time", "reaction"),
+                coords={"time": result._time, "reaction": result._reaction_labels},
+                name=name,
             )
         if name == "sensitivities":
             if not result.has_sensitivities:
@@ -3147,6 +3295,15 @@ def _empty_sens_block(arr: NDArray | None) -> NDArray[np.float64]:
     convention: a 3-D array that is empty (``size == 0``) when not computed.
     """
     return arr if arr is not None else np.empty((0, 0, 0))
+
+
+def _empty_2d_block(arr: NDArray | None) -> NDArray[np.float64]:
+    """A ``(time, column)`` block, defaulting an absent one to the empty ``(0, 0)``.
+
+    The 2-D counterpart of :func:`_empty_sens_block`, for the GH #616
+    per-reaction statistics.
+    """
+    return arr if arr is not None else np.empty((0, 0))
 
 
 def _core_sens_block(core: Any, attr: str) -> NDArray[np.float64]:

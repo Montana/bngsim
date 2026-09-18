@@ -16,6 +16,26 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Added
 
+- **Per-reaction firing counts and propensity integrals from an exact SSA
+  run (issue #616).** `Simulator(model, method="ssa", reaction_stats=True)`
+  records, at every output time, `N_r(t)` and `∫₀ᵗ |a_r| ds` for each
+  reaction — the two accumulators the likelihood-ratio (Girsanov) parameter
+  gradient of an ensemble is built from — on `Result.reaction_firing_counts`,
+  `Result.reaction_propensity_integrals` and `Result.reaction_labels`
+  (`(n_times, n_reactions)`; empty unless asked for). The blocks survive
+  `run_replicates` (sequential and parallel; stacked to
+  `(n_sims, n_times, n_reactions)` under `squeeze=True`), `save`/`load` and
+  `to_dataset`. The new `bngsim.girsanov` module turns them into scores for
+  named mass-action rate constants (`scores`, per parameter or per `log₁₀`)
+  and into the ensemble gradient with its standard error (`gradient`, the
+  sample covariance of observable and score). Off by default, and enabling
+  it leaves every trajectory byte-identical: the integral is banked at the
+  moment a propensity is rewritten, so the incremental loop pays
+  O(affected) per step for it, the same as for the propensities. Exact SSA
+  only — PSA, ODE and network-free refuse the flag — and `scores` refuses a
+  model with a functional or Michaelis–Menten rate law, whose score is not a
+  function of the two accumulators.
+
 - **`Model.analytical_jacobian_status`: why a model runs on the
   finite-difference Jacobian, in words (issue #506).** `"complete"`,
   `"pending"` (functional rate laws not derived yet), or `"declined: <reason>"`

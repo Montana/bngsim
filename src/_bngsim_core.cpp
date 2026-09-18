@@ -811,6 +811,20 @@ PYBIND11_MODULE(_bngsim_core, m) {
                                             static_cast<py::ssize_t>(sizeof(double))},
                                            vec->data(), capsule);
             })
+        // GH #616 — SSA per-reaction event statistics, (n_times, n_reactions);
+        // (n_times, 0) unless the run recorded them (set_record_reaction_stats).
+        .def_property_readonly("n_reaction_stats", &bngsim::Result::n_reaction_stats)
+        .def_property_readonly("reaction_labels", &bngsim::Result::reaction_labels)
+        .def_property_readonly("reaction_firing_counts",
+                               [](const bngsim::Result &r) {
+                                   return vec_to_ndarray_2d(r.reaction_firing_counts(), r.n_times(),
+                                                            r.n_reaction_stats());
+                               })
+        .def_property_readonly("reaction_propensity_integrals",
+                               [](const bngsim::Result &r) {
+                                   return vec_to_ndarray_2d(r.reaction_propensity_integrals(),
+                                                            r.n_times(), r.n_reaction_stats());
+                               })
         // IC sensitivity data
         .def_property_readonly("n_sens_ic_species", &bngsim::Result::n_sens_ic_species)
         .def_property_readonly("sens_ic_species_names", &bngsim::Result::sens_ic_species_names)
@@ -2120,6 +2134,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
     py::class_<bngsim::SsaSimulator>(m, "SsaSimulator")
         .def(py::init<bngsim::NetworkModel &>(), py::arg("model"), py::keep_alive<1, 2>(),
              "Create a stochastic simulator (SSA/PSA) for the given model")
+        .def("set_record_reaction_stats", &bngsim::SsaSimulator::set_record_reaction_stats,
+             py::arg("enabled"),
+             "GH #616: record each reaction's cumulative firing count and integrated "
+             "propensity at every output time (Result.reaction_firing_counts / "
+             "reaction_propensity_integrals). Exact SSA only; run_psa ignores it. Off by "
+             "default, and enabling it changes no trajectory.")
         .def(
             "run",
             [](bngsim::SsaSimulator &self, const bngsim::TimeSpec &times, uint64_t seed,

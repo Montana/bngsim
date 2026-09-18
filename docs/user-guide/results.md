@@ -85,3 +85,32 @@ Batch (3-D) results from `run_batch(squeeze=True)` are intentionally not
 written to text files by these methods; iterate the per-replicate
 `Result` list (the `squeeze=False` shape) and call the writer on each one,
 or use HDF5 for the assembled batch.
+
+## Per-reaction event statistics from an SSA run
+
+An exact SSA run can record, at every output time, each reaction's cumulative
+firing count and integrated propensity — the two accumulators a likelihood-ratio
+(Girsanov) parameter gradient of an ensemble is built from. It is off by default
+and changes no trajectory when on.
+
+```python
+sim = bngsim.Simulator(model, method="ssa", reaction_stats=True)
+batch = sim.run_replicates(200, t_span=(0, 20), n_points=21, seed=1, squeeze=True)
+
+batch.reaction_firing_counts.shape         # (200, 21, n_reactions): N_r(t) per replicate
+batch.reaction_propensity_integrals.shape  # (200, 21, n_reactions): ∫₀ᵗ a_r ds
+batch.reaction_labels                      # ["R1 (0 -> A())", "R2 (A() -> 0)", ...]
+
+# Scores of the path law for named rate constants, and the ensemble gradient
+# d E[observable] / d log10(k) with its standard error.
+from bngsim import girsanov
+
+w = girsanov.scores(model, batch, ["k1", "k2"], log10=True)   # (200, 21, 2)
+grad, stderr = girsanov.gradient(batch.observables, w)         # (21, n_observables, 2)
+```
+
+`N_r(t) − ∫₀ᵗ a_r ds` has zero mean across replicates; how close the sample mean
+is to zero, against its standard error, is the check that the statistics were
+banked against the intensity the sampler actually used. `scores` is defined for
+mass-action rate laws and refuses a model with a functional or Michaelis–Menten
+reaction.
