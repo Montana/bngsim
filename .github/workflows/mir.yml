@@ -83,6 +83,17 @@ on:
       # the JIT too, so it is a second place a #85-class prelude bug can surface.
       - "src/steady_state.cpp"
       - "src/_bngsim_core.cpp"
+      # Issue #619 — the other half of a duplicated invariant. _codegen.py's
+      # function ordering says of itself "This mirrors ModelBuilder's Kahn sort
+      # (src/model_builder.cpp) so the emitted func[] block is ordered the same
+      # way": emit and engine agree only while the two sorts agree, and this leg
+      # is where the emitted order is executed. build() is also where the orders
+      # codegen_data() reports are decided (var_param_bindings, GH #76;
+      # derived_param_order, #568). Registering _codegen.py and not this file
+      # ran the leg on the mirroring half and not on the half being mirrored.
+      # The codegen cache key cannot cover for it — it hashes the Python
+      # emitters only, and says so.
+      - "src/model_builder.cpp"
       - "third_party/mir/**"
       - "python/bngsim/_codegen.py"
       - "python/bngsim/_simulator.py"

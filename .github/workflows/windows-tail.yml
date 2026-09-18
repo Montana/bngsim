@@ -82,6 +82,13 @@ on:
       - "python/bngsim/_sbml_loader.py"
       - "src/cvode_simulator.cpp"
       - "src/model.cpp"
+      # Issue #619 — the construction path behind this cluster's assertions:
+      # species_ic_param_refs (test_ic_sensitivity_seed.py) is populated in
+      # model_builder.cpp, and its Kahn sort is what _codegen.py mirrors for the
+      # emitted func[] order every test_codegen*.py here executes (see mir.yml).
+      # Registered beside _net_reader.py / _model.py for the same reason those
+      # are: the leg guards what they build.
+      - "src/model_builder.cpp"
       - "src/ssa_simulator.cpp"
       # No other workflow both compiles and exercises these — see the note above.
       - "src/rulemonkey_simulator.cpp"
