@@ -2798,14 +2798,171 @@ void NetworkModel::evaluate_functions(double t) {
     if (cache.size() != impl_->functions.size())
         cache.assign(impl_->functions.size(), 0.0);
 
-    // Evaluate each function expression and update its bound parameter
-    for (const auto &[func_idx, param_idx] : impl_->shared->var_param_bindings) {
+    // Evaluate each function expression and update its bound parameter, one
+    // strongly-connected group at a time and in the order build() sorted them
+    // (GH #76). A group of one — every function in every corpus model but one —
+    // is a single evaluation, so this is the same walk it has always been.
+    const auto &starts = impl_->shared->function_scc_starts;
+    const auto &bindings = impl_->shared->var_param_bindings;
+    const auto eval_one = [&](size_t bi) {
+        const auto &[func_idx, param_idx] = bindings[bi];
         const auto &func = impl_->functions[func_idx];
-        if (func.evaluator_id >= 0) {
-            double val = impl_->evaluator->evaluate(func.evaluator_id);
-            impl_->parameters[param_idx].value = val;
-            cache[func_idx] = val;
+        if (func.evaluator_id < 0)
+            return;
+        const double val = impl_->evaluator->evaluate(func.evaluator_id);
+        impl_->parameters[param_idx].value = val;
+        cache[func_idx] = val;
+    };
+
+    for (size_t g = 0; g + 1 < starts.size(); ++g) {
+        const size_t lo = static_cast<size_t>(starts[g]), hi = static_cast<size_t>(starts[g + 1]);
+        if (hi - lo == 1) {
+            eval_one(lo);
+            continue;
         }
+        solve_function_cycle(lo, hi);
+    }
+}
+
+// Gaussian elimination with partial pivoting, in place: solves A x = b for the
+// small dense systems solve_function_cycle() builds (k is a function-cycle size
+// — four on the one corpus model that has one). Returns false when the pivot
+// column is numerically empty, which the caller treats as "this group did not
+// solve" rather than pressing on with a fabricated step. A dedicated routine
+// rather than the LAPACK path: that one is wired to SUNDIALS' SUNLinearSolver
+// for the Jacobian and carries setup this does not need at k of a handful.
+static bool solve_dense_in_place(std::vector<double> &a, std::vector<double> &b, size_t k) {
+    for (size_t col = 0; col < k; ++col) {
+        size_t piv = col;
+        for (size_t r = col + 1; r < k; ++r)
+            if (std::abs(a[r * k + col]) > std::abs(a[piv * k + col]))
+                piv = r;
+        if (!(std::abs(a[piv * k + col]) > 0.0))
+            return false;
+        if (piv != col) {
+            for (size_t c = 0; c < k; ++c)
+                std::swap(a[col * k + c], a[piv * k + c]);
+            std::swap(b[col], b[piv]);
+        }
+        const double d = a[col * k + col];
+        for (size_t r = col + 1; r < k; ++r) {
+            const double m = a[r * k + col] / d;
+            if (m == 0.0)
+                continue;
+            for (size_t c = col; c < k; ++c)
+                a[r * k + c] -= m * a[col * k + c];
+            b[r] -= m * b[col];
+        }
+    }
+    for (size_t i = k; i-- > 0;) {
+        double acc = b[i];
+        for (size_t c = i + 1; c < k; ++c)
+            acc -= a[i * k + c] * b[c];
+        b[i] = acc / a[i * k + i];
+    }
+    return true;
+}
+
+// Solve one strongly-connected group of functions — a set that reads itself, so
+// no order evaluates it one at a time (issue #621).
+//
+// What this replaces: the group used to be swept once per RHS evaluation, in
+// whatever order the sort's cycle fallback left it. That is a Gauss-Seidel
+// iteration with no convergence check and no fixed number of steps, so the
+// value a function held depended on how many times the RHS had been called —
+// `Model.rhs(y, t)` returned a different number on every call at the same state,
+// and `compute_derivs` was not a function of (t, y) at all. Below a loop gain of
+// 1 it crept toward the answer without arriving; above 1 it ran away. On
+// MODEL1006230117, the one corpus model with such a group, the gain is ~36: it
+// reached `inf` before t = 1e-13 and the solve died there.
+//
+// Newton on the residual g(x) = F(x) - x, not iteration of F. That choice is
+// forced by the same model: its group is LINEAR in its unknowns (`R` reads
+// `LR`, `LRG`, `RG`; each of those reads only `R`), so the system has one exact
+// solution — and a linear system is precisely where Newton lands on it in a
+// single step whatever the gain, while fixed-point iteration diverges for any
+// gain above 1. Groups are small (four here; the Jacobian is dense k*k with k
+// the group size), and nothing pays for this unless it has such a group.
+//
+// F is evaluated Jacobi-style — every member read from the SAME x — because a
+// residual built from half-updated values is not g(x) and its difference
+// quotient is not J.
+void NetworkModel::solve_function_cycle(size_t lo, size_t hi) {
+    const auto &bindings = impl_->shared->var_param_bindings;
+    const size_t k = hi - lo;
+    auto &scratch = impl_->fn_cycle_scratch;
+    scratch.x.assign(k, 0.0);
+    scratch.f.assign(k, 0.0);
+    scratch.g.assign(k, 0.0);
+    scratch.jac.assign(k * k, 0.0);
+
+    // Seed from zero, NOT from what the slots happen to hold. The slots hold the
+    // previous call's answer, which makes the starting point a function of
+    // history — and Newton stops as soon as the residual is under tolerance, so
+    // a different start lands on a different point inside that band. Warm-
+    // starting left `Model.rhs()` returning seven distinct values across twelve
+    // calls at one state, spread 1.7e-12 relative: the issue #621 defect
+    // surviving twelve orders of magnitude smaller, which is still not a
+    // function of (t, y). A constant seed makes every step downstream of it a
+    // function of the state alone, so the same state gives the same answer
+    // bit for bit.
+    std::fill(scratch.x.begin(), scratch.x.end(), 0.0);
+
+    // F(x): write x into every bound slot, then read all members off it.
+    const auto eval_F = [&](const std::vector<double> &x, std::vector<double> &out) {
+        for (size_t i = 0; i < k; ++i)
+            impl_->parameters[bindings[lo + i].second].value = x[i];
+        for (size_t i = 0; i < k; ++i) {
+            const auto &func = impl_->functions[bindings[lo + i].first];
+            out[i] = func.evaluator_id >= 0 ? impl_->evaluator->evaluate(func.evaluator_id) : x[i];
+        }
+    };
+
+    constexpr int kMaxIter = 50;
+    constexpr double kTol = 1e-12;
+    bool converged = false;
+    for (int iter = 0; iter < kMaxIter && !converged; ++iter) {
+        eval_F(scratch.x, scratch.f);
+        double norm = 0.0, scale = 0.0;
+        for (size_t i = 0; i < k; ++i) {
+            scratch.g[i] = scratch.f[i] - scratch.x[i];
+            norm = std::max(norm, std::abs(scratch.g[i]));
+            scale = std::max(scale, std::abs(scratch.x[i]));
+        }
+        if (!std::isfinite(norm))
+            break;
+        if (norm <= kTol * (1.0 + scale)) {
+            converged = true;
+            break;
+        }
+        // Dense FD Jacobian of g, column by column.
+        std::vector<double> xp = scratch.x, fp(k);
+        for (size_t j = 0; j < k; ++j) {
+            const double h = 1e-7 * (std::abs(scratch.x[j]) + 1.0);
+            const double keep = xp[j];
+            xp[j] = keep + h;
+            eval_F(xp, fp);
+            for (size_t i = 0; i < k; ++i) {
+                const double gp = fp[i] - xp[i];
+                scratch.jac[i * k + j] = (gp - scratch.g[i]) / h;
+            }
+            xp[j] = keep;
+        }
+        if (!solve_dense_in_place(scratch.jac, scratch.g, k))
+            break; // singular: leave the last iterate, below
+        for (size_t i = 0; i < k; ++i)
+            scratch.x[i] -= scratch.g[i];
+    }
+
+    // Write the result back, converged or not. A group that would not solve is
+    // left holding its last iterate and its functions are marked non-finite, so
+    // the RHS guards that already exist report it rather than a silently
+    // state-independent number reaching the integrator.
+    eval_F(scratch.x, scratch.f);
+    for (size_t i = 0; i < k; ++i) {
+        const double val = converged ? scratch.f[i] : std::numeric_limits<double>::quiet_NaN();
+        impl_->parameters[bindings[lo + i].second].value = val;
+        impl_->function_value_cache[bindings[lo + i].first] = val;
     }
 }
 

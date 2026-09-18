@@ -138,6 +138,46 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A cyclic function graph is solved instead of swept, so the RHS stops being a
+  function of how many times it has been called (issue #621).** Functions that
+  read each other are a simultaneous system. `evaluate_functions()` walked them
+  once per RHS evaluation in whatever order the sort's cycle fallback left —
+  a Gauss-Seidel sweep with no convergence check and no fixed number of steps —
+  so the value a function held depended on the call history. `Model.rhs(y, t)`
+  returned a different number on every call at the same state, and
+  `compute_derivs` was not a function of `(t, y)` at all. Below a loop gain of 1
+  it crept toward the answer without arriving (`-1.0, -1.75, -1.9375, …` for a
+  system whose solution is `-2`); above 1 it ran away.
+
+  `build()` now groups the functions into strongly-connected components
+  (Tarjan), and `evaluate_functions()` walks the groups in dependency order. A
+  group of **one** — every function in every corpus model but one — is a single
+  evaluation, exactly the walk it has always been, so nothing acyclic changes or
+  pays. A group of two or more is solved by Newton on the residual
+  `g(x) = F(x) − x`, seeded from a constant so the answer is a function of the
+  state alone rather than of the previous call's answer.
+
+  Newton rather than iteration is forced by the one model that needs it.
+  `MODEL1006230117`'s group is linear in its unknowns (`R` reads `LR`, `LRG`,
+  `RG`; each of those reads only `R`), so the system has one exact solution —
+  and a linear system is precisely where Newton lands on it whatever the gain,
+  while fixed-point iteration diverges for any gain above 1. That model's gain
+  is ~36: it reached `inf` before `t = 1e-13` and **could not be simulated at
+  all**. It now integrates, and its `R` resolves to the closed-form
+  `R_Total/(1 + LR/R + LRG/R + RG/R)`.
+
+  The compiled path cannot express the solve, so codegen declines a cyclic
+  function graph and the caller falls back to the interpreted engine. It had
+  been emitting `func[i] = …` in an order that cannot exist — 12 use-before-def
+  reads of an uninitialised `func[]` on that model, where the compiled run died
+  on a non-finite RHS at `t = 0` while the interpreted one was correct. Two
+  engines disagreeing in silence is worse than either being wrong alone.
+
+  Acyclic behaviour is unchanged and cross-checked: on function-heavy models
+  (8–37 assignment rules) the newly-ordered interpreted engine and the
+  untouched compiled emitter agree to 8e-12 or better, and all 2,774 `.net`
+  files and 1,291 vendored SBML documents still load.
+
 - **A parameter defined through a reference cycle, or in terms of itself, is
   refused at build time instead of being assigned a number (issue #617).**
   `x = y+1` with `y = x+1` denotes no value and `s = s*2` denotes none either,
