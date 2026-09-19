@@ -138,6 +138,34 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A `NamedArray` column name never points at a column it does not name, so a
+  sliced `as_roadrunner` array stops answering a lookup with its neighbour's
+  species (issue #561).** `colnames` labels columns by position, and
+  `__array_finalize__` copied the parent's list onto every array numpy derived
+  from a labeled one. A plain column slice — `arr[:, 1:]`, on the "all numpy
+  operations work" path `Result.as_roadrunner` advertises — therefore came back
+  two columns wide still carrying three names, with the `__new__` invariant
+  `len(colnames) == shape[1]` violated on a live object. Lookup resolved the
+  name against the stale list and indexed the *sliced* data with it:
+  `sub["[X]"]` returned the `[Y]` trajectory, `sub["time"]` returned `[X]`, and
+  only the last name ran off the end and raised. A PyBNF-style fit taking the
+  time column off the front could feed the wrong species into a residual with
+  nothing to read as an error.
+
+  Names are now attached only where the columns behind them are known.
+  `__getitem__` computes which columns a key kept and relabels the result, so
+  `arr[:, 1:]`, `arr[:, ::-1]`, `arr[:, [2, 0]]`, a boolean column mask, a row
+  slice and a chained slice all come back correctly labeled — more than the
+  reference implementation does, since libroadrunner returns `colnames == []`
+  for every one of them. Anything else numpy hands back — a product, a
+  transpose, `np.sort(arr, axis=1)`, a copy, an unpickled array — carries no
+  names, because this hook is told nothing about the transform that produced
+  the array and a same-shape result is as likely to have had its columns
+  permuted as left alone. Lookup on such an array raises `KeyError` naming the
+  cause and the way to carry names across, instead of resolving against a
+  column that moved; libroadrunner drops the labels on those too. The numbers
+  are untouched in every case — only the labels changed.
+
 - **A cyclic function graph is solved instead of swept, so the RHS stops being a
   function of how many times it has been called (issue #621).** Functions that
   read each other are a simultaneous system. `evaluate_functions()` walked them

@@ -29,10 +29,18 @@ class NamedArray(np.ndarray):
     Attributes
     ----------
     colnames : list[str]
-        One entry per column, in column order. Always a fresh list —
-        slicing / arithmetic that drops columns invalidates the
-        original mapping, so the inherited list is left untouched on
-        non-trivial transforms.
+        One name per column, in column order — the invariant
+        :meth:`__new__` checks, and one that holds for the lifetime of
+        every array of this class (issue #561). Names are *positional*,
+        so they are carried only where the columns they label can be
+        followed: construction, and indexing, which relabels whatever
+        survives the key (``arr[:, 1:]``, ``arr[:, ["time", "[X]"]]``,
+        ``arr[:, ::-1]``, a row slice). Every other derived array — a
+        product, a transpose, a reduction, an unpickled copy — has
+        ``colnames == []`` and raises :class:`KeyError` on a lookup by
+        name, rather than answering with whichever column now sits at
+        the name's old position. libroadrunner drops the labels on
+        every derived array, this one included.
 
     Examples
     --------
@@ -44,6 +52,8 @@ class NamedArray(np.ndarray):
     array([ ... ])
     >>> arr[:, "[X]"]                   # equivalent
     array([ ... ])
+    >>> arr[:, 1:].colnames             # the columns the slice kept
+    ['[X]', '[Y]']
     """
 
     # __slots__ omitted: ndarray subclasses must not declare __slots__
@@ -61,9 +71,16 @@ class NamedArray(np.ndarray):
         return arr
 
     def __array_finalize__(self, obj: NDArray[Any] | None) -> None:
-        if obj is None:
-            return
-        self.colnames = list(getattr(obj, "colnames", []))
+        # Deliberately does *not* inherit the parent's names (issue #561).
+        # They label columns by position, and numpy hands this hook no
+        # description of the transform that produced ``self``: a result of the
+        # parent's shape is as likely to be ``np.sort(parent, axis=1)``, with
+        # the columns permuted, as ``parent * 2``, with them intact. Inheriting
+        # them is what let a column-dropping slice keep one name per column of
+        # the *parent*, so that ``arr[:, 1:]["[X]"]`` returned the ``[Y]``
+        # column and nothing raised. Names are attached only where the
+        # surviving columns are known: __new__ and __getitem__.
+        self.colnames: list[str] = []
 
     def __getitem__(self, key: Any) -> NDArray[np.float64]:  # type: ignore[override]
         # Forms supported:
@@ -71,7 +88,8 @@ class NamedArray(np.ndarray):
         #   arr[:, "name"]      → 1-D column
         #   arr[i, "name"]      → scalar
         #   arr[i:j, ["a","b"]] → 2-D NamedArray slice
-        # Anything else falls through to ndarray.__getitem__.
+        # Anything else falls through to ndarray.__getitem__, and the names of
+        # the columns that survived the key are computed back onto the result.
         if isinstance(key, str):
             return self._col_by_name(key)
         if isinstance(key, tuple) and len(key) == 2:
@@ -85,7 +103,36 @@ class NamedArray(np.ndarray):
                 if sub.ndim == 2:
                     return NamedArray(sub, [self.colnames[i] for i in idxs])
                 return sub
-        return super().__getitem__(key)
+        out = super().__getitem__(key)
+        if isinstance(out, NamedArray):
+            out.colnames = self._colnames_after(key, out)
+        return out
+
+    def _colnames_after(self, key: Any, out: NamedArray) -> list[str]:
+        """Names for the columns of ``self[key]``; ``[]`` when not derivable.
+
+        Whatever selects along axis 1 of a 2-D array selects the same entries
+        of a 1-D array of column positions, so basic and advanced indexing are
+        both answered by indexing ``np.arange(ncols)`` with the key's column
+        part. A key that leaves no recognizable column axis — one whose result
+        is not 2-D, or a broadcast advanced index whose axis 1 is not the
+        column axis — yields no names rather than a guess.
+        """
+        if out.ndim != 2 or not self.colnames:
+            return []
+        col_key: Any = slice(None)  # a key that indexes rows only keeps every column
+        if isinstance(key, tuple):
+            if len(key) > 2:
+                return []
+            if len(key) == 2:
+                col_key = key[1]
+        try:
+            idxs = np.arange(len(self.colnames))[col_key]
+        except (IndexError, TypeError, ValueError):
+            return []
+        if not isinstance(idxs, np.ndarray) or idxs.ndim != 1 or idxs.size != out.shape[1]:
+            return []
+        return [self.colnames[int(i)] for i in idxs]
 
     def _col_index(self, name: str) -> int:
         try:
@@ -99,6 +146,16 @@ class NamedArray(np.ndarray):
     def _unknown_selector_message(self, name: str) -> str:
         # Match RoadRunner's selector-not-found text closely enough that
         # PyBNF code that catches RR errors keeps working.
+        if not self.colnames:
+            return (
+                f"Invalid selection '{name}'. This array carries no column names — it was "
+                "either built without any, or derived by an operation whose effect on the "
+                "columns is not tracked (arithmetic, a transpose, a reduction, unpickling), "
+                "which drops the names rather than leaving them pointing at columns that may "
+                "have moved (issue #561). Look the column up on the array "
+                "Result.as_roadrunner() returned, or index that array by name "
+                "(arr[:, ['time', '[X]']]) to carry the names over."
+            )
         return f"Invalid selection '{name}'. Valid selections: {self.colnames}"
 
     def __repr__(self) -> str:
