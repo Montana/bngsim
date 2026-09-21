@@ -12,10 +12,17 @@ See ``dev/plans/SBML_SSA_SUPPORT_PLAN.md`` Phase 4.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
+
+#: Marks a pickle state written by :meth:`NamedArray.__reduce__`. A stream
+#: written before issue #629 carries numpy's own state and no names, and
+#: :meth:`NamedArray.__setstate__` tells the two apart by this tag rather than
+#: by the state's shape, which is numpy's to change.
+_PICKLE_TAG = "bngsim.NamedArray"
+_PICKLE_VERSION = 1
 
 
 class NamedArray(np.ndarray):
@@ -33,14 +40,17 @@ class NamedArray(np.ndarray):
         :meth:`__new__` checks, and one that holds for the lifetime of
         every array of this class (issue #561). Names are *positional*,
         so they are carried only where the columns they label can be
-        followed: construction, and indexing, which relabels whatever
+        followed: construction; indexing, which relabels whatever
         survives the key (``arr[:, 1:]``, ``arr[:, ["time", "[X]"]]``,
-        ``arr[:, ::-1]``, a row slice). Every other derived array — a
-        product, a transpose, a reduction, an unpickled copy — has
-        ``colnames == []`` and raises :class:`KeyError` on a lookup by
-        name, rather than answering with whichever column now sits at
-        the name's old position. libroadrunner drops the labels on
-        every derived array, this one included.
+        ``arr[:, ::-1]``, a row slice); and a pickle round trip, which
+        rebuilds the same columns (issue #629), so an array that crosses
+        a process boundary arrives labeled. Every other derived array —
+        a product, a transpose, a reduction, ``copy()``,
+        ``copy.deepcopy()`` — has ``colnames == []`` and raises
+        :class:`KeyError` on a lookup by name, rather than answering
+        with whichever column now sits at the name's old position.
+        libroadrunner drops the labels on every derived array, slices
+        included, and likewise keeps them through pickle.
 
     Examples
     --------
@@ -81,6 +91,38 @@ class NamedArray(np.ndarray):
         # column and nothing raised. Names are attached only where the
         # surviving columns are known: __new__ and __getitem__.
         self.colnames: list[str] = []
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # numpy's reduction carries the array and none of a subclass's
+        # attributes, so the names used to be lost on every round trip through a
+        # process boundary: a fit collecting worker results got its tables back
+        # unlabeled, and every lookup by name raised (issue #629). Wrapping
+        # numpy's state rather than serializing the array here leaves the buffer
+        # handling to numpy. pickle calls ``__reduce_ex__``, which numpy
+        # implements and which routes a SUBCLASS through this method at every
+        # protocol — the no-state ``_frombuffer`` form numpy uses for a base
+        # ndarray at protocol 5 cannot rebuild a subclass — and the round trip
+        # is pinned at each protocol in test_named_array_colnames.py rather than
+        # guessed at here.
+        reconstruct, args, state = cast("tuple[Any, Any, Any]", super().__reduce__())
+        return reconstruct, args, (_PICKLE_TAG, _PICKLE_VERSION, list(self.colnames), state)
+
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, tuple) and len(state) == 4 and state[0] == _PICKLE_TAG:
+            _tag, version, colnames, inner = state
+            if version != _PICKLE_VERSION:
+                raise ValueError(
+                    f"NamedArray pickle state version {version!r} is not supported by this "
+                    f"build (it writes and reads version {_PICKLE_VERSION}). The stream was "
+                    "written by a newer bngsim; upgrade to read it."
+                )
+            self.colnames = list(colnames)
+            super().__setstate__(inner)
+            return
+        # Written before #629: numpy's own state, carrying no names. The array
+        # still loads; it simply arrives unlabeled, as it did then.
+        self.colnames = []
+        super().__setstate__(state)
 
     def __getitem__(self, key: Any) -> NDArray[np.float64]:  # type: ignore[override]
         # Forms supported:

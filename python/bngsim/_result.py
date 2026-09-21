@@ -2296,7 +2296,9 @@ class Result:
             transform (arithmetic, a transpose, a reduction) returns an
             array with no names at all, so a lookup by name on it raises
             rather than answering with a column that has moved
-            (issue #561).
+            (issue #561). The names also survive a pickle round trip, so
+            an array collected from a worker process arrives labeled
+            (issue #629).
 
         Raises
         ------

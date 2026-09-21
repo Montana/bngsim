@@ -138,6 +138,34 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A `NamedArray` keeps its column names through a pickle round trip, so an
+  `as_roadrunner` table collected from a worker process arrives labeled
+  (issue #629).** `colnames` is a subclass attribute, and numpy's reduction
+  carries the array and nothing a subclass added, so every round trip through
+  pickle — which is how `multiprocessing`, `joblib` and the rest move an object
+  between processes — dropped it. A fit that farms simulations out to workers
+  got its tables back nameless and every `arr["[X]"]` in the parent raised,
+  while the same code against libroadrunner worked: RoadRunner implements the
+  pickle hooks, so this was a divergence from the compatibility target on the
+  workflow `as_roadrunner` exists for. (Before issue #561 it was worse: the
+  unpickled array had no `colnames` attribute at all and reading it raised
+  `AttributeError`.)
+
+  `__reduce__` now wraps numpy's own state with the names, and `__setstate__`
+  unwraps it, so the array's buffer handling stays numpy's. The names ride
+  along at every pickle protocol, each of which is pinned by a test: numpy
+  picks the reduction per protocol, and the no-state `_frombuffer` form it uses
+  for a base ndarray at protocol 5 could not carry a name if a subclass ever
+  took that path. A stream written by an older build still loads, and arrives
+  unlabeled exactly as that build would have left it; a state from a future
+  format version is refused by name rather than misread.
+
+  What a round trip preserves, it does not invent: a sliced array comes back
+  with the names the slice kept, and a product or a transpose comes back with
+  none, per issue #561. `copy()` and `copy.deepcopy()` are unchanged and still
+  drop the names — they go through numpy's own copy hooks, and libroadrunner
+  drops them there too.
+
 - **A `NamedArray` column name never points at a column it does not name, so a
   sliced `as_roadrunner` array stops answering a lookup with its neighbour's
   species (issue #561).** `colnames` labels columns by position, and
