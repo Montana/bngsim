@@ -200,6 +200,34 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A pickle state bngsim wrote but this class cannot read is refused by name,
+  instead of being handed to numpy as if it were numpy's own (issue #646).**
+  `_ndarray_pickle.unwrap_state` was asked two questions at once — did bngsim
+  write this state, and did *this class* write it — and answered both with one
+  equality test against the caller's tag. A tag it did not recognise therefore
+  came back as "not ours at all", which both callers read as *a stream older
+  than the tagging* and passed down to numpy, where it could only surface as
+  `TypeError: __setstate__() argument 1, item 0 must be tuple, not str` — for a
+  stream bngsim itself wrote and could have named.
+
+  A state is now recognised as bngsim's by its `bngsim.` tag namespace, and a
+  tagged state whose tag this class does not read is refused naming both tags.
+  Nothing reaches it through ordinary pickling, since pickle pairs a state with
+  the class that reduced it; it is the diagnostic path the version check already
+  builds, which covered a stream from a newer build and not one whose tag moved.
+  The pre-tag passthrough is unchanged, and the namespace check is what keeps a
+  future 4-tuple from numpy out of the new branch.
+
+  Two more from @Montana's review of #641, in the same function. The version
+  refusal now says which direction the mismatch runs — it told every caller the
+  stream "was written by a newer bngsim; upgrade to read it", which is the wrong
+  way to send someone holding a version this build has dropped. And
+  `unwrap_state` returns an explicit `tagged` flag rather than signalling a
+  pre-tag stream with a `None` payload: neither class writes a `None` payload
+  today, so that was a trap set for a third class joining the wrapper, whose
+  legitimate `None` would have been read as an untagged stream and silently
+  given the unlabeled default.
+
 - **`JacobianMatrix.source` survives a pickle round trip, so a Jacobian
   computed in a worker process or read back from a disk cache still says how
   it was built (issue #635).** numpy's reduction carries the array and nothing
