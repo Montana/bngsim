@@ -56,7 +56,7 @@ from bngsim._exceptions import (
     SsaValidationError,
     StopConditionMet,
 )
-from bngsim._extension_handle import raise_cannot_pickle, shallow_copy
+from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
 from bngsim._model import Model
 from bngsim._result import Result, _as_selector_list, _resolve_output_selector
 from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
@@ -6896,12 +6896,27 @@ class Simulator:
             "Simulator",
             "Build one in each worker from a model loaded there (Model.from_sbml(path), "
             "Model.from_bngl(path), Model.from_net(path)), and send results back as arrays, "
-            "as_roadrunner() tables, or files written with Result.save(path).",
+            "as_roadrunner() tables, or files written with Result.save(path). Within this "
+            "process, build a second Simulator over model.clone().",
         )
 
-    def __copy__(self) -> Simulator:
-        # See Result.__copy__ and bngsim/_extension_handle.py.
-        return shallow_copy(self)
+    def __copy__(self) -> NoReturn:
+        # Issue #643, and see Model.__copy__: a shallow copy shared this
+        # Simulator's Model object outright, so it aliased the original by the
+        # same route — a write through copy.copy(sim).model landed on the model
+        # this Simulator goes on solving. There is no Simulator.clone() to hand
+        # back instead, and synthesizing one is not a small thing: the faithful
+        # copy would have to carry the tolerances, stop conditions, Jacobian
+        # strategy and its fall-back memos, the sensitivity setup and the
+        # interactive state (_current_time, _snapshot_stack) as well as the
+        # method token. Say what to rebuild rather than guess at it.
+        raise_cannot_shallow_copy(
+            "Simulator",
+            "this Simulator's Model outright",
+            "Build a second Simulator over an independent model instead — "
+            "Simulator(model.clone(), method=...) — repeating the options this one "
+            "was given (see .requested_method).",
+        )
 
     def __repr__(self) -> str:
         return f"Simulator(method='{self._method}', model={self._model!r})"
