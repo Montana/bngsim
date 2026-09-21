@@ -6,8 +6,6 @@ supports column lookup by string. Used by
 :meth:`bngsim.Result.as_roadrunner` to provide a drop-in replacement
 for ``rr.simulate(...)`` output in PyBNF-style stochastic-fitting
 workflows.
-
-See ``dev/plans/SBML_SSA_SUPPORT_PLAN.md`` Phase 4.
 """
 
 from __future__ import annotations
