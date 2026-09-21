@@ -195,6 +195,22 @@ class Result:
     (101, 5)
     >>> result.observables["Atot"]  # named access
     array([100., 99.5, ...])
+
+    Notes
+    -----
+    A ``Result`` holds a handle into bngsim's compiled extension, so it cannot
+    be pickled or deep-copied; :meth:`save` and :meth:`Result.load`, or one of
+    the conversions (:meth:`as_roadrunner`, :meth:`to_xarray`), carry it across
+    a process boundary instead. ``copy.copy(result)`` does work, and the copy
+    shares that handle *and the result arrays* with the original. That is left
+    working, where the same sharing makes ``copy.copy`` refuse on a
+    :class:`Model` or a :class:`Simulator` (issue #643), because a ``Result``
+    has no setter and no mutating method: no call you can make on the copy
+    writes into the original. Writing into its arrays in place does —
+    ``copy.copy(result).species[0] = ...`` changes ``result`` — but so does
+    ``result.species[0] = ...``, because every access returns the same live
+    view rather than a fresh array. Take ``.copy()`` of a block you mean to
+    modify, whichever name you reach it through.
     """
 
     __slots__ = (
@@ -3053,7 +3069,15 @@ class Result:
     def __copy__(self) -> Result:
         # Preserved explicitly: copy.copy() falls back to __reduce_ex__, which
         # defers to the refusal above, and a shallow copy works here and always
-        # has. See bngsim/_extension_handle.py.
+        # has. The copy shares this Result's core and arrays, as the default
+        # copy did — and unlike Model and Simulator, which refuse for exactly
+        # that sharing (issue #643), a Result can afford it: it has no setter
+        # and no mutating method, so no call on the copy writes through. An
+        # in-place numpy write into a shared array does reach the original, but
+        # that aliasing is not the copy's doing — the accessors hand back the
+        # stored array itself, so it is there through the original too. Adding a
+        # setter WOULD make this a Model-shaped trap and move it to the
+        # refusals; test_copy_refusals.py fails when one appears.
         return shallow_copy(self)
 
     def __repr__(self) -> str:

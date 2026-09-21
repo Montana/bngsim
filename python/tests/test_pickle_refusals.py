@@ -16,8 +16,12 @@ Coverage:
 - Each class refuses with a message naming itself, the reason, and a remedy.
 - Every remedy the messages name is checked to exist and to work, because an
   error message that recommends a method is a claim about the API.
-- ``copy.copy`` keeps working. It falls back to ``__reduce_ex__``, so the
-  refusal would have taken a working shallow copy with it.
+- ``copy.copy`` is not collateral damage of the refusal. It falls back to
+  ``__reduce_ex__``, so a refusal on ``__reduce__`` alone would decide the
+  copy question by accident; each class answers it deliberately under
+  ``__copy__`` instead. What each one answers is issue #643's call and is
+  pinned in test_copy_refusals.py — here we only pin that the pickle refusal
+  is not what decided it.
 - ``copy.deepcopy`` gets the same clear refusal, where it used to get the
   internal type name.
 """
@@ -75,7 +79,13 @@ def trio():
     [
         ("Result", ["as_roadrunner()", "to_xarray()", ".species", "save(path)"]),
         ("Model", ["Model.from_sbml(path)", "clone()"]),
-        ("Simulator", ["Model.from_sbml(path)", "Result.save(path)"]),
+        # model.clone() is the in-process half: copy.deepcopy does not go through
+        # __copy__, so an in-process "give me my own" request lands on THIS message
+        # (issue #643). It is a separate sentence, and guarded by "within this
+        # process", so a reader parallelising across a pool cannot read it as a way
+        # to make a Simulator picklable. Model's message has carried the same clause
+        # since #636; this is the half that was missing.
+        ("Simulator", ["Model.from_sbml(path)", "Result.save(path)", "model.clone()"]),
     ],
 )
 def test_the_refusal_says_what_to_do_instead(trio, which, must_mention):
@@ -104,7 +114,7 @@ def test_every_remedy_the_messages_name_exists(trio):
         assert hasattr(result, name), f"Result.{name} is named in a message but missing"
     for name in ("from_sbml", "from_bngl", "from_net"):
         assert hasattr(bngsim.Model, name), f"Model.{name} is named in a message but missing"
-    assert hasattr(model, "clone")
+    assert hasattr(model, "clone")  # named by both the Model and Simulator messages
     assert hasattr(bngsim.Result, "load")
 
 
@@ -131,24 +141,26 @@ def test_a_result_round_trips_through_a_file(trio, tmp_path):
     np.testing.assert_allclose(np.asarray(back.species), np.asarray(result.species))
 
 
-# ── What the refusal must not take with it ───────────────────────────
+# ── What the refusal does, and does not, decide ──────────────────────
 
 
-def test_a_shallow_copy_still_works(trio):
+def test_the_pickle_refusal_is_not_what_answers_the_copy_question(trio):
     """copy.copy falls back to __reduce_ex__, which defers to the refusal.
 
-    Without __copy__ this would now raise, taking away an operation that works
-    today. The copy shares the extension handle, which is what it always did.
+    So without a __copy__ of its own, every one of the three would refuse a
+    shallow copy as a side effect of a change about an error message. Each has
+    one, and Result's still copies — which is how we can tell the copy question
+    is being answered on its own terms (issue #643) rather than inherited here.
     """
     model, sim, result = trio
-    for obj in (result, model, sim):
-        duplicate = copy.copy(obj)
-        assert duplicate is not obj
-        assert type(duplicate) is type(obj)
-    np.testing.assert_array_equal(
-        np.asarray(copy.copy(result).species), np.asarray(result.species)
-    )
-    assert copy.copy(model).n_species == model.n_species
+    duplicate = copy.copy(result)
+    assert duplicate is not result
+    assert type(duplicate) is type(result)
+    np.testing.assert_array_equal(np.asarray(duplicate.species), np.asarray(result.species))
+
+    for obj in (model, sim):
+        with pytest.raises(TypeError, match="copy.copy"):
+            copy.copy(obj)
 
 
 def test_a_deep_copy_gets_the_same_clear_refusal(trio):

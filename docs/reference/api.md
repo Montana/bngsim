@@ -25,7 +25,7 @@ Methods:
 - **`get_param(name)`** — Get a parameter value
 - **`set_params(dict)`** — Set multiple parameters (atomic)
 - **`reset()`** — Reset species to initial concentrations (= `restore_concentrations()` with no label)
-- **`clone()`** — Deep copy for parallel workers
+- **`clone()`** — Deep copy for parallel workers, and the only way to get an independent `Model`. All of a model's state lives behind one handle into the compiled extension, so `copy.copy(model)` would share it — a write through the "copy" would change the original, which would then simulate differently with nothing raised. Both `copy.copy` and `copy.deepcopy` therefore refuse and name this method (issue #643). Same for a `Simulator`: build a second one over `model.clone()`. A `Result` does still shallow-copy, having no setter to write through
 - **`save_concentrations(label=None)`** — Snapshot current concentrations. No label rebases the default slot (`reset()` returns here); a `label` stores a named snapshot (BNG `saveConcentrations("name")`), and multiple named states coexist.
 - **`restore_concentrations(label=None)`** — Restore a snapshot; no label restores the default slot, a `label` restores that named state (BNG `resetConcentrations("name")`)
 - **`has_saved_concentrations(label=None)`** — Whether a named snapshot (or, with no label, any) exists

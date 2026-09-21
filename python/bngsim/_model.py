@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, overload
 import numpy as np
 
 from bngsim._exceptions import ModelError, ParameterError, UnderSpecifiedModelError
-from bngsim._extension_handle import raise_cannot_pickle, shallow_copy
+from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
 
 
 def _guard_function_expressions(core) -> list[tuple[str, str, str]]:
@@ -913,6 +913,12 @@ class Model:
 
         Each clone is fully independent — it has its own parameter values,
         species concentrations, and expression evaluator state.
+
+        This is also the answer to "give me my own copy" in general: all of a
+        ``Model``'s state lives behind one handle into the compiled extension,
+        so neither ``copy.copy`` nor ``copy.deepcopy`` can produce an
+        independent model, and both refuse rather than hand back an alias
+        (issue #643).
 
         Returns
         -------
@@ -2312,10 +2318,22 @@ class Model:
             "independent copy within this process.",
         )
 
-    def __copy__(self) -> Model:
-        # See Result.__copy__ and bngsim/_extension_handle.py. Note that this
-        # copy SHARES the model's engine state, which clone() does not.
-        return shallow_copy(self)
+    def __copy__(self) -> NoReturn:
+        # Issue #643. copy.copy() used to hand back a Model sharing this one's
+        # engine handle — and since every scrap of a Model's state lives behind
+        # that handle, there was nothing left for the "copy" to own: it was an
+        # alias with a different id(), and a set_param or set_concentration
+        # through it changed THIS model, which then simulated differently with
+        # nothing raised. Refusing is loud where that was silent, and the two
+        # things a caller reaches for next do not rescue them on their own:
+        # copy.deepcopy already raises (it cannot pickle the handle), and
+        # clone() is not discoverable from the copy path. So name it here.
+        raise_cannot_shallow_copy(
+            "Model",
+            "everything this model has (all of a Model's state lives behind one handle "
+            "into bngsim's compiled extension)",
+            "Use clone() for an independent Model.",
+        )
 
     def __repr__(self) -> str:
         return (

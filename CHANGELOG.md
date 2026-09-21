@@ -95,6 +95,43 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Changed
 
+- **`copy.copy` on a `Model` or a `Simulator` now refuses instead of handing
+  back an alias (issue #643).** `copy.copy(model)` returned a `Model` sharing
+  the original's engine handle, which is textbook shallow-copy behaviour —
+  `copy.copy` is documented to insert references to the objects found in the
+  original. What made it a trap here is that *all* of a `Model`'s state lives
+  behind that one handle, so there was nothing left for the copy to own: it was
+  an alias with a different `id()`. A `set_param` or `set_concentration` through
+  the "copy" landed on the original, which then integrated to a different answer
+  with nothing raised. A `Simulator` shares its `Model` outright and aliased by
+  the same route. Neither of the two things a caller reaches for next corrected
+  it: `copy.deepcopy` raises (it cannot pickle the handle), and `clone()`, which
+  does give an independent model, is invisible from the copy path.
+
+  Both now raise a `TypeError` naming what the copy would have shared and the
+  remedy — `clone()` for a `Model`, `Simulator(model.clone(), method=...)` for a
+  `Simulator`. **Breaking**, and deliberately so: it removes an operation that
+  ran before, which is the point, because it ran, looked right, and quietly made
+  the original wrong. Returning `clone()` from `__copy__` was considered and
+  rejected — it would trade a loud failure for a silently different one for any
+  caller who copies and then mutates.
+
+  `copy.deepcopy` does not route through `__copy__` — it falls to `__reduce_ex__`,
+  so it still reports the issue #636 pickle refusal. That message now ends with
+  the in-process half for a `Simulator` too ("Within this process, build a second
+  Simulator over `model.clone()`"), which `Model`'s has carried since #636 and
+  which is the only advice that fits a `deepcopy` caller, who is not crossing a
+  process boundary at all. It is a separate sentence, guarded by "within this
+  process", so it cannot be read as a way to make a `Simulator` picklable.
+
+  `Result` keeps its shallow copy. Its API is read-only — no setter, no mutating
+  method — so no call on the copy can write into the original; a test pins that
+  premise, and fails if a setter is ever added. Its arrays *are* shared, so an
+  in-place `copy.copy(result).species[0] = ...` does reach the original — but so
+  does the same write through `result` itself, since every access returns the
+  stored array rather than a fresh one. That is documented on `Result` rather
+  than fixed, being numpy's aliasing and not the copy's.
+
 - **Pickling a `Result`, `Model` or `Simulator` now says what to do instead of
   naming an internal C++ type (issue #636).** Each holds a handle into the
   compiled extension, so none of them can cross a process boundary — a design
@@ -111,9 +148,11 @@ in `CMakeLists.txt`) is derived from it.
   this message — a consumer reaches it on the first return value.
 
   `copy.deepcopy` gets the same sentence, having previously failed with the same
-  internal type name. `copy.copy` keeps working exactly as it did: it falls back
-  to `__reduce_ex__`, so the refusal would otherwise have taken a working
-  shallow copy with it. Every remedy the messages name is checked by a test to
+  internal type name. `copy.copy` was deliberately left as it was: it falls back
+  to `__reduce_ex__`, so the refusal would otherwise have taken a shallow copy
+  with it as a side effect of a change about an error message. What a shallow
+  copy of these three *should* mean was then settled on its own terms — see
+  the issue #643 entry above. Every remedy the messages name is checked by a test to
   exist and to survive a round trip, because an error message that recommends a
   method is a claim about the API.
 
