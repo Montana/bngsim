@@ -11,7 +11,7 @@ of a scipy CSC matrix from the model's own sparsity pattern.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -25,6 +25,13 @@ ANALYTICAL = "analytical"
 #: the same spelling :attr:`bngsim.SteadyStateResult.solver_jacobian_source`
 #: uses for the same fallback.
 FINITE_DIFFERENCE = "finite-difference"
+
+#: Marks a pickle state written by :meth:`JacobianMatrix.__reduce__`. A stream
+#: written before issue #635 carries numpy's own state and no ``source``, and
+#: :meth:`JacobianMatrix.__setstate__` tells the two apart by this tag rather
+#: than by the state's shape, which is numpy's to change.
+_PICKLE_TAG = "bngsim.JacobianMatrix"
+_PICKLE_VERSION = 1
 
 
 class JacobianMatrix(np.ndarray):
@@ -59,9 +66,38 @@ class JacobianMatrix(np.ndarray):
         return arr
 
     def __array_finalize__(self, obj: NDArray[Any] | None) -> None:
-        if obj is None:
-            return
+        # ``obj`` is None when numpy builds the array from nothing — which is
+        # what unpickling does — so the attribute must still be set here, or a
+        # reader sees AttributeError rather than a value (issue #635).
         self.source = getattr(obj, "source", "")
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # numpy's reduction carries the array and none of a subclass's
+        # attributes, so ``source`` was lost on every round trip through a
+        # process boundary or an on-disk cache (issue #635). Same shape as
+        # NamedArray.__reduce__ (issue #629): wrap numpy's own state rather
+        # than serialize the buffer here. The round trip is pinned at every
+        # protocol in test_jacobian_matrix_pickle.py.
+        reconstruct, args, state = cast("tuple[Any, Any, Any]", super().__reduce__())
+        return reconstruct, args, (_PICKLE_TAG, _PICKLE_VERSION, self.source, state)
+
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, tuple) and len(state) == 4 and state[0] == _PICKLE_TAG:
+            _tag, version, source, inner = state
+            if version != _PICKLE_VERSION:
+                raise ValueError(
+                    f"JacobianMatrix pickle state version {version!r} is not supported by "
+                    f"this build (it writes and reads version {_PICKLE_VERSION}). The stream "
+                    "was written by a newer bngsim; upgrade to read it."
+                )
+            self.source = str(source)
+            super().__setstate__(inner)
+            return
+        # Written before #635: numpy's own state, carrying no source. The matrix
+        # still loads, with the same "" that marks any array whose provenance
+        # was not recorded.
+        self.source = ""
+        super().__setstate__(state)
 
 
 StoichCoo = tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64]]

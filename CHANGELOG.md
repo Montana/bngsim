@@ -138,6 +138,25 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`JacobianMatrix.source` survives a pickle round trip, so a Jacobian
+  computed in a worker process or read back from a disk cache still says how
+  it was built (issue #635).** numpy's reduction carries the array and nothing
+  a subclass added, and on unpickling `__array_finalize__` is called with no
+  parent, where it returned before setting anything — so `source` was not
+  merely wrong after a round trip but missing, and reading it raised
+  `AttributeError`. `multiprocessing`, `concurrent.futures` and
+  `joblib.Memory` all move or cache results through pickle, and `source` is
+  what tells a consumer whether to trust the matrix as closed-form or treat it
+  as a difference quotient.
+
+  The fix is the one issue #629 applied to `NamedArray`: `__reduce__` wraps
+  numpy's own state with `source` under a tag and version, and `__setstate__`
+  unwraps it. `__array_finalize__` now sets `source = ""` when there is no
+  parent, so an array built from nothing has the attribute. A stream written
+  by an older build still loads, with `source == ""`; a state from a future
+  format version is refused by name. Pinned at every pickle protocol, for both
+  labels, and on views, transposes and Fortran-order arrays.
+
 - **A `NamedArray` keeps its column names through a pickle round trip, so an
   `as_roadrunner` table collected from a worker process arrives labeled
   (issue #629).** `colnames` is a subclass attribute, and numpy's reduction
