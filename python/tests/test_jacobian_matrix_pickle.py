@@ -23,7 +23,7 @@ import pickle
 import numpy as np
 import pytest
 from bngsim import JacobianMatrix
-from bngsim._evaluators import _PICKLE_TAG, _PICKLE_VERSION, ANALYTICAL, FINITE_DIFFERENCE
+from bngsim._evaluators import ANALYTICAL, FINITE_DIFFERENCE
 
 DATA = np.array([[-0.1, 0.0], [0.1, 0.0]])
 
@@ -81,10 +81,49 @@ def test_a_stream_written_before_the_fix_still_loads():
 
 
 def test_an_unreadable_state_version_says_so():
-    """A stream from a future format is refused by name, not misread."""
+    """A stream from a future format is refused by name, not misread.
+
+    The tag and the version-to-come are spelled out for the same reason the
+    format test spells them out: read from the module, this test would follow a
+    rename or a bump instead of noticing one, and it would go on passing while
+    the thing it is guarding moved (issue #635).
+    """
     J = JacobianMatrix(DATA, ANALYTICAL)
     with pytest.raises(ValueError, match="pickle state version"):
-        J.__setstate__((_PICKLE_TAG, _PICKLE_VERSION + 1, ANALYTICAL, None))
+        J.__setstate__(("bngsim.JacobianMatrix", 2, ANALYTICAL, None))
+
+
+def test_the_state_format_is_the_one_released_builds_write():
+    """The wire format is a compatibility surface, not an implementation detail.
+
+    The mirror of NamedArray's test of the same name, for the other class on the
+    shared ``_ndarray_pickle`` wrapper. The positions are fixed — ``(tag,
+    version, payload, numpy's own state)``, the provenance string as the payload
+    — because a stream written by one build is read by another, and the literals
+    are spelled out rather than imported: a test that read them from the module
+    would follow a rename rather than catch it. That goes for the payload as
+    well as the tag — ``ANALYTICAL``'s *value* is what lands in the stream, so
+    it is written here as the string a released build wrote.
+
+    That is not hypothetical. Before this test existed, renaming
+    ``_PICKLE_TAG`` on JacobianMatrix left every test in this file and in
+    test_named_array_colnames.py passing, while a stream pickled beforehand
+    stopped loading — and not cleanly, because a tag the reader does not
+    recognize falls through to the legacy-stream path and surfaces as numpy's
+    ``__setstate__() argument 1, item 0 must be tuple, not str``. The same
+    rename on NamedArray was caught at once, by its own copy of this test.
+    Reported by Michael Mendy (@Montana) on issue #635.
+    """
+    J = JacobianMatrix(DATA, ANALYTICAL)
+    _reconstruct, _args, state = J.__reduce__()
+    tag, version, payload, inner = state
+    assert (tag, version, payload) == ("bngsim.JacobianMatrix", 1, "analytical")
+
+    # And the reader takes that exact shape back, numpy's state included.
+    fresh = JacobianMatrix(np.zeros_like(DATA), FINITE_DIFFERENCE)
+    fresh.__setstate__((tag, version, payload, inner))
+    assert fresh.source == ANALYTICAL
+    np.testing.assert_array_equal(np.asarray(fresh), DATA)
 
 
 class _LegacyPickler(pickle.Pickler):
