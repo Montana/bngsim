@@ -17,10 +17,13 @@ are left alone.
 
 from __future__ import annotations
 
+import pickle
+
 import bngsim
 import numpy as np
 import pytest
 from bngsim import JacobianMatrix
+from bngsim._evaluators import ANALYTICAL
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -327,3 +330,32 @@ def test_issue_523_reproducer(decay):
     ss = bngsim.Simulator(decay, method="ode").steady_state(method="newton")
     assert ss.root_stability == "stable"
     assert hasattr(ss, "eigenvalues")
+
+
+# ── source through the public evaluator (issue #635 follow-up) ──────────────
+
+
+class TestSourceThroughThePublicEvaluator:
+    """The model-based half of #635's coverage.
+
+    ``test_jacobian_matrix_pickle.py`` pins the round trip on hand-built
+    matrices, deliberately without a model. These two need one: the label has
+    to survive the path a caller actually takes, and the dense and sparse
+    shapes of the same answer have to agree about it.
+    """
+
+    def test_a_pickled_jacobian_keeps_what_the_evaluator_gave_it(self, decay):
+        J = decay.jacobian([100.0, 0.0])
+        assert J.source == ANALYTICAL
+        back = pickle.loads(pickle.dumps(J))
+        assert back.source == ANALYTICAL
+        np.testing.assert_array_equal(np.asarray(back), np.asarray(J))
+
+    def test_dense_and_sparse_agree_after_a_round_trip(self, decay):
+        """``sparse=True`` returns a scipy ``csc_array``, which pickles through
+        its ``__dict__`` and had kept ``source`` all along — the dense path was
+        the only one losing it. Pinned together so they cannot drift apart."""
+        pytest.importorskip("scipy", reason="could not import scipy")
+        dense = pickle.loads(pickle.dumps(decay.jacobian([100.0, 0.0])))
+        sparse = pickle.loads(pickle.dumps(decay.jacobian([100.0, 0.0], sparse=True)))
+        assert dense.source == sparse.source == ANALYTICAL
