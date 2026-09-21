@@ -15,6 +15,8 @@ from typing import Any, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from bngsim._ndarray_pickle import unwrap_state, wrap_state
+
 #: Marks a pickle state written by :meth:`NamedArray.__reduce__`. A stream
 #: written before issue #629 carries numpy's own state and no names, and
 #: :meth:`NamedArray.__setstate__` tells the two apart by this tag rather than
@@ -107,33 +109,21 @@ class NamedArray(np.ndarray):
         # numpy's reduction carries the array and none of a subclass's
         # attributes, so the names used to be lost on every round trip through a
         # process boundary: a fit collecting worker results got its tables back
-        # unlabeled, and every lookup by name raised (issue #629). Wrapping
-        # numpy's state rather than serializing the array here leaves the buffer
-        # handling to numpy. pickle calls ``__reduce_ex__``, which numpy
-        # implements and which routes a SUBCLASS through this method at every
-        # protocol — the no-state ``_frombuffer`` form numpy uses for a base
-        # ndarray at protocol 5 cannot rebuild a subclass — and the round trip
-        # is pinned at each protocol in test_named_array_colnames.py rather than
-        # guessed at here.
-        reconstruct, args, state = cast("tuple[Any, Any, Any]", super().__reduce__())
-        return reconstruct, args, (_PICKLE_TAG, _PICKLE_VERSION, list(self.colnames), state)
+        # unlabeled, and every lookup by name raised (issue #629). The wrapper
+        # is shared with JacobianMatrix and documented in
+        # bngsim/_ndarray_pickle.py, including why this is __reduce__ rather
+        # than __reduce_ex__; the round trip is pinned at each protocol in
+        # test_named_array_colnames.py rather than guessed at here.
+        reduction = cast("tuple[Any, ...]", super().__reduce__())
+        return wrap_state(reduction, _PICKLE_TAG, _PICKLE_VERSION, list(self.colnames))
 
     def __setstate__(self, state: Any) -> None:
-        if isinstance(state, tuple) and len(state) == 4 and state[0] == _PICKLE_TAG:
-            _tag, version, colnames, inner = state
-            if version != _PICKLE_VERSION:
-                raise ValueError(
-                    f"NamedArray pickle state version {version!r} is not supported by this "
-                    f"build (it writes and reads version {_PICKLE_VERSION}). The stream was "
-                    "written by a newer bngsim; upgrade to read it."
-                )
-            self.colnames = list(colnames)
-            super().__setstate__(inner)
-            return
-        # Written before #629: numpy's own state, carrying no names. The array
-        # still loads; it simply arrives unlabeled, as it did then.
-        self.colnames = []
-        super().__setstate__(state)
+        colnames, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "NamedArray")
+        # colnames is None for a stream written before #629: numpy's own state,
+        # carrying no names. The array still loads; it simply arrives
+        # unlabeled, as it did then.
+        self.colnames = [] if colnames is None else list(colnames)
+        super().__setstate__(inner)
 
     # ``copy()`` deliberately has NO override, though a copy plainly has the
     # parent's columns and carrying the names across looks sound. It is not:

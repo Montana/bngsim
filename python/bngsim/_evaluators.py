@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from bngsim._ndarray_pickle import unwrap_state, wrap_state
+
 if TYPE_CHECKING:
     from bngsim._bngsim_core import NetworkModel
 
@@ -78,26 +80,16 @@ class JacobianMatrix(np.ndarray):
         # NamedArray.__reduce__ (issue #629): wrap numpy's own state rather
         # than serialize the buffer here. The round trip is pinned at every
         # protocol in test_jacobian_matrix_pickle.py.
-        reconstruct, args, state = cast("tuple[Any, Any, Any]", super().__reduce__())
-        return reconstruct, args, (_PICKLE_TAG, _PICKLE_VERSION, self.source, state)
+        reduction = cast("tuple[Any, ...]", super().__reduce__())
+        return wrap_state(reduction, _PICKLE_TAG, _PICKLE_VERSION, self.source)
 
     def __setstate__(self, state: Any) -> None:
-        if isinstance(state, tuple) and len(state) == 4 and state[0] == _PICKLE_TAG:
-            _tag, version, source, inner = state
-            if version != _PICKLE_VERSION:
-                raise ValueError(
-                    f"JacobianMatrix pickle state version {version!r} is not supported by "
-                    f"this build (it writes and reads version {_PICKLE_VERSION}). The stream "
-                    "was written by a newer bngsim; upgrade to read it."
-                )
-            self.source = str(source)
-            super().__setstate__(inner)
-            return
-        # Written before #635: numpy's own state, carrying no source. The matrix
-        # still loads, with the same "" that marks any array whose provenance
-        # was not recorded.
-        self.source = ""
-        super().__setstate__(state)
+        source, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "JacobianMatrix")
+        # source is None for a stream written before #635, which carried no
+        # provenance. The matrix still loads, with the same "" that marks any
+        # array whose provenance was not recorded.
+        self.source = "" if source is None else str(source)
+        super().__setstate__(inner)
 
 
 StoichCoo = tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64]]

@@ -270,6 +270,29 @@ def test_pickle_round_trip_at_every_protocol(protocol):
         np.testing.assert_array_equal(back[name], arr[name])
 
 
+def test_the_state_format_is_the_one_released_builds_write():
+    """The wire format is a compatibility surface, not an implementation detail.
+
+    A stream written by one build is read by another, so the positions below
+    are fixed: ``(tag, version, payload, numpy's own state)``, names as the
+    payload. The literals are spelled out rather than read from the module's
+    constants — a test that imported them would follow a rename that breaks
+    every pickle already written. Issue #635 moved this code into a wrapper
+    shared with JacobianMatrix, which is exactly the kind of refactor that can
+    move a format without meaning to.
+    """
+    arr = _arr()
+    _reconstruct, _args, state = arr.__reduce__()
+    tag, version, payload, inner = state
+    assert (tag, version, payload) == ("bngsim.NamedArray", 1, COLNAMES)
+
+    # And the reader takes that exact shape back, numpy's state included.
+    fresh = NamedArray(np.zeros_like(DATA), ["a", "b", "c"])
+    fresh.__setstate__((tag, version, list(COLNAMES), inner))
+    assert fresh.colnames == COLNAMES
+    np.testing.assert_array_equal(np.asarray(fresh), DATA)
+
+
 def test_pickle_carries_the_names_a_derived_array_actually_has():
     """Not the parent's: a round trip preserves, it does not restore."""
     arr = _arr()
