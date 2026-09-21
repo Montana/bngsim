@@ -17,10 +17,12 @@ import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import numpy as np
 from numpy.typing import NDArray
+
+from bngsim._extension_handle import raise_cannot_pickle, shallow_copy
 
 if TYPE_CHECKING:
     from bngsim._bngsim_core import ResultCore
@@ -3038,6 +3040,21 @@ class Result:
         )
 
     # ─── Dunder methods ─────────────────────────────────────────────
+
+    def __reduce__(self) -> NoReturn:
+        raise_cannot_pickle(
+            "Result",
+            "Send what you need from it instead — as_roadrunner() for a labeled table "
+            "(its column names survive the trip), to_xarray() for a Dataset, "
+            ".time / .species / .observables for plain arrays — or save(path) here and "
+            "Result.load(path) on the other side.",
+        )
+
+    def __copy__(self) -> Result:
+        # Preserved explicitly: copy.copy() falls back to __reduce_ex__, which
+        # defers to the refusal above, and a shallow copy works here and always
+        # has. See bngsim/_extension_handle.py.
+        return shallow_copy(self)
 
     def __repr__(self) -> str:
         return (

@@ -95,6 +95,29 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Changed
 
+- **Pickling a `Result`, `Model` or `Simulator` now says what to do instead of
+  naming an internal C++ type (issue #636).** Each holds a handle into the
+  compiled extension, so none of them can cross a process boundary — a design
+  boundary, not a defect. What a caller got was
+  `TypeError: cannot pickle 'bngsim._bngsim_core.ResultCore' object`, which
+  names a type they have never seen, at the moment they are parallelising a fit
+  across a process pool and need to know that the way through is to convert
+  first. The refusal now names itself, the reason, and the conversions that
+  carry what a worker actually needs: `as_roadrunner()`, `to_xarray()`, the
+  plain `.time` / `.species` / `.observables` arrays, or `save(path)` here and
+  `Result.load(path)` on the other side; for a `Model`, rebuilding it there
+  from the same source, with `clone()` for an independent copy in this process.
+  bngsim's own parallelism is threads, so nothing in the library ever reached
+  this message — a consumer reaches it on the first return value.
+
+  `copy.deepcopy` gets the same sentence, having previously failed with the same
+  internal type name. `copy.copy` keeps working exactly as it did: it falls back
+  to `__reduce_ex__`, so the refusal would otherwise have taken a working
+  shallow copy with it. Every remedy the messages name is checked by a test to
+  exist and to survive a round trip, because an error message that recommends a
+  method is a claim about the API.
+
+
 - **`SIR_v4` is re-sourced from wshlavacek/BNGL-Models after its model fix, so
   the corpus model keeps its analytical Jacobian and analytic sensitivity RHS
   (issue #543).** Its four year-selection `if()` chains fell back to 0 after its
