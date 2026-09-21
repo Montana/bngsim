@@ -219,6 +219,19 @@ in `CMakeLists.txt`) is derived from it.
   format version is refused by name. Pinned at every pickle protocol, for both
   labels, and on views, transposes and Fortran-order arrays.
 
+  The wire format itself is pinned too, with the tag and version spelled out
+  rather than imported from the module they describe: a test that read them
+  from `_evaluators` would follow a rename or a version bump instead of
+  catching one. That was not hypothetical — before the pin, renaming
+  `_PICKLE_TAG` left every test in `test_jacobian_matrix_pickle.py` and
+  `test_named_array_colnames.py` green while a stream pickled beforehand
+  stopped loading, and not cleanly: an unrecognized tag falls through to the
+  legacy-stream path and surfaces as numpy's `__setstate__() argument 1, item
+  0 must be tuple, not str`. `NamedArray` has had that guard since #629, which
+  is why the same rename on it was caught at once; `JacobianMatrix` now has its
+  own copy, and the version-refusal test stops importing the constants as well.
+  Reported by Michael Mendy (@Montana).
+
 - **A `NamedArray` keeps its column names through a pickle round trip, so an
   `as_roadrunner` table collected from a worker process arrives labeled
   (issue #629).** `colnames` is a subclass attribute, and numpy's reduction
