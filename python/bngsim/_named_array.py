@@ -118,11 +118,11 @@ class NamedArray(np.ndarray):
         return wrap_state(reduction, _PICKLE_TAG, _PICKLE_VERSION, list(self.colnames))
 
     def __setstate__(self, state: Any) -> None:
-        colnames, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "NamedArray")
-        # colnames is None for a stream written before #629: numpy's own state,
-        # carrying no names. The array still loads; it simply arrives
-        # unlabeled, as it did then.
-        self.colnames = [] if colnames is None else list(colnames)
+        tagged, colnames, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "NamedArray")
+        # `tagged` is False for a stream written before #629: numpy's own state,
+        # carrying no names. The array still loads; it simply arrives unlabeled,
+        # as it did then. The flag rather than a None payload is issue #646.
+        self.colnames = list(colnames) if tagged else []
         super().__setstate__(inner)
 
     # ``copy()`` deliberately has NO override, though a copy plainly has the

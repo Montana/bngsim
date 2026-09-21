@@ -84,11 +84,12 @@ class JacobianMatrix(np.ndarray):
         return wrap_state(reduction, _PICKLE_TAG, _PICKLE_VERSION, self.source)
 
     def __setstate__(self, state: Any) -> None:
-        source, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "JacobianMatrix")
-        # source is None for a stream written before #635, which carried no
+        tagged, source, inner = unwrap_state(state, _PICKLE_TAG, _PICKLE_VERSION, "JacobianMatrix")
+        # `tagged` is False for a stream written before #635, which carried no
         # provenance. The matrix still loads, with the same "" that marks any
-        # array whose provenance was not recorded.
-        self.source = "" if source is None else str(source)
+        # array whose provenance was not recorded. The flag rather than a None
+        # payload is issue #646: the two are different answers.
+        self.source = str(source) if tagged else ""
         super().__setstate__(inner)
 
 
