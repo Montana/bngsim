@@ -312,6 +312,18 @@ When you add one:
 - Names are permanent: `capabilities()` promises that existing keys are never
   renamed or removed.
 
+## Credit
+
+Everyone whose code is merged is listed in [`CONTRIBUTORS.md`](CONTRIBUTORS.md),
+by name with GitHub handle — `Ada Lovelace (@alovelace)`. You are added when your
+first contribution merges, and we make a best effort to get the name right from
+what you have already made public: the name on your commits, your GitHub profile,
+how you signed the pull request.
+
+Best effort is not certainty, and it is your name. If you would rather be listed
+differently — another form of your name, handle only, a different handle, or not
+at all — say so on your pull request or open an issue, and it will be changed.
+
 ## Before opening a PR
 
 - Keep new code consistent with the surrounding style (`.clang-format` for C++,
