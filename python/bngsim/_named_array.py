@@ -39,18 +39,31 @@ class NamedArray(np.ndarray):
         One name per column, in column order — the invariant
         :meth:`__new__` checks, and one that holds for the lifetime of
         every array of this class (issue #561). Names are *positional*,
-        so they are carried only where the columns they label can be
-        followed: construction; indexing, which relabels whatever
-        survives the key (``arr[:, 1:]``, ``arr[:, ["time", "[X]"]]``,
-        ``arr[:, ::-1]``, a row slice); and a pickle round trip, which
-        rebuilds the same columns (issue #629), so an array that crosses
-        a process boundary arrives labeled. Every other derived array —
-        a product, a transpose, a reduction, ``copy()``,
-        ``copy.deepcopy()`` — has ``colnames == []`` and raises
-        :class:`KeyError` on a lookup by name, rather than answering
-        with whichever column now sits at the name's old position.
-        libroadrunner drops the labels on every derived array, slices
-        included, and likewise keeps them through pickle.
+        so they are carried exactly where this class can see the whole
+        operation and knows what became of the columns: construction;
+        indexing, which relabels whatever survives the key
+        (``arr[:, 1:]``, ``arr[:, ["time", "[X]"]]``, ``arr[:, ::-1]``,
+        a row slice); and a pickle round trip, so an array that crosses
+        a process boundary arrives labeled (issue #629).
+
+        Any other array numpy hands back — a product, a transpose, a
+        reduction, ``arr.copy()``, :func:`copy.deepcopy`,
+        ``np.copy(arr, subok=True)``, ``astype``, ``view`` — has
+        ``colnames == []`` and raises :class:`KeyError` on a lookup by
+        name, rather than answering with whichever column now sits at
+        the name's old position. A copy is in that list although its
+        columns are plainly the parent's: ``.copy()`` is one of numpy's
+        own primitives (``np.sort(a, axis=1)`` is a copy followed by an
+        in-place sort), so a copy that carried labels would hand them to
+        operations that permute the columns underneath them. The comment
+        on the method that is *not* overridden has the measurement.
+
+        libroadrunner keeps the labels through pickle as this class
+        does, and drops them on every derived array, copies and slices
+        included. Where this class keeps more of them, it is additive —
+        code written against RoadRunner cannot depend on a label being
+        absent — and it keeps one only where the column is established
+        to be the same column.
 
     Examples
     --------
@@ -123,6 +136,24 @@ class NamedArray(np.ndarray):
         # still loads; it simply arrives unlabeled, as it did then.
         self.colnames = []
         super().__setstate__(state)
+
+    # ``copy()`` deliberately has NO override, though a copy plainly has the
+    # parent's columns and carrying the names across looks sound. It is not:
+    # ``.copy()`` is one of numpy's own primitives, not merely a method users
+    # call. ``np.sort(a, axis=1)`` is implemented as ``a.copy(order="K")``
+    # followed by an in-place sort, and ``np.partition`` the same way, so a
+    # name-preserving ``copy()`` labels the row-wise minima with the column
+    # names — ``np.sort(arr, axis=1)["time"]`` answering with the minima of
+    # each row is the issue #561 defect through a different door. It was
+    # measured, not guessed: the "sorted within rows" case in
+    # test_named_array_colnames.py fails the moment ``copy()`` carries names,
+    # and it is there to keep this from being re-attempted.
+    #
+    # ``copy.copy`` / ``copy.deepcopy`` are not reachable that way — numpy's
+    # own routines never go through the copy module — but a class where
+    # ``arr.copy()`` and ``copy.copy(arr)`` disagree about labels is harder to
+    # explain than one where no copy carries them, which is also what
+    # libroadrunner does. So all three stay unlabeled.
 
     def __getitem__(self, key: Any) -> NDArray[np.float64]:  # type: ignore[override]
         # Forms supported:

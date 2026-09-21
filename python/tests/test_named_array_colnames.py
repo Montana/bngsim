@@ -18,6 +18,11 @@ Coverage:
 - Transforms whose effect on the columns numpy does not report (arithmetic,
   transpose, in-row sort/roll/take, copy, deepcopy) carry no names at all, so a
   lookup raises rather than resolving against a column that moved.
+- Why a *copy* is in that list although its columns are the parent's:
+  ``.copy()`` is a numpy primitive (``np.sort(a, axis=1)`` is a copy plus an
+  in-place sort), so a copy that carried the names would label each row's order
+  statistics with them. The test measures the wrong answer rather than leaving
+  the reason to a comment.
 - The invariant: ``colnames`` is empty or one name per column, never stale.
 - A pickle round trip keeps the names the array actually has, at every protocol
   (#629): numpy's reduction carried the array and dropped the subclass
@@ -46,6 +51,16 @@ DATA = np.array(
         [0.0, 100.0, 7.0],
         [1.0, 90.0, 17.0],
         [2.0, 80.0, 27.0],
+    ]
+)
+
+
+#: Deliberately out of order in every column, for the sort case below.
+DATA_UNSORTED = np.array(
+    [
+        [3.0, 1.0, 2.0],
+        [9.0, 8.0, 7.0],
+        [4.0, 6.0, 5.0],
     ]
 )
 
@@ -146,14 +161,25 @@ UNTRACKED_CASES = [
     ("rolled columns", lambda a: np.roll(a, 1, axis=1)),
     ("take on the column axis", lambda a: a.take([2, 1, 0], axis=1)),
     ("cumulative sum across columns", lambda a: np.cumsum(a, axis=1)),
-    # copy() and deepcopy() go through numpy's own __copy__ / __deepcopy__,
-    # which carry no subclass attribute; libroadrunner drops the labels on both
-    # too. A pickle round trip does keep them — see the section below.
-    ("copy", lambda a: a.copy()),
-    ("deep-copied", lambda a: copy.deepcopy(a)),
     ("single row", lambda a: a[0]),
     ("single column", lambda a: a[:, 0]),
     ("flattened", lambda a: a.reshape(-1)),
+    # Copies. Their columns ARE the parent's, so carrying the names across
+    # looks sound and is not: `.copy()` is a numpy primitive — `np.sort(a,
+    # axis=1)` is `a.copy(order="K")` plus an in-place sort — so a
+    # name-preserving copy hands labels to operations that then permute the
+    # columns. The "sorted within rows" case above is what fails when that is
+    # attempted, and test_a_copy_that_carried_names_would_mislabel_a_sort
+    # measures the wrong answer it would produce.
+    ("copy", lambda a: a.copy()),
+    ("copy.copy", lambda a: copy.copy(a)),
+    ("deep-copied", lambda a: copy.deepcopy(a)),
+    # Copies numpy makes through its own constructor, where there is no hook to
+    # attach a name to even in principle. Pinned so the edge stays known.
+    ("np.copy(subok=True)", lambda a: np.copy(a, subok=True)),
+    ("np.array(subok=True)", lambda a: np.array(a, subok=True)),
+    ("astype", lambda a: a.astype(np.float64)),
+    ("view", lambda a: a.view(NamedArray)),
 ]
 
 
@@ -181,6 +207,43 @@ def test_unlabeled_lookup_says_why_and_what_to_do():
     message = str(excinfo.value)
     assert "no column names" in message
     assert "as_roadrunner" in message
+
+
+def test_a_copy_that_carried_names_would_mislabel_a_sort():
+    """Why ``copy()`` has no override, in the form of the answer it would give.
+
+    ``np.sort(a, axis=1)`` is a copy followed by an in-place sort, so a
+    ``NamedArray.copy`` that carried the parent's names would put them on an
+    array whose columns are now each row's order statistics: ``sorted["time"]``
+    would answer with the row-wise minima. This measures both halves — that the
+    sort does route through ``copy``, and what the labels would then be worth —
+    so the reason survives in runnable form rather than as a comment nobody
+    re-derives.
+    """
+    arr = NamedArray(DATA_UNSORTED.copy(), list(COLNAMES))
+    calls = []
+    original = NamedArray.copy
+
+    def counting_copy(self, order="C"):
+        calls.append(order)
+        out = original(self, order)
+        out.colnames = list(self.colnames)  # the override this test argues against
+        return out
+
+    NamedArray.copy = counting_copy
+    try:
+        mislabeled = np.sort(arr, axis=1)
+    finally:
+        NamedArray.copy = original
+
+    assert calls, "np.sort no longer routes through NamedArray.copy"
+    assert mislabeled.colnames == COLNAMES
+    # The column under 'time' is now the row-wise minimum, not the time column.
+    np.testing.assert_array_equal(mislabeled["time"], np.sort(DATA_UNSORTED, axis=1)[:, 0])
+    assert not np.array_equal(mislabeled["time"], arr["time"])
+
+    # And with no override, which is what ships: no names, so no wrong answer.
+    assert np.sort(arr, axis=1).colnames == []
 
 
 # ── Issue #629: the names survive a pickle round trip ────────────────
