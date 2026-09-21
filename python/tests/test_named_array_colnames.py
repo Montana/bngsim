@@ -1,4 +1,5 @@
-"""Issue #561 — a NamedArray's column names always describe its own columns.
+"""Issues #561 and #629 — a NamedArray's names describe its own columns, and
+survive being sent somewhere.
 
 ``NamedArray.colnames`` is a positional label list: entry *j* names column *j*.
 ``__new__`` checks that once, and nothing checked it again, so every array numpy
@@ -15,20 +16,27 @@ Coverage:
 - Indexing relabels: column slices, reversals, integer and boolean column
   selections, row-only keys, advanced-index broadcasts, chained slices.
 - Transforms whose effect on the columns numpy does not report (arithmetic,
-  transpose, in-row sort/roll/take, copy, pickle) carry no names at all, so a
+  transpose, in-row sort/roll/take, copy, deepcopy) carry no names at all, so a
   lookup raises rather than resolving against a column that moved.
 - The invariant: ``colnames`` is empty or one name per column, never stale.
+- A pickle round trip keeps the names the array actually has, at every protocol
+  (#629): numpy's reduction carried the array and dropped the subclass
+  attribute, so a table collected from a worker process arrived unlabeled.
+  Includes the two compatibility directions — a stream written before that fix
+  still loads, and a state version this build cannot read is refused.
 """
 
 from __future__ import annotations
 
 import copy
+import io
 import pickle
 
 import bngsim
 import numpy as np
 import pytest
 from bngsim import NamedArray
+from bngsim._named_array import _PICKLE_TAG, _PICKLE_VERSION
 
 # Column values are disjoint between columns, so "this name still resolves to
 # the data it named" is checkable by membership rather than by position.
@@ -138,8 +146,10 @@ UNTRACKED_CASES = [
     ("rolled columns", lambda a: np.roll(a, 1, axis=1)),
     ("take on the column axis", lambda a: a.take([2, 1, 0], axis=1)),
     ("cumulative sum across columns", lambda a: np.cumsum(a, axis=1)),
+    # copy() and deepcopy() go through numpy's own __copy__ / __deepcopy__,
+    # which carry no subclass attribute; libroadrunner drops the labels on both
+    # too. A pickle round trip does keep them — see the section below.
     ("copy", lambda a: a.copy()),
-    ("pickled", lambda a: pickle.loads(pickle.dumps(a))),
     ("deep-copied", lambda a: copy.deepcopy(a)),
     ("single row", lambda a: a[0]),
     ("single column", lambda a: a[:, 0]),
@@ -171,6 +181,80 @@ def test_unlabeled_lookup_says_why_and_what_to_do():
     message = str(excinfo.value)
     assert "no column names" in message
     assert "as_roadrunner" in message
+
+
+# ── Issue #629: the names survive a pickle round trip ────────────────
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_pickle_round_trip_at_every_protocol(protocol):
+    """Every protocol, because numpy picks the reduction per protocol.
+
+    A base ndarray at protocol 5 reduces through ``_frombuffer``, which has no
+    state slot and could not carry a name if it were used; a subclass reduces
+    through ``_reconstruct`` at every protocol, which is what routes pickling
+    through ``NamedArray.__reduce__``. That routing is numpy's to change, so it
+    is pinned here rather than assumed: a protocol that stopped carrying the
+    names would fail this test instead of silently unlabeling a worker's result.
+    """
+    arr = _arr()
+    back = pickle.loads(pickle.dumps(arr, protocol=protocol))
+    assert isinstance(back, NamedArray)
+    assert back.colnames == COLNAMES
+    np.testing.assert_array_equal(np.asarray(back), DATA)
+    # The names are attached to the right columns, not merely present.
+    for name in COLNAMES:
+        np.testing.assert_array_equal(back[name], arr[name])
+
+
+def test_pickle_carries_the_names_a_derived_array_actually_has():
+    """Not the parent's: a round trip preserves, it does not restore."""
+    arr = _arr()
+    sliced = pickle.loads(pickle.dumps(arr[:, 1:]))
+    assert sliced.colnames == ["[X]", "[Y]"]
+    np.testing.assert_array_equal(sliced["[X]"], arr["[X]"])
+
+    scaled = pickle.loads(pickle.dumps(arr * 2.0))
+    assert scaled.colnames == []
+    with pytest.raises(KeyError, match="Invalid selection"):
+        _ = scaled["[X]"]
+
+
+def test_a_stream_written_before_the_fix_still_loads():
+    """numpy's own state, which is what a pre-#629 build wrote.
+
+    It has to keep loading — a saved pickle outlives the build that wrote it —
+    and it arrives unlabeled, which is what that build would have given it.
+    """
+    arr = _arr()
+    raw = _LegacyPickler.dumps(arr)
+    back = pickle.loads(raw)
+    assert isinstance(back, NamedArray)
+    assert back.colnames == []
+    np.testing.assert_array_equal(np.asarray(back), DATA)
+    with pytest.raises(KeyError, match="Invalid selection"):
+        _ = back["[X]"]
+
+
+def test_an_unreadable_state_version_says_so():
+    """A stream from a future format is refused by name, not misread."""
+    with pytest.raises(ValueError, match="pickle state version"):
+        _arr().__setstate__((_PICKLE_TAG, _PICKLE_VERSION + 1, ["time"], None))
+
+
+class _LegacyPickler(pickle.Pickler):
+    """Writes a NamedArray the way a build without ``__reduce__`` did."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, NamedArray):
+            return np.ndarray.__reduce__(obj)
+        return NotImplemented
+
+    @classmethod
+    def dumps(cls, obj):
+        buf = io.BytesIO()
+        cls(buf).dump(obj)
+        return buf.getvalue()
 
 
 # ── The construction-time invariant, unchanged ───────────────────────
