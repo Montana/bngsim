@@ -211,12 +211,17 @@ def test_ssa_as_roadrunner():
 
 # ── Optional libroadrunner parity ─────────────────────────────────────
 
-# Skip when RR isn't installed; PyBNF prod environments will have it.
-roadrunner = pytest.importorskip("roadrunner", reason="libroadrunner optional")
+# The gate belongs to the one test that needs it, not to the module (issue
+# #630). At module scope `importorskip` raises Skipped(allow_module_level=True),
+# which takes the file out of collection — so without libroadrunner the
+# thirteen tests above, none of which import it, stopped running and the suite
+# reported a single declared skip. PyBNF production environments have RR; the
+# `uv sync --extra test` line CONTRIBUTING offers does not.
 
 
 def test_libroadrunner_parity_v1():
     """Default selections + numerical values match RR within ODE tol."""
+    roadrunner = pytest.importorskip("roadrunner", reason="libroadrunner optional")
     rr = roadrunner.RoadRunner()
     rr.load(DECAY_SBML_V1)
     rr_arr = rr.simulate(0, 10, 11)

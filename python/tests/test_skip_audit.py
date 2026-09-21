@@ -299,3 +299,123 @@ def test_every_corpus_absence_is_already_a_declared_skip(skip_audit):
             f"{reason!r} is classified as corpus absence but is not declared as a "
             f"skip that is legitimate anywhere (tier: {skip_audit.tier_of(reason)})"
         )
+
+
+# ── A module-scope gate must not swallow tests that do not need it (#630) ──
+
+
+def _module_scope_gate_after_a_test(path: Path) -> tuple[int, int] | None:
+    """``(gate line, first test line)`` when a gate lands after a test is defined.
+
+    At module scope ``pytest.importorskip`` raises
+    ``Skipped(allow_module_level=True)``, which takes the whole FILE out of
+    collection. Placed above every test that is what it means; placed below
+    some, it silently takes those with it. An INDENTED one costs a single test
+    and shows up in the count, which is why only the module body is walked.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    first_test: int | None = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if first_test is None and (node.name.startswith(("test_", "Test"))):
+                first_test = node.lineno
+        elif first_test is not None and _is_importorskip_statement(node):
+            return node.lineno, first_test
+    return None
+
+
+def _is_importorskip_statement(node: ast.stmt) -> bool:
+    """``pytest.importorskip(...)``, bare or bound to a name."""
+    call = node.value if isinstance(node, (ast.Expr, ast.Assign)) else None
+    return isinstance(call, ast.Call) and _dotted(call.func) in _IMPORTORSKIP
+
+
+def test_no_module_scope_gate_lands_after_a_test_definition():
+    """Issue #630: the cost of one is invisible in the number it reports.
+
+    ``test_result_roadrunner.py`` gated thirteen roadrunner-independent tests
+    behind a gate at its foot, so a checkout without libroadrunner ran none of
+    them and the audit showed a single declared "libroadrunner optional" row —
+    one skip where a module was. The declared-skip machinery cannot see this;
+    the reason IS declared. Only the placement is wrong.
+    """
+    offenders = []
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        found = _module_scope_gate_after_a_test(path)
+        if found is not None:
+            gate_line, test_line = found
+            offenders.append(f"{path.name}:{gate_line} (first test at line {test_line})")
+    assert not offenders, (
+        "a module-scope importorskip sits below a test definition in "
+        + "; ".join(offenders)
+        + ". It takes the whole file out of collection, so every test above it stops "
+        "running and the suite reports one skip instead (issue #630). Move the gate "
+        "into the tests that need it, or above every test if the module truly does."
+    )
+
+
+class TestTheGateScannerReadsPlacementNotSpelling:
+    """The scan is the thing asserting the invariant, so pin its own edges."""
+
+    def _gate_in(self, tmp_path, source: str) -> tuple[int, int] | None:
+        path = tmp_path / "test_sample.py"
+        path.write_text(source, encoding="utf-8")
+        return _module_scope_gate_after_a_test(path)
+
+    def test_a_gate_above_every_test_is_fine(self, tmp_path):
+        assert (
+            self._gate_in(
+                tmp_path,
+                'import pytest\npytest.importorskip("sympy")\ndef test_a(): ...\n',
+            )
+            is None
+        )
+
+    def test_a_gate_below_a_test_is_caught(self, tmp_path):
+        found = self._gate_in(
+            tmp_path,
+            'import pytest\ndef test_a(): ...\npytest.importorskip("sympy")\n',
+        )
+        assert found == (3, 2)
+
+    def test_a_gate_bound_to_a_name_is_caught(self, tmp_path):
+        """The form #630 was written in: the module keeps the imported handle."""
+        found = self._gate_in(
+            tmp_path,
+            'import pytest\ndef test_a(): ...\nrr = pytest.importorskip("roadrunner")\n',
+        )
+        assert found == (3, 2)
+
+    def test_a_gate_inside_a_test_is_not_a_module_gate(self, tmp_path):
+        """Where #630's fix puts it: one skip, visible in the count."""
+        assert (
+            self._gate_in(
+                tmp_path,
+                "import pytest\n"
+                "def test_a(): ...\n"
+                'def test_b(): pytest.importorskip("roadrunner")\n',
+            )
+            is None
+        )
+
+    def test_a_test_class_counts_as_a_test_definition(self, tmp_path):
+        found = self._gate_in(
+            tmp_path,
+            "import pytest\n"
+            "class TestThing:\n    def test_a(self): ...\n"
+            'pytest.importorskip("sympy")\n',
+        )
+        assert found == (4, 2)
+
+    def test_a_helper_defined_before_the_gate_is_not_a_test(self, tmp_path):
+        """A module may define fixtures and helpers above its gate."""
+        assert (
+            self._gate_in(
+                tmp_path,
+                "import pytest\n"
+                "def _helper(): ...\n"
+                'pytest.importorskip("sympy")\n'
+                "def test_a(): ...\n",
+            )
+            is None
+        )
