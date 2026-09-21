@@ -27,7 +27,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 import numpy as np
 
@@ -56,6 +56,7 @@ from bngsim._exceptions import (
     SsaValidationError,
     StopConditionMet,
 )
+from bngsim._extension_handle import raise_cannot_pickle, shallow_copy
 from bngsim._model import Model
 from bngsim._result import Result, _as_selector_list, _resolve_output_selector
 from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
@@ -6889,6 +6890,18 @@ class Simulator:
         this back with it.
         """
         return self._current_time
+
+    def __reduce__(self) -> NoReturn:
+        raise_cannot_pickle(
+            "Simulator",
+            "Build one in each worker from a model loaded there (Model.from_sbml(path), "
+            "Model.from_bngl(path), Model.from_net(path)), and send results back as arrays, "
+            "as_roadrunner() tables, or files written with Result.save(path).",
+        )
+
+    def __copy__(self) -> Simulator:
+        # See Result.__copy__ and bngsim/_extension_handle.py.
+        return shallow_copy(self)
 
     def __repr__(self) -> str:
         return f"Simulator(method='{self._method}', model={self._model!r})"

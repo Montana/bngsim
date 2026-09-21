@@ -10,11 +10,12 @@ import logging
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, overload
 
 import numpy as np
 
 from bngsim._exceptions import ModelError, ParameterError, UnderSpecifiedModelError
+from bngsim._extension_handle import raise_cannot_pickle, shallow_copy
 
 
 def _guard_function_expressions(core) -> list[tuple[str, str, str]]:
@@ -2302,6 +2303,19 @@ class Model:
         return self._core.table_function_names
 
     # ─── Dunder methods ───────────────────────────────────────────────────
+
+    def __reduce__(self) -> NoReturn:
+        raise_cannot_pickle(
+            "Model",
+            "Build it again on the other side from the same source — Model.from_sbml(path), "
+            "Model.from_bngl(path), Model.from_net(path) — and use clone() for an "
+            "independent copy within this process.",
+        )
+
+    def __copy__(self) -> Model:
+        # See Result.__copy__ and bngsim/_extension_handle.py. Note that this
+        # copy SHARES the model's engine state, which clone() does not.
+        return shallow_copy(self)
 
     def __repr__(self) -> str:
         return (
