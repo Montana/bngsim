@@ -3440,8 +3440,7 @@ def _build_model_from_sbml_doc(doc):
     # SSA-validation findings, populated as we walk the SBML constructs.
     # Stashed on the returned Model so Simulator(..., method="ssa") and
     # bngsim.validate_for_ssa(model) can inspect them. Empty list means
-    # the loader saw no SSA-incompatible constructs. See
-    # dev/plans/SBML_SSA_SUPPORT_PLAN.md Phase 3.
+    # the loader saw no SSA-incompatible constructs.
     ssa_issues: list[SsaIssue] = []
 
     # SBML <listOfFunctionDefinitions> — collect early so that

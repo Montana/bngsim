@@ -10,8 +10,6 @@ will round at setup.
 ``method="ssa"`` is requested and raises
 :class:`bngsim.SsaValidationError` if any issue has
 ``severity == "error"``. Warnings are emitted via the ``bngsim`` logger.
-
-See ``dev/plans/SBML_SSA_SUPPORT_PLAN.md`` Phase 3.
 """
 
 from __future__ import annotations

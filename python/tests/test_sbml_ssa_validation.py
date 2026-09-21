@@ -1,7 +1,6 @@
 """Phase 3 — SSA validation gate (validate_for_ssa).
 
-One test per detection branch from
-``dev/plans/SBML_SSA_SUPPORT_PLAN.md`` §"Phase 3: SSA Validation Gate":
+One test per detection branch of the gate:
 
   ERRORS
   - non-integer stoichiometry
