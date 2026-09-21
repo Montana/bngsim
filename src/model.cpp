@@ -190,15 +190,23 @@ NetworkModel NetworkModel::clone() const {
     // dropped it would be the one copy of the model that could never be put back.
     // Only an attached parameter takes its value from the expression; an
     // overridden one carries the literal it was written with.
+    //
+    // Issue #626 — two passes, not one. The recompile is about evaluator ids and
+    // walks declaration order; the re-derivation is about values and must walk
+    // `derived_param_order` like every other re-evaluation pass (issue #568),
+    // or a dependent declared before the parameter it reads takes a stale link
+    // whenever the source is not at its expression fixed point (a probe's held
+    // window, or rate_of__ inputs the clone has just zeroed). The set is the
+    // same: after build() an evaluator is only ever dropped, never attached, so
+    // every parameter recompiled here is in `derived_param_order`, and
+    // refresh_derived_params() applies the same is_expression guard.
     for (auto &p : copy.impl_->parameters) {
         if (!p.expression.empty() && p.evaluator_id >= 0) {
             const auto &cached = impl_->evaluator->preprocessed_expr(p.evaluator_id);
             p.evaluator_id = copy.impl_->evaluator->compile_preprocessed(cached);
-            if (p.is_expression) {
-                p.value = copy.impl_->evaluator->evaluate(p.evaluator_id);
-            }
         }
     }
+    copy.refresh_derived_params();
 
     // Re-create table functions in the copy (deep copy with fresh bindings)
     for (const auto &tf_ptr : impl_->table_functions) {
