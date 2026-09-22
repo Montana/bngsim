@@ -31,6 +31,36 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`jacobian="jax"` emitted `jnp.jnp.log` for any model using `ln()` (issue
+  #564).** `_translate_expr_jax` mapped the engine's math functions with one
+  `re.sub` per function, in sequence, so each rule read what the rules before it
+  had written. `ln` became `jnp.log`, and the very next rule's `\blog\b`
+  matched the `log` inside that — `.` is not a word character, so the boundary
+  holds there — leaving `jnp.jnp.log`. Every model with an `ln()` in a function
+  block then failed under `jacobian="jax"` (and `_diffrax_solver.run_diffrax`)
+  with "AttributeError: module 'jax.numpy' has no attribute 'jnp'", while the
+  identical model integrated on the default Jacobian, which puts the failure a
+  long way from its cause: an AD-backend error message for a text substitution.
+
+  The seventeen substitutions are now one pass over the source, from a name →
+  `jnp.<name>` table, so no rule can re-read another's replacement. That ends
+  the class of collision rather than the one instance of it: the ordering
+  between `ln` and `log` was the only pair that collided today, and any future
+  pair where one replacement contains another name is safe by construction. The
+  pass also refuses a match that starts straight after a word character or a
+  `.`, and takes the longest name first, so `asin` still beats `sin` and an
+  already-emitted `jnp.log` cannot be read as the function `log`. Every other
+  function's output is unchanged, and a name the table does not carry
+  (`log10`) still comes through untouched rather than half-rewritten.
+
+  Covered by `test_jax_math_translation.py`: the issue's expression, both
+  logarithm spellings alone, together and nested, every other function in the
+  table, a mixed expression asserting that each emitted `jnp.` is followed by a
+  real jax.numpy name, `log10` left alone, a model name that merely contains a
+  function name left alone, and an end-to-end pair (skipped without JAX)
+  checking that the JAX Jacobian now reproduces the default one's trajectory.
+  Seven of the twenty-eight fail on the previous behavior. From @Montana.
+
 - **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
   markers passed the lint gate (issue #664).** The hook returns success without
   opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of

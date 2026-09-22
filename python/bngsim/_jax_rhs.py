@@ -76,6 +76,38 @@ def screen_for_discontinuities(net_path: str) -> list[str]:
 
 # ─── Expression translator (.net expression -> JAX/Python) ──────────────────
 
+# The engine's math functions and their jax.numpy spelling. Applied in a single
+# pass (see _translate_expr_jax), so no entry's replacement can be rewritten by
+# another entry's pattern.
+_JAX_MATH_FUNCS: dict[str, str] = {
+    "ln": "jnp.log",
+    "log": "jnp.log",
+    "sqrt": "jnp.sqrt",
+    "exp": "jnp.exp",
+    "sin": "jnp.sin",
+    "cos": "jnp.cos",
+    "tan": "jnp.tan",
+    "asin": "jnp.arcsin",
+    "acos": "jnp.arccos",
+    "atan": "jnp.arctan",
+    "abs": "jnp.abs",
+    "min": "jnp.minimum",
+    "max": "jnp.maximum",
+    "pow": "jnp.power",
+    "rint": "jnp.round",
+    "floor": "jnp.floor",
+    "ceil": "jnp.ceil",
+}
+
+# Longest name first so `asin` wins over `sin`, and no match may start straight
+# after a word character or a `.` — the latter keeps an already-emitted
+# `jnp.log` from being read as the function `log` should this ever run twice.
+_JAX_MATH_RE = re.compile(
+    r"(?<![\w.])("
+    + "|".join(sorted(map(re.escape, _JAX_MATH_FUNCS), key=len, reverse=True))
+    + r")\b"
+)
+
 
 def _translate_expr_jax(
     expr: str,
@@ -139,24 +171,15 @@ def _translate_expr_jax(
             c,
         )
 
-    # Replace math functions with jnp equivalents
-    c = re.sub(r"\bln\b", "jnp.log", c)
-    c = re.sub(r"\blog\b", "jnp.log", c)
-    c = re.sub(r"\bsqrt\b", "jnp.sqrt", c)
-    c = re.sub(r"\bexp\b", "jnp.exp", c)
-    c = re.sub(r"\bsin\b", "jnp.sin", c)
-    c = re.sub(r"\bcos\b", "jnp.cos", c)
-    c = re.sub(r"\btan\b", "jnp.tan", c)
-    c = re.sub(r"\basin\b", "jnp.arcsin", c)
-    c = re.sub(r"\bacos\b", "jnp.arccos", c)
-    c = re.sub(r"\batan\b", "jnp.arctan", c)
-    c = re.sub(r"\babs\b", "jnp.abs", c)
-    c = re.sub(r"\bmin\b", "jnp.minimum", c)
-    c = re.sub(r"\bmax\b", "jnp.maximum", c)
-    c = re.sub(r"\bpow\b", "jnp.power", c)
-    c = re.sub(r"\brint\b", "jnp.round", c)
-    c = re.sub(r"\bfloor\b", "jnp.floor", c)
-    c = re.sub(r"\bceil\b", "jnp.ceil", c)
+    # Replace math functions with jnp equivalents, in ONE pass (GH #564).
+    # Run as a sequence of re.sub calls, each rule saw what the rules before it
+    # had already emitted: `ln` became `jnp.log`, and the very next rule's
+    # `\blog\b` matched the `log` inside it — `.` is not a word character, so
+    # the boundary holds there — leaving `jnp.jnp.log` and an
+    # "AttributeError: module 'jax.numpy' has no attribute 'jnp'" at
+    # evaluation. One pass over the source cannot rewrite its own output, which
+    # ends the whole class of collision rather than the one instance of it.
+    c = _JAX_MATH_RE.sub(lambda m: _JAX_MATH_FUNCS[m.group(1)], c)
 
     # Replace ^ with ** for exponentiation
     c = c.replace("^", "**")
