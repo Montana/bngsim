@@ -16,6 +16,27 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
+  markers passed the lint gate (issue #664).** The hook returns success without
+  opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of
+  `MERGE_HEAD` / `rebase-apply` / `rebase-merge` in the git dir. A CI checkout is
+  never in that state, so on the `pre-commit (pinned hooks)` leg it had never
+  inspected anything. That leg exists precisely to close this class of gap:
+  `lint.yml`'s header records that it was added because "nothing in CI runs the
+  hooks", and that the whole hook suite is replayed there rather than only
+  `clang-format`. This hook was in that suite and still checked nothing, because
+  the skip is inside the hook rather than in the hook selection.
+
+  Not theoretical: #662 reached a green `pre-commit` with literal `<<<<<<<`,
+  `=======` and `>>>>>>>` lines committed in `CHANGELOG.md`, the file
+  `release.yml` copies into published GitHub Release notes. Passing
+  `--assume-in-merge` bypasses only the self-skip; the check is unchanged, so a
+  clean tree still passes and a developer committing a resolution — who is
+  mid-merge, and for whom the hook already fired — sees no difference. One
+  false positive is worth knowing about: a line of exactly seven `=` matches, so
+  a Markdown setext H1 underlined that way would trip it. No tracked file has
+  one.
+
 - **An SBML event `<delay>` or `<priority>` that reads a parameter the model
   changes is evaluated when the trigger fires, not folded to t=0 (issue #558).**
   The event loop constant-folds both expressions opportunistically with
