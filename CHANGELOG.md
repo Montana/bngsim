@@ -69,6 +69,43 @@ in `CMakeLists.txt`) is derived from it.
   deliberately exempt and is pinned by a test — a table function's *index name*,
   where `is_time_index()` accepts `time`, `T`, `Time()` and `t()` alike, is a
   different namespace from an expression token.
+- **The JAX Jacobian callback's array was copied into CVODE's Newton matrix
+  without checking its size (issue #566).** `set_jax_jac_fn`'s bridge cast the
+  Python callback's return to a bare `py::array_t<double>` and memcpy'd
+  `ns * ns` doubles out of it. Nothing checked that it held that many. A
+  callback returning a shorter array — a stub, a half-built matrix, a model
+  whose species count moved under it — read foreign heap past the end of that
+  array straight into the Newton matrix. The corruption does not announce
+  itself: it surfaces as a convergence failure, or as non-finite concentrations
+  out of an integration that looked ordinary, with nothing naming the callback.
+  Two smaller hazards sat beside it. A non-contiguous or non-float64 array was
+  read at the wrong strides, so the run silently integrated a matrix the
+  callback never meant to hand over. And `ns * ns` was computed as `int * int`,
+  which overflows above ns = 46340 before it widens to `size_t`.
+
+  The bridge now takes the result as a contiguous float64 array
+  (`c_style|forcecast`, which converts a strided or wrong-dtype array into a
+  temporary rather than misreading it), compares its length against
+  `ns * ns` in `size_t`, and raises a Python `ValueError` naming both counts
+  when they differ. The copy itself is then the only thing left, in `size_t`.
+  Any shape of the right size is accepted, so the documented flat column-major
+  array and an `(ns, ns)` matrix both work.
+
+  What the callback throws now reaches the caller intact. SUNDIALS is C, and an
+  exception unwinding through its frames is undefined behaviour, so
+  `cvode_jax_dense_jac` catches whatever the callback raised, parks it on the
+  user data and returns the unrecoverable-failure code CVODE understands;
+  `run()` rethrows it in place of the integration error, which describes what
+  the corrupt matrix did to the corrector rather than what went wrong.
+
+  Covered by `test_jax_jac_callback_buffer.py`, which drives the callback
+  through `bngsim._bngsim_core` and so needs no JAX: arrays too short (empty,
+  one element, `ns`, `ns*ns - 1`) and too long are refused, the message names
+  both counts, the flat and 2-D right-sized layouts agree, a non-contiguous and
+  a float32 array are converted rather than misread, an exception from the
+  callback arrives as itself, and a non-array return is refused. Seven of the
+  twelve fail on the previous behavior. From @Montana.
+
 - **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
   markers passed the lint gate (issue #664).** The hook returns success without
   opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of

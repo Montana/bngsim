@@ -565,11 +565,41 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     // Call Python: fn(t, y_array) -> flat column-major jac array
                     py::object result = py_fn(t, y_arr);
 
-                    // Copy result into CVODE's Jacobian buffer
-                    auto jac_arr = result.cast<py::array_t<double>>();
+                    // Copy result into CVODE's Jacobian buffer.
+                    //
+                    // GH #566 — this used to cast to a bare py::array_t<double> and
+                    // memcpy ns*ns doubles out of it with nothing checking that it
+                    // held that many. A callback returning a shorter array (a stub,
+                    // a partially built matrix, a model whose species count moved)
+                    // read foreign heap past its end straight into CVODE's Newton
+                    // matrix. The corruption does not announce itself: it surfaces
+                    // as a convergence failure, or as non-finite concentrations from
+                    // an integration that looked ordinary, with nothing pointing at
+                    // the callback. Two smaller hazards sat beside it — a
+                    // non-contiguous or non-float64 array made the copy read the
+                    // wrong strides, and `ns * ns` was computed in `int`, which
+                    // overflows above ns = 46340 before it widens to size_t.
+                    //
+                    // c_style|forcecast converts a strided or wrong-dtype result
+                    // into a contiguous float64 temporary, so the pointer below is
+                    // always the right layout; the size check is then the only
+                    // thing left, and it is done in size_t.
+                    auto jac_arr =
+                        result
+                            .cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+                    const size_t want = static_cast<size_t>(ns) * static_cast<size_t>(ns);
+                    const size_t got = static_cast<size_t>(jac_arr.size());
+                    if (got != want) {
+                        throw py::value_error(
+                            "JAX Jacobian callback returned " + std::to_string(got) +
+                            " element(s); this model has " + std::to_string(ns) +
+                            " species, so a dense Jacobian is " + std::to_string(ns) + "x" +
+                            std::to_string(ns) + " = " + std::to_string(want) +
+                            " elements (flat column-major, or any shape of that size).");
+                    }
                     auto buf = jac_arr.request();
                     const double *src = static_cast<const double *>(buf.ptr);
-                    std::memcpy(jac_ptr, src, ns * ns * sizeof(double));
+                    std::memcpy(jac_ptr, src, want * sizeof(double));
                 };
             },
             py::arg("fn"),

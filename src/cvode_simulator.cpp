@@ -307,6 +307,13 @@ struct CvodeUserData {
     // Stored here so the CVODE Jacobian callback can access it.
     std::function<void(double, const double *, double *, int)> jax_jac_fn;
 
+    // What that callback threw, if it threw (GH #566). SUNDIALS is C, and an
+    // exception unwinding through its frames is undefined behaviour, so the
+    // callback below catches everything, parks it here and returns the failure
+    // code CVODE understands. run() rethrows it in place of the integration
+    // error, which is a description of the symptom rather than of the cause.
+    std::exception_ptr jax_jac_error;
+
     // CVODES sensitivity parameter array.
     // When sensitivities are active, CVODES perturbs sens_p[plist[i]] and
     // calls the RHS. The RHS must read parameters from this array, not from
@@ -807,6 +814,19 @@ static std::string sensitivity_restart_hint(double t_now, const CvodeUserData &d
 // where the integrator itself stood, which `t` (the output time it was asked
 // for) is not; it lets an error-test or convergence failure say it came right
 // after a restart (issue #545).
+// Rethrow what a Python callback threw, if one did (GH #566). Called on every
+// path that is about to report an integration failure, because a Jacobian
+// callback that raised is the cause of that failure and the better message:
+// "CVODE integration failed ... CV_CONV_FAILURE" describes what the corrupt
+// matrix did to the corrector, not the array that was the wrong size.
+static void rethrow_pending_callback_error(CvodeUserData &data) {
+    if (data.jax_jac_error) {
+        std::exception_ptr err = data.jax_jac_error;
+        data.jax_jac_error = nullptr;
+        std::rethrow_exception(err);
+    }
+}
+
 static std::string
 cvode_failure_message(double t, int flag, CvodeUserData &data,
                       double t_internal = std::numeric_limits<double>::quiet_NaN()) {
@@ -1209,7 +1229,19 @@ static int cvode_jax_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMa
 
     // Call the JAX callback: fn(t, y_ptr, jac_col_major_ptr, n_species)
     // The Python callback fills jac_data in column-major order.
-    data->jax_jac_fn(static_cast<double>(t), y_ptr, jac_data, ns);
+    //
+    // Anything it throws — a Python exception from the callback itself, or the
+    // GH #566 size check in the pybind11 bridge — stops here: unwinding through
+    // SUNDIALS' C frames is undefined behaviour. Park it and hand CVODE the
+    // unrecoverable-failure code; run() rethrows it once CVode has returned.
+    try {
+        data->jax_jac_fn(static_cast<double>(t), y_ptr, jac_data, ns);
+    } catch (...) {
+        if (!data->jax_jac_error) {
+            data->jax_jac_error = std::current_exception();
+        }
+        return -1;
+    }
 
     return 0;
 }
@@ -2620,6 +2652,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
                                       budget.check();
                               });
         if (flag < 0) {
+            rethrow_pending_callback_error(w.user_data);
             throw std::runtime_error(cvode_failure_message(t_out[i], flag, w.user_data));
         }
 
@@ -7029,6 +7062,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                   });
 
             if (flag < 0) {
+                rethrow_pending_callback_error(user_data);
                 sunrealtype t_internal = t_now;
                 CVodeGetCurrentTime(cvode_mem, &t_internal);
                 throw std::runtime_error(cvode_failure_message(t_target, flag, user_data,
