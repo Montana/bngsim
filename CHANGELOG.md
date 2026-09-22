@@ -31,6 +31,44 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`jacobian="jax"` died with `NameError` on `log10()`, and on every other
+  engine name the translator's table had never been given (issue #565).** The
+  table stopped at seventeen functions. `log10` was not one of them, and the
+  `log` rule could not cover it — `\blog\b` does not match inside `log10`,
+  since `1` is a word character and the boundary fails — so `log10(...)`
+  reached the generated source untranslated. The RHS evaluates each body with
+  `{"__builtins__": {}}` and a namespace holding only `jnp`, `t`, `params`,
+  `obs`, `y` and the `func_*` locals, so the failure landed mid-solve as
+  `NameError: name 'log10' is not defined`, on a model the ODE backend and
+  `jacobian="auto"` both run. `log10` is first-class everywhere else in bngsim
+  — the .net reader, the SBML round trip, the sympy emitters — and nothing
+  documented it as unsupported under JAX; the omission was an oversight, not a
+  decision.
+
+  Every reserved engine name (`reserved_names()`, `src/expression.cpp`) that
+  jax.numpy spells directly is now mapped: `log10`, `log2`, the hyperbolics
+  `sinh`/`cosh`/`tanh` and their inverses, `round`, `trunc`, `sign`/`sgn`, the
+  constants `_pi` and `_e`, and the bare `time` (`time()` and `t()` were already
+  rewritten; the parenthesis-free spelling the engine also accepts was not).
+  Each of those was the same latent `NameError` as `log10`.
+
+  What is still unmapped — `erf`, `erfc`, `tgamma`, `clamp`, `avg`, `sum` and
+  the table functions, none of which worked before either — is now refused at
+  translation time, naming the function, the expression it came from and
+  `jacobian="auto"` as the path that does evaluate it. The refusal surfaces
+  where the caller can act on it, building the `Simulator`, rather than as a
+  `NameError` inside the solve naming a symbol they never wrote in Python.
+  Quoted text is skipped when scanning, so a table function is refused for
+  `tfun` rather than for the words inside its file name.
+
+  Covered by `test_jax_unmapped_functions.py`: the issue's expression, each
+  added function and constant, the logarithms and the hyperbolics not
+  colliding with their shorter names, each unmapped name refused by its own
+  name, the quoted-file-name case, a fully translatable expression staying
+  quiet, and an end-to-end pair (skipped without JAX) checking that the JAX
+  Jacobian reproduces the default one's trajectory and that an unmapped model
+  fails at `Simulator` construction. From @Montana.
+
 - **`jacobian="jax"` emitted `jnp.jnp.log` for any model using `ln()` (issue
   #564).** `_translate_expr_jax` mapped the engine's math functions with one
   `re.sub` per function, in sequence, so each rule read what the rules before it

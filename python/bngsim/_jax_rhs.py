@@ -95,17 +95,60 @@ _JAX_MATH_FUNCS: dict[str, str] = {
     "max": "jnp.maximum",
     "pow": "jnp.power",
     "rint": "jnp.round",
+    "round": "jnp.round",
+    "trunc": "jnp.trunc",
     "floor": "jnp.floor",
     "ceil": "jnp.ceil",
+    # GH #565 — the engine's reserved list (reserved_names(), src/expression.cpp)
+    # carries these too, and jax.numpy spells every one of them directly. Their
+    # absence was not a decision: `log10` never matched the `log` rule (`1` is a
+    # word character, so the boundary held), so it reached the generated source
+    # untranslated and raised NameError inside the RHS at solve time, on a model
+    # the ODE backend and jacobian="auto" both handle.
+    "log10": "jnp.log10",
+    "log2": "jnp.log2",
+    "sinh": "jnp.sinh",
+    "cosh": "jnp.cosh",
+    "tanh": "jnp.tanh",
+    "asinh": "jnp.arcsinh",
+    "acosh": "jnp.arccosh",
+    "atanh": "jnp.arctanh",
+    "sign": "jnp.sign",
+    "sgn": "jnp.sign",
 }
+
+# The engine's reserved constants, bound on every expression it compiles. Same
+# story as the functions above: nothing substitutes them, so `_pi` reached the
+# RHS as a bare name and raised NameError there.
+_JAX_CONSTANTS: dict[str, str] = {
+    "_pi": "jnp.pi",
+    "_e": "jnp.e",
+    # The bare spelling of the clock. `time()` and `t()` are rewritten above;
+    # the engine accepts `time` without parentheses too, and _BUILTIN_IDENT_MAP
+    # (the C path) maps it the same way.
+    "time": "t",
+}
+
+_JAX_NAMES: dict[str, str] = {**_JAX_MATH_FUNCS, **_JAX_CONSTANTS}
+
+# What the generated RHS binds around the eval (see generate_jax_rhs), plus the
+# Python keywords an expression may legitimately contain. Every other bare name
+# left after translation is a NameError waiting for solve time.
+_JAX_EVAL_NAMES = frozenset({"jnp", "t", "params", "obs", "y"})
+_PY_KEYWORDS = frozenset({"and", "or", "not", "if", "else", "True", "False", "None"})
+
+# An identifier that is not an attribute access: `jnp.log` is one name, not two.
+_BARE_IDENT_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)")
+
+# Quoted text is data, not a name — a table function's file name would
+# otherwise be read as a pile of undefined identifiers.
+_STRING_LITERAL_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 # Longest name first so `asin` wins over `sin`, and no match may start straight
 # after a word character or a `.` — the latter keeps an already-emitted
 # `jnp.log` from being read as the function `log` should this ever run twice.
 _JAX_MATH_RE = re.compile(
-    r"(?<![\w.])("
-    + "|".join(sorted(map(re.escape, _JAX_MATH_FUNCS), key=len, reverse=True))
-    + r")\b"
+    r"(?<![\w.])(" + "|".join(sorted(map(re.escape, _JAX_NAMES), key=len, reverse=True)) + r")\b"
 )
 
 
@@ -179,12 +222,43 @@ def _translate_expr_jax(
     # "AttributeError: module 'jax.numpy' has no attribute 'jnp'" at
     # evaluation. One pass over the source cannot rewrite its own output, which
     # ends the whole class of collision rather than the one instance of it.
-    c = _JAX_MATH_RE.sub(lambda m: _JAX_MATH_FUNCS[m.group(1)], c)
+    c = _JAX_MATH_RE.sub(lambda m: _JAX_NAMES[m.group(1)], c)
 
     # Replace ^ with ** for exponentiation
     c = c.replace("^", "**")
 
+    _reject_untranslated_names(expr, c)
     return c
+
+
+def _reject_untranslated_names(expr: str, translated: str) -> None:
+    """Raise if anything survived translation that the RHS cannot evaluate.
+
+    The generated RHS evaluates each translated body with ``{"__builtins__":
+    {}}`` and a namespace holding only ``jnp``/``t``/``params``/``obs``/``y``
+    and the previously computed ``func_*`` locals, so a name that reaches it
+    untranslated is a guaranteed ``NameError`` — raised deep inside the solve,
+    naming a symbol the caller never wrote in Python (GH #565). Saying so here,
+    while the expression is still in hand, costs nothing and names the function
+    and the model text it came from.
+    """
+    scanned = _STRING_LITERAL_RE.sub("''", translated)
+    unknown = sorted(
+        {
+            name
+            for name in _BARE_IDENT_RE.findall(scanned)
+            if name not in _JAX_EVAL_NAMES
+            and name not in _PY_KEYWORDS
+            and not name.startswith("func_")
+        }
+    )
+    if unknown:
+        raise ValueError(
+            f"jacobian='jax' cannot translate {', '.join(repr(u) for u in unknown)} "
+            f"in the expression {expr!r}: no jax.numpy equivalent is mapped for it. "
+            "Use jacobian='auto' (the default), which evaluates this model through "
+            "the engine instead."
+        )
 
 
 def _safe_py_name(name: str) -> str:
