@@ -2226,6 +2226,43 @@ int test_jacobian_strategy() {
 
 #include <bngsim/model_builder.hpp>
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Regression: issue #626 — clone() re-derives in dependency order
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int test_clone_rederives_in_dependency_order() {
+    // The #568 chain, declared in REVERSE: bb = a*3 before a = base*2.
+    bngsim::ModelBuilder b;
+    b.add_parameter("base", 1.0);
+    b.add_parameter("bb", 6.0, "a*3", true);
+    int a_idx = b.add_parameter("a", 2.0, "base*2", true);
+    int s_idx = b.add_species("S", 1.0);
+    b.add_reaction({s_idx}, {}, bngsim::RateLawType::Elementary, "bb");
+    auto model = b.build();
+
+    // Reproduce a probe's held window (residual_dtstar,
+    // apply_event_sensitivity_jump, SteadyStateRhs::sync_params): perturb `a`
+    // in place and carry it into its dependents while holding `a` itself.
+    auto &params = const_cast<std::vector<bngsim::Parameter> &>(model.parameters());
+    params[a_idx].value = 7.0;
+    model.refresh_derived_params(a_idx);
+    CHECK_CLOSE(model.get_param("bb"), 21.0, 1e-12, "held window: bb read the probe");
+
+    // Cloning here must land the copy on the expression fixed point. A
+    // declaration-order pass re-derives bb (from the probe a = 7 → 21) before
+    // re-deriving a (→ 2), leaving the mixed {a: 2, bb: 21}.
+    auto clone = model.clone();
+    CHECK_CLOSE(clone.get_param("a"), 2.0, 1e-12, "clone: a re-derived");
+    CHECK_CLOSE(clone.get_param("bb"), 6.0, 1e-12,
+                "clone: bb must read the re-derived a, not the probe value");
+
+    // And the clone still propagates a write through the whole chain.
+    clone.set_param("base", 5.0);
+    CHECK_CLOSE(clone.get_param("a"), 10.0, 1e-12, "clone set_param: a");
+    CHECK_CLOSE(clone.get_param("bb"), 30.0, 1e-12, "clone set_param: bb");
+    return 0;
+}
+
 int test_event_bolus_dose() {
     // Model: S decays exponentially, dS/dt = -k*S, S(0) = 100, k = 0.1
     // Event: at time() >= 10, set S = S + 50  (bolus dose)
@@ -2938,6 +2975,7 @@ int main() {
 
     // Regression: set_param on ConstantExpression
     RUN_TEST(test_fix6_set_param_const_expr);
+    RUN_TEST(test_clone_rederives_in_dependency_order);
 
     // Higher-order SSA propensity tests
     RUN_TEST(test_ssa_aab_propensity);
