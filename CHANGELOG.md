@@ -14,6 +14,34 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`clone()` re-derives parameters in dependency order, not declaration order
+  (issue #626).** `src/model_impl.hpp` states that `derived_param_order` is the
+  only order any re-evaluation pass may walk, since a declaration-order pass
+  over a chain reads a stale link (issue #568). `clone()` was the one pass that
+  still walked declaration order: #615 converted seven copies of that loop and
+  deliberately left this one, because it also recompiles each expression into
+  the clone's fresh evaluator and the two concerns were interleaved.
+
+  They are now split. The recompile stays in declaration order — it is about
+  evaluator ids, not values — and the values come from a single
+  `refresh_derived_params()` pass afterwards. The set is unchanged: after
+  `build()` a parameter's evaluator is only ever dropped, never attached, so
+  every parameter the recompile touches is already in `derived_param_order`,
+  and the `is_expression` guard is the same one, so an issue #188 override
+  still keeps both its literal and its reversibility.
+
+  Nothing observable moves today, because a source model's derived parameters
+  are always at their expression fixed point and evaluating a fixed point in
+  any order reproduces it. It would have stopped being idempotent the moment a
+  caller cloned a model inside a probe's held window (`residual_dtstar`,
+  `apply_event_sensitivity_jump`, `SteadyStateRhs::sync_params`), where a
+  dependent has already absorbed the probe value while the held parameter
+  itself has not been re-derived — the copy came out mixed. Covered by a C++
+  regression test that clones the reverse-declared #568 chain mid-probe and
+  fails without the fix (`bb = 21`, expected 6). From @Montana.
+
 ## [0.16.0] - 2026-09-21
 
 ### Added
