@@ -147,7 +147,8 @@ NetworkModel NetworkModel::clone() const {
     // Create evaluator that shares the parser with the original
     copy.impl_->evaluator = impl_->evaluator->clone_empty();
 
-    // Bind time()/t() to the COPY's current_time
+    // Bind time() to the COPY's current_time. One symbol: `t` is left free
+    // as an ordinary model identifier (src/expression.cpp), never bound here.
     copy.impl_->evaluator->set_time_ptr(&copy.impl_->current_time);
 
     // Re-bind all variables to the copy's data
