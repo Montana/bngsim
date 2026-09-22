@@ -1435,10 +1435,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             double tau = -std::log(r1) / a0;
             double t_proposed = t + tau;
 
-            // Record output points strictly before the fire time. (n_func>0 only
-            // when the model has time-invariant functions — time-dependent ones
-            // would have set time_dependent_rates and gated this branch off — so
-            // recording them here matches the main loop byte-for-byte.)
+            // Record output points strictly before the fire time. (Evaluated per
+            // sample. `time_dependent_rates` having gated this branch off is NOT
+            // a guarantee that the functions are time-invariant: the probe that
+            // sets it samples three points and aliases any function whose values
+            // coincide there, issue #654 — so a moving function can reach here.
+            // Recording per sample matches the main loop byte-for-byte either
+            // way.)
             while (next_output < n_out && t_proposed >= t_out[next_output]) {
                 model.update_observables(conc.data());
                 for (int j = 0; j < n_obs; ++j)
@@ -1634,10 +1637,14 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 if (rec_stats)
                     rs_record(next_output, t_out[next_output]);
                 // Issue #569 — same pairing as every other recording site above.
-                // Evaluated per sample rather than once before the loop:
-                // `time_dependent_rates` being false only rules out a rate that
-                // moves with t, and a function may still read time() without
-                // feeding any rate law.
+                // Evaluated per sample rather than once before the loop, because
+                // arriving here does NOT mean the functions are constant. The
+                // probe that sets `time_dependent_rates` samples each function at
+                // three points and reads "no movement" as "time-invariant", so a
+                // function whose values coincide there — a period dividing h/2 is
+                // the easy case — lands in this branch still moving with t
+                // (issue #654). A single pre-loop evaluation would flatline the
+                // whole fast-forwarded tail at one value.
                 if (n_func > 0) {
                     model.evaluate_functions(t_out[next_output]);
                     auto fvals = model.function_values();
