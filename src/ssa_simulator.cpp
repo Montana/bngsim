@@ -1413,6 +1413,16 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     result.record(next_output, t_out[next_output], conc.data(), obs_buf.data());
                     if (rec_stats)
                         rs_record(next_output, t_out[next_output]);
+                    // Issue #569 — the frozen state still has function values, and
+                    // every other recording site in this loop pairs record() with
+                    // them. Leaving these rows untouched is not "unrecorded":
+                    // set_expression_names zero-fills expressions_, so they read
+                    // back as a perfectly plausible 0.0 with no sentinel.
+                    if (n_func > 0) {
+                        model.evaluate_functions(t_out[next_output]);
+                        auto fvals = model.function_values();
+                        result.record_expressions(next_output, fvals.data());
+                    }
                     ++next_output;
                 }
                 break;
@@ -1623,6 +1633,16 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 result.record(next_output, t_out[next_output], conc.data(), obs_buf.data());
                 if (rec_stats)
                     rs_record(next_output, t_out[next_output]);
+                // Issue #569 — same pairing as every other recording site above.
+                // Evaluated per sample rather than once before the loop:
+                // `time_dependent_rates` being false only rules out a rate that
+                // moves with t, and a function may still read time() without
+                // feeding any rate law.
+                if (n_func > 0) {
+                    model.evaluate_functions(t_out[next_output]);
+                    auto fvals = model.function_values();
+                    result.record_expressions(next_output, fvals.data());
+                }
                 ++next_output;
             }
             break;

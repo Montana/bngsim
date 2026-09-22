@@ -42,6 +42,23 @@ in `CMakeLists.txt`) is derived from it.
   regression test that clones the reverse-declared #568 chain mid-probe and
   fails without the fix (`bb = 21`, expected 6). From @Montana.
 
+- **The SSA's stuck fast-forward records function values instead of leaving
+  them at zero (issue #569).** When the total propensity reaches zero the SSA
+  fast-forwards every remaining output time at the frozen state. Both
+  fast-forward branches — the interpreted loop's "truly stuck" path and the
+  GH #190 recompute-all fast loop's — recorded species and observables but not
+  expressions, unlike the five other recording sites in the same loop, each of
+  which pairs `record()` with `evaluate_functions()` + `record_expressions()`.
+  Because `set_expression_names()` zero-fills `expressions_`, the untouched
+  rows read back as exactly 0.0 — a plausible function value, not something a
+  caller could recognise as unset — so a model whose reactions exhaust, a very
+  common SSA end state, reported 0.0 for every function across the whole tail
+  of the trajectory, through `Result.expressions` and into the `.gdat` writer
+  alike. Both branches now evaluate and record alongside the observables, per
+  sample rather than once before the loop: `time_dependent_rates` being false
+  only rules out a rate that moves with t, and a function may still read
+  `time()` without feeding any rate law.
+
 ## [0.16.0] - 2026-09-21
 
 ### Added
