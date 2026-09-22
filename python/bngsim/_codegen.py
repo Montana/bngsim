@@ -6231,6 +6231,9 @@ def _replace_power_op(expr: str) -> str:
     - parenthesized: (a+b)^2 → pow((a+b), 2)
     - array ref: p[0]^2 → pow(p[0], 2)
     - nested: a^(b^c) and (a^b)^c — both inner powers are translated
+    - chained: a^b^c → pow(a, pow(b, c)) — right-associative, as ExprTk
+      evaluates it (GH #555); a signed link binds like ExprTk's unary minus,
+      so a^-b^c → pow(a, -pow(b, c))
     """
     if "^" not in expr:
         return expr
@@ -6250,8 +6253,31 @@ def _replace_power_op(expr: str) -> str:
             # ((10^hn1)+1) appearing inside a^((10^hn1)+1)) would survive
             # untouched. Recurse to translate any such inner powers.
             exp_str, end = _extract_exp_right(chars, i + 1)
-            exp_str = _replace_power_op(exp_str)
-            result.append(f"pow({base}, {exp_str})")
+            exponents = [_replace_power_op(exp_str)]
+            # GH #555 — an unparenthesised chain a^b^c. `^` is
+            # right-associative, so every further `^` belongs to the
+            # exponent, not to the pow(...) just built. Collect the whole
+            # chain here; leaving it to the next loop iteration would make
+            # _extract_base_left look for a base inside the emitted pow(...)
+            # and come back empty (`pow(a, b)pow(, c)`).
+            while True:
+                j = end
+                while j < len(chars) and chars[j].isspace():
+                    j += 1
+                if j >= len(chars) or chars[j] != "^":
+                    break
+                exp_str, end = _extract_exp_right(chars, j + 1)
+                exponents.append(_replace_power_op(exp_str))
+            # Fold right: a^b^c^d → pow(a, pow(b, pow(c, d))). A link with a
+            # leading unary minus negates the power it heads, as in ExprTk
+            # (a^-b^c is a^(-(b^c))), not the bare operand.
+            exponent = exponents[-1]
+            for link in reversed(exponents[:-1]):
+                if link.startswith("-"):
+                    exponent = f"-pow({link[1:]}, {exponent})"
+                else:
+                    exponent = f"pow({link}, {exponent})"
+            result.append(f"pow({base}, {exponent})")
             i = end
         else:
             result.append(chars[i])
