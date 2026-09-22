@@ -16,6 +16,38 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **An n-ary `max()` / `min()` translated to a C `fmax` / `fmin` call with the
+  wrong number of arguments, so codegen refused a model the interpreter ran
+  (issue #556).** ExprTk's `max` and `min` take any number of arguments; C's
+  `fmax` and `fmin` take exactly two. `_BUILTIN_IDENT_MAP` renamed `max` to
+  `fmax` without looking at the arguments, so a `.net` function body like
+  `k*max(A,2,3)` was emitted as `fmax(obs_A,2.0,3.0)` and the compiler rejected
+  it. A model loaded through the sympy round trip never showed this, because
+  that emitter already nests an n-ary call; a `.net` body keeps the call as
+  written. Any such model failed to build under `codegen=True` and under
+  forward sensitivities alike, while ExprTk evaluated it without complaint.
+
+  `_replace_engine_calls` now folds a call with three or more arguments left to
+  right, the way ExprTk reduces it — `max(a,b,c)` becomes `max(max(a,b),c)` —
+  and the existing rename turns each binary call into `fmax` / `fmin`. A
+  one-argument call, which ExprTk accepts and answers with its argument, becomes
+  `(a)` instead of a one-argument `fmax` that would not compile; the
+  zero-argument form, which ExprTk rejects, is left alone. The pass also
+  descends into the arguments of calls it leaves as written, walking each
+  argument once, so an n-ary call inside a binary one is folded too. A binary
+  call is returned byte-for-byte as written, spacing included, so no model that
+  compiled before gets different generated source and `_CODEGEN_VERSION` is
+  unchanged. Both translation routes (`_translate_expr_to_c` and the `.net`
+  `_translate_expr`) run this pass, so the one change covers both.
+
+  Covered by `test_codegen_nary_minmax.py`: unit cases for the fold (nested
+  either way, inside `sum()`, arguments with commas of their own), for the
+  one- and zero-argument forms, for binary calls and look-alike names coming
+  back unchanged, and for the walk staying linear in nesting depth; plus
+  codegen ↔ interpreter parity on seven `.net` models whose winning argument
+  changes during the run. Every case that uses an n-ary or one-argument call
+  fails on the previous behavior. From @Montana.
+
 - **The SSA decides time dependence from the function expressions, not by
   sampling them (issue #654).** `SsaSimulator::run_internal` gates its
   piecewise-constant sub-stepping on whether the model's rates move with the
