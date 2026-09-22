@@ -51,6 +51,36 @@ in `CMakeLists.txt`) is derived from it.
   false positive is worth knowing about: a line of exactly seven `=` matches, so
   a Markdown setext H1 underlined that way would trip it. No tracked file has
   one.
+- **`batch.observables["X"]` indexed the time axis on a squeezed batch,
+  returning plausible wrong numbers (issue #560).**
+  `_ObservableAccessor.__getitem__` resolved a name to `self._data[:, idx]`,
+  which is the right axis only for a single run's `(n_times, n_cols)` block. A
+  squeezed batch (`run_batch(..., squeeze=True)`) carries a leading replicate
+  axis, `(n_sims, n_times, n_cols)`, so the subscript took the TIME axis and
+  the call returned `(n_sims, n_cols)` — every replicate's values at
+  `t = idx`, one entry per observable — where the caller asked for `(n_sims,
+  n_times)` trajectories. Nothing raised: the answer has the rank the caller
+  expects and holds real numbers from the run, and for the usual first column
+  it is each replicate's initial values, which read as a believable start to a
+  trajectory. `result.expressions[name]` and `result.raw_expressions[name]` go
+  through the same accessor and were wrong the same way, while the sibling
+  `Result.outputs("observable:X")` indexes the last axis and was right
+  throughout — so the two APIs disagreed about the same result, and only the
+  named one was quiet about it.
+
+  The named column sits on the last axis in both layouts, so the lookup now
+  indexes there. A single run is unaffected, since `[:, idx]` and `[..., idx]`
+  name the same axis on a 2-D block. An integer or slice key is unchanged and
+  still indexes the leading axis, which is what the same key does on the
+  underlying array: a time row on a single run, a replicate on a batch.
+
+  Covered by `test_named_access_batch.py`: the batch block really carries the
+  extra axis (the premise the rest rests on), a named observable and a named
+  expression come back as trajectories that move rather than as one constant
+  per replicate, named access agrees with both the raw block and
+  `outputs(...)`, the single-run layout is untouched, and positional keys and
+  the unknown-name `KeyError` keep their behavior. Five of the eleven fail on
+  the previous behavior. From @Montana.
 
 - **An SBML event `<delay>` or `<priority>` that reads a parameter the model
   changes is evaluated when the trigger fires, not folded to t=0 (issue #558).**
