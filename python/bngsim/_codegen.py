@@ -6184,6 +6184,12 @@ def _c_engine_call(name: str, args: list[str]) -> str | None:
         # max/min, and the identifier pass renames each binary call to
         # fmax/fmin. A binary call (the only form that ever compiled) is left
         # exactly as written, so its emitted source does not change.
+        #
+        # ExprTk also accepts a single argument and returns it (only the
+        # zero-argument form is rejected), while fmax/fmin would refuse one, so
+        # max(a) becomes (a). A zero-argument call is left for the compiler.
+        if n == 1:
+            return f"({args[0]})"
         if n <= 2:
             return None
         folded = args[0]
@@ -6218,17 +6224,23 @@ def _replace_engine_calls(expr: str) -> str:
             break
         inner = expr[open_paren + 1 : close_paren]
         raw = _split_top_level_commas(inner)
-        args = [_replace_engine_calls(a.strip()) for a in raw]
+        # Each argument is walked once, unstripped, and stripped afterwards.
+        # Whitespace at the ends of an argument is never part of a call, so
+        # stripping after the pass gives what stripping before it did, and the
+        # unstripped results are kept for the left-as-written case below.
+        # Walking the parts a second time there doubled the cost per level of
+        # engine-call nesting.
+        done = [_replace_engine_calls(part) for part in raw]
+        args = [d.strip() for d in done]
         if len(args) == 1 and not args[0]:
             args = []  # `name()`, which is how a .net calls a model function
         c_form = _c_engine_call(m.group(1), args)
         if c_form is None:
             # Left as written, but its arguments still get this pass: a binary
-            # max() can hold an n-ary one (GH #556). Rebuilt from the unstripped
+            # max() can hold an n-ary one (GH #556). Joined from the unstripped
             # parts, so a call with nothing inside to rewrite comes back
             # byte-for-byte.
-            rebuilt = ",".join(_replace_engine_calls(r) for r in raw)
-            c_form = f"{expr[m.start() : open_paren + 1]}{rebuilt})"
+            c_form = f"{expr[m.start() : open_paren + 1]}{','.join(done)})"
         out.append(c_form)
         cursor = close_paren + 1
     return "".join(out)

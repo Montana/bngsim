@@ -13,6 +13,10 @@ The fix folds the call left to right, the way ExprTk reduces it:
 ``max(a,b,c)`` becomes ``max(max(a,b),c)``, and the rename then applies to each
 binary call. A binary call is the only form that ever compiled, and it is left
 byte-for-byte as written, so no existing model's generated source changes.
+
+ExprTk also accepts a one-argument call and returns the argument; ``fmax(a)``
+does not compile, so ``max(a)`` becomes ``(a)``. Only the zero-argument form,
+which ExprTk rejects, is left for the compiler.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import contextlib
 import io
 
 import bngsim
+import bngsim._codegen as _cg
 import numpy as np
 import pytest
 from bngsim._codegen import _expr_to_c, _replace_engine_calls
@@ -108,6 +113,53 @@ def test_the_issue_expression_translates_to_binary_c():
     assert out == "fmin(fmin(p[0],p[1]),p[2])"
 
 
+@pytest.mark.parametrize(
+    "expr, expect",
+    [
+        ("max(a)", "(a)"),
+        ("min(a)", "(a)"),
+        ("max( a+b )", "(a+b)"),
+        # inside an n-ary call, and holding one
+        ("max(min(a),b,c)", "max(max((a),b),c)"),
+        ("min(max(a,b,c))", "(max(max(a,b),c))"),
+    ],
+)
+def test_a_one_argument_call_returns_its_argument(expr, expect):
+    """ExprTk's max(a)/min(a) is a; fmax/fmin would refuse a single argument."""
+    assert _replace_engine_calls(expr) == expect
+
+
+def test_a_zero_argument_call_is_left_for_the_compiler():
+    """ExprTk rejects max(), so no accepted model carries one; nothing to guess."""
+    assert _replace_engine_calls("max()") == "max()"
+
+
+def test_a_one_argument_call_translates_to_c():
+    assert _expr_to_c("max(a)", ["a"], [], [], []) == "(p[0])"
+
+
+@pytest.mark.parametrize("depth", [5, 10, 20])
+def test_each_argument_is_walked_once(monkeypatch, depth):
+    """The pass visits each nested call's arguments once, so its work grows
+    linearly with engine-call nesting. Walking them a second time for a call left
+    as written doubled the work per level: 628 ms at depth 18."""
+    expr = "a"
+    for _ in range(depth):
+        expr = f"max(a,{expr})"
+    calls = 0
+    real = _cg._replace_engine_calls
+
+    def counting(e):
+        nonlocal calls
+        calls += 1
+        return real(e)
+
+    monkeypatch.setattr(_cg, "_replace_engine_calls", counting)
+    assert counting(expr) == expr
+    # one call at the top, then two arguments per level
+    assert calls == 1 + 2 * depth
+
+
 # ── The models build, and compute what the interpreter computes ──────────────
 
 # A starts at 5 and decays through every threshold below, so each case switches
@@ -118,6 +170,9 @@ CASES = [
     "k*A*min(A,4,3.5,n)",
     "k*max(1,min(A,4,3))",
     "k*A*max(min(A,4,3),n,1)",
+    # one argument: ExprTk returns it, and it must compile
+    "k*max(A)",
+    "k*A*min(max(A),n,1)",
 ]
 
 
