@@ -6735,6 +6735,30 @@ def _build_model_from_sbml_doc(doc):
         # Track which parameters need promotion for event assignments
         event_param_promotions = {}  # param_id → species_idx
 
+        # What a <delay> or <priority> may be constant-folded against (GH #558).
+        # Both are evaluated when the trigger fires (SBML L3v2 §4.11.3/§4.11.4),
+        # so folding at load is only sound for symbols that cannot change
+        # between t=0 and then: the parameters no assignment rule, rate rule or
+        # event assignment writes — `_const_param_ids`, the same predicate the
+        # initial-condition seed uses (see the #379 note there on why
+        # `constant="false"` alone is not the test). Each takes its
+        # initialAssignment value when it has one, else its declared value.
+        # Anything else — a written parameter, a species, a compartment — makes
+        # the fold return None, and the expression goes to the C++ dispatcher,
+        # which evaluates it at trigger time. The context used to hold every
+        # parameter's declared value plus every IA / assignment-rule value at
+        # t=0, so a delay reading a rate-rule parameter fired at t_trigger + d(0).
+        event_fold_ctx = {}
+        for j2 in range(sbml_model.getNumParameters()):
+            p = sbml_model.getParameter(j2)
+            pid = p.getId()
+            if pid not in _const_param_ids:
+                continue
+            if pid in ia_values:
+                event_fold_ctx[pid] = ia_values[pid]
+            else:
+                event_fold_ctx[pid] = p.getValue() if p.isSetValue() else 0.0
+
         for i in range(n_events):
             event = sbml_model.getEvent(i)
             eid = event.getId() or f"_event_{i}"
@@ -6775,14 +6799,7 @@ def _build_model_from_sbml_doc(doc):
                     delay_ast = delay_obj.getMath()
                     delay_numeric = _eval_ast_numeric(
                         delay_ast,
-                        {
-                            **{
-                                p.getId(): (p.getValue() if p.isSetValue() else 0.0)
-                                for j2 in range(sbml_model.getNumParameters())
-                                for p in [sbml_model.getParameter(j2)]
-                            },
-                            **ia_values,
-                        },
+                        event_fold_ctx,
                         func_defs,
                         time_value=None,
                         avogadro_value=None,
@@ -6803,14 +6820,7 @@ def _build_model_from_sbml_doc(doc):
                     pri_ast = pri_obj.getMath()
                     pri_numeric = _eval_ast_numeric(
                         pri_ast,
-                        {
-                            **{
-                                p.getId(): (p.getValue() if p.isSetValue() else 0.0)
-                                for j2 in range(sbml_model.getNumParameters())
-                                for p in [sbml_model.getParameter(j2)]
-                            },
-                            **ia_values,
-                        },
+                        event_fold_ctx,
                         func_defs,
                         time_value=None,
                         avogadro_value=None,

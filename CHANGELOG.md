@@ -16,6 +16,40 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **An SBML event `<delay>` or `<priority>` that reads a parameter the model
+  changes is evaluated when the trigger fires, not folded to t=0 (issue #558).**
+  The event loop constant-folds both expressions opportunistically with
+  `_eval_ast_numeric`, and its fold context held every global parameter's
+  declared `value` plus every `initialAssignment` and assignment-rule value at
+  t=0. It never asked whether anything writes the parameter. A delay `d` driven
+  by a rate rule, an assignment rule or another event's assignment therefore
+  folded to `d(0)`, and the event fired at `t_trigger + d(0)` with no warning.
+  SBML L3v2 §4.11.4 evaluates a delay at the moment the trigger becomes true,
+  and §4.11.3 does the same for a priority. A priority reading such a parameter
+  ordered simultaneous events by its t=0 value in the same way.
+
+  The fold context now holds only the parameters no assignment rule, rate rule
+  or event assignment writes (`_const_param_ids`, the same predicate the
+  initial-condition seed uses since #379, so a `constant="false"` parameter
+  nothing writes still folds). Each takes its initialAssignment value when it
+  has one. A delay or priority that reads anything else makes the fold return
+  `None` and takes the existing `delay_expr` / `priority_expr` path, which the
+  C++ event dispatcher evaluates at trigger time, including through a
+  functionDefinition call. The old context also carried every initialAssignment
+  value, so a delay reading an initialAssignment'd compartment or species was
+  folded too; those now take the dynamic path as well, and fire at the same
+  time. A delay that reads only constant parameters folds exactly as before, so
+  those models build the same event.
+
+  Covered by `test_sbml_event_delay_nonconstant_param.py`, with a delay reading
+  a rate-rule, an assignment-rule and an event-assigned parameter, a delay
+  `f(d)` through a functionDefinition on a rate-rule parameter, a priority
+  reading a rate-rule parameter, and controls for a literal delay, an unwritten
+  `constant="false"` parameter, an initialAssignment on a constant parameter,
+  and an initialAssignment'd compartment and species. The five bug cases fail
+  on the previous behavior: each delay fired at t=1.05 instead of 2.0, and the
+  priority case ended with w=10 instead of 20. From @Montana.
+
 - **An n-ary `max()` / `min()` translated to a C `fmax` / `fmin` call with the
   wrong number of arguments, so codegen refused a model the interpreter ran
   (issue #556).** ExprTk's `max` and `min` take any number of arguments; C's
