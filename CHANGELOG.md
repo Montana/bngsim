@@ -16,6 +16,45 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`t` is an ordinary model identifier, not a spelling of the clock, and four
+  expression translators read it as one (issue #659).** The evaluator binds
+  exactly one clock symbol: `time`. `t` is deliberately left free so a model may
+  name a parameter or observable `t` — the BNGL counter idiom
+  `Molecules t counter()` is the reason, and `src/expression.cpp` says so. But
+  `docs/reference/expressions.md` documented `t()` as "alias for `time()`", three
+  C++ comments asserted that both were bound, and the Python layers that
+  translate ExprTk expression *strings* rewrote `t()` to the clock.
+
+  `t()` is not the clock. It is how BNG2.pl writes a reference to a scalar named
+  `t`, and the engine reads it that way (`strip_empty_parens`) — so rewriting it
+  erased the observable. That is issue #28's defect surviving for exactly one
+  name, and two of its consequences were silent wrong numbers:
+
+  * the derived Jacobian entry for a rate law reading `t()` came back empty, so
+    the **forward sensitivity** of such a model was wrong — `d[A]/dk` reported
+    as −6.67 against a finite-difference −22.22 on the regression model, a
+    factor of 3.3, with no warning and no error, because the codegen
+    sensitivity RHS has nothing checking it against finite differences;
+  * the interpreted attach *was* caught, by the C++ FD self-check, which
+    declined the whole analytical Jacobian — so the model silently fell back to
+    finite differences for a reason that was a preprocessing bug rather than a
+    real non-differentiability.
+
+  The JAX translator carried the inverse confusion: it rewrote `time()` and
+  `t()` alike to a bare `t`, which its own observable pass then rewrote, so in a
+  model with an observable named `t` the **clock** came out as that observable's
+  population. Its fix needed the zero-arg strip issue #28 never reached that
+  path, so `Atot()` there stops emitting `obs[1]()` — a call on a JAX array —
+  as well.
+
+  `time()` is now the only clock spelling in `_jacobian`, `_saturable_jacobian`,
+  `_codegen` and `_jax_rhs`, and the docs and comments say so. The ODE
+  trajectory was never affected: the codegen identifier table has always let a
+  model name outrank a built-in, so `t()` emitted the right C. One grammar is
+  deliberately exempt and is pinned by a test — a table function's *index name*,
+  where `is_time_index()` accepts `time`, `T`, `Time()` and `t()` alike, is a
+  different namespace from an expression token.
+
 - **The SSA decides time dependence from the function expressions, not by
   sampling them (issue #654).** `SsaSimulator::run_internal` gates its
   piecewise-constant sub-stepping on whether the model's rates move with the
