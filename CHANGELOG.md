@@ -14,6 +14,21 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+### Changed
+
+- **`CHANGELOG.md` is merged with git's `union` driver, so two open pull
+  requests no longer conflict on it.** Every entry is inserted at the same
+  anchor — the top of `## [Unreleased]` → `### Fixed` — so any two branches
+  open at once edit the same region and git stops there, on a file that cannot
+  affect behavior. 17 of the 30 pull requests before this one touched it, and
+  each merge invalidates every other open branch. `union` keeps both sides'
+  added lines instead of conflicting. It does not understand the list, so the
+  newest entry is not guaranteed to land on top — check the order when it
+  resolves one. It also resolves silently, which is why it wants the issue #664
+  fix (`check-merge-conflict` is a no-op in CI today) underneath it. The
+  structural fix, one fragment file per change assembled at release, is issue
+  #668.
+
 ### Fixed
 
 - **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
@@ -206,6 +221,7 @@ in `CMakeLists.txt`) is derived from it.
   `a0 == 0`, which says nothing about a function that reads `time()` — an
   output-only one, or one whose reaction is exhausted — so its column has to
   keep tracking t across the frozen tail.
+
 
 ## [0.16.0] - 2026-09-21
 

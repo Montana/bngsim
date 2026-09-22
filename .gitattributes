@@ -3,3 +3,24 @@
 # verified by the vendoring tests) match on Windows too. Without this a Windows
 # checkout with core.autocrlf=true rewrites LF->CRLF and every checksum drifts.
 third_party/** -text
+
+# Every entry in CHANGELOG.md is inserted at the same anchor — the top of
+# `## [Unreleased]` → `### Fixed` — so any two pull requests open at the same
+# time edit the same region and git stops on a conflict. That is not an
+# occasional collision: 17 of the 30 pull requests before this one touched the
+# file, and each merge invalidates every other open branch, so N concurrent PRs
+# cost N-1 rebases on a file that has never affected behavior. Four landed in
+# one afternoon (#653, #656, #662, #663), each one blocking a PR whose code
+# merged cleanly.
+#
+# `union` is git's built-in driver for exactly this shape: both sides' added
+# lines are kept instead of conflicting. It does NOT understand the list, so it
+# does not guarantee the newest entry lands on top — check the order when it
+# resolves one, and expect to reorder occasionally. It also resolves silently,
+# which is only safe because `check-merge-conflict` backs it up (issue #664 —
+# that hook is currently a no-op in CI, so land its fix alongside this).
+#
+# This is a mitigation. The structural fix is one changelog fragment file per
+# change, assembled at release, so two PRs never touch the same file at all —
+# issue #668.
+CHANGELOG.md merge=union
