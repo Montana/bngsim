@@ -31,6 +31,39 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **`read_sedml` threw away a third-party document's `@target` whenever the
+  dataGenerator carried a display `@name` (issue #563).** bngsim writes the
+  verbatim bngsim selector into `@name`, and that is the round-trip source of
+  truth, so the reader took `@name` whenever it was there and consulted
+  `@target` only in its absence. Every other writer uses the pair the other way
+  round, as the standard describes: `@target` holds the machine-readable SBML
+  XPath, `@name` a label for a human. Reading such a document discarded
+  `/sbml:sbml/sbml:model/sbml:listOfSpecies/sbml:species[@id='R']` in favour of
+  `Free receptor (nM)` and returned that prose as the output selector. Nothing
+  complained at read time — the `EvaluationSpec` looked well formed — and the
+  failure landed later and elsewhere, as "Unresolved output selector 'Free
+  receptor (nM)': not found" out of `read_omex(...).load_protocol().evaluate()`,
+  naming a label the caller never wrote.
+
+  `@name` now wins only when it already reads as a typed bngsim selector
+  (`species:`, `observable:`, `expression:`, and the `state:` / `function:`
+  aliases) — which is exactly what bngsim itself writes, so the round trip is
+  byte-for-byte what it was. Anything else yields to the selector the target
+  gives, and a generator with neither — an observable or expression, which have
+  no standard SBML element to point at — still falls back to the name, as
+  before. The target scan also stopped requiring one particular spelling: the
+  id may be single- or double-quoted, and the namespace prefix is whatever the
+  document bound (`sbml:`, `s:`, or none), so a `species[@id=...]` step is
+  matched wherever it appears in the XPath.
+
+  Covered by `test_sedml_foreign_target.py`: the issue's document, both
+  quotings, an unprefixed XPath, several generators keeping their order, a
+  time generator still dropped by its symbol rather than its label, every
+  typed name still winning even with a target beside it, the exact round trip,
+  the two fallbacks, and an end-to-end case that reads a foreign document
+  against a real SBML model and evaluates it, which is where the old behavior
+  raised. Five of the fourteen fail on the previous behavior. From @Montana.
+
 - **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
   markers passed the lint gate (issue #664).** The hook returns success without
   opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of
