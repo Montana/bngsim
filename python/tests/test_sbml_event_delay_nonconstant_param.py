@@ -154,6 +154,78 @@ def test_delay_reads_initial_assignment_of_constant_parameter():
     assert _fire_time(sbml) == pytest.approx(2.0, abs=0.011)
 
 
+def _sbml_ia(eid: str, decls: str, ia_symbol: str) -> str:
+    """One event firing on a delay that reads ``ia_symbol``, whose declared value is
+    0.05 and whose initialAssignment sets it to 1."""
+    event = _event("E", _time_gt(1), "w", "<cn>1</cn>", delay_ml=f"<ci>{ia_symbol}</ci>")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+  <model id="{eid}">
+    {decls}
+    <listOfInitialAssignments>
+      <initialAssignment symbol="{ia_symbol}"><math {_MATHML}><cn>1</cn></math></initialAssignment>
+    </listOfInitialAssignments>
+    <listOfEvents>{event}</listOfEvents>
+  </model>
+</sbml>"""
+
+
+def test_delay_reads_initial_assignment_of_compartment():
+    """The old fold context also held every initialAssignment value, compartments
+    included. The narrowed one does not, so a delay reading an IA'd compartment now
+    takes the dynamic path. Pin that it still fires at the right time there."""
+    decls = """<listOfCompartments>
+      <compartment id="C" size="0.05" spatialDimensions="3" constant="true"/>
+    </listOfCompartments>
+    <listOfParameters>
+      <parameter id="w" value="0" constant="false"/>
+    </listOfParameters>"""
+    assert _fire_time(_sbml_ia("m558c", decls, "C")) == pytest.approx(2.0, abs=0.011)
+
+
+def test_delay_reads_initial_assignment_of_species():
+    """The same for an IA'd species: out of the fold context, through the dynamic
+    path, still at the right time."""
+    decls = """<listOfCompartments>
+      <compartment id="cell" size="1" spatialDimensions="3" constant="true"/>
+    </listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="cell" initialAmount="0.05" hasOnlySubstanceUnits="true"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="w" value="0" constant="false"/>
+    </listOfParameters>"""
+    assert _fire_time(_sbml_ia("m558s", decls, "S")) == pytest.approx(2.0, abs=0.011)
+
+
+def test_delay_reads_a_function_of_a_rate_rule_parameter():
+    """A delay ``f(d)`` through a functionDefinition, with d on a rate rule. The
+    narrowed context sends it down the dynamic path, which must evaluate the call
+    rather than fail to build. f(d) = d, so it fires at t=2.0."""
+    sbml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+  <model id="m558f">
+    <listOfFunctionDefinitions>
+      <functionDefinition id="f">
+        <math {_MATHML}><lambda><bvar><ci>x</ci></bvar><ci>x</ci></lambda></math>
+      </functionDefinition>
+    </listOfFunctionDefinitions>
+    <listOfParameters>
+      <parameter id="w" value="0" constant="false"/>
+      <parameter id="d" value="0.05" constant="false"/>
+    </listOfParameters>
+    <listOfRules>
+      <rateRule variable="d"><math {_MATHML}><cn>0.95</cn></math></rateRule>
+    </listOfRules>
+    <listOfEvents>{
+        _event("E", _time_gt(1), "w", "<cn>1</cn>", delay_ml="<apply><ci>f</ci><ci>d</ci></apply>")
+    }</listOfEvents>
+  </model>
+</sbml>"""
+    assert _fire_time(sbml) == pytest.approx(2.0, abs=0.011)
+
+
 def test_priority_reads_rate_rule_parameter():
     """The same defect in ``<priority>``. Two events trigger together at t>1 and both
     write w; the one that fires last wins. Ea's priority is ``p``, which a rate rule

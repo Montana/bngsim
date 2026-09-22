@@ -34,18 +34,21 @@ in `CMakeLists.txt`) is derived from it.
   nothing writes still folds). Each takes its initialAssignment value when it
   has one. A delay or priority that reads anything else makes the fold return
   `None` and takes the existing `delay_expr` / `priority_expr` path, which the
-  C++ event dispatcher evaluates at trigger time. That path already handled a
-  delay reading a species, which was never in the fold context. A delay that
-  reads only constants folds exactly as before, so those models build the same
-  event.
+  C++ event dispatcher evaluates at trigger time, including through a
+  functionDefinition call. The old context also carried every initialAssignment
+  value, so a delay reading an initialAssignment'd compartment or species was
+  folded too; those now take the dynamic path as well, and fire at the same
+  time. A delay that reads only constant parameters folds exactly as before, so
+  those models build the same event.
 
   Covered by `test_sbml_event_delay_nonconstant_param.py`, with a delay reading
-  a rate-rule, an assignment-rule and an event-assigned parameter, a priority
+  a rate-rule, an assignment-rule and an event-assigned parameter, a delay
+  `f(d)` through a functionDefinition on a rate-rule parameter, a priority
   reading a rate-rule parameter, and controls for a literal delay, an unwritten
-  `constant="false"` parameter and an initialAssignment on a constant one. The
-  four bug cases fail on the previous behavior: each delay fired at t=1.05
-  instead of 2.0, and the priority case ended with w=10 instead of 20. From
-  @Montana.
+  `constant="false"` parameter, an initialAssignment on a constant parameter,
+  and an initialAssignment'd compartment and species. The five bug cases fail
+  on the previous behavior: each delay fired at t=1.05 instead of 2.0, and the
+  priority case ended with w=10 instead of 20. From @Montana.
 
 - **An n-ary `max()` / `min()` translated to a C `fmax` / `fmin` call with the
   wrong number of arguments, so codegen refused a model the interpreter ran
