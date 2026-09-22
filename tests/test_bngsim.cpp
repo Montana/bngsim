@@ -2263,6 +2263,99 @@ int test_clone_rederives_in_dependency_order() {
     return 0;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Regression: issue #569 — the SSA stuck fast-forward records expressions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// setenv/unsetenv are POSIX; MSVC spells the same thing _putenv_s.
+static void set_test_env(const char *key, const char *val) {
+#ifdef _WIN32
+    _putenv_s(key, val ? val : "");
+#else
+    if (val)
+        setenv(key, val, 1);
+    else
+        unsetenv(key);
+#endif
+}
+
+int test_ssa_stuck_records_expressions() {
+    // A -> B with nothing to run it backwards: once the last A is consumed the
+    // total propensity is 0 and the SSA fast-forwards every remaining sample at
+    // the frozen state. Those rows must carry the function's value —
+    // `expressions_` is zero-filled by set_expression_names(), so a row nobody
+    // wrote reads back as 0.0, and for `fA = Atot + 100` that is a value the
+    // model cannot produce at all.
+    //
+    // Two legs, because the omission sat in BOTH fast-forward branches. Leg A
+    // pins the interpreted loop's "truly stuck" path. Leg B asks for the
+    // in-process cc backend, which reaches the GH #190 recompute-all fast loop
+    // on POSIX with a C compiler and falls back to interpreted elsewhere — so
+    // its leg label is the backend the run actually reports.
+    auto build_model = []() {
+        bngsim::ModelBuilder b;
+        b.add_parameter("k1", 2.0);
+        int a = b.add_species("A", 5.0);
+        int bb = b.add_species("B", 0.0);
+        b.add_observable("Atot", {{a, 1.0}});
+        b.add_observable("Btot", {{bb, 1.0}});
+        b.add_function("fA", "Atot + 100");
+        b.add_reaction({a}, {bb}, bngsim::RateLawType::Elementary, "k1");
+        return b.build();
+    };
+
+    // Every row whose A has reached 0 is a fast-forwarded row. fA is identically
+    // 100 there, which is what the ODE engine reports for the same model.
+    auto check_frozen = [](const bngsim::Result &r, const std::string &leg) -> int {
+        const auto &sp = r.species_data();
+        const auto &ex = r.expression_data();
+        const int ns = r.n_species();
+        const int ne = r.n_expressions();
+        CHECK(ne == 1, leg + ": expected exactly one expression column");
+        int frozen = 0;
+        for (int t = 0; t < r.n_times(); ++t) {
+            if (sp[t * ns + 0] != 0.0)
+                continue; // A still present — an ordinary recording site
+            ++frozen;
+            CHECK_CLOSE(ex[t * ne + 0], 100.0, 1e-12,
+                        leg + ": fast-forwarded row must report fA = 100, not the zero-fill");
+        }
+        CHECK(frozen > 0, leg + ": A should be exhausted well before t=10 at k1=2");
+        return 0;
+    };
+
+    // ── Leg A: the interpreted loop's "truly stuck" branch ───────────────────
+    set_test_env("BNGSIM_SSA_NO_CODEGEN", "1");
+    set_test_env("BNGSIM_SSA_PROP_CC", nullptr);
+    set_test_env("BNGSIM_SSA_RECOMPUTE_ALL", nullptr);
+    {
+        auto model = build_model();
+        bngsim::SsaSimulator sim(model);
+        auto r = sim.run(bngsim::TimeSpec{0.0, 10.0, 11}, 7);
+        CHECK(r.ssa_diagnostics().propensity_backend == "interpreted",
+              "leg A should pin the interpreted propensity path");
+        int rc = check_frozen(r, "interpreted");
+        if (rc)
+            return rc;
+    }
+
+    // ── Leg B: the GH #190 fast loop, where the host can reach it ────────────
+    set_test_env("BNGSIM_SSA_NO_CODEGEN", nullptr);
+    set_test_env("BNGSIM_SSA_PROP_CC", "1");
+    set_test_env("BNGSIM_SSA_RECOMPUTE_ALL", "1");
+    {
+        auto model = build_model();
+        bngsim::SsaSimulator sim(model);
+        auto r = sim.run(bngsim::TimeSpec{0.0, 10.0, 11}, 7);
+        int rc = check_frozen(r, r.ssa_diagnostics().propensity_backend);
+        if (rc)
+            return rc;
+    }
+    set_test_env("BNGSIM_SSA_PROP_CC", nullptr);
+    set_test_env("BNGSIM_SSA_RECOMPUTE_ALL", nullptr);
+    return 0;
+}
+
 int test_event_bolus_dose() {
     // Model: S decays exponentially, dS/dt = -k*S, S(0) = 100, k = 0.1
     // Event: at time() >= 10, set S = S + 50  (bolus dose)
@@ -2959,6 +3052,7 @@ int main() {
     RUN_TEST(test_ssa_reproducibility);
     RUN_TEST(test_ssa_reaction_stats);
     RUN_TEST(test_ssa_fractional_initial_population_rounds);
+    RUN_TEST(test_ssa_stuck_records_expressions);
     RUN_TEST(test_observables);
     RUN_TEST(test_c_api);
     RUN_TEST(test_reserved_names);
