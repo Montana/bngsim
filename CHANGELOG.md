@@ -16,6 +16,36 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A chained power `a^b^c` translated to `pow(a, b)pow(, c)`, so codegen
+  refused a model the interpreter ran (issue #555).** `_replace_power_op`
+  rewrote each `^` as it reached it and pushed the whole `pow(...)` string into
+  its output list, which `_extract_base_left` reads one element at a time as if
+  every element were a single character. On the second `^` of a chain that
+  element is the string `pow(a, b)`: not `)` or `]`, not alphanumeric, so
+  nothing was collected and the base came back empty. Any rate law, function
+  body or observable holding two or more unparenthesised `^` produced C that
+  would not compile — under `codegen=True` and under forward sensitivities
+  alike — while ExprTk evaluated the same string without complaint.
+
+  The whole chain is now collected at the first `^` and folded from the right,
+  which is both how ExprTk parses it and what `_saturable_jacobian`'s grammar
+  already documented (`power := atom ('^' unary)?`): `a^b^c` becomes
+  `pow(a, pow(b, c))`, so `2^3^2` is 512 and not 64. A link carrying a unary
+  minus heads the power that follows it rather than binding to the bare
+  operand, again matching ExprTk — `a^-b^c` becomes `pow(a, -pow(b, c))`, so
+  `2^-1^2` is 0.5 and not 2. One helper serves both translation routes
+  (`_translate_expr_to_c` for the model path, `_translate_expr` for the `.net`
+  path), so the single change covers both, and the MIR JIT backend with them,
+  since it consumes the same generated C.
+
+  Covered by unit cases for the rewrite — spacing, `p[i]` refs,
+  scientific-notation literals, bracketed links, a chain inside a call, and
+  both minus positions — and by two codegen ↔ interpreter parity cases
+  (`2^3^2`, `2^-1^2`); every one of them fails on the previous behavior. The
+  sibling gaps in the same exponent scan, where the operand is a function call
+  or carries a spaced or doubled sign, are unchanged and tracked in #657 and
+  #573. From @Montana.
+
 - **`clone()` re-derives parameters in dependency order, not declaration order
   (issue #626).** `src/model_impl.hpp` states that `derived_param_order` is the
   only order any re-evaluation pass may walk, since a declaration-order pass

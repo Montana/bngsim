@@ -65,6 +65,43 @@ class TestReplacePowerOp:
         assert _replace_power_op("k0 * A_obs / 10") == "k0 * A_obs / 10"
 
 
+class TestReplacePowerOpChained:
+    """An unparenthesised chain ``a^b^c`` is right-associative (GH #555).
+
+    The rewrite used to treat the second ``^`` as applying to the ``pow(...)``
+    it had just emitted, found no base there and wrote ``pow(a, b)pow(, c)`` —
+    invalid C, so any model with such a chain lost codegen and forward
+    sensitivities while the ExprTk interpreter ran it fine as ``a^(b^c)``.
+    """
+
+    @pytest.mark.parametrize(
+        "expr,want",
+        [
+            ("a^b^c", "pow(a, pow(b, c))"),
+            ("a ^ b ^ c", "pow(a, pow(b, c))"),
+            ("a^b^c^d", "pow(a, pow(b, pow(c, d)))"),
+            ("p[0]^p[1]^p[2]", "pow(p[0], pow(p[1], p[2]))"),
+            ("(a+b)^c^2", "pow((a+b), pow(c, 2))"),
+            ("a^(b)^c", "pow(a, pow((b), c))"),
+            ("2e-3^1e-3^2", "pow(2e-3, pow(1e-3, 2))"),
+            ("exp(a^b^c)", "exp(pow(a, pow(b, c)))"),
+            ("a^b^c+d^e", "pow(a, pow(b, c))+pow(d, e)"),
+            # ExprTk's unary minus heads the power, a^-b^c == a^(-(b^c)) ...
+            ("a^-b^c", "pow(a, -pow(b, c))"),
+            # ... and a trailing signed exponent is just a negative operand.
+            ("a^b^-c", "pow(a, pow(b, -c))"),
+        ],
+    )
+    def test_chain_is_right_associative(self, expr, want):
+        assert _replace_power_op(expr) == want
+
+    def test_expr_to_c_chain(self):
+        from bngsim._codegen import _expr_to_c
+
+        out = _expr_to_c("a^b^c", ["a", "b", "c"], [], [], [])
+        assert out == "pow(p[0], pow(p[1], p[2]))"
+
+
 class TestReplacePowerOpScientificNotation:
     """A signed exponent must not split the literal (GH #240).
 
@@ -615,6 +652,11 @@ class TestExprTkConstructs:
             # ``a^((10^c)+1)``. The outer ^ used to be replaced but the
             # inner one survived untouched.
             ("caret_nested", "k0 * A_obs * (2.0^((1^1)+1)) / 4.0"),
+            # Unparenthesised chain (GH #555): used to emit
+            # ``pow(2, 3)pow(, 2)``. Right-associative, so 2^3^2 = 2^9 = 512,
+            # not (2^3)^2 = 64.
+            ("caret_chain", "k0 * A_obs * (2^3^2) / 512.0"),
+            ("caret_chain_neg", "k0 * A_obs * (2^-1^2) * 2.0"),
             # if(cond, a, b) — must become C ternary, not the C ``if`` keyword.
             ("if_branch", "k0 * if(A_obs>0, 1.0, 0.0)"),
             # abs(x) — must become fabs() so doubles aren't silently
