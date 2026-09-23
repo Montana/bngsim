@@ -1081,11 +1081,24 @@ Result NfsimSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_
     // process died with a segfault rather than an exception the caller could
     // catch. The sibling RuleMonkey backend has refused this since it was
     // written (rulemonkey_interval_count); this says the same thing in the same
-    // words. Checked before create_system() so nothing is built or leaked: the
-    // System below is a raw pointer this function deletes on the way out.
+    // words. Checked before create_system() so nothing is built at all on this
+    // path.
     require_positive_n_points("NfsimSimulator::run", times.effective_n_points());
 
-    auto *system = impl_->create_system();
+    // GH #577 — the System is owned for the whole function, not from the
+    // stepping loop onwards. It used to be a bare pointer freed in two places:
+    // a catch around the loop, and a delete before the return. Everything
+    // between its creation and that try block was unguarded — prepare_system()
+    // ("NFsim setup failed" on a bad model or a failed override bake),
+    // times.output_times(), result.allocate(), resolve_output_functions() — and
+    // a throw from any of them walked out of the function leaving the whole
+    // parsed System behind. That is megabytes each time on a real model (it
+    // scales with molecule_limit: ~3 KB per call at 1,000, ~5 MB at 100,000),
+    // and a parameter scan that trips prepare_system repeats it per point.
+    // unique_ptr frees it on every path out, so the two hand-written deletes
+    // and the catch-and-rethrow that existed only to run one of them are gone.
+    std::unique_ptr<::NFcore::System> system_owner(impl_->create_system());
+    auto *system = system_owner.get();
     impl_->prepare_system(system, seed);
 
     // Wall-clock budget. Checked between each stepTo() because NFsim's
@@ -1133,7 +1146,7 @@ Result NfsimSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_
     result.record_expressions(0, fn_buf.data());
 
     // Simulation loop using stepTo()
-    try {
+    {
         StreamSuppressor suppress;
         for (int i = 1; i < n_points; ++i) {
             if (budget.active())
@@ -1146,19 +1159,12 @@ Result NfsimSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_
             eval_function_set(fn_set.funcs, fn_buf);
             result.record_expressions(i, fn_buf.data());
         }
-    } catch (...) {
-        // Free the parsed System before propagating (no other cleanup hook
-        // on this path). Catches TimeoutError as well as any NFsim-internal
-        // exception that may surface here.
-        delete system;
-        throw;
     }
 
     // Solver stats
     result.solver_stats().n_steps = system->getGlobalEventCounter();
     result.solver_stats().n_rhs_evals = system->getGlobalEventCounter();
 
-    delete system;
     return result;
 }
 
