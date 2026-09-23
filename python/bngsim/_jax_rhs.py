@@ -132,6 +132,10 @@ _JAX_MATH_FUNCS: dict[str, str] = {
     "atanh": "jnp.arctanh",
     "sign": "jnp.sign",
     "sgn": "jnp.sign",
+    # ExprTk takes `not` only as a call, `not(x)`. Python's `not` asks a traced
+    # value for bool() under jax.jit, and ExprTk reads a number as its truth
+    # value, which jnp.logical_not does too (GH #579).
+    "not": "jnp.logical_not",
 }
 
 # The engine's reserved constants, bound on every expression it compiles. Same
@@ -180,7 +184,10 @@ _JAX_HELPERS: dict[str, Any] = {"__bngsim_round__": _jax_round, "__bngsim_rint__
 # Python keywords an expression may legitimately contain. Every other bare name
 # left after translation is a NameError waiting for solve time.
 _JAX_EVAL_NAMES = frozenset({"jnp", "t", "params", "obs", "y", *_JAX_HELPERS})
-_PY_KEYWORDS = frozenset({"and", "or", "not", "if", "else", "True", "False", "None"})
+# Not `and`/`or`/`not`: _regroup_for_python and the table turn those into
+# jnp.logical_* calls, and one that survived would ask a tracer for bool()
+# under jax.jit (GH #579).
+_PY_KEYWORDS = frozenset({"if", "else", "True", "False", "None"})
 
 # An identifier that is not an attribute access: `jnp.log` is one name, not two.
 _BARE_IDENT_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)")
@@ -336,12 +343,26 @@ def _regroup_operand(expr: str) -> str:
     that, left-fold its comparison run."""
     parts = _split_top_level_ops(expr, _LOGICAL_OPS)
     if len(parts) > 1:
-        out = []
-        for idx, part in enumerate(parts):
-            # The spaces are load-bearing for the word spellings: `(a)or(b)` is
-            # not Python. `&&`/`||` are spaced again when they are replaced.
-            out.append(f" {part} " if idx % 2 else f"({_regroup_operand(part).strip()})")
-        return "".join(out)
+        # Emitted as calls, not operators. Python's `and`/`or` ask a traced value
+        # for bool(), which fails under the jax.jit the Jacobian is built with,
+        # and `&`/`|` refuse a float operand — where ExprTk reads any number as
+        # its truth value (`2 and 3` is 1). jnp.logical_and/or do both. `and`
+        # binds tighter than `or`, as ExprTk has it (`1 or 0 and 0` is 1), so
+        # each run of conjunctions is folded first and the disjuncts after.
+        operands = [_regroup_operand(part).strip() for part in parts[0::2]]
+        disjuncts: list[str] = []
+        current = operands[0]
+        for op, operand in zip(parts[1::2], operands[1:], strict=True):
+            if op in ("&&", "and"):
+                current = f"jnp.logical_and({current}, {operand})"
+            else:
+                disjuncts.append(current)
+                current = operand
+        disjuncts.append(current)
+        folded = disjuncts[0]
+        for disjunct in disjuncts[1:]:
+            folded = f"jnp.logical_or({folded}, {disjunct})"
+        return folded
 
     parts = _split_top_level_ops(expr, _COMPARISON_OPS)
     if len(parts) <= 3:
@@ -378,7 +399,8 @@ def _translate_expr_jax(
     # whose precedence differs (GH #579).
     c = _regroup_for_python(c)
 
-    # Replace logical operators FIRST
+    # _regroup_for_python has already turned every balanced &&/|| into a
+    # jnp.logical_* call; this only reaches text it left as written.
     c = c.replace("&&", " & ")
     c = c.replace("||", " | ")
 

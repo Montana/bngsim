@@ -88,6 +88,10 @@ CORPUS: tuple[str, ...] = (
     "k^n^z^q",
     "A^B^2",
     "A^-n",
+    # #573, fixed by #680: a sign run or a plus ahead of the exponent.
+    "A^+n",
+    "A^--n",
+    "k^-(z+n)",
     "-k^n",
     "-A^-n",
     "(A+B)^2",
@@ -162,6 +166,16 @@ CORPUS: tuple[str, ...] = (
     "if(time()>1 && A>1, 1, 0)",
     "k*if(A>B && n<q, 2, 3)",
     "max(if(A>B && k>n,1,0), 0)",
+    # `and` binds tighter than `or` in ExprTk (`1 or 0 and 0` is 1), and any
+    # nonzero number is true (`2 and 3` is 1). `not` is ExprTk's only negation
+    # and must be written as a call. Python's and/or/not fail on these under
+    # jax.jit, which is where the JAX leg evaluates them.
+    "if(A>B or k>n and z>q, 1, 0)",
+    "if(A>B || k>n && z>q, 1, 0)",
+    "if(A && B, 1, 0)",
+    "if(A>B && z, 1, 0)",
+    "if(not(A>B), 1, 0)",
+    "if(not(A>B) || k<n, 1, 0)",
     # Constants.
     "_pi*_e",
     "_pi*A",
@@ -258,8 +272,13 @@ def _compiled_c(expr: str, obs: dict[str, float], t: float) -> float:
 
 def _jax(expr: str, obs: dict[str, float], t: float) -> float:
     """The same expression through the JAX translator, evaluated in the
-    namespace the generated RHS evaluates it in."""
+    namespace the generated RHS evaluates it in — under ``jax.jit``, because
+    that is how the Jacobian is built (``jax.jit(jax.jacfwd(rhs))``). An
+    untraced eval hands Python's ``and``/``or``/``not`` concrete values and
+    lets them through; a traced one asks a tracer for ``bool()`` and fails,
+    as the solve does."""
     jax_available()  # also switches JAX to float64, as the RHS does
+    import jax
     import jax.numpy as jnp
     from bngsim._jax_rhs import _JAX_HELPERS
 
@@ -270,14 +289,19 @@ def _jax(expr: str, obs: dict[str, float], t: float) -> float:
         set(),
         [],
     )
-    namespace = {
-        "jnp": jnp,
-        "params": jnp.array(list(PARAMS.values()), dtype=jnp.float64),
-        "obs": jnp.array(list(obs.values()), dtype=jnp.float64),
-        "t": t,
-        **_JAX_HELPERS,
-    }
-    return float(eval(code, {"__builtins__": {}}, namespace))  # noqa: S307
+
+    @jax.jit
+    def evaluate(obs_arr, t_arr):
+        namespace = {
+            "jnp": jnp,
+            "params": jnp.array(list(PARAMS.values()), dtype=jnp.float64),
+            "obs": obs_arr,
+            "t": t_arr,
+            **_JAX_HELPERS,
+        }
+        return eval(code, {"__builtins__": {}}, namespace)  # noqa: S307
+
+    return float(evaluate(jnp.array(list(obs.values()), dtype=jnp.float64), jnp.float64(t)))
 
 
 # ── The differential ─────────────────────────────────────────────────────────
@@ -343,7 +367,7 @@ def test_the_forms_jax_declines_are_ones_the_other_two_do_handle(expr: str):
         )
 
 
-# ── The divergence this suite found, and the one it still names ──────────────
+# ── The divergence this suite found ─────────────────────────────────────────────
 
 
 @needs_jax
@@ -435,20 +459,3 @@ def test_a_gated_rate_law_reaches_the_jax_rhs_intact(tmp_path):
         expected = np.asarray(model.rhs(state, 0.0))
         got = np.asarray(rhs(jnp.array(state), 0.0, params))
         assert got == pytest.approx(expected, rel=1e-12, abs=1e-15), f"at {state}"
-
-
-@needs_cc
-@pytest.mark.xfail(
-    reason="GH #573: an explicit unary plus in an exponent emits pow(A, )+n",
-    strict=False,
-)
-def test_a_signed_exponent_still_diverges():
-    """The one divergence the corpus finds that this branch does not close.
-
-    ``A^+n`` is valid ExprTk and the interpreter evaluates it as ``A^n``; the
-    codegen translator emits ``pow(A, )+n``, which does not compile. It has its
-    own issue and its own fix; it is named here so the suite tracks it rather
-    than omitting the shape that would have caught it.
-    """
-    obs, t = POINTS[0]
-    assert _compiled_c("A^+n", obs, t) == pytest.approx(_interpreter("A^+n", obs, t))
