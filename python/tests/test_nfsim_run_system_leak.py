@@ -17,10 +17,12 @@ The System is now owned by a ``unique_ptr`` for the whole function, so every
 path out frees it — and the catch-and-rethrow that existed only to run one of
 the two deletes is gone with it.
 
-The measurement below runs in a subprocess under an ``RLIMIT_AS`` cap, so the
-allocation that triggers the throw fails at a fixed size rather than depending
-on how much memory the machine happens to have. Linux only, for ``/proc`` and
-the address-space limit; skipped elsewhere.
+Two throws exercise it. The first is an allocation in ``result.allocate()``,
+measured in a subprocess under an ``RLIMIT_AS`` cap so it fails at a fixed size
+rather than depending on how much memory the machine has — Linux only, for
+``/proc`` and the address-space limit. The second is NFsim's own setup failing
+on a model whose function names a missing observable: deterministic on every
+platform, and the only path where a *half-prepared* System is freed.
 """
 
 from __future__ import annotations
@@ -103,77 +105,108 @@ def test_a_throwing_run_does_not_retain_the_system(nfsim_xml: Path):
     )
 
 
-# ── The behaviour around it, which needs no measurement ──────────────────────
+# ── A throw from inside NFsim's own setup, on every platform ─────────────────
 #
-# These two drive the same oversized allocation, so they run in a child process
-# too. In the pytest process they relied on 2e9 points failing to allocate
-# immediately; under Linux overcommit a ~16 GB request can instead *succeed*,
-# get zero-filled page by page, and take the runner down with it (exit 143 on
-# ubuntu-latest-lapack, run 35893818826). In a child, under the same RLIMIT_AS
-# cap as the probe above, the allocation fails at a fixed size.
-#
-# That cap is what makes them tests at all, so they are Linux-only like the
-# probe. macOS does not enforce RLIMIT_AS: there the uncapped child's request
-# succeeded lazily and the OS killed it (returncode -9, macos-14, run
-# 35904461799), and Windows has no RLIMIT_AS. The ordinary-run test below needs
-# no allocation and runs everywhere.
+# The probe above throws from result.allocate(), after prepare_system() has
+# finished. prepare_system() is the other way out of the window, and the one a
+# user actually reaches: NFsim parses the model, then throws "Quitting" part-way
+# through System::prepareForSimulation(). The fixture's global function names an
+# observable that does not exist, which gets there cheaply and deterministically
+# on every platform — no oversized allocation, no address-space cap. It is also
+# the one path where the unique_ptr frees a System that was only half prepared;
+# before GH #577 that System was leaked, so nothing had ever freed one.
 
-_CAPPED_PRELUDE = f"""
-import sys
-if sys.platform.startswith("linux"):
-    import resource
-    resource.setrlimit(resource.RLIMIT_AS, ({_ADDRESS_SPACE_CAP},) * 2)
+_SETUP_FAILURE_CALLS = 200
+
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-specific: peak RSS comes from resource.getrusage, which Windows lacks",
+)
+
+_SETUP_FAILURE_PROBE = f"""
+import resource, sys
 from bngsim._bngsim_core import NfsimSimulator, TimeSpec
 
-def oversized():
-    ts = TimeSpec()
-    ts.t_start, ts.t_end, ts.n_points = 0.0, 1.0, 2_000_000_000
-    return ts
+def peak_bytes():
+    kb_or_b = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return kb_or_b if sys.platform == "darwin" else kb_or_b * 1024
 
-def raises(sim):
+ts = TimeSpec()
+ts.t_start, ts.t_end, ts.n_points = 0.0, 1.0, 3
+sim = NfsimSimulator(sys.argv[1])
+
+def failing_call():
     try:
-        sim.run(oversized(), 42, 0.0)
-    except (MemoryError, RuntimeError, ValueError) as exc:
-        return type(exc).__name__
-    return None
+        sim.run(ts, 42, 0.0)
+    except RuntimeError:
+        return
+    raise AssertionError("run() did not raise on the setup-failure fixture")
+
+for _ in range(20):  # let the allocator and NFsim's statics settle first
+    failing_call()
+before = peak_bytes()
+for _ in range({_SETUP_FAILURE_CALLS}):
+    failing_call()
+print(peak_bytes() - before)
 """
 
 
-def _run_capped(body: str, nfsim_xml: Path) -> list[str]:
+@pytest.fixture
+def setup_failure_xml(data_dir: Path) -> Path:
+    return data_dir / "nfsim" / "setup_failure_unknown_observable.xml"
+
+
+def _three_points():
+    from bngsim._bngsim_core import TimeSpec
+
+    ts = TimeSpec()
+    ts.t_start, ts.t_end, ts.n_points = 0.0, 1.0, 3
+    return ts
+
+
+def test_a_setup_failure_still_raises_every_time(setup_failure_xml: Path):
+    """Freeing the half-prepared System must not swallow the error that freed
+    it, nor leave anything behind that changes the next call."""
+    from bngsim._bngsim_core import NfsimSimulator
+
+    sim = NfsimSimulator(str(setup_failure_xml))
+    for _ in range(_SETUP_FAILURE_CALLS):
+        with pytest.raises(RuntimeError, match="NFsim setup failed"):
+            sim.run(_three_points(), 42, 0.0)
+
+
+def test_a_simulator_still_runs_after_a_setup_failure(
+    setup_failure_xml: Path, nfsim_funccols_xml: Path
+):
+    """The same model with the reference intact runs, after a string of failed
+    setups in the same process: the teardown corrupted nothing."""
+    from bngsim._bngsim_core import NfsimSimulator
+
+    failing = NfsimSimulator(str(setup_failure_xml))
+    for _ in range(20):
+        with pytest.raises(RuntimeError):
+            failing.run(_three_points(), 42, 0.0)
+    assert NfsimSimulator(str(nfsim_funccols_xml)).run(_three_points(), 42, 0.0).n_times == 3
+
+
+@_POSIX_ONLY
+def test_a_setup_failure_does_not_retain_the_half_prepared_system(setup_failure_xml: Path):
+    """Peak RSS is a ceiling, not a live count, but a leak can only raise it —
+    and in a fresh process past a warm-up there is nothing else to. Before the
+    fix it grew ~27 MB over these calls on macOS (~150 KB per call, this small
+    model's System); after it, not at all."""
     proc = subprocess.run(
-        [sys.executable, "-c", _CAPPED_PRELUDE + body, str(nfsim_xml)],
+        [sys.executable, "-c", _SETUP_FAILURE_PROBE, str(setup_failure_xml)],
         capture_output=True,
         text=True,
         timeout=600,
     )
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout.strip().splitlines()
-
-
-@_LINUX_ONLY
-def test_the_oversized_run_still_raises(nfsim_xml: Path):
-    """Freeing the System must not swallow the error that freed it."""
-    out = _run_capped(
-        "print(raises(NfsimSimulator(sys.argv[1])))\n",
-        nfsim_xml,
+    grew = float(proc.stdout.strip().splitlines()[-1])
+    assert grew < 4 * 1024 * 1024, (
+        f"peak RSS grew {grew / 1e6:.1f} MB over {_SETUP_FAILURE_CALLS} setup-failure "
+        "calls; the half-prepared System is not being freed"
     )
-    assert out[-1] != "None", "run() returned instead of raising on 2e9 points"
-
-
-@_LINUX_ONLY
-def test_a_simulator_still_runs_after_a_throw(nfsim_xml: Path):
-    """The throw leaves nothing half-owned behind it: the same simulator
-    parses a fresh System and runs."""
-    out = _run_capped(
-        "sim = NfsimSimulator(sys.argv[1])\n"
-        "print(raises(sim))\n"
-        "good = TimeSpec()\n"
-        "good.t_start, good.t_end, good.n_points = 0.0, 1.0, 3\n"
-        "print(sim.run(good, 42, 0.0).n_times)\n",
-        nfsim_xml,
-    )
-    assert out[-2] != "None", "run() returned instead of raising on 2e9 points"
-    assert out[-1] == "3"
 
 
 def test_the_ordinary_run_is_unchanged(nfsim_xml: Path):
