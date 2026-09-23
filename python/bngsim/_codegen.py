@@ -6458,28 +6458,52 @@ def _extract_exp_right(expr: str, start: int) -> tuple[str, int]:
     if i >= len(expr):
         return "0", i
 
+    # GH #573 — the leading unary signs, as a run.
+    #
+    # Only a single `-` immediately followed by a bare token was handled, and
+    # every other spelling the engine accepts fell through to the unsigned scan,
+    # which stops on a sign because `+`/`-` are not in its character class. The
+    # sign was then left behind as loose text and the exponent came back empty:
+    # `x^+2` emitted `pow(x, )+2`, `x^--2` emitted `pow(x, -)-2`, and `x^-(y+2)`
+    # emitted `pow(x, -)(y+2)`. None of those is C a compiler will take, and the
+    # interpreter evaluates all of them, so a model that ran interpreted lost
+    # codegen and forward sensitivities on a `+` it was entitled to write.
+    #
+    # ExprTk folds a run of unary signs the ordinary way — `--n` is `n`, `+-n`
+    # is `-n` — and allows spaces between them, so the run is collected here and
+    # reduced to one effective sign. What follows it is the same operand the
+    # unsigned scan below takes: a parenthesised group or a bare token.
+    negate = False
+    saw_sign = False
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "+-":
+            negate = negate != (ch == "-")
+            saw_sign = True
+            i += 1
+        elif ch.isspace() and saw_sign:
+            i += 1
+        else:
+            break
+
+    if i >= len(expr):
+        return "0", i
+
+    sign = "-" if negate else ""
+
     # Check for '(' — find matching close
     if expr[i] == "(":
         end = _find_matching_paren(expr, i)
-        return expr[i : end + 1], end + 1
-    # Check for unary minus
-    if expr[i] == "-":
-        i += 1
-        start_num = i
-        while i < len(expr) and (expr[i].isalnum() or expr[i] in "_.[]"):
-            i += 1
-        # GH #240 — `x^-1e-3`: the class stops at the exponent's sign, so the
-        # literal is only half taken. Same fix as the unsigned case below.
-        i += _sci_exponent_suffix_len(expr[start_num:i], expr, i)
-        return f"-{expr[start_num:i]}", i
+        return sign + expr[i : end + 1], end + 1
     # Collect identifier or number
     start_tok = i
     while i < len(expr) and (expr[i].isalnum() or expr[i] in "_.[]"):
         i += 1
     # GH #240 — `x^1e-3` would otherwise emit `pow(x, 1e)-3`, which is neither
-    # valid C (`exponent has no digits`) nor the intended number.
+    # valid C (`exponent has no digits`) nor the intended number. The same scan
+    # serves a signed exponent, which reaches here with its sign already taken.
     i += _sci_exponent_suffix_len(expr[start_tok:i], expr, i)
-    return expr[start_tok:i], i
+    return sign + expr[start_tok:i], i
 
 
 def _amount_volume_factors(species: list[dict]) -> tuple[dict[int, float], dict[int, int]]:
