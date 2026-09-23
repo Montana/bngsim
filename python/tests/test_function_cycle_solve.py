@@ -122,6 +122,87 @@ def test_the_corpus_model_integrates():
     assert species[-1, 0] > species[0, 0]  # it actually moves
 
 
+# ─── Scale invariance (issue #782) ───────────────────────────────────────────
+#
+# The solve seeds x = 0 and used to test convergence against an absolute
+# 1e-12 before any Newton step, so a group whose values were all <= ~1e-12 was
+# "solved" at F(0) — the answer with every other member read as 0 — and marked
+# converged, silently. A cyclic model has no preferred scale; these pin that.
+
+_SCALES = [1.0, 1e-9, 1e-11, 3e-12, 1.5e-12, 1e-12, 1e-13, 1e-20]
+
+_DECAY_NET = """begin parameters
+    1 A0 {A0}
+end parameters
+begin functions
+    1 F1() Atot-F2()
+    2 F2() 0.5*F1()
+    3 kr() F2()/Atot
+end functions
+begin species
+    1 A() A0
+    2 B() 0
+end species
+begin reactions
+    1 1 2 kr
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+@pytest.mark.parametrize("a0", _SCALES)
+def test_a_cyclic_decay_does_not_depend_on_its_scale(tmp_path, a0):
+    """F2 = Atot/3 in closed form, so kr = 1/3 and A = A0*exp(-t/3) for ANY A0.
+
+    Before the fix: A0 <= 1e-12 never decayed ([1, 1, 1, 1]); A0 = 3e-12 and
+    1.5e-12 decayed until A reached 1e-12 and then froze there.
+    """
+    net = tmp_path / "cyc.net"
+    net.write_text(_DECAY_NET.format(A0=a0))
+    r = bngsim.Simulator(bngsim.Model.from_net(str(net)), "ode").run(
+        (0.0, 6.0), 4, rtol=1e-10, atol=a0 * 1e-12
+    )
+    t = np.asarray(r.time)
+    ratio = np.asarray(r.species)[:, 0] / a0
+    np.testing.assert_allclose(ratio, np.exp(-t / 3.0), rtol=1e-8)
+
+
+@pytest.mark.parametrize("rt", [1.0, 1e-13, 1e-30, 1e30])
+def test_a_nonlinear_cycle_does_not_depend_on_its_scale(rt):
+    """`f = Rt - g`, `g = f*f/Rt` solves to f = Rt*(sqrt(5)-1)/2 at any Rt.
+
+    Nonlinear, so it also needs the FD Jacobian step to scale with the group:
+    a fixed `1e-7*(|x|+1)` step is ~1e6x a 1e-13 group.
+    """
+    b = ModelBuilder()
+    b.add_parameter("Rt", rt, "", False)
+    b.add_species("S", 1.0, False, 1.0)
+    b.add_function("f", "Rt - g")
+    b.add_function("g", "f*f/Rt")
+    b.add_reaction([0], [], "functional", "f", 1.0, True)
+    m = bngsim.Model(_core=b.build())
+    y = np.array(m.get_state())
+    values = [float(np.asarray(m.rhs(y, 0.0))[0]) for _ in range(3)]
+    assert len(set(values)) == 1
+    assert -values[0] / rt == pytest.approx((5**0.5 - 1) / 2, rel=1e-10)
+
+
+def test_the_corpus_model_keeps_its_ratios_at_a_tiny_receptor_total():
+    """Issue #782's corpus reproduction: at R_Total = 1e-13 the muscarinic group
+    reported R/R_Total = 1.0 and RG = 0. The ratios must match R_Total = 1e-9."""
+    suffix = "_caveolar_muscarinic_receptor_module"
+
+    def ratios(total):
+        m = _corpus_model()
+        m.set_param("R_Total" + suffix, total)
+        m.rhs(np.array(m.get_state()), 0.0)
+        return np.array([m.get_param(n + suffix) / total for n in ("R", "RG")])
+
+    np.testing.assert_allclose(ratios(1e-13), ratios(1e-9), rtol=1e-8)
+
+
 # ─── What must not change ────────────────────────────────────────────────────
 
 
