@@ -110,10 +110,13 @@ def test_a_throwing_run_does_not_retain_the_system(nfsim_xml: Path):
 # immediately; under Linux overcommit a ~16 GB request can instead *succeed*,
 # get zero-filled page by page, and take the runner down with it (exit 143 on
 # ubuntu-latest-lapack, run 35893818826). In a child, under the same RLIMIT_AS
-# cap as the probe above, the allocation fails at a fixed size. Where RLIMIT_AS
-# is not enforced (macOS) the child still runs uncapped, as these did before, so
-# no platform loses coverage — but the worst case now kills the child, not the
-# session.
+# cap as the probe above, the allocation fails at a fixed size.
+#
+# That cap is what makes them tests at all, so they are Linux-only like the
+# probe. macOS does not enforce RLIMIT_AS: there the uncapped child's request
+# succeeded lazily and the OS killed it (returncode -9, macos-14, run
+# 35904461799), and Windows has no RLIMIT_AS. The ordinary-run test below needs
+# no allocation and runs everywhere.
 
 _CAPPED_PRELUDE = f"""
 import sys
@@ -147,6 +150,7 @@ def _run_capped(body: str, nfsim_xml: Path) -> list[str]:
     return proc.stdout.strip().splitlines()
 
 
+@_LINUX_ONLY
 def test_the_oversized_run_still_raises(nfsim_xml: Path):
     """Freeing the System must not swallow the error that freed it."""
     out = _run_capped(
@@ -156,6 +160,7 @@ def test_the_oversized_run_still_raises(nfsim_xml: Path):
     assert out[-1] != "None", "run() returned instead of raising on 2e9 points"
 
 
+@_LINUX_ONLY
 def test_a_simulator_still_runs_after_a_throw(nfsim_xml: Path):
     """The throw leaves nothing half-owned behind it: the same simulator
     parses a fresh System and runs."""

@@ -121,6 +121,8 @@ jobs:
           python -m pytest -p no:cacheprovider \
             python/tests/test_nfsim*.py \
             --deselect python/tests/test_nfsim_run_system_leak.py::test_a_throwing_run_does_not_retain_the_system \
+            --deselect python/tests/test_nfsim_run_system_leak.py::test_the_oversized_run_still_raises \
+            --deselect python/tests/test_nfsim_run_system_leak.py::test_a_simulator_still_runs_after_a_throw \
             -rA --tb=long ${{ inputs.pytest_args }} \
             2>&1 | tee nfsim-windows.log
 
@@ -162,6 +164,9 @@ jobs:
           # a missing optional import means a module's oracle is absent (#291). A
           # test that is genuinely inapplicable on Windows should be xfailed or
           # deselected by name, and this guard amended to say which and why.
+          # Deselected: the three RLIMIT_AS tests in test_nfsim_run_system_leak.py
+          # (GH #577). Each needs the Linux address-space cap to make a 2e9-point
+          # allocation fail at a fixed size; Windows has no RLIMIT_AS.
           if [ "$skipped" -ne 0 ]; then
             echo "::error::$skipped test(s) skipped. On this leg a skip is a false green — see the comment above this check."
             exit 1
