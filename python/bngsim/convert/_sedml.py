@@ -28,6 +28,7 @@ emitted for interop with other SED-ML tools.
 
 from __future__ import annotations
 
+import re
 import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -409,16 +410,23 @@ def read_sedml(
             elif apk == _KISAO_MAXSTEPS:
                 max_steps = int(float(val))
 
-    # Outputs: each non-time data generator's name is the verbatim bngsim
-    # selector. Fall back to the variable's target/symbol when name is absent.
+    # Outputs. A document bngsim wrote carries the verbatim bngsim selector in
+    # @name, which is the round-trip source of truth and still wins. Every other
+    # writer follows the standard the other way round: @target holds the
+    # machine-readable XPath and @name a display label ("Free receptor (nM)"),
+    # so preferring @name there discarded the one resolvable field and handed
+    # the caller prose that no lookup can match (GH #563). Take @name only when
+    # it is a typed bngsim selector, else the selector the target yields, else
+    # the name as a last resort — which is what an observable or expression
+    # generator has, since neither has a standard SBML element to point at.
     outputs: list[str] = []
     for dg in _findall_local(root, "dataGenerator"):
         var = _find(dg, "variable")
         if var is not None and (var.get("symbol") or "").strip() == _TIME_SYMBOL:
             continue
-        label = dg.get("name") or (var.get("name") if var is not None else None)
-        if label is None and var is not None:
-            label = _selector_from_var(var)
+        name = dg.get("name") or (var.get("name") if var is not None else None)
+        target_sel = _selector_from_var(var) if var is not None else None
+        label = name if _is_typed_selector(name) else (target_sel or name)
         if label and label != "time":
             outputs.append(label)
 
@@ -441,12 +449,32 @@ def read_sedml(
     )
 
 
+# The kinds Result.resolve_outputs accepts, aliases included. A ``@name`` in
+# this shape was written by bngsim (or by a tool following it) and is already
+# the selector the caller wants; anything else is a display label.
+_SELECTOR_KINDS = ("species", "observable", "expression", "state", "function")
+_TYPED_SELECTOR_RE = re.compile(rf"\A(?:{'|'.join(_SELECTOR_KINDS)}):\S")
+
+# ``species[@id='R']`` inside an SBML XPath. The namespace prefix is whatever
+# the document bound (``sbml:``, ``s:``, or none at all), so it is not matched;
+# either quoting style is, since both are well-formed XML.
+_SPECIES_TARGET_RE = re.compile(r"""species\[\s*@id\s*=\s*['"]([^'"]+)['"]\s*\]""")
+
+
+def _is_typed_selector(label: str | None) -> bool:
+    """True when *label* already reads as a bngsim ``<kind>:<name>`` selector."""
+    if not label:
+        return False
+    return _TYPED_SELECTOR_RE.match(label.strip()) is not None
+
+
 def _selector_from_var(var: ET.Element) -> str | None:
     """Best-effort bngsim selector from a SED-ML variable's target/symbol."""
     target = var.get("target")
-    if target and "species[@id='" in target:
-        sid = target.split("species[@id='", 1)[1].split("'", 1)[0]
-        return f"species:{sid}"
+    if target:
+        m = _SPECIES_TARGET_RE.search(target)
+        if m:
+            return f"species:{m.group(1)}"
     return None
 
 
