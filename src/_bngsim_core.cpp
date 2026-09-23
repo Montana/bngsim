@@ -556,11 +556,32 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     // Acquire GIL to call Python
                     py::gil_scoped_acquire acquire;
 
-                    // Create numpy views (zero-copy) of the C arrays
-                    auto y_arr =
-                        py::array_t<double>({static_cast<py::ssize_t>(ns)}, {sizeof(double)}, y_ptr,
-                                            py::cast(0) // no owner — data lives in CVODE
-                        );
+                    // The state handed to the callback is a COPY (GH #576).
+                    //
+                    // This used to be a zero-copy view over CVODE's N_Vector
+                    // storage with `py::cast(0)` as its base — an integer, which
+                    // owns nothing and keeps nothing alive. Two ways that bit:
+                    //
+                    //  * a callback that retained the array (a trace, a debug
+                    //    log, a closure over it) held a numpy array pointing
+                    //    into memory CVODE frees at teardown. Reading it
+                    //    afterwards returned whatever had since been allocated
+                    //    there — plausible-looking floats, never an error;
+                    //  * the view was WRITEABLE over a `const double *`. A
+                    //    callback assigning into its argument wrote into
+                    //    CVODE's own vector — which did not move the
+                    //    trajectory in the cases probed here, since CVODE does
+                    //    not read that vector again after the Jacobian call,
+                    //    but is a const the binding had no business casting
+                    //    away and nothing documents as safe.
+                    //
+                    // A copy of ns doubles ends both, and costs nothing next to
+                    // the Jacobian evaluation it precedes — the callback is
+                    // about to do ns² work, and a JAX-traced one allocates far
+                    // more than this on its own. The copy is a genuine array:
+                    // it outlives the run, and writing into it is a caller's
+                    // business rather than a corrupted integrator.
+                    auto y_arr = py::array_t<double>(static_cast<py::ssize_t>(ns), y_ptr);
 
                     // Call Python: fn(t, y_array) -> flat column-major jac array
                     py::object result = py_fn(t, y_arr);
