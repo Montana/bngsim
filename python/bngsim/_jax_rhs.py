@@ -23,7 +23,7 @@ import logging
 import re
 from typing import Any
 
-from bngsim._codegen import _classify_rate_law, _parse_net_file
+from bngsim._codegen import _BUILTIN_CONSTANT_VALUES, _classify_rate_law, _parse_net_file
 
 logger = logging.getLogger("bngsim")
 
@@ -104,8 +104,9 @@ _JAX_MATH_FUNCS: dict[str, str] = {
     "min": "jnp.minimum",
     "max": "jnp.maximum",
     "pow": "jnp.power",
-    "rint": "jnp.round",
-    "round": "jnp.round",
+    # Not jnp.round, which rounds a half to EVEN — see _jax_round below.
+    "rint": "__bngsim_rint__",
+    "round": "__bngsim_round__",
     "trunc": "jnp.trunc",
     "floor": "jnp.floor",
     "ceil": "jnp.ceil",
@@ -129,22 +130,50 @@ _JAX_MATH_FUNCS: dict[str, str] = {
 
 # The engine's reserved constants, bound on every expression it compiles. Same
 # story as the functions above: nothing substitutes them, so `_pi` reached the
-# RHS as a bare name and raised NameError there.
+# RHS as a bare name and raised NameError there. The physical constants have no
+# jax.numpy name, so they are emitted as the values the engine binds.
 _JAX_CONSTANTS: dict[str, str] = {
+    **{name: repr(value) for name, value in _BUILTIN_CONSTANT_VALUES.items()},
     "_pi": "jnp.pi",
     "_e": "jnp.e",
-    # The bare spelling of the clock. `time()` and `t()` are rewritten above;
+    # The bare spelling of the clock. `time()` is parked above as _CLOCK_SYM;
     # the engine accepts `time` without parentheses too, and _BUILTIN_IDENT_MAP
-    # (the C path) maps it the same way.
+    # (the C path) maps it the same way. (`t()` is not the clock — issue #659.)
     "time": "t",
 }
 
 _JAX_NAMES: dict[str, str] = {**_JAX_MATH_FUNCS, **_JAX_CONSTANTS}
 
+
+# The engine's two roundings, neither of which jax.numpy spells. jnp.round
+# rounds a half to EVEN, so mapping either name onto it moved every exact half:
+# round(2.5) came out 2 here and 3 in the engine. They are not quite each other
+# either. `rint` is the engine's own adapter over C std::round
+# (src/expression.cpp), halves away from zero; `round` is ExprTk's
+# floor(x + 0.5), or ceil(x - 0.5) below zero, which agrees except where the
+# addition itself rounds — round(0.49999999999999994) is 1, rint of it is 0.
+# Each needs its argument twice, so the RHS namespace binds them as helpers.
+def _jax_round(x: Any) -> Any:
+    """ExprTk's ``round``: ``floor(x + 0.5)``, or ``ceil(x - 0.5)`` below zero."""
+    import jax.numpy as jnp
+
+    return jnp.where(x < 0, jnp.ceil(x - 0.5), jnp.floor(x + 0.5))
+
+
+def _jax_rint(x: Any) -> Any:
+    """The engine's ``rint``: C ``std::round``, a half rounded away from zero."""
+    import jax.numpy as jnp
+
+    whole = jnp.trunc(x)  # x - whole is exact, so the test below is too
+    return jnp.where(jnp.abs(x - whole) >= 0.5, whole + jnp.sign(x), whole)
+
+
+_JAX_HELPERS: dict[str, Any] = {"__bngsim_round__": _jax_round, "__bngsim_rint__": _jax_rint}
+
 # What the generated RHS binds around the eval (see generate_jax_rhs), plus the
 # Python keywords an expression may legitimately contain. Every other bare name
 # left after translation is a NameError waiting for solve time.
-_JAX_EVAL_NAMES = frozenset({"jnp", "t", "params", "obs", "y"})
+_JAX_EVAL_NAMES = frozenset({"jnp", "t", "params", "obs", "y", *_JAX_HELPERS})
 _PY_KEYWORDS = frozenset({"and", "or", "not", "if", "else", "True", "False", "None"})
 
 # An identifier that is not an attribute access: `jnp.log` is one name, not two.
@@ -394,6 +423,7 @@ def generate_jax_rhs(net_path: str) -> Any:
             _safe_py_name(fname)
             # Build local namespace for eval
             local_ns = {
+                **_JAX_HELPERS,
                 "jnp": jnp,
                 "t": t,
                 "params": params,

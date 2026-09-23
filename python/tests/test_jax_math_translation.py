@@ -81,7 +81,7 @@ def test_the_logarithms(expr, want):
         ("min(B,k1)", "jnp.minimum(obs[0],params[0])"),
         ("max(B,k1)", "jnp.maximum(obs[0],params[0])"),
         ("pow(B,2)", "jnp.power(obs[0],2)"),
-        ("rint(B)", "jnp.round(obs[0])"),
+        ("rint(B)", "__bngsim_rint__(obs[0])"),
         ("floor(B)", "jnp.floor(obs[0])"),
         ("ceil(B)", "jnp.ceil(obs[0])"),
         # nesting, and an inverse wrapping its own bare form
