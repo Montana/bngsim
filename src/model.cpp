@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -2933,8 +2934,22 @@ void NetworkModel::solve_function_cycle(size_t lo, size_t hi) {
         }
     };
 
+    // Convergence and the FD step are both RELATIVE to the group's own
+    // magnitude, max(|x|, |F(x)|) (issue #782). The old test,
+    // `norm <= kTol*(1 + max|x|)`, was absolute at the x = 0 seed — max|F(0)|
+    // <= 1e-12 — so any group whose values were all ~1e-12 or smaller was
+    // declared solved at F(0) without a single Newton step: the wrong answer,
+    // marked converged, so the NaN guard below never fired. A cyclic model is
+    // scale-invariant in exactly the way that test was not. The only absolute
+    // floor left is DBL_MIN, which admits nothing but a group that is zero.
+    //
+    // For the same reason the seed is never accepted unless its residual is
+    // exactly zero (x = 0 is then a true fixed point). Otherwise at least one
+    // Newton step is taken, which is exact for a linear group whatever its
+    // scale.
     constexpr int kMaxIter = 50;
     constexpr double kTol = 1e-12;
+    constexpr double kFloor = std::numeric_limits<double>::min();
     bool converged = false;
     for (int iter = 0; iter < kMaxIter && !converged; ++iter) {
         eval_F(scratch.x, scratch.f);
@@ -2942,18 +2957,21 @@ void NetworkModel::solve_function_cycle(size_t lo, size_t hi) {
         for (size_t i = 0; i < k; ++i) {
             scratch.g[i] = scratch.f[i] - scratch.x[i];
             norm = std::max(norm, std::abs(scratch.g[i]));
-            scale = std::max(scale, std::abs(scratch.x[i]));
+            scale = std::max({scale, std::abs(scratch.x[i]), std::abs(scratch.f[i])});
         }
         if (!std::isfinite(norm))
             break;
-        if (norm <= kTol * (1.0 + scale)) {
+        if (iter == 0 ? norm == 0.0 : norm <= kTol * scale + kFloor) {
             converged = true;
             break;
         }
-        // Dense FD Jacobian of g, column by column.
+        // Dense FD Jacobian of g, column by column. The step scales with the
+        // group (issue #782): a fixed `1e-7*(|x|+1)` is ~1e6 times a 1e-13
+        // group, which turns the Jacobian of a nonlinear group into a secant
+        // taken far from the point.
         std::vector<double> xp = scratch.x, fp(k);
         for (size_t j = 0; j < k; ++j) {
-            const double h = 1e-7 * (std::abs(scratch.x[j]) + 1.0);
+            const double h = 1e-7 * std::max({std::abs(scratch.x[j]), scale, kFloor});
             const double keep = xp[j];
             xp[j] = keep + h;
             eval_F(xp, fp);
