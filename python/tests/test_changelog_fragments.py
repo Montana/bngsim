@@ -389,6 +389,11 @@ class TestTheGatesAreWiredUp:
         assert "ci/changelog.py check" in body
         assert "ci/changelog.py required" in body
         assert "pull_request" in body
+        # The escape hatch is a label, so the gate has to re-run when one is
+        # applied. Without these two types the label clears nothing until an
+        # unrelated commit lands, which is a workflow asking for empty commits
+        # to use its own exemption. Found on this workflow's own pull request.
+        assert "labeled" in body and "unlabeled" in body
 
     def test_the_pre_commit_hook_runs_the_check_at_both_gating_stages(self):
         """``stages:`` is absent on purpose, so the hook inherits

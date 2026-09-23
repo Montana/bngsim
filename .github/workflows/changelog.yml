@@ -21,6 +21,12 @@ name: changelog
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` on top of the three default types, because the escape
+    # hatch below is a label: without them, applying `changelog exempt` leaves a
+    # red check that only an unrelated commit can clear, and the workflow would
+    # be telling maintainers to push empty commits to use its own escape hatch.
+    # Measured on this workflow's own pull request, which needs the label.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   group: changelog-${{ github.ref }}
