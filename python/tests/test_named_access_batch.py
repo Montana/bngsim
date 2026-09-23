@@ -5,7 +5,7 @@ That is the right axis only for a single run's ``(n_times, n_cols)`` block. A
 squeezed batch (``run_batch(..., squeeze=True)``) carries one more leading
 axis, ``(n_sims, n_times, n_cols)``, so the same subscript took the TIME axis:
 ``batch.observables["X"]`` came back ``(n_sims, n_cols)`` — every replicate's
-values at ``t = idx``, one column per observable — instead of ``(n_sims,
+values at time row ``idx``, one column per observable — instead of ``(n_sims,
 n_times)`` trajectories.
 
 Nothing raised, because the result has the rank the caller expects and holds

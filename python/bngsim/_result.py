@@ -3099,8 +3099,8 @@ class _ObservableAccessor:
     leading axis, ``(n_sims, n_times, n_cols)``. The named column lives on the
     LAST axis on both layouts, so the lookup indexes there (GH #560): a
     hard-coded ``[:, idx]`` took the *time* axis on a batch and returned
-    ``(n_sims, n_cols)`` — one row per replicate, all of it the value at
-    ``t = idx`` — which is the same rank and a plausible set of numbers, so
+    ``(n_sims, n_cols)`` — one row per replicate, all of it from time row
+    ``idx`` — which is the same rank and a plausible set of numbers, so
     nothing raised. An integer or slice key still indexes the leading axis,
     which is the time axis on a single run and the replicate axis on a batch,
     matching what the same key does on the underlying array.
