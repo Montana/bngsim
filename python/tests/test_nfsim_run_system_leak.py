@@ -104,35 +104,70 @@ def test_a_throwing_run_does_not_retain_the_system(nfsim_xml: Path):
 
 
 # ── The behaviour around it, which needs no measurement ──────────────────────
+#
+# These two drive the same oversized allocation, so they run in a child process
+# too. In the pytest process they relied on 2e9 points failing to allocate
+# immediately; under Linux overcommit a ~16 GB request can instead *succeed*,
+# get zero-filled page by page, and take the runner down with it (exit 143 on
+# ubuntu-latest-lapack, run 35893818826). In a child, under the same RLIMIT_AS
+# cap as the probe above, the allocation fails at a fixed size. Where RLIMIT_AS
+# is not enforced (macOS) the child still runs uncapped, as these did before, so
+# no platform loses coverage — but the worst case now kills the child, not the
+# session.
+
+_CAPPED_PRELUDE = f"""
+import resource, sys
+if sys.platform.startswith("linux"):
+    resource.setrlimit(resource.RLIMIT_AS, ({_ADDRESS_SPACE_CAP},) * 2)
+from bngsim._bngsim_core import NfsimSimulator, TimeSpec
+
+def oversized():
+    ts = TimeSpec()
+    ts.t_start, ts.t_end, ts.n_points = 0.0, 1.0, 2_000_000_000
+    return ts
+
+def raises(sim):
+    try:
+        sim.run(oversized(), 42, 0.0)
+    except (MemoryError, RuntimeError, ValueError) as exc:
+        return type(exc).__name__
+    return None
+"""
+
+
+def _run_capped(body: str, nfsim_xml: Path) -> list[str]:
+    proc = subprocess.run(
+        [sys.executable, "-c", _CAPPED_PRELUDE + body, str(nfsim_xml)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip().splitlines()
 
 
 def test_the_oversized_run_still_raises(nfsim_xml: Path):
     """Freeing the System must not swallow the error that freed it."""
-    from bngsim._bngsim_core import NfsimSimulator, TimeSpec
-
-    ts = TimeSpec()
-    ts.t_start = 0.0
-    ts.t_end = 1.0
-    ts.n_points = 2_000_000_000
-    with pytest.raises((MemoryError, RuntimeError, ValueError)):
-        NfsimSimulator(str(nfsim_xml)).run(ts, 42, 0.0)
+    out = _run_capped(
+        "print(raises(NfsimSimulator(sys.argv[1])))\n",
+        nfsim_xml,
+    )
+    assert out[-1] != "None", "run() returned instead of raising on 2e9 points"
 
 
 def test_a_simulator_still_runs_after_a_throw(nfsim_xml: Path):
     """The throw leaves nothing half-owned behind it: the same simulator
     parses a fresh System and runs."""
-    from bngsim._bngsim_core import NfsimSimulator, TimeSpec
-
-    sim = NfsimSimulator(str(nfsim_xml))
-    bad = TimeSpec()
-    bad.t_start, bad.t_end, bad.n_points = 0.0, 1.0, 2_000_000_000
-    with pytest.raises((MemoryError, RuntimeError, ValueError)):
-        sim.run(bad, 42, 0.0)
-
-    good = TimeSpec()
-    good.t_start, good.t_end, good.n_points = 0.0, 1.0, 3
-    result = sim.run(good, 42, 0.0)
-    assert result.n_times == 3
+    out = _run_capped(
+        "sim = NfsimSimulator(sys.argv[1])\n"
+        "print(raises(sim))\n"
+        "good = TimeSpec()\n"
+        "good.t_start, good.t_end, good.n_points = 0.0, 1.0, 3\n"
+        "print(sim.run(good, 42, 0.0).n_times)\n",
+        nfsim_xml,
+    )
+    assert out[-2] != "None", "run() returned instead of raising on 2e9 points"
+    assert out[-1] == "3"
 
 
 def test_the_ordinary_run_is_unchanged(nfsim_xml: Path):
