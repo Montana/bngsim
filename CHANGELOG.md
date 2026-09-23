@@ -14,7 +14,133 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+Entries for the next release are staged one file per change under
+[`changelog.d/`](changelog.d/) and assembled into a version section by the
+release commit, so no two branches ever edit this file (issue #668). Add a
+fragment — see [`changelog.d/README.md`](changelog.d/README.md) — rather than
+an entry here.
+
+### Changed
+
+- **`CHANGELOG.md` is merged with git's `union` driver, so a local merge no
+  longer stops on it. GitHub's merge still does.** Every entry is inserted at the same
+  anchor — the top of `## [Unreleased]` → `### Fixed` — so any two branches
+  open at once edit the same region and git stops there, on a file that cannot
+  affect behavior. 17 of the 30 pull requests before this one touched it, and
+  each merge invalidates every other open branch. `union` keeps both sides'
+  added lines instead of conflicting. It does not understand the list, so the
+  newest entry is not guaranteed to land on top — check the order when it
+  resolves one. It also resolves silently, which is why it wants the issue #664
+  fix (`check-merge-conflict` is a no-op in CI today) underneath it. The
+  structural fix, one fragment file per change assembled at release, is issue
+  #668.
+
+  Measured after the fact, and the half that does not work is worth stating
+  plainly: GitHub's merge machinery ignores `.gitattributes`. #663 was open with
+  an entry in the same section, reported `CONFLICTING` before this landed, and
+  still reported `CONFLICTING` after — while the identical merge run locally,
+  against the same `main`, resolved clean. So a concurrent pull request still
+  shows "This branch has conflicts", "Update branch" still does not clear it,
+  and someone still has to merge locally and push. What changed is that the
+  push is `git merge` plus `git push` instead of a hand-edit of the region,
+  which is where the two hand-resolution defects came from (#662 committed
+  conflict markers, #656 duplicated its entry). The fix that clears the GitHub
+  path is one fragment file per change — issue #668.
+
 ### Fixed
+
+- **`t` is an ordinary model identifier, not a spelling of the clock, and four
+  expression translators read it as one (issue #659).** The evaluator binds
+  exactly one clock symbol: `time`. `t` is deliberately left free so a model may
+  name a parameter or observable `t` — the BNGL counter idiom
+  `Molecules t counter()` is the reason, and `src/expression.cpp` says so. But
+  `docs/reference/expressions.md` documented `t()` as "alias for `time()`", three
+  C++ comments asserted that both were bound, and the Python layers that
+  translate ExprTk expression *strings* rewrote `t()` to the clock.
+
+  `t()` is not the clock. It is how BNG2.pl writes a reference to a scalar named
+  `t`, and the engine reads it that way (`strip_empty_parens`) — so rewriting it
+  erased the observable. That is issue #28's defect surviving for exactly one
+  name, and two of its consequences were silent wrong numbers:
+
+  * the derived Jacobian entry for a rate law reading `t()` came back empty, so
+    the **forward sensitivity** of such a model was wrong — `d[A]/dk` reported
+    as −6.67 against a finite-difference −22.22 on the regression model, a
+    factor of 3.3, with no warning and no error, because the codegen
+    sensitivity RHS has nothing checking it against finite differences;
+  * the interpreted attach *was* caught, by the C++ FD self-check, which
+    declined the whole analytical Jacobian — so the model silently fell back to
+    finite differences for a reason that was a preprocessing bug rather than a
+    real non-differentiability.
+
+  The JAX translator carried the inverse confusion: it rewrote `time()` and
+  `t()` alike to a bare `t`, which its own observable pass then rewrote, so in a
+  model with an observable named `t` the **clock** came out as that observable's
+  population. Its fix needed the zero-arg strip issue #28 never reached that
+  path, so `Atot()` there stops emitting `obs[1]()` — a call on a JAX array —
+  as well.
+
+  `time()` is now the only clock spelling in `_jacobian`, `_saturable_jacobian`,
+  `_codegen` and `_jax_rhs`, and the docs and comments say so. The ODE
+  trajectory was never affected: the codegen identifier table has always let a
+  model name outrank a built-in, so `t()` emitted the right C. One grammar is
+  deliberately exempt and is pinned by a test — a table function's *index name*,
+  where `is_time_index()` accepts `time`, `T`, `Time()` and `t()` alike, is a
+  different namespace from an expression token.
+- **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
+  markers passed the lint gate (issue #664).** The hook returns success without
+  opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of
+  `MERGE_HEAD` / `rebase-apply` / `rebase-merge` in the git dir. A CI checkout is
+  never in that state, so on the `pre-commit (pinned hooks)` leg it had never
+  inspected anything. That leg exists precisely to close this class of gap:
+  `lint.yml`'s header records that it was added because "nothing in CI runs the
+  hooks", and that the whole hook suite is replayed there rather than only
+  `clang-format`. This hook was in that suite and still checked nothing, because
+  the skip is inside the hook rather than in the hook selection.
+
+  Not theoretical: #662 reached a green `pre-commit` with literal `<<<<<<<`,
+  `=======` and `>>>>>>>` lines committed in `CHANGELOG.md`, the file
+  `release.yml` copies into published GitHub Release notes. Passing
+  `--assume-in-merge` bypasses only the self-skip; the check is unchanged, so a
+  clean tree still passes and a developer committing a resolution — who is
+  mid-merge, and for whom the hook already fired — sees no difference. One
+  false positive is worth knowing about: a line of exactly seven `=` matches, so
+  a Markdown setext H1 underlined that way would trip it. No tracked file has
+  one.
+
+- **An SBML event `<delay>` or `<priority>` that reads a parameter the model
+  changes is evaluated when the trigger fires, not folded to t=0 (issue #558).**
+  The event loop constant-folds both expressions opportunistically with
+  `_eval_ast_numeric`, and its fold context held every global parameter's
+  declared `value` plus every `initialAssignment` and assignment-rule value at
+  t=0. It never asked whether anything writes the parameter. A delay `d` driven
+  by a rate rule, an assignment rule or another event's assignment therefore
+  folded to `d(0)`, and the event fired at `t_trigger + d(0)` with no warning.
+  SBML L3v2 §4.11.4 evaluates a delay at the moment the trigger becomes true,
+  and §4.11.3 does the same for a priority. A priority reading such a parameter
+  ordered simultaneous events by its t=0 value in the same way.
+
+  The fold context now holds only the parameters no assignment rule, rate rule
+  or event assignment writes (`_const_param_ids`, the same predicate the
+  initial-condition seed uses since #379, so a `constant="false"` parameter
+  nothing writes still folds). Each takes its initialAssignment value when it
+  has one. A delay or priority that reads anything else makes the fold return
+  `None` and takes the existing `delay_expr` / `priority_expr` path, which the
+  C++ event dispatcher evaluates at trigger time, including through a
+  functionDefinition call. The old context also carried every initialAssignment
+  value, so a delay reading an initialAssignment'd compartment or species was
+  folded too; those now take the dynamic path as well, and fire at the same
+  time. A delay that reads only constant parameters folds exactly as before, so
+  those models build the same event.
+
+  Covered by `test_sbml_event_delay_nonconstant_param.py`, with a delay reading
+  a rate-rule, an assignment-rule and an event-assigned parameter, a delay
+  `f(d)` through a functionDefinition on a rate-rule parameter, a priority
+  reading a rate-rule parameter, and controls for a literal delay, an unwritten
+  `constant="false"` parameter, an initialAssignment on a constant parameter,
+  and an initialAssignment'd compartment and species. The five bug cases fail
+  on the previous behavior: each delay fired at t=1.05 instead of 2.0, and the
+  priority case ended with w=10 instead of 20. From @Montana.
 
 - **An n-ary `max()` / `min()` translated to a C `fmax` / `fmin` call with the
   wrong number of arguments, so codegen refused a model the interpreter ran

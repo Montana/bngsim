@@ -39,6 +39,20 @@ repos:
       - id: trailing-whitespace
         files: ^.*\.(py|cpp|hpp|cc|cxx|hh|hxx|c|h|md|toml|cfg|ini|yaml|yml)$
       - id: check-merge-conflict
+        # Without this flag the hook returns 0 without reading a file unless git
+        # is mid-merge (it tests for MERGE_MSG plus MERGE_HEAD/rebase-apply/
+        # rebase-merge in the git dir). A CI checkout is never in that state, so
+        # on the lint leg -- the one place this config is replayed for everyone,
+        # and the reason lint.yml exists at all -- it checked nothing. #662
+        # reached a green `pre-commit` with literal <<<<<<< markers committed in
+        # CHANGELOG.md. The flag only bypasses that self-skip; the check itself
+        # is unchanged, so a clean tree still passes, and a developer committing
+        # a resolution is mid-merge and saw it fire already (GH #664).
+        #
+        # One false positive to know about: a line of EXACTLY seven '=' matches,
+        # so a Markdown setext H1 underlined with seven '=' would trip it. No
+        # tracked file has one today (checked over the whole tree).
+        args: [--assume-in-merge]
       - id: check-added-large-files
         # Committed spec manifests (parity_checks/*/ *_jobs.json) run ~0.6 MB;
         # the multi-MB SBML/SED-ML corpora are gitignored, so 1 MB still
@@ -92,6 +106,21 @@ repos:
 
   - repo: local
     hooks:
+      # Fragment names, shape and the 1,200-character limit (issue #668). Runs
+      # at both gating stages like everything else here, and costs milliseconds:
+      # it reads the handful of files in changelog.d/ and nothing else.
+      # `pass_filenames: false` because the check is about the directory as a
+      # whole — a duplicate fragment is a relationship between two files.
+      # lint.yml replays it with --all-files, so CI enforces it too; the
+      # `changelog` workflow adds the half a hook cannot see, namely whether
+      # THIS branch staged anything.
+      - id: changelog-fragments
+        name: changelog fragments (names, shape, length)
+        entry: python3 ci/changelog.py check
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: pytest
         name: pytest (bngsim)
         # Run in the uv project venv (.venv) WITHOUT requiring the developer to

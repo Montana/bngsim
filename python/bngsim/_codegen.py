@@ -5804,7 +5804,7 @@ def _expr_to_c(
     - Observable references → obs[idx]
     - Function references → func[idx]
     - if(cond, t, f) → ((cond) ? (t) : (f))
-    - time() / t() → t
+    - time() → t
     - ^ (power) → pow(a, b)
     - and / or / not → && / || / !
     - Standard math functions pass through to C math.h
@@ -5933,8 +5933,14 @@ def builtin_constant_bindings(sp) -> dict:
 
 
 _BUILTIN_IDENT_MAP: dict[str, tuple[str, bool]] = {
+    # `time` is the only clock symbol the evaluator binds; `t` is deliberately
+    # left free as an ordinary model identifier (src/expression.cpp), so it is
+    # NOT listed here (issue #659). A model name always overrode this table
+    # anyway, so an observable `t` emitted correctly — but a `t` entry says the
+    # bare word means the clock, and it does not: in a model with no scalar `t`
+    # the expression does not compile at all, and in one that has a scalar `t`
+    # it means that scalar.
     "time": ("t", True),
-    "t": ("t", True),
     # Registered as remapped *constants* on the ExprTk evaluator, so
     # strip_empty_parens() strips `_pi()` → `_pi` there too.
     "_pi": ("M_PI", True),
@@ -8820,9 +8826,11 @@ def _functional_rate_law_partials(
             return None, crossing_why
 
     # Strip the two zero-argument forms ``_preprocess_exprtk`` accepts
-    # (``time()``/``t()`` and an observable written as a call, #28) before looking
-    # for call heads, so neither is mistaken for an unknown function.
-    probe = _EMPTY_CALL_RE.sub(r"\1", re.sub(r"\b(?:time|t)\s*\(\s*\)", " ", inlined))
+    # (``time()`` and an observable written as a call, #28) before looking for
+    # call heads, so neither is mistaken for an unknown function. ``t()`` is the
+    # second kind, not the first (issue #659): `t` is an ordinary model
+    # identifier, so the empty-call strip is what handles it.
+    probe = _EMPTY_CALL_RE.sub(r"\1", re.sub(r"\btime\s*\(\s*\)", " ", inlined))
     known = _exprtk_call_heads()
     if scope.switch_scope is not None:
         # ``if``, ``and``, ``or`` and ``not`` are recognized heads, just not
