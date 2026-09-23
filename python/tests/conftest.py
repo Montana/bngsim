@@ -307,8 +307,9 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
     (
         "POSIX-specific",
         _ANYWHERE,
-        "no Windows equivalent: process-group reaping, and the /bin/sh fake "
-        "interpreters the pybind11-resolution probe walks (GH #288)",
+        "no Windows equivalent: process-group reaping, the /bin/sh fake "
+        "interpreters the pybind11-resolution probe walks (GH #288), and the "
+        "peak RSS the GH #577 setup-failure probe reads from resource.getrusage",
     ),
     (
         "RLIMIT_AS",
