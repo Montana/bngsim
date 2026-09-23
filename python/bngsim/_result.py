@@ -3094,6 +3094,16 @@ class _ObservableAccessor:
     ``result.observables`` returns the full array.
     ``result.observables["name"]`` returns a single column.
     ``result.observables[0]`` returns a single time-point row.
+
+    A squeezed batch (``run_batch(..., squeeze=True)``) carries one more
+    leading axis, ``(n_sims, n_times, n_cols)``. The named column lives on the
+    LAST axis on both layouts, so the lookup indexes there (GH #560): a
+    hard-coded ``[:, idx]`` took the *time* axis on a batch and returned
+    ``(n_sims, n_cols)`` — one row per replicate, all of it from time row
+    ``idx`` — which is the same rank and a plausible set of numbers, so
+    nothing raised. An integer or slice key still indexes the leading axis,
+    which is the time axis on a single run and the replicate axis on a batch,
+    matching what the same key does on the underlying array.
     """
 
     __slots__ = ("_data", "_names", "_name_to_idx")
@@ -3107,7 +3117,8 @@ class _ObservableAccessor:
         if isinstance(key, str):
             if key not in self._name_to_idx:
                 raise KeyError(f"Observable '{key}' not found. Available: {self._names}")
-            return self._data[:, self._name_to_idx[key]]
+            # Last axis, not the second: see the note above about batches.
+            return self._data[..., self._name_to_idx[key]]
         return self._data[key]
 
     def __array__(self, dtype=None, copy=None) -> NDArray[np.float64]:
