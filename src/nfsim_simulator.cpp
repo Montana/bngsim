@@ -1061,9 +1061,30 @@ void NfsimSimulator::set_traversal_limit(int limit) { impl_->traversal_limit = l
 
 const std::string &NfsimSimulator::xml_path() const { return impl_->xml_path; }
 
+// An output schedule with no points has no initial row to record, and both
+// entry points below record one unconditionally (GH #570). Refuse it where the
+// caller can see it, naming the count they passed.
+static void require_positive_n_points(const char *where, int n_points) {
+    if (n_points < 1) {
+        throw std::runtime_error(std::string(where) + ": n_points must be positive (got " +
+                                 std::to_string(n_points) + ")");
+    }
+}
+
 // ─── run() — stateless simulation (re-parses XML each call) ──────────────────
 
 Result NfsimSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_seconds) {
+    // GH #570 — every row below is written into a Result sized by this count,
+    // and the initial row is recorded unconditionally: t_out[0] is read and
+    // record(0, ...) writes before the loop is ever entered. With no output
+    // points there is no t_out[0] and no row 0, so both ran off the end and the
+    // process died with a segfault rather than an exception the caller could
+    // catch. The sibling RuleMonkey backend has refused this since it was
+    // written (rulemonkey_interval_count); this says the same thing in the same
+    // words. Checked before create_system() so nothing is built or leaked: the
+    // System below is a raw pointer this function deletes on the way out.
+    require_positive_n_points("NfsimSimulator::run", times.effective_n_points());
+
     auto *system = impl_->create_system();
     impl_->prepare_system(system, seed);
 
@@ -1199,6 +1220,8 @@ Result NfsimSimulator::simulate(double t_start, double t_end, int n_points, doub
     //     byte-identical to before so the golden/parity suites are stable).
     const bool explicit_times = !sample_times.empty();
     const int n_out = explicit_times ? static_cast<int>(sample_times.size()) : n_points;
+    // GH #570 — same unguarded t_out[0] / record(0, ...) as run(); see there.
+    require_positive_n_points("NfsimSimulator::simulate", n_out);
 
     std::vector<double> t_out(n_out);
     std::vector<double> abs_targets(n_out);
