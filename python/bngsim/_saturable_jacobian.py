@@ -475,6 +475,49 @@ def _takes_log_of_state(node, state_names: AbstractSet[str]) -> bool:
     return False
 
 
+def _synthesizes_log_of_state(node, state_names: AbstractSet[str]) -> bool:
+    """True if differentiating ``node`` would synthesize ``log`` of a state.
+
+    GH #574. :func:`_takes_log_of_state` reads the law as written, and a power
+    is written without one: ``k*A^B`` mentions no logarithm at all, so the guard
+    above passes it through. The logarithm appears during differentiation.
+    :func:`_diff_pow`'s constant-base branch emits ``base^exp · ln(base) ·
+    d(exp)`` whenever the base does not move with the target — and "does not
+    move with *this* target" is not "is a constant". Differentiating ``A^B``
+    with respect to ``B`` takes that branch with ``A``, a state variable, as the
+    base, and writes ``ln(A)``.
+
+    That is the very singularity #336 defers for: at ``A = 0`` the emitted
+    ``pow(A, B) * log(A)`` is ``0 · -inf``, a NaN where the derivative's limit is
+    a finite ``0``, and ``A = 0`` is an ordinary initial condition rather than a
+    corner. The NaN then spreads through the Jacobian and through the ``J·yS``
+    half of the analytic sensitivity RHS built from it. SymPy's emitters guard
+    exactly this (``_guard_exponent_log_at_zero``, #310/#317), so the law is
+    deferred to them and comes back as
+    ``((A == 0.0) && (B > 0.0)) ? 0.0 : pow(A, B)*log(A)``.
+
+    The test is the shape that reaches that branch: a power with a state
+    variable in the exponent AND a state variable in the base. A constant base
+    (``2^n``, ``KM^h``) keeps its native ``ln(base)``, which is a number with no
+    singularity the state can reach — the case the docstring above describes,
+    and the one this does not touch.
+    """
+    tag = node[0]
+    if tag == "^":
+        base, exp = node[1], node[2]
+        if (_var_names(base, set()) & state_names) and (_var_names(exp, set()) & state_names):
+            return True
+    if tag == "call":
+        return _synthesizes_log_of_state(node[2][0], state_names)
+    if tag == "neg":
+        return _synthesizes_log_of_state(node[1], state_names)
+    if tag in ("+", "-", "*", "/", "^"):
+        return _synthesizes_log_of_state(node[1], state_names) or _synthesizes_log_of_state(
+            node[2], state_names
+        )
+    return False
+
+
 def _contains(node, target) -> bool:
     """True if ``target`` occurs anywhere in ``node``."""
     if node == target:
@@ -838,6 +881,11 @@ def differentiate_rate_law_native(
     # GH #336: a logarithm of a state variable carries a removable singularity
     # that only the SymPy emitters' guard takes out. See _takes_log_of_state.
     if _takes_log_of_state(node, state_names):
+        return None
+    # GH #574: the same singularity, in a law that does not mention a logarithm
+    # — differentiating a state-in-both power synthesizes one. See
+    # _synthesizes_log_of_state.
+    if _synthesizes_log_of_state(node, state_names):
         return None
 
     # Differentiate only the observables that actually appear (scanning all of
