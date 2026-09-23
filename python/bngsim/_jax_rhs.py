@@ -76,6 +76,16 @@ def screen_for_discontinuities(net_path: str) -> list[str]:
 
 # ─── Expression translator (.net expression -> JAX/Python) ──────────────────
 
+# Stand-in for `time()` while the model-name substitutions run, so no parameter
+# or observable can rewrite the clock (issue #659). Not a valid BNG identifier,
+# so it cannot collide with a model name.
+_CLOCK_SYM = "__bngsim_clock__"
+
+# A zero-arg call — an observable, parameter or any other scalar written as
+# `name()` (issue #28). `time()` is the only zero-argument built-in and is
+# rewritten before this runs.
+_EMPTY_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(\s*\)")
+
 # The engine's math functions and their jax.numpy spelling. Applied in a single
 # pass (see _translate_expr_jax), so no entry's replacement can be rewritten by
 # another entry's pattern.
@@ -122,7 +132,8 @@ def _translate_expr_jax(
       - parameter names -> params[idx]
       - observable names -> obs[idx]
       - function names -> func_<name> (local variable)
-      - time() / t() -> t
+      - a scalar written as a zero-arg call (`Atot()`) -> the scalar (issue #28)
+      - time() -> t
       - if(cond,a,b) -> jnp.where(cond,a,b)
       - ln() -> jnp.log()
       - common math -> jnp.<func>()
@@ -134,9 +145,26 @@ def _translate_expr_jax(
     c = c.replace("&&", " & ")
     c = c.replace("||", " | ")
 
-    # Replace time() / t() with t
-    c = re.sub(r"\btime\(\)", "t", c)
-    c = re.sub(r"\bt\(\)", "t", c)
+    # The clock, parked under a placeholder no model name can collide with.
+    #
+    # Issue #659 — `time` is the only clock symbol the evaluator binds; `t` is
+    # deliberately left free as an ordinary model identifier
+    # (src/expression.cpp), and `t()` is that identifier written as a zero-arg
+    # call. Rewriting both to a bare `t` here put the clock and a model symbol
+    # named `t` into the same token, and the observable pass below then rewrote
+    # it: in a model with an observable `t`, `time()` came out as `obs[i]` — the
+    # clock silently replaced by a population. The placeholder survives every
+    # substitution below and is spent last.
+    c = re.sub(r"\btime\s*\(\s*\)", _CLOCK_SYM, c)
+
+    # A scalar written as a zero-arg call (issue #28): BNGL accepts `Atot()`
+    # wherever `Atot` is valid and BNG2.pl preserves whichever the user wrote,
+    # so the engine strips the parens for any registered scalar
+    # (strip_empty_parens, src/expression.cpp). Do the same before the name
+    # passes below, or `Atot()` becomes `obs[1]()` — a call on a JAX array —
+    # and `t()` becomes `obs[3]()`. `time()` is already gone, and it is the only
+    # zero-arg built-in, so every remaining empty argument list is a scalar.
+    c = _EMPTY_CALL_RE.sub(r"\1", c)
 
     # Replace if(cond, a, b) -> jnp.where(cond, a, b)
     # This handles nested if() via repeated application
@@ -183,6 +211,10 @@ def _translate_expr_jax(
 
     # Replace ^ with ** for exponentiation
     c = c.replace("^", "**")
+
+    # Spend the clock placeholder last: `t` is the JAX RHS's own time argument,
+    # and nothing above may rewrite it (issue #659).
+    c = c.replace(_CLOCK_SYM, "t")
 
     return c
 

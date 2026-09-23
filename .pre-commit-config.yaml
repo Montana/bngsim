@@ -106,6 +106,21 @@ repos:
 
   - repo: local
     hooks:
+      # Fragment names, shape and the 1,200-character limit (issue #668). Runs
+      # at both gating stages like everything else here, and costs milliseconds:
+      # it reads the handful of files in changelog.d/ and nothing else.
+      # `pass_filenames: false` because the check is about the directory as a
+      # whole — a duplicate fragment is a relationship between two files.
+      # lint.yml replays it with --all-files, so CI enforces it too; the
+      # `changelog` workflow adds the half a hook cannot see, namely whether
+      # THIS branch staged anything.
+      - id: changelog-fragments
+        name: changelog fragments (names, shape, length)
+        entry: python3 ci/changelog.py check
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: pytest
         name: pytest (bngsim)
         # Run in the uv project venv (.venv) WITHOUT requiring the developer to

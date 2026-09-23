@@ -11,7 +11,8 @@
 //      and O(log N) propensity updates, replacing O(N) linear scan.
 //
 // Per-instance RNG (std::mt19937_64). Deterministic seeding.
-// Simulation time is always tracked so time()/t() expressions stay current.
+// Simulation time is always tracked so time() expressions stay current.
+// (`time` is the only clock symbol; `t` is an ordinary model identifier.)
 
 #include "bngsim/cc_jit.hpp"  // GH #190: system-cc propensity backend (no MIR)
 #include "bngsim/mir_jit.hpp" // GH #149: opt-in JIT'd propensity fast path
@@ -1816,7 +1817,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
         }
 
-        // 8. Advance time unconditionally so time()/t() stay current
+        // 8. Advance time unconditionally so time() stays current
         // GH #81: Euler-advance the rate-rule targets over the inter-fire
         // interval (t, t_proposed] alongside the discrete fire just applied.
         integrate_rr(t_proposed - t);

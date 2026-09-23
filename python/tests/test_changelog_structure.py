@@ -14,6 +14,15 @@ history: rewriting them would edit the record of what shipped, to fix something
 no one will read them for. ``[Unreleased]`` is the only section anyone still
 edits, and it is the one the next release inherits, so holding the line there is
 what stops the drift from recurring.
+
+Since issue #668 no contributor edits it either: entries are staged one file per
+change under ``changelog.d/`` and ``ci/changelog.py build`` assembles them. That
+moves what these three assertions guard rather than retiring it. The heading they
+watch is now emitted by the assembler, so a duplicate or an out-of-order section
+would be a defect in one script running unwatched once per release, instead of
+an entry someone filed under a fresh heading -- and the entries still sitting
+here, which predate fragments, are still inherited by the next release. The
+fragments themselves are covered by ``test_changelog_fragments.py``.
 """
 
 from __future__ import annotations
@@ -98,3 +107,17 @@ def test_the_check_would_catch_a_duplicate_of_each_kind(kind, monkeypatch):
     )
     monkeypatch.setattr(Path, "read_text", lambda self, **kw: body)
     assert Counter(_unreleased_subsections())[kind] == 2
+
+
+def test_unreleased_points_at_the_fragment_directory():
+    """The pointer is load-bearing prose. ``CONTRIBUTING.md`` asked contributors
+    to edit ``CHANGELOG.md`` for 579 entries, and the file itself is where
+    someone looks to copy the shape of the last entry; if this paragraph goes,
+    the habit it replaced comes back and the conflicts come back with it."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    start = text.index("## [Unreleased]")
+    end = text.index("\n## [", start + 1)
+    assert "changelog.d/" in text[start:end], (
+        "[Unreleased] no longer says where entries go. Entries are staged one "
+        "file per change under changelog.d/ (issue #668); restore the pointer."
+    )
