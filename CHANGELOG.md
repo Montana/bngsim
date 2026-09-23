@@ -14,6 +14,12 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+Entries for the next release are staged one file per change under
+[`changelog.d/`](changelog.d/) and assembled into a version section by the
+release commit, so no two branches ever edit this file (issue #668). Add a
+fragment — see [`changelog.d/README.md`](changelog.d/README.md) — rather than
+an entry here.
+
 ### Changed
 
 - **`CHANGELOG.md` is merged with git's `union` driver, so a local merge no
@@ -29,9 +35,6 @@ in `CMakeLists.txt`) is derived from it.
   structural fix, one fragment file per change assembled at release, is issue
   #668.
 
-### Fixed
-
-
   Measured after the fact, and the half that does not work is worth stating
   plainly: GitHub's merge machinery ignores `.gitattributes`. #663 was open with
   an entry in the same section, reported `CONFLICTING` before this landed, and
@@ -43,6 +46,9 @@ in `CMakeLists.txt`) is derived from it.
   which is where the two hand-resolution defects came from (#662 committed
   conflict markers, #656 duplicated its entry). The fix that clears the GitHub
   path is one fragment file per change — issue #668.
+
+### Fixed
+
 - **`t` is an ordinary model identifier, not a spelling of the clock, and four
   expression translators read it as one (issue #659).** The evaluator binds
   exactly one clock symbol: `time`. `t` is deliberately left free so a model may
@@ -271,7 +277,6 @@ in `CMakeLists.txt`) is derived from it.
   `a0 == 0`, which says nothing about a function that reads `time()` — an
   output-only one, or one whose reaction is exhausted — so its column has to
   keep tracking t across the frozen tail.
-
 
 ## [0.16.0] - 2026-09-21
 
