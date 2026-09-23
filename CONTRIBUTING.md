@@ -346,8 +346,37 @@ at all — say so on your pull request or open an issue, and it will be changed.
 - Keep new code consistent with the surrounding style (`.clang-format` for C++,
   `ruff` for Python).
 - Add or update tests for behavior changes.
-- Update [`CHANGELOG.md`](CHANGELOG.md) and, where user-facing, the relevant page
-  under [`docs/`](docs/).
+- Stage a changelog fragment (below) and, where user-facing, update the relevant
+  page under [`docs/`](docs/).
 
 See the [development docs](docs/development/) for building wheels locally
 (`cibuildwheel`) and for guides on adding built-in functions and objectives.
+
+## Changelog entries
+
+**Do not edit [`CHANGELOG.md`](CHANGELOG.md).** Write one file instead:
+
+```bash
+cat > changelog.d/659.fixed.md <<'EOF'
+- **One sentence saying what was wrong and for whom (issue #659).** Then two or
+  three saying what the fix changes and what a reader should do differently.
+EOF
+python3 ci/changelog.py check
+```
+
+The name is `<issue>.<category>.md`, with `<category>` one of `added`, `changed`,
+`deprecated`, `removed`, `fixed`, `security`. The file holds the bullet exactly as
+it will read in the changelog, leading `- ` and two-space continuation indent
+included. Keep it under 1,200 characters — the evidence and the reasoning belong
+in the issue and the commit message, where no limit constrains them and where a
+reader who wants them will look.
+
+The reason is that `CHANGELOG.md` has exactly one anchor a new entry can go at,
+so any two open branches edit the same region of it and git stops on a conflict
+(issue #668). A fragment has no shared anchor; the release commit assembles them.
+CI enforces both halves — a branch touching `python/bngsim/`, `src/` or
+`include/` must stage a fragment, and no branch may edit `CHANGELOG.md`. Label a
+pull request `changelog exempt` if its change is genuinely invisible to users.
+
+[`changelog.d/README.md`](changelog.d/README.md) has the rest: multiple entries
+per issue, entries with no issue number, and what the release step does.
