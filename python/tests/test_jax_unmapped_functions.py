@@ -104,6 +104,26 @@ def test_every_reserved_name_translates_or_is_one_of_the_refused():
     assert refused == {"erf", "erfc", "tgamma", "clamp", "avg", "sum", "mratio"}
 
 
+@pytest.mark.parametrize(
+    "expr, want",
+    [
+        ("max(B,k1,2)", "jnp.maximum(jnp.maximum(obs[0],params[0]),2)"),
+        ("min(B,k1,2,3)", "jnp.minimum(jnp.minimum(jnp.minimum(obs[0],params[0]),2),3)"),
+        ("max(B)", "(obs[0])"),
+        (
+            "max(B, min(k1,B,3))",
+            "jnp.maximum(obs[0], jnp.minimum(jnp.minimum(params[0],obs[0]),3))",
+        ),
+        # a binary call is left exactly as written, spaces and all
+        ("max(B, k1)", "jnp.maximum(obs[0], params[0])"),
+    ],
+)
+def test_a_variadic_max_or_min_is_folded_to_binary_calls(expr, want):
+    """The engine's max/min are ExprTk's, which take any number of arguments;
+    jnp.maximum takes two, so `max(a, b, c)` was a TypeError mid-solve."""
+    assert _t(expr) == want
+
+
 def test_the_logarithms_do_not_collide():
     """`log10` is not `log` with a stray `10`, and `ln` is still `jnp.log`."""
     assert _t("ln(B)+log(B)+log10(B)+log2(B)") == (
@@ -201,7 +221,7 @@ def test_the_jax_jacobian_matches_the_default(tmp_path, body):
     assert default[-1] < default[0]
 
 
-ROUNDING_NET = """begin parameters
+PROBE_NET = """begin parameters
     1 k1      1.0  # Constant
     2 h       0.0  # Constant
 end parameters
@@ -227,7 +247,7 @@ def _jax_and_engine_rhs(tmp_path, body, h):
     from bngsim._jax_rhs import generate_jax_rhs
 
     net = tmp_path / "m.net"
-    net.write_text(ROUNDING_NET.format(body=body))
+    net.write_text(PROBE_NET.format(body=body))
     with contextlib.redirect_stderr(io.StringIO()):
         model = bngsim.Model.from_net(str(net))
     model.set_param("h", h)
@@ -248,6 +268,14 @@ def test_the_roundings_match_the_engine_exactly(tmp_path, fn, h):
     """`round` and `rint` must mean what the engine means. Mapped onto
     jnp.round, both rounded a half to even — round(2.5) was 2, not 3."""
     got, want = _jax_and_engine_rhs(tmp_path, f"{fn}(h)", h)
+    assert got == want
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not installed")
+@pytest.mark.parametrize("body", ["max(h,1,2)", "min(h,1,2)", "max(h)", "min(3,max(h,-1,0),2)"])
+@pytest.mark.parametrize("h", [-2.0, 0.5, 1.5, 4.0])
+def test_a_variadic_max_or_min_matches_the_engine(tmp_path, body, h):
+    got, want = _jax_and_engine_rhs(tmp_path, body, h)
     assert got == want
 
 

@@ -23,7 +23,13 @@ import logging
 import re
 from typing import Any
 
-from bngsim._codegen import _BUILTIN_CONSTANT_VALUES, _classify_rate_law, _parse_net_file
+from bngsim._codegen import (
+    _BUILTIN_CONSTANT_VALUES,
+    _classify_rate_law,
+    _find_close_paren_strict,
+    _parse_net_file,
+    _split_top_level_commas,
+)
 
 logger = logging.getLogger("bngsim")
 
@@ -191,6 +197,43 @@ _JAX_MATH_RE = re.compile(
 )
 
 
+# `max(`/`min(` as a call, not as the tail of a longer name or an attribute.
+_MINMAX_CALL_RE = re.compile(r"(?<![\w.])(max|min)\s*\(")
+
+
+def _fold_minmax(expr: str) -> str:
+    """Fold an n-ary ``max``/``min`` into nested binary calls, a unary one into
+    its parenthesized argument, and leave a binary one byte-for-byte.
+
+    The engine's are ExprTk's, which are variadic: ``max(a, b, c)`` is the
+    largest of three and ``max(a)`` is ``a``. jnp.maximum/jnp.minimum take
+    exactly two arguments, so either form reached the RHS as a TypeError at
+    solve time — past _reject_untranslated_names, since ``jnp.maximum`` is a
+    perfectly good name. The C path folds the same way (GH #556). Runs before
+    the name passes, while the arguments are still the model's own text.
+    """
+    out: list[str] = []
+    cursor = 0
+    while (m := _MINMAX_CALL_RE.search(expr, cursor)) is not None:
+        close = _find_close_paren_strict(expr, m.end() - 1)
+        if close < 0:
+            break  # unbalanced: leave the rest as written
+        parts = [_fold_minmax(part) for part in _split_top_level_commas(expr[m.end() : close])]
+        out.append(expr[cursor : m.start()])
+        if len(parts) == 2:
+            out.append(f"{expr[m.start() : m.end()]}{parts[0]},{parts[1]})")
+        elif len(parts) == 1:
+            out.append(f"({parts[0]})" if parts[0].strip() else expr[m.start() : close + 1])
+        else:
+            folded = parts[0].strip()
+            for part in parts[1:]:
+                folded = f"{m.group(1)}({folded},{part.strip()})"
+            out.append(folded)
+        cursor = close + 1
+    out.append(expr[cursor:])
+    return "".join(out)
+
+
 def _translate_expr_jax(
     expr: str,
     param_names: dict[str, int],
@@ -237,6 +280,8 @@ def _translate_expr_jax(
     # and `t()` becomes `obs[3]()`. `time()` is already gone, and it is the only
     # zero-arg built-in, so every remaining empty argument list is a scalar.
     c = _EMPTY_CALL_RE.sub(r"\1", c)
+
+    c = _fold_minmax(c)
 
     # Replace if(cond, a, b) -> jnp.where(cond, a, b)
     # This handles nested if() via repeated application
