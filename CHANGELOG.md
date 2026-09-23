@@ -14,10 +14,16 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+Entries for the next release are staged one file per change under
+[`changelog.d/`](changelog.d/) and assembled into a version section by the
+release commit, so no two branches ever edit this file (issue #668). Add a
+fragment — see [`changelog.d/README.md`](changelog.d/README.md) — rather than
+an entry here.
+
 ### Changed
 
-- **`CHANGELOG.md` is merged with git's `union` driver, so two open pull
-  requests no longer conflict on it.** Every entry is inserted at the same
+- **`CHANGELOG.md` is merged with git's `union` driver, so a local merge no
+  longer stops on it. GitHub's merge still does.** Every entry is inserted at the same
   anchor — the top of `## [Unreleased]` → `### Fixed` — so any two branches
   open at once edit the same region and git stops there, on a file that cannot
   affect behavior. 17 of the 30 pull requests before this one touched it, and
@@ -28,6 +34,18 @@ in `CMakeLists.txt`) is derived from it.
   fix (`check-merge-conflict` is a no-op in CI today) underneath it. The
   structural fix, one fragment file per change assembled at release, is issue
   #668.
+
+  Measured after the fact, and the half that does not work is worth stating
+  plainly: GitHub's merge machinery ignores `.gitattributes`. #663 was open with
+  an entry in the same section, reported `CONFLICTING` before this landed, and
+  still reported `CONFLICTING` after — while the identical merge run locally,
+  against the same `main`, resolved clean. So a concurrent pull request still
+  shows "This branch has conflicts", "Update branch" still does not clear it,
+  and someone still has to merge locally and push. What changed is that the
+  push is `git merge` plus `git push` instead of a hand-edit of the region,
+  which is where the two hand-resolution defects came from (#662 committed
+  conflict markers, #656 duplicated its entry). The fix that clears the GitHub
+  path is one fragment file per change — issue #668.
 
 ### Fixed
 
@@ -296,7 +314,6 @@ in `CMakeLists.txt`) is derived from it.
   `a0 == 0`, which says nothing about a function that reads `time()` — an
   output-only one, or one whose reaction is exhausted — so its column has to
   keep tracking t across the frozen tail.
-
 
 ## [0.16.0] - 2026-09-21
 
