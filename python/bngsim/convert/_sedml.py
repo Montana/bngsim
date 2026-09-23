@@ -694,7 +694,17 @@ def write_sedml_protocol(
                     "id": rng_id,
                     "start": _num(exp.scan_min or 0.0),
                     "end": _num(exp.scan_max if exp.scan_max is not None else 1.0),
-                    "numberOfPoints": str(int(exp.scan_points)),
+                    # GH #575 — numberOfPoints counts the INTERVALS, as it does
+                    # on the uniformTimeCourse above: a consumer expands a
+                    # uniformRange to numberOfPoints+1 values. bngsim's
+                    # scan_points is the inclusive point count (the linspace /
+                    # BNG2.pl n_scan_pts convention, delta = (max-min)/(n-1)),
+                    # so writing it verbatim handed every standards-compliant
+                    # reader one point more than the scan bngsim ran — 6 values
+                    # over [1,2] where bngsim used 5, each at a different
+                    # parameter value. Nothing downstream could notice: the
+                    # document is well-formed and the sweep looks reasonable.
+                    "numberOfPoints": str(max(int(exp.scan_points) - 1, 0)),
                     "type": "log" if exp.scan_log else "linear",
                 },
             )
@@ -809,6 +819,26 @@ def read_sedml_protocol(source: str | Path):
     return ProtocolSpec(steps=tuple(steps), source=None, dropped=())
 
 
+def _uniform_range_points(rng: ET.Element) -> int | None:
+    """Inclusive point count of a ``uniformRange``, or ``None`` if unstated.
+
+    SED-ML's ``numberOfPoints`` counts intervals — a range expands to
+    ``numberOfPoints + 1`` values — which is the same convention the
+    ``uniformTimeCourse`` reader above applies. bngsim's ``scan_points`` is the
+    inclusive count on both sides of that conversion (GH #575).
+    """
+    raw = rng.get("numberOfPoints")
+    if raw is None:
+        return None
+    try:
+        intervals = int(float(raw))
+    except ValueError:
+        return None
+    if intervals < 0:
+        return None
+    return intervals + 1
+
+
 def _scan_targets(root: ET.Element) -> dict[str, dict]:
     """Map each scanned simulation id → its sweep (parameter/min/max/points/…).
 
@@ -824,7 +854,10 @@ def _scan_targets(root: ET.Element) -> dict[str, dict]:
         info: dict[str, object] = {
             "min": _float_attr(rng, "start", 0.0),
             "max": _float_attr(rng, "end", 1.0),
-            "points": int(_float_attr(rng, "numberOfPoints", 0.0)) or None,
+            # GH #575 — the mirror of the write side: numberOfPoints intervals
+            # are numberOfPoints+1 inclusive points. An absent attribute is
+            # unknown rather than zero, and stays None.
+            "points": _uniform_range_points(rng),
             "log": (rng.get("type") or "linear").lower() == "log",
             "reset": (rt.get("resetModel") or "true").lower() == "true",
         }
