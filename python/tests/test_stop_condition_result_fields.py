@@ -1,14 +1,14 @@
 """GH #559 — a stop-condition Result must keep everything the run produced.
 
-``Simulator._truncate_result`` rebuilt the partial Result from eight fields and
+``Simulator._truncate_result`` rebuilt the partial Result from nine fields and
 dropped the rest, so stopping early cost the caller the sensitivity blocks, the
 seed, the SSA reaction statistics and the SSA/PSA diagnostics. Two of those
-losses were worse than a missing value:
+losses showed up in what the result reports:
 
 * the truncated result is built with ``core=None``, and ``Result.__init__``
   fills the SSA diagnostics with inert defaults in that branch, so a run on the
-  ``cc`` propensity backend came back claiming ``"interpreted"`` — a wrong
-  answer where there should have been none;
+  ``cc`` propensity backend came back claiming ``"unknown"`` (``"interpreted"``
+  before #616) in place of the backend that actually ran;
 * a sensitivity run that stopped early raised "no parameter sensitivities were
   computed for this result. Enable them via Simulator(..., sensitivity_params=
   [...])" from the empty block, telling the caller to enable the thing they had

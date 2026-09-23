@@ -6303,13 +6303,14 @@ class Simulator:
 
         Everything the run produced survives the cut (GH #559): every per-time
         block is sliced, and every scalar or metadata field is carried over
-        verbatim. This used to forward eight fields and drop the rest, so a
+        verbatim. This used to forward nine fields and drop the rest, so a
         stop condition silently cost the caller the sensitivity blocks, the
         seed, the reaction statistics and the SSA/PSA diagnostics — and,
         because the truncated result is built with ``core=None``, the dropped
         diagnostics came back as ``Result.__init__``'s inert defaults rather
         than as nothing, so an SSA run on the ``cc`` propensity backend
-        reported ``propensity_backend == "interpreted"``. A sensitivity run
+        reported ``propensity_backend == "unknown"`` (``"interpreted"``
+        before #616), not the backend that ran. A sensitivity run
         stopped early then raised "no parameter sensitivities were computed"
         from an empty (0, 0, 0) block, naming the one thing the caller had
         asked for.
