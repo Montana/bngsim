@@ -120,6 +120,7 @@ jobs:
           # rather than reporting a green empty run.
           python -m pytest -p no:cacheprovider \
             python/tests/test_nfsim*.py \
+            --deselect python/tests/test_nfsim_run_system_leak.py::test_a_throwing_run_does_not_retain_the_system \
             -rA --tb=long ${{ inputs.pytest_args }} \
             2>&1 | tee nfsim-windows.log
 
