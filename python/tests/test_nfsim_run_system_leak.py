@@ -116,8 +116,9 @@ def test_a_throwing_run_does_not_retain_the_system(nfsim_xml: Path):
 # session.
 
 _CAPPED_PRELUDE = f"""
-import resource, sys
+import sys
 if sys.platform.startswith("linux"):
+    import resource
     resource.setrlimit(resource.RLIMIT_AS, ({_ADDRESS_SPACE_CAP},) * 2)
 from bngsim._bngsim_core import NfsimSimulator, TimeSpec
 
