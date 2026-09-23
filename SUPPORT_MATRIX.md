@@ -173,7 +173,13 @@ assert r.n_times == 11
 1. Bump `version` in `pyproject.toml` — the single source of truth.
    `python/bngsim/_version.py` reads it back through `importlib.metadata`, so
    there is no second literal to keep in sync.
-2. Update `CHANGELOG.md` with the user-visible diff.
+2. Assemble the staged changelog fragments:
+   `python3 ci/changelog.py build --version <x.y.z>`. It folds every file in
+   `changelog.d/` into a new `## [<x.y.z>]` section, deletes the fragments, and
+   refuses if the result would exceed GitHub's release-body limit — shorten the
+   longest entries and re-run, or pass `--allow-truncation` to accept notes that
+   end in a pointer back at `CHANGELOG.md`. The pull request carrying steps 1–2
+   is the one thing that may edit `CHANGELOG.md`, so label it `changelog exempt`.
 3. Push to `main`; verify all four wheel legs are green on cp310–cp313.
 4. Tag `git tag v<x.y.z> && git push origin v<x.y.z>` — `release.yml` builds and
    publishes to PyPI via Trusted Publishing. Rehearse first with a manual
