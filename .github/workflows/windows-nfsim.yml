@@ -120,7 +120,6 @@ jobs:
           # rather than reporting a green empty run.
           python -m pytest -p no:cacheprovider \
             python/tests/test_nfsim*.py \
-            --deselect python/tests/test_nfsim_run_system_leak.py::test_a_throwing_run_does_not_retain_the_system \
             -rA --tb=long ${{ inputs.pytest_args }} \
             2>&1 | tee nfsim-windows.log
 
@@ -162,8 +161,6 @@ jobs:
           # a missing optional import means a module's oracle is absent (#291). A
           # test that is genuinely inapplicable on Windows should be xfailed or
           # deselected by name, and this guard amended to say which and why.
-          # Deselected: test_a_throwing_run_does_not_retain_the_system — uses
-          # /proc/self/statm and RLIMIT_AS, both Linux-only (GH #577).
           if [ "$skipped" -ne 0 ]; then
             echo "::error::$skipped test(s) skipped. On this leg a skip is a false green — see the comment above this check."
             exit 1

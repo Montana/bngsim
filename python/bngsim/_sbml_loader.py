@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import io
 import logging
 import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import IO
 
 import libsbml
 
@@ -2167,50 +2169,36 @@ def _package_name_from_uri(uri: str) -> str:
     return parts[-2]
 
 
-def _raw_required_namespaces(xml_source: str) -> dict[str, str]:
-    """Parse only the root element of *xml_source* and return a mapping of
-    ``{uri: local_name}`` for every namespace that carries ``required="true"``
-    as a prefixed attribute (issue #613).
+def _raw_required_namespaces(stream: IO) -> dict[str, str]:
+    """``{uri: name}`` for every namespace the root ``<sbml>`` element marks
+    ``required="true"`` (issue #613), read from *stream* rather than libSBML.
 
     This is the safety net for namespaces outside
-    ``http://www.sbml.org/sbml/level3/…``: libSBML drops them entirely —
-    no plugin, no unknown-package entry, no error — so the libSBML API cannot
-    see them at all.  ``ElementTree`` reads only the opening tag (``iterparse``
-    with an ``end`` event on the root element stops after it) and returns the
-    full ``{URI}local`` Clark-notation attribute map, from which the prefixed
-    ``required`` attributes are identified by their local name.
-
-    The local name of the attribute is returned as the package name because
-    there is no better source for a namespace libSBML does not know about:
-    ``xmlns:zzz="http://example.com/zzz" zzz:required="true"`` → ``zzz``.
-    That is the prefix the document author chose, and it is what appears in the
-    error message. For a standard L3 namespace the caller already has a better
-    name (from libSBML), so the two sets are unioned after the fact.
+    ``http://www.sbml.org/sbml/level3/…``: libSBML drops them entirely — no
+    plugin, no unknown-package entry, no error — so its API cannot see them.
+    ``iterparse`` stops at the first start tag, so only the opening ``<sbml>``
+    element is read however large the document is, and it hands the attributes
+    back in Clark notation (``{uri}required``). The name is
+    :func:`_package_name_from_uri`'s, which for a URI outside the L3 hierarchy
+    is the URI itself.
     """
     import xml.etree.ElementTree as ET
 
-    required_uris: dict[str, str] = {}
+    required: dict[str, str] = {}
     try:
-        # iterparse so we stop at the root end-event without reading the whole doc.
-        for _event, elem in ET.iterparse(__import__("io").StringIO(xml_source), events=("start",)):
-            # The very first element is the root <sbml>.
-            for clark, value in elem.attrib.items():
-                if value.lower() != "true":
-                    continue
-                # Clark notation: {uri}local — local must be "required".
-                if clark.startswith("{") and clark.endswith("}required"):
+        for _event, root in ET.iterparse(stream, events=("start",)):
+            for clark, value in root.attrib.items():
+                is_required = clark.startswith("{") and clark.endswith("}required")
+                if is_required and value.strip().lower() == "true":
                     uri = clark[1 : clark.index("}")]
-                    # The prefix is not recoverable from Clark notation alone;
-                    # use the last path component of the URI as a readable name,
-                    # same heuristic as _package_name_from_uri.
-                    required_uris[uri] = _package_name_from_uri(uri)
-            break  # root element only
+                    required[uri] = _package_name_from_uri(uri)
+            break  # the root element only
     except ET.ParseError:
-        pass  # malformed XML — libSBML will report the error separately
-    return required_uris
+        pass  # malformed XML — libSBML reports it separately
+    return required
 
 
-def _unhandled_required_packages(doc, raw_xml: str | None = None) -> list[tuple[str, str]]:
+def _unhandled_required_packages(doc, raw_xml: IO | None = None) -> list[tuple[str, str]]:
     """``(name, namespace URI)`` for every ``required="true"`` package bngsim
     does not account for, sorted by name (issues #592, #613).
 
@@ -2221,8 +2209,9 @@ def _unhandled_required_packages(doc, raw_xml: str | None = None) -> list[tuple[
       libSBML) is an *unknown package*, which it still records with its
       ``required`` flag.
     * A namespace outside ``http://www.sbml.org/sbml/level3/…`` is neither —
-      libSBML drops it without a word. When *raw_xml* is provided the root
-      element is parsed with ``ElementTree`` to catch these (issue #613).
+      libSBML drops it without a word. When *raw_xml* (a readable stream over
+      the document) is given, its root element is parsed with ``ElementTree``
+      to catch these (issue #613).
 
     Only ``required="true"`` is collected. That is the whole design: SBML
     defines it to mean the package changes the model's mathematical meaning, so
@@ -2272,7 +2261,7 @@ def _unhandled_required_packages(doc, raw_xml: str | None = None) -> list[tuple[
     return sorted(found.items())
 
 
-def _check_required_packages(doc, source: str, raw_xml: str | None = None) -> None:
+def _check_required_packages(doc, source: str, raw_xml: IO | None = None) -> None:
     """Refuse a document whose declared ``required="true"`` package bngsim does
     not interpret, instead of silently building a model from the core layer
     (issue #592).
@@ -2477,7 +2466,8 @@ def load_sbml(path: str | Path, compartment_sizes: dict | None = None):
     t0 = time.perf_counter()
     doc = libsbml.readSBMLFromFile(str(path))
     _check_sbml_errors(doc, str(path))
-    _check_required_packages(doc, str(path), raw_xml=path.read_text(errors="replace"))
+    with open(path, "rb") as stream:  # read as bytes, so the XML declaration names the encoding
+        _check_required_packages(doc, str(path), raw_xml=stream)
     if _doc_uses_comp(doc):
         _flatten_comp(doc, base_path=str(path.parent))
     if compartment_sizes:
@@ -2496,7 +2486,7 @@ def load_sbml_string(text: str, compartment_sizes: dict | None = None):
     t0 = time.perf_counter()
     doc = libsbml.readSBMLFromString(text)
     _check_sbml_errors(doc, "<string>")
-    _check_required_packages(doc, "<string>", raw_xml=text)
+    _check_required_packages(doc, "<string>", raw_xml=io.StringIO(text))
     if _doc_uses_comp(doc):
         # No file context for a string load, so ExternalModelDefinitions cannot
         # be resolved; in-document ModelDefinitions/Submodels flatten fine.
