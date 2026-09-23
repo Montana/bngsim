@@ -31,6 +31,38 @@ in `CMakeLists.txt`) is derived from it.
 
 ### Fixed
 
+- **A cold `run()` recorded every `rateOf` column's t=0 row from a stale
+  derivative buffer (issue #567).** A `rate_of__<species>` accessor reads
+  `model.current_derivs`, which is refreshed only as a side effect of an RHS
+  evaluation. At t=0, before any step has been taken, that buffer holds whatever
+  the last run left in it. The warm path probes `dx/dt` at the exact
+  `(t_row, y_data)` of every row it records, the initial one included, and the
+  cold path's per-point recording does the same under an `uses_rateof()` guard —
+  only the cold path's initial row was left out. So `r := rateOf(A)` over
+  `A' = -k·A` with `k = 0.7`, `A(0) = 10` recorded `r(0) = 0` where the warm path
+  and the closed form both say `-7`, with the rest of the trajectory correct.
+  A first sample that is wrong and a remainder that is right reads as a
+  transient, not as a bug, which is the part that makes it expensive.
+
+  On a fresh model that buffer is zero, a recognisable wrong answer. On a model
+  that has already been run it carries a real derivative from wherever the
+  previous run left off — a plausible wrong answer, which is worse. The cold
+  path is not a corner either: a forward-sensitivity run, `jacobian="jax"`, a
+  non-empty `crossing_stops` and `BNGSIM_NO_WARM_CVODE` all take it, so the
+  models most likely to hit this are the ones being differentiated.
+
+  The initial-state block now refreshes the derivative buffer before recording,
+  behind the same `uses_rateof()` guard the other sites use, so a model without
+  `rateOf` does no extra work and records exactly what it did before.
+
+  Covered by `test_rateof_cold_path_initial_row.py`: the warm path as the
+  reference, the cold path reached two different ways (forward sensitivities
+  and `BNGSIM_NO_WARM_CVODE`), the stale non-zero buffer from a reused model,
+  the two paths agreeing over the whole run, the column against its closed form
+  `-k·A(0)·exp(-k·t)` so the agreement cannot be agreement on the same wrong
+  numbers, and a model without `rateOf` left untouched. Five of the seven fail
+  on the previous behavior. From @Montana.
+
 
   Measured after the fact, and the half that does not work is worth stating
   plainly: GitHub's merge machinery ignores `.gitattributes`. #663 was open with
