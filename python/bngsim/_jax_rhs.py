@@ -23,7 +23,13 @@ import logging
 import re
 from typing import Any
 
-from bngsim._codegen import _classify_rate_law, _parse_net_file
+from bngsim._codegen import (
+    _BUILTIN_CONSTANT_VALUES,
+    _classify_rate_law,
+    _find_close_paren_strict,
+    _parse_net_file,
+    _split_top_level_commas,
+)
 
 logger = logging.getLogger("bngsim")
 
@@ -104,19 +110,128 @@ _JAX_MATH_FUNCS: dict[str, str] = {
     "min": "jnp.minimum",
     "max": "jnp.maximum",
     "pow": "jnp.power",
-    "rint": "jnp.round",
+    # Not jnp.round, which rounds a half to EVEN — see _jax_round below.
+    "rint": "__bngsim_rint__",
+    "round": "__bngsim_round__",
+    "trunc": "jnp.trunc",
     "floor": "jnp.floor",
     "ceil": "jnp.ceil",
+    # GH #565 — the engine's reserved list (reserved_names(), src/expression.cpp)
+    # carries these too, and jax.numpy spells every one of them directly. Their
+    # absence was not a decision: `log10` never matched the `log` rule (`1` is a
+    # word character, so the boundary held), so it reached the generated source
+    # untranslated and raised NameError inside the RHS at solve time, on a model
+    # the ODE backend and jacobian="auto" both handle.
+    "log10": "jnp.log10",
+    "log2": "jnp.log2",
+    "sinh": "jnp.sinh",
+    "cosh": "jnp.cosh",
+    "tanh": "jnp.tanh",
+    "asinh": "jnp.arcsinh",
+    "acosh": "jnp.arccosh",
+    "atanh": "jnp.arctanh",
+    "sign": "jnp.sign",
+    "sgn": "jnp.sign",
 }
+
+# The engine's reserved constants, bound on every expression it compiles. Same
+# story as the functions above: nothing substitutes them, so `_pi` reached the
+# RHS as a bare name and raised NameError there. The physical constants have no
+# jax.numpy name, so they are emitted as the values the engine binds.
+_JAX_CONSTANTS: dict[str, str] = {
+    **{name: repr(value) for name, value in _BUILTIN_CONSTANT_VALUES.items()},
+    "_pi": "jnp.pi",
+    "_e": "jnp.e",
+    # The bare spelling of the clock. `time()` is parked above as _CLOCK_SYM;
+    # the engine accepts `time` without parentheses too, and _BUILTIN_IDENT_MAP
+    # (the C path) maps it the same way. (`t()` is not the clock — issue #659.)
+    "time": "t",
+}
+
+_JAX_NAMES: dict[str, str] = {**_JAX_MATH_FUNCS, **_JAX_CONSTANTS}
+
+
+# The engine's two roundings, neither of which jax.numpy spells. jnp.round
+# rounds a half to EVEN, so mapping either name onto it moved every exact half:
+# round(2.5) came out 2 here and 3 in the engine. They are not quite each other
+# either. `rint` is the engine's own adapter over C std::round
+# (src/expression.cpp), halves away from zero; `round` is ExprTk's
+# floor(x + 0.5), or ceil(x - 0.5) below zero, which agrees except where the
+# addition itself rounds — round(0.49999999999999994) is 1, rint of it is 0.
+# Each needs its argument twice, so the RHS namespace binds them as helpers.
+def _jax_round(x: Any) -> Any:
+    """ExprTk's ``round``: ``floor(x + 0.5)``, or ``ceil(x - 0.5)`` below zero."""
+    import jax.numpy as jnp
+
+    return jnp.where(x < 0, jnp.ceil(x - 0.5), jnp.floor(x + 0.5))
+
+
+def _jax_rint(x: Any) -> Any:
+    """The engine's ``rint``: C ``std::round``, a half rounded away from zero."""
+    import jax.numpy as jnp
+
+    whole = jnp.trunc(x)  # x - whole is exact, so the test below is too
+    return jnp.where(jnp.abs(x - whole) >= 0.5, whole + jnp.sign(x), whole)
+
+
+_JAX_HELPERS: dict[str, Any] = {"__bngsim_round__": _jax_round, "__bngsim_rint__": _jax_rint}
+
+# What the generated RHS binds around the eval (see generate_jax_rhs), plus the
+# Python keywords an expression may legitimately contain. Every other bare name
+# left after translation is a NameError waiting for solve time.
+_JAX_EVAL_NAMES = frozenset({"jnp", "t", "params", "obs", "y", *_JAX_HELPERS})
+_PY_KEYWORDS = frozenset({"and", "or", "not", "if", "else", "True", "False", "None"})
+
+# An identifier that is not an attribute access: `jnp.log` is one name, not two.
+_BARE_IDENT_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)")
+
+# Quoted text is data, not a name — a table function's file name would
+# otherwise be read as a pile of undefined identifiers.
+_STRING_LITERAL_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 # Longest name first so `asin` wins over `sin`, and no match may start straight
 # after a word character or a `.` — the latter keeps an already-emitted
 # `jnp.log` from being read as the function `log` should this ever run twice.
 _JAX_MATH_RE = re.compile(
-    r"(?<![\w.])("
-    + "|".join(sorted(map(re.escape, _JAX_MATH_FUNCS), key=len, reverse=True))
-    + r")\b"
+    r"(?<![\w.])(" + "|".join(sorted(map(re.escape, _JAX_NAMES), key=len, reverse=True)) + r")\b"
 )
+
+
+# `max(`/`min(` as a call, not as the tail of a longer name or an attribute.
+_MINMAX_CALL_RE = re.compile(r"(?<![\w.])(max|min)\s*\(")
+
+
+def _fold_minmax(expr: str) -> str:
+    """Fold an n-ary ``max``/``min`` into nested binary calls, a unary one into
+    its parenthesized argument, and leave a binary one byte-for-byte.
+
+    The engine's are ExprTk's, which are variadic: ``max(a, b, c)`` is the
+    largest of three and ``max(a)`` is ``a``. jnp.maximum/jnp.minimum take
+    exactly two arguments, so either form reached the RHS as a TypeError at
+    solve time — past _reject_untranslated_names, since ``jnp.maximum`` is a
+    perfectly good name. The C path folds the same way (GH #556). Runs before
+    the name passes, while the arguments are still the model's own text.
+    """
+    out: list[str] = []
+    cursor = 0
+    while (m := _MINMAX_CALL_RE.search(expr, cursor)) is not None:
+        close = _find_close_paren_strict(expr, m.end() - 1)
+        if close < 0:
+            break  # unbalanced: leave the rest as written
+        parts = [_fold_minmax(part) for part in _split_top_level_commas(expr[m.end() : close])]
+        out.append(expr[cursor : m.start()])
+        if len(parts) == 2:
+            out.append(f"{expr[m.start() : m.end()]}{parts[0]},{parts[1]})")
+        elif len(parts) == 1:
+            out.append(f"({parts[0]})" if parts[0].strip() else expr[m.start() : close + 1])
+        else:
+            folded = parts[0].strip()
+            for part in parts[1:]:
+                folded = f"{m.group(1)}({folded},{part.strip()})"
+            out.append(folded)
+        cursor = close + 1
+    out.append(expr[cursor:])
+    return "".join(out)
 
 
 def _translate_expr_jax(
@@ -166,6 +281,8 @@ def _translate_expr_jax(
     # zero-arg built-in, so every remaining empty argument list is a scalar.
     c = _EMPTY_CALL_RE.sub(r"\1", c)
 
+    c = _fold_minmax(c)
+
     # Replace if(cond, a, b) -> jnp.where(cond, a, b)
     # This handles nested if() via repeated application
     for _ in range(10):  # max nesting depth
@@ -207,7 +324,7 @@ def _translate_expr_jax(
     # "AttributeError: module 'jax.numpy' has no attribute 'jnp'" at
     # evaluation. One pass over the source cannot rewrite its own output, which
     # ends the whole class of collision rather than the one instance of it.
-    c = _JAX_MATH_RE.sub(lambda m: _JAX_MATH_FUNCS[m.group(1)], c)
+    c = _JAX_MATH_RE.sub(lambda m: _JAX_NAMES[m.group(1)], c)
 
     # Replace ^ with ** for exponentiation
     c = c.replace("^", "**")
@@ -216,7 +333,41 @@ def _translate_expr_jax(
     # and nothing above may rewrite it (issue #659).
     c = c.replace(_CLOCK_SYM, "t")
 
+    # After the clock is spent, not before: the scan below rejects any bare name
+    # it cannot evaluate, and `__bngsim_clock__` is one until it becomes `t`.
+    _reject_untranslated_names(expr, c)
+
     return c
+
+
+def _reject_untranslated_names(expr: str, translated: str) -> None:
+    """Raise if anything survived translation that the RHS cannot evaluate.
+
+    The generated RHS evaluates each translated body with ``{"__builtins__":
+    {}}`` and a namespace holding only ``jnp``/``t``/``params``/``obs``/``y``
+    and the previously computed ``func_*`` locals, so a name that reaches it
+    untranslated is a guaranteed ``NameError`` — raised deep inside the solve,
+    naming a symbol the caller never wrote in Python (GH #565). Saying so here,
+    while the expression is still in hand, costs nothing and names the function
+    and the model text it came from.
+    """
+    scanned = _STRING_LITERAL_RE.sub("''", translated)
+    unknown = sorted(
+        {
+            name
+            for name in _BARE_IDENT_RE.findall(scanned)
+            if name not in _JAX_EVAL_NAMES
+            and name not in _PY_KEYWORDS
+            and not name.startswith("func_")
+        }
+    )
+    if unknown:
+        raise ValueError(
+            f"jacobian='jax' cannot translate {', '.join(repr(u) for u in unknown)} "
+            f"in the expression {expr!r}: no jax.numpy equivalent is mapped for it. "
+            "Use jacobian='auto' (the default), which evaluates this model through "
+            "the engine instead."
+        )
 
 
 def _safe_py_name(name: str) -> str:
@@ -317,6 +468,7 @@ def generate_jax_rhs(net_path: str) -> Any:
             _safe_py_name(fname)
             # Build local namespace for eval
             local_ns = {
+                **_JAX_HELPERS,
                 "jnp": jnp,
                 "t": t,
                 "params": params,

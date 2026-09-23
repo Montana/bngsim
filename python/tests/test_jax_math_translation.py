@@ -81,7 +81,7 @@ def test_the_logarithms(expr, want):
         ("min(B,k1)", "jnp.minimum(obs[0],params[0])"),
         ("max(B,k1)", "jnp.maximum(obs[0],params[0])"),
         ("pow(B,2)", "jnp.power(obs[0],2)"),
-        ("rint(B)", "jnp.round(obs[0])"),
+        ("rint(B)", "__bngsim_rint__(obs[0])"),
         ("floor(B)", "jnp.floor(obs[0])"),
         ("ceil(B)", "jnp.ceil(obs[0])"),
         # nesting, and an inverse wrapping its own bare form
@@ -114,9 +114,13 @@ def test_no_replacement_is_rewritten_by_another_rule():
 
 
 def test_a_longer_name_is_not_partially_matched():
-    """`log10` is not `log`, and nothing here claims to translate it — it must
-    come through untouched rather than half-rewritten into `jnp.log10`."""
-    assert _t("log10(B)") == "log10(obs[0])"
+    """A name that merely starts with a mapped one keeps its own identity:
+    `log10` is translated as itself (GH #565 added it), and a name that is in
+    no table at all is refused by its own name rather than half-rewritten into
+    `jnp.log` plus a stray tail."""
+    assert _t("log10(B)") == "jnp.log10(obs[0])"
+    with pytest.raises(ValueError, match="logistic"):
+        _t("logistic(B)")
 
 
 def test_a_model_name_that_merely_contains_one_is_left_alone():
