@@ -1,4 +1,4 @@
-"""SBML Level 3 packages declared ``required="true"`` (issue #592).
+"""SBML Level 3 packages declared ``required="true"`` (issues #592, #613).
 
 SBML defines ``required="true"`` on a package namespace to mean the package
 changes the *mathematical meaning* of the model. bngsim interprets exactly one
@@ -197,6 +197,79 @@ def test_a_handled_package_still_loads() -> None:
     ):
         model = bngsim.Model.from_sbml_string(_with_package(prefix, uri, "true"))
         assert model.species_names == ["A"], prefix
+
+
+# ─── Non-standard namespace blind spot (issue #613) ─────────────────────────
+
+#: A namespace outside http://www.sbml.org/sbml/level3/… — libSBML drops it
+#: entirely: no plugin, no unknown-package entry, no error.
+_ZZZ_URI = "http://example.com/zzz/version1"
+
+
+def test_a_nonstandard_required_namespace_is_refused(tmp_path) -> None:
+    """A ``required="true"`` attribute on a namespace outside the standard SBML
+    L3 hierarchy is invisible to libSBML's plugin and unknown-package APIs
+    (issue #613). The loader must still refuse it rather than silently loading
+    the core layer as if the namespace were not there."""
+    xml = _with_package("zzz", _ZZZ_URI, "true")
+    with pytest.raises(ModelError) as excinfo:
+        bngsim.Model.from_sbml_string(xml)
+    msg = str(excinfo.value)
+    assert _ZZZ_URI in msg
+    assert 'required="true"' in msg
+    assert _ALLOW_UNSUPPORTED_ENV in msg
+
+
+def test_a_nonstandard_required_false_namespace_is_not_refused() -> None:
+    """``required="false"`` on a non-standard namespace means the same thing it
+    does on a standard one: the package does not change the math, and the core
+    layer is the model."""
+    xml = _with_package("zzz", _ZZZ_URI, "false")
+    model = bngsim.Model.from_sbml_string(xml)
+    assert model.species_names == ["A"]
+
+
+def test_nonstandard_required_namespace_opt_out(monkeypatch, caplog) -> None:
+    """``BNGSIM_ALLOW_UNSUPPORTED_CONSTRUCTS=1`` opts out of the refusal for
+    non-standard namespaces the same as for standard ones."""
+    monkeypatch.setenv(_ALLOW_UNSUPPORTED_ENV, "1")
+    xml = _with_package("zzz", _ZZZ_URI, "true")
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(xml)
+    assert model.species_names == ["A"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(_ZZZ_URI in w and _ALLOW_UNSUPPORTED_ENV in w for w in warnings), warnings
+
+
+def test_the_file_entry_point_catches_nonstandard_namespace(tmp_path) -> None:
+    """The file entry point (``Model.from_sbml``) must also catch non-standard
+    required namespaces, not only the string entry point."""
+    path = tmp_path / "zzz.xml"
+    path.write_text(_with_package("zzz", _ZZZ_URI, "true"))
+    with pytest.raises(ModelError, match=_ZZZ_URI):
+        bngsim.Model.from_sbml(path)
+
+
+def test_the_raw_scan_reads_only_the_root_element() -> None:
+    """The #613 scan must cost the same on a 20 MB document as on a 2 kB one:
+    it reads as far as the ``<sbml>`` start tag and stops, rather than taking a
+    second full copy of a document libSBML has already read."""
+    import io
+
+    from bngsim._sbml_loader import _raw_required_namespaces
+
+    class _Counting(io.BytesIO):
+        consumed = 0
+
+        def read(self, size=-1):
+            data = super().read(size)
+            _Counting.consumed += len(data)
+            return data
+
+    padding = b"<!-- " + b"x" * (20 * 1024 * 1024) + b" -->"
+    stream = _Counting(_with_package("zzz", _ZZZ_URI, "true").encode() + padding)
+    assert _raw_required_namespaces(stream) == {_ZZZ_URI: _ZZZ_URI}
+    assert _Counting.consumed < 1024 * 1024
 
 
 # ─── Opt-out ────────────────────────────────────────────────────────────────

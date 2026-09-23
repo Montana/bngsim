@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import io
 import logging
 import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import IO
 
 import libsbml
 
@@ -2167,16 +2169,49 @@ def _package_name_from_uri(uri: str) -> str:
     return parts[-2]
 
 
-def _unhandled_required_packages(doc) -> list[tuple[str, str]]:
-    """``(name, namespace URI)`` for every ``required="true"`` package bngsim
-    does not account for, sorted by name (issue #592).
+def _raw_required_namespaces(stream: IO) -> dict[str, str]:
+    """``{uri: name}`` for every namespace the root ``<sbml>`` element marks
+    ``required="true"`` (issue #613), read from *stream* rather than libSBML.
 
-    Two sources, because libSBML splits them: a package it implements is a
-    *plugin* on the document, and one it does not (``arrays`` in 5.21, anything
-    newer than the installed libSBML) is an *unknown package*, which it still
-    records with its ``required`` flag. A namespace outside
-    ``http://www.sbml.org/sbml/level3/…`` is neither — libSBML drops it without
-    a word, and there is nothing here to read.
+    This is the safety net for namespaces outside
+    ``http://www.sbml.org/sbml/level3/…``: libSBML drops them entirely — no
+    plugin, no unknown-package entry, no error — so its API cannot see them.
+    ``iterparse`` stops at the first start tag, so only the opening ``<sbml>``
+    element is read however large the document is, and it hands the attributes
+    back in Clark notation (``{uri}required``). The name is
+    :func:`_package_name_from_uri`'s, which for a URI outside the L3 hierarchy
+    is the URI itself.
+    """
+    import xml.etree.ElementTree as ET
+
+    required: dict[str, str] = {}
+    try:
+        for _event, root in ET.iterparse(stream, events=("start",)):
+            for clark, value in root.attrib.items():
+                is_required = clark.startswith("{") and clark.endswith("}required")
+                if is_required and value.strip().lower() == "true":
+                    uri = clark[1 : clark.index("}")]
+                    required[uri] = _package_name_from_uri(uri)
+            break  # the root element only
+    except ET.ParseError:
+        pass  # malformed XML — libSBML reports it separately
+    return required
+
+
+def _unhandled_required_packages(doc, raw_xml: IO | None = None) -> list[tuple[str, str]]:
+    """``(name, namespace URI)`` for every ``required="true"`` package bngsim
+    does not account for, sorted by name (issues #592, #613).
+
+    Three sources, because libSBML splits them and silently drops one class:
+
+    * A package libSBML has an extension for is a *plugin* on the document.
+    * One it does not (``arrays`` in 5.21, anything newer than the installed
+      libSBML) is an *unknown package*, which it still records with its
+      ``required`` flag.
+    * A namespace outside ``http://www.sbml.org/sbml/level3/…`` is neither —
+      libSBML drops it without a word. When *raw_xml* (a readable stream over
+      the document) is given, its root element is parsed with ``ElementTree``
+      to catch these (issue #613).
 
     Only ``required="true"`` is collected. That is the whole design: SBML
     defines it to mean the package changes the model's mathematical meaning, so
@@ -2215,10 +2250,18 @@ def _unhandled_required_packages(doc) -> list[tuple[str, str]]:
         name = _package_name_from_uri(uri)
         if name not in handled and doc.getPackageRequired(uri):
             found[name] = uri
+    # GH #613: namespaces outside the standard L3 hierarchy are invisible to
+    # libSBML's plugin and unknown-package APIs.  Parse the root element
+    # directly and add any that libSBML missed.
+    if raw_xml is not None:
+        already_seen = set(found.values()) | {core_uri}
+        for uri, name in _raw_required_namespaces(raw_xml).items():
+            if uri not in already_seen and name not in handled:
+                found[name] = uri
     return sorted(found.items())
 
 
-def _check_required_packages(doc, source: str) -> None:
+def _check_required_packages(doc, source: str, raw_xml: IO | None = None) -> None:
     """Refuse a document whose declared ``required="true"`` package bngsim does
     not interpret, instead of silently building a model from the core layer
     (issue #592).
@@ -2237,7 +2280,7 @@ def _check_required_packages(doc, source: str) -> None:
     """
     import os
 
-    offenders = _unhandled_required_packages(doc)
+    offenders = _unhandled_required_packages(doc, raw_xml=raw_xml)
     if not offenders:
         return
 
@@ -2423,7 +2466,8 @@ def load_sbml(path: str | Path, compartment_sizes: dict | None = None):
     t0 = time.perf_counter()
     doc = libsbml.readSBMLFromFile(str(path))
     _check_sbml_errors(doc, str(path))
-    _check_required_packages(doc, str(path))
+    with open(path, "rb") as stream:  # read as bytes, so the XML declaration names the encoding
+        _check_required_packages(doc, str(path), raw_xml=stream)
     if _doc_uses_comp(doc):
         _flatten_comp(doc, base_path=str(path.parent))
     if compartment_sizes:
@@ -2442,7 +2486,7 @@ def load_sbml_string(text: str, compartment_sizes: dict | None = None):
     t0 = time.perf_counter()
     doc = libsbml.readSBMLFromString(text)
     _check_sbml_errors(doc, "<string>")
-    _check_required_packages(doc, "<string>")
+    _check_required_packages(doc, "<string>", raw_xml=io.StringIO(text))
     if _doc_uses_comp(doc):
         # No file context for a string load, so ExternalModelDefinitions cannot
         # be resolved; in-document ModelDefinitions/Submodels flatten fine.
