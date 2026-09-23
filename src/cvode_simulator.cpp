@@ -6734,6 +6734,20 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
     // ─── Record initial state ────────────────────────────────────────────────
 
+    // GH #106/#231/#567: a rate_of__<species> accessor reads
+    // model.current_derivs, which is refreshed only as a side effect of an RHS
+    // eval — and at t=0, before any step has been taken, that buffer holds
+    // whatever the last run left in it (zero on a fresh model, an arbitrary
+    // stale derivative on a reused one). The warm path probes dx/dt for every
+    // recorded row including this one, and the cold path's per-point recording
+    // below does the same; only this initial row was left out, so every cold
+    // run of a rateOf model reported a wrong first sample and a correct rest.
+    // The cold path is what a forward-sensitivity run, jacobian="jax", a
+    // crossing stop or BNGSIM_NO_WARM_CVODE all take, so it is not a rare
+    // corner. No-op on a model without rateOf.
+    if (model.uses_rateof()) {
+        model.refresh_rateof_derivs(times.t_start, y_data);
+    }
     model.update_observables(y_data);
     model.evaluate_functions(times.t_start);
     for (int j = 0; j < n_obs; ++j) {
