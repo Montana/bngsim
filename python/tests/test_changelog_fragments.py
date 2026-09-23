@@ -372,6 +372,33 @@ class TestTheBranchMustStageItsOwnEntry:
         assert done.returncode == 1
         assert "stages no changelog entry" in done.stderr
 
+    def test_an_empty_file_list_fails_closed(self):
+        """The failure a gate cannot afford. A pipeline's exit status is the
+        last command's, so a `gh api` that failed would feed nothing to a
+        checker that then objects to nothing — green, having read nothing.
+        That is #664's defect, and the workflow's `set -o pipefail` is the
+        other half of this guard."""
+        done = subprocess.run(
+            [sys.executable, str(SCRIPT), "required", "--files", "-"],
+            input="",
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+        assert done.returncode == 1
+        assert "nothing was actually checked" in done.stderr
+
+    def test_the_workflow_does_not_swallow_a_failed_api_call(self):
+        workflow = REPO_ROOT / ".github" / "workflows" / "changelog.yml"
+        if not workflow.is_file():
+            pytest.skip(".github/workflows is not in this checkout")
+        body = "\n".join(
+            line
+            for line in workflow.read_text(encoding="utf-8").split("\n")
+            if not line.lstrip().startswith("#")
+        )
+        assert "pipefail" in body
+
 
 class TestTheGatesAreWiredUp:
     """Textual, like the other CI-coverage modules here, and for the same

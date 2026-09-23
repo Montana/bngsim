@@ -58,7 +58,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+        # `pipefail` is load-bearing, not hygiene: a pipeline's exit status is
+        # the last command's, so without it a `gh api` that failed for any
+        # reason would hand an empty list to a checker that found nothing to
+        # object to, and this job would go green having read nothing. The script
+        # refuses an empty list for the same reason — two independent guards,
+        # because #664 is what one that can silently pass looks like.
         run: |
+          set -o pipefail
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
             --paginate --jq '.[].filename' \
             | python3 ci/changelog.py required --files -

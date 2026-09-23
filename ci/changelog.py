@@ -415,6 +415,18 @@ def main(argv: list[str] | None = None) -> int:
             changed = [line.strip() for line in raw.split("\n") if line.strip()]
         else:
             changed = _changed_files(args.base)
+        # Fail closed. The workflow pipes `gh api … --jq` into this, and a
+        # pipeline's exit status is the last command's: without this, an API
+        # call that failed for any reason would hand over an empty list, every
+        # rule would find nothing to object to, and the gate would go green
+        # having read nothing. That is #664's defect -- a check that returns
+        # success without opening a file -- and it is the one failure a gate
+        # cannot afford. No pull request changes zero files.
+        if not changed:
+            return _report(
+                ["no changed files were reported, so nothing was actually checked"],
+                "",
+            )
         return _report(required(changed), "changelog: this branch's entry is staged correctly")
 
     fragments = load()
