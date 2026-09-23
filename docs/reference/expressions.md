@@ -53,7 +53,18 @@ BNGsim provides all standard ExprTk functions plus BNG-specific extensions:
 
 **Time**:
 - `time()` — current simulation time (updated by CVODE/SSA at each step)
-- `t()` — alias for `time()`
+
+`time()` is the only way to read the clock. `t` is **not** an alias for it: it
+is left free as an ordinary identifier, so that a model may name a parameter or
+observable `t` (the BNGL counter idiom `Molecules t counter()` is why), matching
+BNG2.pl. A bare `t` in an expression is that model symbol, and `t()` is the same
+symbol written as a zero-argument call — the form BNG2.pl emits and which bngsim
+accepts for any scalar. In a model that defines no `t`, both spellings fail to
+compile rather than falling back to the clock.
+
+One place does treat `t` as the clock, and it is a different grammar: the
+*index name* of a table function, where `time`, `T`, `Time()` and `t()` all
+select simulation time. See [Table functions](../user-guide/table-functions.md).
 
 **Special functions**:
 - `mratio(a, b, z)` — confluent hypergeometric ratio M(a+1,b+1,z)/M(a,b,z)

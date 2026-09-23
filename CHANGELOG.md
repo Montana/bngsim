@@ -14,10 +14,16 @@ in `CMakeLists.txt`) is derived from it.
 
 ## [Unreleased]
 
+Entries for the next release are staged one file per change under
+[`changelog.d/`](changelog.d/) and assembled into a version section by the
+release commit, so no two branches ever edit this file (issue #668). Add a
+fragment — see [`changelog.d/README.md`](changelog.d/README.md) — rather than
+an entry here.
+
 ### Changed
 
-- **`CHANGELOG.md` is merged with git's `union` driver, so two open pull
-  requests no longer conflict on it.** Every entry is inserted at the same
+- **`CHANGELOG.md` is merged with git's `union` driver, so a local merge no
+  longer stops on it. GitHub's merge still does.** Every entry is inserted at the same
   anchor — the top of `## [Unreleased]` → `### Fixed` — so any two branches
   open at once edit the same region and git stops there, on a file that cannot
   affect behavior. 17 of the 30 pull requests before this one touched it, and
@@ -28,6 +34,18 @@ in `CMakeLists.txt`) is derived from it.
   fix (`check-merge-conflict` is a no-op in CI today) underneath it. The
   structural fix, one fragment file per change assembled at release, is issue
   #668.
+
+  Measured after the fact, and the half that does not work is worth stating
+  plainly: GitHub's merge machinery ignores `.gitattributes`. #663 was open with
+  an entry in the same section, reported `CONFLICTING` before this landed, and
+  still reported `CONFLICTING` after — while the identical merge run locally,
+  against the same `main`, resolved clean. So a concurrent pull request still
+  shows "This branch has conflicts", "Update branch" still does not clear it,
+  and someone still has to merge locally and push. What changed is that the
+  push is `git merge` plus `git push` instead of a hand-edit of the region,
+  which is where the two hand-resolution defects came from (#662 committed
+  conflict markers, #656 duplicated its entry). The fix that clears the GitHub
+  path is one fragment file per change — issue #668.
 
 ### Fixed
 
@@ -64,6 +82,44 @@ in `CMakeLists.txt`) is derived from it.
   against a real SBML model and evaluates it, which is where the old behavior
   raised. Five of the fourteen fail on the previous behavior. From @Montana.
 
+- **`t` is an ordinary model identifier, not a spelling of the clock, and four
+  expression translators read it as one (issue #659).** The evaluator binds
+  exactly one clock symbol: `time`. `t` is deliberately left free so a model may
+  name a parameter or observable `t` — the BNGL counter idiom
+  `Molecules t counter()` is the reason, and `src/expression.cpp` says so. But
+  `docs/reference/expressions.md` documented `t()` as "alias for `time()`", three
+  C++ comments asserted that both were bound, and the Python layers that
+  translate ExprTk expression *strings* rewrote `t()` to the clock.
+
+  `t()` is not the clock. It is how BNG2.pl writes a reference to a scalar named
+  `t`, and the engine reads it that way (`strip_empty_parens`) — so rewriting it
+  erased the observable. That is issue #28's defect surviving for exactly one
+  name, and two of its consequences were silent wrong numbers:
+
+  * the derived Jacobian entry for a rate law reading `t()` came back empty, so
+    the **forward sensitivity** of such a model was wrong — `d[A]/dk` reported
+    as −6.67 against a finite-difference −22.22 on the regression model, a
+    factor of 3.3, with no warning and no error, because the codegen
+    sensitivity RHS has nothing checking it against finite differences;
+  * the interpreted attach *was* caught, by the C++ FD self-check, which
+    declined the whole analytical Jacobian — so the model silently fell back to
+    finite differences for a reason that was a preprocessing bug rather than a
+    real non-differentiability.
+
+  The JAX translator carried the inverse confusion: it rewrote `time()` and
+  `t()` alike to a bare `t`, which its own observable pass then rewrote, so in a
+  model with an observable named `t` the **clock** came out as that observable's
+  population. Its fix needed the zero-arg strip issue #28 never reached that
+  path, so `Atot()` there stops emitting `obs[1]()` — a call on a JAX array —
+  as well.
+
+  `time()` is now the only clock spelling in `_jacobian`, `_saturable_jacobian`,
+  `_codegen` and `_jax_rhs`, and the docs and comments say so. The ODE
+  trajectory was never affected: the codegen identifier table has always let a
+  model name outrank a built-in, so `t()` emitted the right C. One grammar is
+  deliberately exempt and is pinned by a test — a table function's *index name*,
+  where `is_time_index()` accepts `time`, `T`, `Time()` and `t()` alike, is a
+  different namespace from an expression token.
 - **The `check-merge-conflict` pre-commit hook read no files in CI, so conflict
   markers passed the lint gate (issue #664).** The hook returns success without
   opening a file unless git is mid-merge — it tests for `MERGE_MSG` plus one of
@@ -254,7 +310,6 @@ in `CMakeLists.txt`) is derived from it.
   `a0 == 0`, which says nothing about a function that reads `time()` — an
   output-only one, or one whose reaction is exhausted — so its column has to
   keep tracking t across the frozen tail.
-
 
 ## [0.16.0] - 2026-09-21
 

@@ -58,9 +58,13 @@ from bngsim._jacobian import _TIME_SYM, _inline_functions
 _UNARY_FUNCS = {"exp", "log", "ln", "sqrt"}
 _CANONICAL_FUNC = {"exp": "exp", "log": "log", "ln": "log", "sqrt": "sqrt"}
 
-# time() / t() spellings (parens required, matching _jacobian._preprocess_exprtk
-# so a parameter literally named ``t`` is left as a variable).
-_TIME_NAMES = {"time", "t"}
+# The clock. `time` is the only spelling the evaluator binds — `t` is
+# deliberately left free as an ordinary model identifier (src/expression.cpp),
+# so `t()` is a reference to a scalar named `t`, not the clock, and must not
+# land here (issue #659). A zero-arg call that is not `time()` falls through to
+# the "unsupported call" path below and the SymPy route differentiates it,
+# which is where `Atot()` already goes.
+_TIME_NAMES = {"time"}
 
 _NAN_INF_RE = re.compile(r"(?<![A-Za-z0-9_])(nan|inf|-inf)(?![A-Za-z0-9_])", re.IGNORECASE)
 
@@ -76,7 +80,7 @@ class _NativeError(Exception):
 # Tagged tuples, immutable and cheap to hash/compare:
 #   ('num', float)            numeric literal
 #   ('var', name)             identifier — a state observable or a constant param
-#   ('time',)                 time() / t()
+#   ('time',)                 time()
 #   ('neg', a)                unary minus
 #   ('+'|'-'|'*'|'/'|'^', a, b)   binary op
 #   ('call', name, (arg,))    exp/log/sqrt (canonical name)
