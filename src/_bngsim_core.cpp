@@ -576,17 +576,22 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     // as a convergence failure, or as non-finite concentrations from
                     // an integration that looked ordinary, with nothing pointing at
                     // the callback. Two smaller hazards sat beside it — a
-                    // non-contiguous or non-float64 array made the copy read the
-                    // wrong strides, and `ns * ns` was computed in `int`, which
+                    // non-contiguous array made the copy read the wrong strides (a
+                    // wrong dtype did not: array_t's default flags already carry
+                    // forcecast), and `ns * ns` was computed in `int`, which
                     // overflows above ns = 46340 before it widens to size_t.
                     //
-                    // c_style|forcecast converts a strided or wrong-dtype result
-                    // into a contiguous float64 temporary, so the pointer below is
-                    // always the right layout; the size check is then the only
+                    // f_style|forcecast converts a strided or wrong-dtype result
+                    // into a Fortran-ordered float64 temporary. A flat array is the
+                    // same either way; an (ns, ns) matrix J[i, j] = df_i/dy_j lands
+                    // in exactly the column-major layout CVODE's dense matrix holds.
+                    // c_style would hand CVODE that matrix's transpose, and quietly:
+                    // Newton tolerates an inexact Jacobian, so the run still ends,
+                    // just on the wrong matrix. The size check is then the only
                     // thing left, and it is done in size_t.
                     auto jac_arr =
                         result
-                            .cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+                            .cast<py::array_t<double, py::array::f_style | py::array::forcecast>>();
                     const size_t want = static_cast<size_t>(ns) * static_cast<size_t>(ns);
                     const size_t got = static_cast<size_t>(jac_arr.size());
                     if (got != want) {
@@ -595,7 +600,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                             " element(s); this model has " + std::to_string(ns) +
                             " species, so a dense Jacobian is " + std::to_string(ns) + "x" +
                             std::to_string(ns) + " = " + std::to_string(want) +
-                            " elements (flat column-major, or any shape of that size).");
+                            " elements (a flat column-major array, or a " + std::to_string(ns) +
+                            "x" + std::to_string(ns) + " matrix whose [i, j] is df_i/dy_j).");
                     }
                     auto buf = jac_arr.request();
                     const double *src = static_cast<const double *>(buf.ptr);

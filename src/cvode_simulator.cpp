@@ -808,17 +808,11 @@ static std::string sensitivity_restart_hint(double t_now, const CvodeUserData &d
     return os.str();
 }
 
-// The message a CVODE hard failure raises with. `flag` gains SUNDIALS' own name
-// for it (CVodeGetReturnFlagName mallocs the string), and the witness — if this
-// run left one — gains the species and the rate law behind it. `t_internal` is
-// where the integrator itself stood, which `t` (the output time it was asked
-// for) is not; it lets an error-test or convergence failure say it came right
-// after a restart (issue #545).
 // Rethrow what a Python callback threw, if one did (GH #566). Called on every
 // path that is about to report an integration failure, because a Jacobian
-// callback that raised is the cause of that failure and the better message:
-// "CVODE integration failed ... CV_CONV_FAILURE" describes what the corrupt
-// matrix did to the corrector, not the array that was the wrong size.
+// callback that raised is the cause of that failure, and CVODE's own account of
+// it — a failed linear-solver setup — names neither the callback nor what it
+// raised.
 static void rethrow_pending_callback_error(CvodeUserData &data) {
     if (data.jax_jac_error) {
         std::exception_ptr err = data.jax_jac_error;
@@ -827,6 +821,12 @@ static void rethrow_pending_callback_error(CvodeUserData &data) {
     }
 }
 
+// The message a CVODE hard failure raises with. `flag` gains SUNDIALS' own name
+// for it (CVodeGetReturnFlagName mallocs the string), and the witness — if this
+// run left one — gains the species and the rate law behind it. `t_internal` is
+// where the integrator itself stood, which `t` (the output time it was asked
+// for) is not; it lets an error-test or convergence failure say it came right
+// after a restart (issue #545).
 static std::string
 cvode_failure_message(double t, int flag, CvodeUserData &data,
                       double t_internal = std::numeric_limits<double>::quiet_NaN()) {

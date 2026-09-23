@@ -9,9 +9,11 @@ heap past the end of that array straight into CVODE's Newton matrix.
 The corruption does not announce itself. It surfaces as a convergence failure,
 or as non-finite concentrations out of an integration that looked ordinary,
 with nothing naming the callback. Two smaller hazards sat beside it: a
-non-contiguous or non-float64 array made the copy read the wrong strides and
-silently integrate the wrong Jacobian, and ``ns * ns`` was computed in ``int``,
-which overflows above ns = 46340 before widening to ``size_t``.
+non-contiguous array made the copy read the wrong strides and silently integrate
+the wrong Jacobian, and ``ns * ns`` was computed in ``int``, which overflows
+above ns = 46340 before widening to ``size_t``. (A float32 array was already
+converted — ``array_t``'s default flags carry ``forcecast`` — and is pinned here
+so it stays that way.)
 
 These go through ``bngsim._bngsim_core`` directly. The callback path is C++ and
 pybind11 — JAX itself is not involved, so none of this needs JAX installed.
@@ -111,6 +113,41 @@ def test_a_two_dimensional_array_of_the_right_size_works(net):
     assert np.array_equal(_run(net, lambda: JAC.copy()), _run(net, lambda: FLAT.copy()))
 
 
+# A -> B -> 0: dA/dt = -k*A, dB/dt = k*A - k2*B. Unlike the diagonal JAC above,
+# this Jacobian is not its own transpose, so it can tell the two apart.
+NET_AB = """begin parameters
+    1 k 50
+    2 k2 0.1
+end parameters
+begin species
+    1 A() 10
+    2 B() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+    2 2 0 k2 #_R2
+end reactions
+begin groups
+    1 A_t 1
+    2 B_t 2
+end groups
+"""
+JAC_AB = np.array([[-50.0, 0.0], [50.0, -0.1]])  # J[i, j] = df_i/dy_j
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_a_square_matrix_is_read_as_the_jacobian_not_its_transpose(tmp_path, order):
+    """An (ns, ns) return means J[i, j] = df_i/dy_j, the layout jax.jacfwd
+    produces. Read in C order it reached CVODE as J^T, and nothing said so:
+    Newton tolerates an inexact matrix, so the run still finished."""
+    net = tmp_path / "ab.net"
+    net.write_text(NET_AB)
+    want = _run(str(net), lambda: JAC_AB.flatten(order="F"))
+    assert np.array_equal(_run(str(net), lambda: np.array(JAC_AB, order=order)), want)
+    # Not vacuous: on this model the transpose really does integrate differently.
+    assert not np.array_equal(_run(str(net), lambda: JAC_AB.T.flatten(order="F")), want)
+
+
 def test_a_non_contiguous_array_is_read_correctly(net):
     """It used to be read at the wrong strides — the values the callback meant
     were skipped, and the run integrated a different matrix without saying so."""
@@ -124,6 +161,8 @@ def test_a_non_contiguous_array_is_read_correctly(net):
 
 
 def test_a_float32_array_is_converted_not_misread(net):
+    """Already true before GH #566 (forcecast is array_t's default); kept so a
+    change of cast flags cannot quietly undo it."""
     out32 = _run(net, lambda: FLAT.astype(np.float32))
     assert np.isfinite(out32).all()
     assert out32 == pytest.approx(_run(net, lambda: FLAT.copy()), rel=1e-6, abs=1e-8)
