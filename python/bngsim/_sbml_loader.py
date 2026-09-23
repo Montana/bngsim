@@ -425,7 +425,6 @@ def _check_unsupported_constructs(sbml_model, func_defs: dict) -> None:
         for getter, n in (
             (rxn.getReactant, rxn.getNumReactants()),
             (rxn.getProduct, rxn.getNumProducts()),
-        ):
             for k in range(n):
                 sr = getter(k)
                 if sr.isSetStoichiometryMath() and sr.getStoichiometryMath() is not None:
@@ -511,7 +510,6 @@ def _iter_species_references(sbml_model):
         for getter, n_refs in (
             (rxn.getReactant, rxn.getNumReactants()),
             (rxn.getProduct, rxn.getNumProducts()),
-        ):
             for j in range(n_refs):
                 yield getter(j)
 
@@ -1696,7 +1694,6 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         for getter, n, sign in (
             (rxn.getReactant, rxn.getNumReactants(), -1.0),
             (rxn.getProduct, rxn.getNumProducts(), +1.0),
-        ):
             for k in range(n):
                 sr = getter(k)
                 if sr.getSpecies() != sid:
@@ -2192,9 +2189,7 @@ def _raw_required_namespaces(xml_source: str) -> dict[str, str]:
     required_uris: dict[str, str] = {}
     try:
         # iterparse so we stop at the root end-event without reading the whole doc.
-        for event, elem in ET.iterparse(
-            __import__("io").StringIO(xml_source), events=("start",)
-        ):
+        for _event, elem in ET.iterparse(__import__("io").StringIO(xml_source), events=("start",)):
             # The very first element is the root <sbml>.
             for clark, value in elem.attrib.items():
                 if value.lower() != "true":
@@ -2672,7 +2667,6 @@ def _factor_minus_subtree(node):
             libsbml.AST_REAL_E,
             libsbml.AST_RATIONAL,
             libsbml.AST_NAME,
-        ):
             wrapper.append(n)
             return True
         return False
@@ -3241,7 +3235,6 @@ def _classify_mass_action_ast(
     def _record_varvol_reject(comp: str) -> None:
         if varvol_reject is not None and comp in (
             set(rate_rule_targets) | set(event_promoted_params)
-        ):
             varvol_reject["comp"] = comp
             varvol_reject["n_f"] = sum(
                 m for sid, m in species_multiset.items() if not species_hosu.get(sid, False)
@@ -3620,7 +3613,6 @@ def _build_model_from_sbml_doc(doc):
         for _getter, _n in (
             (_rxn.getReactant, _rxn.getNumReactants()),
             (_rxn.getProduct, _rxn.getNumProducts()),
-        ):
             for k in range(_n):
                 _sr = _getter(k)
                 _srid = _sr.getId() if hasattr(_sr, "getId") else ""
@@ -4187,7 +4179,6 @@ def _build_model_from_sbml_doc(doc):
             _sp.isSetInitialConcentration()
             if _sp.getHasOnlySubstanceUnits()
             else (_sp.isSetInitialAmount() and not _sp.isSetInitialConcentration())
-        ):
             volume_taint[_sp.getId()] = {_cid}
 
     _taint_edges = list(_ia_math.items())
@@ -4203,7 +4194,6 @@ def _build_model_from_sbml_doc(doc):
         for _get, _n in (
             (_rx.getReactant, _rx.getNumReactants()),
             (_rx.getProduct, _rx.getNumProducts()),
-        ):
             for _k in range(_n):
                 _sr = _get(_k)
                 _srid = _sr.getId() if hasattr(_sr, "getId") else ""
@@ -4920,7 +4910,6 @@ def _build_model_from_sbml_doc(doc):
             and (is_boundary or sid not in reaction_species)
             and sid not in assignment_targets
             and sid not in rate_rule_targets
-        ):
             is_fixed = False
 
         # volume_factor = compartment volume V_c. Storage is `amount/V_c`
@@ -5082,7 +5071,6 @@ def _build_model_from_sbml_doc(doc):
             target_var in species_idx
             and species_hosu.get(target_var, False)
             and (comp_volumes.get(_tcomp, 1.0) != 1.0 or _tcomp in live_volume_param_comps)
-        ):
             target_comp = species_comp[target_var]
             div = libsbml.ASTNode(libsbml.AST_DIVIDE)
             div.addChild(math.deepCopy())
@@ -5304,7 +5292,6 @@ def _build_model_from_sbml_doc(doc):
         for _getter, _n in (
             (_rxn.getReactant, _rxn.getNumReactants()),
             (_rxn.getProduct, _rxn.getNumProducts()),
-        ):
             for _j in range(_n):
                 if _variable_stoich_expr(_getter(_j)) is not None:
                     _variable_stoich_rxns.add(_ri)
