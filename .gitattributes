@@ -20,6 +20,19 @@ third_party/** -text
 # which is only safe because `check-merge-conflict` backs it up (issue #664 —
 # that hook is currently a no-op in CI, so land its fix alongside this).
 #
+# Two limits, both measured rather than assumed:
+#
+#   - GitHub's merge machinery ignores .gitattributes, so a concurrent PR still
+#     reports a conflict on github.com and `Update branch` still will not clear
+#     it. This only helps merges run by git. Clearing one means merging locally
+#     and pushing.
+#   - git reads .gitattributes from the PRE-merge checkout, so a branch older
+#     than this line does not benefit from it on its first merge with main. For
+#     one of those:
+#         git merge origin/main            # CHANGELOG.md conflicts
+#         git checkout -m -- CHANGELOG.md  # re-run it, driver now readable
+#         git add CHANGELOG.md
+#
 # This is a mitigation. The structural fix is one changelog fragment file per
 # change, assembled at release, so two PRs never touch the same file at all —
 # issue #668.
