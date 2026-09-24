@@ -33,6 +33,15 @@ namespace expr_compat {
 // modified-Lentz method so it stays finite on BNG's large-|z| range (issue #42).
 double mratio(double a, double b, double z);
 
+// rint(x): BNG's round-to-nearest, floor(x + 0.5) — the definition BNG2.pl's
+// run_network evaluates (muParser's Rint). A half rounds up, toward +inf, so
+// rint(-2.5) is -2 and rint(-0.5) is 0 (issue #771). This is NOT C's rint
+// (half to even under the default rounding mode), std::round (half away from
+// zero) or ExprTk's round (away from zero below 0); all four agree except at
+// halves. Written as the literal expression, so an argument where x + 0.5
+// itself rounds (0.49999999999999994 -> 1) gives what run_network gives.
+double rint(double x);
+
 // Unconditional leading-underscore remap: "_X" → "u_X" (ExprTk rejects an
 // identifier starting with '_'). Identity for any name not starting with '_'.
 // No ExprTk built-in starts with '_', so this rewrite is always safe to apply

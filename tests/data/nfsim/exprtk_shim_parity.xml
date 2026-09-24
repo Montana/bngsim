@@ -9,6 +9,10 @@
        * reserved-symbol remap -> the observable `frac` collides with an ExprTk
                                 built-in; `reserved_frac() = frac + 10` only
                                 compiles if the shim remaps `frac` -> `r_frac`.
+       * rint()    built-in  -> the rint_* functions below (constant arguments
+                                again). BNG's rint is floor(x + 0.5), so a
+                                negative half rounds up: rint(-2.5) = -2
+                                (issue #771; the shim used std::round).
      `frac` counts molecules of F; no rule touches F, so frac == 7 for all time.
      These function columns are computed by NFsim's shim (FuncFactory::Eval),
      not the host bngsim::ExprTkEvaluator (see nfsim_simulator.cpp). -->
@@ -120,6 +124,36 @@
         <ListOfReferences>
         </ListOfReferences>
         <Expression> mratio(3.2,0.8,5.0) </Expression>
+      </Function>
+      <Function id="rint_m2p5">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(-2.5) </Expression>
+      </Function>
+      <Function id="rint_m1p5">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(-1.5) </Expression>
+      </Function>
+      <Function id="rint_m0p5">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(-0.5) </Expression>
+      </Function>
+      <Function id="rint_p0p5">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(0.5) </Expression>
+      </Function>
+      <Function id="rint_p2p5">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(2.5) </Expression>
+      </Function>
+      <Function id="rint_m0p3">
+        <ListOfReferences>
+        </ListOfReferences>
+        <Expression> rint(-0.3) </Expression>
       </Function>
       <Function id="reserved_frac">
         <ListOfReferences>

@@ -157,12 +157,12 @@ _JAX_NAMES: dict[str, str] = {**_JAX_MATH_FUNCS, **_JAX_CONSTANTS}
 
 # The engine's two roundings, neither of which jax.numpy spells. jnp.round
 # rounds a half to EVEN, so mapping either name onto it moved every exact half:
-# round(2.5) came out 2 here and 3 in the engine. They are not quite each other
-# either. `rint` is the engine's own adapter over C std::round
-# (src/expression.cpp), halves away from zero; `round` is ExprTk's
-# floor(x + 0.5), or ceil(x - 0.5) below zero, which agrees except where the
-# addition itself rounds — round(0.49999999999999994) is 1, rint of it is 0.
-# Each needs its argument twice, so the RHS namespace binds them as helpers.
+# round(2.5) came out 2 here and 3 in the engine. They are not each other
+# either. `rint` is BNG's floor(x + 0.5) (expr_compat::rint in
+# src/expression.cpp, issue #771), so a half always rounds up: rint(-2.5) is -2.
+# `round` is ExprTk's floor(x + 0.5), or ceil(x - 0.5) below zero, so a
+# negative half rounds away from zero: round(-2.5) is -3. They agree at and
+# above zero. The RHS namespace binds them as helpers.
 def _jax_round(x: Any) -> Any:
     """ExprTk's ``round``: ``floor(x + 0.5)``, or ``ceil(x - 0.5)`` below zero."""
     import jax.numpy as jnp
@@ -171,11 +171,10 @@ def _jax_round(x: Any) -> Any:
 
 
 def _jax_rint(x: Any) -> Any:
-    """The engine's ``rint``: C ``std::round``, a half rounded away from zero."""
+    """The engine's ``rint``: BNG's ``floor(x + 0.5)``, a half rounded up."""
     import jax.numpy as jnp
 
-    whole = jnp.trunc(x)  # x - whole is exact, so the test below is too
-    return jnp.where(jnp.abs(x - whole) >= 0.5, whole + jnp.sign(x), whole)
+    return jnp.floor(x + 0.5)
 
 
 _JAX_HELPERS: dict[str, Any] = {"__bngsim_round__": _jax_round, "__bngsim_rint__": _jax_rint}
