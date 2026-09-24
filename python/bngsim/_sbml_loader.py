@@ -2192,9 +2192,7 @@ def _raw_required_namespaces(xml_source: str) -> dict[str, str]:
     required_uris: dict[str, str] = {}
     try:
         # iterparse so we stop at the root end-event without reading the whole doc.
-        for event, elem in ET.iterparse(
-            __import__("io").StringIO(xml_source), events=("start",)
-        ):
+        for event, elem in ET.iterparse(__import__("io").StringIO(xml_source), events=("start",)):
             # The very first element is the root <sbml>.
             for clark, value in elem.attrib.items():
                 if value.lower() != "true":
@@ -2212,9 +2210,7 @@ def _raw_required_namespaces(xml_source: str) -> dict[str, str]:
     return required_uris
 
 
-def _unhandled_required_packages(
-    doc, raw_xml: str | None = None
-) -> list[tuple[str, str]]:
+def _unhandled_required_packages(doc, raw_xml: str | None = None) -> list[tuple[str, str]]:
     """``(name, namespace URI)`` for every ``required="true"`` package bngsim
     does not account for, sorted by name (issues #592, #613).
 

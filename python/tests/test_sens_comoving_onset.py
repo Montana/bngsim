@@ -351,17 +351,15 @@ end groups
 
     start_values = (2.0, 4.0) if onsets == "on" else (2.0, 3.0)
     expected = 0.0
+
+    def decayed_pulse(age, amplitude, start):
+        s = age / 5.0
+        return amplitude * s**0.1 * (1 - s) * np.exp(-0.2 * (12.0 - start - age))
+
     for amplitude, start, speed in zip((0.7, 0.9), start_values, (1, 2), strict=False):
-
-        def pulse(age):
-            s = age / 5.0
-            return amplitude * s**0.1 * (1 - s)
-
         # Translate u = t - start and integrate by parts: the boundary fluxes
         # vanish, leaving kdeg * speed times the decayed pulse integral.
-        expected += (
-            0.2 * speed * quad(lambda u: pulse(u) * np.exp(-0.2 * (12.0 - start - u)), 0.0, 5.0)[0]
-        )
+        expected += 0.2 * speed * quad(decayed_pulse, 0.0, 5.0, args=(amplitude, start))[0]
     x_index = list(model.species_names).index("X()")
     assert result.sensitivities[-1, x_index, 0] == pytest.approx(expected, rel=2e-4)
 
