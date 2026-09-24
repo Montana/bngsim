@@ -18,6 +18,7 @@ import textwrap
 from pathlib import Path
 
 import bngsim
+import bngsim._codegen as cg
 import numpy as np
 import pytest
 
@@ -51,14 +52,26 @@ def _nan_indexed_model(tmp_path: Path, method: str) -> bngsim.Model:
     return bngsim.Model.from_net(str(net))
 
 
+def _has_cc() -> bool:
+    try:
+        cg._find_c_compiler()
+        return True
+    except Exception:
+        return False
+
+
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreter", "codegen"])
 @pytest.mark.parametrize("method", sorted(_METHODS))
-def test_a_nan_index_refuses_the_run(tmp_path, monkeypatch, method, codegen):
-    if codegen:
-        monkeypatch.setenv("BNGSIM_CODEGEN_THRESHOLD", "1")
+def test_a_nan_index_refuses_the_run(tmp_path, method, codegen):
+    if codegen and not _has_cc():
+        pytest.skip("no C compiler available")
     m = _nan_indexed_model(tmp_path, method)
+    sim = bngsim.Simulator(m, "ode", codegen=codegen)
+    # A .net model codegens only when asked: BNGSIM_CODEGEN_THRESHOLD alone
+    # leaves it on the interpreter, which would pin that path twice.
+    assert (sim.codegen_backend == "exprtk") is not codegen
     with pytest.raises(bngsim.SimulationError, match="non-finite"):
-        bngsim.Simulator(m, "ode").run((0.0, 1.0), 3)
+        sim.run((0.0, 1.0), 3)
 
 
 @pytest.mark.parametrize("method", sorted(_METHODS))
