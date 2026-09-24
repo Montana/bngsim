@@ -195,8 +195,7 @@ jobs:
       # bare install. Building bngsim itself is the slow part (SUNDIALS is
       # FetchContent'd and the KLU subset is built from source).
       - name: Provision from uv.lock (default build config)
-        # Install a regular wheel so Python resolves the complete package.
-        run: uv sync --extra dev --python 3.12 --no-editable
+        run: uv sync --extra dev --python 3.12
 
       - name: Show build / capability info
         env:
