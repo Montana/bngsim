@@ -353,6 +353,7 @@ def bn_ode(
     from pathlib import Path
 
     import bngsim
+    from _core.work import work_counters
 
     # 1. File I/O (if xml is a path)
     t0 = time.perf_counter()
@@ -452,6 +453,9 @@ def bn_ode(
         # and the renderer's stock-RR fallback expect.
         "parse_interpret_sec": round(libsbml_parse_sec + interpret_sec, 6),
         "config": config,
+        # The verdict run's solver work (steps, RHS/Jacobian evaluations): the
+        # noise-free efficiency signal the nightly check compares (GH #702).
+        "work": work_counters(stats),
     }
 
     return np.asarray(r.time), np.asarray(r.species), list(r.species_names), timing
