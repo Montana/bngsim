@@ -300,6 +300,12 @@ class TestEmittedTerms:
 # ─── decline loudly ────────────────────────────────────────────────────────
 
 
+# A clock threshold no recognizer can solve for its crossing: cubic in the
+# clock with a linear term, over no live state. The one example every decline
+# test below reaches for.
+_UNBRACKETABLE = "if(time()*time()*time() + time() > gamma, beta, 0)*I"
+
+
 class TestDeclinesLoudly:
     @pytest.mark.parametrize(
         ("body", "fragment"),
@@ -311,11 +317,14 @@ class TestDeclinesLoudly:
             # issue #150 lifted more of it (`if(I > 3, ...)` is admitted now that
             # its crossing is rooted and jumped) and #381 lifted the equality
             # spelling of that same surface. What still declines is a crossing NO
-            # machinery can bracket — a clock threshold quadratic in the clock,
-            # so no stop time can be solved from it, over no live state to root
-            # on; or a comparison with no `if()` head to locate a threshold in
-            # (see test_codegen_switch_condition_sens.py).
-            ("if(time()*time() > gamma, beta, 0)*I", "neither a recognized clock threshold"),
+            # machinery can bracket — a clock threshold cubic in the clock with a
+            # linear term, which no recognizer solves (#418 takes one power of
+            # the clock, #421 degree 2), over no live state to root on; or a
+            # comparison with no `if()` head to locate a threshold in (see
+            # test_codegen_switch_condition_sens.py). This case used to be
+            # `time()*time() > gamma`, which declined only because sympy read
+            # `gamma` as its gamma function (issue #757); #418 solves it now.
+            (_UNBRACKETABLE, "neither a recognized clock threshold"),
             ("beta*(I > 1)", "is not inside an if() condition"),
             ("beta*abs(I)", "abs()"),
             ("beta*max(I, 1)", "max()"),
@@ -358,7 +367,7 @@ class TestDeclinesLoudly:
         assert terms is None and "cycle" in decline
 
     def test_the_decline_is_warned_not_silent(self, tmp_path, caplog):
-        model = _model(tmp_path, _with_rate_law("if(time()*time() > gamma, beta, 0)*I"))
+        model = _model(tmp_path, _with_rate_law(_UNBRACKETABLE))
         with caplog.at_level(logging.WARNING, logger="bngsim"):
             assert cg.generate_sens_from_model(model, functional=True) is None
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]

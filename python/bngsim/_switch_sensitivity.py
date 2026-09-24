@@ -480,6 +480,77 @@ def _clock_symbol_sub(expr: str, sym: str, repl: str) -> str:
 # cannot collide with a model parameter, since it is parsed alongside them.
 _CLOCK_SOLVE_SYMBOL = "_bng_clock_t"
 
+# An identifier and whether a call's `(` follows it. The lookbehind keeps the
+# exponent of a numeric literal (`1e5`, `2.5E-3`) from reading as a name.
+_CLOCK_PARSE_NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)(\s*\()?")
+
+# The calls the clock solvers legitimately need sympy's own meaning for: the
+# step functions a schedule is written with, and what `_preprocess_derived_expr`
+# rewrites `if`/`&&`/`||`/`!`/comparisons into.
+_CLOCK_PARSE_CALLS = ("floor", "ceiling", "Piecewise", "And", "Or", "Not", "Eq", "Ne")
+
+
+def _parse_clock_expr(text: str):
+    """``(sympy_expr, dealias)`` for a clock-solver residual or condition, with
+    every bare model name bound as a plain ``Symbol`` (issue #757).
+
+    ``parse_expr`` with no ``local_dict`` resolves a bare name through sympy's
+    own namespace first, so a model parameter spelled ``E`` came back as Euler's
+    number, ``S`` as the ``S`` singleton, ``N`` as ``evalf``, ``Q`` as the
+    assumptions object, ``O`` as ``Order``, and ``beta``/``gamma``/``zeta`` as
+    special functions. A constant silently dropped the parameter from the solved
+    threshold (``time()-E*E >= 0`` solved to ``exp(2)``, so ``dX/dE`` came back
+    an exact 0); anything else raised, and the recognizer's decline cost a
+    periodic schedule every stop on a plain run and turned an affine threshold
+    into a spurious ``SensitivityUnsupportedError``. ``_codegen``'s
+    ``_prepare_derived_expr`` binds every parameter for exactly this reason;
+    these five sites came later and never did.
+
+    A name followed by ``(`` is a call and keeps its default meaning (only the
+    step functions and logic classes are pinned); every other name is a
+    ``Symbol``. Python keywords are aliased so the text parses, and ``dealias``
+    maps a printed result back to the model's names. Keywords only, not C
+    reserved words too: these results are printed with ``str()``, never through
+    ``sp.ccode``, which is the narrow side of issue #108's aliasing rule. A name
+    used both ways, or two names that would share an alias, raises, which every
+    caller already reads as a decline.
+    """
+    import sympy as sp
+    from sympy.parsing.sympy_parser import parse_expr
+
+    from bngsim._codegen import (
+        _PY_KEYWORD_PARAM_NAMES,
+        _alias_keyword_param,
+        _preprocess_derived_expr,
+        _substitute_symbols_once,
+    )
+
+    s = _preprocess_derived_expr(text)
+    calls: set[str] = set()
+    names: set[str] = set()
+    for m in _CLOCK_PARSE_NAME.finditer(s):
+        (calls if m.group(2) else names).add(m.group(1))
+    names -= {"True", "False"}
+    if names & calls:
+        raise ValueError(f"{sorted(names & calls)} used both as a value and as a call")
+    alias = {n: _alias_keyword_param(n) if n in _PY_KEYWORD_PARAM_NAMES else n for n in names}
+    if len(set(alias.values())) != len(alias):
+        raise ValueError("two names share a sympy alias")
+    renamed = {n: a for n, a in alias.items() if n != a}
+    if renamed:
+        s = _substitute_symbols_once(s, renamed)
+
+    local_dict: dict = {c: getattr(sp, c) for c in _CLOCK_PARSE_CALLS}
+    local_dict.update({a: sp.Symbol(a) for a in alias.values()})
+    expr = parse_expr(s, local_dict=local_dict, evaluate=True)
+
+    back = {a: n for n, a in renamed.items()}
+
+    def dealias(printed: str) -> str:
+        return _substitute_symbols_once(printed, back) if back else printed
+
+    return expr, dealias
+
 
 def _clock_free(text: str, clock_symbols: AbstractSet[str]) -> bool:
     """True when *text* reads none of the model's clock symbols back."""
@@ -589,11 +660,8 @@ def _clock_affine_threshold(atom: str, clock_symbols: AbstractSet[str]) -> tuple
 
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
 
-        from bngsim._codegen import _preprocess_derived_expr
-
-        expr = parse_expr(_preprocess_derived_expr(residual), evaluate=True)
+        expr, dealias = _parse_clock_expr(residual)
         t = sp.Symbol(_CLOCK_SOLVE_SYMBOL)
         if t not in expr.free_symbols:
             return None
@@ -603,7 +671,7 @@ def _clock_affine_threshold(atom: str, clock_symbols: AbstractSet[str]) -> tuple
         threshold = sp.simplify(-(expr - a * t) / a)
         if t in threshold.free_symbols:  # pragma: no cover - implied by linearity
             return None
-        text = str(threshold).replace("**", "^")
+        text = dealias(str(threshold).replace("**", "^"))
     except Exception as exc:  # noqa: BLE001 - an unparseable atom is just declined
         logger.debug("clock affine solve declined %r: %s", atom, exc)
         return None
@@ -658,12 +726,10 @@ def _clock_monomial_threshold(
 
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
-
-        from bngsim._codegen import _preprocess_derived_expr
 
         t = sp.Symbol(_CLOCK_SOLVE_SYMBOL)
-        expr = sp.expand(parse_expr(_preprocess_derived_expr(residual), evaluate=True))
+        expr, dealias = _parse_clock_expr(residual)
+        expr = sp.expand(expr)
         if t not in expr.free_symbols:
             return None
         const = expr.subs(t, 0)
@@ -681,7 +747,7 @@ def _clock_monomial_threshold(
         root = sp.simplify(sp.root(sp.simplify(-const / coeff), int(degree)))
         if t in root.free_symbols:  # pragma: no cover - implied by the single term
             return None
-        text = str(root).replace("**", "^")
+        text = dealias(str(root).replace("**", "^"))
     except Exception as exc:  # noqa: BLE001 - an unsolvable atom is just declined
         logger.debug("clock monomial solve declined %r: %s", atom, exc)
         return None
@@ -750,12 +816,10 @@ def _clock_quadratic_thresholds(
 
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
-
-        from bngsim._codegen import _preprocess_derived_expr
 
         t = sp.Symbol(_CLOCK_SOLVE_SYMBOL)
-        expr = sp.expand(parse_expr(_preprocess_derived_expr(residual), evaluate=True))
+        expr, dealias = _parse_clock_expr(residual)
+        expr = sp.expand(expr)
         if t not in expr.free_symbols:
             return None
         # `Poly` raises on a non-polynomial power (t^0.5, t^k) and on anything
@@ -775,7 +839,7 @@ def _clock_quadratic_thresholds(
             roots = [sp.simplify((-b - r) / (2 * a)), sp.simplify((-b + r) / (2 * a))]
         if any(t in root.free_symbols for root in roots):  # pragma: no cover
             return None
-        texts = [str(root).replace("**", "^") for root in roots]
+        texts = [dealias(str(root).replace("**", "^")) for root in roots]
     except Exception as exc:  # noqa: BLE001 - an unsolvable atom is just declined
         logger.debug("clock quadratic solve declined %r: %s", atom, exc)
         return None
@@ -1178,13 +1242,10 @@ def _clock_guard_cannot_cross(atom: str, scope: SwitchConditionScope) -> bool:
         return False
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
-
-        from bngsim._codegen import _preprocess_derived_expr
 
         t = sp.Symbol(_CLOCK_SOLVE_SYMBOL)
         text = _clock_symbol_sub(atom, present[0], _CLOCK_SOLVE_SYMBOL)
-        cond = parse_expr(_preprocess_derived_expr(_CEIL_CALL.sub("ceiling(", text)))
+        cond, _ = _parse_clock_expr(_CEIL_CALL.sub("ceiling(", text))
         if not isinstance(cond, sp.logic.boolalg.Boolean) or t not in cond.free_symbols:
             return False
         return _guard_holds(cond, t, scope) is not None
@@ -1265,12 +1326,9 @@ def _clock_periodic_schedule(
 
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
-
-        from bngsim._codegen import _preprocess_derived_expr
 
         t = sp.Symbol(_CLOCK_SOLVE_SYMBOL)
-        expr = parse_expr(_preprocess_derived_expr(_CEIL_CALL.sub("ceiling(", residual)))
+        expr, dealias = _parse_clock_expr(_CEIL_CALL.sub("ceiling(", residual))
         # An `if()` inside the condition — libSBML's expansion of `rem()` is the
         # one the corpus writes — reaches here as a `Piecewise`. Collapsing it to
         # the branch the run takes is what lets the rest of this read the
@@ -1314,7 +1372,7 @@ def _clock_periodic_schedule(
         if sp.simplify(a * period + b1) != 0:
             return None  # the residual does not repeat period to period
         duty = sp.simplify(-b0 / a - offset)
-        texts = [str(e).replace("**", "^") for e in (period, offset, duty)]
+        texts = [dealias(str(e).replace("**", "^")) for e in (period, offset, duty)]
     except Exception as exc:  # noqa: BLE001 - an unreadable atom is just declined
         logger.debug("clock periodic schedule declined %r: %s", atom, exc)
         return None
@@ -2121,9 +2179,10 @@ def _schedule_stop_times(
     The chain rule ``_periodic_schedule_terms`` computes is not needed here — a
     stop carries no ``∂t*/∂p`` — so the numbers are read straight through
     :func:`_evaluate_threshold`. The residual round-trip is kept: it is what
-    catches a schedule sympy's parser mis-read (a parameter named ``I`` folding
-    ``I*I`` to ``-1``), and placing stops where the model has no edge would be a
-    pure perturbation of its stepping.
+    catches a schedule the recognizer mis-read (before issue #757, sympy's
+    namespace folded ``I*I`` to ``-1`` for a parameter named ``I``), and placing
+    stops where the model has no edge would be a pure perturbation of its
+    stepping.
     """
     # A condition can arrive wrapped — `((time()-P*floor(time()/P))>=D)` is how
     # the SBML loader registers one — and the recognizer, like the relational
@@ -2789,15 +2848,13 @@ def _schedule_matches_residual(
 ) -> bool:
     """Check a recognized schedule against the condition the model evaluates.
 
-    :func:`_clock_periodic_schedule` reads the residual through ``sympy``'s
-    parser, which binds a handful of one-letter names to its own objects: a model
-    parameter called ``I`` arrives as the imaginary unit, ``S`` as the singleton
-    registry, ``E`` as Euler's number. Most of the time that is harmless, because
-    those objects obey the same arithmetic a symbol would and the recognizer's
-    answer comes back spelled with the same name. It is not harmless always —
-    ``I*I`` folds to ``-1`` — and the failure it produces is the quiet one: a
-    schedule that reads as never crossing, which the gate then admits with
-    nothing behind it.
+    :func:`_clock_periodic_schedule` reads the residual symbolically, and a
+    misreading fails quietly: a schedule that reads as never crossing is one the
+    gate admits with nothing behind it. The case that motivated this check was
+    sympy's own namespace, which read a model parameter ``I`` as the imaginary
+    unit and folded ``I*I`` to ``-1``. Model names are bound as plain symbols now
+    (issue #757), and the check stays as the net under whatever the recognizer
+    gets wrong next.
 
     So the schedule is checked against the residual evaluated the *model's* way,
     through :func:`_evaluate_threshold`, which binds parameter names before it

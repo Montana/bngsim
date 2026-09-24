@@ -1694,30 +1694,48 @@ class TestAPeriodicClockScheduleIsEnumeratedAndJumped:
         )
         assert records == []
 
-    def test_the_schedule_is_checked_against_the_condition_the_model_evaluates(self, tmp_path):
-        """The recogniser reads the residual through sympy's parser, which binds
-        ``I`` to the imaginary unit — so a model parameter spelled ``I`` is not the
-        symbol the recogniser thinks it is. Most of the time that costs nothing,
-        because the imaginary unit multiplies and divides like any other symbol and
-        the answer comes back spelled with the same name. ``I*I`` is where it stops
-        being harmless: sympy folds it to ``-1``, the schedule reads as one whose
-        duty falls outside its period, and a condition that crosses eight times in
-        the window would be admitted with no record behind it. Four evaluations of
-        the model's own residual are what stop that."""
+    def test_a_parameter_named_I_squared_is_the_period_it_spells(self, tmp_path):
+        """The recogniser used to read the residual through sympy's default
+        namespace, which binds ``I`` to the imaginary unit, so ``I*I`` folded to
+        ``-1`` and this schedule was refused only because the four residual
+        evaluations caught the mismatch. Model names are bound as plain symbols
+        now (issue #757), so ``I*I`` is the period it spells: 576 with I = 24,
+        on from the duty d = 7 to the end of each period."""
         text = _with_dose("if(time()-I*I*floor(time()/(I*I))>=d,kin,0)").replace(
             "    1 P       24.0", "    1 I       24.0"
         )
         core = _model(tmp_path, text)._core
         _terms, reason = cg._functional_dfdp_terms(core, core.codegen_data())
+        assert reason is None
+        records, _pinned = sw.compute_switch_time_sens(
+            core, ["I", "d"], 0.0, 1200.0, has_analytic_sens_rhs=True
+        )
+        assert [r.t_star for r in records] == pytest.approx([7.0, 576.0, 583.0, 1152.0, 1159.0])
+
+    def test_a_schedule_the_residual_does_not_follow_is_refused(self, tmp_path, monkeypatch):
+        """The residual check the ``I*I`` case above used to reach. With that
+        misreading gone (issue #757), a recognizer that names the right period
+        but the wrong duty stands in for the next one: the model's residual is
+        not zero at the edge it claims, so the gate refuses the schedule instead
+        of admitting crossings nothing compensates."""
+        real = sw._clock_periodic_schedule
+
+        def wrong_duty(*args, **kwargs):
+            sched = real(*args, **kwargs)
+            return None if sched is None else sched._replace(duty="1")
+
+        monkeypatch.setattr(sw, "_clock_periodic_schedule", wrong_duty)
+        monkeypatch.setattr(sw, "_SCHEDULE_CACHE", {})
+        core = _model(tmp_path, SCHEDULED)._core
+        _terms, reason = cg._functional_dfdp_terms(core, core.codegen_data())
         assert reason is not None
         assert "does not follow that schedule" in reason
 
     def test_a_parameter_named_I_is_not_refused_on_suspicion(self, tmp_path):
-        """The companion that keeps the check above from being a blanket refusal.
-        ``I`` alone survives the imaginary unit's arithmetic — ``1/I`` is ``-I``,
-        and the period comes back spelled ``I`` again — so this schedule is read
-        correctly and is compensated, which the residual check confirms rather than
-        assumes."""
+        """A schedule over a parameter named ``I`` is read and compensated like
+        any other, which the residual check confirms rather than assumes. (Before
+        issue #757 this passed only because ``I`` alone survived the imaginary
+        unit's arithmetic: ``1/I`` is ``-I``.)"""
         text = _with_dose("if(time()-I*floor(time()/I)>=d,kin,0)").replace(
             "    1 P       24.0", "    1 I       24.0"
         )
