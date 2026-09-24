@@ -1328,13 +1328,18 @@ bool NetworkModel::event_trigger_is_state_dependent(int event_idx0) const {
     if (ev.trigger_expr_idx < 0) {
         return false;
     }
-    for (const double *addr :
-         impl_->evaluator->referenced_variable_addresses(ev.trigger_expr_idx)) {
-        if (is_state_address(addr)) {
-            return true;
-        }
-    }
-    return false;
+    // Through expression_support(), not the trigger's direct references (issue
+    // #775). An SBML assignment rule arrives as a function-written parameter
+    // and a non-linear rule on a species as a parameter slot too, so `x < 1`
+    // with `x := 2*S` names no state address at all, and this used to answer
+    // "time-only": the solver then jumped at a fixed t* (dt*/dp = 0) and the
+    // and/or/not refusal below never ran. The support walk already follows
+    // observables, function-written and expression-valued parameters down to
+    // the species behind them, and widens to every species for a rateOf
+    // accessor, so it is a superset of what is_state_address() accepted.
+    std::vector<int> species;
+    expression_support(ev.trigger_expr_idx, &species, nullptr);
+    return !species.empty();
 }
 
 std::vector<int> NetworkModel::events_with_runtime_event_time_sens() const {
@@ -1456,15 +1461,10 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
         // only case that reaches here — trigger time IS execution time, so the
         // flag has no window to act in and refusing on it refused nothing real.
         // Ghanbari2020 and Zongo2020 were blocked by exactly this.
-        const std::vector<const double *> refs =
-            eval.referenced_variable_addresses(ev.trigger_expr_idx);
-        bool state_dependent = false;
-        for (const double *addr : refs) {
-            if (is_state_address(addr)) {
-                state_dependent = true;
-                break;
-            }
-        }
+        // One definition of "reads state", shared with the runtime gate
+        // (events_with_runtime_event_time_sens), so the two cannot drift again
+        // (issue #775: this was a second copy of the direct-address loop).
+        const bool state_dependent = event_trigger_is_state_dependent(static_cast<int>(ei));
         if (state_dependent && compensated.count(static_cast<int>(ei)) == 0) {
             // Issue #144: the crossing time moves with the trajectory, so
             // ∂t*/∂p is non-zero and cannot be resolved before the run — it is
@@ -1488,15 +1488,17 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
             // crossing-time term is carried by the jump rather than dropped.
             continue;
         }
-        for (const double *addr : refs) {
-            if (sens_param_addrs.count(addr) != 0) {
-                std::string pname;
-                for (const Parameter &p : params) {
-                    if (&p.value == addr) {
-                        pname = p.name;
-                        break;
-                    }
-                }
+        // The parameters the trigger reaches, not just the ones it names: a
+        // derived parameter or an assignment rule hides its primaries from the
+        // trigger's own references (issue #775), and a requested primary behind
+        // one moves the crossing just as a named one does.
+        std::vector<int> trigger_params;
+        if (ev.trigger_expr_idx >= 0) {
+            expression_support(ev.trigger_expr_idx, nullptr, &trigger_params);
+        }
+        for (const int pidx : trigger_params) {
+            if (sens_param_addrs.count(&params[pidx].value) != 0) {
+                const std::string &pname = params[pidx].name;
                 return "event '" + id +
                        "' has a trigger whose crossing time depends on the requested "
                        "sensitivity parameter '" +
