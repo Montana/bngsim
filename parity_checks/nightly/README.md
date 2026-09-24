@@ -12,7 +12,7 @@ a regression. Nothing here blocks a PR.
 | `bng_ode` | BNG2.pl + run_network | 592 committed BNGL ODE jobs, ExprTk interpreter |
 | `bng_ode_codegen` | BNG2.pl + run_network | the same jobs on the compiled C path (`--codegen`) |
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
-| `amici_sens` | AMICI forward sensitivities | 41 of the 50 curated BioModels, staggered + simultaneous |
+| `amici_sens` | AMICI forward sensitivities | 40 of the 50 curated BioModels, staggered + simultaneous |
 
 **The BioModels gap.** 317 of the 1,323 BioModels come only from EBI's BioModels REST
 API, which answers HTTP 403 to GitHub-hosted runners (the same URLs work from a
@@ -25,7 +25,9 @@ license review first.
 separate `rr-ode` pass, two at a time on the interpreted RHS: their automatic C
 compile alone outlasts the per-job cap on a 4-core runner, and four at once exhausted
 its memory. `amici-sens` leaves out BIOMD0000000496/497, which time out on both
-engines even on a workstation, and the 7 curated models that come only from EBI.
+engines even on a workstation; BIOMD0000000608, whose 66.7 MB generated sensitivity
+RHS outlasts bngsim's 600 s compile budget; and the 7 curated models that come only
+from EBI. The workflow file records the measurement behind each.
 
 ## Why a baseline, not the exit code
 
