@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -33,6 +34,16 @@ TableFunction::TableFunction(const std::string &name, std::vector<double> xs,
                                  std::to_string(xs_.size()));
     }
 
+    // A NaN x value slips through the monotonicity test below (both `<=`
+    // comparisons are false) and then breaks the binary search in evaluate_at()
+    // the same way a NaN index does (issue #778), so refuse it by position.
+    for (size_t i = 0; i < xs_.size(); ++i) {
+        if (std::isnan(xs_[i])) {
+            throw std::runtime_error("TableFunction '" + name_ + "': x[" + std::to_string(i) +
+                                     "] is NaN");
+        }
+    }
+
     // Check monotonically increasing x values
     for (size_t i = 1; i < xs_.size(); ++i) {
         if (xs_[i] <= xs_[i - 1]) {
@@ -48,6 +59,15 @@ TableFunction::TableFunction(const std::string &name, std::vector<double> xs,
 // ─── Evaluate ────────────────────────────────────────────────────────────────
 
 double TableFunction::evaluate_at(double x) const {
+    // A NaN index has no place in the table (issue #778). Every comparison with
+    // NaN is false, so it fell through both endpoint tests and upper_bound()
+    // returned end(): a step table answered its LAST value — finite, plausible
+    // and wrong, with no warning — and a linear table read xs_[n]/ys_[n], one
+    // past the end. Propagate it instead, so the RHS non-finite guards refuse
+    // the run the way they refuse any other uncomputable rate (#580).
+    if (std::isnan(x))
+        return std::numeric_limits<double>::quiet_NaN();
+
     // Constant extrapolation beyond endpoints
     if (x <= xs_.front())
         return ys_.front();
@@ -55,9 +75,12 @@ double TableFunction::evaluate_at(double x) const {
         return ys_.back();
 
     // Binary search for the interval containing x
-    // Find the first element > x, then back up one
+    // Find the first element > x, then back up one. With x strictly inside
+    // (front, back) that is always in [0, n-2]; the clamp keeps the linear
+    // branch's i+1 in bounds even if that invariant is ever broken.
     auto it = std::upper_bound(xs_.begin(), xs_.end(), x);
-    int i = static_cast<int>(it - xs_.begin()) - 1;
+    const int last = static_cast<int>(xs_.size()) - 2;
+    int i = std::clamp(static_cast<int>(it - xs_.begin()) - 1, 0, last);
 
     // i is the index of the left endpoint of the interval [xs_[i], xs_[i+1])
     if (method_ == InterpolationMethod::Step) {
