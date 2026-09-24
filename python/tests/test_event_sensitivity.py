@@ -1216,9 +1216,14 @@ class TestEventTimeSensitivity:
         m = build(1.0)
         assert m._core.events_with_runtime_event_time_sens() == [0]
         run = {"t_span": (0, 10), "n_points": 11}
-        sens = bngsim.Simulator(m, method="ode", sensitivity_params=["t_first"]).run(
-            **run, rtol=1e-10, atol=1e-12
-        )
+        sim = bngsim.Simulator(m, method="ode", sensitivity_params=["t_first"])
+        # The ahead-of-run detector must still refuse to read t_rule's current
+        # value as a constant threshold (the refusal this test used to assert).
+        # The gate drops that block only because the solver now differentiates
+        # the crossing at the fire.
+        _compensated, _detail, blocked = sim._event_time_compensation(["t_first"])
+        assert "does not reduce to arithmetic" in blocked[0]
+        sens = sim.run(**run, rtol=1e-10, atol=1e-12)
         analytic = np.asarray(sens.sensitivities)[:, :, 0]
 
         h = 1e-5
