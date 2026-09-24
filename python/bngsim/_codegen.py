@@ -10490,6 +10490,10 @@ def prepare_model_codegen(model) -> Path | None:
     Path or None
         Path to compiled .so, or None if codegen fails.
     """
+    # Cleared before the decline below, not after it: a decline records no error,
+    # so an earlier failed build's exception would otherwise be what
+    # last_codegen_error() reports as the reason for this one.
+    _record_codegen_error(None)
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
@@ -10502,7 +10506,6 @@ def prepare_model_codegen(model) -> Path | None:
 
     t0 = time.perf_counter()
     cache_hit: bool | None = None
-    _record_codegen_error(None)
     declines = _reset_sens_declines()
     try:
         emit_output_sens = bool(getattr(model, "_want_output_sens", False))
@@ -10611,6 +10614,8 @@ def prepare_model_codegen_source(model) -> str | None:
     compiles, returned as a string for the in-process MIR micro-JIT. Returns
     ``None`` (matching ``prepare_model_codegen``) if source generation fails.
     """
+    # Cleared before the decline, as in prepare_model_codegen.
+    _record_codegen_error(None)
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
@@ -10622,7 +10627,6 @@ def prepare_model_codegen_source(model) -> str | None:
         pass
 
     t0 = time.perf_counter()
-    _record_codegen_error(None)
     declines = _reset_sens_declines()
     try:
         c_source, _ = generate_combined_from_model(
