@@ -75,9 +75,12 @@ def _run(net, path, *, sens=None, t_end=1.0, n=3, override=None, model=None):
     if path == "model":
         m._net_path = ""  # the switch Simulator reads (#803)
     kw = {"sensitivity_params": sens} if sens else {"codegen": True}
-    return bngsim.Simulator(m, method="ode", **kw).run(
-        t_span=(0.0, t_end), n_points=n, rtol=1e-10, atol=1e-12
-    )
+    sim = bngsim.Simulator(m, method="ode", **kw)
+    if not sens:
+        # Compiled code on the path under test, not a quiet ExprTk run that would
+        # pass the model leg trivially.
+        assert sim.codegen_backend in ("cc", "mir")
+    return sim.run(t_span=(0.0, t_end), n_points=n, rtol=1e-10, atol=1e-12)
 
 
 def _write(tmp_path, name: str, text: str):

@@ -31,9 +31,12 @@ def _cold_codegen_cache(monkeypatch, tmp_path):
 
 
 def _run(model, **kw):
-    return bngsim.Simulator(model, method="ode", **kw).run(
-        t_span=(0.0, 1.0), n_points=3, rtol=1e-10, atol=1e-12
-    )
+    sim = bngsim.Simulator(model, method="ode", **kw)
+    if kw.get("codegen"):
+        # Compiled code on the path under test, not a quiet ExprTk run that would
+        # match the interpreter trivially.
+        assert sim.codegen_backend in ("cc", "mir")
+    return sim.run(t_span=(0.0, 1.0), n_points=3, rtol=1e-10, atol=1e-12)
 
 
 # ── 1. integer stat factors past 2**64 ───────────────────────────────────────
@@ -118,6 +121,16 @@ def test_normalize_makes_exprtk_reading_explicit(text, normal):
 )
 def test_normalize_leaves_unambiguous_text_byte_identical(text):
     assert cg._normalize_exprtk_operators(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "normal"),
+    [("k'", "k'"), ("a'b<c<d", "(a'b<c)<d"), ('x<1<2 + "', '(x<1)<2 + "')],
+)
+def test_normalize_reads_an_unpaired_quote_as_plain_text(text, normal):
+    """A quote with no partner splits into no quoted piece. Recursing on the
+    unchanged text never ended (RecursionError); it is plain text instead."""
+    assert cg._normalize_exprtk_operators(text) == normal
 
 
 OPS = """begin parameters

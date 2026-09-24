@@ -1821,10 +1821,13 @@ def _normalize_exprtk_operators(expr: str) -> str:
     """
     if "'" in expr or '"' in expr:
         pieces = re.split(r"""('[^']*'|"[^"]*")""", expr)
-        return "".join(
-            piece if i % 2 else _normalize_exprtk_operators(piece)
-            for i, piece in enumerate(pieces)
-        )
+        # A quote with no partner splits nothing; recursing on the same text
+        # would never end, so it falls through and is read as plain text.
+        if len(pieces) > 1:
+            return "".join(
+                piece if i % 2 else _normalize_exprtk_operators(piece)
+                for i, piece in enumerate(pieces)
+            )
     if not (_RELATIONAL_CHAR_RE.search(expr) or _SIGN_RUN_RE.search(expr)):
         return expr
     s = _LONE_EQUALS_RE.sub("==", expr).replace("<>", "!=")
