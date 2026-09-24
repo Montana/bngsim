@@ -20,6 +20,7 @@ import re
 import bngsim
 import numpy as np
 import pytest
+from scipy.integrate import quad
 
 K0, K1, D = 0.1, 1.0, 20.0
 PARAMS = ("k0", "on", "a", "D")
@@ -286,6 +287,81 @@ def test_only_a_power_singular_at_its_crossing_gets_a_case(tmp_path, law, has_ca
         assert re.search(r"case 3:\n\s+if \(k == 0\) \{ \*c_out = 1\.0; return \d+; \}", source)
     else:
         assert "comoving" not in source
+
+
+@pytest.mark.parametrize("power", ["a-1", "0.1"], ids=["shared parameter", "shared literal"])
+@pytest.mark.parametrize("onsets", ["on", "tau"], ids=["on and 2*on", "periodic doses"])
+def test_one_parameter_moves_two_shared_exponent_pulses_at_different_speeds(
+    tmp_path, power, onsets
+):
+    """Two bases with the same exponent must each earn a comoving shift.
+
+    After both windows, the state derivative is an independent quadrature of
+    the pulse fluxes. It remains nonzero because X has a decay reaction.
+    """
+    from bngsim._codegen import generate_sens_from_model
+
+    starts = ("on", "2*on") if onsets == "on" else ("t0+tau", "t0+2*tau")
+    moving = "on" if onsets == "on" else "tau"
+    parameters = "3 on 2" if onsets == "on" else "3 t0 1\n    4 tau 1"
+    a_index = 4 if onsets == "on" else 5
+    path = tmp_path / "two_pulses.net"
+    path.write_text(
+        f"""begin parameters
+    1 k1 0.7
+    2 k2 0.9
+    {parameters}
+    {a_index} a 1.1
+    {a_index + 1} D 5
+    {a_index + 2} kdeg 0.2
+    {a_index + 3} _rateLaw1 1
+end parameters
+begin functions
+    1 s1() if(((t>={starts[0]})&&(t<=({starts[0]}+D))),((t-({starts[0]}))/D),0)
+    2 s2() if(((t>={starts[1]})&&(t<=({starts[1]}+D))),((t-({starts[1]}))/D),0)
+    3 prod() k1*(s1()^({power}))*(1-s1())+k2*(s2()^({power}))*(1-s2())
+end functions
+begin species
+    1 X() 0
+    2 counter() 0
+end species
+begin reactions
+    1 0 1 prod #_R1
+    2 1 0 kdeg #_R2
+    3 0 2 _rateLaw1 #_R3
+end reactions
+begin groups
+    1 t 2
+end groups
+"""
+    )
+    model = bngsim.Model.from_net(str(path))
+    source = generate_sens_from_model(model, functional=True, emit_term_scale=True)
+    assert source is not None
+    # The moving parameter is index 2 (on) or 3 (tau), zero based.
+    moving_idx = 2 if onsets == "on" else 3
+    case = re.search(rf"case {moving_idx}:\n((?:\s+if \(k == \d+\).*\n)+)", source)
+    assert case is not None
+    shifts = re.findall(r"\*c_out = ([^;]+);", case.group(1))
+    assert shifts == ["1.0", "2.0"]
+
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[moving])
+    result = sim.run(t_span=(0.0, 12.0), n_points=13, rtol=1e-8, atol=1e-10)
+    assert sim.has_analytic_sens_rhs, sim.sens_rhs_decline_reason
+
+    start_values = (2.0, 4.0) if onsets == "on" else (2.0, 3.0)
+    expected = 0.0
+
+    def decayed_pulse(age, amplitude, start):
+        s = age / 5.0
+        return amplitude * s**0.1 * (1 - s) * np.exp(-0.2 * (12.0 - start - age))
+
+    for amplitude, start, speed in zip((0.7, 0.9), start_values, (1, 2), strict=False):
+        # Translate u = t - start and integrate by parts: the boundary fluxes
+        # vanish, leaving kdeg * speed times the decayed pulse integral.
+        expected += 0.2 * speed * quad(decayed_pulse, 0.0, 5.0, args=(amplitude, start))[0]
+    x_index = list(model.species_names).index("X()")
+    assert result.sensitivities[-1, x_index, 0] == pytest.approx(expected, rel=2e-4)
 
 
 # Two seasons on a counter clock, the second opening through a year selection:

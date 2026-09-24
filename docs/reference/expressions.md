@@ -42,7 +42,12 @@ BNGsim provides all standard ExprTk functions plus BNG-specific extensions:
 - `sqrt(x)` — square root
 
 **Rounding**: `floor`, `ceil`, `round`, `trunc`
-- `rint(x)` — alias for `round(x)` (backward compatibility with BNG's `rint()`)
+- `rint(x)` — BNG's `rint()`: `floor(x + 0.5)`, so a half always rounds
+  **up** (toward +∞), as BNG2.pl's `run_network` computes it. `rint(2.5)` is 3,
+  `rint(-2.5)` is -2 and `rint(-0.5)` is 0. It is not the same as `round(x)`,
+  which rounds a half away from zero: `round(-2.5)` is -3. The two agree at
+  and above zero. Below zero they differ at every half, and also where
+  `x - 0.5` itself rounds: `round(-0.49999999999999994)` is -1, `rint` of it 0.
 
 **Other math**: `abs`, `min`, `max`, `clamp`, `avg`, `sum`, `erf`, `erfc`
 - `sign(x)` — returns -1, 0, or 1 (alias: `sgn`)
@@ -72,6 +77,15 @@ BNG2.pl. A bare `t` in an expression is that model symbol, and `t()` is the same
 symbol written as a zero-argument call — the form BNG2.pl emits and which bngsim
 accepts for any scalar. In a model that defines no `t`, both spellings fail to
 compile rather than falling back to the clock.
+
+A model may also declare a scalar named `time` itself: BNG2.pl rejects a
+parameter named `time` but accepts an observable named `time`, and a
+hand-written `.net` can declare either. The call form `time()` still reads the
+clock (interpreted and compiled ODE, SSA, and the sensitivity layer); the bare
+word `time` is the model's scalar. So
+`k*time()*time` is the rate constant, times the clock, times the observable.
+NFsim does not yet accept such a model: it refuses to load it with an error
+naming `time` rather than guessing.
 
 One place does treat `t` as the clock, and it is a different grammar: the
 *index name* of a table function, where `time`, `T`, `Time()` and `t()` all

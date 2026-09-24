@@ -3605,6 +3605,9 @@ def _translate_expr(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     def _repl(m: re.Match) -> str:
         name = m.group(1)
         empty_call = m.group(2)
+        builtin = _call_form_builtin(name, empty_call)
+        if builtin is not None:
+            return builtin  # `time()` is the clock, even beside a scalar `time` (#776)
         entry = lookup.get(name)
         if entry is None:
             return m.group(0)
@@ -5938,6 +5941,22 @@ def builtin_constant_bindings(sp) -> dict:
     return out
 
 
+# Zero-argument built-ins whose *call form* keeps its built-in meaning even when
+# the model declares a scalar of the same name (issue #776). BNG2.pl rejects a
+# parameter named `time` but accepts an observable named `time`, and a .net can
+# declare either; `time()` must still read the clock then, as it does in the
+# interpreter (``is_zero_arg_builtin`` in src/expression.cpp). The bare word
+# is the model's scalar and goes through the ordinary lookup.
+_CALL_FORM_BUILTINS: dict[str, str] = {"time": "t"}
+
+
+def _call_form_builtin(name: str, empty_call: str | None) -> str | None:
+    """The C for ``name()`` when it is a zero-argument built-in call, else None."""
+    if empty_call is None:
+        return None
+    return _CALL_FORM_BUILTINS.get(name)
+
+
 _BUILTIN_IDENT_MAP: dict[str, tuple[str, bool]] = {
     # `time` is the only clock symbol the evaluator binds; `t` is deliberately
     # left free as an ordinary model identifier (src/expression.cpp), so it is
@@ -6048,6 +6067,9 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     def _repl(m: re.Match) -> str:
         name = m.group(1)
         empty_call = m.group(2)
+        builtin = _call_form_builtin(name, empty_call)
+        if builtin is not None:
+            return builtin  # `time()` is the clock, even beside a scalar `time` (#776)
         entry = lookup.get(name)
         if entry is None:
             # Unknown identifier (e.g. math.h funcs like sin, exp, pow,
@@ -9167,10 +9189,13 @@ def _comoving_coefficients(
     return out
 
 
-def _singular_clock_exponents(expr, clock_names: set[str], sp) -> set[str]:
-    """The exponents, as ``srepr``, of every singular power in the derivative
-    ``expr`` (:func:`_singular_power`) — read after the rewrites the C emitter
-    applies, so a removable denominator (``x^(a-2)·x`` is ``x^(a-1)``) does not count."""
+def _singular_clock_powers(expr, clock_names: set[str], sp) -> set[tuple[str, str]]:
+    """The (base, exponent) of every singular power in the derivative ``expr``.
+
+    Read after the C emitter's rewrites so a removable denominator
+    (``x^(a-2)·x`` is ``x^(a-1)``) does not count. Include the base because
+    distinct onsets can have the same exponent but move at different rates.
+    """
     from bngsim._jacobian import _emitter_rewrites
 
     try:
@@ -9178,7 +9203,7 @@ def _singular_clock_exponents(expr, clock_names: set[str], sp) -> set[str]:
     except Exception:  # noqa: BLE001 - the emitter would refuse it too
         rewritten = expr
     return {
-        sp.srepr(node.exp)
+        (sp.srepr(node.base), sp.srepr(node.exp))
         for node in _pow_nodes_in_values(rewritten, sp)
         if _singular_power(node, clock_names, sp, derivative=True)
     }
@@ -9345,9 +9370,9 @@ def _functional_comoving_plan(
                     moved = _comoving_shifted_partial(
                         on_cell, p_alias, c, clock_names, derived_shift, constants, sp
                     )
-                    if _singular_clock_exponents(
-                        plain, clock_names, sp
-                    ) - _singular_clock_exponents(moved, clock_names, sp):
+                    if _singular_clock_powers(plain, clock_names, sp) - _singular_clock_powers(
+                        moved, clock_names, sp
+                    ):
                         eligible = True
                     pieces.append((moved, cond))
                 if len(pieces) == 1:
