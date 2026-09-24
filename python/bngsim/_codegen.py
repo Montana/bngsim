@@ -1763,6 +1763,171 @@ def _rewrite_logicals(expr: str) -> str:
     return _rewrite_logicals_checked(expr, _LOGICAL_REWRITE_BUDGET)
 
 
+# ─── ExprTk spellings that C and Python read differently (issue #734) ─────
+#
+# ExprTk and the two languages the emitters target disagree about three
+# spellings, and every emitter copies operators through as text:
+#
+#   * a lone ``=`` (and ``<>``) is equality in ExprTk; in C ``=`` is assignment,
+#     which compiles and overwrites the live parameter array;
+#   * ExprTk has no decrement, so ``--x`` is ``-(-x)``; in C it decrements ``x``;
+#   * ExprTk puts all six relationals on ONE left-associative level, so
+#     ``a==b<1`` is ``(a==b)<1`` (BNG2.pl parenthesises it that way too). C binds
+#     ``<`` before ``==`` and reads ``a==(b<1)``; Python/sympy reads a chained
+#     comparison, ``a==b and b<1``.
+#
+# ``_normalize_exprtk_operators`` rewrites all three into the one spelling every
+# target reads as ExprTk does, and runs where text enters the C translator and
+# both sympy parsers. BNG2.pl, SBML and Antimony never write any of them (every
+# relational comes parenthesised), so their text passes through byte-identical.
+
+_EXPRTK_RELATIONALS: tuple[tuple[str, bool], ...] = (
+    ("==", False),
+    ("!=", False),
+    ("<=", False),
+    (">=", False),
+    ("<", False),
+    (">", False),
+)
+# What binds looser than a relational in ExprTk: a relational chain never spans
+# one of these. Longest spellings first, as ``_depth0_token_spans`` requires.
+_EXPRTK_BELOW_RELATIONAL: tuple[tuple[str, bool], ...] = (
+    (",", False),
+    ("&&", False),
+    ("||", False),
+    ("&", False),
+    ("|", False),
+    ("?", False),
+    (":", False),
+    ("nand", True),
+    ("xnor", True),
+    ("and", True),
+    ("nor", True),
+    ("xor", True),
+    ("or", True),
+)
+_LONE_EQUALS_RE = re.compile(r"(?<![=!<>:])=(?!=)")
+_SIGN_RUN_RE = re.compile(r"([-+])(?=[-+])")
+_RELATIONAL_CHAR_RE = re.compile(r"[<>=!]")
+
+
+def _normalize_exprtk_operators(expr: str) -> str:
+    """``expr`` with ExprTk's reading of ``=``, ``<>``, ``--`` and relational
+    chains made explicit, so C and sympy read it as ExprTk does (issue #734).
+
+    Quoted text (a ``tfun`` file name) is left alone. Text with no relational
+    character, no ``=`` and no run of signs -- nearly every rate law -- returns
+    unchanged without a scan.
+    """
+    if "'" in expr or '"' in expr:
+        pieces = re.split(r"""('[^']*'|"[^"]*")""", expr)
+        # A quote with no partner splits nothing; recursing on the same text
+        # would never end, so it falls through and is read as plain text.
+        if len(pieces) > 1:
+            return "".join(
+                piece if i % 2 else _normalize_exprtk_operators(piece)
+                for i, piece in enumerate(pieces)
+            )
+    if not (_RELATIONAL_CHAR_RE.search(expr) or _SIGN_RUN_RE.search(expr)):
+        return expr
+    s = _LONE_EQUALS_RE.sub("==", expr).replace("<>", "!=")
+    s = _SIGN_RUN_RE.sub(r"\1 ", s)
+    return _parenthesize_relational_chains(s)
+
+
+def _parenthesize_relational_chains(s: str) -> str:
+    """Left-associate every run of two or more relationals within one operand.
+
+    One pass over the string with a stack of paren levels: each level tracks the
+    start of its current operand (reset at a comma, a logical connective or a
+    ternary mark) and the relational operators seen in it. A run ``x0 op1 x1 op2
+    x2 ... opk xk`` becomes ``((x0 op1 x1) op2 x2) ... opk xk`` by inserting k-1
+    ``(`` at the operand's start and a ``)`` before op2..opk -- insertions only,
+    so the text between them is untouched and the pass is linear.
+    """
+    rel_positions = _depth0_like_all_levels(s)
+    if not rel_positions:
+        return s
+    inserts: dict[int, str] = {}
+    for start, ops in rel_positions:
+        if len(ops) < 2:
+            continue
+        inserts[start] = inserts.get(start, "") + "(" * (len(ops) - 1)
+        for op_start in ops[1:]:
+            inserts[op_start] = ")" + inserts.get(op_start, "")
+    if not inserts:
+        return s
+    out: list[str] = []
+    for i, c in enumerate(s):
+        if i in inserts:
+            out.append(inserts[i])
+        out.append(c)
+    if len(s) in inserts:
+        out.append(inserts[len(s)])
+    return "".join(out)
+
+
+def _depth0_like_all_levels(s: str) -> list[tuple[int, list[int]]]:
+    """Every operand of ``s``, at every paren depth, that holds two or more
+    relationals: ``(operand_start, [start of each relational])``. The operand
+    start skips leading spaces, so the inserted ``(`` hugs the text."""
+    n = len(s)
+    # Per open level: [operand start, relational op starts]
+    stack: list[list] = [[0, []]]
+    found: list[tuple[int, list[int]]] = []
+
+    def close_operand(level: list) -> None:
+        if len(level[1]) >= 2:
+            found.append((level[0], level[1]))
+
+    def operand_start(i: int) -> int:
+        while i < n and s[i] == " ":
+            i += 1
+        return i
+
+    stack[0][0] = operand_start(0)
+    i = 0
+    while i < n:
+        c = s[i]
+        if c == "(":
+            stack.append([operand_start(i + 1), []])
+            i += 1
+            continue
+        if c == ")":
+            if len(stack) == 1:
+                return []  # unbalanced: leave the text to fail where it would have
+            close_operand(stack.pop())
+            i += 1
+            continue
+        matched = 0
+        for tok, is_word in _EXPRTK_BELOW_RELATIONAL:
+            if s.startswith(tok, i):
+                if is_word:
+                    before = s[i - 1] if i else ""
+                    after = s[i + len(tok)] if i + len(tok) < n else ""
+                    if before.isalnum() or before == "_" or after.isalnum() or after == "_":
+                        continue
+                matched = len(tok)
+                break
+        if matched:
+            close_operand(stack[-1])
+            stack[-1][0] = operand_start(i + matched)
+            stack[-1][1] = []
+            i += matched
+            continue
+        for tok, _ in _EXPRTK_RELATIONALS:
+            if s.startswith(tok, i):
+                stack[-1][1].append(i)
+                i += len(tok)
+                break
+        else:
+            i += 1
+    if len(stack) != 1:
+        return []
+    close_operand(stack[0])
+    return found
+
+
 def _split_depth0(s: str, tokens: tuple[tuple[str, bool], ...]) -> list[str] | None:
     """``s`` split at every depth-0 ``tokens`` occurrence, or ``None`` if none."""
     spans = _depth0_token_spans(s, tokens)
@@ -2053,7 +2218,7 @@ def _preprocess_derived_expr(expr: str) -> str:
     pass leaves untranslated makes ``parse_expr`` raise, and the caller then
     drops the chain rule for that parameter (issue #56).
     """
-    s = _translate_bngl_if_to_piecewise(expr)
+    s = _translate_bngl_if_to_piecewise(_normalize_exprtk_operators(expr))
     s = s.replace("^", "**")
     s = re.sub(r"\bnot\s*\(", "Not(", s)
     return _rewrite_logicals(s)
@@ -3594,7 +3759,10 @@ def _translate_expr(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     second GH #161 quadratic). Single-pass identifier rewriting — see
     ``_translate_expr_to_c`` for the Issue-#25 motivation.
     """
-    c_expr = _replace_if_calls(expr)
+    # ExprTk's reading of =, <>, -- and relational chains first, as in the model
+    # path (issue #734). This path must match it: its RHS sits beside
+    # model-built sensitivity code that already reads the normalized text.
+    c_expr = _replace_if_calls(_normalize_exprtk_operators(expr))
     # Then the engine functions C has no name for (issue #448) — same pass and
     # same place as the model-based twin, so the two agree.
     c_expr = _replace_engine_calls(c_expr)
@@ -3640,10 +3808,7 @@ def _rate_elementary(
         parts.append(f"/* UNKNOWN_PARAM {pname} */ 0.0")
 
     if sf != 1.0:
-        if sf == int(sf):
-            parts.insert(0, str(int(sf)))
-        else:
-            parts.insert(0, str(sf))
+        parts.insert(0, _c_scalar(sf))
 
     for ri in reactants:
         if ri > 0:
@@ -3676,10 +3841,7 @@ def _rate_functional(
         parts.append(f"func_{safe}")
 
     if sf != 1.0:
-        if sf == int(sf):
-            parts.insert(0, str(int(sf)))
-        else:
-            parts.insert(0, str(sf))
+        parts.insert(0, _c_scalar(sf))
 
     for ri in reactants:
         if ri > 0:
@@ -4151,7 +4313,7 @@ def _emit_sens_rhs_body(
         sf = rxn["stat_factor"]
         terms: list[str] = []
         if sf != 1.0:
-            terms.append(str(int(sf)) if sf == int(sf) else str(sf))
+            terms.append(_c_scalar(sf))
         # GH #75: amount_valued reactants enter by their amount (stored × V_c),
         # so the rate carries the constant ∏ V_c^mult. None ⇒ no term emitted
         # (byte-identical for .net / V=1 / hOSU=false).
@@ -4452,10 +4614,7 @@ def _emit_sens_rhs_body(
             if amount_factor_c is not None:
                 parts.append(amount_factor_c)
             if sf != 1.0:
-                if sf == int(sf):
-                    parts.append(str(int(sf)))
-                else:
-                    parts.append(str(sf))
+                parts.append(_c_scalar(sf))
             parts.append(str(m_j))
 
             # x_j^{m_j - 1}
@@ -6052,9 +6211,12 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     rewritten to ``floor((x) + 0.5)`` by ``_replace_engine_calls`` before this
     pass runs (issue #771).
     """
+    # ExprTk's reading of =, <>, -- and relational chains made explicit before
+    # anything else, since each is copied through as text (issue #734).
+    result = _normalize_exprtk_operators(expr)
     # if() must be expanded first so nested ternary structure is correct
     # before identifier rewriting touches anything.
-    result = _replace_if_calls(expr)
+    result = _replace_if_calls(result)
     # sign/sgn/rint/clamp/avg/sum become ordinary C expressions here, before the
     # identifier pass would otherwise leave the bare name in the source and the
     # compile would fail on it (issue #448).
@@ -6837,7 +6999,7 @@ def generate_rhs_from_model(model) -> str:
             if fidx >= 0:
                 parts: list[str] = []
                 if sf != 1.0:
-                    parts.append(str(int(sf)) if sf == int(sf) else str(sf))
+                    parts.append(_c_scalar(sf))
                 parts.append(f"func[{fidx}]")
                 if asf:
                     if amount_factor_c is not None:
@@ -6856,10 +7018,7 @@ def generate_rhs_from_model(model) -> str:
             else:
                 parts.append("0.0")
             if sf != 1.0:
-                if sf == int(sf):
-                    parts.insert(0, str(int(sf)))
-                else:
-                    parts.insert(0, str(sf))
+                parts.insert(0, _c_scalar(sf))
             if amount_factor_c is not None:
                 parts.append(amount_factor_c)
             for ri in reactants:
@@ -7163,14 +7322,23 @@ def generate_rhs_from_model(model) -> str:
 
 
 def _c_scalar(x) -> str:
-    """An observable coefficient as C, in the style the two observable emitters
-    have always used: an integral value without a decimal point, anything else via
-    ``str`` (which round-trips a double). Factored out so the folded coefficient and
-    issue #170's ``factor*p[k]`` form are formatted identically."""
+    """A numeric constant as C: an observable coefficient, or a reaction's
+    statistical factor. An integral value goes out without a decimal point, as the
+    emitters have always written it; anything else via ``str`` (which round-trips a
+    double). Factored out so the folded coefficient, issue #170's ``factor*p[k]``
+    form and every rate emitter format a constant identically.
+
+    Only a value below 2**53 goes out as an integer. ``str(int(1e24))`` is a
+    25-digit integer literal, and C has no integer type that holds it, so the
+    compile fails ("integer literal is too large") -- BNG2.pl folds a cBNGL volume
+    conversion into the stat factor, and ``1e+24*k`` is what a 1 fL compartment
+    writes (issue #803, ``db_3rd_order_EnergyBNGL_v1``). Every double of 2**53 and
+    above is an integer anyway, so the float literal loses nothing, and every
+    value below keeps its historical, byte-identical spelling."""
     xf = float(x)
-    if xf == int(xf):
+    if xf.is_integer() and abs(xf) < 2**53:
         return str(int(xf))
-    return str(xf)
+    return repr(xf)
 
 
 # Signature of the sharded observable-fill block (GH #165). Issue #170 stage 2: an

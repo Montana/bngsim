@@ -50,6 +50,7 @@ from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _PY_KEYWORD_PARAM_NAMES,
     _alias_keyword_param,
+    _normalize_exprtk_operators,
     _rewrite_logicals,
     _translate_bngl_if_to_piecewise,
     builtin_constant_bindings,
@@ -311,7 +312,9 @@ def _preprocess_exprtk(expr: str) -> str:
     """Rewrite an ExprTk expression string into a form ``sympy.parse_expr`` can
     tokenize: ``time()``→placeholder, ``obs()``→``obs``, ``if(c,t,f)``→Piecewise,
     ``^``→``**``, logicals → sympy ``And``/``Or``/``Not`` calls."""
-    s = expr.strip()
+    # ExprTk's reading of =, <>, -- and relational chains, made explicit so
+    # parse_expr does not read them as Python (issue #734).
+    s = _normalize_exprtk_operators(expr.strip())
     # time() → constant placeholder. `time` is the ONLY clock symbol the
     # evaluator binds: `t` is deliberately left free as an ordinary model
     # identifier, so that a BNGL model declaring `Molecules t counter()` loads
