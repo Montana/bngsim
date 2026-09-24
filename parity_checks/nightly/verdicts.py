@@ -282,8 +282,19 @@ def diff(
     wall_ratio_any_cpu: float = 4.0,
     min_fraction: float = 0.9,
     expect_backend: str | None = None,
+    flaky: dict[str, str] | None = None,
+    timeout_flips_info: bool = False,
 ) -> dict:
-    """Compare two verdict files of the same kind. Returns a JSON-able result."""
+    """Compare two verdict files of the same kind. Returns a JSON-able result.
+
+    ``flaky`` maps case ids whose verdict measurably depends on runner timing to
+    the reason; any change of theirs is reported under ``changed``, never alerted.
+    ``timeout_flips_info`` does the same for every transition into or out of
+    TIMEOUT: right for comparing two single nights, which may land on runner CPUs
+    of different speed, and wrong for the committed baseline, where PASS ->
+    TIMEOUT is the efficiency regression the check exists to catch.
+    """
+    flaky = flaky or {}
     if base["kind"] != fresh["kind"]:
         raise ValueError(f"kind mismatch: baseline {base['kind']} vs fresh {fresh['kind']}")
     kind = base["kind"]
@@ -303,7 +314,16 @@ def diff(
             continue
         fo = fr["outcome"]
         item = {"case": cid, "before": _label(br), "after": _label(fr), "note": fr.get("note", "")}
-        if bo in good and fo not in good:
+        soft = None
+        if cid in flaky:
+            soft = f"flaky: {flaky[cid]}"
+        elif timeout_flips_info and "TIMEOUT" in (bo, fo) and bo != fo:
+            soft = "timeout flip between two nights (runner speed)"
+        if soft and (bo, br.get("subclass")) != (fo, fr.get("subclass")):
+            changed.append({**item, "note": f"[{soft}] {item['note']}".strip()})
+        elif soft:
+            pass
+        elif bo in good and fo not in good:
             regressed.append(item)
         elif bo not in good and fo in good:
             improved.append(item)
@@ -557,6 +577,9 @@ def _cmd_diff(args) -> int:
         print(msg)
         return 0 if args.allow_missing_baseline else 2
     base = load_verdicts(base_path)
+    flaky = {}
+    if args.flaky and Path(args.flaky).exists():
+        flaky = json.loads(Path(args.flaky).read_text()).get(fresh["suite"], {})
     result = diff(
         base,
         fresh,
@@ -566,6 +589,8 @@ def _cmd_diff(args) -> int:
         wall_ratio_any_cpu=args.wall_ratio_any_cpu,
         min_fraction=args.min_fraction,
         expect_backend=args.expect_backend or None,
+        flaky=flaky,
+        timeout_flips_info=args.timeout_flips_info,
     )
     result["label"] = args.label
     md = render_md(result, args.label)
@@ -658,6 +683,16 @@ def main(argv=None) -> int:
     )
     d.add_argument("--min-fraction", type=float, default=0.9)
     d.add_argument("--expect-backend", default="", help="e.g. 'cc' for the compiled arm")
+    d.add_argument(
+        "--flaky",
+        default="",
+        help="JSON file {suite: {case: reason}}: changes of these cases never alert",
+    )
+    d.add_argument(
+        "--timeout-flips-info",
+        action="store_true",
+        help="report (do not alert on) transitions into or out of TIMEOUT",
+    )
     d.add_argument(
         "--allow-missing-baseline",
         action="store_true",

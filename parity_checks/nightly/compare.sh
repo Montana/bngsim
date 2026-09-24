@@ -57,7 +57,7 @@ if [ -n "${ALLOW_MISSING_BASELINE:-}" ]; then
 fi
 python3 "$here/verdicts.py" diff \
   --baseline "$here/baselines/$suite.json" --fresh "$out/verdicts.json" \
-  --label "vs committed baseline" \
+  --label "vs committed baseline" --flaky "$here/flaky.json" \
   --json-out "$out/diff-baseline.json" --md-out "$out/diff-baseline.md" \
   ${allow[@]+"${allow[@]}"} "$@" >/dev/null || rc=1
 if [ -f "$out/diff-baseline.md" ]; then
@@ -81,7 +81,7 @@ if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
       [ -f "$prev/verdicts.json" ]; then
       python3 "$here/verdicts.py" diff \
         --baseline "$prev/verdicts.json" --fresh "$out/verdicts.json" \
-        --label "vs previous night (run $id)" \
+        --label "vs previous night (run $id)" --flaky "$here/flaky.json" --timeout-flips-info \
         --json-out "$out/diff-prev.json" --md-out "$out/diff-prev.md" "$@" >/dev/null || rc=1
       [ -f "$out/diff-prev.md" ] && cat "$out/diff-prev.md" >>"$summary"
       break

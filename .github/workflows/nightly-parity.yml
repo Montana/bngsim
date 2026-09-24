@@ -63,6 +63,7 @@ on:
       # A re-baseline PR only copies a verdict file a nightly already produced;
       # re-running hours of sweeps to validate that would buy nothing.
       - "!parity_checks/nightly/baselines/**"
+      - "!parity_checks/nightly/flaky.json"
 
 permissions:
   contents: read
