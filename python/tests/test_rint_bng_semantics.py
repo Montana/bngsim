@@ -115,10 +115,14 @@ def test_codegen_rewrites_nested_rint():
     assert _replace_engine_calls("rint(rint(x)/2)") == "floor((floor((x) + 0.5)/2) + 0.5)"
 
 
-def test_rint_differs_from_round_only_at_negative_halves(tmp_path):
+def test_rint_differs_from_round_only_below_zero(tmp_path):
     """`round` is ExprTk's (away from zero below 0) and is unchanged. The two
-    must now disagree at -2.5 and agree at 2.5."""
+    must now disagree at -2.5 and agree at 2.5. Below zero they also disagree
+    where x - 0.5 itself rounds, as the expression reference says: ExprTk's
+    round(-0.49999999999999994) is ceil(-1.0) = -1, BNG's rint of it is 0."""
     at_neg = _ode_rate(_net(tmp_path, -2.5, "rint(c) - round(c)"), codegen=False)
     at_pos = _ode_rate(_net(tmp_path, 2.5, "rint(c) - round(c) + 1"), codegen=False)
+    at_edge = _ode_rate(_net(tmp_path, -0.49999999999999994, "rint(c) - round(c)"), codegen=False)
     assert at_neg == pytest.approx(1.0)  # -2 - (-3)
     assert at_pos == pytest.approx(1.0)  # 3 - 3 + 1
+    assert at_edge == pytest.approx(1.0)  # 0 - (-1)

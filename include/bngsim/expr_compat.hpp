@@ -38,8 +38,8 @@ double mratio(double a, double b, double z);
 // rint(-2.5) is -2 and rint(-0.5) is 0 (issue #771). This is NOT C's rint
 // (half to even under the default rounding mode), std::round (half away from
 // zero) or ExprTk's round (away from zero below 0); all four agree except at
-// halves. Written as the literal expression, so an argument where x + 0.5
-// itself rounds (0.49999999999999994 -> 1) gives what run_network gives.
+// halves and where x +/- 0.5 itself rounds. Written as the literal expression,
+// so such an argument (0.49999999999999994 -> 1) gives what run_network gives.
 double rint(double x);
 
 // Unconditional leading-underscore remap: "_X" → "u_X" (ExprTk rejects an
