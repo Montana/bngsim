@@ -49,7 +49,18 @@ BNGsim provides all standard ExprTk functions plus BNG-specific extensions:
 
 **Control flow**:
 - `if(condition, true_value, false_value)` — ternary conditional. Condition is
-  true when > 0.5. Example: `if(A_tot > 100, k_fast, k_slow)`
+  true when it is **nonzero** (`condition != 0`), in every bngsim backend: the
+  ODE interpreter, compiled (`codegen=True`) models, SSA, PSA, NFsim and
+  RuleMonkey. Example: `if(A_tot > 100, k_fast, k_slow)`
+
+  A relational or logical condition (`>`, `<=`, `==`, `&&`, `||`, ...) always
+  evaluates to exactly 0 or 1, so this is the same answer BNG2.pl gives. The
+  rule matters only for a *bare* number used as the condition: BNG2.pl's
+  `run_network` tests `condition > 0.5`, so a condition in `(0, 0.5]` or a
+  negative one takes the true branch in bngsim and the false branch in
+  `run_network`. For example, `if(c, 10, 20)` with `c = 0.3` gives 10 here and
+  20 there. To get the same result in both, write the comparison you mean,
+  e.g. `if(c > 0.5, 10, 20)` or `if(c != 0, 10, 20)`.
 
 **Time**:
 - `time()` — current simulation time (updated by CVODE/SSA at each step)
