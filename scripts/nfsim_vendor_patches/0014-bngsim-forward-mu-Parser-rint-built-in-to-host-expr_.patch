@@ -1,0 +1,61 @@
+From 23ea03390fd2c490f49a0b9982cd793fcf5c013e Mon Sep 17 00:00:00 2001
+From: Montana Mendy <montana@linux.com>
+Date: Thu, 24 Sep 2026 08:13:32 -0700
+Subject: [PATCH] bngsim: forward mu::Parser rint() built-in to host
+ expr_compat
+
+The shim's RintFunction used std::round, which rounds a half away from
+zero. BNG2.pl's rint is floor(x + 0.5), so rint(-2.5) came out -3
+instead of -2 at every negative half. Forward to the host single source
+bngsim::expr_compat::rint instead, the same way mratio() is forwarded,
+so NFsim and the ODE/SSA engine evaluate rint from one definition.
+(bngsim issue #771)
+---
+ src/NFfunction/nfsim_funcparser.h | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/NFfunction/nfsim_funcparser.h b/src/NFfunction/nfsim_funcparser.h
+index a192ad5..85831f9 100644
+--- a/src/NFfunction/nfsim_funcparser.h
++++ b/src/NFfunction/nfsim_funcparser.h
+@@ -15,7 +15,7 @@
+ // - Constants: _PI, _e, _Na (NFsim convention) plus bngsim's _pi, _kB, _NA, _R, _h, _F.
+ //
+ // SINGLE SOURCE OF TRUTH (issue #49): the BNG-compatibility logic this shim needs
+-// — the mratio() built-in and the BNG-identifier → ExprTk-symbol mapping (the
++// — the mratio() and rint() built-ins and the BNG-identifier → ExprTk-symbol mapping (the
+ // unconditional leading-underscore remap and the conditional reserved-symbol
+ // mangle) — is owned by the host evaluator and exposed via
+ // <bngsim/expr_compat.hpp>. This shim FORWARDS to those definitions instead of
+@@ -65,7 +65,7 @@
+ #define exprtk_disable_caseinsensitivity
+ #include "exprtk.hpp"
+ 
+-// Host single source of truth for mratio() + the BNG↔ExprTk identifier mapping
++// Host single source of truth for mratio(), rint() + the BNG↔ExprTk identifier mapping
+ // (issue #49). Linked into the vendored NFsim target via bngsim::expression.
+ #include "bngsim/expr_compat.hpp"
+ 
+@@ -91,11 +91,17 @@ struct LnFunction : public exprtk::ifunction<T> {
+     T operator()(const T& x) override { return std::log(x); }
+ };
+ 
+-// 1-arg: rint(x) — round to nearest integer
++// 1-arg: rint(x) — BNG's round-to-nearest, floor(x + 0.5): a half rounds up,
++// so rint(-2.5) is -2. Forwards to the host single source
++// bngsim::expr_compat::rint (bngsim issue #771), the same way mratio() does
++// (issue #49). This used to be std::round, which rounds a half away from zero
++// and so disagreed with BNG2.pl and the host evaluator at every negative half.
+ template <typename T>
+ struct RintFunction : public exprtk::ifunction<T> {
+     RintFunction() : exprtk::ifunction<T>(1) {}
+-    T operator()(const T& x) override { return std::round(x); }
++    T operator()(const T& x) override {
++        return static_cast<T>(bngsim::expr_compat::rint(static_cast<double>(x)));
++    }
+ };
+ 
+ // 1-arg: sign(x) — signum function
+-- 
+2.43.0
+

@@ -287,6 +287,24 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-shim-rint-single-source",
+        "kind": "local",
+        "status": (
+            "Forward the NFsim ExprTk mu::Parser shim's rint(x) built-in to the "
+            "host single source bngsim::expr_compat::rint (nfsim_funcparser.h), "
+            "the same way mratio() is forwarded (internal#49). The shim used "
+            "std::round, which rounds a half away from zero; BNG2.pl's rint is "
+            "floor(x + 0.5), so every negative half came out one lower than "
+            "BNG's and than the host evaluator's. See bngsim GH #771."
+        ),
+        "commits": [
+            {
+                "commit": "23ea03390fd2c490f49a0b9982cd793fcf5c013e",
+                "summary": "bngsim: forward mu::Parser rint() built-in to host expr_compat",
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12

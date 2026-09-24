@@ -42,7 +42,11 @@ BNGsim provides all standard ExprTk functions plus BNG-specific extensions:
 - `sqrt(x)` — square root
 
 **Rounding**: `floor`, `ceil`, `round`, `trunc`
-- `rint(x)` — alias for `round(x)` (backward compatibility with BNG's `rint()`)
+- `rint(x)` — BNG's `rint()`: `floor(x + 0.5)`, so a half always rounds
+  **up** (toward +∞), as BNG2.pl's `run_network` computes it. `rint(2.5)` is 3,
+  `rint(-2.5)` is -2 and `rint(-0.5)` is 0. It is not the same as `round(x)`,
+  which rounds a half away from zero: `round(-2.5)` is -3. The two agree
+  everywhere except at negative halves.
 
 **Other math**: `abs`, `min`, `max`, `clamp`, `avg`, `sum`, `erf`, `erfc`
 - `sign(x)` — returns -1, 0, or 1 (alias: `sgn`)

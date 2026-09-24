@@ -3,16 +3,17 @@
 The embedded NFsim path has two ExprTk-based expression layers: the host
 ``bngsim::ExprTkEvaluator`` (``bngsim/src/expression.cpp``) and NFsim's internal
 ``mu::Parser`` shim (``third_party/nfsim/src/NFfunction/nfsim_funcparser.h``).
-The shim needs two BNG-compatibility features:
+The shim needs these BNG-compatibility features:
 
   * the ``mratio(a, b, z)`` built-in -- the confluent-hypergeometric ratio
     ``M(a+1, b+1, z) / M(a, b, z)``; and
   * a reserved-symbol remap, so a model symbol named like an ExprTk built-in
     (e.g. ``frac``) resolves to the model quantity instead of the built-in.
+  * the ``rint(x)`` built-in, BNG's ``floor(x + 0.5)`` (issue #771).
 
 Per issue #49 the shim no longer carries a hand-ported copy of this logic: it
-**forwards** both features to the host single source ``bngsim::expr_compat``
-(``mratio`` and ``compute_registration_name`` / ``remap_name``), linked into the
+**forwards** each feature to the host single source ``bngsim::expr_compat``
+(``mratio``, ``rint`` and ``compute_registration_name`` / ``remap_name``), linked into the
 vendored NFsim target via ``bngsim::expression``. There is therefore no second
 implementation to drift -- so the old host-vs-shim parity assertion has been
 retired as tautological.
@@ -97,6 +98,32 @@ def test_nfsim_shim_mratio_matches_scipy(parity_sim_cols, col, abz):
     _, cols = parity_sim_cols
     assert col in cols, f"{col} did not compile/appear as an NFsim function column"
     np.testing.assert_allclose(cols[col], _mratio_reference(*abz), rtol=1e-10)
+
+
+# rint(x) columns baked into exprtk_shim_parity.xml, with BNG's value for each:
+# floor(x + 0.5), the definition BNG2.pl's run_network evaluates (issue #771).
+# The negative halves are the discriminating cases: std::round, which the shim
+# used, gives -3, -2 and -1 for the first three. (The 0.49999999999999994 edge is
+# pinned in test_rint_bng_semantics.py through a parameter value: written as a
+# literal in the expression, ExprTk's number parser reads it as 0.5.)
+_RINT_CASES = {
+    "rint_m2p5": -2.0,
+    "rint_m1p5": -1.0,
+    "rint_m0p5": 0.0,
+    "rint_p0p5": 1.0,
+    "rint_p2p5": 3.0,
+    "rint_m0p3": 0.0,
+}
+
+
+@pytest.mark.parametrize("col, want", list(_RINT_CASES.items()))
+def test_nfsim_shim_rint_is_bng_floor_half(parity_sim_cols, col, want):
+    """NFsim shim's ``rint(x)`` is BNG's ``floor(x + 0.5)``, evaluated inside
+    NFsim through the forwarding adapter (issue #771). Oracle: the literal
+    values of floor(x + 0.5), written out above."""
+    _, cols = parity_sim_cols
+    assert col in cols, f"{col} did not compile/appear as an NFsim function column"
+    np.testing.assert_array_equal(cols[col], want)
 
 
 def test_nfsim_shim_resolves_reserved_symbol(parity_sim_cols):

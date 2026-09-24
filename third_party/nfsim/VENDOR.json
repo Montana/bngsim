@@ -7,11 +7,11 @@
     "local_origin_remote": "https://github.com/RuleWorld/nfsim.git",
     "fork_remote": null,
     "branch_or_ref": "bngsim/vendor",
-    "commit": "77931f50be0a0f191e2ca8a8cfcd95a20562eb00",
+    "commit": "23ea03390fd2c490f49a0b9982cd793fcf5c013e",
     "base_ref": "origin/master",
     "base_commit": "1a54f38701ab2213de831f9ba272cbb14f7c371f"
   },
-  "imported_at_utc": "2026-09-11T15:23:40+00:00",
+  "imported_at_utc": "2026-09-24T15:13:45+00:00",
   "pruning": {
     "included_paths": [
       "CMakeLists.txt",
@@ -167,6 +167,17 @@
         {
           "commit": "5c547470600d00b1bbd64c087705b905b2e007f4",
           "summary": "bngsim: keep zero-base-rate reactions so post-init set_param can activate them"
+        }
+      ]
+    },
+    {
+      "topic": "bngsim/carry-shim-rint-single-source",
+      "kind": "local",
+      "status": "Forward the NFsim ExprTk mu::Parser shim's rint(x) built-in to the host single source bngsim::expr_compat::rint (nfsim_funcparser.h), the same way mratio() is forwarded (internal#49). The shim used std::round, which rounds a half away from zero; BNG2.pl's rint is floor(x + 0.5), so every negative half came out one lower than BNG's and than the host evaluator's. See bngsim GH #771.",
+      "commits": [
+        {
+          "commit": "23ea03390fd2c490f49a0b9982cd793fcf5c013e",
+          "summary": "bngsim: forward mu::Parser rint() built-in to host expr_compat"
         }
       ]
     }

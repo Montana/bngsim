@@ -55,7 +55,8 @@ class ExpressionEvaluator {
 // ─── ExprTk-based implementation ─────────────────────────────────────────────
 //
 // Registers BNG-compatible aliases:
-//   ln → log, rint → round, sign → sgn
+//   ln → log, sign → sgn, rint → floor(x + 0.5) (BNG's rint, which is not
+//   ExprTk's round below zero; see expr_compat::rint)
 // Registers built-in constants:
 //   _pi, _e, _kB, _NA, _R, _h, _F
 // Registers built-in functions:

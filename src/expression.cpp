@@ -308,6 +308,8 @@ static bool mratio_asymptotic(double a, double b, double z, double *out) {
     return true;
 }
 
+double expr_compat::rint(double x) { return std::floor(x + 0.5); }
+
 double expr_compat::mratio(double a, double b, double z) {
     if (!mratio_cf_is_trustworthy(a, b, z)) {
         double asymptotic = 0.0;
@@ -499,7 +501,9 @@ template <typename T> struct RintFunction : public exprtk::ifunction<T> {
     RintFunction() : exprtk::ifunction<T>(1) {}
     T operator()(const T &x) override {
         const double dx = static_cast<double>(x);
-        const double r = std::round(dx);
+        // BNG's floor(x + 0.5), not std::round (issue #771): the two differ at
+        // every negative half, where std::round goes away from zero.
+        const double r = expr_compat::rint(dx);
         if (warner) {
             warner->warn_if_nonfinite("rint", {dx}, r);
         }

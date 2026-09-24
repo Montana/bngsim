@@ -240,7 +240,12 @@ _compile_counter = itertools.count()
 # scale, and the case and clock tables the solver reads them through. A cached v29
 # .so has none of them, and a run on it would keep failing at the onset of a pulse
 # whose derivative is unbounded there. Invalidate v29.
-_CODEGEN_VERSION = "30"
+# v31: lanl/bngsim #771 — `rint(x)` is emitted as BNG's `floor((x) + 0.5)`
+# instead of C's `round(x)`, which rounds a half away from zero. That changes
+# what a model calling rint computes at every negative half, and a .net model's
+# key is content+version, so a cached v30 .so would keep serving the old values.
+# Invalidate v30.
+_CODEGEN_VERSION = "31"
 
 
 # Modules whose *source* determines the emitted C. ``_codegen`` holds the
@@ -3579,7 +3584,8 @@ def _translate_expr(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     codegen path produces the same numerics as the ExprTk interpreter for
     every BNG-supported expression construct: power (``^``), conditionals
     (``if(c,a,b)``), word-form logicals (``and``/``or``/``not``), constants
-    (``_pi``/``_e``), and ``abs``/``ln``/``rint``. The .net path uses the
+    (``_pi``/``_e``), ``abs``/``ln``, and the engine calls C has no name for
+    (``sign``/``rint``/``clamp``/...). The .net path uses the
     ``obs_<Name>`` / ``func_<Name>`` local-variable naming emitted by
     ``generate_rhs_c``; species are referenced only via observables.
 
@@ -5949,7 +5955,6 @@ _BUILTIN_IDENT_MAP: dict[str, tuple[str, bool]] = {
     "or": ("||", False),
     "not": ("!", False),
     "ln": ("log", False),
-    "rint": ("round", False),
     "abs": ("fabs", False),
     # ExprTk max/min have no C equivalent under those names; <math.h> spells
     # them fmax/fmin, which are strictly binary. ExprTk's are variadic, and a
@@ -6024,12 +6029,14 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     — shared across all bodies so it is built once, not per call (GH #161;
     rebuilding the ~245k-entry table per body was quadratic at genome scale).
     Its precedence is function > observable > species > parameter > built-in
-    (time, _pi, _e, and, or, not, ln, rint, abs).
+    (time, _pi, _e, and, or, not, ln, abs). ``rint`` is not in it: it is
+    rewritten to ``floor((x) + 0.5)`` by ``_replace_engine_calls`` before this
+    pass runs (issue #771).
     """
     # if() must be expanded first so nested ternary structure is correct
     # before identifier rewriting touches anything.
     result = _replace_if_calls(expr)
-    # sign/sgn/clamp/avg/sum become ordinary C expressions here, before the
+    # sign/sgn/rint/clamp/avg/sum become ordinary C expressions here, before the
     # identifier pass would otherwise leave the bare name in the source and the
     # compile would fail on it (issue #448).
     result = _replace_engine_calls(result)
@@ -6142,7 +6149,12 @@ def _split_if_args(expr: str, paren_pos: int) -> list[str] | None:
 # ``max``/``min`` join them for their n-ary form only (GH #556): C's fmax/fmin
 # take exactly two arguments, so a three-or-more-argument call is folded into
 # nested binary calls here and left for _BUILTIN_IDENT_MAP to rename.
-_ENGINE_CALL_NAMES = ("sign", "sgn", "clamp", "avg", "sum", "max", "min")
+#
+# ``rint`` joins them because C's name means something else (issue #771). It was
+# renamed to C's ``round``, which rounds a half away from zero; BNG's rint is
+# floor(x + 0.5), so the two disagreed at every negative half. It is reserved
+# like the others (an alias in ``reserved_names()``), so the same rule applies.
+_ENGINE_CALL_NAMES = ("sign", "sgn", "rint", "clamp", "avg", "sum", "max", "min")
 _ENGINE_CALL_RE = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(_ENGINE_CALL_NAMES) + r")\s*\(")
 
 
@@ -6172,6 +6184,14 @@ def _c_engine_call(name: str, args: list[str]) -> str | None:
             return None
         x = args[0]
         return f"((({x}) > 0.0) ? 1.0 : ((({x}) < 0.0) ? -1.0 : 0.0))"
+    if name == "rint":
+        # expr_compat::rint in src/expression.cpp: BNG's floor(x + 0.5), the
+        # same arithmetic in the same order. Not C's round(), which the name
+        # used to be renamed to: that rounds a half away from zero, so every
+        # negative half came out one lower than BNG's (issue #771).
+        if n != 1:
+            return None
+        return f"floor(({args[0]}) + 0.5)"
     if name == "clamp":
         if n != 3:
             return None
@@ -6206,7 +6226,7 @@ def _c_engine_call(name: str, args: list[str]) -> str | None:
 
 
 def _replace_engine_calls(expr: str) -> str:
-    """Rewrite every ``sign``/``sgn``/``clamp``/``avg``/``sum`` call to C, and
+    """Rewrite every ``sign``/``sgn``/``rint``/``clamp``/``avg``/``sum`` call to C, and
     fold an n-ary ``max``/``min`` into nested binary calls (GH #556).
 
     Runs after ``_replace_if_calls`` and before identifier substitution, in both
