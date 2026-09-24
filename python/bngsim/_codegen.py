@@ -9123,10 +9123,13 @@ def _comoving_coefficients(
     return out
 
 
-def _singular_clock_exponents(expr, clock_names: set[str], sp) -> set[str]:
-    """The exponents, as ``srepr``, of every singular power in the derivative
-    ``expr`` (:func:`_singular_power`) — read after the rewrites the C emitter
-    applies, so a removable denominator (``x^(a-2)·x`` is ``x^(a-1)``) does not count."""
+def _singular_clock_powers(expr, clock_names: set[str], sp) -> set[tuple[str, str]]:
+    """The (base, exponent) of every singular power in the derivative ``expr``.
+
+    Read after the C emitter's rewrites so a removable denominator
+    (``x^(a-2)·x`` is ``x^(a-1)``) does not count. Include the base because
+    distinct onsets can have the same exponent but move at different rates.
+    """
     from bngsim._jacobian import _emitter_rewrites
 
     try:
@@ -9134,7 +9137,7 @@ def _singular_clock_exponents(expr, clock_names: set[str], sp) -> set[str]:
     except Exception:  # noqa: BLE001 - the emitter would refuse it too
         rewritten = expr
     return {
-        sp.srepr(node.exp)
+        (sp.srepr(node.base), sp.srepr(node.exp))
         for node in _pow_nodes_in_values(rewritten, sp)
         if _singular_power(node, clock_names, sp, derivative=True)
     }
@@ -9301,9 +9304,9 @@ def _functional_comoving_plan(
                     moved = _comoving_shifted_partial(
                         on_cell, p_alias, c, clock_names, derived_shift, constants, sp
                     )
-                    if _singular_clock_exponents(
+                    if _singular_clock_powers(
                         plain, clock_names, sp
-                    ) - _singular_clock_exponents(moved, clock_names, sp):
+                    ) - _singular_clock_powers(moved, clock_names, sp):
                         eligible = True
                     pieces.append((moved, cond))
                 if len(pieces) == 1:
