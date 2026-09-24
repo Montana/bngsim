@@ -1,0 +1,557 @@
+name: nightly-parity
+
+# Nightly correctness and efficiency sweep against independent references (GH #702).
+#
+# Before this workflow nothing ran any oracle sweep on any schedule: the parity
+# harness's unit tests ran on every PR, but no job ever handed them two
+# trajectories. This runs the real sweeps every night and alerts on what CHANGED:
+#
+#   job          reference                       corpus
+#   sbml         SBML Test Suite expected CSVs    1,824 semantic cases (pinned checkout)
+#                DSMTS analytic mean/sd           39 stochastic cases (committed)
+#   rr-ode       libRoadRunner                    1,006 of the 1,323 BioModels SBML: the
+#                                                 part a hosted runner can fetch (pinned, cached)
+#   bng-ode      BNG2.pl + run_network            592 committed BNGL ODE jobs, twice:
+#                                                 the ExprTk interpreter a .net runs by
+#                                                 default, and the compiled C path every
+#                                                 sensitivity run uses (#689/#699 lived
+#                                                 only there)
+#   bng-stoch    run_network SSA / NFsim          110 SSA + 235 NF committed BNGL jobs
+#   amici-sens   AMICI forward sensitivities      40 of the 50 curated BioModels x 2 methods
+#
+# THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
+# any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
+# runner exits 0 whatever happens. So each job extracts its report into a per-case
+# verdict file and parity_checks/nightly/compare.sh diffs it against
+#
+#   1. the committed baseline, parity_checks/nightly/baselines/<suite>.json, and
+#   2. the previous nightly's verdicts, scheduled or manual on main (catches a
+#      regression of a fix that nobody has re-baselined yet).
+#
+# It alerts on a good case that is no longer good (including one that silently
+# drops out or stops being compared), a failing case that starts crashing, a jump
+# in bngsim's solver work (steps / RHS / Jacobian evaluations: deterministic, so
+# they catch efficiency regressions that runner wall-clock noise would hide), a
+# >2x wall-clock blowup, a compiled-arm row that did not run compiled, and a run
+# that compared too little. Known failures sit in the baseline and do not re-alert.
+#
+# ALERTING: the report job opens one tracking issue ("Nightly parity: regressions
+# detected") or comments on it if it is already open. A job that could not run at
+# all alerts too, because that suite went unchecked. Nothing here blocks a PR.
+#
+# RE-BASELINING: every run uploads `nightly-<suite>` with verdicts.json, the
+# candidate baseline. After a fix improves models (the run summary lists them),
+# copy that file over parity_checks/nightly/baselines/<suite>.json in a PR so a
+# later regression of the fix alerts against the committed baseline too. See
+# parity_checks/nightly/README.md.
+#
+# Pull requests that touch this workflow or parity_checks/nightly/ run it too, so
+# a change to the nightly is validated before it lands; there a missing baseline
+# is allowed (that is how a new suite's first baseline is recorded).
+#
+# Scheduled workflows run only from the default branch, and GitHub disables them
+# after 60 days without repository activity.
+
+on:
+  schedule:
+    - cron: "17 8 * * *" # 08:17 UTC, ~02:17 US Mountain; off the top of the hour
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/nightly-parity.yml"
+      - "parity_checks/nightly/**"
+      # A re-baseline PR only copies a verdict file a nightly already produced;
+      # re-running hours of sweeps to validate that would buy nothing.
+      - "!parity_checks/nightly/baselines/**"
+
+permissions:
+  contents: read
+  actions: read # compare.sh downloads the previous night's verdicts
+
+concurrency:
+  group: nightly-parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONUNBUFFERED: "1"
+  NIGHTLY_OUT: nightly-out
+  ALLOW_MISSING_BASELINE: ${{ github.event_name == 'pull_request' && '1' || '' }}
+  # BioNetGen 2.9.3 (BNG2.pl + run_network + NFsim), pinned by sha256 — the same
+  # release tarball and hash bngsim-paper's fetch_bionetgen.py records.
+  BNG_URL: https://github.com/RuleWorld/bionetgen/releases/download/BioNetGen-2.9.3/BioNetGen-2.9.3-linux.tar.gz
+  BNG_SHA256: b85743d422aa3fd112aceb3725dd1b1f2ff1ad829d20d71682680426582bcb5d
+
+jobs:
+  # ------------------------------------------------------------------------- #
+  # The BioModels SBML corpus rr-ode and amici-sens read. It is gitignored
+  # (~260 MB), so it is rebuilt from its pinned, sha256-checked sources on a cache
+  # miss and restored from the cache otherwise.
+  #
+  # CI covers the part of the corpus a hosted runner can fetch: the 992 models
+  # (SBML + SED-ML) from sys-bio/temp-biomodels on GitHub, plus the committed SBML
+  # overrides. The other 317 come only from EBI's BioModels REST API, which answers
+  # HTTP 403 to GitHub-hosted runners (every request, measured on this workflow's
+  # first run) while serving the same URLs elsewhere, so they are not requested
+  # here. The two consumers run whatever is present and the baseline records it.
+  # ------------------------------------------------------------------------- #
+  corpus:
+    name: BioModels corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: key
+        run: echo "key=rr-corpus-v2-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
+
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+
+      # Standard library only: no bngsim build needed here.
+      - name: Fetch and materialize the corpus (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # SED-ML + SBML: sys-bio/temp-biomodels at the pinned commit, sha256-verified.
+          python3 parity_checks/rr_parity/fetch_sedml.py --dest "$RUNNER_TEMP/sedml_source"
+          python3 parity_checks/rr_parity/materialize.py \
+            --sedml-dir "$RUNNER_TEMP/sedml_source/final" \
+            --sbml-dir "$RUNNER_TEMP/no-ebi-downloads"
+
+      # Every job whose SBML comes from temp-biomodels must be present; a shortfall
+      # there is a fetch failure, not the known EBI gap.
+      - name: Check coverage
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path("parity_checks/rr_parity")
+          jobs = json.loads((root / "ode_jobs.json").read_text())["jobs"]
+          present = [j for j in jobs if (root / j["model"]).is_file()]
+          tb_missing = [j["model_id"] for j in jobs
+                        if j.get("params", {}).get("sbml_origin") == "temp-biomodels"
+                        and not (root / j["model"]).is_file()]
+          msg = f"{len(present)}/{len(jobs)} manifest SBML files present ({len(jobs) - len(present)} are EBI-only)"
+          print(msg)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"BioModels corpus: {msg}\n")
+          if tb_missing:
+              raise SystemExit(f"temp-biomodels models missing: {tb_missing[:10]}")
+          PY
+
+      - name: Save the corpus cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ steps.key.outputs.key }}
+
+  # ------------------------------------------------------------------------- #
+  # SBML Test Suite (semantic) + DSMTS (stochastic). Seconds + a few minutes; the
+  # expected values come from the suite, never from bngsim.
+  # ------------------------------------------------------------------------- #
+  sbml:
+    name: SBML test suite + DSMTS
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; print('bngsim', bngsim.__version__); bp.print_identity()"
+
+      - id: pin
+        run: echo "commit=$(jq -r .commit harness/sbml_test_suite/SUITE_PIN.json)" >> "$GITHUB_OUTPUT"
+      - id: suite-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sbml-test-suite
+          key: sbml-test-suite-semantic-${{ steps.pin.outputs.commit }}
+      - name: Fetch the pinned semantic suite (cache miss only)
+        if: steps.suite-cache.outputs.cache-hit != 'true'
+        env:
+          SUITE: ${{ runner.temp }}/sbml-test-suite
+          COMMIT: ${{ steps.pin.outputs.commit }}
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none --no-checkout --sparse https://github.com/sbmlteam/sbml-test-suite "$SUITE"
+          git -C "$SUITE" sparse-checkout set cases/semantic
+          git -C "$SUITE" checkout "$COMMIT"
+
+      # The runner exits 0 whatever it finds, and reads 0 cases (and exits 0) when
+      # pointed at the checkout root instead of cases/semantic. The comparison below
+      # is the verdict; the floor here catches a run that found nothing to run.
+      - name: Run the semantic suite
+        env:
+          SBML_TEST_SUITE_DIR: ${{ runner.temp }}/sbml-test-suite/cases/semantic
+        run: |
+          set -o pipefail
+          uv run --no-sync python benchmarks/suites/sbml_test_suite/run.py --mode correctness 2>&1 | tail -n 60
+          python3 -c "
+          import json, sys
+          d = json.load(open('benchmarks/suites/sbml_test_suite/results/sbml_test_suite_results.json'))
+          print('cases', d['n_cases'], 'in scope', d['n_in_scope'])
+          sys.exit(0 if d['n_in_scope'] >= 1500 else 'only %d in-scope cases ran' % d['n_in_scope'])
+          "
+      - name: Compare (semantic)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh sbml_semantic sbml-suite benchmarks/suites/sbml_test_suite/results/sbml_test_suite_results.json
+
+      # SBML_TEST_SUITE_DIR must NOT be set here: run_dsmts.py reads it as the checkout
+      # ROOT and would leave its committed, hash-pinned copy of the cases.
+      - name: Run DSMTS
+        if: always()
+        run: uv run --no-sync python harness/run_dsmts.py --quiet || true
+      - name: Compare (DSMTS)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh dsmts dsmts harness/results/dsmts.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-sbml_semantic
+          path: nightly-out/sbml_semantic/
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-dsmts
+          path: nightly-out/dsmts/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
+  # bngsim vs libRoadRunner over the BioModels corpus.
+  # ------------------------------------------------------------------------- #
+  rr-ode:
+    name: RoadRunner ODE parity
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
+      - uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ needs.corpus.outputs.key }}
+          fail-on-cache-miss: true
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp, roadrunner; print('bngsim', bngsim.__version__, 'roadrunner', roadrunner.__version__); bp.print_identity()"
+      # --timeout 300 rather than the runner's 120 s: four models sit at 115-118 s on
+      # an M1 Max (RoadRunner's JIT load dominates), and a timeout that flips with
+      # runner speed would alert as a regression.
+      # Two passes. The dozen SBML files over 1 MB (up to 786 species) run on their
+      # own: four of them at once, each auto-compiling ~20 MB of generated C in
+      # parallel shards, killed the runner on the first run.
+      - name: Select the models the corpus holds
+        run: |
+          python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json --max-bytes 1000000 > "$RUNNER_TEMP/light.txt"
+          python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json --min-bytes 1000001 > "$RUNNER_TEMP/heavy.txt"
+      - name: Run rr_run.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+        run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/light.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
+      # The giants on the interpreted RHS: their auto-codegen compile alone runs past
+      # the per-job cap on a 4-core runner, so with it they would only ever report
+      # TIMEOUT. These are the only fetchable models at or above the 256-species
+      # auto-codegen threshold (the light pass tops out at 194), so rr-ode does not
+      # exercise SBML auto-codegen; compiled RHS code is covered by bng-ode's codegen
+      # arm and by amici-sens, whose bngsim side always runs compiled.
+      - name: Run rr_run.py on the giant models
+        env:
+          BNGSIM_NO_CODEGEN: "1"
+        run: |
+          reports="$RUNNER_TEMP/rr_ode.json"
+          if [ -n "$(tr -d '[:space:]' < "$RUNNER_TEMP/heavy.txt")" ]; then
+            uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 2 --timeout 600 \
+              --models "$(cat "$RUNNER_TEMP/heavy.txt")" --out "$RUNNER_TEMP/rr_ode_giants.json" || true
+            reports="$reports,$RUNNER_TEMP/rr_ode_giants.json"
+          fi
+          echo "REPORTS=$reports" >> "$GITHUB_ENV"
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh rr_ode core "$REPORTS"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-rr_ode
+          path: nightly-out/rr_ode/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
+  # bngsim vs BNG2.pl/run_network on the committed BNGL corpus, interpreter and
+  # compiled arms.
+  # ------------------------------------------------------------------------- #
+  bng-ode:
+    name: BNG ODE parity · ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: interpreter
+            suite: bng_ode
+            flags: ""
+            expect: ""
+          - arm: codegen
+            suite: bng_ode_codegen
+            flags: "--codegen"
+            expect: "--expect-backend cc"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; from bngsim import _codegen; print('bngsim', bngsim.__version__, 'cc', _codegen._find_c_compiler()); bp.print_identity()"
+      - name: Fetch BioNetGen 2.9.3
+        run: |
+          set -euxo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bng.tgz" "$BNG_URL"
+          echo "$BNG_SHA256  $RUNNER_TEMP/bng.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bng"
+          tar -xzf "$RUNNER_TEMP/bng.tgz" -C "$RUNNER_TEMP/bng"
+          root=$(dirname "$(find "$RUNNER_TEMP/bng" -name BNG2.pl | head -n 1)")
+          test -x "$root/bin/run_network"
+          echo "BNGPATH=$root" >> "$GITHUB_ENV"
+      # An explicit --timeout also retires the per-job timeout overrides, which were
+      # sized for parity_sweep's 180 s budget. A fresh codegen cache per run: its key
+      # covers the Python emitters, not the C++ core.
+      - name: Run bng_ode_run.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+        run: uv run --no-sync python parity_checks/bng_parity/bng_ode_run.py --workers 4 --timeout 600 ${{ matrix.flags }} --out "$RUNNER_TEMP/${{ matrix.suite }}.json" || true
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh ${{ matrix.suite }} core "$RUNNER_TEMP/${{ matrix.suite }}.json" ${{ matrix.expect }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-${{ matrix.suite }}
+          path: nightly-out/${{ matrix.suite }}/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
+  # Stochastic tracks against run_network's SSA and standalone NFsim. Seeds are
+  # fixed on both sides.
+  # ------------------------------------------------------------------------- #
+  bng-stoch:
+    name: BNG stochastic parity · ${{ matrix.track }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - track: ssa
+            workers: 4
+          - track: nf # an NF model can take several GB; 3 workers on a 16 GB runner
+            workers: 3
+    steps:
+      - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; print('bngsim', bngsim.__version__, 'HAS_NFSIM', bngsim.HAS_NFSIM); bp.print_identity()"
+      - name: Fetch BioNetGen 2.9.3
+        run: |
+          set -euxo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bng.tgz" "$BNG_URL"
+          echo "$BNG_SHA256  $RUNNER_TEMP/bng.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bng"
+          tar -xzf "$RUNNER_TEMP/bng.tgz" -C "$RUNNER_TEMP/bng"
+          root=$(dirname "$(find "$RUNNER_TEMP/bng" -name BNG2.pl | head -n 1)")
+          test -x "$root/bin/run_network"
+          test -x "$root/bin/NFsim"
+          echo "BNGPATH=$root" >> "$GITHUB_ENV"
+      - name: Run bng_stoch_run.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+        run: uv run --no-sync python parity_checks/bng_parity/bng_stoch_run.py --track ${{ matrix.track }} --workers ${{ matrix.workers }} --timeout 1800 --out "$RUNNER_TEMP/bng_${{ matrix.track }}.json" || true
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh bng_${{ matrix.track }} core "$RUNNER_TEMP/bng_${{ matrix.track }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-bng_${{ matrix.track }}
+          path: nightly-out/bng_${{ matrix.track }}/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
+  # bngsim vs AMICI forward sensitivities (staggered + simultaneous) on the curated
+  # 50-model set. AMICI compiles each model to C++; the compiled models are cached
+  # across nights (keyed inside by SBML content, so a stale cache is harmless).
+  # ------------------------------------------------------------------------- #
+  amici-sens:
+    name: AMICI forward-sensitivity parity
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
+      - uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ needs.corpus.outputs.key }}
+          fail-on-cache-miss: true
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          cache-suffix: amici # keeps the from-source AMICI wheel out of the other jobs' cache
+      - name: Provision from uv.lock (with the pinned AMICI)
+        run: uv sync --extra dev --group amici --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp, amici; print('bngsim', bngsim.__version__, 'amici', amici.__version__); bp.print_identity()"
+      - id: amici-key
+        run: echo "prefix=amici-sens-models-${{ runner.os }}-py312-${{ hashFiles('parity_checks/amici_parity/AMICI_PIN.json') }}-" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/amici_parity/amici_sens_cache
+          key: ${{ steps.amici-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.amici-key.outputs.prefix }}
+      # Left out, each for a measured reason:
+      #   BIOMD0000000496/497 (~3 MB SBML): both engines' sensitivity runs hit the wall
+      #     cap even on a 10-core workstation (TIMEOUT at 900 s); here that is 40
+      #     runner-minutes of guaranteed TIMEOUT.
+      #   BIOMD0000000608: bngsim now generates a 66.7 MB C sensitivity RHS for it,
+      #     whose compile outlasts the 600 s codegen budget even on a workstation (an
+      #     older build declined the model in 0.9 s). Both methods compiling it at
+      #     once killed this job's runner.
+      # BNGSIM_CODEGEN_JOBS=2 bounds the compiler processes per model (3 workers).
+      - name: Select the models the corpus holds
+        run: python3 parity_checks/nightly/present_models.py parity_checks/amici_parity/amici_ode_jobs.json --skip BIOMD0000000496,BIOMD0000000497,BIOMD0000000608 > "$RUNNER_TEMP/models.txt"
+      - name: Run amici_sens_run.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+          BNGSIM_CODEGEN_JOBS: "2"
+        run: uv run --no-sync python parity_checks/amici_parity/amici_sens_run.py --workers 3 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/amici_sens.json" || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true # nothing to save when provisioning failed before the run
+        with:
+          path: parity_checks/amici_parity/amici_sens_cache
+          key: ${{ steps.amici-key.outputs.prefix }}${{ github.run_id }}
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh amici_sens core "$RUNNER_TEMP/amici_sens.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-amici_sens
+          path: nightly-out/amici_sens/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
+  # One summary for the whole night; on a scheduled or manual run with any alert
+  # (or any job that could not run), open or update the tracking issue.
+  # ------------------------------------------------------------------------- #
+  report:
+    name: Report
+    needs: [corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-*
+          path: nightly-in
+      - name: Summarize
+        id: sum
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          shopt -s nullglob
+          diffs=(nightly-in/*/diff-*.json)
+          rc=0
+          python3 parity_checks/nightly/verdicts.py summarize ${diffs[@]+"${diffs[@]}"} \
+            --needs-json "$NEEDS" --run-url "$RUN_URL" --sha "$GITHUB_SHA" --out body.md > /dev/null || rc=$?
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          echo "alert=$([ "$rc" -ne 0 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+      - name: Open or update the tracking issue
+        if: steps.sum.outputs.alert == '1' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Nightly parity: regressions detected"
+        run: |
+          set -euo pipefail
+          num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" \
+            --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body-file body.md
+          fi
+      - name: Fail the run on any alert
+        if: steps.sum.outputs.alert == '1'
+        run: exit 1

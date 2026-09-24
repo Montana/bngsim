@@ -69,6 +69,7 @@ _PARITY_CHECKS = Path(__file__).resolve().parent.parent
 if str(_PARITY_CHECKS) not in sys.path:
     sys.path.insert(0, str(_PARITY_CHECKS))
 
+from _core.work import work_counters  # noqa: E402
 from rr_parity import _rr_common as _rc  # noqa: E402
 
 schedule = _rc.schedule
@@ -598,8 +599,16 @@ def bn_ode_net(
     n_points: int,
     rtol: float,
     atol: float,
+    *,
+    codegen: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict]:
     """One BNGsim ODE run over a BNG2.pl ``.net``. Returns (time, values, names, timing).
+
+    ``codegen=True`` forces the compiled C RHS (and analytical Jacobian) that every
+    sensitivity run uses. A ``.net`` model otherwise always runs the ExprTk
+    interpreter, so without it the compiled path is never compared against
+    run_network — which is how #689 and #699 went unseen (GH #702). The timing's
+    ``config.codegen`` records what actually ran.
 
     ``t_span=(t_start, t_end)`` sampled at ``n_points`` uniformly — set to
     ``n_steps + 1`` by the caller so the grid matches run_network's
@@ -617,7 +626,7 @@ def bn_ode_net(
     model = bngsim.Model.from_net(str(net_path))
     load_sec = time.perf_counter() - t0
 
-    sim = bngsim.Simulator(model, method="ode")
+    sim = bngsim.Simulator(model, method="ode", **({"codegen": True} if codegen else {}))
 
     # Cold solve (one-time CVODE setup + lazy Jacobian derivation + codegen +
     # solve) feeds the parity verdict; then up to _warm_rep_count(cold) warm
@@ -655,6 +664,8 @@ def bn_ode_net(
         "codegen_sec": round(float(sim.last_codegen_sec), 6),
         **integ,
         "config": config,
+        # The verdict run's solver work, for the nightly efficiency check (GH #702).
+        "work": work_counters(stats),
     }
     return np.asarray(r.time), np.asarray(r.species), list(r.species_names), timing
 
@@ -1584,6 +1595,7 @@ def multi_segment_replay(
     rtol: float,
     seed: int | None,
     poplevel: float,
+    codegen: bool = False,
 ):
     """Drive bngsim in-process through a network protocol's segments (GH #179).
 
@@ -1700,6 +1712,8 @@ def multi_segment_replay(
                 )
             if sim is None or method != sim_method:
                 init_kw = {"poplevel": poplevel} if method in _PSA_METHODS and poplevel else {}
+                if codegen and method in _ODE_METHODS:
+                    init_kw["codegen"] = True  # the compiled arm (see bn_ode_net)
                 sim = bngsim.Simulator(model, method=method, **init_kw)
                 sim_method = method
             run_kw: dict = {}
@@ -1768,6 +1782,9 @@ def multi_segment_replay(
         "segments": n_segments,
         "rep_method": sim_method,
         "reinit_ics": len(reinit_ids),
+        # What ran the representative segment, and its solver work (GH #702).
+        "backend": getattr(sim, "codegen_backend", None),
+        "work": work_counters(getattr(captured, "solver_stats", None)),
     }
 
 

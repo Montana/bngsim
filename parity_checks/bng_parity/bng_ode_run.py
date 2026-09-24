@@ -439,6 +439,7 @@ def _worker(spec: dict, q) -> None:
                     rtol=ode["rtol"],
                     seed=None,
                     poplevel=0.0,
+                    codegen=spec.get("codegen", False),
                 )
                 bn_wall = time.perf_counter() - t0
                 bn = (
@@ -454,6 +455,10 @@ def _worker(spec: dict, q) -> None:
                     "integrate_cold_sec": round(bn_wall, 6),
                     "integrate_n_warm": 0,
                     "multi_segment": True,
+                    # config.codegen names the replay mode; backend is what actually
+                    # ran the representative segment (the compiled arm checks it).
+                    "backend": _info.get("backend"),
+                    "work": _info.get("work") or {},
                     "config": {
                         "codegen": "full-protocol replay",
                         "jacobian": "per segment",
@@ -500,7 +505,13 @@ def _worker(spec: dict, q) -> None:
             try:
                 t0 = time.perf_counter()
                 t, v, n, bn_timing = bc.bn_ode_net(
-                    net_path, ode["t_start"], ode["t_end"], n_points, ode["rtol"], ode["atol"]
+                    net_path,
+                    ode["t_start"],
+                    ode["t_end"],
+                    n_points,
+                    ode["rtol"],
+                    ode["atol"],
+                    codegen=spec.get("codegen", False),
                 )
                 bn_wall = time.perf_counter() - t0
                 bn = (t, v, n)
@@ -697,6 +708,13 @@ def main() -> int:
     ap.add_argument("--models", default="", help="Comma-separated model_id filter.")
     ap.add_argument("--include", default="", help="Substring filter on the model path.")
     ap.add_argument("--exclude", default="", help="Substring filter — drop matching model paths.")
+    ap.add_argument(
+        "--codegen",
+        action="store_true",
+        help="Force bngsim's compiled C RHS (Simulator(codegen=True)) instead of the ExprTk "
+        "interpreter a .net otherwise runs. The compiled path is what every sensitivity run "
+        "uses, and #689/#699 existed only there. Needs a C compiler (GH #702).",
+    )
     args = ap.parse_args()
 
     bng2_pl, run_network_bin = _resolve_bng_tools()
@@ -775,6 +793,7 @@ def main() -> int:
                 "bng2_pl": bng2_pl,
                 "run_network_bin": run_network_bin,
                 "inject": bc.injected_action_block(j.overrides),
+                "codegen": bool(args.codegen),
             }
         )
 
@@ -784,6 +803,8 @@ def main() -> int:
     print("  bngsim vs BNG2.pl/run_network — BNGL ODE parity + timing (bng_parity)")
     print("=" * 72)
     print(f"  jobs: {len(specs)}   workers: {args.workers}   (ODE/deterministic only)")
+    if args.codegen:
+        print("  bngsim RHS: compiled C (--codegen), not the ExprTk interpreter")
     print(f"  bngsim {ver['bngsim']}   BNG {ver.get('bng')}   run_network: {run_network_bin}")
     print(
         f"  ODE tol (both engines): rtol={args.rtol:g} atol={args.atol:g}   protocol: _core.differ"
@@ -852,6 +873,7 @@ def main() -> int:
         "concurrency": {"workers": args.workers, "mode": "process-parallel"},
         "config": {
             "bngsim_method": "ode",
+            "codegen_forced": bool(args.codegen),
             "rtol": args.rtol,
             "atol": args.atol,
             "tol_overridden_jobs": n_tol_ov,

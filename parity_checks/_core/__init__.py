@@ -9,7 +9,7 @@ engine/bridge layers.
 
 from __future__ import annotations
 
-from . import bngpath, differ, fingerprint, oracles, versions
+from . import bngpath, differ, fingerprint, oracles, versions, work
 from .bngpath import BngResolution, require_bng, resolve_bng, skip_reason
 from .schema import (
     EXCEPTION_TEXT_LIMIT,
@@ -60,4 +60,5 @@ __all__ = [
     "differ",
     "fingerprint",
     "versions",
+    "work",
 ]

@@ -323,6 +323,7 @@ def bn_sens(
     """
     import bngsim
     import bngsim._sbml_loader as sbml_loader
+    from _core.work import work_counters
 
     t0 = time.perf_counter()
     if Path(xml).exists():
@@ -382,6 +383,9 @@ def bn_sens(
             "linear_solver": ac._rc.LINEAR_SOLVER_NAMES.get(ls_code, f"kind_{ls_code}"),
             "sens_method": method,
         },
+        # The verdict solve's work (state + sensitivity system), for the nightly
+        # efficiency check (GH #702).
+        "work": work_counters(stats),
     }
 
     sx = np.asarray(r.sensitivities, dtype=float)  # (n_t, n_species, n_param)
