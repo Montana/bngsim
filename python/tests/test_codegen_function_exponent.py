@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-
 from bngsim import Model, Simulator
 from bngsim._codegen import _expr_to_c, _extract_exp_right, _replace_power_op
 
@@ -61,17 +60,15 @@ end groups
     )
     np.testing.assert_allclose(compiled.species, interpreted.species, rtol=1e-7, atol=1e-9)
 
-    sensitivity = Simulator(
-        Model.from_net(str(net)), method="ode", sensitivity_params=["n"]
-    ).run(t_span=times, n_points=3)
+    sensitivity = Simulator(Model.from_net(str(net)), method="ode", sensitivity_params=["n"]).run(
+        t_span=times, n_points=3
+    )
     legs = []
     for offset in (1e-4, -1e-4):
         perturbed = Model.from_net(str(net))
         perturbed.set_param("n", 2.0 + offset)
         legs.append(
-            np.asarray(
-                Simulator(perturbed, method="ode").run(t_span=times, n_points=3).species
-            )
+            np.asarray(Simulator(perturbed, method="ode").run(t_span=times, n_points=3).species)
         )
     np.testing.assert_allclose(
         np.asarray(sensitivity.sensitivities)[:, :, 0],
