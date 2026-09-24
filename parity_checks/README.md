@@ -14,6 +14,7 @@ benchmarking (`benchmarks/`).
 | [`rr_parity`](rr_parity/) | SBML | ODE, SSA | libRoadRunner |
 | [`bng_parity`](bng_parity/) | BNGL / .net | ODE, SSA, NF | legacy BNG stack (BNG2.pl / run_network / NFsim) |
 | [`amici_parity`](amici_parity/) | SBML | sensitivities / gradients | AMICI |
+| [`codegen_paths`](codegen_paths/) | BNGL → .net | ODE codegen, forward sensitivities | bngsim's own interpreter, plus finite differences: the `.net` and model-based codegen paths against each other (issue #803) |
 | [`_core`](_core/) | — | — | shared contracts only, **no models** |
 
 Each suite is self-contained: its own vendored `models/`, a spec manifest, an
