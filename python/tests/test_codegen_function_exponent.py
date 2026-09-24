@@ -55,9 +55,10 @@ end groups
     interpreted = Simulator(Model.from_net(str(net)), method="ode", codegen=False).run(
         t_span=times, n_points=3
     )
-    compiled = Simulator(Model.from_net(str(net)), method="ode", codegen=True).run(
-        t_span=times, n_points=3
-    )
+    compiled_sim = Simulator(Model.from_net(str(net)), method="ode", codegen=True)
+    # A silent fallback to ExprTk would match the interpreter trivially.
+    assert compiled_sim.codegen_backend in ("cc", "mir")
+    compiled = compiled_sim.run(t_span=times, n_points=3)
     np.testing.assert_allclose(compiled.species, interpreted.species, rtol=1e-7, atol=1e-9)
 
     sensitivity = Simulator(Model.from_net(str(net)), method="ode", sensitivity_params=["n"]).run(
