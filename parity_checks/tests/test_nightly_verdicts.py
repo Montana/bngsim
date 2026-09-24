@@ -116,6 +116,53 @@ def test_subclass_change_is_a_change_not_an_alert():
     assert r["changed"][0]["after"] == "DIFF (rr_known)"
 
 
+def test_timeout_flips_are_reported_not_alerted_between_two_nights():
+    last_night = fresh_with(E_ode=rec("PASS"))
+    tonight = fresh_with(E_ode=rec("TIMEOUT"), A_ode=rec("TIMEOUT"))
+    r = V.diff(last_night, tonight, timeout_flips_info=True)
+    assert r["n_alerts"] == 0
+    assert sorted(x["case"] for x in r["changed"]) == ["A|ode", "E|ode"]
+    assert all("timeout flip" in x["note"] for x in r["changed"])
+    # ... but against the committed baseline PASS -> TIMEOUT is still a regression.
+    assert V.diff(BASE, fresh_with(A_ode=rec("TIMEOUT")))["alerts"]["regressed"] == 1
+
+
+def test_timeout_flips_info_does_not_hide_other_regressions():
+    r = V.diff(BASE, fresh_with(A_ode=rec("DIFF")), timeout_flips_info=True)
+    assert r["alerts"]["regressed"] == 1
+
+
+def test_flaky_case_changes_never_alert():
+    flaky = {"A|ode": "flips with runner speed"}
+    r = V.diff(BASE, fresh_with(A_ode=rec("DIFF"), C_ode=rec("EXCEPTION")), flaky=flaky)
+    assert [x["case"] for x in r["regressed"]] == []
+    assert [x["case"] for x in r["new_crash"]] == ["C|ode"]  # not listed: still alerts
+    assert r["changed"][0]["case"] == "A|ode" and "flaky" in r["changed"][0]["note"]
+
+
+def test_cli_reads_the_flaky_file_for_its_suite(tmp_path):
+    base = _write(tmp_path, "base.json", BASE)
+    worse = _write(tmp_path, "worse.json", fresh_with(A_ode=rec("TIMEOUT")))
+    flaky = tmp_path / "flaky.json"
+    flaky.write_text(json.dumps({"t": {"A|ode": "measured"}, "other": {"B|ode": "x"}}))
+    assert V.main(["diff", "--baseline", base, "--fresh", worse]) == 1
+    assert V.main(["diff", "--baseline", base, "--fresh", worse, "--flaky", str(flaky)]) == 0
+
+
+def test_the_committed_flaky_file_is_well_formed():
+    from pathlib import Path
+
+    path = Path(V.__file__).with_name("flaky.json")
+    data = json.loads(path.read_text())
+    for suite, cases in data.items():
+        if suite.startswith("_"):
+            continue
+        assert isinstance(cases, dict) and cases, suite
+        for cid, reason in cases.items():
+            assert "|" in cid or suite in ("sbml_semantic", "dsmts"), cid
+            assert len(reason) > 20, f"{cid}: give the measurement, not just a label"
+
+
 def test_new_case_is_reported_not_alerted():
     fresh = fresh_with()
     fresh["cases"]["Z|ode"] = rec("EXCEPTION")
