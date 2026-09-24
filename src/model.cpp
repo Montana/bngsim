@@ -434,6 +434,8 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
     // "this parameter is an independent input" — see the header. It pins
     // regardless of the value, which is what the unconditional detach used to do
     // for every caller.
+    const bool was_expression = param.is_expression;
+    const int was_evaluator_id = param.evaluator_id;
     double from_expr = 0.0;
     bool expr_live = false;
     if (!force_override && param.evaluator_id >= 0 && !param.expression.empty()) {
@@ -465,6 +467,16 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
         param.evaluator_id = -1;
         // Keep param.expression for debugging/introspection
     }
+
+    // expression_support() follows an is_expression parameter to whatever its
+    // expression reads, so flipping the flag either way changes the support of
+    // every expression that reads this parameter. Since #188 made an override
+    // reversible, a re-attach GROWS the support again, and a memo entry filled
+    // while detached would keep the primaries out, so an event jump writes
+    // dh/dp = 0 for them (issue #773). Drop the whole memo: the walk is
+    // transitive, so the affected entries are not just this parameter's own.
+    if (param.is_expression != was_expression || param.evaluator_id != was_evaluator_id)
+        impl_->expression_support_cache.clear();
 
     // Re-evaluate remaining expression-valued parameters (e.g., "a = a__FREE"),
     // so derived parameters pick up the new value — the whole chain of them,
@@ -2747,6 +2759,10 @@ bool NetworkModel::set_function_eval_expression(const std::string &name,
         }
         f.evaluator_id = compiled;
         f.eval_expression = expression;
+        // The support walk follows a function-written parameter into its
+        // function's body, so a new body can change the support of anything
+        // that reads it (issue #773).
+        impl_->expression_support_cache.clear();
         return true;
     }
     return false;

@@ -361,12 +361,14 @@ struct NetworkModel::Impl {
     // address→index maps over the whole model each time — on a spiking model
     // that is the difference between O(1) and O(n_species) per fire.
     //
-    // Safe to memo because the answer is a property of the expression graph,
-    // which build() fixes. The one post-build mutation that can touch it,
-    // set_param()'s detach of an expression-backed parameter, can only ever
-    // make a support SMALLER (the parameter stops expanding to the primaries
-    // behind it) — so a stale entry over-differences, costing time and writing
-    // the zero it would have written anyway, and never under-differences.
+    // The answer is a property of the expression graph, which build() fixes
+    // except for two post-build mutations, and both CLEAR this memo (issue
+    // #773): set_param() flipping a parameter's is_expression (a detach shrinks
+    // a support; since #188 a re-attach grows it back, and a stale shrunken
+    // entry would under-difference, writing dh/dp = 0 for real primaries), and
+    // set_function_eval_expression() replacing a function body. Any new
+    // mutation of is_expression, a parameter or function evaluator_id, or
+    // var_param_bindings after build() must clear it too.
     // Recomputable, so clone() leaves it empty (same exemption as
     // function_value_cache).
     std::unordered_map<int, std::pair<std::vector<int>, std::vector<int>>> expression_support_cache;
