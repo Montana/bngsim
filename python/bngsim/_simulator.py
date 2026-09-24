@@ -1344,13 +1344,15 @@ class Simulator:
 
         The classification is delegated to the core
         (:func:`NetworkModel.event_sensitivity_unsupported_reason`), which knows
-        each event's persistence/delay and — via the trigger's referenced
-        variables — whether its crossing time moves, and whether it can be
-        differentiated. "Moves" is judged against every address that carries
-        live state, not just species concentrations: an observable total or a
-        rateOf accessor moves with the trajectory too, so a trigger reading one
-        has a parameter-dependent crossing time even though it names no
-        parameter (issue #52). ``param_names`` is the set of parameters whose
+        each event's persistence/delay and — via what the trigger reads,
+        followed through observables, derived parameters and assignment rules
+        by ``expression_support()`` (issue #775) — whether its crossing time
+        moves, and whether it can be differentiated. "Moves" is judged against
+        every address that carries live state, not just species
+        concentrations: an observable total or a rateOf accessor moves with the
+        trajectory too, so a trigger reading one has a parameter-dependent
+        crossing time even though it names no parameter (issue #52).
+        ``param_names`` is the set of parameters whose
         sensitivities this call requests (defaults to
         ``self._sensitivity_params``); an IC-only request passes an empty list,
         which still exercises the persistence/delay checks — and, since issue
@@ -1374,11 +1376,12 @@ class Simulator:
             runtime = set(self._model._core.events_with_runtime_event_time_sens())
             blocked = {ei: msg for ei, msg in blocked.items() if ei not in runtime}
         if reason is None and blocked:
-            # The core tests the trigger's *bound addresses*, which cannot see
-            # through an assignment-rule parameter: in `time >= t_rule` with
-            # `t_rule = t_first + …`, the trigger binds to `t_rule`'s address and
-            # never to `t_first`'s, so a requested `t_first` looks absent. The
-            # detector inlines the rule and knows better (issue #49).
+            # The detector's reason, when the core found none. The core used to
+            # test only the trigger's bound addresses, so a requested `t_first`
+            # behind `t_rule = t_first + …` looked absent and this was what
+            # refused it (issue #49). Since issue #775 the core follows the rule
+            # itself and refuses first, so this is a fallback, kept for anything
+            # the detector reads that the core's support walk does not.
             reason = sorted(blocked.values())[0] + "."
             detail = ""
         if reason:

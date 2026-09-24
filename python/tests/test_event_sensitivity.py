@@ -1188,27 +1188,53 @@ class TestEventTimeSensitivity:
             relerr = np.abs(sens[mask, col] - dx[mask]) / np.abs(dx[mask])
             assert relerr.max() < 1e-6, f"col {col}: {relerr.max():.3e}"
 
-    def test_unresolvable_rule_threshold_is_refused_not_guessed(self):
+    def test_a_rule_threshold_that_reads_state_is_differentiated_at_the_fire(self):
         """The same shape, but the rule reads state. Its value at the current
-        point still *looks* like a number; treating it as one would attribute
-        ∂t*/∂p to a parameter that does not move the crossing."""
-        b = ModelBuilder()
-        b.add_parameter("kin", KIN)
-        b.add_parameter("kout", KOUT)
-        b.add_parameter("t_first", 1.0)
-        x = b.add_species("X", 1.0)
-        on = b.add_species("on", 0.0)
-        b.add_observable("Xobs", [(x, 1.0)])
-        b.add_function("t_rule", "t_first + Xobs")
-        b.add_parameter("t_rule", 0.0)
-        b.add_reaction([on], [on, x], "elementary", "kin")
-        b.add_reaction([x], [], "elementary", "kout")
-        b.add_event("onset", "time() >= t_rule", [(on, "1.0")])
-        m = bngsim.Model(_core=b.build())
+        point still *looks* like a number, and treating it as one would attribute
+        ∂t*/∂p to a parameter that does not move the crossing, so the threshold
+        detector must not resolve it. This used to be refused outright; since
+        issue #775 the engine classes the trigger as state-dependent (it reads
+        Xobs through the rule) and differentiates the crossing at the fire by the
+        implicit function theorem, which is checked here against a central
+        finite difference of the trajectory rather than assumed."""
 
+        def build(t_first: float) -> bngsim.Model:
+            b = ModelBuilder()
+            b.add_parameter("kin", KIN)
+            b.add_parameter("kout", KOUT)
+            b.add_parameter("t_first", t_first)
+            x = b.add_species("X", 1.0)
+            on = b.add_species("on", 0.0)
+            b.add_observable("Xobs", [(x, 1.0)])
+            b.add_function("t_rule", "t_first + Xobs")
+            b.add_parameter("t_rule", 0.0)
+            b.add_reaction([on], [on, x], "elementary", "kin")
+            b.add_reaction([x], [], "elementary", "kout")
+            b.add_event("onset", "time() >= t_rule", [(on, "1.0")])
+            return bngsim.Model(_core=b.build())
+
+        m = build(1.0)
+        assert m._core.events_with_runtime_event_time_sens() == [0]
+        run = {"t_span": (0, 10), "n_points": 11}
         sim = bngsim.Simulator(m, method="ode", sensitivity_params=["t_first"])
-        with pytest.raises(ValueError, match="does not reduce to arithmetic"):
-            sim.run(t_span=(0, 10), n_points=11)
+        # The ahead-of-run detector must still refuse to read t_rule's current
+        # value as a constant threshold (the refusal this test used to assert).
+        # The gate drops that block only because the solver now differentiates
+        # the crossing at the fire.
+        _compensated, _detail, blocked = sim._event_time_compensation(["t_first"])
+        assert "does not reduce to arithmetic" in blocked[0]
+        sens = sim.run(**run, rtol=1e-10, atol=1e-12)
+        analytic = np.asarray(sens.sensitivities)[:, :, 0]
+
+        h = 1e-5
+
+        def traj(t_first: float) -> np.ndarray:
+            r = bngsim.Simulator(build(t_first), method="ode").run(**run, rtol=1e-12, atol=1e-14)
+            return np.asarray(r.species)
+
+        fd = (traj(1.0 + h) - traj(1.0 - h)) / (2 * h)
+        assert np.abs(fd).max() > 0.1  # the crossing really does move
+        np.testing.assert_allclose(analytic, fd, rtol=1e-5, atol=1e-7)
 
     def test_compute_all_sensitivities_includes_the_trigger_parameter(self):
         """The full-tensor entry point defaults to every parameter, so it used

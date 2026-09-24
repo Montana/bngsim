@@ -209,7 +209,9 @@ class NetworkModel {
     const std::vector<int> &event_trigger_residual_species(int event_idx0) const;
 
     // Does this event's trigger read live state (a species concentration, an
-    // observable total, or a rateOf accessor)? Such a trigger's crossing time
+    // observable total, or a rateOf accessor), directly or through a parameter
+    // an assignment rule or expression writes (issue #775)? Decided by
+    // expression_support()'s species support. Such a trigger's crossing time
     // moves with the parameters *through the trajectory* even when it names
     // none of them, so its ∂t*/∂p is non-zero and must be differentiated at the
     // crossing rather than resolved ahead of the run (issue #52 / issue #144).
