@@ -12,6 +12,7 @@
 
 #include "bngsim/model_builder.hpp"
 #include "bngsim/expression.hpp"
+#include "bngsim/table_function.hpp"
 #include "bngsim/types.hpp"
 #include "model_impl.hpp"
 
@@ -654,12 +655,21 @@ std::vector<std::string> extract_ids(const std::string &expr) {
 }
 
 // Build Jacobian sparsity (same algorithm as net_file_loader.cpp)
-JacobianSparsity build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
-                                    const std::vector<Observable> &observables,
-                                    const std::unordered_map<std::string, int> &obs_name_to_idx,
-                                    const std::vector<Function> &functions,
-                                    const std::unordered_map<std::string, int> &func_name_to_idx,
-                                    const std::vector<Species> &species) {
+//
+// `tfun_index_by_call` maps each table function's internal call name
+// (`tfun_<name>`, including the synthetic `tfun_<f>__tfun<k>` of an embedded
+// call) to its index name. Step 3d rewrites a tfun-bodied function to
+// `tfun_<name>()` before this runs, so the index an observable- or
+// function-indexed table reads is no longer in the expression text; without
+// this map the species behind it drop out of the pattern (issue #781).
+JacobianSparsity
+build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
+                   const std::vector<Observable> &observables,
+                   const std::unordered_map<std::string, int> &obs_name_to_idx,
+                   const std::vector<Function> &functions,
+                   const std::unordered_map<std::string, int> &func_name_to_idx,
+                   const std::vector<Species> &species,
+                   const std::unordered_map<std::string, std::string> &tfun_index_by_call) {
 
     if (n_species == 0)
         return {};
@@ -694,7 +704,22 @@ JacobianSparsity build_jac_sparsity(const std::vector<Reaction> &reactions, int 
     std::vector<std::vector<int>> func_direct_obs(nf); // species from observables in expr
     std::vector<std::vector<int>> func_refs(nf);       // functions referenced in expr
     for (int fi = 0; fi < nf; ++fi) {
-        for (const auto &id : extract_ids(functions[fi].expression)) {
+        std::vector<std::string> ids = extract_ids(functions[fi].expression);
+        // A table-function call reads its index (issue #781). Resolve it the
+        // way register_table_function_ binds it: time reads no species; a
+        // function index is that function's bound parameter, so it becomes a
+        // function→function edge below; an observable index contributes its
+        // species. A plain-parameter index matches neither map and adds
+        // nothing. Appended after the scan so the loop below treats the index
+        // exactly as if the modeller had written it in the expression.
+        const size_t n_direct = ids.size();
+        for (size_t k = 0; k < n_direct; ++k) {
+            auto tit = tfun_index_by_call.find(ids[k]);
+            if (tit == tfun_index_by_call.end() || is_time_index(tit->second))
+                continue;
+            ids.push_back(strip_paren_suffix(tit->second));
+        }
+        for (const auto &id : ids) {
             auto oit = obs_name_to_idx.find(id);
             if (oit != obs_name_to_idx.end())
                 for (int si_0 : obs_species[oit->second])
@@ -1999,9 +2024,13 @@ NetworkModel ModelBuilder::build() {
     const int ns = static_cast<int>(impl.species.size());
     const int np = static_cast<int>(impl.parameters.size());
 
-    sd->jac_sparsity =
-        build_jac_sparsity(sd->reactions, ns, impl.observables, sd->observable_name_to_idx,
-                           impl.functions, sd->function_name_to_idx, impl.species);
+    std::unordered_map<std::string, std::string> tfun_index_by_call;
+    for (const auto &spec : bimpl_->tfun_specs)
+        tfun_index_by_call.emplace("tfun_" + spec.func_name, spec.index_name);
+
+    sd->jac_sparsity = build_jac_sparsity(
+        sd->reactions, ns, impl.observables, sd->observable_name_to_idx, impl.functions,
+        sd->function_name_to_idx, impl.species, tfun_index_by_call);
 
     sd->analytical_jac = build_anal_jac(sd->reactions, ns, np, sd->jac_sparsity, impl.species);
 
