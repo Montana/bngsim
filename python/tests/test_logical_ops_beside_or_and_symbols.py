@@ -77,7 +77,10 @@ def _net(tmp_path: Path, extra: dict[str, float], body: str, name: str) -> str:
 def test_operator_is_not_the_symbol(tmp_path, case, codegen):
     extra, body = CASES[case]
     model = Model.from_net(_net(tmp_path, extra, body, case))
-    res = Simulator(model, method="ode", codegen=codegen).run(t_span=(0, 1), n_points=2)
+    sim = Simulator(model, method="ode", codegen=codegen)
+    # The codegen leg must really run compiled code, not fall back to ExprTk.
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
+    res = sim.run(t_span=(0, 1), n_points=2)
     assert float(res.species[-1, 0]) == pytest.approx(A1, rel=1e-6)
 
 

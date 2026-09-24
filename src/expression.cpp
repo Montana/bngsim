@@ -501,7 +501,8 @@ template <typename T> struct RintFunction : public exprtk::ifunction<T> {
     RintFunction() : exprtk::ifunction<T>(1) {}
     T operator()(const T &x) override {
         const double dx = static_cast<double>(x);
-        // Match BNG's floor(x + 0.5), including negative half-integers (#771).
+        // BNG's floor(x + 0.5), not std::round (issue #771): the two differ at
+        // every negative half, where std::round goes away from zero.
         const double r = expr_compat::rint(dx);
         if (warner) {
             warner->warn_if_nonfinite("rint", {dx}, r);
