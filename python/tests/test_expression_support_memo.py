@@ -64,10 +64,18 @@ _SBML = """<?xml version="1.0" encoding="UTF-8"?>
 </sbml>"""
 
 
-def _s1_and_dsdk(m: bngsim.Model) -> tuple[float, float]:
-    r = bngsim.Simulator(m, method="ode", sensitivity_params=["k"]).run(t_span=(0, 1), n_points=3)
+def _sim(m: bngsim.Model) -> bngsim.Simulator:
+    return bngsim.Simulator(m, method="ode", sensitivity_params=["k"])
+
+
+def _run(sim: bngsim.Simulator) -> tuple[float, float]:
+    r = sim.run(t_span=(0, 1), n_points=3)
     i = list(r.species_names).index("S")
     return float(np.asarray(r.species)[-1, i]), float(np.asarray(r.sensitivities)[-1, i, 0])
+
+
+def _s1_and_dsdk(m: bngsim.Model) -> tuple[float, float]:
+    return _run(_sim(m))
 
 
 @pytest.fixture
@@ -106,4 +114,19 @@ def test_a_reattached_override_differences_the_primary_again(model):
     model.reset()
     s1, dk = _s1_and_dsdk(model)
     assert s1 == pytest.approx(3.0)
+    assert dk == pytest.approx(2.0, rel=1e-8)
+
+
+def test_a_reused_simulator_differences_the_primary_after_a_reattach(model):
+    """The fitting-loop pattern: one Simulator, built before the override and
+    kept across it. The memo lives on the Model, not the Simulator, so this
+    path went stale the same way (dS/dk = 0.0 on main)."""
+    sim = _sim(model)
+    model.set_param("d", 5.0)
+    model.reset()
+    assert _run(sim)[1] == 0.0
+    model.set_param("d", 2.0)
+    model.reset()
+    s1, dk = _run(sim)
+    assert s1 == pytest.approx(2.0)
     assert dk == pytest.approx(2.0, rel=1e-8)
