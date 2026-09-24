@@ -1099,7 +1099,8 @@ void ExprTkEvaluator::define_function(const std::string &name, Func3 fn) {
 
 // ─── C-style logical operator replacement ────────────────────────────────────
 // BNG2.pl emits C-style && and || in if() conditions, but ExprTk uses
-// 'and' and 'or' keywords. Replace before compilation.
+// 'and' and 'or' keywords. Replaced in compile(), after the identifier remap
+// (issue #770: see the note there).
 static std::string replace_logical_operators(const std::string &expr) {
     std::string result;
     result.reserve(expr.size() + 16);
@@ -1122,14 +1123,11 @@ static std::string replace_logical_operators(const std::string &expr) {
 }
 
 int ExprTkEvaluator::compile(const std::string &expr) {
-    // Replace C-style logical operators before any other processing
-    std::string preprocessed = replace_logical_operators(expr);
-
     // Strip `obs()` → `obs` for any name registered as a scalar variable.
     // BNGL accepts Observable references as zero-arg calls; ExprTk does
     // not. Run before remap_expression so we match against BNG-source
     // names, not their post-mangling forms.
-    std::string stripped = impl_->strip_empty_parens(preprocessed);
+    std::string stripped = impl_->strip_empty_parens(expr);
 
     // Remap identifiers before ExprTk compilation:
     //   - Unconditional: "_X" → "u_X" (ExprTk rejects '_' prefix)
@@ -1137,8 +1135,21 @@ int ExprTkEvaluator::compile(const std::string &expr) {
     //                    (e.g., user's `const` → `r_const`)
     std::string remapped = impl_->remap_expression(stripped);
 
+    // Replace C-style logical operators LAST, after the identifier remap
+    // (issue #770). The replacement inserts the ExprTk
+    // keywords `and` / `or`, which are identifiers as far as the remap is
+    // concerned: run first, a model symbol named `or` or `and` (mangled to
+    // `r_or` / `r_and` at registration) captured the operator just inserted,
+    // so `(x>2) || on` compiled as the implicit product `(x>2) r_or on` and
+    // `(a)||(b)` tripped the "declared symbol used as a function call" guard.
+    // `&&` and `||` contain no identifier characters, so the remap passes them
+    // through untouched and the keywords inserted here are never rewritten.
+    // Every expression without such a symbol compiles to exactly the text it
+    // did before.
+    std::string preprocessed = replace_logical_operators(remapped);
+
     // Delegate to compile_preprocessed (which also caches the string)
-    return compile_preprocessed(remapped);
+    return compile_preprocessed(preprocessed);
 }
 
 int ExprTkEvaluator::compile_preprocessed(const std::string &preprocessed_expr) {

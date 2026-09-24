@@ -2073,11 +2073,16 @@ def _make_printer():
         def _print_BooleanFalse(self, expr):
             return "0"
 
+        # `&&` / `||`, not the keywords `and` / `or` (issue #770). The engine's
+        # compile() renames model symbols first and turns `&&` / `||` into the
+        # keywords last, so the C-style spelling cannot be captured by a model
+        # symbol named `and` or `or`; a printed keyword would be, exactly as the
+        # model's own text used to be.
         def _print_And(self, expr):
-            return "(" + " and ".join(self._print(a) for a in expr.args) + ")"
+            return "(" + " && ".join(self._print(a) for a in expr.args) + ")"
 
         def _print_Or(self, expr):
-            return "(" + " or ".join(self._print(a) for a in expr.args) + ")"
+            return "(" + " || ".join(self._print(a) for a in expr.args) + ")"
 
         def _print_Not(self, expr):
             return f"(not({self._print(expr.args[0])}))"

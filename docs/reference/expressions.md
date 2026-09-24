@@ -140,6 +140,12 @@ if(A_tot >= 0 && A_tot <= 200, k_active, 0)    # BNG2.pl output
 if(A_tot >= 0 and A_tot <= 200, k_active, 0)    # ExprTk native
 ```
 
+A model may declare a parameter or observable named `and` or `or` (BNG2.pl
+accepts both). `&&` and `||` are always the operators in such a model; the
+conversion runs after model symbols are resolved, so it cannot pick up the
+symbol. The bare words `and` and `or` then mean the model's symbol, so in that
+model write the operators as `&&` and `||`, the form BNG2.pl emits.
+
 ## Case Sensitivity
 
 BNGsim treats all identifiers as **case-sensitive**. Parameters `k3` and `K3`
