@@ -65,7 +65,8 @@ compile rather than falling back to the clock.
 A model may also declare a scalar named `time` itself: BNG2.pl rejects a
 parameter named `time` but accepts an observable named `time`, and a
 hand-written `.net` can declare either. The call form `time()` still reads the
-clock in every engine; the bare word `time` is the model's scalar. So
+clock (interpreted and compiled ODE, SSA, and the sensitivity layer); the bare
+word `time` is the model's scalar. So
 `k*time()*time` is the rate constant, times the clock, times the observable.
 NFsim does not yet accept such a model: it refuses to load it with an error
 naming `time` rather than guessing.

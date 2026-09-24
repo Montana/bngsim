@@ -29,7 +29,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 from bngsim import Model, Simulator
-from bngsim._codegen import _build_ident_lookup, _translate_expr
+from bngsim._codegen import (
+    _build_ident_lookup,
+    _build_ident_lookup_model,
+    _translate_expr,
+    _translate_expr_to_c,
+)
 
 T_OUT = np.array([0.0, 1.0, 2.0])
 CLOCK_B = T_OUT**2 / 2  # k = 1
@@ -162,6 +167,16 @@ def test_codegen_translation_keeps_the_clock():
     assert _translate_expr("k*time()", lookup) == "p[0]*t"
     assert _translate_expr("k*time", lookup) == "p[0]*obs[0]"
     assert _translate_expr("k*time( )*time", lookup) == "p[0]*t*obs[0]"
+
+
+def test_model_codegen_translation_keeps_the_clock():
+    """The model-path emitter (``_translate_expr_to_c``, used for SBML, Antimony
+    and ModelBuilder models) has its own lookup table and needed the same fix;
+    on main it compiled all three `time` tokens below to the observable's slot."""
+    lookup = _build_ident_lookup_model({"k": "p[0]"}, {}, {"time": "obs[0]"}, {})
+    assert _translate_expr_to_c("k*time()", lookup) == "p[0]*t"
+    assert _translate_expr_to_c("k*time", lookup) == "p[0]*obs[0]"
+    assert _translate_expr_to_c("k*time( )*time", lookup) == "p[0]*t*obs[0]"
 
 
 def test_no_scalar_named_time_is_unchanged(tmp_path):
