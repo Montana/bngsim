@@ -49,6 +49,9 @@ class ExpressionEvaluator {
     // has a parameter-dependent crossing time — both are beyond Phase-1
     // (fixed-time) event sensitivity and keep raising. Constants and built-in
     // functions (e.g. time()) are not variables and are not reported.
+    // An empty result means the expression reads no model variable. When the
+    // set cannot be determined, this throws std::runtime_error rather than
+    // return an empty one (issue #779).
     virtual std::vector<const double *> referenced_variable_addresses(int expr_id) const = 0;
 };
 

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -1010,11 +1011,21 @@ struct ExprTkEvaluator::Impl {
     Parser &acquire_parser() {
         if (!parser) {
             parser = std::make_unique<Parser>();
-            // Increase max stack depth for deeply nested if() expressions.
-            // ExprTk default is 400 (~200 nested if()), muParser handled 2000.
-            parser->settings().set_max_stack_depth(4096);
+            configure_parser(*parser);
         }
         return *parser;
+    }
+
+    // Every parser this evaluator uses is configured here, so the one that
+    // compiles an expression and the one that later re-reads it to collect its
+    // variables (referenced_variable_addresses) accept exactly the same inputs.
+    // They did not: the collector was ExprTk's own collect_variables(), which
+    // builds a default parser, and an expression deeper than that parser's
+    // limit compiled here and came back as reading no variables (issue #779).
+    static void configure_parser(Parser &p) {
+        // Increase max stack depth for deeply nested if() expressions.
+        // ExprTk default is 400 (~200 nested if()), muParser handled 2000.
+        p.settings().set_max_stack_depth(4096);
     }
 
     void set_time_ptr(double *ptr) { time_func.time_ptr = ptr; }
@@ -1167,19 +1178,39 @@ std::vector<const double *> ExprTkEvaluator::referenced_variable_addresses(int e
     // table to the address it was bound to via define_variable. Names not
     // registered as variables (constants, functions) resolve to null and are
     // skipped, so the result contains only model-variable addresses.
-    std::vector<std::string> names;
-    // Pass the symbol table so the collector resolves built-in/user functions
-    // (e.g. time()) instead of bailing out when it meets an unknown token — the
-    // symbol-table-less overload returns nothing for a trigger like
-    // `time() >= t_dose`, which would silently hide a parameter reference.
-    if (!exprtk::collect_variables(impl_->preprocessed_strings[expr_id], impl_->symbol_table,
-                                   names)) {
-        return out;
+    //
+    // The text is re-parsed against this evaluator's own symbol table (so
+    // built-in and user functions such as time() resolve instead of stopping
+    // the parse — a trigger like `time() >= t_dose` must still report t_dose)
+    // by a parser configured exactly as the one that compiled it. ExprTk's
+    // exprtk::collect_variables() cannot be used: it builds a default parser
+    // whose stack-depth limit is ~10x lower than ours, and on failure it
+    // returns false, which this function used to turn into "reads no
+    // variables". Every caller takes an empty result to mean the expression is
+    // independent of the model — a fixed-time trigger, a zero jump sensitivity,
+    // a constant delay — so an expression past ~197 nested if()s or ~65 nested
+    // parentheses silently lost its dt*/dp term or its jump (issue #779).
+    // A re-parse that fails now raises instead: an unknown dependency set must
+    // not read as an empty one.
+    Impl::Parser collector;
+    Impl::configure_parser(collector);
+    collector.dec().collect_variables() = true;
+    Impl::Expression scratch;
+    scratch.register_symbol_table(impl_->symbol_table);
+    const std::string &text = impl_->preprocessed_strings[expr_id];
+    if (!collector.compile(text, scratch)) {
+        throw std::runtime_error("ExprTk: could not re-parse expression '" + text +
+                                 "' to collect the model variables it reads (" + collector.error() +
+                                 "). Its dependencies are unknown, so it cannot be classified "
+                                 "for sensitivity analysis.");
     }
-    out.reserve(names.size());
-    for (const std::string &nm : names) {
-        auto *var = impl_->symbol_table.get_variable(nm);
-        if (var != nullptr) {
+    std::deque<Impl::Parser::dependent_entity_collector::symbol_t> symbols;
+    collector.dec().symbols(symbols);
+    std::unordered_set<const double *> seen;
+    out.reserve(symbols.size());
+    for (const auto &sym : symbols) {
+        auto *var = impl_->symbol_table.get_variable(sym.first);
+        if (var != nullptr && seen.insert(&var->ref()).second) {
             out.push_back(&var->ref());
         }
     }
