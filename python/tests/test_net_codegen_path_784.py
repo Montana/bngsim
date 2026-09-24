@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -296,14 +297,44 @@ def test_699_forward_reference_flat(tmp_path, monkeypatch, path, sens):
     _fwd_expect(_run(_write(tmp_path, "fwd.net", FWD), path, sens=["k"] if sens else None), sens)
 
 
+def _reads_before_written(src: str) -> list[str]:
+    """``func[]`` slots the emitted C reads before any line has assigned them."""
+    written: set[str] = set()
+    early = []
+    for line in src.splitlines():
+        m = re.match(r"\s*func\[(\d+)\]\s*=(.*);", line)
+        if m:
+            early += [
+                f"func[{j}] in `{line.strip()}`"
+                for j in sorted(set(re.findall(r"func\[(\d+)\]", m.group(2))) - written)
+            ]
+            written.add(m.group(1))
+    return early
+
+
+def _source(net, path) -> str:
+    m = bngsim.Model.from_net(net)
+    if path == "model":
+        m._net_path = ""
+        return cg.prepare_model_codegen_source(m)
+    return cg.prepare_codegen_source(net, m)
+
+
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
 @pytest.mark.parametrize(
     "path",
     _paths(699, AssertionError, "a chunked build reads a forward function's uninitialised slot"),
 )
 def test_699_forward_reference_chunked(tmp_path, monkeypatch, path, sens):
+    """The defect is a read of an uninitialised stack slot, and what that slot
+    holds is up to the platform: on Linux CI it held the right value, so the run
+    passed and the strict xfail failed. The emitted C's order is checked first,
+    because that is the same everywhere."""
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
-    _fwd_expect(_run(_write(tmp_path, "fwd.net", FWD), path, sens=["k"] if sens else None), sens)
+    net = _write(tmp_path, "fwd.net", FWD)
+    early = _reads_before_written(_source(net, path))
+    assert not early, f"read before written: {early}"
+    _fwd_expect(_run(net, path, sens=["k"] if sens else None), sens)
 
 
 # ── #721: a tfun time index spelled T ────────────────────────────────────────
