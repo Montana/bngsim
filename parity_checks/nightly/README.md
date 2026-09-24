@@ -46,11 +46,15 @@ A night alerts on:
 - **efficiency**: on a case good both times, bngsim's solver work (steps, RHS
   evaluations, Jacobian evaluations, from `Result.solver_stats`) grew past x1.25
   (with an absolute floor), or a counter's corpus total grew past x1.05, or bngsim's
-  total wall time grew past x2. The counters are deterministic for a given model,
-  build and platform, so they catch the algorithmic slowdowns (a Jacobian falling
-  back to finite differences, step-size control, an event forcing restarts) that
-  runner wall-clock noise would hide. Constant-factor slowdowns need a timing A/B on
-  a fixed local machine; the wall check here only catches a blowup.
+  total wall time grew past x2 on the same runner CPU model (x4 across models). The
+  counters are deterministic for a given model, build and platform -- two runs on
+  different runner hardware matched exactly -- so they catch the algorithmic
+  slowdowns (a Jacobian falling back to finite differences, step-size control, an
+  event forcing restarts) that runner wall-clock noise would hide. Wall time is not:
+  hosted runners mix CPU generations, and the compiled arm measured 1.8x slower on
+  an EPYC 7763 than on an EPYC 9V45. Constant-factor slowdowns need a timing A/B on
+  a fixed machine (`benchmarks/perf_ab.py`); the wall check here only catches a
+  blowup.
 - **backend**: on the compiled arm, a good row that did not actually run compiled.
 - **incomplete**: the run compared fewer than 90 % of the baseline's cases.
 

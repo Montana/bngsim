@@ -160,12 +160,29 @@ def test_corpus_total_work_growth_alerts_even_below_the_per_case_bar():
     assert r["alerts"]["efficiency_totals"] == 3
 
 
-def test_wall_alerts_only_past_the_coarse_ratio():
+def _on(obj, cpu):
+    return dict(obj, source={"cpu": cpu})
+
+
+def test_wall_on_the_same_cpu_alerts_past_the_coarse_ratio():
+    base = _on(BASE, "EPYC 7763")
     slower = fresh_with(A_ode=rec("PASS", work=W, sec=1.9), B_ode=rec("PASS", work=W, sec=1.9))
-    assert V.diff(BASE, slower)["alerts"]["wall"] == 0
+    assert V.diff(base, _on(slower, "EPYC 7763"))["alerts"]["wall"] == 0
     much = fresh_with(A_ode=rec("PASS", work=W, sec=2.5), B_ode=rec("PASS", work=W, sec=2.5))
-    r = V.diff(BASE, much)
-    assert r["alerts"]["wall"] == 1 and r["wall"]["ratio"] == 2.5
+    r = V.diff(base, _on(much, "EPYC 7763"))
+    assert r["alerts"]["wall"] == 1 and r["wall"]["ratio"] == 2.5 and r["wall"]["same_cpu"]
+
+
+def test_wall_across_cpu_models_alerts_only_on_a_blowup():
+    # Measured: the compiled arm ran 1.8x slower on an EPYC 7763 than on a 9V45.
+    base = _on(BASE, "EPYC 9V45")
+    much = fresh_with(A_ode=rec("PASS", work=W, sec=2.5), B_ode=rec("PASS", work=W, sec=2.5))
+    r = V.diff(base, _on(much, "EPYC 7763"))
+    assert r["alerts"]["wall"] == 0 and not r["wall"]["same_cpu"] and r["wall"]["limit"] == 4.0
+    huge = fresh_with(A_ode=rec("PASS", work=W, sec=5.0), B_ode=rec("PASS", work=W, sec=5.0))
+    assert V.diff(base, _on(huge, "EPYC 7763"))["alerts"]["wall"] == 1
+    # an unknown CPU on either side counts as "not the same"
+    assert V.diff(BASE, much)["alerts"]["wall"] == 0
 
 
 def test_incomplete_run_alerts():
@@ -221,7 +238,7 @@ def test_extract_core_reads_outcome_work_wall_and_backend(tmp_path):
             _jr("M2", "EXCEPTION", exception="bngsim: RuntimeError: boom"),
             _jr("M2", "PASS", method="sens/staggered"),
         ],
-        meta={"suite": "rr_parity", "git_rev": "abc1234"},
+        meta={"suite": "rr_parity", "git_rev": "abc1234", "hardware": {"cpu": "EPYC 7763"}},
     )
     obj = V.extract("core", path, "rr_ode")
     assert obj["n_cases"] == 3
@@ -236,6 +253,7 @@ def test_extract_core_reads_outcome_work_wall_and_backend(tmp_path):
     assert obj["cases"]["M2|ode"]["note"] == "bngsim: RuntimeError: boom"
     assert obj["cases"]["M2|sens/staggered"]["outcome"] == "PASS"
     assert obj["source"]["git_rev"] == "abc1234"
+    assert obj["source"]["cpu"] == "EPYC 7763"
 
 
 def test_multi_segment_backend_wins_over_the_replay_label(tmp_path):

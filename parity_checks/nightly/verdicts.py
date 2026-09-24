@@ -26,8 +26,9 @@ REPORT the verdict:
       (steps, RHS evaluations, Jacobian evaluations) grew by more than
       ``--work-ratio`` and ``--work-min-delta``; or a counter's total over all
       such cases grew by more than ``--work-total-ratio``; or bngsim's total wall
-      seconds grew by more than ``--wall-ratio`` (coarse: hosted runners are noisy,
-      precise timing is a local A/B job).
+      seconds grew by more than ``--wall-ratio`` on the same CPU model, or
+      ``--wall-ratio-any-cpu`` across models (coarse: hosted runners mix CPU
+      generations; precise timing is benchmarks/perf_ab.py on a fixed machine).
     * **incomplete** -- the run compared fewer than ``--min-fraction`` of the
       baseline's cases, so a green result would mean "compared too little".
 
@@ -185,7 +186,11 @@ def _source_meta(kind: str, payload: dict) -> dict:
     if kind == "core":
         meta = payload.get("_meta") or {}
         keep = ("suite", "regime", "git_rev", "versions", "generated", "elapsed_sec", "config")
-        return {k: meta[k] for k in keep if k in meta}
+        out = {k: meta[k] for k in keep if k in meta}
+        cpu = (meta.get("hardware") or {}).get("cpu")
+        if cpu:
+            out["cpu"] = cpu  # wall time is only comparable on the same CPU model
+        return out
     if kind == "sbml-suite":
         return {k: payload[k] for k in ("n_cases", "n_in_scope", "engines") if k in payload}
     return {
@@ -274,6 +279,7 @@ def diff(
     work_ratio: float = 1.25,
     work_total_ratio: float = 1.05,
     wall_ratio: float = 2.0,
+    wall_ratio_any_cpu: float = 4.0,
     min_fraction: float = 0.9,
     expect_backend: str | None = None,
 ) -> dict:
@@ -344,12 +350,24 @@ def diff(
     ]
     wb = sum(b[c]["bngsim_sec"] for c in wall_cases)
     wf = sum(f[c]["bngsim_sec"] for c in wall_cases)
+    # Hosted runners come in several CPU models, and compiled code in particular
+    # runs ~1.8x slower on the older ones (measured: the codegen arm on an EPYC
+    # 7763 vs an EPYC 9V45), so a wall ratio across CPU models mostly measures the
+    # hardware. It alerts at wall_ratio only on the same CPU model, and across
+    # models only past wall_ratio_any_cpu. The work counters are the precise signal.
+    cpu_b, cpu_f = base.get("source", {}).get("cpu"), fresh.get("source", {}).get("cpu")
+    same_cpu = bool(cpu_b) and cpu_b == cpu_f
+    limit = wall_ratio if same_cpu else wall_ratio_any_cpu
     wall = {
         "n_cases": len(wall_cases),
         "before": round(wb, 3),
         "after": round(wf, 3),
         "ratio": round(wf / wb, 3) if wb else None,
-        "alert": wb > 0 and wf > wb * wall_ratio,
+        "cpu_baseline": cpu_b,
+        "cpu_fresh": cpu_f,
+        "same_cpu": same_cpu,
+        "limit": limit,
+        "alert": wb > 0 and wf > wb * limit,
     }
 
     # A run meant to exercise a specific backend (the compiled arm) must have run it.
@@ -395,6 +413,7 @@ def diff(
             "work_ratio": work_ratio,
             "work_total_ratio": work_total_ratio,
             "wall_ratio": wall_ratio,
+            "wall_ratio_any_cpu": wall_ratio_any_cpu,
             "min_fraction": min_fraction,
             "work_min_delta": WORK_MIN_DELTA,
         },
@@ -476,10 +495,14 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
     w = result["wall"]
     if w["n_cases"]:
         flag = " — **ALERT**" if w["alert"] else ""
+        where = (
+            f"same CPU ({w.get('cpu_fresh')})"
+            if w.get("same_cpu")
+            else f"CPU {w.get('cpu_baseline')} -> {w.get('cpu_fresh')}"
+        )
         lines += [
             f"bngsim wall over {w['n_cases']} cases: {w['before']} s -> {w['after']} s "
-            f"(x{w['ratio']}; hosted-runner noise, alerts only above "
-            f"x{result['thresholds']['wall_ratio']}){flag}",
+            f"(x{w['ratio']}; {where}; alerts above x{w.get('limit')}){flag}",
             "",
         ]
     for name, title in (
@@ -540,6 +563,7 @@ def _cmd_diff(args) -> int:
         work_ratio=args.work_ratio,
         work_total_ratio=args.work_total_ratio,
         wall_ratio=args.wall_ratio,
+        wall_ratio_any_cpu=args.wall_ratio_any_cpu,
         min_fraction=args.min_fraction,
         expect_backend=args.expect_backend or None,
     )
@@ -628,7 +652,10 @@ def main(argv=None) -> int:
     d.add_argument("--md-out", default="")
     d.add_argument("--work-ratio", type=float, default=1.25)
     d.add_argument("--work-total-ratio", type=float, default=1.05)
-    d.add_argument("--wall-ratio", type=float, default=2.0)
+    d.add_argument("--wall-ratio", type=float, default=2.0, help="wall alert, same CPU model")
+    d.add_argument(
+        "--wall-ratio-any-cpu", type=float, default=4.0, help="wall alert, across CPU models"
+    )
     d.add_argument("--min-fraction", type=float, default=0.9)
     d.add_argument("--expect-backend", default="", help="e.g. 'cc' for the compiled arm")
     d.add_argument(

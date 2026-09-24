@@ -2,7 +2,7 @@
   "schema": 1,
   "suite": "bng_ode_codegen",
   "kind": "core",
-  "source": {"config": {"atol": 1e-08, "bngsim_method": "ode", "codegen_forced": true, "rtol": 1e-08, "timeout_overridden_jobs": 0, "tol_overridden_jobs": 2}, "elapsed_sec": 854.27, "event": "pull_request", "generated": "2026-09-24T01:01:03", "git_rev": "14aa1a6", "regime": "ode", "run_id": "35939719229", "sha": "14aa1a60c2a727cc4a6a082e0c95d83b467464e4", "suite": "bng_parity", "versions": {"bng": "2.9.3", "bngsim": "0.16.0", "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39", "python": "3.12.3", "sundials": "7.2.1"}},
+  "source": {"config": {"atol": 1e-08, "bngsim_method": "ode", "codegen_forced": true, "rtol": 1e-08, "timeout_overridden_jobs": 0, "tol_overridden_jobs": 2}, "cpu": "AMD EPYC 9V45 96-Core Processor", "elapsed_sec": 854.27, "event": "pull_request", "generated": "2026-09-24T01:01:03", "git_rev": "14aa1a6", "regime": "ode", "run_id": "35939719229", "sha": "14aa1a60c2a727cc4a6a082e0c95d83b467464e4", "suite": "bng_parity", "versions": {"bng": "2.9.3", "bngsim": "0.16.0", "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39", "python": "3.12.3", "sundials": "7.2.1"}},
   "n_cases": 592,
   "tally": {"BAD_TEST": 1, "DIFF": 10, "PASS": 580, "TIMEOUT": 1},
   "cases": {
