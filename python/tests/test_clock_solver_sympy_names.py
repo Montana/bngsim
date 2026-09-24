@@ -155,7 +155,10 @@ def test_a_pulse_over_a_sympy_name_matches_its_twin(tmp_path, name):
 
 @pytest.mark.parametrize("name", SYMPY_NAMES)
 def test_the_affine_solver_returns_the_parameter(name):
-    assert _clock_affine_threshold(f"(time()-{name}*2)>=0", CLOCK) == ("time()", f"2*{name}")
+    # Squared, not doubled: `2*E` prints the same whether E is the parameter or
+    # Euler's number, so only `E*E` (which folded to `exp(2)`) tells them apart.
+    got = _clock_affine_threshold(f"(time()-{name}*{name})>=0", CLOCK)
+    assert got == ("time()", f"{name}^2")
 
 
 def test_the_monomial_and_quadratic_solvers_return_the_parameters():

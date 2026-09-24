@@ -2179,9 +2179,10 @@ def _schedule_stop_times(
     The chain rule ``_periodic_schedule_terms`` computes is not needed here — a
     stop carries no ``∂t*/∂p`` — so the numbers are read straight through
     :func:`_evaluate_threshold`. The residual round-trip is kept: it is what
-    catches a schedule sympy's parser mis-read (a parameter named ``I`` folding
-    ``I*I`` to ``-1``), and placing stops where the model has no edge would be a
-    pure perturbation of its stepping.
+    catches a schedule the recognizer mis-read (before issue #757, sympy's
+    namespace folded ``I*I`` to ``-1`` for a parameter named ``I``), and placing
+    stops where the model has no edge would be a pure perturbation of its
+    stepping.
     """
     # A condition can arrive wrapped — `((time()-P*floor(time()/P))>=D)` is how
     # the SBML loader registers one — and the recognizer, like the relational
@@ -2847,15 +2848,13 @@ def _schedule_matches_residual(
 ) -> bool:
     """Check a recognized schedule against the condition the model evaluates.
 
-    :func:`_clock_periodic_schedule` reads the residual through ``sympy``'s
-    parser, which binds a handful of one-letter names to its own objects: a model
-    parameter called ``I`` arrives as the imaginary unit, ``S`` as the singleton
-    registry, ``E`` as Euler's number. Most of the time that is harmless, because
-    those objects obey the same arithmetic a symbol would and the recognizer's
-    answer comes back spelled with the same name. It is not harmless always —
-    ``I*I`` folds to ``-1`` — and the failure it produces is the quiet one: a
-    schedule that reads as never crossing, which the gate then admits with
-    nothing behind it.
+    :func:`_clock_periodic_schedule` reads the residual symbolically, and a
+    misreading fails quietly: a schedule that reads as never crossing is one the
+    gate admits with nothing behind it. The case that motivated this check was
+    sympy's own namespace, which read a model parameter ``I`` as the imaginary
+    unit and folded ``I*I`` to ``-1``. Model names are bound as plain symbols now
+    (issue #757), and the check stays as the net under whatever the recognizer
+    gets wrong next.
 
     So the schedule is checked against the residual evaluated the *model's* way,
     through :func:`_evaluate_threshold`, which binds parameter names before it
