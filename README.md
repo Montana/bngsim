@@ -87,6 +87,12 @@ numbers — the pinned-fetch model, corpus provenance, tool versions, and a no-d
 path — see [`REPRODUCING.md`](REPRODUCING.md). The supported-construct matrix is in
 [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md).
 
+Those results are re-checked every night: a [scheduled workflow](.github/workflows/nightly-parity.yml)
+runs the parity sweeps and alerts on any change in correctness or solver work
+([`parity_checks/nightly/`](parity_checks/nightly/README.md)). To check whether a change of
+yours slowed bngsim down, `benchmarks/perf_ab.py` times two builds against each other on your
+machine (see [Checking performance and parity](CONTRIBUTING.md#checking-performance-and-parity)).
+
 ## Contributing
 
 Build-from-source, test, and CI instructions are in [`CONTRIBUTING.md`](CONTRIBUTING.md)
