@@ -30,16 +30,15 @@ regenerating with the defaults yields a *different model* (or no termination).
 :func:`generate_network_call` recovers those options and forces only
 ``overwrite``, which is vacuous in a fresh scratch directory anyway.
 
-**The generated ``.net`` outlives the call.** Not a convenience — a correctness
-requirement. ``Model.from_net`` stashes the path in ``_net_path``, and codegen
-prefers that file over the in-memory model precisely because a BNG2.pl network
-carries derived rate-constant parameters (``_rateLaw{N} = chi*kon``) whose chain
-rules the model-based path does not reconstruct (issue #15). Deleting the
-scratch directory would leave every ``from_bngl`` model with a dangling
-``_net_path`` — a hard failure at codegen time, on exactly the models that need
-the ``.net`` route most. So networks land in a content-addressed cache beside the
-codegen one, which makes the answer to "cache it?" a side effect of getting the
-lifetime right: reloading unchanged BNGL skips network generation entirely.
+**The generated ``.net`` outlives the call.** ``Model.from_net`` stashes the
+path in ``_net_path``, and deleting the scratch directory would leave every
+``from_bngl`` model's ``_net_path`` dangling. Until #803 that was a hard failure
+at codegen time, which re-read the file; codegen now compiles the in-memory
+model, but the path still has to name a real file, since it is what a caller
+hands ``Simulator(net_path=...)`` for ``jacobian="jax"``. So networks land in a
+content-addressed cache beside the codegen one, which makes the answer to
+"cache it?" a side effect of getting the lifetime right: reloading unchanged
+BNGL skips network generation entirely.
 """
 
 from __future__ import annotations

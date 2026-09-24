@@ -19,10 +19,11 @@ whole run. Keeping the declared law smooth lets the derivative emitters go on
 differentiating it and apply their own guard to the result, while only the two
 value consumers read the branch.
 
-Those two value consumers are the point of ``TestBothRhsEmitters``. bngsim has
-*two* RHS emitters — one that builds C from a loaded model and one that builds it
-from the ``.net`` file — and a guard on either alone would leave them disagreeing
-about the same rate law at the same point.
+Those two value consumers are the point of ``TestBothRhsEmitters``: the
+interpreter and the RHS emitter, which builds C from the loaded model. (There was
+a second RHS emitter, building C from the ``.net`` file, until #803 retired it; a
+guard on either alone would have left them disagreeing about the same rate law at
+the same point.)
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import pytest
 
 pytest.importorskip("sympy")
 
-from bngsim._codegen import generate_rhs_c, generate_rhs_from_model  # noqa: E402
+from bngsim._codegen import generate_rhs_from_model  # noqa: E402
 from bngsim._jacobian import guard_rate_law_text  # noqa: E402
 
 # A is produced from B and never consumed, so it leaves zero immediately and
@@ -181,21 +182,16 @@ class TestTheModel:
 
 
 class TestBothRhsEmitters:
-    """bngsim builds the RHS twice — from a loaded model, and from the ``.net``
-    file — and a guard on one only would leave two emitters disagreeing about
-    the same rate law at the same point. The rewrite is shared
-    (``guard_rate_law_text``), not reimplemented at each site.
+    """The compiled RHS and the interpreted one must apply the same guard, or
+    they disagree about the same rate law at the same point. The rewrite is shared
+    (``guard_rate_law_text``), not reimplemented at each site. (Until #803 there
+    were two compiled RHS emitters, from the loaded model and from the ``.net``
+    file, and each carried the guard.)
     """
 
     def test_the_model_based_emitter_guards_the_function_body(self, log_net):
         c = generate_rhs_from_model(bngsim.Model.from_net(log_net))
         body = [ln for ln in c.splitlines() if "logterm" in ln and "func[" in ln]
-        assert body, "no function body emitted for logterm"
-        assert "== 0.0" in body[0] and "?" in body[0]
-
-    def test_the_net_file_emitter_guards_the_function_body(self, log_net):
-        c = generate_rhs_c(str(log_net))
-        body = [ln for ln in c.splitlines() if "func_logterm" in ln and "=" in ln]
         assert body, "no function body emitted for logterm"
         assert "== 0.0" in body[0] and "?" in body[0]
 

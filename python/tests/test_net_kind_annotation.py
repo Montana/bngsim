@@ -23,6 +23,10 @@ expression references another declared parameter. Two properties are pinned here
   parses as a float* — the other reading of "derive it from the expression" —
   reclassifies 628 of those lines and rewrites the sensitivity RHS of 54 models
   that were never broken.
+
+Since #803 codegen compiles the model the C++ loader built rather than re-reading
+the file, so the emitted-C tests below pin the loader's reading of the kinds; the
+``_parse_net_file`` tests pin the Python reader ``jacobian="jax"`` still uses.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from pathlib import Path
 import bngsim
 import numpy as np
 import pytest
-from bngsim._codegen import _parse_net_file, generate_sens_rhs_c
+from bngsim._codegen import _parse_net_file, generate_sens_from_model
 
 _env = os.environ.get("BNGSIM_TEST_DATA")
 DATA_DIR = Path(_env) if _env else Path(__file__).resolve().parent.parent.parent / "tests" / "data"
@@ -81,6 +85,12 @@ def _write(tmp_path: Path, name: str, text: str) -> str:
     return str(p)
 
 
+def _sens_c(net: str) -> str | None:
+    """The sensitivity RHS a sensitivity run of the .net at *net* compiles (GH #67
+    extends it to Functional rate laws, so they are compared too)."""
+    return generate_sens_from_model(bngsim.Model.from_net(net), functional=True)
+
+
 def _dX_dp(times: np.ndarray) -> np.ndarray:
     """Closed-form dX/dp for the model above."""
     return C1 * times * np.exp(-P * C2 * times)
@@ -113,9 +123,9 @@ def test_parameter_kinds_are_read_off_the_expressions(tmp_path, text):
 @pytest.mark.parametrize("text", [BARE, MISLABELLED], ids=["bare", "lying"])
 def test_stripping_the_annotations_does_not_change_the_emitted_c(tmp_path, text):
     """The strongest form: the comments carry no information the emitter needs."""
-    annotated = generate_sens_rhs_c(_write(tmp_path, "annotated.net", ANNOTATED))
+    annotated = _sens_c(_write(tmp_path, "annotated.net", ANNOTATED))
     assert annotated is not None
-    assert generate_sens_rhs_c(_write(tmp_path, "other.net", text)) == annotated
+    assert _sens_c(_write(tmp_path, "other.net", text)) == annotated
 
 
 def test_unannotated_net_reports_the_true_sensitivity(tmp_path):
@@ -206,17 +216,22 @@ _ANNOTATED_FIXTURES = sorted(
 def test_shipped_fixture_emits_the_same_c_without_its_kind_comments(tmp_path, net):
     """The no-op half of the change, over every annotated .net this repo ships.
 
-    Whatever ``generate_sens_rhs_c`` does with a BNG2.pl file — emit C, decline
-    with ``None``, or raise — it must do the identical thing to the same file with
-    the kind annotations deleted.
+    Whatever codegen does with a BNG2.pl file — emit C, decline with ``None``, or
+    raise (loading included) — it must do the identical thing to the same file
+    with the kind annotations deleted.
     """
     stripped = _strip_kind_comments(net.read_text(encoding="utf-8"))
     assert stripped != net.read_text(encoding="utf-8"), "fixture lost its annotations"
     other = _write(tmp_path, net.name, stripped)
+    # The loader resolves a relative tfun() data file beside the .net, so the copy
+    # needs its data files too, or it fails to load where the original does not.
+    for ref in set(re.findall(r"""['"]([^'"]+\.tfun)['"]""", stripped)):
+        if (net.parent / ref).is_file():
+            (tmp_path / ref).write_bytes((net.parent / ref).read_bytes())
 
     def outcome(path: str):
         try:
-            return ("ok", generate_sens_rhs_c(path))
+            return ("ok", _sens_c(path))
         except Exception as exc:  # noqa: BLE001 — an equal failure is still equal
             return ("raised", f"{type(exc).__name__}: {exc}")
 

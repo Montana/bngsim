@@ -1,20 +1,13 @@
-"""The #784 family on both codegen paths: the model path answers correctly today;
-the .net path is quarantined until #803 step 3 routes .net models to it.
+"""The #784 family, retired by compiling .net models from the built model (#803).
 
-Each case is a reproduction from its issue, run through the public
-``Model.from_net`` + ``Simulator`` on two paths and checked against a closed form
-or scipy's ``solve_ivp``:
-
-* ``net``   -- the path ``from_net``/``from_bngl`` models take today: codegen
-  re-reads the ``.net`` text with its own parser (``_codegen._parse_net_file``);
-* ``model`` -- the same model with ``_net_path`` cleared, the one switch
-  ``Simulator`` reads, so C is emitted from the model bngsim built.
-
-The ``net`` parameter of every case is ``xfail(strict=True, raises=...)`` naming
-its issue. When step 3 routes ``.net`` models to the model path the ``net`` and
-``model`` parameters run the same code, every quarantined case passes, and strict
-xfail turns that into a failure -- so the markers have to come out in that PR,
-not whenever someone remembers.
+Codegen used to re-read a ``.net`` file with a parser of its own
+(``_codegen._parse_net_file``) and emit C from that second reading; wherever it
+disagreed with the loader the compiled RHS did too. Since #803 step 3 every
+codegen build, ``.net`` and BNGL models included, compiles the model bngsim
+built. Each case here is its issue's reproduction, run through the public
+``Model.from_net`` + ``Simulator`` and checked against a closed form or scipy's
+``solve_ivp``. In #803 step 2 each was a strict xfail on the old path; routing
+flipped all 28, which is how they came to be plain tests.
 """
 
 from __future__ import annotations
@@ -35,45 +28,15 @@ import pytest
 from scipy.integrate import solve_ivp
 
 
-def _quarantine(issue: int, raises: type[BaseException], why: str):
-    return pytest.mark.xfail(
-        strict=True,
-        raises=raises,
-        reason=f"#{issue}: {why} on the .net codegen path; retires when .net "
-        "models route to the model path (#803 step 3)",
-    )
-
-
-def _paths(issue: int, raises: type[BaseException], why: str) -> list:
-    return [pytest.param("net", marks=_quarantine(issue, raises, why)), "model"]
-
-
-def _refused(issue: int, why: str) -> list:
-    """(sens, path) cases for a file the .net path refuses and the model path runs:
-    its parser's ValueError reaches a codegen=True run as it is, and a
-    sensitivity run wrapped in the RuntimeError that says the sensitivity RHS
-    could not be built."""
-    return [
-        pytest.param(False, "net", marks=_quarantine(issue, ValueError, why), id="codegen-net"),
-        pytest.param(False, "model", id="codegen-model"),
-        pytest.param(
-            True, "net", marks=_quarantine(issue, RuntimeError, why), id="sensitivity-net"
-        ),
-        pytest.param(True, "model", id="sensitivity-model"),
-    ]
-
-
 @pytest.fixture(autouse=True)
 def _cold_codegen_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "cg")
 
 
-def _run(net, path, *, sens=None, t_end=1.0, n=3, override=None, model=None):
+def _run(net, *, sens=None, t_end=1.0, n=3, override=None, model=None):
     m = model if model is not None else bngsim.Model.from_net(net)
     for name, value in (override or {}).items():
         m.set_param(name, value)
-    if path == "model":
-        m._net_path = ""  # the switch Simulator reads (#803)
     kw = {"sensitivity_params": sens} if sens else {"codegen": True}
     sim = bngsim.Simulator(m, method="ode", **kw)
     if not sens:
@@ -110,16 +73,12 @@ end reactions
     [".5*k", "5e-01*k", "1.6605779e-09*k", "1e+24*k"],
     ids=["leading-dot", "exponent", "cbngl-volume", "1e24"],
 )
-@pytest.mark.parametrize(
-    "path",
-    _paths(689, AssertionError, "a stat factor with an exponent or a leading dot is a zero rate"),
-)
-def test_689_stat_factor_spellings(tmp_path, path, tok, sens):
+def test_689_stat_factor_spellings(tmp_path, tok, sens):
     """A -> 0 at sf*k with k = 1/sf: A = 10 e^-t, dA/dk = -sf t A. BNG2.pl prints a
     cBNGL volume conversion with %.8g, so e-notation is what it writes below 1e-4."""
     sf = float(tok.split("*")[0])
     net = _write(tmp_path, "d.net", DECAY.replace("RATE", tok).replace("K", repr(1.0 / sf)))
-    r = _run(net, path, sens=["k"] if sens else None)
+    r = _run(net, sens=["k"] if sens else None)
     t = np.array([0.0, 0.5, 1.0])
     np.testing.assert_allclose(r.species[:, 0], 10 * np.exp(-t), rtol=1e-7)
     if sens:
@@ -155,14 +114,11 @@ def _s10(dsdt, p):
 @pytest.mark.filterwarnings("ignore:Legacy/deprecated BioNetGen")
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
 @pytest.mark.parametrize("law", ["Sat", "Hill"])
-@pytest.mark.parametrize(
-    "path", _paths(689, AssertionError, "a legacy Sat/Hill rate law is a zero rate")
-)
-def test_689_legacy_sat_and_hill(tmp_path, path, law, sens):
+def test_689_legacy_sat_and_hill(tmp_path, law, sens):
     text, p0, dsdt = LEGACY[law]
     net = _write(tmp_path, f"{law}.net", text)
     first = "k3" if law == "Sat" else "V"
-    r = _run(net, path, sens=[first] if sens else None, t_end=10.0, n=2)
+    r = _run(net, sens=[first] if sens else None, t_end=10.0, n=2)
     np.testing.assert_allclose(r.species[-1, 0], _s10(dsdt, p0), rtol=1e-7)
     if sens:
         h = 1e-6
@@ -206,13 +162,9 @@ end reactions
 """
 
 
-@pytest.mark.parametrize(
-    "path",
-    _paths(694, AssertionError, "a pinned derived rate constant keeps its stale chain rule"),
-)
-def test_694_elementary_override_drops_the_chain_rule(tmp_path, path):
+def test_694_elementary_override_drops_the_chain_rule(tmp_path):
     """k2 pinned to 5: A = 10 e^-5t does not depend on k1."""
-    r = _run(_write(tmp_path, "e.net", ELEM), path, sens=["k1"], override={"k2": 5.0})
+    r = _run(_write(tmp_path, "e.net", ELEM), sens=["k1"], override={"k2": 5.0})
     assert r.species[-1, 0] == pytest.approx(10 * math.exp(-5), rel=1e-7)
     assert r.sensitivities[-1, 0, 0] == pytest.approx(0.0, abs=1e-10)
 
@@ -221,12 +173,10 @@ _CHILD = """
 import json, sys, warnings
 warnings.simplefilter("ignore")
 import bngsim
-net, mode, path = sys.argv[1:4]
+net, mode = sys.argv[1:3]
 m = bngsim.Model.from_net(net)
 if mode == "override":
     m.set_param("k2", 5.0)
-if path == "model":
-    m._net_path = ""
 r = bngsim.Simulator(m, method="ode", sensitivity_params=["k1"]).run(
     t_span=(0.0, 1.0), n_points=3, rtol=1e-10, atol=1e-12)
 print("ROW" + json.dumps([float(r.species[-1, 0]), float(r.sensitivities[-1, 0, 0])]))
@@ -234,15 +184,7 @@ print("ROW" + json.dumps([float(r.species[-1, 0]), float(r.sensitivities[-1, 0, 
 
 
 @pytest.mark.parametrize("order", [("override", "pristine"), ("pristine", "override")])
-@pytest.mark.parametrize(
-    "path",
-    _paths(
-        694,
-        AssertionError,
-        "the .so cache key cannot tell a pinned derived parameter from a pristine one",
-    ),
-)
-def test_694_cache_serves_each_attachment_state_its_own_code(tmp_path, path, order):
+def test_694_cache_serves_each_attachment_state_its_own_code(tmp_path, order):
     """dA/dt = -k2 A^2: A = 10/(1 + 10 k2 t). Pristine, dA/dk1 = 2 dA/dk2; pinned,
     0. Two processes share one codegen cache, in both orders."""
     net = _write(tmp_path, "f.net", FUNC)
@@ -250,7 +192,7 @@ def test_694_cache_serves_each_attachment_state_its_own_code(tmp_path, path, ord
     env = {**os.environ, "BNGSIM_CODEGEN_CACHE_DIR": str(tmp_path / "shared")}
     for mode in order:
         out = subprocess.run(
-            [sys.executable, "-c", _CHILD, str(net), mode, path],
+            [sys.executable, "-c", _CHILD, str(net), mode],
             capture_output=True,
             text=True,
             env=env,
@@ -292,12 +234,9 @@ def _fwd_expect(r, sens):
 
 
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
-@pytest.mark.parametrize(
-    "path", _paths(699, RuntimeError, "a forward function reference fails to compile")
-)
-def test_699_forward_reference_flat(tmp_path, monkeypatch, path, sens):
+def test_699_forward_reference_flat(tmp_path, monkeypatch, sens):
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "off")
-    _fwd_expect(_run(_write(tmp_path, "fwd.net", FWD), path, sens=["k"] if sens else None), sens)
+    _fwd_expect(_run(_write(tmp_path, "fwd.net", FWD), sens=["k"] if sens else None), sens)
 
 
 def _reads_before_written(src: str) -> list[str]:
@@ -315,29 +254,17 @@ def _reads_before_written(src: str) -> list[str]:
     return early
 
 
-def _source(net, path) -> str:
-    m = bngsim.Model.from_net(net)
-    if path == "model":
-        m._net_path = ""
-        return cg.prepare_model_codegen_source(m)
-    return cg.prepare_codegen_source(net, m)
-
-
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
-@pytest.mark.parametrize(
-    "path",
-    _paths(699, AssertionError, "a chunked build reads a forward function's uninitialised slot"),
-)
-def test_699_forward_reference_chunked(tmp_path, monkeypatch, path, sens):
-    """The defect is a read of an uninitialised stack slot, and what that slot
-    holds is up to the platform: on Linux CI it held the right value, so the run
-    passed and the strict xfail failed. The emitted C's order is checked first,
-    because that is the same everywhere."""
+def test_699_forward_reference_chunked(tmp_path, monkeypatch, sens):
+    """The defect was a read of an uninitialised stack slot, and what that slot
+    holds is up to the platform: on Linux CI it held the right value and the run
+    passed. So the emitted C's order is checked first, which is the same
+    everywhere, and then the closed form."""
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
     net = _write(tmp_path, "fwd.net", FWD)
-    early = _reads_before_written(_source(net, path))
+    early = _reads_before_written(cg.prepare_model_codegen_source(bngsim.Model.from_net(net)))
     assert not early, f"read before written: {early}"
-    _fwd_expect(_run(net, path, sens=["k"] if sens else None), sens)
+    _fwd_expect(_run(net, sens=["k"] if sens else None), sens)
 
 
 # ── #721: a tfun time index spelled T ────────────────────────────────────────
@@ -370,20 +297,15 @@ def _tfun_model(tmp_path, with_param_t: bool):
 
 
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
-@pytest.mark.parametrize(
-    "path", _paths(721, AssertionError, "a tfun index T reads a parameter named T, not the clock")
-)
-def test_721_tfun_index_T_is_the_clock_beside_a_parameter_T(tmp_path, path, sens):
+def test_721_tfun_index_T_is_the_clock_beside_a_parameter_T(tmp_path, sens):
     """B' = drv(t) A with A = 1: B(3) = the table's integral over [0, 3] = 9.5."""
-    r = _run(_tfun_model(tmp_path, True), path, sens=["k"] if sens else None, t_end=3.0)
+    r = _run(_tfun_model(tmp_path, True), sens=["k"] if sens else None, t_end=3.0)
     assert r.species[-1, 1] == pytest.approx(9.5, rel=1e-7)
 
 
-@pytest.mark.parametrize(
-    ("sens", "path"), _refused(721, "a tfun index T with no symbol named T is refused")
-)
-def test_721_tfun_index_T_with_no_symbol_T(tmp_path, path, sens):
-    r = _run(_tfun_model(tmp_path, False), path, sens=["k"] if sens else None, t_end=3.0)
+@pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
+def test_721_tfun_index_T_with_no_symbol_T(tmp_path, sens):
+    r = _run(_tfun_model(tmp_path, False), sens=["k"] if sens else None, t_end=3.0)
     assert r.species[-1, 1] == pytest.approx(9.5, rel=1e-7)
 
 
@@ -405,24 +327,18 @@ end reactions
 
 
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
-@pytest.mark.parametrize(
-    "path", _paths(730, AssertionError, "codegen compiles whatever file is at _net_path now")
-)
-def test_730_codegen_compiles_the_loaded_model_not_the_file(tmp_path, path, sens):
+def test_730_codegen_compiles_the_loaded_model_not_the_file(tmp_path, sens):
     """Loaded with rate k1 = 1, file then rewritten to k2: X = 10 e^-t."""
     net = _write(tmp_path, "m.net", REWRITE.replace("RATE", "k1"))
     m = bngsim.Model.from_net(net)
     net.write_text(REWRITE.replace("RATE", "k2"))
-    r = _run(net, path, sens=["k1"] if sens else None, model=m)
+    r = _run(net, sens=["k1"] if sens else None, model=m)
     assert r.species[-1, 0] == pytest.approx(10 * math.exp(-1), rel=1e-7)
     if sens:
         assert r.sensitivities[-1, 0, 0] == pytest.approx(-10 * math.exp(-1), rel=1e-6)
 
 
-@pytest.mark.parametrize(
-    "path", _paths(731, AssertionError, "the in-process memo keys the .net by mtime only")
-)
-def test_731_same_mtime_rewrite_is_not_served_the_old_network(tmp_path, path):
+def test_731_same_mtime_rewrite_is_not_served_the_old_network(tmp_path):
     base = (
         "begin parameters\n    1 k 1\nend parameters\n"
         "begin species\n    1 A() 10\n    2 B() 0\n    3 C() 0\nend species\n"
@@ -433,9 +349,9 @@ def test_731_same_mtime_rewrite_is_not_served_the_old_network(tmp_path, path):
     os.utime(v2, ns=(st.st_atime_ns, st.st_mtime_ns))
     target = tmp_path / "model.net"
     shutil.copy2(v1, target)
-    _run(target, path)
+    _run(target)
     shutil.copy2(v2, target)  # same bytes length, same mtime: cp -p / tar x
-    r = _run(target, path)
+    r = _run(target)
     np.testing.assert_allclose(
         r.species[-1], [10 * math.exp(-1), 0.0, 10 * (1 - math.exp(-1))], rtol=1e-7, atol=1e-9
     )
@@ -463,12 +379,10 @@ end reactions
 """
 
 
-@pytest.mark.parametrize(
-    ("sens", "path"), _refused(608, "an unindexed parameters/species/groups block is refused")
-)
-def test_608_unindexed_blocks(tmp_path, path, sens):
+@pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
+def test_608_unindexed_blocks(tmp_path, sens):
     """dA/dt = -kcat A^2: A = 100/(1 + 100 kcat t), dA/dkcat = -1e4 t/(1 + 100 kcat t)^2."""
-    r = _run(_write(tmp_path, "u.net", UNINDEXED), path, sens=["kcat"] if sens else None)
+    r = _run(_write(tmp_path, "u.net", UNINDEXED), sens=["kcat"] if sens else None)
     assert r.species[-1, 0] == pytest.approx(100 / 31, rel=1e-7)
     if sens:
         assert r.sensitivities[-1, 0, 0] == pytest.approx(-1e4 / 31**2, rel=1e-6)

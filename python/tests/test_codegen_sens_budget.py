@@ -194,12 +194,6 @@ def _model(tmp_path, text, name="m.net"):
     return bngsim.Model.from_net(net)
 
 
-def _net(tmp_path, text, name="m.net"):
-    net = tmp_path / name
-    net.write_text(text)
-    return str(net)
-
-
 # ─── the policy ────────────────────────────────────────────────────────────
 
 
@@ -269,9 +263,11 @@ class TestPolicy:
 
 
 class TestCacheKey:
-    """The ``.net`` path keys its ``.so`` on the model's *content*, not on the
-    generated C, so anything that changes whether the sens RHS is emitted has to
-    reach the key — the trap #67's A/B hatch already had to sidestep."""
+    """The codegen cache keys its ``.so`` on the model's *structure* (issue #174),
+    not on the generated C, so anything that changes whether the sens RHS is
+    emitted has to reach the key — the trap #67's A/B hatch already had to
+    sidestep. (The ``.net`` path retired by #803 keyed on the file's content, the
+    same trap.)"""
 
     def test_unset_leaves_every_existing_key_untouched(self):
         assert cg._sens_budget_cache_tag() == ""
@@ -289,15 +285,21 @@ class TestCacheKey:
 
     @requires_cc
     def test_a_tight_budget_is_not_served_a_cached_analytic_so(self, tmp_path, monkeypatch):
-        """End to end through the real cache: emit under the default budget, then
-        re-request the same .net under a budget that cannot be met. Sharing a key
-        would hand back the analytic .so and make the decline invisible."""
+        """End to end through the real cache: build a sensitivity run's artifact
+        under the default budget, then re-request the same model under a budget
+        that cannot be met. Sharing a key would hand back the analytic .so and make
+        the decline invisible."""
+        import ctypes
+
         model = _model(tmp_path, SIR)
-        net = str(tmp_path / "m.net")
-        analytic = cg.prepare_codegen(net, model=model)
+        model._want_output_sens = True  # what a sensitivity_params run sets
+        analytic = cg.prepare_model_codegen(model)
         monkeypatch.setenv(_SENS_ENV, "1e-9")
-        declined = cg.prepare_codegen(net, model=model)
+        declined = cg.prepare_model_codegen(model)
         assert analytic != declined
+        # The premise, both halves: the budget really is what separates them.
+        assert hasattr(ctypes.CDLL(str(analytic)), "bngsim_codegen_sens_rhs")
+        assert not hasattr(ctypes.CDLL(str(declined)), "bngsim_codegen_sens_rhs")
 
 
 # ─── the deadline is checked *during* the derivation ───────────────────────
@@ -380,15 +382,6 @@ class TestDecline:
         assert cg.generate_sens_from_model(model) is not None
         monkeypatch.setenv(_SENS_ENV, "1e-9")
         assert cg.generate_sens_from_model(model) is None
-
-    def test_the_net_text_path_declines_too(self, tmp_path, monkeypatch):
-        """``generate_sens_rhs_c`` reads the .net as text and never sees a model,
-        so it is a separate entry point with its own build — and its own
-        derived-rate-constant derivation to bound."""
-        net = _net(tmp_path, ELEMENTARY)
-        assert cg.generate_sens_rhs_c(net) is not None
-        monkeypatch.setenv(_SENS_ENV, "1e-9")
-        assert cg.generate_sens_rhs_c(net) is None
 
     def test_the_escape_hatch_restores_the_unbudgeted_path(self, tmp_path, monkeypatch):
         monkeypatch.setenv(_SENS_ENV, "inf")

@@ -403,19 +403,15 @@ def _as_before_75():
     saved_prep = bngsim.Simulator._prepare_output_sens_codegen
     saved_emit = cg.generate_output_sens_from_model
     saved_cache = cg.CACHE_DIR
-    saved_memo = dict(cg._PREPARE_CODEGEN_MEMO)
     tmp = tempfile.TemporaryDirectory()
     try:
         cg.generate_output_sens_from_model = lambda model: None
         cg.CACHE_DIR = Path(tmp.name)
-        cg._PREPARE_CODEGEN_MEMO.clear()
         yield
     finally:
         bngsim.Simulator._prepare_output_sens_codegen = saved_prep
         cg.generate_output_sens_from_model = saved_emit
         cg.CACHE_DIR = saved_cache
-        cg._PREPARE_CODEGEN_MEMO.clear()
-        cg._PREPARE_CODEGEN_MEMO.update(saved_memo)
         tmp.cleanup()
 
 
@@ -538,9 +534,14 @@ class TestCompiledOutputSensPath:
         assert ss.sens_output_source == "finite-difference"
 
     def test_regeneration_failure_with_nothing_to_restore_propagates(self, monkeypatch):
-        """With no artifact to put back, the refusal is the real GH #214 one."""
+        """With no artifact to put back, the refusal is the real GH #214 one.
+
+        ``codegen=False`` is what leaves nothing to put back: since #803 a .net
+        model auto-codegens at construction like any other, and ``_force_codegen``
+        drops the threshold to one species."""
         m = bngsim.Model.from_net(DERIVED_NET)
-        sim = bngsim.Simulator(m, method="ode")
+        sim = bngsim.Simulator(m, method="ode", codegen=False)
+        assert not (sim._codegen_so_path or sim._codegen_c_source)
 
         def _boom(self, **kw):
             raise RuntimeError("simulated codegen failure")

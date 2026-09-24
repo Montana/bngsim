@@ -133,7 +133,7 @@ def test_the_fixture_emits_a_self_multiply(tmp_path, key):
     """
     model = _model(tmp_path, BODIES[key], key)
     model._want_output_sens = True
-    src = cg.prepare_codegen_source(model._net_path, model, emit_jac=True)
+    src = cg.prepare_model_codegen_source(model)
     assert _self_multiplies(src) > 0, (
         f"{key}: the emitted C no longer multiplies a value by itself, so it no "
         f"longer reproduces #413. Pick a rate law that does."
@@ -143,7 +143,7 @@ def test_the_fixture_emits_a_self_multiply(tmp_path, key):
 def test_the_control_emits_no_self_multiply(tmp_path):
     model = _model(tmp_path, BODIES["linear"], "linear")
     model._want_output_sens = True
-    src = cg.prepare_codegen_source(model._net_path, model, emit_jac=True)
+    src = cg.prepare_model_codegen_source(model)
     assert _self_multiplies(src) == 0
 
 

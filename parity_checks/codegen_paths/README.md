@@ -42,6 +42,13 @@ A **positive control** is recorded on every codegen cell: the compiled backend
 ran, and `Simulator._net_path` was set on the `net` arms and empty on the
 `model` arms.
 
+**Since #803 step 3 there is one codegen path.** Every model compiles from the
+model bngsim built, so on a current bngsim the `net` arms build exactly the
+`model` arms' artifact and reproduce them bit for bit; each cell records
+`net_codegen_path: false`, and the positive control becomes "the two arms built
+the same artifact". The arms A/B the two paths only when the harness runs against
+a bngsim from before that step, which is how the tables below were measured.
+
 ## How a disagreement is judged
 
 - **Trajectories** (`_metrics.traj_err`): the maximum over time of |a − ref|,
@@ -311,5 +318,6 @@ those models' compile times.
   `../bng_parity`'s job.
 - **MIR JIT backend.** It is not built here. It compiles the same generated
   source, so the source-level parity carries over, but it was not run.
-- **Once step 3 routes `.net` models to the model path,** the `net` arms will
-  measure nothing and should be retired.
+- **Step 3 has routed `.net` models to the model path,** so on a current bngsim
+  the `net` arms measure nothing new; they are kept so the tables above can be
+  reproduced against the bngsim they were measured on.

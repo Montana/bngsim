@@ -6,7 +6,8 @@ compile-time literals), so the .so is compiled ONCE per model structure
 and reused for all parameter evaluations in a PyBNF fitting run.
 
 Architecture (AMICI/libRoadRunner pattern):
-  1. generate_rhs_c(net_path) -> str: Parse .net, emit C source
+  1. generate_combined_from_model(model) -> str: emit C source from the
+     model bngsim built, whatever it was loaded from (issue #803)
   2. compile_rhs(c_source, model_hash) -> Path: cc -O3 -shared -fPIC
   3. Cache the compiled .so as rhs_<key>_<hash> in ~/.cache/bngsim/codegen/,
      where <key> is _CODEGEN_CACHE_KEY (issue #363) and <hash> mixes it in
@@ -121,7 +122,7 @@ _CODEGEN_HUGE_SOURCE_BYTES = 8_000_000
 # Per-process counter feeding unique temp filenames for atomic .so installs.
 _compile_counter = itertools.count()
 
-# Bump when generate_combined_c output changes for unchanged .net input
+# Bump when the emitted C changes for an unchanged model
 # (e.g., when the dfdp/jac_vec/rhs C-emit logic itself changes). The cache
 # hash mixes this in so stale .so files are not silently reused.
 # v4: CodegenUserData gained tfun_ctx + tfun_eval fields; .net function
@@ -1045,22 +1046,6 @@ def _classify_parameter_kinds(params: list[tuple]) -> list[tuple]:
     ]
 
 
-def _validate_net_model_for_codegen(model: dict, net_path: str) -> None:
-    """Reject inputs that did not parse as a usable BioNetGen .net model."""
-    n_species = len(model.get("species", []))
-    n_reactions = len(model.get("reactions", []))
-    if n_species > 0 and n_reactions > 0:
-        return
-
-    raise ValueError(
-        "codegen net_path must point to a BioNetGen .net file with non-empty "
-        f"species and reactions sections; parsed {net_path!r} as "
-        f"{n_species} species and {n_reactions} reactions. For SBML or "
-        "Antimony models, load the model first and use Simulator(..., "
-        "codegen=True) without passing the SBML/XML file as net_path."
-    )
-
-
 def _parse_parameter_line(line: str) -> tuple:
     """Parse: '1 kf 0.001  # Constant' -> (1, 'kf', '0.001', True)
 
@@ -1163,90 +1148,6 @@ def _parse_function_line(line: str) -> tuple:
 # ─── tfun body recognition ───────────────────────────────────────────────
 
 
-_TIME_INDEX_NAMES = {"time", "t", "time()", "t()"}
-
-
-def _recognize_tfun_body(expr: str) -> dict | None:
-    """Recognize a BNGL function body that is exactly ``tfun(...)``.
-
-    Returns a dict with keys ``index_name``, ``method``, ``filename`` (or
-    None for inline mode), and a list of ``referenced_files`` (resolved
-    later against the .net directory by the caller). Returns None if the
-    body is not a whole-function tfun call.
-
-    Used in two places: (1) standalone, to classify whole-body tfun
-    functions in the codegen loop; (2) by ``_extract_tfun_calls`` to parse
-    each individual ``tfun(...)`` substring once located inside a larger
-    expression.
-    """
-    s = expr.strip()
-    m = re.match(r"^tfun\s*\((.*)\)\s*$", s, re.DOTALL)
-    if not m:
-        return None
-    inner = m.group(1).strip()
-    if not inner:
-        return None
-
-    method = "linear"
-    method_match = re.search(r"\bmethod\s*=>\s*['\"]([^'\"]+)['\"]", inner)
-    if method_match:
-        method = method_match.group(1)
-        # Strip the method=>"..." segment (and its leading comma if any)
-        # so the remaining tokens are the positional args.
-        inner = (inner[: method_match.start()] + inner[method_match.end() :]).strip()
-        inner = inner.rstrip(",").strip()
-
-    # Inline mode: tfun([xs], [ys], index)
-    if inner.startswith("["):
-        # Skip past the two bracket arrays to extract the index name.
-        idx_name = "time"
-        depth = 0
-        i = 0
-        bracket_count = 0
-        while i < len(inner):
-            ch = inner[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    bracket_count += 1
-                    if bracket_count == 2:
-                        # Index name follows — skip comma+whitespace.
-                        j = i + 1
-                        while j < len(inner) and inner[j] in ", \t":
-                            j += 1
-                        idx_token = inner[j:].strip().rstrip(",").strip()
-                        if idx_token:
-                            idx_name = idx_token
-                        break
-            i += 1
-        return {
-            "filename": None,
-            "index_name": idx_name,
-            "method": method,
-            "is_inline": True,
-        }
-
-    # File-based mode: tfun('file', [index])
-    fn_match = re.match(r"['\"]([^'\"]+)['\"]\s*(?:,\s*(.*))?$", inner)
-    if not fn_match:
-        return None
-    filename = fn_match.group(1)
-    rest = (fn_match.group(2) or "").strip().rstrip(",").strip()
-    idx_name = rest if rest else "time"
-    return {
-        "filename": filename,
-        "index_name": idx_name,
-        "method": method,
-        "is_inline": False,
-    }
-
-
-_TFUN_PLACEHOLDER_FMT = "__BNGSIM_TFUN_PH_{idx}__"
-_TFUN_PLACEHOLDER_RE = re.compile(r"__BNGSIM_TFUN_PH_(\d+)__")
-
-
 def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     """Return the index of the ')' that matches '(' at ``expr[open_pos]``,
     or -1 if the parens are unbalanced.
@@ -1268,86 +1169,6 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
                 return i
         i += 1
     return -1
-
-
-def _guarded_rate_law_text(expr: str) -> str:
-    """GH #333 zero-base logarithm guard for one rate law, or ``expr`` unchanged.
-
-    A thin forward to ``bngsim._jacobian.guard_rate_law_text``, imported inside
-    the call because the module dependency runs the other way (``_jacobian``
-    imports this module, so a top-level import here would close the cycle). The
-    guard's own substring gate makes this a cheap no-op for a rate law without a
-    logarithm, which is 97.9% of the corpus.
-    """
-    try:
-        from bngsim._jacobian import guard_rate_law_text
-    except ImportError:  # pragma: no cover - _jacobian is always importable here
-        return expr
-    return guard_rate_law_text(expr) or expr
-
-
-def _extract_tfun_calls(expr: str) -> tuple[str, list[dict]]:
-    """Locate every ``tfun(...)`` call inside ``expr`` and replace each with a
-    unique placeholder identifier.
-
-    Returns ``(rewritten_expr, calls)``. Each ``calls[k]`` is the dict returned
-    by ``_recognize_tfun_body`` for the k-th tfun substring (left-to-right
-    order); the rewritten expression contains ``__BNGSIM_TFUN_PH_<k>__`` in
-    place of each call so the surrounding arithmetic can be translated to C
-    normally before the placeholders are substituted with ``tfun_eval``
-    callbacks.
-
-    Whole-word matching: only treat ``tfun`` as the table-function name when
-    it is not part of a longer identifier (e.g., ``mytfun`` is ignored).
-    """
-    calls: list[dict] = []
-    out_parts: list[str] = []
-    cursor = 0
-    pattern = re.compile(r"\btfun\s*\(")
-    while True:
-        m = pattern.search(expr, cursor)
-        if m is None:
-            out_parts.append(expr[cursor:])
-            break
-        out_parts.append(expr[cursor : m.start()])
-        open_paren = m.end() - 1  # position of '('
-        close_paren = _find_close_paren_strict(expr, open_paren)
-        if close_paren < 0:
-            raise ValueError(f"unbalanced parentheses in tfun call: {expr!r}")
-        call_substr = expr[m.start() : close_paren + 1]
-        tspec = _recognize_tfun_body(call_substr)
-        if tspec is None:
-            raise ValueError(f"failed to parse tfun call: {call_substr!r}")
-        placeholder = _TFUN_PLACEHOLDER_FMT.format(idx=len(calls))
-        out_parts.append(placeholder)
-        calls.append(tspec)
-        cursor = close_paren + 1
-    return "".join(out_parts), calls
-
-
-def _classify_tfun_index(
-    index_name: str, param_idx: dict, obs_idx: dict, *, use_arrays: bool = False
-) -> tuple[str, str]:
-    """Resolve a tfun index name to a C expression.
-
-    Returns ``(kind, c_expr)`` where ``kind`` is ``"time"``,
-    ``"parameter"``, or ``"observable"``, and ``c_expr`` is the C
-    snippet the codegen emits as the second argument of ``tfun_eval``.
-    Raises ValueError if the index name doesn't resolve.
-
-    ``use_arrays`` selects an observable index's reference form: the default
-    ``obs_<name>`` local (flat .net RHS) or the ``obs[idx]`` array slot used when
-    the function computation is sharded into NOINLINE blocks (GH #165), where the
-    named locals are not in scope.
-    """
-    if index_name in _TIME_INDEX_NAMES:
-        return ("time", "t")
-    if index_name in param_idx:
-        return ("parameter", f"p[{param_idx[index_name]}]")
-    if index_name in obs_idx:
-        ref = f"obs[{obs_idx[index_name]}]" if use_arrays else f"obs_{_safe_c_name(index_name)}"
-        return ("observable", ref)
-    raise ValueError(f"tfun index '{index_name}' is not time, a parameter, or an observable")
 
 
 # ─── Rate law classification ─────────────────────────────────────────
@@ -2231,24 +2052,6 @@ def _derived_rate_constant_decline(name: str, expr: str, reason: str) -> str:
     return f"the derived rate constant {name} = {expr!r} could not be differentiated ({reason})"
 
 
-def _warn_sens_rhs_refused(name: str, expr: str, reason: str) -> None:
-    """Report that the analytic sensitivity RHS was declined because a derived
-    rate constant could not be differentiated (issue #56).
-
-    Usually the *good* outcome — the run falls back to CVODES' internal
-    difference quotient and the gradient stays correct, just slower — but worth
-    saying out loud either way, because the alternative the caller is avoiding is
-    a sensitivity column of exact zeros that looks like a converged answer.
-
-    Routed through :func:`_warn_functional_sens_rhs_refused` rather than logging
-    its own sentence, so there is one place that decides whether the fallback may
-    be called correct: a model that also carries a moving branch crossing hands
-    that function a tagged reason and gets the honest message instead (issue
-    #232). The text is otherwise unchanged.
-    """
-    _warn_functional_sens_rhs_refused(_derived_rate_constant_decline(name, expr, reason))
-
-
 def _warn_chain_rule_dropped(expr: str, referenced: list[str], reason: str) -> None:
     """Report a derived-parameter expression whose chain rule could not be
     differentiated even though it *does* reference primary parameters.
@@ -2343,9 +2146,9 @@ def _sens_derivation_deadline(n_species: int) -> float | None:
     """Absolute ``time.perf_counter()`` deadline for one sensitivity-RHS build, or
     ``None`` when the budget is disabled (GH #90).
 
-    Resolved once per :func:`generate_sens_from_model` / :func:`generate_sens_rhs_c`
-    call and threaded down, so every ``sp.diff`` on the ∂f/∂p path shares a single
-    wall-clock bound instead of each site getting its own.
+    Resolved once per :func:`generate_sens_from_model` call and threaded down, so
+    every ``sp.diff`` on the ∂f/∂p path shares a single wall-clock bound instead of
+    each site getting its own.
     """
     from bngsim._jacobian import _sens_derivation_budget_s
 
@@ -2359,8 +2162,8 @@ def _sens_budget_cache_tag() -> str:
 
     The budget decides whether a model gets an analytic sensitivity RHS at all, so
     it belongs in the key of any cache that is not content-addressed on the
-    generated source — the ``.net`` path's in-process memo and its on-disk
-    ``model_hash``, which both key on the .net's *content*. Without it a build made
+    generated source — the structural key :func:`compute_model_codegen_hash`
+    (issue #174), which keys on the model's *structure*. Without it a build made
     under a deliberately tight budget would be served back to one made without it,
     the same trap ``functional_sens_rhs_enabled`` already sidesteps (GH #67).
     Empty when unset, so the default key — and every ``.so`` already cached — is
@@ -2368,7 +2171,7 @@ def _sens_budget_cache_tag() -> str:
 
     This does not make a *default*-budget expiry cache-safe: the budget is
     wall-clock, so a model that derives near the limit can emit on one run and
-    decline on the next, and whichever came first is what the .net path cached.
+    decline on the next, and whichever came first is what the cache holds.
     Raising the budget is the fix, and doing so lands in a fresh namespace.
     """
     from bngsim._jacobian import _SENS_BUDGET_ENV
@@ -3374,482 +3177,6 @@ def compute_ic_param_sens_seed(core) -> list[tuple[int, int, float]]:
 # ─── C code generation ───────────────────────────────────────────────
 
 
-def generate_rhs_c(net_path: str) -> str:
-    """Generate a C source file implementing the CVODE RHS callback.
-
-    The generated code reads parameters from a runtime array via user_data,
-    NOT baked as compile-time literals. This allows the .so to be compiled
-    once and reused for all parameter evaluations.
-
-    Parameters
-    ----------
-    net_path : str
-        Path to the .net file.
-
-    Returns
-    -------
-    str
-        Complete C source code.
-    """
-    model = _parse_net_file(net_path)
-    _validate_net_model_for_codegen(model, net_path)
-    params = model["parameters"]
-    species = model["species"]
-    reactions = model["reactions"]
-    observables = model["observables"]
-    functions = model["functions"]
-
-    n_sp = len(species)
-    n_params = len(params)
-    n_obs = len(observables)
-    n_func = len(functions)
-
-    # Build name->index maps (0-based)
-    param_idx = {name: i for i, (_, name, _, _) in enumerate(params)}
-    func_names = {name for _, name, _ in functions}
-    func_idx = {name: i for i, (_, name, _) in enumerate(functions)}
-    obs_idx = {name: i for i, (_, name, _) in enumerate(observables)}
-
-    # Identify fixed species (0-based indices)
-    fixed_sp = set()
-    for _, _, _, _is_fixed in species:
-        pass
-    fixed_sp = {sp[0] - 1 for sp in species if sp[3]}
-
-    # ── Build per-reaction rate + scatter lines (one group per reaction) ────
-    # See generate_rhs_from_model for the Tier-1 chunking rationale. When
-    # chunking, Functional rates reference func[idx] (the packed array passed to
-    # each block) instead of the func_<name> locals, which live inside
-    # bngsim_codegen_rhs and are invisible to the file-scope blocks.
-    chunk = _should_chunk(len(reactions))
-    block_size = _chunk_block_size()
-    rxn_groups: list[list[str]] = []
-    for _, reactants, products, rate_law, _comment in reactions:
-        grp: list[str] = []
-        g = grp.append
-        kind = _classify_rate_law(rate_law, func_names)
-        rate_expr: str | None = None
-        if kind[0] == "elementary":
-            _, pname, sf = kind
-            rate_expr = _rate_elementary(pname, sf, reactants, param_idx, func_idx)
-        elif kind[0] == "functional":
-            _, fname, sf = kind
-            rate_expr = _rate_functional(fname, sf, reactants, func_idx, use_array=chunk)
-        elif kind[0] == "mm":
-            # A braced block, not an expression: the stable free-substrate root
-            # is a branch on delta's sign (GH #89), and inlining it would repeat
-            # the sqrt four times.
-            _, kcat, km, sf = kind
-            if len(reactants) >= 2:
-                for ln in _mm_rate_lines(
-                    f"p[{param_idx[kcat]}]" if kcat in param_idx else "0.0",
-                    f"p[{param_idx[km]}]" if km in param_idx else "0.0",
-                    sf,
-                    reactants[0] - 1,
-                    reactants[1] - 1,
-                ):
-                    g(ln)
-            else:
-                rate_expr = "0.0"
-        else:
-            rate_expr = "0.0"
-        if rate_expr is not None:
-            g(f"    rate = {rate_expr};")
-        # Subtract from reactants (index 0 = null reactant, skip)
-        for ri in reactants:
-            if ri > 0:
-                g(f"    ydot[{ri - 1}] -= rate;")
-        # Add to products (index 0 = null/degradation product, skip)
-        for pi in products:
-            if pi > 0:
-                g(f"    ydot[{pi - 1}] += rate;")
-        g("")
-        rxn_groups.append(grp)
-
-    rxn_needs_func = any("func[" in ln for grp in rxn_groups for ln in grp)
-    if rxn_needs_func:
-        _rxn_sig = "const double* y, const double* p, const double* func, double* ydot"
-        _rxn_args = "y, p, func, ydot"
-    else:
-        _rxn_sig = "const double* y, const double* p, double* ydot"
-        _rxn_args = "y, p, ydot"
-    rxn_block_defs: list[str] = []
-    rxn_call_lines: list[str] = []
-    rxn_block_protos: list[str] = []
-    if chunk:
-        rxn_block_defs, rxn_call_lines, rxn_block_protos = _emit_chunked_blocks(
-            rxn_groups,
-            fn_prefix="rxn_blk",
-            signature_params=_rxn_sig,
-            call_args=_rxn_args,
-            block_size=block_size,
-            preamble=("double rate;",),
-        )
-
-    # ── Observable + function computation (GH #165 chunking) ────────────────
-    # Flat: ``obs_<name>`` / ``func_<name>`` locals (byte-identical to pre-#165).
-    # Chunked: ``obs[idx]`` / ``func[idx]`` arrays filled by NOINLINE shard blocks,
-    # so this large basic block (a genome-scale model has ~18k of each) is split
-    # off the serial driver into parallel translation units instead of being the
-    # compile wall. The Functional reaction blocks already read ``func[idx]``, so
-    # the chunked form drops the separate "pack func_<name> into func[]" step.
-    obs_value_lines: list[str] = []
-    if observables:
-        if chunk:
-            obs_value_lines.append("    double obs[N_OBS];")
-        for _i, (_, name, entries) in enumerate(observables):
-            if not entries:
-                rhs_expr = "0.0"
-            else:
-                terms = []
-                for factor, sp_i in entries:
-                    sp0 = sp_i - 1  # 0-based
-                    if factor == 1.0:
-                        terms.append(f"y[{sp0}]")
-                    elif factor == int(factor):
-                        terms.append(f"{int(factor)}*y[{sp0}]")
-                    else:
-                        terms.append(f"{factor}*y[{sp0}]")
-                rhs_expr = " + ".join(terms)
-            if chunk:
-                obs_value_lines.append(f"    obs[{_i}] = {rhs_expr};")
-            else:
-                obs_value_lines.append(f"    double obs_{_safe_c_name(name)} = {rhs_expr};")
-
-    func_value_lines: list[str] = []
-    if functions:
-        if chunk:
-            func_value_lines.append("    double func[N_FUNC];")
-        # Built once and shared across every function body — see _build_ident_lookup
-        # (rebuilding it per body was the second GH #161 quadratic). The reference
-        # form (named locals vs obs[]/func[] arrays) follows the chunk decision.
-        ident_lookup = _build_ident_lookup(param_idx, obs_idx, functions, use_arrays=chunk)
-        tf_id = 0
-        for _i, (_, name, expr) in enumerate(functions):
-            # GH #333: this emitter builds its C from the .net file rather than
-            # from a loaded Model, so the guard the Model constructor applies to
-            # a rate law's evaluation expression never reaches it. Two RHS
-            # emitters for the same rate law that disagree about the value at a
-            # zero logarithm base is the failure this closes; the rewrite itself
-            # is shared, not reimplemented.
-            expr = _guarded_rate_law_text(expr)
-            rewritten, tfun_calls = _extract_tfun_calls(expr)
-            if not tfun_calls:
-                c_expr = _translate_expr(expr, ident_lookup)
-            else:
-                c_expr = _translate_expr(rewritten, ident_lookup)
-                for k, tspec in enumerate(tfun_calls):
-                    _, idx_c_expr = _classify_tfun_index(
-                        tspec["index_name"], param_idx, obs_idx, use_arrays=chunk
-                    )
-                    placeholder = _TFUN_PLACEHOLDER_FMT.format(idx=k)
-                    callback = f"data->tfun_eval({tf_id}, {idx_c_expr}, data->tfun_ctx)"
-                    c_expr = c_expr.replace(placeholder, callback)
-                    tf_id += 1
-            if chunk:
-                func_value_lines.append(f"    func[{_i}] = {c_expr};")
-            else:
-                func_value_lines.append(f"    double func_{_safe_c_name(name)} = {c_expr};")
-
-    rhs_obs_in, rhs_obs_fs = _shard_value_lines(
-        obs_value_lines,
-        chunk=chunk,
-        fn_prefix="rhs_obs_blk",
-        signature_params=_OBS_BLK_SIG,
-        call_args=_OBS_BLK_ARGS,
-    )
-    rhs_func_in, rhs_func_fs = _shard_value_lines(
-        func_value_lines,
-        chunk=chunk,
-        fn_prefix="rhs_func_blk",
-        signature_params=_FUNC_BLK_SIG,
-        call_args=_FUNC_BLK_ARGS,
-        preamble=_FUNC_BLK_PREAMBLE,
-    )
-
-    lines: list[str] = []
-    _emit = lines.append
-
-    # ── Header ────────────────────────────────────────────────────────
-    _emit("/* Auto-generated by bngsim._codegen - DO NOT EDIT */")
-    if chunk:
-        _emit(_CHUNK_MARKER)
-    _emit("/* Code-generated ODE RHS for CVODE */")
-    _emit("")
-    _emit("#include <math.h>")
-    _emit("#include <stdlib.h>")
-    _emit("#include <string.h>")
-    _emit("")
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
-    _emit("")
-    _emit("/* User data struct passed via CVODE user_data pointer.")
-    _emit("   Must match the layout set up by the C++ CvodeSimulator. */")
-    _emit("typedef double (*TfunEvalFn)(int tf_id, double x, void* ctx);")
-    _emit("typedef struct {")
-    _emit("    double* param_values;   /* runtime parameter array */")
-    _emit("    void* tfun_ctx;         /* opaque context for tfun callback */")
-    _emit("    TfunEvalFn tfun_eval;   /* table-function dispatch (may be NULL) */")
-    _emit("} CodegenUserData;")
-    _emit("")
-
-    # ── Dimensions as macros ──────────────────────────────────────────
-    _emit(f"#define N_SPECIES {n_sp}")
-    _emit(f"#define N_PARAMS  {n_params}")
-    _emit(f"#define N_OBS     {n_obs}")
-    _emit(f"#define N_FUNC    {n_func}")
-    _emit("")
-
-    # No per-parameter ``#define P_<name> <idx>`` macros are emitted: the rate-law
-    # emitters reference parameters numerically (``p[idx]``), so the macros were
-    # never used — yet, sitting in the source prefix before the first shard block,
-    # they were duplicated into every parallel shard unit (~3.4 MB × ~175 units ≈
-    # 600 MB of dead scratch on a genome-scale build). Dropped (GH #165 follow-up).
-
-    # ── Tier-1 chunking: NOINLINE reaction blocks at file scope ───────────
-    # Prototypes precede the definitions so the driver TU can call the blocks
-    # after compile_rhs lifts their bodies into separate units (GH #160).
-    # BNGSIM_EXPORT (below) tags the entry points so they are visible from the
-    # built library on Windows and must be defined for every model, chunked or
-    # not; BNGSIM_NOINLINE is used only by the chunked blocks (lanl/bngsim #5).
-    for ln in _CODEGEN_PRELUDE_LINES:
-        _emit(ln)
-    _emit("")
-    if chunk:
-        for ln in (
-            *rxn_block_protos,
-            "",
-            *rxn_block_defs,
-            *rhs_obs_fs,
-            *rhs_func_fs,
-        ):
-            _emit(ln)
-        _emit("")
-
-    # ── RHS function ──────────────────────────────────────────────────
-    _emit(
-        "BNGSIM_EXPORT int bngsim_codegen_rhs(double t, double* y, double* ydot, "
-        "void* user_data) {"
-    )
-    _emit("    CodegenUserData* data = (CodegenUserData*)user_data;")
-    _emit("    double* p = data->param_values;")
-    _emit("")
-
-    # Zero derivatives
-    _emit("    /* Zero derivatives */")
-    _emit("    memset(ydot, 0, N_SPECIES * sizeof(double));")
-    _emit("")
-
-    # Compute observables (flat: obs_<name> locals; chunked: obs[] array filled by
-    # the rhs_obs_blk_* shard blocks built above — see the obs/func construction).
-    if observables:
-        _emit("    /* Compute observables */")
-        for ln in rhs_obs_in:
-            _emit(ln)
-        _emit("")
-
-    # Evaluate functions (in dependency order — same as .net file order). Flat:
-    # func_<name> locals; chunked: func[] array filled by the rhs_func_blk_* shard
-    # blocks (which also packs func[] for the Functional reaction blocks, so no
-    # separate pack step is needed). tfun(...) calls dispatch through the runtime
-    # callback; the tf_id ordering matches the runtime table_functions vector.
-    if functions:
-        _emit("    /* Evaluate functions (dependency order from .net) */")
-        for ln in rhs_func_in:
-            _emit(ln)
-        _emit("")
-
-    # Reactions. Chunked: call the file-scope NOINLINE blocks built above.
-    # Flat (below threshold): splice the per-reaction groups inline — byte-
-    # identical to the pre-chunking output.
-    _emit("    /* Compute reaction rates and accumulate derivatives */")
-    if chunk:
-        lines.extend(rxn_call_lines)
-        _emit("")
-    else:
-        _emit("    double rate;")
-        _emit("")
-        for grp in rxn_groups:
-            lines.extend(grp)
-
-    # Zero derivatives for fixed species
-    if fixed_sp:
-        _emit("    /* Zero derivatives for fixed species */")
-        for si in sorted(fixed_sp):
-            _emit(f"    ydot[{si}] = 0.0;")
-        _emit("")
-
-    _emit("    return 0;")
-    _emit("}")
-
-    return "\n".join(lines) + "\n"
-
-
-def _safe_c_name(name: str) -> str:
-    """Convert a BNG name to a safe C identifier."""
-    # Replace non-alphanumeric chars with underscore
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-
-def _build_ident_lookup(
-    param_idx: dict,
-    obs_idx: dict,
-    functions: list,
-    *,
-    use_arrays: bool = False,
-) -> dict[str, tuple[str, bool]]:
-    """Build the identifier → (C-reference, eats-empty-call) table that
-    ``_translate_expr`` rewrites function bodies against.
-
-    Built ONCE per ``generate_rhs_c`` and reused for every function body.
-    Building it per call is O(n_functions × (n_params + n_obs + n_funcs)) —
-    the second GH #161 quadratic: a genome-scale model has ~132k params +
-    ~18k observables + ~18k functions, and rebuilding all ~170k entries (plus
-    a ``_safe_c_name`` regex per observable and function) for each of ~18k
-    function bodies dominated source generation. Insertion order sets
-    precedence (later wins): params, then observables, then functions — so a
-    name reused as both an observable and a function resolves to the function,
-    matching ``_translate_expr_to_c``.
-
-    ``use_arrays`` selects the observable / function reference form: the default
-    ``obs_<name>`` / ``func_<name>`` locals (flat .net RHS) or the ``obs[idx]`` /
-    ``func[idx]`` array slots used when the obs/func computation is sharded into
-    NOINLINE blocks (GH #165) — there the named locals are not in scope, so the
-    blocks read and write the passed arrays instead.
-
-    Every model name eats a trailing ``()`` (issue #28 — see
-    ``_BUILTIN_IDENT_MAP``): each resolves to a scalar in the emitted C, so
-    ``divide()`` in a function body must become ``obs_divide``, not
-    ``obs_divide()``.
-    """
-    lookup: dict[str, tuple[str, bool]] = dict(_BUILTIN_IDENT_MAP)
-    for name, idx in param_idx.items():
-        lookup[name] = (f"p[{idx}]", True)
-    if use_arrays:
-        for name, oi in obs_idx.items():
-            lookup[name] = (f"obs[{oi}]", True)
-        for fi, (_, fname, _) in enumerate(functions):
-            lookup[fname] = (f"func[{fi}]", True)
-    else:
-        for name in obs_idx:
-            lookup[name] = (f"obs_{_safe_c_name(name)}", True)
-        for _, fname, _ in functions:
-            lookup[fname] = (f"func_{_safe_c_name(fname)}", True)
-    return lookup
-
-
-def _translate_expr(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
-    """Translate a .net function expression (ExprTk grammar) to C code.
-
-    Mirrors the model-based ``_translate_expr_to_c`` pipeline so the .net
-    codegen path produces the same numerics as the ExprTk interpreter for
-    every BNG-supported expression construct: power (``^``), conditionals
-    (``if(c,a,b)``), word-form logicals (``and``/``or``/``not``), constants
-    (``_pi``/``_e``), ``abs``/``ln``, and the engine calls C has no name for
-    (``sign``/``rint``/``clamp``/...). The .net path uses the
-    ``obs_<Name>`` / ``func_<Name>`` local-variable naming emitted by
-    ``generate_rhs_c``; species are referenced only via observables.
-
-    ``lookup`` is the prebuilt identifier table from ``_build_ident_lookup`` —
-    shared across all function bodies so it is built once, not per call (the
-    second GH #161 quadratic). Single-pass identifier rewriting — see
-    ``_translate_expr_to_c`` for the Issue-#25 motivation.
-    """
-    # ExprTk's reading of =, <>, -- and relational chains first, as in the model
-    # path (issue #734). This path must match it: its RHS sits beside
-    # model-built sensitivity code that already reads the normalized text.
-    c_expr = _replace_if_calls(_normalize_exprtk_operators(expr))
-    # Then the engine functions C has no name for (issue #448) — same pass and
-    # same place as the model-based twin, so the two agree.
-    c_expr = _replace_engine_calls(c_expr)
-    # Float-ify integer literals before subscripts appear (see
-    # _translate_expr_to_c) so ExprTk's ``1/2`` == 0.5 survives into C.
-    c_expr = _floatify_int_literals(c_expr)
-
-    def _repl(m: re.Match) -> str:
-        name = m.group(1)
-        empty_call = m.group(2)
-        builtin = _call_form_builtin(name, empty_call)
-        if builtin is not None:
-            return builtin  # `time()` is the clock, even beside a scalar `time` (#776)
-        entry = lookup.get(name)
-        if entry is None:
-            return m.group(0)
-        rep, eats_call = entry
-        if empty_call is not None:
-            return rep if eats_call else rep + empty_call
-        return rep
-
-    c_expr = _IDENT_OR_EMPTY_CALL_RE.sub(_repl, c_expr)
-    c_expr = _replace_power_op(c_expr)
-    return c_expr
-
-
-def _rate_elementary(
-    pname: str,
-    sf: float,
-    reactants: list,
-    param_idx: dict,
-    func_idx: dict,
-) -> str:
-    """Generate C expression for elementary rate: k * sf * ∏ y[ri].
-
-    Reactant index 0 marks a null reactant (synthesis reaction); skip it
-    so we don't emit an out-of-bounds y[-1] read.
-    """
-    parts = []
-    if pname in param_idx:
-        parts.append(f"p[{param_idx[pname]}]")
-    else:
-        parts.append(f"/* UNKNOWN_PARAM {pname} */ 0.0")
-
-    if sf != 1.0:
-        parts.insert(0, _c_scalar(sf))
-
-    for ri in reactants:
-        if ri > 0:
-            parts.append(f"y[{ri - 1}]")
-
-    return " * ".join(parts)
-
-
-def _rate_functional(
-    fname: str,
-    sf: float,
-    reactants: list,
-    func_idx: dict,
-    use_array: bool = False,
-) -> str:
-    """Generate C expression for functional rate: func * sf * ∏ y[ri].
-
-    Reactant index 0 marks a null reactant (synthesis reaction); skip it
-    so we don't emit an out-of-bounds y[-1] read.
-
-    ``use_array`` references the function value as ``func[idx]`` (the packed
-    array passed to a Tier-1 NOINLINE block) instead of the ``func_<name>``
-    local — the blocks live outside bngsim_codegen_rhs and cannot see its locals.
-    """
-    parts = []
-    safe = _safe_c_name(fname)
-    if use_array and fname in func_idx:
-        parts.append(f"func[{func_idx[fname]}]")
-    else:
-        parts.append(f"func_{safe}")
-
-    if sf != 1.0:
-        parts.insert(0, _c_scalar(sf))
-
-    for ri in reactants:
-        if ri > 0:
-            parts.append(f"y[{ri - 1}]")
-
-    return " * ".join(parts)
-
-
 def _mm_sfree_c_lines(km_c: str, e_idx: int, s_idx: int, indent: str) -> list[str]:
     """C lines declaring ``Km``/``E``/``S``/``delta``/``Dmm``/``sFree``/``KpsF``
     for one tQSSA Michaelis–Menten reaction — the single source of the
@@ -3914,169 +3241,6 @@ def _mm_rate_lines(
 # ─── Sensitivity RHS code generation ────────────────────────────────────
 
 
-def generate_sens_rhs_c(net_path: str, *, emit_term_scale: bool = False) -> str | None:
-    """Generate C code for the CVODES sensitivity RHS callback.
-
-    The sensitivity equation for parameter p_iS is:
-        ySdot = J * yS + df/dp_{iS}
-    where J = df/dy is the Jacobian and df/dp_{iS} is the partial
-    derivative of each species' RHS w.r.t. the iS-th parameter.
-
-    For Elementary reactions v_r = k_r * sf * ∏ x_j^{m_j}:
-        df_i/dk_r = S[i][r] * sf * ∏ x_j^{m_j}  (rate without k_r)
-        J[i][j]   = S[i][r] * k_r * sf * m_j * x_j^{m_j-1} * ∏_{l≠j} x_l^{m_l}
-
-    For Functional/MM: returns None (fall back to CVODES internal FD).
-
-    The only symbolic work here is the derived-rate-constant chain rule below; it
-    shares the GH #90 build-time budget with the model path, so a .net carrying
-    enough ``# ConstantExpression`` rate constants declines rather than hangs.
-
-    Parameters
-    ----------
-    net_path : str
-        Path to the .net file.
-
-    Returns
-    -------
-    str or None
-        C source code, or None if model has non-Elementary reactions.
-    """
-    model = _parse_net_file(net_path)
-    _validate_net_model_for_codegen(model, net_path)
-    params = model["parameters"]
-    species = model["species"]
-    reactions = model["reactions"]
-    model["observables"]
-    functions = model["functions"]
-
-    n_sp = len(species)
-    n_params = len(params)
-
-    # GH #90: one deadline for this build's symbolic work, resolved before it.
-    from bngsim._jacobian import _DerivationBudgetExceeded
-
-    deadline = _sens_derivation_deadline(n_sp)
-
-    # Build name→index maps
-    param_idx = {name: i for i, (_, name, _, _) in enumerate(params)}
-    func_names = {name for _, name, _ in functions}
-
-    # Check: all reactions must be Elementary for analytical sensitivity RHS
-    rate_const_names: set[str] = set()
-    for _, _reactants, _products, rate_law, _ in reactions:
-        kind = _classify_rate_law(rate_law, func_names)
-        if kind[0] != "elementary":
-            return None  # Fall back to CVODES internal FD
-        rate_const_names.add(kind[1])
-
-    # Identify fixed species
-    fixed_sp = {sp[0] - 1 for sp in species if sp[3]}
-
-    # Build mapping from derived (constant-expression) parameter name to
-    # ``{primary_param_name: C-expression-for-∂p_d/∂primary}``. When BNG2.pl
-    # emits a rate law like ``chi_r1*kon_CSH2`` or ``5/MEK`` it stores the
-    # value as a derived parameter ``_rateLaw{N}``. Without this expansion,
-    # the codegen sensitivity RHS treats ``_rateLaw{N}`` as an independent
-    # rate constant and the sensitivities w.r.t. the underlying primary
-    # parameters are wrong (issue #2). The chain-rule contribution to
-    # ``∂rate/∂primary`` is ``(∂p_d/∂primary) * sf * ∏y^m``.
-    primary_param_names = {name for (_, name, expr, is_const) in params if is_const}
-    derived_exprs = {name: expr for (_, name, expr, is_const) in params if not is_const and expr}
-    derived_expansion: dict[str, dict[str, str]] = {}
-    # GH #99: one memo for the whole loop, so a DAG node shared by several rate
-    # constants is differentiated once.
-    derived_jac_cache: dict[str, tuple[dict[str, str] | None, str | None]] = {}
-    for _, name, expr, is_const in params:
-        # Only a derived parameter that actually serves as a reaction's rate
-        # constant reaches the sens RHS, so only those are differentiated — and
-        # only those can invalidate it. A derived parameter used solely by an
-        # observable or a function (a reporting quantity like a mean or a
-        # standard deviation) has no bearing here.
-        if is_const or name not in rate_const_names:
-            continue
-        try:
-            jac, reason = _derived_param_jacobian_checked(
-                expr,
-                primary_param_names,
-                param_idx,
-                derived_exprs=derived_exprs,
-                deadline=deadline,
-                cache=derived_jac_cache,
-                name=name,
-            )
-        except _DerivationBudgetExceeded:
-            # GH #90: decline to CVODES' difference quotient rather than let the
-            # chain-rule derivation run unbounded (see generate_sens_from_model).
-            _warn_functional_sens_rhs_refused(
-                _sens_budget_decline_reason(n_sp, f"deriving the rate constant {name} = {expr!r}")
-            )
-            return None
-        if reason is not None:
-            # Issue #56: emitting the RHS without this chain rule would report
-            # ∂/∂primary as exactly zero. Refuse the analytic RHS instead so the
-            # caller falls back to CVODES' internal difference quotient, which
-            # is slower but right.
-            _warn_sens_rhs_refused(name, expr, reason)
-            return None
-        if jac is not None:
-            derived_expansion[name] = jac
-
-    # Build reaction data structure for code generation
-    rxn_data = []
-    for _, reactants, products, rate_law, _ in reactions:
-        kind = _classify_rate_law(rate_law, func_names)
-        _, pname, sf = kind
-        pidx = param_idx.get(pname, -1)
-
-        # Net stoichiometry: for each species, compute net change
-        stoich: dict[int, int] = {}  # 0-based species index → net coefficient
-        for ri in reactants:
-            if ri > 0:
-                si = ri - 1
-                stoich[si] = stoich.get(si, 0) - 1
-        for pi in products:
-            if pi > 0:
-                si = pi - 1
-                stoich[si] = stoich.get(si, 0) + 1
-
-        # Reactant multiplicities (0-based)
-        rmult = Counter(ri - 1 for ri in reactants if ri > 0)
-
-        # Resolve any chain rule for derived rate-constant parameters.
-        # Each entry ``(primary_param_idx, dpd_dprimary_c_expr)`` carries
-        # the primary parameter's index and the C source for
-        # ``∂p_d/∂primary``; the dfdp emit then multiplies by ``sf * ∏y^m``.
-        derived_terms: list[tuple] = []
-        if pname in derived_expansion:
-            for primary_name, c_expr in derived_expansion[pname].items():
-                p_idx_k = param_idx.get(primary_name, -1)
-                if p_idx_k < 0:
-                    continue
-                derived_terms.append((p_idx_k, c_expr))
-
-        rxn_data.append(
-            {
-                "param_idx": pidx,
-                "stat_factor": sf,
-                "stoich": stoich,
-                "reactant_mult": dict(rmult),  # {sp_idx: multiplicity}
-                "reactants_raw": [ri for ri in reactants if ri > 0],
-                "derived_terms": derived_terms,
-            }
-        )
-
-    # No ``value_lines_fn`` (GH #65): every derivative this path emits is a
-    # ``p[]``/``y[]`` expression, so none can reference obs[]/func[] and the
-    # context is never asked for. The .net parse also carries neither the
-    # observable-entry nor the table-function shapes ``_emit_observable_lines`` /
-    # ``_emit_function_lines`` consume — the same reason ``generate_combined_c``
-    # sources its Jacobian from the *model*, not from the .net. Should a caller
-    # ever produce an obs-referencing term here, _emit_sens_rhs_body declines
-    # rather than emitting C that names an undeclared array.
-    return _emit_sens_rhs_body(rxn_data, n_sp, n_params, fixed_sp, emit_term_scale=emit_term_scale)
-
-
 def _emit_sens_rhs_body(
     rxn_data: list[dict],
     n_sp: int,
@@ -4102,8 +3266,8 @@ def _emit_sens_rhs_body(
         stoich        : dict[int, int] — 0-based species index → net coeff
         reactant_mult : dict[int, int] — 0-based species index → multiplicity
         derived_terms : list[(primary_param_idx, dpd_dprimary_c_expr)]
-                        — chain-rule contributions for derived rate constants;
-                        empty for the model-based path (see issue #15).
+                        — chain-rule contributions for derived rate constants
+                        (and, GH #67, a Functional law's ∂func/∂p).
         row_divisor   : dict[int, (live_volume_idx0, static_divisor,
                         static_divisor_param_idx0)] — optional, the GH #160
                         cross-compartment volume divide for the rows that have one
@@ -4115,9 +3279,9 @@ def _emit_sens_rhs_body(
                         ``None``/absent for a reaction that carries none. The
                         ``.net`` path never sets it.
 
-    Both ``generate_sens_rhs_c`` (.net path) and ``generate_sens_from_model``
-    (model path) feed this helper, so the emitted C is byte-identical for the
-    same normalized input.
+    ``generate_sens_from_model`` feeds this helper the normalized input below;
+    until #803 the ``.net`` path's ``generate_sens_rhs_c`` fed it too, which is
+    why the two paths' sensitivity RHS came out byte-identical.
 
     ``value_lines_fn`` (GH #65) supplies the ``obs[]``/``func[]`` recomputation a
     Functional ``∂f/∂p`` reads. An Elementary rate law is ``k·sf·∏y^m``, whose
@@ -4214,7 +3378,7 @@ def _emit_sens_rhs_body(
     if need_obs or need_func:
         values = value_lines_fn() if value_lines_fn is not None else None
         if values is None:
-            # No context available (the .net path), or the caller declined (a
+            # No context available, or the caller declined (a
             # tfun-backed function value). Refuse the analytic RHS rather than
             # emit a derivative that cannot compile — CVODES' internal
             # difference quotient is slower but right (the #56 precedent).
@@ -4304,8 +3468,7 @@ def _emit_sens_rhs_body(
         # (sFree and friends), so it arrives as C lines that assign ``v`` rather
         # than as an expression the geometry gets multiplied into — its rate is
         # not k·sf·∏y^m, so there is no geometry to multiply. Never present for
-        # the .net path or for an Elementary/Functional model, so their emission
-        # is untouched.
+        # an Elementary/Functional model, so their emission is untouched.
         for primary_pidx, v_lines in rxn.get("mm_terms", []):
             rxns_by_param.setdefault(primary_pidx, []).append(("mm", rxn, v_lines))
 
@@ -4919,75 +4082,6 @@ def _emit_sens_rhs_body(
     return "\n".join(lines) + "\n"
 
 
-def _codegen_emit_flags(model, emit_jac: bool) -> tuple[bool, bool, bool, bool, bool]:
-    """``(want_jac, want_outputs, want_output_sens, want_term_scale,
-    want_sens_rhs)`` for the .net codegen append, from cheap O(1) model
-    flags — never generates source, so a .net cache hit stays a few stat()s.
-
-    ``want_sens_rhs`` (issues #209, #217): ask for the sensitivity RHS — *either*
-    half, the .net text emitter's Elementary one and the model-based Functional/MM
-    hook ``generate_combined_c`` reaches for after it declines — only on a
-    sensitivity run, off the same ``_want_output_sens`` signal the two flags below
-    read. See :func:`want_sens_rhs` for why #209's Functional-only scope did not
-    hold. It goes into the cache key as the *resolved* decision, for the reason
-    stated at ``chunk_policy`` there: today ``want_term_scale`` already separates a
-    plain key from a sensitivity one, so this is redundancy — but redundancy against
-    a narrowing of either gate, and the thing it would be protecting against is a
-    plain-run .so silently lacking ``bngsim_codegen_sens_rhs`` (the issue #51
-    inertness trap), not a build error.
-
-    ``want_term_scale`` (issue #177): append the ∂f/∂p term scale only for a
-    sensitivity run — the same ``_want_output_sens`` signal ``want_output_sens``
-    reads, but WITHOUT its has-functions condition, because a model with no
-    functions at all is exactly the shape the #177 reproduction has. It must reach
-    the cache key below or a .so compiled for a plain run would be reused for a
-    sensitivity run and silently lack the symbol (the issue #51 inertness trap).
-
-    ``want_jac`` (GH #162): append the compiled analytical Jacobian only when an
-    analytical Jacobian is wanted (``emit_jac`` — i.e. ``jacobian`` in
-    ``auto``/``analytical``; ``fd``/``jax`` keep the .net RHS Jacobian-free), the
-    interpreted analytical Jacobian is complete (so the compiled scatter matches it),
-    and the ``BNGSIM_NO_CODEGEN_JAC`` A/B hatch is off.
-
-    ``want_outputs`` (GH #136/#163): append the compiled output evaluator whenever
-    the model has at least one observable or function and references no ``rateOf``
-    csymbol — exactly the two cases ``generate_outputs_from_model`` *emits* (it
-    declines on no-obs-no-func and on rateOf). This is INDEPENDENT of the Jacobian
-    gate: ``fd``/``jax`` runs record observables too. ``uses_rateof`` is a (slight)
-    conservative over-decline — a model with rateOf only in event triggers (never in
-    functions) could in principle be emitted, but those decline cleanly to the
-    interpreted recorder, which is correct. Gating the emit on this exact flag keeps
-    the cache key and the emitted symbols in lock-step: ``want_outputs`` ⇒
-    ``generate_outputs_from_model`` returns non-None.
-    """
-    core = model._core if (model is not None and hasattr(model, "_core")) else model
-    if core is None:
-        return False, False, False, False, False
-    want_jac = bool(
-        emit_jac
-        and core.analytical_jacobian_complete
-        and os.environ.get("BNGSIM_NO_CODEGEN_JAC") != "1"
-    )
-    want_outputs = bool((core.n_observables + core.n_functions) > 0 and not core.uses_rateof)
-    # GH #198: append the expression output-sensitivity evaluator only for a
-    # sensitivity run (the Simulator stashes _want_output_sens on the model before
-    # codegen) AND only when there are functions to differentiate — generate_
-    # output_sens_from_model declines (returns None) for the no-function /
-    # no-user-function / rateOf / embedded-tfun cases, so gate on the same
-    # has-functions signal to keep the cache key and emitted symbol in lock-step.
-    want_output_sens = bool(
-        want_outputs and core.n_functions > 0 and getattr(model, "_want_output_sens", False)
-    )
-    want_term_scale = bool(getattr(model, "_want_output_sens", False))
-    return (
-        want_jac,
-        want_outputs,
-        want_output_sens,
-        want_term_scale,
-        want_sens_rhs(model),
-    )
-
-
 def functional_sens_rhs_enabled() -> bool:
     """Whether the analytic sensitivity RHS may cover Functional rate laws (GH #67).
 
@@ -5036,8 +4130,8 @@ def want_sens_rhs(model) -> bool:
     This is the *request* half only. Whether the Functional extension of that RHS
     (GH #67) is permitted is :func:`functional_sens_rhs_enabled`, and the two are
     now genuinely independent: with the hatch set, a sensitivity run still emits the
-    Elementary sens RHS. Both reach the cache keys separately for that reason — see
-    :func:`compute_model_codegen_hash` and ``prepare_codegen``'s suffix.
+    Elementary sens RHS. Both reach the cache key separately for that reason — see
+    :func:`compute_model_codegen_hash`.
 
     Two things have to hold for this to be a gate and not a silent downgrade to
     CVODES' difference quotient, and both are checked by the callers rather than
@@ -5049,170 +4143,7 @@ def want_sens_rhs(model) -> bool:
     return bool(getattr(model, "_want_output_sens", False))
 
 
-def generate_combined_c(
-    net_path: str,
-    model=None,
-    emit_jac: bool = True,
-    emit_outputs: bool = True,
-    emit_output_sens: bool = False,
-    emit_term_scale: bool = False,
-    emit_sens_rhs: bool = True,
-) -> tuple[str, bool]:
-    """Generate C source with RHS, sensitivity RHS (if possible), and — when the
-    built model is supplied — the analytical Jacobian (GH #162), the output
-    evaluator (GH #136/#163), and the expression output-sensitivity evaluator
-    (GH #198).
-
-    Returns ``(c_source, has_sens_rhs)``.
-
-    ``model`` is the built model (``Model`` or its ``_core``) for this *same* .net.
-    When given, model-based callbacks are appended after the RHS (in the same
-    RHS, sens, Jacobian, outputs, output-sens order as
-    ``generate_combined_from_model``):
-
-    * the analytical Jacobian (``generate_jacobian_from_model`` — dense, or sparse
-      CSC for KLU-routed models) when ``emit_jac`` — so a .net-loaded large sparse
-      model gets a **compiled** per-step Jacobian instead of the interpreted one
-      (GH #162);
-    * the output evaluator (``generate_outputs_from_model`` — ``bngsim_codegen_outputs``)
-      when ``emit_outputs`` — so the warm recording loop fills the per-row observable
-      and function buffers with one compiled call instead of re-walking the ExprTk
-      trees for every observable/function at every output row (GH #136). Unlike the
-      Jacobian, this applies to *every* ``jacobian`` strategy (GH #163).
-    * the expression output-sensitivity evaluator (``generate_output_sens_from_model``
-      — ``bngsim_codegen_output_sens``) when ``emit_output_sens`` — the GH #198
-      chain-rule ``d func/dθ``. Gated separately because its build-time expression
-      differentiation is expensive and only a sensitivity run needs it; the .net
-      cache key carries the flag (``prepare_codegen``).
-
-    ``emit_sens_rhs`` (issues #209, #217) gates the sensitivity RHS — **both** the
-    .net text emitter's Elementary one and the GH #67 model-based hook below that
-    covers what it cannot produce — off the same signal, because a run that never
-    calls ``CVodeSensInit1`` discards every byte of either. #209 gated only the
-    model-based half; on the 20 largest ``.net`` models the .net half it left alone
-    is 55.6% of a plain build's source (issue #217). ``prepare_codegen`` resolves it
-    through ``_codegen_emit_flags`` and carries it in the cache key. It defaults to
-    True so a direct caller (and every test that asks "can this model be
-    differentiated?") still exercises the emitter; only the production entry points
-    gate it.
-
-    The append is sound because the .net RHS already emits the ``CodegenUserData``
-    typedef and the ``N_SPECIES``/``N_OBS``/``N_FUNC`` macros both callbacks reuse,
-    and the .net parse and the built model agree on species/parameter/observable
-    ordering (the model is built from the .net). ``model=None`` with the default
-    ``emit_sens_rhs`` keeps the historical RHS+sens output byte-for-byte. A ``None``
-    from either emitter (an incomplete/un-emittable Jacobian or the A/B hatch; a
-    rateOf / no-obs-no-func model for outputs) simply omits that symbol — never a
-    partial/wrong one, and the simulator falls back to the interpreted Jacobian /
-    interpreted recorder.
-    """
-    rhs_code = generate_rhs_c(net_path)
-    sens_code = (
-        generate_sens_rhs_c(net_path, emit_term_scale=emit_term_scale) if emit_sens_rhs else None
-    )
-    if sens_code is None and model is not None and emit_sens_rhs and functional_sens_rhs_enabled():
-        # GH #67: the .net emitter reads rate laws as text and has no rate-law
-        # expression to differentiate, so it declines every Functional model. The
-        # built model does — and this is the path a .net-loaded model actually
-        # takes, so without this hook #67 would reach only the SBML/Antimony
-        # entry points. Same append-from-the-model shape as the Jacobian and the
-        # output evaluators above, and sound for the same reason: the model is
-        # built from this .net, so the two agree on species/parameter ordering.
-        # Only ever tried once the .net path has already declined, so an
-        # all-Elementary model's source stays byte-for-byte what it was.
-        sens_code = generate_sens_from_model(
-            model, functional=True, emit_term_scale=emit_term_scale
-        )
-    parts = [rhs_code]
-    if sens_code is not None:
-        parts.append(sens_code)
-    if model is not None:
-        if emit_jac:
-            jac_code = generate_jacobian_from_model(model)
-            if jac_code is not None:
-                parts.append(jac_code)
-        if emit_outputs:
-            outputs_code = generate_outputs_from_model(model)
-            if outputs_code is not None:
-                parts.append(outputs_code)
-        # Expression output sensitivities (GH #198) are appended only for a
-        # sensitivity run — the build-time differentiation is expensive and wasted
-        # otherwise. The cache key carries emit_output_sens so a non-sensitivity
-        # .so is never reused for a sensitivity run (see prepare_codegen).
-        if emit_output_sens:
-            output_sens_code = generate_output_sens_from_model(model)
-            if output_sens_code is not None:
-                parts.append(output_sens_code)
-    return "\n".join(parts), sens_code is not None
-
-
 # ─── Compilation + caching ───────────────────────────────────────────
-
-
-def compute_model_hash(net_path: str) -> str:
-    """Compute a hash of the .net file content for caching.
-
-    The hash mixes in ``_CODEGEN_CACHE_KEY`` — the hand-maintained
-    ``_CODEGEN_VERSION`` *and* a digest of the emitters' own source (issue #51)
-    — so a codegen behavior change invalidates previously-cached .so files
-    whether or not the constant was bumped. Any .tfun data files referenced by
-    the .net's function block are also folded in, so editing a tfun's y-values
-    triggers a recompile.
-    """
-    h = hashlib.sha256()
-    h.update(_CODEGEN_CACHE_KEY.encode())
-    h.update(b"\0")
-    with open(net_path, "rb") as f:
-        net_bytes = f.read()
-    h.update(net_bytes)
-
-    # Walk the function block for tfun('file.tfun', ...) references.
-    # Resolve relative paths against the .net's directory; silently skip
-    # missing files (the build will fail loudly when it hits them).
-    net_dir = Path(net_path).parent
-    for ref in _iter_tfun_file_refs(net_bytes.decode("utf-8", errors="replace")):
-        ref_path = Path(ref)
-        if not ref_path.is_absolute():
-            ref_path = net_dir / ref_path
-        try:
-            with open(ref_path, "rb") as f:
-                h.update(b"\0tfun\0")
-                h.update(ref.encode("utf-8"))
-                h.update(b"\0")
-                h.update(f.read())
-        except OSError:
-            # Missing or unreadable — leave it out of the hash. The
-            # downstream model load will surface the error.
-            continue
-
-    return h.hexdigest()[:16]
-
-
-def _iter_tfun_file_refs(net_text: str):
-    """Yield each filename argument from tfun('file', ...) inside a .net's
-    functions block. Inline tfuns (tfun([…],[…],…)) and non-function uses
-    are skipped.
-    """
-    in_functions = False
-    for raw_line in net_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("begin functions"):
-            in_functions = True
-            continue
-        if line.startswith("end functions"):
-            in_functions = False
-            continue
-        if not in_functions:
-            continue
-        # Strip trailing comment
-        comment = line.find("#")
-        if comment >= 0:
-            line = line[:comment]
-        m = re.search(r"\btfun\s*\(\s*['\"]([^'\"]+)['\"]", line)
-        if m:
-            yield m.group(1)
 
 
 def _shared_lib_suffix() -> str:
@@ -5861,9 +4792,9 @@ def compile_rhs(c_source: str, model_hash: str) -> Path:
     Parameters
     ----------
     c_source : str
-        Complete C source code from generate_rhs_c().
+        Complete C source code (``generate_combined_from_model``).
     model_hash : str
-        Hash of the .net file content.
+        The artifact key (``compute_model_codegen_hash``).
 
     Returns
     -------
@@ -6007,7 +4938,6 @@ def _expr_to_c(
 
 
 _IDENT_OR_EMPTY_CALL_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)(\s*\(\s*\))?")
-_PAREN_AFTER_RE = re.compile(r"\s*\(")
 
 # A bare integer literal: a digit run not glued to an identifier, a decimal
 # point, or an exponent. The ``(?<![\w.])`` / ``(?![\w.])`` guards keep us
@@ -7027,7 +5957,7 @@ def generate_rhs_from_model(model) -> str:
 
         elif rtype == "mm":
             # tQSSA Michaelis-Menten — the free substrate through the stable
-            # quadratic root (GH #89), shared with generate_rhs_c.
+            # quadratic root (GH #89).
             if len(rate_params) >= 2 and len(reactants) >= 2:
                 for ln in _mm_rate_lines(
                     f"p[{rate_params[0]}]",
@@ -7503,6 +6433,7 @@ def _emit_function_lines(
     # Built once and shared across every function body — rebuilding it per body
     # is the model-based GH #161 quadratic (see _build_ident_lookup_model).
     lookup = _build_ident_lookup_model(param_map, species_map, obs_map, func_map, rateof_map)
+    embedded_tfun = _embedded_tfun_resolver(tfun_call_by_name)
     lines = [f"    double func[{len(functions)}];"]
     for i in _topological_function_order(functions):
         f = functions[i]
@@ -7521,8 +6452,33 @@ def _emit_function_lines(
         # law, because the guarded form's ``S == 0`` branch would otherwise read
         # as a moving state switch and cost the analytic sensitivity RHS.
         c_expr = _translate_expr_to_c(f.get("eval_expression") or f["expression"], lookup)
+        if embedded_tfun is not None:
+            c_expr = embedded_tfun(c_expr)
         lines.append(f"    func[{i}] = {c_expr};  /* {f['name']} */")
     return lines
+
+
+def _embedded_tfun_resolver(tfun_call_by_name: dict):
+    """Rewrite embedded table-function references in translated C, or ``None``.
+
+    A ``tfun()`` call nested inside arithmetic -- ``(tfun('drive') + 5)/k`` --
+    reaches codegen as a synthetic reference ``tfun_<table>()`` to a table of its
+    own (``tfun_f_complex__tfun0()``), which the translator passes through
+    verbatim. The returned callable resolves each one to the ``data->tfun_eval``
+    callback a whole-body tfun gets, so the emitted C calls the loader's table
+    rather than an undeclared function. The ``.net`` RHS did this with a
+    placeholder pass until #803 routed ``.net`` models here; without it such a
+    model failed to compile.
+    """
+    if not tfun_call_by_name:
+        return None
+    names = sorted(tfun_call_by_name, key=len, reverse=True)
+    pattern = re.compile(r"\btfun_(" + "|".join(map(re.escape, names)) + r")\(\s*\)")
+    calls = {
+        name: f"data->tfun_eval({tf_id}, {idx_c}, data->tfun_ctx)"
+        for name, (tf_id, idx_c) in tfun_call_by_name.items()
+    }
+    return lambda c_expr: pattern.sub(lambda mo: calls[mo.group(1)], c_expr)
 
 
 def _jac_c_float(x) -> str:
@@ -8833,8 +7789,8 @@ def _sens_decline_note_path(so_path: str | os.PathLike[str]) -> Path:
     """The note that belongs to the artifact at *so_path*.
 
     Addressed by the artifact rather than by the model hash on purpose: whatever
-    resolved that path — a fresh compile, the on-disk cache, the in-process memo, a
-    second Simulator inheriting it off the model — reads the same note.
+    resolved that path — a fresh compile, the on-disk cache, a second Simulator
+    inheriting it off the model — reads the same note.
     """
     return Path(so_path).with_suffix(_SENS_DECLINE_NOTE_EXT)
 
@@ -9879,7 +8835,7 @@ def generate_sens_from_model(
     model, *, functional: bool = False, emit_term_scale: bool = False
 ) -> str | None:
     """Generate C source for the CVODES analytical sensitivity RHS from a
-    built model, parallel to ``generate_sens_rhs_c`` (.net path).
+    built model.
 
     Returns ``None`` if any reaction is non-Elementary — the caller then
     falls back to RHS-only codegen and CVODES uses internal FD.
@@ -9889,8 +8845,7 @@ def generate_sens_from_model(
     :func:`_functional_dfdp_terms` (GH #66), and the ``J·yS`` reconstructed by
     :func:`_functional_jacobian_groups` with the matvec fused into the scatter
     (GH #67). ``generate_combined_from_model`` sets it; it stays a keyword so the
-    pre-#67 behaviour is one argument away for an A/B, and so the .net path (which
-    has no model to read a rate law off) keeps declining as it always has.
+    pre-#67 behaviour is one argument away for an A/B.
 
     A Functional model is emitted only when **every** rate law it must
     differentiate is smooth algebra, or is conditional in a way issue #48 already
@@ -9910,8 +8865,8 @@ def generate_sens_from_model(
     is_expression=True)``) get chain-rule expansion via sympy. Each derived
     rate constant ``p_d = expr(primary_1, primary_2, ...)`` contributes
     ``(∂p_d/∂primary_k) * sf * ∏y^m`` to the sensitivity of every primary
-    parameter that appears in ``expr``, exactly mirroring the .net path's
-    ``derived_expansion`` machinery.
+    parameter that appears in ``expr`` -- the chain rule the ``.net`` codegen
+    path was once kept for ("issue #15"), until #803 retired that path.
 
     Every symbolic derivation this triggers — the Functional ∂func/∂p and both
     flavours of derived-parameter chain rule — shares one wall-clock budget
@@ -9952,8 +8907,7 @@ def generate_sens_from_model(
         _warn_functional_sens_rhs_refused(_tag_decline_at_moving_crossing(reason, _moving[0]))
 
     # Bail if any reaction is non-Elementary — analytical sens RHS is only
-    # defined for k * sf * ∏y^m kinetics. Same constraint as
-    # generate_sens_rhs_c (line 762-765) for the .net path.
+    # defined for k * sf * ∏y^m kinetics.
     # ``function_name`` is the key the derived-expansion lookup below uses, so
     # collect the same key here (not the parameter index) when deciding which
     # derived parameters can reach this RHS.
@@ -10071,12 +9025,13 @@ def generate_sens_from_model(
             functional_jacv_groups = functional_jacv_groups + mm_jacv
 
     derived_expansion: dict[str, dict[str, str]] = {}
-    # GH #99: one memo for the whole loop (see generate_sens_rhs_c). Separate
+    # GH #99: one memo for the whole loop, so a DAG node shared by several
+    # rate constants is differentiated once. Separate
     # from the Functional pass's — that one is scoped to its own scope object,
     # and both are pure functions of the same DAG, so neither can disagree.
     derived_jac_cache: dict[str, tuple[dict[str, str] | None, str | None]] = {}
     for p in params:
-        # As in generate_sens_rhs_c: only a derived parameter that is some
+        # Only a derived parameter that is some
         # reaction's rate constant reaches this RHS, so only those are
         # differentiated, and only those can invalidate it.
         if p.get("is_const", True) or p["name"] not in rate_const_names:
@@ -10107,7 +9062,7 @@ def generate_sens_from_model(
             )
             return None
         if reason is not None:
-            # Issue #56 — see generate_sens_rhs_c: a dropped chain rule here
+            # Issue #56: a dropped chain rule here
             # reads downstream as a hard zero, so refuse the analytic RHS and
             # let CVODES' internal difference quotient answer correctly.
             _refuse(_derived_rate_constant_decline(p["name"], expr, reason))
@@ -10134,8 +9089,7 @@ def generate_sens_from_model(
         ]
 
     # Build the normalized rxn_data shape consumed by _emit_sens_rhs_body.
-    # Reactant/product indices from codegen_data() are already 0-based, unlike
-    # the .net path which carries 1-based indices and shifts them here.
+    # Reactant/product indices from codegen_data() are already 0-based.
     # GH #75: per-species amount factor (volume_factor for amount_valued
     # species, else 1.0). An amount_valued reactant participates in the rate by
     # its amount (stored × V_c), so a reaction's rate carries the constant
@@ -10383,7 +9337,7 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
         if f["name"] in tfun_names:
             return None  # whole-body tfun → data->tfun_eval, unreachable here
         if any(f"tfun_{tname}(" in f["expression"] for tname in tfun_names):
-            return None  # embedded wrapper → the value codegen declines too
+            return None  # embedded wrapper → data->tfun_eval too, unreachable here
 
     # GH #75 amount factor, exactly as generate_rhs_from_model folds it in.
     av_factor, av_param = _amount_volume_factors(species)
@@ -10479,14 +9433,13 @@ def generate_outputs_from_model(model) -> str | None:
 
     # Embedded (wrapper-form) tfun — a tfun call nested inside arithmetic, e.g.
     # ``(tfun('drive') + 5)/k`` — is rewritten by the model to a synthetic helper
-    # reference ``tfun_<table>(...)`` (e.g. ``tfun_f_complex__tfun0()``). This reuses
-    # ``_emit_function_lines``, which only resolves a *whole-body* tfun (via
-    # ``tfun_call_by_name`` → a ``data->tfun_eval`` callback); it has no inline
-    # placeholder-substitution pass like the .net RHS (``generate_rhs_c`` L1109), so
-    # it would emit that ``tfun_<table>()`` token as an undeclared C call. Decline so
-    # the interpreted recorder is kept — both when appended onto the .net RHS (which
-    # compiles standalone, GH #163) and the model-based RHS (which cannot emit the
-    # embedded form either). Mirrors the rateOf / no-obs-no-func declines above.
+    # reference ``tfun_<table>()`` (e.g. ``tfun_f_complex__tfun0()``). Until #803
+    # ``_emit_function_lines`` resolved only a *whole-body* tfun and would have
+    # emitted that token as an undeclared C call, so this declined and kept the
+    # interpreted recorder. It resolves both now (the RHS needs it), but this
+    # evaluator has not been validated on the embedded form, so it still declines
+    # rather than change what these models record. Mirrors the rateOf /
+    # no-obs-no-func declines above.
     _tfun_table_names = [spec["name"] for spec in tfun_specs]
     for f in functions:
         if f["name"] in tfun_call_by_name:
@@ -10697,8 +9650,8 @@ def _compute_output_sens_analysis(model, core) -> dict:
 
     # Whole-body tfun functions dispatch through data->tfun_eval (a *value*
     # callback only; table functions are intentionally not differentiated, so
-    # their output sensitivity is unsupported). Embedded tfun wrappers make even
-    # the value codegen decline; mirror that decline.
+    # their output sensitivity is unsupported). A model with embedded tfun
+    # wrappers is declined whole, as the output evaluator declines it.
     tfun_call_by_name: dict[str, tuple[int, str]] = {}
     for tf_id, spec in enumerate(tfun_specs):
         kind = spec["index_kind"]
@@ -10717,7 +9670,8 @@ def _compute_output_sens_analysis(model, core) -> dict:
             continue
         if any(f"tfun_{tname}(" in f["expression"] for tname in _tfun_table_names):
             return {
-                "decline": "model uses embedded table-function wrappers (value codegen declines)",
+                "decline": "model uses embedded table-function wrappers "
+                "(table functions are not differentiated)",
                 "func_infos": [],
                 **base,
             }
@@ -11175,9 +10129,8 @@ def generate_combined_from_model(
 ) -> tuple[str, bool]:
     """Generate combined RHS + sensitivity RHS from a built model.
 
-    Returns ``(c_source, has_sens_rhs)``. Mirrors ``generate_combined_c``
-    for the .net path so the model-based pipeline emits the same combined
-    .so when sensitivity is supported.
+    Returns ``(c_source, has_sens_rhs)``. Every codegen build goes through here
+    since #803, ``.net`` and BNGL models included.
 
     The analytical Jacobian callback (``bngsim_codegen_jac`` dense, GH #76 Task 4,
     or ``bngsim_codegen_jac_sparse`` CSC, GH #162) and the output evaluator
@@ -11431,7 +10384,7 @@ def _record_codegen_sec(
     declined — on this thread, and on ``model`` when one is available (model-based
     prepare paths).
 
-    ``cache_hit`` is ``True`` when ``get_cached_so`` (or the .net memo) resolved an
+    ``cache_hit`` is ``True`` when ``get_cached_so`` resolved an
     existing .so without recompiling, ``False`` when a fresh ``cc`` compile ran,
     and ``None`` when no .so was involved at all (the MIR source-only paths, or a
     codegen failure). This is the definitive cache signal — not inferred from the
@@ -11451,22 +10404,6 @@ def _record_codegen_sec(
             model._codegen_sec = float(sec)
             model._codegen_cache_hit = cache_hit
             model._codegen_sens_decline = sens_decline
-
-
-def carry_codegen_stats(model) -> None:
-    """Copy this thread's most recent codegen stats onto *model*.
-
-    The ``.net`` entry points take a path rather than a Model, so they record only
-    to the thread-local; this is how the constructing Simulator hands the model
-    what a model-path ``prepare_*`` writes itself. One function rather than a
-    hand-copied pair at each call site, because the failure mode of the pair was
-    silent: a stat added to the recorder and forgotten at one site simply reads as
-    "no opinion" there forever.
-    """
-    with contextlib.suppress(AttributeError, TypeError):
-        model._codegen_sec = last_codegen_sec()
-        model._codegen_cache_hit = last_codegen_cache_hit()
-        model._codegen_sens_decline = last_sens_rhs_decline()
 
 
 def last_codegen_sec() -> float:
@@ -11541,8 +10478,7 @@ def prepare_model_codegen(model) -> Path | None:
     generates no source at all. It used to hash the generated source, which meant
     a hit skipped only the ``cc`` compile — on ``Smith_BMCSystBiol2013`` that left
     97% of ``Simulator`` construction being re-derived per construction, none of
-    it dependent on the parameter values a fit is moving. This mirrors what
-    ``prepare_codegen`` already does for the ``.net`` path.
+    it dependent on the parameter values a fit is moving.
 
     Parameters
     ----------
@@ -11572,8 +10508,7 @@ def prepare_model_codegen(model) -> Path | None:
         emit_output_sens = bool(getattr(model, "_want_output_sens", False))
         # Issue #209: resolved ONCE and handed to both the key and the generator,
         # so the two cannot drift into serving a sens-free .so to a sensitivity
-        # run. Same lock-step rule ``_codegen_emit_flags`` enforces for the .net
-        # path's four flags.
+        # run.
         emit_sens_rhs = want_sens_rhs(model)
         model_hash: str | None
         try:
@@ -11668,53 +10603,10 @@ def prepare_model_codegen(model) -> Path | None:
         )
 
 
-def prepare_codegen_source(net_path: str, model=None, emit_jac: bool = True) -> str:
-    """Generate the combined codegen C source for a .net model (GH #78).
-
-    The in-process MIR micro-JIT backend consumes this string directly instead
-    of compiling it to a .so with ``cc`` and dlopen'ing the result. It is the
-    SAME C source ``prepare_codegen`` compiles — RHS plus analytical sensitivity
-    RHS when every reaction is Elementary, plus (when ``model`` is supplied) the
-    analytical Jacobian (GH #162, gated by ``emit_jac``) and the output evaluator
-    (GH #136/#163) — so the JIT'd code is numerically identical to the cc-compiled
-    one and the JIT backend resolves the same compiled symbols. The emit flags are
-    derived from the SAME cheap model predicates ``prepare_codegen`` uses for its
-    cache key (``_codegen_emit_flags``), so the JIT and cc paths emit byte-identical
-    source for a given model. No caching: c2mir JIT is ~1-2 ms, far cheaper than the
-    SHA-256 + filesystem round-trip a cache would add.
-    """
-    t0 = time.perf_counter()
-    declines = _reset_sens_declines()
-    try:
-        parsed = _parse_net_file(net_path)
-        _validate_net_model_for_codegen(parsed, net_path)
-        (
-            want_jac,
-            want_outputs,
-            want_output_sens,
-            want_term_scale,
-            want_sens_rhs,
-        ) = _codegen_emit_flags(model, emit_jac)
-        c_source, _ = generate_combined_c(
-            net_path,
-            model,
-            emit_jac=want_jac,
-            emit_outputs=want_outputs,
-            emit_output_sens=want_output_sens,
-            emit_term_scale=want_term_scale,
-            emit_sens_rhs=want_sens_rhs,
-        )
-        return c_source
-    finally:
-        _record_codegen_sec(
-            None, time.perf_counter() - t0, sens_decline=declines[0] if declines else None
-        )
-
-
 def prepare_model_codegen_source(model) -> str | None:
     """Generate the combined codegen C source for a built model (GH #78).
 
-    Model-based analogue of ``prepare_codegen_source``: the same combined RHS +
+    The same combined RHS +
     sensitivity RHS + analytical Jacobian source ``prepare_model_codegen``
     compiles, returned as a string for the in-process MIR micro-JIT. Returns
     ``None`` (matching ``prepare_model_codegen``) if source generation fails.
@@ -11809,297 +10701,60 @@ def prepare_ssa_propensity_lib(model, *, force_recompile: bool = False) -> str |
         return None
 
 
-# Process-local memo for prepare_codegen (T2). Without it, every
-# Simulator(codegen=True, net_path=...) construction on an UNCHANGED .net
-# re-reads, re-parses, and SHA-256-hashes the file (two full reads + parse +
-# hash) only to resolve an already-cached .so — pure overhead under PyBNF's
-# construct-Simulator-per-eval pattern. The memo maps the .net's absolute path
-# to (so_path, dep_stamps, codegen_version); the fast path returns so_path after
-# only re-stat()ing the .net and any .tfun files it folds into the hash — no
-# read, no parse, no hash. dep_stamps captures the same file set
-# compute_model_hash() folds into the cache key, so editing the .net or any
-# referenced .tfun changes an mtime and forces a recompute, exactly matching the
-# no-memo behavior. _CODEGEN_CACHE_KEY is part of the validity test so a codegen
-# behavior change invalidates stale memo entries too — including one that edits an
-# emitter without bumping _CODEGEN_VERSION (issue #51).
-# Keyed by (net_abspath, want_jac, want_outputs, want_output_sens,
-# want_term_scale, functional_sens, sens_budget_tag, chunk_policy): the compiled
-# Jacobian (GH #162), output evaluator (GH #163), and expression
-# output-sensitivity evaluator (GH #198) are independent content-distinct
-# callbacks; the GH #67 A/B hatch changes the sensitivity RHS in place; and the
-# chunking policy (issue #174) changes generate_rhs_c's emitted text — so every
-# flag is part of the key, and an entry for one combination must never satisfy
-# another.
-_PREPARE_CODEGEN_MEMO: dict[
-    tuple[str, bool, bool, bool, bool, bool, str, tuple[int | None, int]],
-    tuple[Path, tuple[tuple[str, int], ...], str],
-] = {}
-_PREPARE_CODEGEN_MEMO_LOCK = threading.Lock()
-
-
-def _codegen_dep_stamps(net_path: str) -> tuple[tuple[str, int], ...]:
-    """(abspath, mtime_ns) for the .net and every .tfun it references.
-
-    Mirrors the file set ``compute_model_hash`` folds into the cache key, so the
-    memo invalidates on exactly the same edits. Reads the .net once; called only
-    on the cold (memo-miss) path, so it adds no cost to the fast path.
-    """
-    net_abs = os.path.abspath(net_path)
-    stamps: list[tuple[str, int]] = [(net_abs, os.stat(net_abs).st_mtime_ns)]
-    net_dir = Path(net_path).parent
-    try:
-        with open(net_path, "rb") as f:
-            net_text = f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return tuple(stamps)
-    for ref in _iter_tfun_file_refs(net_text):
-        ref_path = Path(ref)
-        if not ref_path.is_absolute():
-            ref_path = net_dir / ref_path
-        try:
-            stamps.append((os.path.abspath(ref_path), os.stat(ref_path).st_mtime_ns))
-        except OSError:
-            # Missing/unreadable tfun: compute_model_hash silently skips it too.
-            # Its absence is folded into the hash, so a later add → recompile.
-            continue
-    return tuple(stamps)
-
-
-def _codegen_dep_stamps_unchanged(dep_stamps: tuple[tuple[str, int], ...]) -> bool:
-    """True iff every recorded dependency still has its recorded mtime."""
-    for path, mtime in dep_stamps:
-        try:
-            if os.stat(path).st_mtime_ns != mtime:
-                return False
-        except OSError:
-            return False
-    return True
-
-
 def prepare_codegen(net_path: str, model=None, emit_jac: bool = True) -> Path:
-    """Generate C code, compile, and return .so path (with caching).
+    """Compile a ``.net`` model's codegen library and return its path.
 
-    This is the main entry point for the codegen pipeline.
-    It generates combined RHS + sensitivity RHS when possible.
-    The sensitivity RHS is included for all-Elementary models (analytical
-    df/dp + J*v), and — when ``model`` is supplied (GH #67) — for a Functional
-    model whose rate laws are smooth algebra, reconstructed from the built model
-    because the .net text alone has no expression to differentiate. MM models, and
-    Functional ones carrying a condition or a non-smooth builtin, still get the RHS
-    only, and CVODES uses internal FD for sensitivity. Issues #209/#217: none of
-    that runs at all except on a sensitivity run (:func:`want_sens_rhs`) — the
-    reconstruct-from-the-model step is the most expensive derivation in the build,
-    the .net text emission is over half a large plain build's source, and a plain
-    solve discards every byte of both — and the cache key carries the flag through
-    the ``:no_sens_rhs`` namespace below.
+    .. deprecated::
+        Codegen compiles the model bngsim built, whatever it was loaded from
+        (issue #803). Pass ``codegen=True`` to :class:`bngsim.Simulator`, or call
+        :func:`prepare_model_codegen` on the loaded model.
 
-    GH #162: when ``model`` (the built model for this .net) is supplied, ``emit_jac``
-    is set, and its analytical Jacobian is complete, the compiled analytical Jacobian
-    (``bngsim_codegen_jac`` dense / ``bngsim_codegen_jac_sparse`` CSC) is appended so
-    a .net-loaded large sparse model gets a compiled per-step Jacobian rather than
-    the interpreted fallback.
+    Kept so existing callers keep working, as a thin wrapper: ``model`` (loaded
+    from ``net_path`` with :meth:`bngsim.Model.from_net` when not given) goes
+    through :func:`prepare_model_codegen`. The ``.net`` file is no longer re-read
+    by a codegen parser of its own -- the second reading that disagreed with the
+    loader (#784). ``emit_jac`` derives the model's analytical Jacobian first,
+    as ``Simulator`` does, so the compiled one can be appended; the solver uses
+    it only when its ``jacobian`` asks for an analytical Jacobian.
 
-    GH #163: when ``model`` is supplied and it has observables/functions and no
-    ``rateOf`` csymbol, the compiled output evaluator (``bngsim_codegen_outputs``,
-    GH #136) is appended so the warm recording loop fills the per-row observable +
-    function buffers with one compiled call instead of the interpreted ExprTk pass.
-    This is INDEPENDENT of ``emit_jac`` — outputs are emitted for every ``jacobian``
-    strategy (``fd``/``jax`` record observables too).
-
-    The cache key gains a ``:codegen_jac``, ``:codegen_outputs``, and/or
-    ``:codegen_output_sens`` (GH #198) suffix so a .so carrying any of these
-    callbacks never collides with one without it. The suffixes
-    key off cheap O(1) model flags (not the generated source — ``_codegen_emit_flags``),
-    so a cross-process .so cache hit still avoids regenerating the (large) RHS source;
-    a Jacobian derivation that fails the GH #95 budget reports
-    ``analytical_jacobian_complete == False`` and drops the ``:codegen_jac`` suffix —
-    no cache poisoning.
-
-    Parameters
-    ----------
-    net_path : str
-        Path to the .net file.
-    model : optional
-        The built model (``Model`` or ``NetworkModel``) for this .net. When an
-        analytical Jacobian is wanted (``emit_jac``), the caller must have prepared
-        it (``prepare_analytical_jacobian``). Pass ``None`` to keep RHS(+sens)-only.
-    emit_jac : bool
-        Whether to append the analytical Jacobian (``jacobian`` in ``auto``/
-        ``analytical``). Does not affect the output evaluator, which is emitted
-        whenever ``model`` qualifies.
-
-    Returns
-    -------
-    Path
-        Path to the compiled shared library.
+    Raises
+    ------
+    ValueError
+        When the model has no species or no reactions -- what an SBML file
+        passed as ``net_path`` loads as (GH #101) -- as the old path did.
+    RuntimeError
+        When the build fails or codegen declines the model, where the old path
+        raised too.
     """
-    t0 = time.perf_counter()
-    cache_hit: bool | None = None
-    declines = _reset_sens_declines()
-    try:
-        net_key = os.path.abspath(net_path)
+    import warnings
 
-        # Two independent compiled-callback decisions, both from cheap O(1) model
-        # flags (no RHS source-gen): the analytical Jacobian (GH #162, gated by
-        # emit_jac + completeness + A/B hatch) and the output evaluator (GH #163,
-        # whenever the model has obs/func and no rateOf — independent of emit_jac).
-        (
-            want_jac,
-            want_outputs,
-            want_output_sens,
-            want_term_scale,
-            want_sens_rhs,
-        ) = _codegen_emit_flags(model, emit_jac)
-        # The GH #67 hatch is process-scoped, not file-scoped, so it belongs in the
-        # in-process memo key as well as the on-disk one below — a test that flips
-        # it mid-process must not be handed the other variant's .so. GH #90's
-        # derivation-budget override is process-scoped in exactly the same way and
-        # decides exactly the same thing (whether the analytic sens RHS is emitted),
-        # so it rides along in both keys.
-        # The chunking hatch rides along for exactly the same reason (issue #174):
-        # BNGSIM_CODEGEN_CHUNK changes generate_rhs_c's emitted text — 4,974 chars
-        # to 5,385 on akt-signaling — and nothing else in this key saw it, so a
-        # chunked run was handed the unchunked .so and an A/B of the feature
-        # measured one binary twice. Resolved through the two policy functions
-        # rather than read raw, so `on` and `true` do not make two keys for one
-        # source. Same shape as the GH #67 hatch below: this is the fourth
-        # process-scoped knob that changes the emitted source, and the .net key is
-        # built from the file's bytes, so every one of them has to be here.
-        chunk_policy = (_chunk_threshold(), _chunk_block_size())
-        memo_key = (
-            net_key,
-            want_jac,
-            want_outputs,
-            want_output_sens,
-            want_term_scale,
-            want_sens_rhs,
-            _sens_budget_cache_tag(),
-            chunk_policy,
+    warnings.warn(
+        "bngsim.prepare_codegen(net_path) is deprecated: codegen compiles the built "
+        "model (issue #803). Pass codegen=True to Simulator instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if model is None or not hasattr(model, "_core"):
+        from bngsim._model import Model
+
+        model = Model.from_net(net_path)
+    if model.n_species == 0 or model.n_reactions == 0:
+        raise ValueError(
+            "codegen net_path must point to a BioNetGen .net file with non-empty "
+            f"species and reactions sections; loaded {net_path!r} as "
+            f"{model.n_species} species and {model.n_reactions} reactions. For SBML "
+            "or Antimony models, load the model first and use Simulator(..., "
+            "codegen=True) without passing the SBML/XML file as net_path."
         )
-
-        # Fast path (T2): an unchanged .net (and its .tfun deps) resolves to the
-        # already-cached .so via a few stat() calls, skipping the re-read +
-        # re-parse + SHA-256 the cold path below performs.
-        with _PREPARE_CODEGEN_MEMO_LOCK:
-            entry = _PREPARE_CODEGEN_MEMO.get(memo_key)
-        if entry is not None:
-            memo_so, dep_stamps, ver = entry
-            if (
-                ver == _CODEGEN_CACHE_KEY
-                and memo_so.exists()
-                and _codegen_dep_stamps_unchanged(dep_stamps)
-            ):
-                logger.debug("Codegen memo hit: %s", memo_so)
-                cache_hit = True  # memo resolved an existing .so, no recompile
-                # Issue #438: the memo skips source generation too, so the decline
-                # is as silent here as on an on-disk cache hit.
-                _replay_sens_decline(memo_so)
-                return memo_so
-
-        parsed = _parse_net_file(net_path)
-        _validate_net_model_for_codegen(parsed, net_path)
-
-        model_hash = compute_model_hash(net_path)
-        # Distinct cache key per appended-callback combination; cheap to derive (no
-        # RHS source-gen), so cross-process cache hits stay fast. The ":codegen_jac"
-        # form is byte-identical to GH #162 so a Jacobian-only .so still hits its
-        # existing cache entry; ":codegen_outputs" is appended independently.
-        suffix = ""
-        if want_jac:
-            suffix += ":codegen_jac"
-        if want_outputs:
-            suffix += ":codegen_outputs"
-        if want_output_sens:
-            suffix += ":codegen_output_sens"
-        if want_term_scale:
-            suffix += ":sens_term_scale"
-        # Two namespaces, because since #217 these are two different sources.
-        #
-        # ":no_functional_sens" is GH #67's: the A/B hatch changes the emitted
-        # source but nothing else in the key. Under #209 a build with the hatch SET
-        # and a build with nobody asking produced the SAME source — neither emitted
-        # a Functional ∂f/∂p, and both emitted the Elementary sens RHS — so they
-        # shared it. #217 gates the Elementary half as well, so "nobody asked" now
-        # means no bngsim_codegen_sens_rhs at all while "hatch set" still means the
-        # Elementary one is there. Sharing a namespace across that difference is
-        # the issue #51 inertness trap.
-        #
-        # Both are appended only when something is off, so the ordinary
-        # sensitivity-run key — and every .so already cached for one — is unchanged.
-        if not want_sens_rhs:
-            suffix += ":no_sens_rhs"
-        elif not functional_sens_rhs_enabled():
-            suffix += ":no_functional_sens"
-        suffix += _sens_budget_cache_tag()
-        # Issue #174: appended only when the chunking policy is OVERRIDDEN, so the
-        # default key — and every .so already in this cache — stays byte-identical,
-        # exactly as the GH #162 form above is preserved.
-        if chunk_policy != (_DEFAULT_CHUNK_THRESHOLD, _DEFAULT_CHUNK_SIZE):
-            suffix += f":chunk={chunk_policy[0]}x{chunk_policy[1]}"
-        if suffix:
-            model_hash = hashlib.sha256((model_hash + suffix).encode()).hexdigest()[:16]
-
-        # Check cache first
-        cached = get_cached_so(model_hash)
-        if cached is not None:
-            logger.debug("Codegen cache hit: %s", cached)
-            cache_hit = True
-            _replay_sens_decline(cached)  # issue #438
-            so_path = cached
-        else:
-            # Generate combined RHS + sensitivity RHS (+ Jacobian / + output
-            # evaluator when wanted). model=None when neither is wanted keeps the
-            # historical RHS(+sens)-only source byte-for-byte.
-            c_source, has_sens = generate_combined_c(
-                net_path,
-                model
-                if (
-                    want_jac
-                    or want_outputs
-                    or want_output_sens
-                    or want_term_scale
-                    or want_sens_rhs
-                )
-                else None,
-                emit_jac=want_jac,
-                emit_outputs=want_outputs,
-                emit_output_sens=want_output_sens,
-                emit_term_scale=want_term_scale,
-                emit_sens_rhs=want_sens_rhs,
-            )
-            extra = ", ".join(
-                n
-                for n, on in (
-                    ("analytical Jacobian", want_jac),
-                    ("outputs", want_outputs),
-                    ("output sensitivities", want_output_sens),
-                )
-                if on
-            )
-            extra_note = f" + {extra}" if extra else ""
-            if has_sens:
-                logger.info("Codegen: combined RHS + sensitivity RHS (analytical)%s", extra_note)
-            elif not want_sens_rhs:
-                # Issue #209 — "nobody asked" is not "this model declined".
-                logger.info("Codegen: RHS only (no sensitivity requested)%s", extra_note)
-            else:
-                logger.info("Codegen: RHS only (Functional/MM model, no sens RHS)%s", extra_note)
-            cache_hit = False
-            so_path = compile_rhs(c_source, model_hash)
-            if declines and not has_sens:
-                write_sens_decline_note(so_path, declines[0])  # issue #438
-
-        with _PREPARE_CODEGEN_MEMO_LOCK:
-            _PREPARE_CODEGEN_MEMO[memo_key] = (
-                so_path,
-                _codegen_dep_stamps(net_path),
-                _CODEGEN_CACHE_KEY,
-            )
-        return so_path
-    finally:
-        _record_codegen_sec(
-            None,
-            time.perf_counter() - t0,
-            cache_hit,
-            declines[0] if declines else None,
+    if emit_jac:
+        model.prepare_analytical_jacobian()
+    so_path = prepare_model_codegen(model)
+    if so_path is None:
+        cause = last_codegen_error()
+        if cause is not None:
+            raise RuntimeError(f"codegen build failed for {net_path}: {cause}") from cause
+        raise RuntimeError(
+            f"codegen declined {net_path}: a cyclic function dependency has no emit "
+            "order (issue #621)"
         )
+    return so_path

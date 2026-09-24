@@ -32,10 +32,9 @@ import numpy as np
 import pytest
 from bngsim._codegen import (
     CodegenDeclined,
-    _codegen_emit_flags,
     _topological_function_order,
     generate_outputs_from_model,
-    prepare_codegen,
+    prepare_model_codegen,
 )
 
 _CC = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
@@ -271,21 +270,18 @@ def test_generate_outputs_declines_rateof_model(monkeypatch):
 </sbml>"""
     m = bngsim.Model.from_sbml_string(rateof_sbml)
     assert generate_outputs_from_model(m) is None
-    # The .net cache-key predicate must agree with the emitter's decline so the
-    # interpreted recorder is kept for these models (GH #163): want_outputs is
-    # False regardless of the Jacobian strategy.
-    assert _codegen_emit_flags(m, emit_jac=True)[1] is False
-    assert _codegen_emit_flags(m, emit_jac=False)[1] is False
 
 
-# ─── .net codegen path carries the output evaluator (GH #163) ─────────────────
+# ─── A .net model's codegen carries the output evaluator (GH #163) ────────────
 #
-# bngsim_codegen_outputs was emitted only by the model-based path; a model loaded
-# via Model.from_net + Simulator(codegen=True) — the genome-scale workflow — got a
-# compiled RHS (+ Jacobian since #162) but the *interpreted* per-row recording.
-# These pin that the .net codegen now appends the compiled evaluator, that it is
-# emitted independently of the Jacobian strategy, that recorded values match the
-# interpreted recorder, and that the decline-cleanly cases still fall back.
+# bngsim_codegen_outputs was once emitted only by the model-based path; a model
+# loaded via Model.from_net + Simulator(codegen=True) — the genome-scale workflow —
+# got a compiled RHS (+ Jacobian since #162) but the *interpreted* per-row
+# recording. GH #163 appended it to the .net codegen; since #803 a .net model
+# compiles through the model-based path itself. These pin that a .net model's
+# artifact carries the compiled evaluator, that it is emitted independently of the
+# Jacobian strategy, that recorded values match the interpreted recorder, and that
+# the decline-cleanly cases still fall back.
 
 
 def _chain_net_with_obs_and_func(n_species: int = 3) -> str:
@@ -354,41 +350,37 @@ def _so_has_symbol(so_path, name: str) -> bool:
 
 @needs_cc
 def test_net_codegen_path_appends_outputs(tmp_path):
-    # prepare_codegen, given the built model, appends bngsim_codegen_outputs onto
-    # the .net RHS in one .so — so a .net-loaded model gets the compiled per-row
-    # recorder, not the interpreted fallback.
+    # A .net-loaded model's .so carries bngsim_codegen_outputs beside the RHS, so
+    # it gets the compiled per-row recorder, not the interpreted fallback.
     net = _write(tmp_path, "chain.net", _chain_net_with_obs_and_func())
     m = bngsim.Model.from_net(net)
     m.prepare_analytical_jacobian()
 
-    so = prepare_codegen(net, m)
+    so = prepare_model_codegen(m)
     assert _so_has_symbol(so, "bngsim_codegen_rhs")
     assert _so_has_symbol(so, "bngsim_codegen_outputs")
 
-    # The same .net WITHOUT a model stays RHS-only (historical behavior) and gets a
-    # DISTINCT cache key, so it never collides with the outputs-carrying .so.
-    so_rhs_only = prepare_codegen(net)
-    assert not _so_has_symbol(so_rhs_only, "bngsim_codegen_outputs")
-    assert so_rhs_only != so
-
 
 @needs_cc
-def test_net_codegen_outputs_independent_of_jacobian_strategy(tmp_path):
-    # The key GH #163 decoupling: the output evaluator is emitted for EVERY
-    # jacobian strategy, while the analytical Jacobian is gated on emit_jac. With
-    # emit_jac=False (jacobian="fd"/"jax"), the .so must carry the outputs symbol
-    # but NOT the Jacobian symbol.
+def test_net_codegen_outputs_independent_of_jacobian_strategy(tmp_path, monkeypatch):
+    # The key GH #163 decoupling: the output evaluator is emitted whether or not
+    # the compiled Jacobian is. The Jacobian rides along only when the model's
+    # analytical Jacobian is complete (and the solver installs it only for
+    # jacobian="auto"/"analytical"); BNGSIM_NO_CODEGEN_JAC=1 withholds it, which
+    # must leave the outputs symbol in place.
     net = _write(tmp_path, "chain.net", _chain_net_with_obs_and_func())
     m = bngsim.Model.from_net(net)
     m.prepare_analytical_jacobian()
 
-    so_fd = prepare_codegen(net, m, emit_jac=False)
+    monkeypatch.setenv("BNGSIM_NO_CODEGEN_JAC", "1")
+    so_fd = prepare_model_codegen(m)
     assert _so_has_symbol(so_fd, "bngsim_codegen_outputs")
     assert not _so_has_symbol(so_fd, "bngsim_codegen_jac")
     assert not _so_has_symbol(so_fd, "bngsim_codegen_jac_sparse")
 
-    # With the Jacobian wanted, both symbols coexist in a distinct .so.
-    so_jac = prepare_codegen(net, m, emit_jac=True)
+    # With the Jacobian emitted, both symbols coexist in a distinct .so.
+    monkeypatch.delenv("BNGSIM_NO_CODEGEN_JAC")
+    so_jac = prepare_model_codegen(m)
     assert _so_has_symbol(so_jac, "bngsim_codegen_outputs")
     assert _so_has_symbol(so_jac, "bngsim_codegen_jac")  # small/dense model
     assert so_jac != so_fd
@@ -400,9 +392,9 @@ def test_net_codegen_declines_no_observables(tmp_path):
     # output evaluator (the simulator keeps the interpreted recorder).
     net = _write(tmp_path, "bare.net", _no_obs_net())
     m = bngsim.Model.from_net(net)
-    assert _codegen_emit_flags(m, emit_jac=True)[1] is False
+    assert generate_outputs_from_model(m) is None
 
-    so = prepare_codegen(net, m)
+    so = prepare_model_codegen(m)
     assert _so_has_symbol(so, "bngsim_codegen_rhs")
     assert not _so_has_symbol(so, "bngsim_codegen_outputs")
 
@@ -418,7 +410,6 @@ def _run_net(net: str, *, codegen: bool, jacobian: str, monkeypatch):
         method="ode",
         jacobian=jacobian,
         codegen=True if codegen else None,
-        net_path=net,
     )
     r = sim.run(t_span=(0.0, 6.0), n_points=31, rtol=1e-9, atol=1e-12)
     return sim, m, r
@@ -462,10 +453,10 @@ _DET_CHILD = textwrap.dedent(
     import os, sys, hashlib
     os.environ["BNGSIM_NO_CODEGEN"] = "1"
     import bngsim
-    from bngsim._codegen import generate_combined_c
+    from bngsim._codegen import generate_combined_from_model
     m = bngsim.Model.from_net(sys.argv[1])
     m.prepare_analytical_jacobian()
-    src, _ = generate_combined_c(sys.argv[1], m, emit_jac=True, emit_outputs=True)
+    src, _ = generate_combined_from_model(m)
     assert "int bngsim_codegen_outputs(" in src, "expected output evaluator"
     sys.stdout.write(hashlib.sha256(src.encode()).hexdigest())
     """
@@ -474,7 +465,7 @@ _DET_CHILD = textwrap.dedent(
 
 @needs_cc
 def test_net_codegen_outputs_pythonhashseed_independent(tmp_path):
-    # Byte-determinism: the combined .net source (RHS + Jacobian + output evaluator)
+    # Byte-determinism: a .net model's combined source (RHS + Jacobian + output evaluator)
     # must be identical across PYTHONHASHSEED values — the emitter sorts every
     # set/dict iteration, so the obs[]/func[] copy loops never reorder.
     net = _write(tmp_path, "chain.net", _chain_net_with_obs_and_func())

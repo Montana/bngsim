@@ -156,9 +156,9 @@ class TestParameterProbe:
         warm.prepare_analytical_jacobian()
         # Issue #217: the sens RHS is emitted only for a build that asks for it.
         # ``Simulator`` sets this from ``sensitivity_params``; this test drives
-        # ``prepare_codegen`` directly, so it says so itself.
+        # ``prepare_model_codegen`` directly, so it says so itself.
         warm._want_output_sens = True
-        so = str(cg.prepare_codegen(str(_RECIPROCAL), warm, emit_jac=True))
+        so = str(cg.prepare_model_codegen(warm))
 
         fd_result, fd = _core_sensitivity(_RECIPROCAL, ["KD", "kon", "koff"])
         an_result, an = _core_sensitivity(_RECIPROCAL, ["KD", "kon", "koff"], so_path=so)
@@ -276,9 +276,9 @@ class TestCancelledTerm:
         warm.prepare_analytical_jacobian()
         # Issue #217: the sens RHS is emitted only for a build that asks for it.
         # ``Simulator`` sets this from ``sensitivity_params``; this test drives
-        # ``prepare_codegen`` directly, so it says so itself.
+        # ``prepare_model_codegen`` directly, so it says so itself.
         warm._want_output_sens = True
-        so = str(cg.prepare_codegen(str(_CANCELLED), warm, emit_jac=True))
+        so = str(cg.prepare_model_codegen(warm))
         params = ["ktrace", "ksyn", "kdeg"]
 
         fd_result, fd = _core_sensitivity(_CANCELLED, params)

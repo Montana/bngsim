@@ -20,7 +20,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim._bngsim_core import CvodeSimulator, NetworkModel, SolverOptions, TimeSpec
-from bngsim._codegen import prepare_codegen, prepare_codegen_source
+from bngsim._codegen import prepare_model_codegen, prepare_model_codegen_source
 
 # Skip the whole module unless this extension actually embeds MIR.
 pytestmark = pytest.mark.skipif(
@@ -58,7 +58,7 @@ def _timespec(t_end, n_points):
 
 def _run_cc(net_path, ts):
     """Default backend: compile the codegen C source with cc, dlopen, integrate."""
-    so = str(prepare_codegen(net_path))
+    so = str(prepare_model_codegen(bngsim.Model.from_net(net_path)))
     m = NetworkModel.from_net(net_path)
     s = CvodeSimulator(m)
     opts = SolverOptions()
@@ -68,8 +68,8 @@ def _run_cc(net_path, ts):
 
 def _run_mir(net_path, ts):
     """MIR backend: JIT the same codegen C source in-process (codegen_c_source)."""
-    src = prepare_codegen_source(net_path)
-    assert src, "prepare_codegen_source returned empty C source"
+    src = prepare_model_codegen_source(bngsim.Model.from_net(net_path))
+    assert src, "prepare_model_codegen_source returned empty C source"
     m = NetworkModel.from_net(net_path)
     s = CvodeSimulator(m)
     opts = SolverOptions()

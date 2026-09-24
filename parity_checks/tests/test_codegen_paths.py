@@ -20,8 +20,9 @@ classification
   * any model/.net difference leads the verdict; a tight re-run that did not
     finish is not reported as a disagreement
 arm wiring (needs a C compiler)
-  * the net and model arms really take the two different codegen paths and
-    agree with the interpreter on the derived-rate-constant fixture
+  * since #803 step 3 the net and model arms both compile the built model: the
+    same artifact, bit-identical results, and agreement with the interpreter on
+    the derived-rate-constant fixture (until then they took the two paths)
 """
 
 from __future__ import annotations
@@ -163,9 +164,12 @@ def _have_cc() -> bool:
 
 @pytest.mark.skipif(not _have_cc(), reason="needs bngsim and a C compiler for codegen")
 @pytest.mark.parametrize("sens", [False, True], ids=["plain", "sensitivity"])
-def test_arms_take_distinct_codegen_paths_and_agree(tmp_path, sens):
-    """The positive control the sweep's comparisons rest on: two arms that
-    silently ran the same code would report perfect agreement."""
+def test_net_and_model_arms_compile_the_built_model_and_agree(tmp_path, sens):
+    """The arm wiring on a current bngsim. Until #803 step 3 this was the
+    positive control that the two arms took two different codegen paths (two arms
+    that silently ran the same code would report perfect agreement); since then
+    there is one path, so the net arms must build exactly the model arms' artifact
+    and the cells must record that they ran without a .net path."""
     net = REPO / "tests" / "data" / "derived_rate_const.net"
     spec = json.dumps({"t_end": 5.0, "n_points": 6, "sens_params": ["kon", "chi"]})
     env = {**os.environ, "BNGSIM_CODEGEN_CACHE_DIR": str(tmp_path / "cg")}
@@ -183,8 +187,9 @@ def test_arms_take_distinct_codegen_paths_and_agree(tmp_path, sens):
         out[arm] = (meta, np.load(tmp_path / f"{arm}.npz"))
     n, m = arms[1], arms[2]
     assert out[n][0]["backend"] == out[m][0]["backend"] == "cc"
-    assert out[n][0]["sim_net_path"] and not out[m][0]["sim_net_path"]
-    assert out[n][0]["so"] != out[m][0]["so"]
+    assert out[n][0]["net_codegen_path"] is out[m][0]["net_codegen_path"] is False
+    assert out[n][0]["so"] == out[m][0]["so"]
+    np.testing.assert_array_equal(out[n][1]["species"], out[m][1]["species"])
     ref = out["interp"][1]["species"]
     for arm in (n, m):
         assert traj_err(out[arm][1]["species"], ref) < 1e-6
@@ -193,4 +198,4 @@ def test_arms_take_distinct_codegen_paths_and_agree(tmp_path, sens):
         # _rateLaw1 = chi*kon makes dA/dkon = chi * dA/d_rateLaw1 = (chi/kon) dA/dchi.
         s = out[m][1]["sens"]
         np.testing.assert_allclose(s[:, :, 0], 10.0 * s[:, :, 1], rtol=1e-6, atol=1e-12)
-        np.testing.assert_allclose(out[n][1]["sens"], s, rtol=1e-8, atol=1e-14)
+        np.testing.assert_array_equal(out[n][1]["sens"], s)

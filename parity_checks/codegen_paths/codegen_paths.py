@@ -355,9 +355,14 @@ def model_row(p: dict, d: Path) -> dict:
             r[f"{arm}_exc"] = f"{m.get('exc_type')}: {(m.get('exc') or '')[:300]}"
         if arm in ("net", "model", "net_sens", "model_sens") and m:
             if ok(m):
-                r[f"{arm}_path_ok"] = m.get("backend") == "cc" and bool(
-                    m.get("sim_net_path")
-                ) == arm.startswith("net")
+                if m.get("net_codegen_path", True):
+                    took_its_path = bool(m.get("sim_net_path")) == arm.startswith("net")
+                else:
+                    # Since #803 step 3 both arms compile the built model: the
+                    # control is that they built the same artifact.
+                    twin = M[arm.replace("net", "model", 1) if arm.startswith("net") else arm]
+                    took_its_path = bool(twin) and m.get("so") == twin.get("so")
+                r[f"{arm}_path_ok"] = m.get("backend") == "cc" and took_its_path
                 r[f"{arm}_codegen_sec"] = m.get("codegen_sec")
                 r[f"{arm}_gen_sec"] = sum(g["sec"] for g in m.get("gen", []))
                 r[f"{arm}_c_bytes"] = sum(c["bytes"] for c in m.get("compiles", []))

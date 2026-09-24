@@ -42,7 +42,6 @@ from bngsim._atol import (
 )
 from bngsim._codegen import (
     _codegen_jit_backend,
-    carry_codegen_stats,
     last_codegen_error,
     read_sens_decline_note,
 )
@@ -222,6 +221,22 @@ _UNAVAILABLE_NF_METHODS: dict[str, str] = _unavailable_nf_methods
 # sensitivity auto-codegen path here share one source of truth.
 
 
+def _codegen_refusal(cause: BaseException | None) -> str:
+    """Why ``codegen=True`` could not be honoured: the build failed (``cause``, as
+    :func:`bngsim._codegen.last_codegen_error` recorded it) or codegen declined the
+    model (a cyclic function graph, issue #621, has no emit order)."""
+    if cause is not None:
+        return (
+            "codegen=True requested, but the codegen build failed "
+            f"({type(cause).__name__}: {cause})."
+        )
+    return (
+        "codegen=True requested, but codegen declined this model (a cyclic "
+        "function dependency has no emit order, issue #621); run it on the "
+        "interpreted RHS with codegen=None or codegen=False."
+    )
+
+
 def normalize_method(requested: str) -> tuple[str, str]:
     """Normalize a user-requested method token to its canonical form.
 
@@ -341,17 +356,16 @@ class Simulator:
         lets NFsim auto-compute a suggested limit from the XML.
 
     codegen : bool, optional
-        Only used for ``method="ode"``. When true, use a compiled C RHS.
-        Models loaded from BioNetGen ``.net`` files use the ``.net``
-        codegen path. SBML, Antimony, and other already-built models use
-        model-based codegen. For SBML/Antimony models, pass
-        ``codegen=True`` without ``net_path``.
+        Only used for ``method="ode"``. When true, use a compiled C RHS,
+        generated from the model bngsim built -- whatever it was loaded from
+        (``.net``, BNGL, SBML, Antimony or the builder). ``None`` (default)
+        compiles automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species
+        (256), where native code beats the interpreter; ``False`` never does.
 
     net_path : str, optional
-        BioNetGen ``.net`` path for the ``.net`` codegen path. This is not
-        a generic model path and should not point to SBML XML. Models loaded
-        with :meth:`Model.from_net` remember their source path, so most
-        callers do not need to pass this manually.
+        BioNetGen ``.net`` path, required by ``jacobian="jax"``, which reads the
+        file itself. Codegen does not read it: it compiles the model bngsim
+        built.
 
     sensitivity_params : list[str], optional
         Parameter names to integrate forward sensitivities for, alongside
@@ -619,8 +633,8 @@ class Simulator:
         # self._sensitivity_* assignments) reads it to decide whether to emit the
         # bngsim_codegen_output_sens evaluator. Its build-time differentiation is
         # expensive on large functional models, so a non-sensitivity run must not
-        # pay it. The .so cache key carries this flag (prepare_codegen), so a
-        # non-sensitivity .so is never reused for a sensitivity run.
+        # pay it. The .so cache key carries this flag (prepare_model_codegen), so
+        # a non-sensitivity .so is never reused for a sensitivity run.
         #
         # Issue #209: the flag is also the RECORD of what the codegen artifact
         # already sitting on the model was built with — ``_prepare_output_sens_codegen``
@@ -893,19 +907,22 @@ class Simulator:
             # emitter (generate_jacobian_from_model) declines unless
             # analytical_jacobian_complete is set, so the attach must populate it
             # first — the load-time "attach before codegen" invariant, preserved.
-            # Scope matches the loader's original step 12: SBML / builder models
-            # only (a .net model carries _net_path and codegens via its own .net
-            # path on explicit codegen=True, never the model-based path here — that
-            # keeps issue #15's derived-parameter chain rules). Skipped when the
-            # caller set codegen explicitly (True is handled below; False opts
-            # out), when BNGSIM_NO_CODEGEN is set, when the model already prepared
-            # codegen (a prior Simulator — amortized, like the load-time path was),
-            # or below threshold. Writes onto the model so the reuse block below
-            # inherits it and a warm clone carries it, exactly as the loader did.
+            # Every model qualifies, .net and BNGL ones included: since #803 every
+            # codegen build compiles the built model, so a .net model no longer
+            # needs a path of its own (it used to be excluded to keep "issue #15's
+            # derived-parameter chain rules", which the model path has handled
+            # since #99). Skipped when the caller set codegen explicitly (True is
+            # handled below; False opts out), when BNGSIM_NO_CODEGEN is set, when
+            # the model already prepared codegen (a prior Simulator — amortized,
+            # like the load-time path was), below threshold, and on a sensitivity
+            # run: _auto_codegen_for_sensitivity builds the same artifact there, so
+            # building it here too only paid a failed compile twice (#803: 1231 s
+            # to fail instead of 601 s on a 172k-reaction network). Writes onto
+            # the model so the reuse block below inherits it and a warm clone
+            # carries it, exactly as the loader did.
             if (
                 codegen is None
-                and not net_path_str
-                and not getattr(model, "_net_path", "")
+                and not want_sens_run
                 and not getattr(model, "_codegen_so_path", "")
                 and not getattr(model, "_codegen_c_source", "")
                 and not os.environ.get("BNGSIM_NO_CODEGEN")
@@ -930,48 +947,22 @@ class Simulator:
                     logger.debug("Auto-codegen skipped: %s", e)
 
         if codegen and dispatch == "ode":
-            model_net_path = getattr(model, "_net_path", "")
-            explicit_net_path = bool(net_path_str) and Path(net_path_str).suffix.lower() == ".net"
-            use_net = explicit_net_path or (model_net_path and not net_path_str)
-            codegen_path = net_path_str if explicit_net_path else model_net_path
-
-            # Pass the built model to the .net codegen so the .so also carries the
-            # compiled callbacks reconstructed from the (fully-populated) model:
-            #   * GH #162 — the analytical Jacobian (dense / sparse CSC), but ONLY
-            #     when an analytical Jacobian is wanted (prepared at L625 above);
-            #     "fd"/"jax" keep the .net RHS Jacobian-free.
-            #   * GH #163 — the compiled output evaluator (bngsim_codegen_outputs),
-            #     emitted whenever the model qualifies (obs/func, no rateOf),
-            #     INDEPENDENT of the Jacobian strategy — "fd"/"jax" record
-            #     observables too, so the model is passed unconditionally and the
-            #     emit_jac flag (not model=None) gates the Jacobian.
-            # prepare_codegen declines each callback cleanly when it does not apply.
-            emit_jac = jacobian in ("auto", "analytical")
+            # Every model compiles from the model bngsim built (#803): the RHS,
+            # the analytical Jacobian (GH #162, when complete), the compiled output
+            # evaluator (GH #136/#163) and, on a sensitivity run, the sensitivity
+            # RHS. A .net or BNGL model used to be re-read from its file by a
+            # second parser instead, and the two readings disagreed (#784).
+            from bngsim._codegen import last_codegen_error
 
             if jit_backend:
                 # JIT path: generate the C source string; the C++ MirJit backend
                 # compiles it in-process. No `cc` subprocess, no .so, no dlopen.
-                if use_net:
-                    from bngsim._codegen import prepare_codegen_source
+                from bngsim._codegen import prepare_model_codegen_source
 
-                    self._codegen_c_source = prepare_codegen_source(
-                        codegen_path, model, emit_jac=emit_jac
-                    )
-                    self._net_path = codegen_path
-                    # .net-path prepares record only to the thread-local (no
-                    # Model arg); surface what they recorded on the model.
-                    carry_codegen_stats(model)
-                else:
-                    from bngsim._codegen import prepare_model_codegen_source
-
-                    self._net_path = ""
-                    src = prepare_model_codegen_source(model)
-                    if src is None:
-                        raise RuntimeError(
-                            "codegen=True requested, but model-based codegen failed. "
-                            "For .net models, pass net_path=... pointing to the .net file."
-                        )
-                    self._codegen_c_source = src
+                src = prepare_model_codegen_source(model)
+                if src is None:
+                    raise RuntimeError(_codegen_refusal(last_codegen_error()))
+                self._codegen_c_source = src
                 if hasattr(model, "_codegen_c_source"):
                     model._codegen_c_source = self._codegen_c_source
                 logger.info(
@@ -980,26 +971,11 @@ class Simulator:
                     len(self._codegen_c_source),
                 )
             else:
-                if use_net:
-                    from bngsim._codegen import prepare_codegen
+                from bngsim._codegen import prepare_model_codegen
 
-                    # prepare_codegen returns Path; the else-branch's
-                    # prepare_model_codegen returns Path | None (None-checked
-                    # below), so the variable must carry the union (pre-existing
-                    # mypy gap).
-                    so_path: Path | None = prepare_codegen(codegen_path, model, emit_jac=emit_jac)
-                    self._net_path = codegen_path
-                    carry_codegen_stats(model)  # T0.3 (see above)
-                else:
-                    from bngsim._codegen import prepare_model_codegen
-
-                    self._net_path = ""
-                    so_path = prepare_model_codegen(model)
-                    if so_path is None:
-                        raise RuntimeError(
-                            "codegen=True requested, but model-based codegen failed. "
-                            "For .net models, pass net_path=... pointing to the .net file."
-                        )
+                so_path = prepare_model_codegen(model)
+                if so_path is None:
+                    raise RuntimeError(_codegen_refusal(last_codegen_error()))
                 self._codegen_so_path = str(so_path)
                 if hasattr(model, "_codegen_so_path"):
                     model._codegen_so_path = self._codegen_so_path
@@ -1871,15 +1847,12 @@ class Simulator:
                 "interpreted finite-difference sensitivity path was retired "
                 "because it silently fails at tight tolerances; GH #214)."
             )
-        # Prefer the .net path when the model carries a net_path
-        # (Model.from_net stashes it). The .net codegen handles derived-parameter
-        # chain rules (e.g., ``_rateLaw{N} = chi*kon``) that the model-based path
-        # does not (issue #15). Falls through to model-based codegen for
-        # from_sbml / from_antimony / from_builder.
-        model_net_path = getattr(model, "_net_path", "")
-        # GH #163 appends the compiled output evaluator whenever the model
-        # qualifies; GH #162 appends the analytical Jacobian when one is wanted.
-        emit_jac = self._jacobian in ("auto", "analytical")
+        # Every model, .net and BNGL ones included, builds its sensitivity RHS
+        # from the model bngsim built (#803). The .net path this replaced was kept
+        # for "issue #15's derived-parameter chain rules", which the model path
+        # has expanded since #99 (DAG-aware); #803's corpus sweep found the two
+        # paths' sensitivities byte-identical wherever the .net reader read the
+        # file correctly.
         auto_src: str | None = None
         auto_so: Path | None = None
         try:
@@ -1888,27 +1861,13 @@ class Simulator:
                 # combined RHS + sensitivity-RHS C source string the cc path
                 # compiles, and hand it to the C++ MirJit instead of building a
                 # .so. Numerically identical RHS either way.
-                if model_net_path:
-                    from bngsim._codegen import prepare_codegen_source
+                from bngsim._codegen import prepare_model_codegen_source
 
-                    auto_src = prepare_codegen_source(model_net_path, model, emit_jac=emit_jac)
-                    self._net_path = model_net_path
-                    carry_codegen_stats(model)  # T0.3 (.net path)
-                else:
-                    from bngsim._codegen import prepare_model_codegen_source
-
-                    auto_src = prepare_model_codegen_source(model)
+                auto_src = prepare_model_codegen_source(model)
             else:
-                if model_net_path:
-                    from bngsim._codegen import prepare_codegen
+                from bngsim._codegen import prepare_model_codegen
 
-                    auto_so = prepare_codegen(model_net_path, model, emit_jac=emit_jac)
-                    self._net_path = model_net_path
-                    carry_codegen_stats(model)  # T0.3 (.net path)
-                else:
-                    from bngsim._codegen import prepare_model_codegen
-
-                    auto_so = prepare_model_codegen(model)
+                auto_so = prepare_model_codegen(model)
         except Exception as e:
             # A backend/compile failure (e.g. no C compiler and no JIT) — not a
             # differentiability issue. Refuse loudly rather than silently fall to
@@ -1995,11 +1954,11 @@ class Simulator:
         silently drops to finite differences (:meth:`compute_all_sensitivities`) or
         an empty block (GH #205).
 
-        Two construction-time wrinkles to clear past:
+        One construction-time wrinkle to clear past (two until #803, when .net
+        models never auto-codegened at construction and the helper below always
+        fired fresh for them):
 
-        * .net models never auto-codegen at construction (the species-threshold
-          attach is SBML/builder-only), so the helper below always fires fresh.
-        * an SBML/builder model CAN already carry a plain-RHS codegen ``.so`` /
+        * a model CAN already carry a plain-RHS codegen ``.so`` /
           source from construction (species-threshold attach, explicit
           ``codegen=True``, or inherited) — built WITHOUT output sens because
           ``_want_output_sens`` was then False. :meth:`_auto_codegen_for_sensitivity`

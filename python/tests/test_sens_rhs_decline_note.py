@@ -94,17 +94,14 @@ UNCOMPENSATED = "beta*(I>1)*I"
 
 @pytest.fixture
 def isolated_cache(tmp_path, monkeypatch) -> Path:
-    """A codegen cache of this test's own, cold on entry.
-
-    Both halves matter: the on-disk directory, so "first construction" really is a
-    cold cache whatever else the suite has compiled, and the in-process memo, which
-    is a second short-circuit past source generation with the same consequence for
-    the decline.
+    """A codegen cache of this test's own, cold on entry, so "first construction"
+    really is a cold cache whatever else the suite has compiled. (The ``.net``
+    path's in-process memo was a second short-circuit past source generation
+    until #803 retired it.)
     """
     d = tmp_path / "codegen-cache"
     d.mkdir()
     monkeypatch.setattr(cg, "CACHE_DIR", d)
-    monkeypatch.setattr(cg, "_PREPARE_CODEGEN_MEMO", {})
     return d
 
 
@@ -232,39 +229,6 @@ class TestTheReasonSurvivesTheCache:
         assert warm.codegen_cache_hit is True
         assert warm.has_analytic_sens_rhs is False
         assert warm.sens_rhs_decline_reason is None
-
-    def test_the_in_process_memo_replays_it_as_well(
-        self, tmp_path, isolated_cache, monkeypatch, caplog
-    ):
-        """The .net path has a second short-circuit past source generation — the
-        process-local memo, keyed on the file and its mtime — and it skips the same
-        step for the same reason. The two tests above take the on-disk cache
-        instead: same content, different file names.
-
-        The memo returns before the .net is even re-read, so breaking that read is
-        what proves this construction took it rather than one of the other two
-        paths to the same answer.
-        """
-        net = tmp_path / "m.net"
-        net.write_text(_NET.format(law=UNDERIVABLE))
-        first = bngsim.Simulator(
-            bngsim.Model.from_net(net), method="ode", sensitivity_params=["beta"]
-        )
-        assert cg._PREPARE_CODEGEN_MEMO, "the memo is what this test is about"
-
-        def unreachable(*a, **k):
-            raise AssertionError("the memo should have answered before this")
-
-        monkeypatch.setattr(cg, "_parse_net_file", unreachable)
-        caplog.clear()  # the cold build's own decline is already in here
-        with caplog.at_level(logging.WARNING, logger="bngsim"):
-            second = bngsim.Simulator(
-                bngsim.Model.from_net(net), method="ode", sensitivity_params=["beta"]
-            )
-        assert second.sens_rhs_decline_reason == first.sens_rhs_decline_reason
-        # Both channels, because they come from different places: the reason is read
-        # off the note by the property, and the log line is the replay.
-        assert len(_declines(caplog)) == 1
 
     def test_a_budget_decline_survives_it_too(self, tmp_path, isolated_cache, monkeypatch):
         """The other producer of a decline, and the one the issue singles out.
@@ -500,15 +464,14 @@ class TestTheJitSourcePathRecordsItToo:
         cg.prepare_model_codegen_source(model)
         assert model._codegen_sens_decline is None
 
-    def test_the_net_path_records_it_on_the_thread(self, tmp_path, isolated_cache):
-        """``prepare_codegen_source`` takes a path rather than a Model, so it
-        records to the thread-local that ``carry_codegen_stats`` reads."""
+    def test_it_is_recorded_on_the_thread_too(self, tmp_path, isolated_cache):
+        """Every prepare also records to the thread-local ``last_sens_rhs_decline``
+        reads, and the two agree. (The ``.net`` path's source entry point took a
+        path rather than a Model and recorded only there, until #803.)"""
         model = _model(tmp_path, UNDERIVABLE)
         model._want_output_sens = True
-        cg.prepare_codegen_source(str(tmp_path / "m.net"), model)
+        cg.prepare_model_codegen_source(model)
         assert "abs()" in cg.last_sens_rhs_decline()
-
-        cg.carry_codegen_stats(model)
         assert model._codegen_sens_decline == cg.last_sens_rhs_decline()
 
 

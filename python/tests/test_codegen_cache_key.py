@@ -1,7 +1,8 @@
 """Issue #51 — the codegen cache key must react to a codegen change.
 
-The ``.net`` path keys its compiled ``.so`` on the model content plus a
-hand-maintained ``_CODEGEN_VERSION`` constant, not on the generated C. That made
+Codegen keys its compiled ``.so`` on the model -- the ``.net`` file's content
+when #51 was filed, its structure since #174 (and for ``.net`` models since #803)
+-- plus a hand-maintained ``_CODEGEN_VERSION`` constant, not on the generated C. That made
 the constant load-bearing: a change that altered the emitted forward-sensitivity
 RHS **without** bumping it was invisible to any machine with a warm
 ``~/.cache/bngsim/codegen``, which kept loading the stale library and returning
@@ -219,21 +220,34 @@ class TestTheDocumentedModuleList:
         )
 
 
+def _sens_run_key(net: str) -> str:
+    """The key a ``sensitivity_params`` + ``codegen=True`` run looks its ``.so`` up
+    under: the model prepared the way ``Simulator`` prepares it first."""
+    import bngsim
+
+    m = bngsim.Model.from_net(net)
+    m._want_output_sens = True
+    m.prepare_analytical_jacobian()
+    return cg.compute_model_codegen_hash(
+        m, emit_output_sens=True, emit_sens_rhs=cg.want_sens_rhs(m)
+    )
+
+
 class TestModelHashHonorsTheKey:
     def test_model_hash_changes_with_the_cache_key(self, tmp_path, monkeypatch):
         net = tmp_path / "m.net"
         shutil.copy(DATA_DIR / "nested_derived_rate_const.net", net)
 
-        current = cg.compute_model_hash(str(net))
+        current = _sens_run_key(str(net))
         monkeypatch.setattr(cg, "_CODEGEN_CACHE_KEY", cg._CODEGEN_CACHE_KEY + "+moved")
-        assert cg.compute_model_hash(str(net)) != current
+        assert _sens_run_key(str(net)) != current
 
     def test_model_hash_is_stable_for_an_unchanged_key(self, tmp_path):
         """Caching must still work — the key reacts to codegen changes, not to
         the phase of the moon."""
         net = tmp_path / "m.net"
         shutil.copy(DATA_DIR / "nested_derived_rate_const.net", net)
-        assert cg.compute_model_hash(str(net)) == cg.compute_model_hash(str(net))
+        assert _sens_run_key(str(net)) == _sens_run_key(str(net))
 
 
 @needs_cc
@@ -244,14 +258,15 @@ class TestStaleArtifactIsNotServed:
     _SAMPLE_TIMES = list(np.linspace(0.0, 2.0, 21))
 
     @staticmethod
-    def _analytic(net: str) -> np.ndarray:
+    def _analytic(net: str) -> tuple[np.ndarray, str]:
         import bngsim
 
         m = bngsim.Model.from_net(net)
-        r = bngsim.Simulator(
-            m, method="ode", sensitivity_params=["kcr"], codegen=True, net_path=net
-        ).run(sample_times=TestStaleArtifactIsNotServed._SAMPLE_TIMES, rtol=1e-11, atol=1e-13)
-        return np.asarray(r.sensitivities)[:, :, 0]
+        sim = bngsim.Simulator(m, method="ode", sensitivity_params=["kcr"], codegen=True)
+        r = sim.run(
+            sample_times=TestStaleArtifactIsNotServed._SAMPLE_TIMES, rtol=1e-11, atol=1e-13
+        )
+        return np.asarray(r.sensitivities)[:, :, 0], sim._codegen_so_path
 
     @classmethod
     def _rebuild_fd(cls, net: str, tmp_path: Path) -> np.ndarray:
@@ -287,7 +302,6 @@ class TestStaleArtifactIsNotServed:
         cache = tmp_path / "cache"
         cache.mkdir()
         monkeypatch.setattr(cg, "CACHE_DIR", cache)
-        cg._PREPARE_CODEGEN_MEMO.clear()
 
         net = tmp_path / "nested.net"
         shutil.copy(DATA_DIR / "nested_derived_rate_const.net", net)
@@ -297,22 +311,29 @@ class TestStaleArtifactIsNotServed:
         # Built through _artifact_stem under the patched key, so it is that install's
         # real filename rather than this file's guess at it.
         monkeypatch.setattr(cg, "_CODEGEN_CACHE_KEY", "23+staleemitterdigest")
-        stale_hash = cg.compute_model_hash(str(net))
+        stale_hash = _sens_run_key(str(net))
         stale_so = cache / f"{cg._artifact_stem(stale_hash)}{cg._shared_lib_suffix()}"
         stale_so.write_bytes(b"not a shared library - loading this must never happen\n")
 
         monkeypatch.undo()
         monkeypatch.setattr(cg, "CACHE_DIR", cache)
-        cg._PREPARE_CODEGEN_MEMO.clear()
 
-        current_hash = cg.compute_model_hash(str(net))
+        current_hash = _sens_run_key(str(net))
         assert current_hash != stale_hash, (
             "an emitter change left the cache key unchanged, so the stale .so would "
             "be reused and the fix would be silently inert (issue #51)"
         )
 
-        sx = self._analytic(str(net))
+        sx, so_path = self._analytic(str(net))
         fd = self._rebuild_fd(str(net), tmp_path)
+
+        # The positive control: the run looked its artifact up under exactly the
+        # key computed above, so a stale artifact at a key that had NOT moved
+        # would have been loaded. Without this the inequality could hold because
+        # the helper computes some other key than the run uses.
+        assert so_path == str(
+            cache / f"{cg._artifact_stem(current_hash)}{cg._shared_lib_suffix()}"
+        )
 
         # kcr reaches the rate laws only through a1prime and the nested a2prime,
         # so a stale pre-#41 library reports these as identically zero.

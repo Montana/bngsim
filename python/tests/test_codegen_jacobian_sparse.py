@@ -37,7 +37,6 @@ import numpy as np
 import pytest
 from bngsim._codegen import (
     generate_jacobian_from_model,
-    prepare_codegen,
     prepare_model_codegen,
 )
 
@@ -406,23 +405,24 @@ def _so_has_symbol(so_path, name: str) -> bool:
 
 @needs_cc
 @needs_klu
-def test_net_codegen_path_appends_sparse_jac(tmp_path):
-    # The .net codegen entry point (prepare_codegen), given the built model,
-    # appends the compiled sparse Jacobian onto the .net RHS in one .so — so a
-    # .net-loaded large sparse model gets a compiled per-step Jacobian, not the
-    # interpreted fallback. The RHS and the Jacobian must coexist correctly.
+def test_net_model_so_carries_the_sparse_jac_beside_the_rhs(tmp_path):
+    # A .net-loaded large sparse model compiles the sparse Jacobian into the same
+    # .so as its RHS, so it gets a compiled per-step Jacobian, not the interpreted
+    # fallback. The RHS and the Jacobian must coexist correctly. (Until #803 this
+    # went through the .net path's prepare_codegen(net, model).)
     m = _prepared_sparse_model(tmp_path, 70)
     core = m._core
     net = str(tmp_path / "sparse_chain_70.net")
 
-    so = prepare_codegen(net, m)
+    so = prepare_model_codegen(m)
     assert _so_has_symbol(so, "bngsim_codegen_rhs")
     assert _so_has_symbol(so, "bngsim_codegen_jac_sparse")
     assert not _so_has_symbol(so, "bngsim_codegen_jac")  # sparse-routed → no dense
 
-    # Same .net WITHOUT a model stays RHS-only (historical behavior) and gets a
-    # DISTINCT cache key, so it never collides with the Jacobian-carrying .so.
-    so_rhs_only = prepare_codegen(net)
+    # The same .net loaded fresh, its analytical Jacobian never derived (what
+    # jacobian="fd"/"jax" leave it as), stays RHS-only and gets a DISTINCT cache
+    # key, so it never collides with the Jacobian-carrying .so.
+    so_rhs_only = prepare_model_codegen(bngsim.Model.from_net(net))
     assert not _so_has_symbol(so_rhs_only, "bngsim_codegen_jac_sparse")
     assert so_rhs_only != so
 
@@ -468,17 +468,22 @@ def test_net_codegen_true_end_to_end_uses_compiled_sparse_jac(tmp_path):
 @needs_cc
 @needs_klu
 def test_net_codegen_fd_jacobian_appends_nothing(tmp_path):
-    # jacobian="fd" must not append the analytical Jacobian to the .net .so (the
-    # solver uses colored FD; the analytical terms are never derived). Confirms the
-    # Simulator gate passes model=None for non-analytical strategies.
-    # Writes sparse_chain_70.net into tmp_path; the model object itself is unused here.
-    _prepared_sparse_model(tmp_path, 70)
-    net = str(tmp_path / "sparse_chain_70.net")
-    # Mirror the Simulator gate: fd → no model passed.
-    so = prepare_codegen(net, None)
-    assert _so_has_symbol(so, "bngsim_codegen_rhs")
-    assert not _so_has_symbol(so, "bngsim_codegen_jac_sparse")
-    assert not _so_has_symbol(so, "bngsim_codegen_jac")
+    # jacobian="fd" must not derive this model's analytical Jacobian just to
+    # append it to the .so (the solver uses colored FD). Its Functional reaction
+    # is derived lazily (GH #145), which the Simulator does only for
+    # "auto"/"analytical", and the emitter declines a model whose analytical
+    # Jacobian is not complete. (An all-Elementary model's Jacobian is complete at
+    # load, so it rides along at no derivation cost; the solver ignores it on fd.)
+    net = str(_write_net(tmp_path, 70))
+    sim = bngsim.Simulator(bngsim.Model.from_net(net), method="ode", jacobian="fd", codegen=True)
+    if sim._codegen_so_path:
+        so = sim._codegen_so_path
+        assert _so_has_symbol(so, "bngsim_codegen_rhs")
+        assert not _so_has_symbol(so, "bngsim_codegen_jac_sparse")
+        assert not _so_has_symbol(so, "bngsim_codegen_jac")
+    else:  # the MIR JIT backend carries the source instead of a .so
+        assert "bngsim_codegen_rhs" in sim._codegen_c_source
+        assert "bngsim_codegen_jac" not in sim._codegen_c_source
 
 
 @needs_cc

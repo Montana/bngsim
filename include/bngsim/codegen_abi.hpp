@@ -10,8 +10,8 @@
 //
 // Anything added here must mirror the emitter. The current contract:
 //
-//   bngsim_codegen_rhs        (generate_rhs_c)        — dx/dt
-//   bngsim_codegen_sens_rhs   (generate_sens_rhs_c)   — ySdot = J·yS + ∂f/∂p_iS
+//   bngsim_codegen_rhs        (generate_rhs_from_model)  — dx/dt
+//   bngsim_codegen_sens_rhs   (generate_sens_from_model) — ySdot = J·yS + ∂f/∂p_iS
 //   bngsim_codegen_sens_term_scale (same emitter)     — Σ|term| per row of ∂f/∂p_iS
 //   bngsim_codegen_jac        (generate_jacobian_*)   — dense column-major J
 //   bngsim_codegen_jac_sparse (generate_jacobian_*)   — CSC value array
@@ -62,7 +62,7 @@ namespace bngsim {
 using CodegenTfunEvalFn = double (*)(int tf_id, double x, void *ctx);
 
 // Lightweight struct matching the CodegenUserData layout expected by the .so.
-// MUST mirror the typedef emitted by _codegen.py (generate_rhs_c). Field order
+// MUST mirror the typedef emitted by _codegen.py (generate_rhs_from_model). Field order
 // is part of the ABI contract between the codegen .so and its callers.
 struct CodegenUserDataForSO {
     double *param_values;
@@ -71,7 +71,7 @@ struct CodegenUserDataForSO {
 };
 
 // The user_data struct the codegen *sensitivity* RHS expects. Mirrors the
-// CodegenSensUserData typedef emitted by generate_sens_rhs_c; same ABI caveat.
+// CodegenSensUserData typedef emitted by generate_sens_from_model; same ABI caveat.
 struct CodegenSensUserDataForSO {
     double *param_values;
     int *plist; // plist[iS] = parameter index for sensitivity direction iS

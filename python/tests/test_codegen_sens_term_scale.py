@@ -262,8 +262,8 @@ def test_the_companion_is_emitted_only_for_a_sensitivity_run(tmp_path):
     the switch is O(parameters × reactions) — big enough to matter on a large
     Functional model (18 MB of .so becomes 29 MB on BIOMD0000000496). So the
     emission is gated on the same ``_want_output_sens`` signal the GH #198
-    output-sensitivity block uses, and the .net cache key carries it: without that
-    a plain run's .so would be reused for a sensitivity run and silently lack the
+    output-sensitivity block uses, and the cache key carries it: without that a
+    plain run's .so would be reused for a sensitivity run and silently lack the
     symbol.
     """
     m = _model(tmp_path, CANCELLING, "gate.net")
@@ -280,10 +280,16 @@ def test_the_companion_is_emitted_only_for_a_sensitivity_run(tmp_path):
         "emitting the term scale changed a line of the source that ships without it"
     )
 
-    flags_off = cg._codegen_emit_flags(m, True)
+    # The combined source reads the flag off the model, and the key reads the same
+    # flag: both move together.
+    plain_src, _ = cg.generate_combined_from_model(m)
+    plain_key = cg.compute_model_codegen_hash(m)
     m._want_output_sens = True
-    flags_on = cg._codegen_emit_flags(m, True)
-    assert flags_off[3] is False and flags_on[3] is True, (
+    sens_src, _ = cg.generate_combined_from_model(m)
+    sens_key = cg.compute_model_codegen_hash(m, emit_output_sens=True)
+    assert "bngsim_codegen_sens_term_scale" not in plain_src
+    assert "bngsim_codegen_sens_term_scale" in sens_src
+    assert plain_key != sens_key, (
         "the sensitivity-run flag must reach the cache key, or a .so compiled "
         "without the symbol is reused for a run that needs it"
     )

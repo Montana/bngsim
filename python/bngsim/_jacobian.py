@@ -3235,8 +3235,8 @@ class _DerivationBudgetExceeded(Exception):
     """Internal signal: the build-time symbolic derivation passed its wall-clock
     budget. Caught by :func:`attach_functional_jacobian`, which logs the fallback
     and leaves the model on the finite-difference Jacobian (GH #95), and by
-    ``_codegen.generate_sens_from_model`` / ``generate_sens_rhs_c``, which decline
-    the analytic sensitivity RHS and leave the model on CVODES' internal
+    ``_codegen.generate_sens_from_model``, which declines
+    the analytic sensitivity RHS and leaves the model on CVODES' internal
     difference quotient (GH #90)."""
 
 
