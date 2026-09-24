@@ -307,8 +307,16 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
     (
         "POSIX-specific",
         _ANYWHERE,
-        "no Windows equivalent: process-group reaping, and the /bin/sh fake "
-        "interpreters the pybind11-resolution probe walks (GH #288)",
+        "no Windows equivalent: process-group reaping, the /bin/sh fake "
+        "interpreters the pybind11-resolution probe walks (GH #288), and the "
+        "peak RSS the GH #577 setup-failure probe reads from resource.getrusage",
+    ),
+    (
+        "RLIMIT_AS",
+        _ANYWHERE,
+        "the GH #577 leak probe reads /proc/self/statm and caps its own address "
+        "space so the triggering allocation fails at a fixed size; neither has a "
+        "Windows equivalent, and the behavioural half of that file runs everywhere",
     ),
     ("tomllib is 3.11+", _ANYWHERE, "stdlib module absent on 3.10, which is still supported"),
     ("gcc/clang only", _ANYWHERE, "the sharded compile path; MSVC takes the other branch"),

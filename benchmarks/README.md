@@ -32,6 +32,24 @@ respecting cross-suite ordering (`showcase` before `antimony`,
 `{run,emit}.{stdout,stderr}.log`. See `_dev/phase6_plan.md` for the
 locked design.
 
+### Did my change slow bngsim down? — `perf_ab.py`
+
+```bash
+python benchmarks/perf_ab.py                               # origin/main vs HEAD
+python benchmarks/perf_ab.py --candidate python:.venv/bin/python   # uncommitted work
+```
+
+A wall-clock A/B of two builds on this machine: each side is a git ref (a wheel is
+built from it once and cached under `~/.cache/bngsim/perf-ab`) or an interpreter
+that already has bngsim. It times load, Simulator setup, the cold run and warm runs
+of the committed ODE networks in `_dev/suite_ode.json`, sides interleaved, and flags
+a model SLOWER only when the median ratio is past `--threshold` (5 %), the 99 %
+bootstrap interval is above 1 and the change is at least `--min-delta-ms`. Exit 1
+if anything is flagged. It also compares solver work counters: a slowdown with
+identical counters is a constant-factor change the nightly parity workflow
+(`.github/workflows/nightly-parity.yml`, which watches the counters) cannot see.
+Leave the machine idle while it runs.
+
 ### Sharding a regen across machines
 
 The orchestrator is designed for a *walk-away, maybe-shard* workflow:

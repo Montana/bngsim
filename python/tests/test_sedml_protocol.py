@@ -77,7 +77,10 @@ def test_scan_emits_repeated_task_with_range_and_setvalue() -> None:
     assert len(_locals(root, "setValue")) == 2
     rng = _locals(root, "uniformRange")[0]
     assert rng.get("start") == "0" and rng.get("end") == "1"
-    assert rng.get("numberOfPoints") == "20"
+    # GH #575 — numberOfPoints counts the intervals, so the scan's 20 inclusive
+    # points are 19 of them. This asserted 20 and so pinned the off-by-one in
+    # place: a consumer expanding numberOfPoints+1 got 21 values.
+    assert rng.get("numberOfPoints") == "19"
 
 
 def test_well_formed_xml_and_file_write(tmp_path: Path) -> None:

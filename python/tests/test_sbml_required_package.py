@@ -199,9 +199,6 @@ def test_a_handled_package_still_loads() -> None:
         assert model.species_names == ["A"], prefix
 
 
-# ─── Opt-out ────────────────────────────────────────────────────────────────
-
-
 # ─── Non-standard namespace blind spot (issue #613) ─────────────────────────
 
 #: A namespace outside http://www.sbml.org/sbml/level3/… — libSBML drops it
@@ -253,7 +250,29 @@ def test_the_file_entry_point_catches_nonstandard_namespace(tmp_path) -> None:
         bngsim.Model.from_sbml(path)
 
 
-# ─── Opt-out ─────────────────────────────────────────────────────────────────
+def test_the_raw_scan_reads_only_the_root_element() -> None:
+    """The #613 scan must cost the same on a 20 MB document as on a 2 kB one:
+    it reads as far as the ``<sbml>`` start tag and stops, rather than taking a
+    second full copy of a document libSBML has already read."""
+    import io
+
+    from bngsim._sbml_loader import _raw_required_namespaces
+
+    class _Counting(io.BytesIO):
+        consumed = 0
+
+        def read(self, size=-1):
+            data = super().read(size)
+            _Counting.consumed += len(data)
+            return data
+
+    padding = b"<!-- " + b"x" * (20 * 1024 * 1024) + b" -->"
+    stream = _Counting(_with_package("zzz", _ZZZ_URI, "true").encode() + padding)
+    assert _raw_required_namespaces(stream) == {_ZZZ_URI: _ZZZ_URI}
+    assert _Counting.consumed < 1024 * 1024
+
+
+# ─── Opt-out ────────────────────────────────────────────────────────────────
 
 
 def test_the_opt_out_loads_the_core_layer_and_says_so(monkeypatch, caplog) -> None:

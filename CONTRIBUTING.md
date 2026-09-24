@@ -270,6 +270,38 @@ that in particular when the test **invents a key**: a fabricated
 `_CODEGEN_CACHE_KEY` or model hash produces an artifact that is orphaned the
 moment it is written, and it must not be written where anything else will see it.
 
+## Checking performance and parity
+
+Two tools watch for regressions that unit tests cannot see.
+
+**`benchmarks/perf_ab.py`: did my change slow bngsim down?** A wall-clock A/B of
+two builds on your machine. It interleaves the committed ODE networks in
+`benchmarks/_dev/suite_ode.json` (2 to 3,744 species) across the two sides and
+flags a model only when the slowdown is past 5 %, outside a 99 % bootstrap
+interval and at least 2 ms:
+
+```bash
+uv run python benchmarks/perf_ab.py                                # origin/main vs HEAD
+uv run python benchmarks/perf_ab.py --candidate python:.venv/bin/python   # uncommitted work
+uv run python benchmarks/perf_ab.py --quick                        # models up to 150 species
+```
+
+A git-ref side is built once into a wheel and cached under
+`~/.cache/bngsim/perf-ab`. Leave the machine idle while it runs. It exits 1 if
+anything is flagged, and `summary.md` also shows whether the solver's work
+counters changed: a slowdown with identical counters is a constant-factor
+change. Run it for any change to `src/`, `include/`, the code generator, the
+loaders or `Simulator`, and paste the summary into the PR.
+
+**The nightly parity workflow** (`.github/workflows/nightly-parity.yml`) runs
+bngsim against RoadRunner, BNG2.pl/run_network/NFsim, AMICI forward
+sensitivities, and the SBML and DSMTS test suites every night. It compares each
+model's verdict and bngsim's solver work with committed baselines and with the
+previous night, and opens or updates the issue *Nightly parity: regressions
+detected* when something regresses. It never blocks a PR. When a fix turns
+failing models good, re-baseline so that a later regression of the fix alerts:
+see [`parity_checks/nightly/README.md`](parity_checks/nightly/README.md).
+
 ## Changing generated code
 
 Compiled codegen artifacts are cached under `~/.cache/bngsim/codegen` and keyed by
@@ -346,6 +378,9 @@ at all — say so on your pull request or open an issue, and it will be changed.
 - Keep new code consistent with the surrounding style (`.clang-format` for C++,
   `ruff` for Python).
 - Add or update tests for behavior changes.
+- For a change to `src/`, `include/`, the code generator, the loaders or
+  `Simulator`, run `benchmarks/perf_ab.py` and put its summary in the PR
+  ([Checking performance and parity](#checking-performance-and-parity)).
 - Stage a changelog fragment (below) and, where user-facing, update the relevant
   page under [`docs/`](docs/).
 
