@@ -27,6 +27,7 @@ from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _classify_rate_law,
     _find_close_paren_strict,
+    _normalize_exprtk_operators,
     _parse_net_file,
     _split_top_level_commas,
 )
@@ -392,7 +393,9 @@ def _translate_expr_jax(
       - common math -> jnp.<func>()
       - && -> & (JAX boolean), || -> | (JAX boolean)
     """
-    c = expr
+    # ExprTk's reading of =, <>, -- and relational chains made explicit, as in
+    # the C translators and the sympy parsers (issue #734).
+    c = _normalize_exprtk_operators(expr)
 
     # Bracket the source's grouping before the operators become Python ones,
     # whose precedence differs (GH #579).
