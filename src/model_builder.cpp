@@ -1598,12 +1598,26 @@ NetworkModel ModelBuilder::build() {
     // the fix is to solve the system or to iterate it to a checked fixed point,
     // which is a different change from this sort, and not because the relaxation
     // works. A parameter cycle has no such open question: it is refused.
+    //
+    // A table-function call reads its index, and that index is not always in
+    // the text: the .net loader hands an embedded call over already rewritten
+    // to `tfun_<f>__tfun<k>()`, so `F() 2*tfun(..., G)` names no G. Without the
+    // edge a G declared after F is read stale, GH #76's defect (issue #781).
+    // build_jac_sparsity (step 7) resolves the same calls through this map.
+    std::unordered_map<std::string, std::string> tfun_index_by_call;
+    for (const auto &spec : bimpl_->tfun_specs)
+        tfun_index_by_call.emplace("tfun_" + spec.func_name, spec.index_name);
+
     std::vector<std::vector<int>> successors(nf); // fj -> functions depending on fj
     std::vector<int> in_degree(nf, 0);
     for (int fi = 0; fi < nf; ++fi) {
         std::unordered_set<int> deps;
         for_each_identifier(impl.functions[fi].expression, [&](const std::string &token) {
-            auto it = sd->function_name_to_idx.find(token);
+            std::string name = token;
+            auto tit = tfun_index_by_call.find(token);
+            if (tit != tfun_index_by_call.end() && !is_time_index(tit->second))
+                name = strip_paren_suffix(tit->second);
+            auto it = sd->function_name_to_idx.find(name);
             if (it != sd->function_name_to_idx.end() && it->second != fi && it->second >= 0 &&
                 it->second < nf)
                 deps.insert(it->second);
@@ -2023,10 +2037,6 @@ NetworkModel ModelBuilder::build() {
     // ── 7. Jacobian sparsity + analytical Jacobian ───────────────────────
     const int ns = static_cast<int>(impl.species.size());
     const int np = static_cast<int>(impl.parameters.size());
-
-    std::unordered_map<std::string, std::string> tfun_index_by_call;
-    for (const auto &spec : bimpl_->tfun_specs)
-        tfun_index_by_call.emplace("tfun_" + spec.func_name, spec.index_name);
 
     sd->jac_sparsity = build_jac_sparsity(
         sd->reactions, ns, impl.observables, sd->observable_name_to_idx, impl.functions,

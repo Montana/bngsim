@@ -36,12 +36,16 @@ A, B, P = 0, 1, 3
 
 #: Every way a .net can put an observable- or function-indexed table behind a
 #: rate law: inline data, the documented file form, a call embedded in
-#: arithmetic (synthetic table name), and an index that is itself a function.
+#: arithmetic (synthetic table name), and an index that is itself a function,
+#: whole-body and embedded.
 INDEXED_FORMS = {
     "inline_observable": ["F() tfun([0,100],[0,10], Ptot)"],
     "file_observable": ["F() tfun('p.tfun', Ptot)"],
     "embedded_observable": ["F() 2*tfun([0,100],[0,5], Ptot)"],
     "function_index": ["G() Ptot*1", "F() tfun([0,100],[0,10], G)"],
+    # F before G on purpose: the loader hands an embedded call over already
+    # rewritten, so G was missing from the evaluation-order sort as well.
+    "embedded_function_index": ["F() 2*tfun([0,100],[0,5], G)", "G() Ptot*1"],
 }
 
 
@@ -106,6 +110,20 @@ def test_function_index_declared_after_the_table(tmp_path: Path) -> None:
     pairs = _pattern(model)
     assert (A, P) in pairs
     assert (B, P) in pairs
+
+
+def test_an_embedded_call_orders_its_function_index_first(tmp_path: Path) -> None:
+    """The RHS must be a function of y alone. An embedded call reaches the builder
+    as `tfun_F__tfun1()`, so the sort that orders functions after what they read
+    (GH #76) could not see G: F, declared first, read G from the previous RHS
+    evaluation and gave dA/dt = -20 at P = 80 after a call at P = 50."""
+    functions = ["F() 2*tfun([0,100],[0,5], G)", "G() Ptot*1"]
+    model = bngsim.Model.from_net(str(_write_net(tmp_path, functions)))
+    model.rhs(Y)
+    y = Y.copy()
+    y[P] = 80.0
+    # F = 2 * (G / 20) = P / 10, so dA/dt = -(P / 10) * A + kb * B.
+    assert np.asarray(model.rhs(y))[A] == pytest.approx(-(80.0 / 10.0) * 5.0 + 5.0)
 
 
 def _pattern(model: bngsim.Model) -> set[tuple[int, int]]:
