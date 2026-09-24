@@ -9304,9 +9304,9 @@ def _functional_comoving_plan(
                     moved = _comoving_shifted_partial(
                         on_cell, p_alias, c, clock_names, derived_shift, constants, sp
                     )
-                    if _singular_clock_powers(
-                        plain, clock_names, sp
-                    ) - _singular_clock_powers(moved, clock_names, sp):
+                    if _singular_clock_powers(plain, clock_names, sp) - _singular_clock_powers(
+                        moved, clock_names, sp
+                    ):
                         eligible = True
                     pieces.append((moved, cond))
                 if len(pieces) == 1:
