@@ -1,14 +1,14 @@
-"""Tests for if(cond, a, b) semantics — Decision D1 (Session 37).
+"""Tests for if(cond, a, b) semantics.
 
-DISCOVERY: ExprTk's built-in `if` keyword uses nonzero truthiness
-and takes precedence over any custom IfFunction registered via
-add_function("if", ...). The custom IfFunction with cond > 0.5
-in expression.cpp and nfsim_funcparser.h is DEAD CODE.
+bngsim semantics: cond != 0 -> true_val, cond == 0 -> false_val. ExprTk's
+built-in `if` keyword uses nonzero truthiness, and the compiled (codegen) path
+emits a C ternary, which agrees.
 
-Actual BNGsim semantics: cond != 0 -> true_val, cond == 0 -> false_val
-This matches BioNetGen Perl truthiness (if($_[0])).
-
-See: bngsim/dev/adr/ADR-002-function-semantics.md for full analysis.
+This differs from BNG2.pl's run_network, which tests cond > 0.5, but only for
+a bare numeric condition in (0, 0.5] or below 0: relational and logical
+conditions evaluate to exactly 0 or 1 and agree under both rules. The contract
+and the run_network difference are documented in docs/reference/expressions.md
+(issue #774).
 """
 
 import math
