@@ -689,10 +689,12 @@ bool expr_compat::is_exprtk_reserved(const std::string &name) {
     //      of these once the function is registered, but the names are
     //      not on ExprTk's reserved_symbols[] list, so we have to track
     //      them here ourselves. BNG2.pl's parser already rejects
-    //      `ln`/`rint`/`mratio`/`time` as parameter names upstream, so
-    //      models reaching bngsim via `generate_network` can only hit
-    //      the `sign` collision in practice — but we mangle all five
-    //      for symmetry and to handle hand-crafted .net inputs.
+    //      `ln`/`rint`/`mratio`/`time` as *parameter* names upstream, but
+    //      it accepts an *observable* named `time`, so models reaching
+    //      bngsim via `generate_network` can hit the `sign` and `time`
+    //      collisions in practice. We mangle all five for symmetry and to
+    //      handle hand-crafted .net inputs. A mangled `time` stays the
+    //      clock in call form (`time()`); see is_zero_arg_builtin (#776).
     //
     //   3. The registration keys bngsim's built-in constants occupy after the
     //      unconditional "_X" → "u_X" remap (`u_pi`, …, `u_h`, `u_F`). A user
@@ -810,6 +812,11 @@ struct ExprTkEvaluator::Impl {
     // ExprTk's grammar would reject as `obs * ()`.
     std::unordered_set<std::string> scalar_variable_names;
 
+    // Built-in functions that take no arguments. Their call form `name()` means
+    // the built-in even when the model declares a scalar of the same name,
+    // which is then reachable only bare (issue #776). `time` is the only one.
+    static bool is_zero_arg_builtin(const std::string &name) { return name == "time"; }
+
     // Look up the symbol-table key for `name` when rewriting an expression.
     // Mirrors compute_registration_name() but only mangles reserved words
     // that were actually registered on this evaluator, so built-in tokens
@@ -837,6 +844,14 @@ struct ExprTkEvaluator::Impl {
     // know is a scalar — leaving function names (built-ins like `sin`,
     // `time`, user-defined Func0/1/2/3) untouched, since those go
     // through add_function and are not in scalar_variable_names.
+    //
+    // A built-in can end up in scalar_variable_names after all: a model may
+    // declare a scalar under a built-in's name, which define_variable registers
+    // under the mangled key and records by its source name. BNG2.pl rejects a
+    // *parameter* named `time` but accepts an *observable* named `time`, and a
+    // hand-written .net can declare either. `time()` must still read the clock
+    // then, so a zero-argument built-in call is never stripped (issue #776):
+    // stripping it turned the clock into the model scalar, silently.
     std::string strip_empty_parens(const std::string &expr) const {
         if (scalar_variable_names.empty())
             return expr;
@@ -858,7 +873,7 @@ struct ExprTkEvaluator::Impl {
                 }
                 std::string ident = expr.substr(start, i - start);
                 if (i + 1 < expr.size() && expr[i] == '(' && expr[i + 1] == ')' &&
-                    scalar_variable_names.count(ident)) {
+                    scalar_variable_names.count(ident) && !is_zero_arg_builtin(ident)) {
                     result += ident;
                     i += 2;
                 } else {
@@ -905,6 +920,15 @@ struct ExprTkEvaluator::Impl {
                     size_t j = i;
                     while (j < expr.size() && std::isspace(static_cast<unsigned char>(expr[j]))) {
                         j++;
+                    }
+                    if (j < expr.size() && expr[j] == '(' && is_zero_arg_builtin(token)) {
+                        // `time()` with a model scalar also named `time`: the
+                        // call form is the built-in clock, the bare name is the
+                        // scalar (r_time). Not ambiguous — BNG gives `time()`
+                        // no other meaning — so emit the built-in unmapped
+                        // rather than raise (issue #776).
+                        result += token;
+                        continue;
                     }
                     if (j < expr.size() && expr[j] == '(') {
                         throw std::runtime_error(
