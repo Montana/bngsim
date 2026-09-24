@@ -2192,7 +2192,7 @@ def _raw_required_namespaces(xml_source: str) -> dict[str, str]:
     required_uris: dict[str, str] = {}
     try:
         # iterparse so we stop at the root end-event without reading the whole doc.
-        for event, elem in ET.iterparse(__import__("io").StringIO(xml_source), events=("start",)):
+        for _event, elem in ET.iterparse(__import__("io").StringIO(xml_source), events=("start",)):
             # The very first element is the root <sbml>.
             for clark, value in elem.attrib.items():
                 if value.lower() != "true":
