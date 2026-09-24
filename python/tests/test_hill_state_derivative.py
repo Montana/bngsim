@@ -66,6 +66,8 @@ def _exprtk(expr, **values):
     text = sympy_to_exprtk(expr)
     assert text is not None
     py = text.replace("if(", "_if(").replace("^", "**")
+    # The emitter writes `&&` / `||` (issue #770); Python spells them as words.
+    py = py.replace("&&", " and ").replace("||", " or ")
     env = {"log": np.log, "exp": np.exp, "sqrt": np.sqrt, "_if": lambda c, a, b: a if c else b}
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
         return float(eval(py, env, {k: np.float64(w) for k, w in values.items()}))  # noqa: S307

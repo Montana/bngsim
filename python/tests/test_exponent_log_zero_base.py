@@ -447,7 +447,7 @@ class TestBothEmitters:
         expr, _ = _hill_derivative()
         s = sympy_to_exprtk(expr)
         assert s is not None
-        assert "if(((x == 0) and (n > 0)),0,((x)^(n))*log(x))" in s
+        assert "if(((x == 0) && (n > 0)),0,((x)^(n))*log(x))" in s
         assert "Eq(" not in s
 
     def test_both_emitters_carry_the_squared_logarithm_into_the_branch(self):
@@ -469,7 +469,7 @@ class TestBothEmitters:
 
         s = sympy_to_exprtk(expr)
         assert s is not None
-        assert "if(((x == 0) and (n > 0)),0,((x)^(n))*((log(x))^(2)))" in s
+        assert "if(((x == 0) && (n > 0)),0,((x)^(n))*((log(x))^(2)))" in s
         assert "Eq(" not in s
 
 

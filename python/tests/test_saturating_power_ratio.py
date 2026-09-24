@@ -247,6 +247,8 @@ class TestTheOrderAgainstTheZeroBaseGuard:
         assert text is not None
         # ExprTk's `if(c,a,b)` is a call, not Python's conditional expression.
         py = text.replace("if(", "_if(").replace("^", "**")
+        # The emitter writes `&&` / `||` (issue #770); Python spells them as words.
+        py = py.replace("&&", " and ").replace("||", " or ")
         env = {"log": np.log, "_if": lambda c, a, b: a if c else b}
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             return float(eval(py, env, {k: np.float64(v) for k, v in point.items()}))  # noqa: S307
