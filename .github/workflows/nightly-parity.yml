@@ -284,8 +284,10 @@ jobs:
         run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/light.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
       # The giants on the interpreted RHS: their auto-codegen compile alone runs past
       # the per-job cap on a 4-core runner, so with it they would only ever report
-      # TIMEOUT. The compiled path stays covered by the light pass's >=256-species
-      # models and by bng-ode's codegen arm.
+      # TIMEOUT. These are the only fetchable models at or above the 256-species
+      # auto-codegen threshold (the light pass tops out at 194), so rr-ode does not
+      # exercise SBML auto-codegen; compiled RHS code is covered by bng-ode's codegen
+      # arm and by amici-sens, whose bngsim side always runs compiled.
       - name: Run rr_run.py on the giant models
         env:
           BNGSIM_NO_CODEGEN: "1"

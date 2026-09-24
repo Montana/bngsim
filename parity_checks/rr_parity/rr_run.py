@@ -583,7 +583,11 @@ def _bngsim_config_meta(args) -> dict:
     """
     combo = getattr(args, "config", "auto")
     spec = _CONFIG_COMBOS[combo]
-    env = dict.fromkeys(_BNGSIM_CONFIG_ENV_VARS)
+    # What the workers actually see: a knob the caller exported (the nightly's
+    # giant-model pass sets BNGSIM_NO_CODEGEN) is inherited by every spawned
+    # worker, so it is recorded too; the combo's own values override it, as in
+    # the worker. Reporting only the combo made such a run claim "unset".
+    env = {k: os.environ.get(k) for k in _BNGSIM_CONFIG_ENV_VARS}
     env.update(spec["env"])
     return {
         "combo": combo,
