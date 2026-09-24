@@ -257,6 +257,17 @@ def test_work_keys_match_the_harness_recorder():
     assert work_counters(None) == {}
 
 
+def test_extract_merges_passes_and_refuses_overlap(tmp_path):
+    light, heavy = tmp_path / "light.json", tmp_path / "heavy.json"
+    write_report(light, [_jr("M1", "PASS")], meta={"suite": "rr_parity", "elapsed_sec": 10})
+    write_report(heavy, [_jr("M9", "TIMEOUT")], meta={"suite": "rr_parity", "elapsed_sec": 90})
+    obj = V.extract("core", [light, heavy], "rr_ode")
+    assert sorted(obj["cases"]) == ["M1|ode", "M9|ode"]
+    assert [p["elapsed_sec"] for p in obj["source"]["parts"]] == [10, 90]
+    with pytest.raises(ValueError, match="more than one report"):
+        V.extract("core", [light, light], "rr_ode")
+
+
 def test_extract_core_refuses_a_duplicate_case(tmp_path):
     path = tmp_path / "report.json"
     write_report(path, [_jr("M1", "PASS"), _jr("M1", "DIFF")], meta={})
@@ -423,3 +434,8 @@ def test_present_models_lists_only_models_on_disk(tmp_path):
         )
     )
     assert P.present(manifest, root=tmp_path) == (["M1"], 2)
+    (tmp_path / "models" / "M2").mkdir()
+    (tmp_path / "models" / "M2" / "M2.xml").write_text("<sbml>" + "x" * 100 + "</sbml>")
+    assert P.present(manifest, root=tmp_path, max_bytes=50) == (["M1"], 2)
+    assert P.present(manifest, root=tmp_path, min_bytes=51) == (["M2"], 2)
+    assert P.present(manifest, root=tmp_path, skip=frozenset({"M1"})) == (["M2"], 2)

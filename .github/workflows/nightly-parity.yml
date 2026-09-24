@@ -17,7 +17,7 @@ name: nightly-parity
 #                                                 sensitivity run uses (#689/#699 lived
 #                                                 only there)
 #   bng-stoch    run_network SSA / NFsim          110 SSA + 235 NF committed BNGL jobs
-#   amici-sens   AMICI forward sensitivities      43 of the 50 curated BioModels x 2 methods
+#   amici-sens   AMICI forward sensitivities      41 of the 50 curated BioModels x 2 methods
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -242,9 +242,19 @@ jobs:
     name: RoadRunner ODE parity
     needs: corpus
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
       - uses: actions/cache/restore@v4
         with:
           path: parity_checks/rr_parity/models
@@ -261,16 +271,36 @@ jobs:
       # --timeout 300 rather than the runner's 120 s: four models sit at 115-118 s on
       # an M1 Max (RoadRunner's JIT load dominates), and a timeout that flips with
       # runner speed would alert as a regression.
+      # Two passes. The dozen SBML files over 1 MB (up to 786 species) run on their
+      # own: four of them at once, each auto-compiling ~20 MB of generated C in
+      # parallel shards, killed the runner on the first run.
       - name: Select the models the corpus holds
-        run: python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json > "$RUNNER_TEMP/models.txt"
+        run: |
+          python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json --max-bytes 1000000 > "$RUNNER_TEMP/light.txt"
+          python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json --min-bytes 1000001 > "$RUNNER_TEMP/heavy.txt"
       - name: Run rr_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
+        run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/light.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
+      # The giants on the interpreted RHS: their auto-codegen compile alone runs past
+      # the per-job cap on a 4-core runner, so with it they would only ever report
+      # TIMEOUT. The compiled path stays covered by the light pass's >=256-species
+      # models and by bng-ode's codegen arm.
+      - name: Run rr_run.py on the giant models
+        env:
+          BNGSIM_NO_CODEGEN: "1"
+        run: |
+          reports="$RUNNER_TEMP/rr_ode.json"
+          if [ -n "$(tr -d '[:space:]' < "$RUNNER_TEMP/heavy.txt")" ]; then
+            uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 2 --timeout 600 \
+              --models "$(cat "$RUNNER_TEMP/heavy.txt")" --out "$RUNNER_TEMP/rr_ode_giants.json" || true
+            reports="$reports,$RUNNER_TEMP/rr_ode_giants.json"
+          fi
+          echo "REPORTS=$reports" >> "$GITHUB_ENV"
       - name: Compare
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash parity_checks/nightly/compare.sh rr_ode core "$RUNNER_TEMP/rr_ode.json"
+        run: bash parity_checks/nightly/compare.sh rr_ode core "$REPORTS"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -354,6 +384,16 @@ jobs:
             workers: 3
     steps:
       - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -400,6 +440,16 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      # A 16 GB runner is enough for one model at a time, not for several giant
+      # compiles at once; extra swap turns a near-miss into a slow step instead of a
+      # killed runner (the first run lost rr-ode and amici-sens that way).
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
       - uses: actions/cache/restore@v4
         with:
           path: parity_checks/rr_parity/models
@@ -421,12 +471,16 @@ jobs:
           path: parity_checks/amici_parity/amici_sens_cache
           key: ${{ steps.amici-key.outputs.prefix }}${{ github.run_id }}
           restore-keys: ${{ steps.amici-key.outputs.prefix }}
+      # BIOMD0000000496/497 (~3 MB SBML) are left out: both engines' sensitivity runs
+      # hit the wall cap on them even on a 10-core workstation (TIMEOUT at 900 s), so
+      # here they would buy 40 runner-minutes of guaranteed TIMEOUT and, compiled
+      # alongside other models, were the likely cause of the first run's killed runner.
       - name: Select the models the corpus holds
-        run: python3 parity_checks/nightly/present_models.py parity_checks/amici_parity/amici_ode_jobs.json > "$RUNNER_TEMP/models.txt"
+        run: python3 parity_checks/nightly/present_models.py parity_checks/amici_parity/amici_ode_jobs.json --skip BIOMD0000000496,BIOMD0000000497 > "$RUNNER_TEMP/models.txt"
       - name: Run amici_sens_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/amici_parity/amici_sens_run.py --workers 4 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/amici_sens.json" || true
+        run: uv run --no-sync python parity_checks/amici_parity/amici_sens_run.py --workers 3 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/amici_sens.json" || true
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true # nothing to save when provisioning failed before the run

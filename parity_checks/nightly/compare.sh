@@ -2,9 +2,10 @@
 # Nightly parity comparison for one suite (GH #702). Called by
 # .github/workflows/nightly-parity.yml once a suite's runner has written its report.
 #
-#   compare.sh SUITE KIND REPORT [extra `verdicts.py diff` args, e.g. --expect-backend cc]
+#   compare.sh SUITE KIND REPORT[,REPORT...] [extra `verdicts.py diff` args, e.g. --expect-backend cc]
 #
-#   1. extract REPORT into $NIGHTLY_OUT/SUITE/verdicts.json. That file is the candidate
+#   1. extract REPORT (several comma-separated reports -- passes of one sweep -- are
+#      merged) into $NIGHTLY_OUT/SUITE/verdicts.json. That file is the candidate
 #      baseline: committing it as baselines/SUITE.json accepts tonight's state.
 #   2. diff it against the committed baseline, parity_checks/nightly/baselines/SUITE.json.
 #   3. diff it against the previous nightly's verdicts for SUITE (the last scheduled or
@@ -18,7 +19,7 @@ set -uo pipefail
 
 suite=$1
 kind=$2
-report=$3
+IFS=',' read -r -a reports <<<"$3"
 shift 3
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -26,19 +27,26 @@ out=${NIGHTLY_OUT:-nightly-out}/$suite
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 mkdir -p "$out"
 
-if [ ! -s "$report" ]; then
-  echo "::error::$suite: no report at $report; the run did not finish."
-  printf '### %s\n\n**No report**: the run did not finish. See the job log.\n\n' "$suite" >>"$summary"
-  printf '{"suite": "%s", "label": "", "no_report": true, "n_alerts": 1}\n' "$suite" >"$out/diff-baseline.json"
-  exit 1
-fi
-cp "$report" "$out/report.json"
+extract_args=()
+i=0
+for report in "${reports[@]}"; do
+  if [ ! -s "$report" ]; then
+    echo "::error::$suite: no report at $report; the run did not finish."
+    printf '### %s\n\n**No report** (%s): the run did not finish. See the job log.\n\n' \
+      "$suite" "$(basename "$report")" >>"$summary"
+    printf '{"suite": "%s", "label": "", "no_report": true, "n_alerts": 1}\n' "$suite" >"$out/diff-baseline.json"
+    exit 1
+  fi
+  if [ "$i" -eq 0 ]; then cp "$report" "$out/report.json"; else cp "$report" "$out/report-$i.json"; fi
+  extract_args+=(--report "$report")
+  i=$((i + 1))
+done
 
 prov=$(printf '{"run_id": "%s", "sha": "%s", "event": "%s"}' \
   "${GITHUB_RUN_ID:-local}" "${GITHUB_SHA:-}" "${GITHUB_EVENT_NAME:-local}")
 if ! python3 "$here/verdicts.py" extract --kind "$kind" --suite "$suite" \
-  --report "$report" --out "$out/verdicts.json" --provenance "$prov"; then
-  echo "::error::$suite: could not extract verdicts from $report"
+  "${extract_args[@]}" --out "$out/verdicts.json" --provenance "$prov"; then
+  echo "::error::$suite: could not extract verdicts from ${reports[*]}"
   exit 1
 fi
 

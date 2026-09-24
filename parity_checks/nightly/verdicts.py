@@ -200,14 +200,32 @@ def tally(cases: dict[str, dict]) -> dict[str, int]:
     return dict(sorted(out.items()))
 
 
-def extract(kind: str, report_path: Path, suite: str, provenance: dict | None = None) -> dict:
-    payload = json.loads(Path(report_path).read_text())
-    cases = EXTRACTORS[kind](payload)
+def extract(kind: str, report_paths, suite: str, provenance: dict | None = None) -> dict:
+    """One or more reports of one suite -> a verdict file.
+
+    Several reports are merged case by case (a sweep split into passes, e.g. the
+    giant models run on their own); a case in two of them is refused.
+    """
+    if isinstance(report_paths, (str, Path)):
+        report_paths = [report_paths]
+    cases: dict[str, dict] = {}
+    metas = []
+    for path in report_paths:
+        payload = json.loads(Path(path).read_text())
+        part = EXTRACTORS[kind](payload)
+        dup = sorted(set(part) & set(cases))
+        if dup:
+            raise ValueError(f"case(s) in more than one report: {dup[:5]}")
+        cases.update(part)
+        metas.append(_source_meta(kind, payload))
+    source = dict(metas[0]) if metas else {}
+    if len(metas) > 1:
+        source["parts"] = metas
     return {
         "schema": SCHEMA,
         "suite": suite,
         "kind": kind,
-        "source": {**_source_meta(kind, payload), **(provenance or {})},
+        "source": {**source, **(provenance or {})},
         "n_cases": len(cases),
         "tally": tally(cases),
         "cases": dict(sorted(cases.items())),
@@ -485,7 +503,7 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
 # --------------------------------------------------------------------------- #
 def _cmd_extract(args) -> int:
     prov = json.loads(args.provenance) if args.provenance else None
-    obj = extract(args.kind, Path(args.report), args.suite, prov)
+    obj = extract(args.kind, [Path(r) for r in args.report], args.suite, prov)
     dump_verdicts(obj, Path(args.out))
     print(f"{args.suite}: {obj['n_cases']} cases {obj['tally']} -> {args.out}")
     return 0
@@ -597,7 +615,7 @@ def main(argv=None) -> int:
     e = sub.add_parser("extract", help="report -> normalized verdict file")
     e.add_argument("--kind", choices=KINDS, required=True)
     e.add_argument("--suite", required=True, help="suite name recorded in the file (e.g. rr_ode)")
-    e.add_argument("--report", required=True)
+    e.add_argument("--report", required=True, action="append", help="repeat to merge passes")
     e.add_argument("--out", required=True)
     e.add_argument("--provenance", default="", help="JSON object merged into 'source'")
     e.set_defaults(fn=_cmd_extract)

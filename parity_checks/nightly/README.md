@@ -12,7 +12,7 @@ a regression. Nothing here blocks a PR.
 | `bng_ode` | BNG2.pl + run_network | 592 committed BNGL ODE jobs, ExprTk interpreter |
 | `bng_ode_codegen` | BNG2.pl + run_network | the same jobs on the compiled C path (`--codegen`) |
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
-| `amici_sens` | AMICI forward sensitivities | 43 of the 50 curated BioModels, staggered + simultaneous |
+| `amici_sens` | AMICI forward sensitivities | 41 of the 50 curated BioModels, staggered + simultaneous |
 
 **The BioModels gap.** 317 of the 1,323 BioModels come only from EBI's BioModels REST
 API, which answers HTTP 403 to GitHub-hosted runners (the same URLs work from a
@@ -20,6 +20,12 @@ workstation), so CI runs the 992 temp-biomodels models plus the committed SBML
 overrides. `present_models.py` hands each runner the models that are on disk. 300 of
 the 317 carry no recorded license (17 are CC0), so re-hosting them for CI needs a
 license review first.
+
+**Giant models.** The dozen SBML files over 1 MB (up to 786 species) run in a
+separate `rr-ode` pass, two at a time on the interpreted RHS: their automatic C
+compile alone outlasts the per-job cap on a 4-core runner, and four at once exhausted
+its memory. `amici-sens` leaves out BIOMD0000000496/497, which time out on both
+engines even on a workstation, and the 7 curated models that come only from EBI.
 
 ## Why a baseline, not the exit code
 
