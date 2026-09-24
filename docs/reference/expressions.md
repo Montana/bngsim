@@ -50,8 +50,8 @@ BNGsim provides all standard ExprTk functions plus BNG-specific extensions:
 **Control flow**:
 - `if(condition, true_value, false_value)` — ternary conditional. Condition is
   true when it is **nonzero** (`condition != 0`), in every bngsim backend: the
-  ODE interpreter, compiled (`codegen=True`) models, SSA and NFsim. Example:
-  `if(A_tot > 100, k_fast, k_slow)`
+  ODE interpreter, compiled (`codegen=True`) models, SSA, PSA, NFsim and
+  RuleMonkey. Example: `if(A_tot > 100, k_fast, k_slow)`
 
   A relational or logical condition (`>`, `<=`, `==`, `&&`, `||`, ...) always
   evaluates to exactly 0 or 1, so this is the same answer BNG2.pl gives. The
