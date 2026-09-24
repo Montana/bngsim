@@ -43,7 +43,9 @@ _SBML = """<?xml version="1.0" encoding="UTF-8"?>
   </listOfInitialAssignments>
   <listOfReactions>
    <reaction id="R" reversible="false">
-    <listOfReactants><speciesReference species="P" stoichiometry="1" constant="true"/></listOfReactants>
+    <listOfReactants>
+     <speciesReference species="P" stoichiometry="1" constant="true"/>
+    </listOfReactants>
     <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
      <apply><times/><ci>k</ci><ci>P</ci></apply></math></kineticLaw>
    </reaction>
