@@ -6545,6 +6545,11 @@ def _extract_exp_right(expr: str, start: int) -> tuple[str, int]:
     # valid C (`exponent has no digits`) nor the intended number. The same scan
     # serves a signed exponent, which reaches here with its sign already taken.
     i += _sci_exponent_suffix_len(expr[start_tok:i], expr, i)
+    # A call is one exponent operand: A^sqrt(n) means A^(sqrt(n)), not
+    # (A^sqrt)(n). Include the entire argument list before the caller recurses
+    # into it to translate nested powers such as A^sqrt(n^2).
+    if expr[start_tok:i].isidentifier() and i < len(expr) and expr[i] == "(":
+        i = _find_matching_paren(expr, i) + 1
     return sign + expr[start_tok:i], i
 
 
