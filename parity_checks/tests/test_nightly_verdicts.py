@@ -401,3 +401,25 @@ def test_cli_summarize(tmp_path):
     body = out.read_text()
     assert "vs baseline" in body and "A\\|ode" in body  # table cells escape the pipe
     assert V.main(["summarize", str(tmp_path / "unreadable.json")]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# present_models.py (which corpus models the nightly can run)
+# --------------------------------------------------------------------------- #
+def test_present_models_lists_only_models_on_disk(tmp_path):
+    import present_models as P
+
+    (tmp_path / "models" / "M1").mkdir(parents=True)
+    (tmp_path / "models" / "M1" / "M1.xml").write_text("<sbml/>")
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"model_id": "M2", "model": "models/M2/M2.xml"},
+                    {"model_id": "M1", "model": "models/M1/M1.xml"},
+                ]
+            }
+        )
+    )
+    assert P.present(manifest, root=tmp_path) == (["M1"], 2)

@@ -7,8 +7,9 @@
 #   1. extract REPORT into $NIGHTLY_OUT/SUITE/verdicts.json. That file is the candidate
 #      baseline: committing it as baselines/SUITE.json accepts tonight's state.
 #   2. diff it against the committed baseline, parity_checks/nightly/baselines/SUITE.json.
-#   3. diff it against the previous scheduled run's verdicts for SUITE, when one can be
-#      downloaded. This catches a fix that regresses before anyone re-baselined it.
+#   3. diff it against the previous nightly's verdicts for SUITE (the last scheduled or
+#      manual run on main), when one can be downloaded. This catches a fix that
+#      regresses before anyone re-baselined it.
 #
 # Both Markdown reports go to $GITHUB_STEP_SUMMARY. Exit 1 on any alert or on a
 # missing report; a missing baseline is an alert unless ALLOW_MISSING_BASELINE is set
@@ -58,11 +59,13 @@ else
   rc=1
 fi
 
-# The previous scheduled run's verdicts for this suite, if any is still downloadable.
+# The previous nightly's verdicts for this suite (scheduled or manual, on main), if any
+# is still downloadable. Pull-request runs are not nightlies and are never compared to.
 if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
   ids=$(gh run list -R "$GITHUB_REPOSITORY" --workflow nightly-parity.yml --branch main \
-    --event schedule --limit 7 --json databaseId,status \
-    --jq '.[] | select(.status == "completed") | .databaseId' 2>/dev/null || true)
+    --limit 10 --json databaseId,status,event \
+    --jq '.[] | select(.status == "completed" and (.event == "schedule" or .event == "workflow_dispatch")) | .databaseId' \
+    2>/dev/null || true)
   for id in $ids; do
     [ "$id" = "${GITHUB_RUN_ID:-}" ] && continue
     prev=$(mktemp -d)

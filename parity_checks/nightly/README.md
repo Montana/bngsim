@@ -8,11 +8,18 @@ a regression. Nothing here blocks a PR.
 |---|---|---|
 | `sbml_semantic` | SBML Test Suite expected results | 1,824 semantic cases, pinned checkout |
 | `dsmts` | DSMTS analytic mean / sd | 39 stochastic cases, committed |
-| `rr_ode` | libRoadRunner | 1,323 BioModels SBML, pinned and cached |
+| `rr_ode` | libRoadRunner | the 1,006 of 1,323 BioModels SBML a hosted runner can fetch, pinned and cached |
 | `bng_ode` | BNG2.pl + run_network | 592 committed BNGL ODE jobs, ExprTk interpreter |
 | `bng_ode_codegen` | BNG2.pl + run_network | the same jobs on the compiled C path (`--codegen`) |
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
-| `amici_sens` | AMICI forward sensitivities | 50 curated BioModels, staggered + simultaneous |
+| `amici_sens` | AMICI forward sensitivities | 43 of the 50 curated BioModels, staggered + simultaneous |
+
+**The BioModels gap.** 317 of the 1,323 BioModels come only from EBI's BioModels REST
+API, which answers HTTP 403 to GitHub-hosted runners (the same URLs work from a
+workstation), so CI runs the 992 temp-biomodels models plus the committed SBML
+overrides. `present_models.py` hands each runner the models that are on disk. 300 of
+the 317 carry no recorded license (17 are CC0), so re-hosting them for CI needs a
+license review first.
 
 ## Why a baseline, not the exit code
 
@@ -43,8 +50,8 @@ Improvements, new cases and churn between two failing states are listed in the
 run summary but never alert.
 
 Each suite is compared twice: against the committed baseline, and against the
-previous scheduled run's verdicts. The second catches a fix that regresses before
-anyone re-baselined it.
+previous nightly's verdicts (the last scheduled or manual run on `main`). The second
+catches a fix that regresses before anyone re-baselined it.
 
 ## When it alerts
 

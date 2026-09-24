@@ -9,14 +9,15 @@ name: nightly-parity
 #   job          reference                       corpus
 #   sbml         SBML Test Suite expected CSVs    1,824 semantic cases (pinned checkout)
 #                DSMTS analytic mean/sd           39 stochastic cases (committed)
-#   rr-ode       libRoadRunner                    1,323 BioModels SBML (pinned, cached)
+#   rr-ode       libRoadRunner                    1,006 of the 1,323 BioModels SBML: the
+#                                                 part a hosted runner can fetch (pinned, cached)
 #   bng-ode      BNG2.pl + run_network            592 committed BNGL ODE jobs, twice:
 #                                                 the ExprTk interpreter a .net runs by
 #                                                 default, and the compiled C path every
 #                                                 sensitivity run uses (#689/#699 lived
 #                                                 only there)
 #   bng-stoch    run_network SSA / NFsim          110 SSA + 235 NF committed BNGL jobs
-#   amici-sens   AMICI forward sensitivities      50 curated BioModels x 2 methods
+#   amici-sens   AMICI forward sensitivities      43 of the 50 curated BioModels x 2 methods
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -24,8 +25,8 @@ name: nightly-parity
 # verdict file and parity_checks/nightly/compare.sh diffs it against
 #
 #   1. the committed baseline, parity_checks/nightly/baselines/<suite>.json, and
-#   2. the previous scheduled run's verdicts (catches a regression of a fix that
-#      nobody has re-baselined yet).
+#   2. the previous nightly's verdicts, scheduled or manual on main (catches a
+#      regression of a fix that nobody has re-baselined yet).
 #
 # It alerts on a good case that is no longer good (including one that silently
 # drops out or stops being compared), a failing case that starts crashing, a jump
@@ -84,20 +85,26 @@ jobs:
   # ------------------------------------------------------------------------- #
   # The BioModels SBML corpus rr-ode and amici-sens read. It is gitignored
   # (~260 MB), so it is rebuilt from its pinned, sha256-checked sources on a cache
-  # miss and restored from the cache otherwise. One job fills the cache so the two
-  # consumers never both hit EBI and GitHub for 1.6 GB on the same night.
+  # miss and restored from the cache otherwise.
+  #
+  # CI covers the part of the corpus a hosted runner can fetch: the 992 models
+  # (SBML + SED-ML) from sys-bio/temp-biomodels on GitHub, plus the committed SBML
+  # overrides. The other 317 come only from EBI's BioModels REST API, which answers
+  # HTTP 403 to GitHub-hosted runners (every request, measured on this workflow's
+  # first run) while serving the same URLs elsewhere, so they are not requested
+  # here. The two consumers run whatever is present and the baseline records it.
   # ------------------------------------------------------------------------- #
   corpus:
     name: BioModels corpus
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     outputs:
       key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
 
       - id: key
-        run: echo "key=rr-corpus-v1-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'benchmarks/suites/biomodels/biomodels_provenance.json', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=rr-corpus-v2-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
 
       - id: cache
         uses: actions/cache/restore@v4
@@ -111,46 +118,32 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          # SED-ML + most SBML: sys-bio/temp-biomodels at the pinned commit, sha256-verified.
+          # SED-ML + SBML: sys-bio/temp-biomodels at the pinned commit, sha256-verified.
           python3 parity_checks/rr_parity/fetch_sedml.py --dest "$RUNNER_TEMP/sedml_source"
-          # The rest from BioModels REST at pinned versions. Only the models the manifest
-          # takes from there, minus the ones a committed override replaces anyway.
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          jobs = json.loads(Path("parity_checks/rr_parity/ode_jobs.json").read_text())["jobs"]
-          overridden = {p.name for p in Path("parity_checks/rr_parity/data/sbml_overrides").iterdir() if p.is_dir()}
-          want = {j["model_id"] for j in jobs if j.get("params", {}).get("sbml_origin") != "temp-biomodels"} - overridden
-          prov = json.loads(Path("benchmarks/suites/biomodels/biomodels_provenance.json").read_text())
-          prov["records"] = [r for r in prov["records"] if r["id"] in want]
-          missing = want - {r["id"] for r in prov["records"]}
-          if missing:
-              raise SystemExit(f"{len(missing)} manifest models have no pinned provenance: {sorted(missing)[:5]}")
-          out = Path(os.environ["RUNNER_TEMP"]) / "biomodels_needed.json"
-          out.write_text(json.dumps(prov))
-          print(f"BioModels REST: {len(prov['records'])} models to fetch")
-          PY
-          # Idempotent and resumable: a second pass retries only what a transient
-          # network failure left behind. The presence check below is the gate.
-          fetch() { python3 benchmarks/suites/biomodels/fetch.py \
-            --manifest "$RUNNER_TEMP/biomodels_needed.json" --data "$RUNNER_TEMP/biomodels"; }
-          fetch || fetch || echo "::warning::BioModels fetch reported failures; checking presence"
           python3 parity_checks/rr_parity/materialize.py \
             --sedml-dir "$RUNNER_TEMP/sedml_source/final" \
-            --sbml-dir "$RUNNER_TEMP/biomodels/sbml_downloads"
+            --sbml-dir "$RUNNER_TEMP/no-ebi-downloads"
 
-      - name: Check every manifest model is present
+      # Every job whose SBML comes from temp-biomodels must be present; a shortfall
+      # there is a fetch failure, not the known EBI gap.
+      - name: Check coverage
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           python3 - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
           root = Path("parity_checks/rr_parity")
           jobs = json.loads((root / "ode_jobs.json").read_text())["jobs"]
-          missing = [j["model_id"] for j in jobs if not (root / j["model"]).is_file()]
-          print(f"{len(jobs) - len(missing)}/{len(jobs)} manifest SBML files present")
-          if missing:
-              raise SystemExit(f"missing: {missing[:10]}")
+          present = [j for j in jobs if (root / j["model"]).is_file()]
+          tb_missing = [j["model_id"] for j in jobs
+                        if j.get("params", {}).get("sbml_origin") == "temp-biomodels"
+                        and not (root / j["model"]).is_file()]
+          msg = f"{len(present)}/{len(jobs)} manifest SBML files present ({len(jobs) - len(present)} are EBI-only)"
+          print(msg)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"BioModels corpus: {msg}\n")
+          if tb_missing:
+              raise SystemExit(f"temp-biomodels models missing: {tb_missing[:10]}")
           PY
 
       - name: Save the corpus cache
@@ -268,10 +261,12 @@ jobs:
       # --timeout 300 rather than the runner's 120 s: four models sit at 115-118 s on
       # an M1 Max (RoadRunner's JIT load dominates), and a timeout that flips with
       # runner speed would alert as a regression.
+      - name: Select the models the corpus holds
+        run: python3 parity_checks/nightly/present_models.py parity_checks/rr_parity/ode_jobs.json > "$RUNNER_TEMP/models.txt"
       - name: Run rr_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --out "$RUNNER_TEMP/rr_ode.json" || true
+        run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
       - name: Compare
         env:
           GH_TOKEN: ${{ github.token }}
@@ -426,10 +421,12 @@ jobs:
           path: parity_checks/amici_parity/amici_sens_cache
           key: ${{ steps.amici-key.outputs.prefix }}${{ github.run_id }}
           restore-keys: ${{ steps.amici-key.outputs.prefix }}
+      - name: Select the models the corpus holds
+        run: python3 parity_checks/nightly/present_models.py parity_checks/amici_parity/amici_ode_jobs.json > "$RUNNER_TEMP/models.txt"
       - name: Run amici_sens_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/amici_parity/amici_sens_run.py --workers 4 --out "$RUNNER_TEMP/amici_sens.json" || true
+        run: uv run --no-sync python parity_checks/amici_parity/amici_sens_run.py --workers 4 --models "$(cat "$RUNNER_TEMP/models.txt")" --out "$RUNNER_TEMP/amici_sens.json" || true
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true # nothing to save when provisioning failed before the run
