@@ -1145,13 +1145,21 @@ Result NfsimSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_
     eval_function_set(fn_set.funcs, fn_buf);
     result.record_expressions(0, fn_buf.data());
 
-    // Simulation loop using stepTo()
+    // Simulation loop using stepTo(). The run starts from the initial state at
+    // t_out[0] (= t_start) and never sees [0, t_start], as ode and ssa do and as
+    // BNG2.pl's simulate_nf does (it runs NFsim for t_end - t_start). stepTo()
+    // takes NFsim's own clock, which starts at the system's current time, so
+    // each target is that clock plus the time elapsed since t_start; the row
+    // keeps its absolute label. Stepping to the absolute t_out[i] ran the
+    // pre-history too and labelled the t = 0 state as t_start (issue #703).
+    // simulate() anchors its segments the same way (segment_base_time).
+    const double clock0 = system->getCurrentTime();
     {
         StreamSuppressor suppress;
         for (int i = 1; i < n_points; ++i) {
             if (budget.active())
                 budget.check();
-            system->stepTo(t_out[i]);
+            system->stepTo(clock0 + (t_out[i] - t_out[0]));
             for (int j = 0; j < n_obs; ++j) {
                 obs_buf[j] = static_cast<double>(system->getObsForOutput(j)->getCount());
             }
