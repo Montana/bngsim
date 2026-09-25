@@ -508,7 +508,10 @@ static double codegen_tfun_eval_thunk(int tf_id, double x, void *ctx) {
 // -287), a species declared with a negative initial value, a boundary species
 // held at -5. The clamp now leaves alone every slot that is fixed, that is the
 // target of a rate rule, that is a promoted parameter or compartment (not
-// reported as a species), or whose initial value is negative.
+// reported as a species), or that was declared with a negative initial value.
+// The declared value, not initial_conc: save_concentrations() moves that to a
+// captured state, where a depleted concentration a hair below 0 still needs the
+// clamp (Species::declared_negative).
 static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
     const NetworkModel &model = *data->model;
     const int ns = model.n_species();
@@ -518,7 +521,7 @@ static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
     const auto &species = model.species();
     for (int i = 0; i < ns; ++i) {
         const Species &sp = species[i];
-        if (sp.fixed || !sp.reported || sp.initial_conc < 0.0)
+        if (sp.fixed || !sp.reported || sp.declared_negative)
             mask[i] = 0;
     }
     for (const Reaction &rxn : model.reactions()) {
