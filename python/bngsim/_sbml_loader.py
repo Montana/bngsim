@@ -2137,10 +2137,17 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
             periods.append(1.0 / s)
     longest = max(periods) if periods else 1.0
     shortest = min(periods) if periods else 1.0
-    # A few of the longest period covers every phase; cap the window so a model
-    # with a very long period stays cheap (the narrowest feature is periodic, so
-    # a few cycles still contain it).
-    horizon = min(max(2.5 * longest, 4.0 * shortest, 4.0), 128.0)
+    # A few of the longest period covers every phase. The window is capped so a
+    # model with one very long period beside a fast one stays cheap and finely
+    # sampled: the cap is 128, or four of the FASTEST period when that is longer.
+    # A flat 128 (issue #712) held less than one cycle of any schedule slower
+    # than about 51 time units -- weekly dosing in hours, daily in minutes, or a
+    # first pulse after t = 127 -- so the scan saw one edge or only the off
+    # interval, returned None or a bound far wider than the pulse, and CVODE
+    # stepped over every pulse after the first. Scaling with the fastest period
+    # keeps several complete cycles of the schedule in view whatever its units,
+    # and leaves a model with any period under 32 exactly as before.
+    horizon = min(max(2.5 * longest, 4.0 * shortest, 4.0), max(128.0, 4.0 * shortest))
 
     # Scan the structural signature for edges. Samples at cell centres so the
     # scan never lands exactly on an integer edge — a measure-zero `0 < frac` flip
