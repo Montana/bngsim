@@ -443,10 +443,19 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // message includes the event id. run() and run_psa() both come through here.
     // The message used to send the reader to "Phase 5c of the SBML SSA Support
     // Plan", a planning document that is no longer in the tree (issue #526).
+    //
+    // A delay expression that reads only fixed parameters and is 0 for this
+    // run queues nothing, exactly as a literal 0 does. The SBML loader keeps
+    // `<delay><ci>d</ci></delay>` as an expression so set_param reaches it
+    // (issue #835), and before that it folded to a literal 0 that ran here.
     {
         const auto &evs = model.events();
-        for (const auto &ev : evs) {
-            if (ev.delay > 0.0 || ev.delay_expr_idx >= 0) {
+        for (std::size_t ei = 0; ei < evs.size(); ++ei) {
+            const auto &ev = evs[ei];
+            const bool delayed = ev.delay_expr_idx >= 0
+                                     ? !model.event_delay_is_fixed_zero(static_cast<int>(ei))
+                                     : ev.delay > 0.0;
+            if (delayed) {
                 throw std::runtime_error("Event '" + ev.id +
                                          "' has a delay, which is not yet supported under SSA/PSA "
                                          "(issue #526 tracks adding it). Use method='ode', which "
@@ -766,8 +775,9 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // a post-fire trigger sweep handles those.
     //
     // Delayed events never reach this loop: the check at the top of
-    // run_internal() raises on any event with delay > 0 or delay_expr_idx >= 0
-    // (delay support under SSA/PSA is issue #526).
+    // run_internal() raises on any event whose delay is not a fixed zero
+    // (NetworkModel::event_delay_is_fixed_zero; delay support under SSA/PSA is
+    // issue #526).
     std::vector<bool> trigger_was_true(n_events, false);
     auto &eval_ref = model.evaluator();
     auto &sp_vec_ref = const_cast<std::vector<Species> &>(model.species());
