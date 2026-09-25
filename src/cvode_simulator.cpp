@@ -6305,10 +6305,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             double d = ev.delay;
             if (ev.delay_expr_idx >= 0) {
                 d = eval_ref_outer.evaluate(ev.delay_expr_idx);
-                if (d < 0.0)
-                    d = 0.0;
             }
-            inst.delay = d;
+            // A delay must be a finite, non-negative number (SBML L3 §4.11.3).
+            // NaN failed the `delay_now > 0` test below and every negative
+            // passed the old clamp, so both fired at trigger time as if the
+            // delay were 0, with no error (issue #762). Refuse them by name. A
+            // negative within rounding of zero (`T - time()` evaluated at T) is
+            // still read as 0, which is what the clamp was for.
+            const double tol = 1e-9 * std::max(1.0, std::fabs(t_now));
+            if (!std::isfinite(d) || d < -tol) {
+                const std::string id = ev.id.empty() ? std::to_string(ei) : ev.id;
+                throw std::runtime_error("event '" + id + "' fired at t=" + std::to_string(t_now) +
+                                         " with delay " + std::to_string(d) +
+                                         "; an event delay must be a finite, non-negative "
+                                         "number");
+            }
+            inst.delay = d < 0.0 ? 0.0 : d;
             return inst;
         };
 

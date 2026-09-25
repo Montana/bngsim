@@ -157,6 +157,10 @@ _IC_SENS_PROBE_TOL = 1e-4
 # unwritable compartment sizes — spell themselves out in full and do not use this.
 _SKIP_WARN_NAME_LIMIT = 8
 
+# The engine's refusal of an event delay that is NaN, infinite or negative
+# (issue #762). Matched in the jacobian="auto" retry, which must not retry it.
+_EVENT_DELAY_REFUSAL = "an event delay must be a finite, non-negative number"
+
 
 def _abbreviate(names: list[str], limit: int = _SKIP_WARN_NAME_LIMIT) -> str:
     """``['a', 'b', ...]`` for a warning, truncated with a count past ``limit``."""
@@ -2859,6 +2863,12 @@ class Simulator:
         try:
             return self._sim.run(times, opts)
         except RuntimeError as e:
+            # A model error the Jacobian has nothing to do with fails the same way
+            # on the FD retry, so retrying only adds a warning that blames the
+            # Jacobian and a second full run. An invalid event delay is one
+            # (issue #762).
+            if _EVENT_DELAY_REFUSAL in str(e):
+                raise
             logger.warning(
                 "GH#176 analytical Jacobian: CVODE integration failed (%s); "
                 "retrying with the finite-difference Jacobian. The rate law is "
