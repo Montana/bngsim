@@ -6666,6 +6666,24 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             double delay_now = queue[k].delay;
 
             if (delay_now > 0.0) {
+                if (n_sens > 0) {
+                    // The delayed apply below has no sensitivity jump and no
+                    // CVodeSensReInit (issue #146), so a live sensitivity run
+                    // must never get here. The pre-run gate
+                    // (NetworkModel::event_sensitivity_unsupported_reason)
+                    // passes a parameter-only delay that is 0 for the values it
+                    // saw (issue #835); a run_batch row, or any caller that
+                    // sets the parameter afterwards, can still make it
+                    // positive. Refuse at the fire rather than return columns
+                    // that silently miss the jump.
+                    const std::string id =
+                        ev.id.empty() ? std::to_string(queue[k].event_idx) : ev.id;
+                    throw std::runtime_error(
+                        "event '" + id + "' fired at t=" + diag_number(t_now) + " with delay " +
+                        diag_number(delay_now) +
+                        " during a forward-sensitivity run; forward sensitivity through "
+                        "delayed events is not yet supported (issue #144 tracks what is)");
+                }
                 // Delayed: queue for a future apply_time. No state change now,
                 // so no cascade re-check follows.
                 PendingEvent pe;

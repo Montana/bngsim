@@ -147,6 +147,42 @@ def test_parameter_scan_changes_constant_parameter_priority():
 
 def test_zero_constant_parameter_delay_does_not_block_sensitivities():
     event = _event("E", "y", "<cn>1</cn>", delay_math="<ci>d</ci>")
-    sbml = _model('<parameter id="d" value="0" constant="true"/>', event)
-    _, result = _run(sbml, end=2, sensitivity_params=("d",))
+    sbml = _model(
+        '<parameter id="d" value="0" constant="true"/>'
+        '<parameter id="k" value="1" constant="true"/>',
+        event,
+    )
+    _, result = _run(sbml, end=2, sensitivity_params=("k",))
     assert result.species[-1, result.species_names.index("y")] == pytest.approx(1.0)
+
+
+# x' = -k*x, reset to x = 1 at `d` after time > 1: for t > 1 + d,
+# x = exp(-k*(t - 1 - d)), so the right-sided dx/dd is k*x, not 0.
+_DECAY_RESET_ANT = """
+x = 0.5; k = 1; x' = -k*x; const d = 0;
+E: at d after (time > 1), fromTrigger=false: x = 2*k;
+"""
+
+
+def test_zero_delay_reading_a_sensitivity_parameter_is_refused():
+    # The delay is 0 for this run, but its execution time moves with d, and the
+    # immediate path adds no d(t_exec)/dd term: passing the gate reported 0.
+    model = bngsim.Model.from_antimony_string(_DECAY_RESET_ANT)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["d"])
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match="reads the requested"):
+        sim.run(t_span=(0, 2), n_points=3)
+
+
+def test_run_batch_row_that_makes_a_zero_delay_positive_is_refused():
+    # The pre-run gate sees d = 0 on the Simulator's model; a row sets it to 0.5.
+    # The delayed apply carries no sensitivity jump, so the row must raise rather
+    # than return dx/dk from the undelayed path.
+    model = bngsim.Model.from_antimony_string(_DECAY_RESET_ANT)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["k"])
+    rows = sim.run_batch(t_span=(0, 3), n_points=4, params=[{"d": 0.0}])
+    # d = 0: x(t) = 2k*exp(-k(t - 1)) for t > 1, so dx/dk(3) = 2e^-2*(1 - 2).
+    assert np.asarray(rows[0].sensitivities)[-1].ravel()[0] == pytest.approx(
+        2.0 * np.exp(-2.0) * (1.0 - 2.0), rel=1e-4
+    )
+    with pytest.raises(bngsim.SimulationError, match="forward-sensitivity run"):
+        sim.run_batch(t_span=(0, 3), n_points=4, params=[{"d": 0.5}])

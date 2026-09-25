@@ -1437,36 +1437,52 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
     // 0`, so nothing is queued and there is no trigger-time-to-execution-time
     // window at all. Normalize it here rather than in the builder, so the
     // runtime's own delay handling is untouched. A delay *expression* counts as
-    // vacuous when it reads only fixed parameters and evaluates to 0 now; those
-    // parameter values can be changed before a run but not during one.
+    // vacuous when it reads only fixed parameters, none of them a requested
+    // sensitivity parameter, and evaluates to 0 now; those parameter values can
+    // be changed before a run but not during one. The verdict therefore holds
+    // for this run's values only — the runtime re-checks at every fire (the
+    // delayed-queue guard in CvodeSimulator::run), so a batch row that sets the
+    // parameter nonzero is refused there rather than answered.
+    //
+    // zero_delay_sens_param is set when the only thing making a zero delay
+    // effective is that it reads a requested sensitivity parameter.
+    const Parameter *zero_delay_sens_param = nullptr;
     auto has_effective_delay = [&](const Event &ev) {
+        zero_delay_sens_param = nullptr;
         if (ev.delay_expr_idx >= 0) {
-            const auto refs = eval.referenced_variable_addresses(ev.delay_expr_idx);
-            for (const double *addr : refs) {
-                // A delay that reads trajectory state (or a non-parameter such
-                // as time) can become positive after the run starts. A plain
-                // parameter expression cannot: its current value is fixed for
-                // the duration of a run, though callers may set it before the
-                // run. Allow a parameter-only expression through this gate
-                // when it currently evaluates to zero (issue #835).
-                bool is_parameter = false;
-                bool is_live_parameter = false;
+            const Parameter *reads_sens = nullptr;
+            for (const double *addr : eval.referenced_variable_addresses(ev.delay_expr_idx)) {
+                // A delay that reads trajectory state, time, or a derived
+                // parameter can become positive after the run starts. A plain
+                // parameter cannot: its value is fixed for the run (issue #835).
+                const Parameter *param = nullptr;
                 for (const Parameter &p : params) {
                     if (&p.value == addr) {
-                        is_parameter = true;
-                        is_live_parameter = p.is_expression;
+                        param = &p;
                         break;
                     }
                 }
-                if (!is_parameter || is_live_parameter || is_state_address(addr)) {
+                if (param == nullptr || param->is_expression) {
                     return true;
+                }
+                if (reads_sens == nullptr && sens_param_addrs.count(addr) != 0) {
+                    reads_sens = param;
                 }
             }
             // evaluate() is non-const on the evaluator but has no observable
             // effect here; the model is logically unchanged. For parameter-only
             // expressions this checks the current run's value.
             ExpressionEvaluator &mut = const_cast<ExpressionEvaluator &>(eval);
-            return mut.evaluate(ev.delay_expr_idx) != 0.0;
+            if (mut.evaluate(ev.delay_expr_idx) != 0.0) {
+                return true;
+            }
+            // A zero delay is still one to differentiate when it reads a
+            // requested parameter: the execution time is t* + d(p), so
+            // ∂t_exec/∂p carries ∂d/∂p, which the immediate path never adds. On
+            // `x' = -x`, reset `x = 1` at `d` after `time > 1` with d = 0, the
+            // true ∂x/∂d is x (right-sided), and passing this gate reported 0.
+            zero_delay_sens_param = reads_sens;
+            return reads_sens != nullptr;
         }
         return ev.delay != 0.0;
     };
@@ -1478,6 +1494,16 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
         const Event &ev = events[ei];
         const std::string id = ev.id.empty() ? std::string("<unnamed>") : ev.id;
         const bool delayed = has_effective_delay(ev);
+        if (delayed && zero_delay_sens_param != nullptr) {
+            const std::string &pname = zero_delay_sens_param->name;
+            return "event '" + id +
+                   "' has a delay that is 0 for this run but reads the requested " +
+                   "sensitivity parameter '" + pname +
+                   "', so its execution time moves with that parameter; forward sensitivity "
+                   "through event delays is not yet supported (issue #144 tracks what is). "
+                   "Drop '" +
+                   pname + "' from the requested sensitivity parameters.";
+        }
         if (delayed) {
             return "event '" + id +
                    "' has an execution delay; forward sensitivity through delayed events "
