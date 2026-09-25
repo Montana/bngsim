@@ -74,3 +74,44 @@ def test_output_sensitivity_at_a_zero_base_is_finite(tmp_path):
     a = 10.0 * np.exp(-KB * t)
     # dg/dkb = A + kr dA/dkb = A (1 - kb t).
     np.testing.assert_allclose(out[:, 2], a * (1.0 - KB * t), rtol=1e-5, atol=1e-8)
+
+
+def test_an_infinite_threshold_partial_is_refused_not_zeroed():
+    """d(E^n)/dE at E = 0 with n = 0.5 is infinite, so the event's crossing time
+    has no derivative in E. The guards leave it non-finite; dropping it read as
+    dt*/dp = 0 in the event-threshold detector, which asks for no warnings, and
+    the run returned dX/dE = 0 where the one-sided difference grows without
+    bound. Kept, it reaches the jump, which refuses it."""
+    from bngsim._bngsim_core import ModelBuilder
+
+    b = ModelBuilder()
+    b.add_parameter("kin", 2.0)
+    b.add_parameter("kout", 0.5)
+    b.add_parameter("E", 0.0)
+    b.add_parameter("n", 0.5)
+    b.add_parameter("T", 1.0, expression="1 + E^n", is_expression=True)
+    x = b.add_species("X", 0.0)
+    on = b.add_species("on", 0.0)
+    b.add_reaction([on], [on, x], "elementary", "kin")
+    b.add_reaction([x], [], "elementary", "kout")
+    b.add_observable("Xobs", [(x, 1.0)])
+    b.add_event("onset", "time() >= T", [(on, "1.0")])
+    sim = bngsim.Simulator(bngsim.Model(_core=b.build()), method="ode", sensitivity_params=["E"])
+    with pytest.raises(bngsim.SimulationError, match="non-finite"):
+        sim.run(t_span=(0.0, 5.0), n_points=6)
+
+
+@pytest.mark.parametrize(("n", "dkr_dE"), [(0.5, np.inf), (1.0, 1.0 / H), (2.0, 0.0)])
+def test_the_numeric_twin_takes_the_limit_the_c_twin_takes(n, dkr_dE):
+    """The guarded partials divide through by the base, so at E = 0 they read
+    pow(0, -k): C takes that to inf and 1/inf to 0. The numeric twin evaluates
+    the same way, so d(E^n/(E^n+h^n))/dE is 0 at n = 2 (sympy's zoo arithmetic
+    made it NaN) and inf at n = 0.5, kept rather than dropped as a zero."""
+    from bngsim._codegen import _derived_expr_partials_numeric
+
+    names = ["E", "n", "h"]
+    walked = _derived_expr_partials_numeric(
+        "E^n/(E^n+h^n)", set(names), {p: i for i, p in enumerate(names)}, [0.0, n, H], {}
+    )
+    assert walked.get("E", 0.0) == pytest.approx(dkr_dE)
+    assert walked.get("n", 0.0) == 0.0

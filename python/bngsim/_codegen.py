@@ -2517,6 +2517,35 @@ def _guard_zero_base(deriv):
     return deriv if _folds_nonfinite(guarded) else guarded
 
 
+def _partial_value(deriv, subs: dict) -> float:
+    """*deriv* at the point *subs*, in IEEE double arithmetic, as the C twin
+    computes it (issue #720).
+
+    The guarded forms divide through by the base, so at a zero base they read
+    ``pow(0, -k)``: C takes that to ``inf`` and ``1/inf`` to 0, the limit, while
+    sympy's ``subs``/``evalf`` takes it to ``zoo`` and the sum to NaN, or leaves a
+    ``zoo`` that ``float()`` refuses. The first disagreed with the C twin at a
+    removable singularity (d/dE of ``E^n/(E^n+h^n)`` at E = 0, n = 2: 0 in C,
+    NaN here); the second made a genuinely infinite partial (d/dE of ``E^n`` at
+    n = 0.5) a *dropped* one, which the event-threshold detector reads as
+    dt*/dp = 0. Evaluated the way C does, the first is 0 and the second ``inf``,
+    which the run refuses by name. Anything numpy cannot evaluate (an engine
+    function it has no name for) goes through sympy as before.
+    """
+    import numpy as np
+    import sympy as sp
+
+    syms = sorted(deriv.free_symbols, key=str)
+    try:
+        fn = sp.lambdify(syms, deriv, modules="numpy")
+        with np.errstate(all="ignore"):
+            # numpy scalars, not Python floats: `0.0 ** -0.5` raises in Python
+            # and is inf in numpy, as in C.
+            return float(fn(*[np.float64(subs[s]) for s in syms]))
+    except Exception:  # noqa: BLE001 - the sympy route below says why, if it fails
+        return float(deriv.subs(subs).evalf())
+
+
 def _direct_derived_partials(
     expr: str,
     primary_names: set[str],
@@ -2778,8 +2807,6 @@ def _direct_derived_partials_numeric(
     and issue #56's point is only that a missing one must not pass silently for
     a real zero.
     """
-    import math
-
     import sympy as sp
 
     prep, reason = _prepare_derived_expr(expr, primary_names, derived_names)
@@ -2803,16 +2830,17 @@ def _direct_derived_partials_numeric(
         try:
             # The C twin's zero-base guards, so both agree at a zero base
             # (issue #720): the raw derivative is NaN there.
-            val = float(_guard_zero_base(deriv).subs(subs).evalf())
+            val = _partial_value(_guard_zero_base(deriv), subs)
         except (TypeError, ValueError) as exc:
             if warn_on_failure:
                 _warn_chain_rule_dropped(expr, [p_name], f"{type(exc).__name__}: {exc}")
             continue
-        if not math.isfinite(val):
-            # NaN != 0.0, so a non-finite partial used to be kept as a real one.
-            if warn_on_failure:
-                _warn_chain_rule_dropped(expr, [p_name], f"non-finite at this point ({val})")
-            continue
+        # A partial still non-finite after the guards (d(E^n)/dE at E = 0 with
+        # n < 1, a genuinely infinite derivative) is kept, not dropped: a
+        # missing partial reads downstream as a real zero, and the callers that
+        # pass warn_on_failure=False (the switch-time and event-threshold
+        # detectors) would then report dt*/dp = 0 without a word. Kept, it
+        # reaches the run, which refuses the non-finite jump by name.
         if val != 0.0:
             out[p_name] = val
     return (out or None), None
