@@ -2519,11 +2519,13 @@ def model_moving_crossings(core, ctx=None) -> tuple[str, ...]:
 
     Deliberately coarse, in the safe direction: it asks only whether an atom
     *can* cross at a moving time, never whether anything compensates the
-    crossing. Two grounds exclude an atom, both borrowed from
+    crossing. Three grounds exclude an atom, all borrowed from
     :func:`uncompensated_condition_reason` so the two agree about what is not a
     crossing at all — a comparison naming no symbol (``0>0``, decided at load),
-    and a :func:`fixed_clock_threshold` (``t<14``, whose ``∂t*/∂p`` is exactly
-    0). Everything else reads live state or a parameter, so some θ moves it.
+    a :func:`fixed_clock_threshold` (``t<14``, whose ``∂t*/∂p`` is exactly 0),
+    and a :func:`condition_cannot_cross` atom (``a<b`` over run-constants, which
+    picks its branch before the first step and holds it; issue #824). Everything
+    else reads live state, so some θ moves it.
 
     It follows that an atom here may be one the analytic path *would* have
     compensated — issue #48's clock jump, issue #150's saltation jump. That is
@@ -2567,6 +2569,12 @@ def model_moving_crossings(core, ctx=None) -> tuple[str, ...]:
             if not _IDENTIFIER.search(atom_flat):
                 continue
             if fixed_clock_threshold(atom, scope):
+                continue
+            # A condition over run-constants alone holds one truth value for the
+            # whole run, so it has no crossing time to move (issue #824). The
+            # warning used to name `a<b` or `(a==b)<1` as a moving crossing
+            # whenever something else declined the analytic RHS.
+            if condition_cannot_cross(atom_flat, scope):
                 continue
             found.append(atom)
     return tuple(found)
