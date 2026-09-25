@@ -4482,7 +4482,9 @@ def _analyze_event_trigger(
         # to the wrong parameter (see :func:`_threshold_scope`).
         thr_flat = _inline_derived_param_refs(threshold_expr, thresholds.exprs) or threshold_expr
         leftover = sorted(
-            {m.group(0) for m in _IDENTIFIER.finditer(thr_flat)} - thresholds.primaries
+            {m.group(0) for m in _IDENTIFIER.finditer(thr_flat)}
+            - thresholds.primaries
+            - _BUILTIN_CONSTANT_VALUES.keys()
         )
         if leftover:
             return (
