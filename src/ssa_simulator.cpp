@@ -1046,10 +1046,32 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // samples strictly before the event. Defined at function scope so both
     // the a0==0 idle path and the τ-step recording loop can reuse it.
     constexpr double SAMPLE_EVENT_TOL = 1e-9;
+    // Both tolerances are absolute, and at large t an absolute 1e-12 is below
+    // the spacing of doubles: from t = 8192 one ulp is 2^-39 ≈ 1.8e-12, so
+    // `hi - lo` can never fall under BISECT_EPS and the bisection below spun
+    // forever at 100% CPU, never reaching the wall-clock budget, which is only
+    // checked in the outer loops (issue #716). Floor each at a few ulps of the
+    // time it is applied at. Wherever the old loop terminated, 2 ulps is at or
+    // below 1e-12 and nothing changes; the floors only take over where 1e-12 is
+    // finer than a double can resolve. The sample tolerance keeps its ~1e3
+    // margin over the bisection's.
+    auto bisect_tol = [&](double t) {
+        const double ulp =
+            std::nextafter(std::fabs(t), std::numeric_limits<double>::infinity()) - std::fabs(t);
+        return std::max(BISECT_EPS, 2.0 * ulp);
+    };
+    auto sample_event_tol = [&](double t) {
+        return std::max(SAMPLE_EVENT_TOL, 1e3 * bisect_tol(t));
+    };
+    // Enough halvings to take any finite window down to one ulp; the
+    // no-progress exit below normally ends it long before.
+    constexpr int BISECT_MAX_ITERS = 1100;
     auto bisect_trigger = [&](int ei, double lo, double hi) -> double {
         // State is unchanged during the τ-step; only time advances.
-        while (hi - lo > BISECT_EPS) {
+        for (int iter = 0; iter < BISECT_MAX_ITERS && hi - lo > bisect_tol(hi); ++iter) {
             double mid = 0.5 * (lo + hi);
+            if (mid <= lo || mid >= hi)
+                break; // lo and hi are adjacent doubles: nothing left to split
             model.evaluate_functions(mid);
             double v = eval_ref.evaluate(events[ei].trigger_expr_idx);
             if (v > 0.5) {
@@ -1332,7 +1354,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
             t_event = t_min;
             for (size_t i = 0; i < potential.size(); ++i) {
-                if (t_cross_per[i] <= t_event + BISECT_EPS) {
+                if (t_cross_per[i] <= t_event + bisect_tol(t_event)) {
                     firing_at_event.push_back(potential[i]);
                 }
             }
@@ -1546,7 +1568,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 if (std::isfinite(t_event_idle) && t_event_idle <= times.t_end) {
                     // Record any samples strictly before t_event_idle.
                     while (next_output < n_out && t_event_idle > t_out[next_output] &&
-                           t_out[next_output] < t_event_idle - SAMPLE_EVENT_TOL) {
+                           t_out[next_output] < t_event_idle - sample_event_tol(t_event_idle)) {
                         const double *cc = sample_conc(t_out[next_output]);
                         model.update_observables(cc);
                         for (int j = 0; j < n_obs; ++j) {
@@ -1688,7 +1710,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         //    several orders wider than BISECT_EPS so a legitimate sample
         //    strictly before t_event is still recorded pre-event.
         while (next_output < n_out && t_advance >= t_out[next_output]) {
-            if (event_wins && t_out[next_output] >= t_event - SAMPLE_EVENT_TOL)
+            if (event_wins && t_out[next_output] >= t_event - sample_event_tol(t_event))
                 break;
             const double *cc = sample_conc(t_out[next_output]);
             model.update_observables(cc);
