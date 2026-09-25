@@ -322,6 +322,17 @@ struct CvodeUserData {
     double *sens_p = nullptr; // pointer to sens_p vector (owned by run())
     int n_params = 0;         // number of parameters in sens_p
 
+    // sens_p as set up, before any probe (issue #690). CVODES restores the
+    // entry it perturbed in sens_p itself, but the RHS callbacks mirror sens_p
+    // into the model's parameters and the codegen buffer, and nothing mirrored
+    // the restore back. So between probes the model held p - delta for the last
+    // sensitivity parameter, and every reader outside the RHS (output rows,
+    // recorded functions, event triggers and assignments, the state written back
+    // after the run) saw the probed value. The callbacks now put these back
+    // whenever their sync moved a parameter off them.
+    const double *sens_p_nominal = nullptr;
+    bool params_off_nominal = false;
+
     // Switch-time parameters held at their nominal value against CVODES'
     // finite-difference sensitivity probe (issue #48). Non-null only when a
     // fitted switch time was detected; sized n_params, 1 = pinned.
@@ -843,7 +854,7 @@ cvode_failure_message(double t, int flag, CvodeUserData &data,
     return msg + nonfinite_witness_suffix(data);
 }
 
-static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
+static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     const double *y_ptr = N_VGetArrayPointer(y);
     double *ydot_ptr = N_VGetArrayPointer(ydot);
@@ -863,6 +874,8 @@ static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) 
             params[i].value = (data->sens_param_pinned != nullptr && data->sens_param_pinned[i])
                                   ? data->sens_param_nominal[i]
                                   : data->sens_p[i];
+            if (data->sens_p_nominal != nullptr && params[i].value != data->sens_p_nominal[i])
+                data->params_off_nominal = true;
         }
         // Re-evaluate constant-expression parameters (e.g., ``_rateLaw{N}``
         // from BNG2.pl that encode ``chi*kon`` style products) so derived
@@ -896,6 +909,33 @@ static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) 
     return 0; // success
 }
 
+// Put the model's parameters (and the codegen buffer) back at their nominal
+// values after an RHS call whose sensitivity sync moved one to a CVODES
+// finite-difference probe value (issue #690). Only a probe call pays for this:
+// an ordinary RHS call leaves params_off_nominal false.
+static void restore_params_after_probe(CvodeUserData *data) {
+    if (!data->params_off_nominal) {
+        return;
+    }
+    auto &params = const_cast<std::vector<Parameter> &>(data->model->parameters());
+    for (int i = 0; i < data->n_params; ++i) {
+        params[i].value = data->sens_p_nominal[i];
+    }
+    const_cast<NetworkModel *>(data->model)->refresh_derived_params();
+    if (data->codegen_param_values != nullptr) {
+        for (int i = 0; i < data->n_params; ++i) {
+            data->codegen_param_values[i] = params[i].value;
+        }
+    }
+    data->params_off_nominal = false;
+}
+
+static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
+    const int rc = cvode_rhs_body(t, y, ydot, user_data);
+    restore_params_after_probe(static_cast<CvodeUserData *>(user_data));
+    return rc;
+}
+
 // ─── Codegen RHS callback ────────────────────────────────────────────────────
 // CVODE calls this; we forward to the dlopen'd codegen function.
 // The codegen function expects (double t, double* y, double* ydot, void* user_data)
@@ -905,7 +945,7 @@ static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) 
 // observables internally. The key insight: the codegen RHS reads params
 // from the runtime array, not from the model object.
 
-static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
+static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     double *y_ptr = N_VGetArrayPointer(y);
     double *ydot_ptr = N_VGetArrayPointer(ydot);
@@ -927,6 +967,8 @@ static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *use
             params[i].value = (data->sens_param_pinned != nullptr && data->sens_param_pinned[i])
                                   ? data->sens_param_nominal[i]
                                   : data->sens_p[i];
+            if (data->sens_p_nominal != nullptr && params[i].value != data->sens_p_nominal[i])
+                data->params_off_nominal = true;
         }
         const_cast<NetworkModel *>(data->model)->refresh_derived_params();
         for (int i = 0; i < data->n_params; ++i) {
@@ -960,6 +1002,12 @@ static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *use
         }
     }
     return 0;
+}
+
+static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
+    const int rc = cvode_codegen_rhs_body(t, y, ydot, user_data);
+    restore_params_after_probe(static_cast<CvodeUserData *>(user_data));
+    return rc;
 }
 
 // ─── Codegen Sensitivity RHS callback ────────────────────────────────────────
@@ -1180,9 +1228,10 @@ static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, S
     double *y_ptr = N_VGetArrayPointer(y);
     double *jac = SUNDenseMatrix_Data(J);
 
-    // When CVODES FD sensitivity is active, codegen_param_values is kept in sync
-    // with the (possibly perturbed) parameters by cvode_codegen_rhs, which runs
-    // before the Jacobian in each Newton iteration — so the buffer is current.
+    // When CVODES FD sensitivity is active, cvode_codegen_rhs mirrors a probe's
+    // perturbed parameters into codegen_param_values only for the duration of
+    // that call and puts the nominal values back on return (issue #690), so the
+    // state Jacobian reads the nominal system it belongs to.
     // Reuse the per-run() pre-built struct rather than rebuilding it here (GH #77).
     int rc = data->codegen_jac_fn(static_cast<double>(t), y_ptr, jac, &data->codegen_so_data);
     if (rc != 0)
@@ -1500,6 +1549,7 @@ struct SensitivityState {
     std::vector<int> ic_species_indices; // 0-based species indices for IC sens
     std::vector<double> pbar;            // parameter scaling factors for CVODES
     std::vector<double> p;               // contiguous parameter values (CVODES reads this)
+    std::vector<double> p_nominal;       // p before any probe (issue #690)
     std::vector<int> plist;              // which indices in p to perturb
     std::vector<char> pin_mask;          // switch-time params held nominal (issue #48)
     std::vector<double> pin_nominal;     // their nominal values
@@ -3006,6 +3056,7 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
     for (size_t i = 0; i < params.size(); ++i) {
         sens_p[i] = params[i].value;
     }
+    sens.p_nominal = sens_p;
 
     // plist[iS] = parameter index for column iS. For IC-sens columns we
     // use a sentinel ``params.size()`` (one past the end). The codegen
@@ -3474,6 +3525,7 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
     }
 
     user_data.sens_p = sens_p.data();
+    user_data.sens_p_nominal = sens.p_nominal.data();
     user_data.n_params = static_cast<int>(params.size());
 
     // Pin switch-time parameters against the internal-FD probe (issue #48).
@@ -4074,8 +4126,10 @@ void CvodeSimulator::Impl::write_final_state_back(const SolverOptions &opts, int
 // f(p_l)) are a Phase-1 limitation: only the direct ∂c/∂p_l is differenced.
 // CVODES leaves the model's parameter values wherever its last
 // finite-difference sensitivity probe put them — the RHS callbacks mirror
-// sens_p into params and nothing writes them back afterwards — so any
-// derivative read here would be taken at p ± √rtol·|p|. For a term that is
+// sens_p into params — so any derivative read here would be taken at
+// p ± √rtol·|p|. Since issue #690 the callbacks put the nominal values back
+// after every probe, so this is now a no-op in practice; it stays as the
+// explicit guarantee at the one site that multiplies by what it reads. For a term that is
 // MULTIPLIED into the jump (f⁻/f⁺ against ∂t*/∂p) that scales the whole
 // jump by (1 ∓ √rtol), i.e. an answer that drifts with rtol. sens_p itself
 // IS nominal between probes (CVODES restores the perturbed entry), so
