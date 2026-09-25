@@ -23,6 +23,7 @@ import ctypes
 import logging
 import os
 import threading
+import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -295,6 +296,67 @@ def normalize_method(requested: str) -> tuple[str, str]:
     }[canonical]
 
     return canonical, dispatch
+
+
+# ─── Failed automatic codegen builds (issue #826) ────────────────────────────
+#
+# A failed automatic build fell back to the interpreted RHS and was forgotten,
+# so the next Simulator() on the same model (or a freshly loaded copy) tried
+# again: regenerated the source, waited out the compile timeout (600 s by
+# default) and fell back again. A fitting loop or a parameter scan paid that on
+# every construction. A failure is now remembered for the process, keyed on the
+# structural codegen key plus the settings that decide the outcome — the
+# compile timeout, the job count and the backend — so a larger budget or more
+# cores still gets a fresh attempt. Only failures are remembered, not declines
+# (a decline is decided before anything compiles). An explicit codegen=True
+# never consults this: the caller asked for the build.
+_AUTO_CODEGEN_FAILURES: dict[tuple, str] = {}
+_AUTO_CODEGEN_SKIP_LOGGED: set[tuple] = set()
+
+
+def _auto_codegen_failure_key(model, jit_backend, *, force: bool = False) -> tuple | None:
+    """The failure-memo key for *model*, or ``None`` when it cannot be formed.
+
+    Computing the structural key costs O(model) reads, so the lookup is skipped
+    outright while nothing has failed in this process (``force`` computes it for
+    recording a failure).
+    """
+    if not force and not _AUTO_CODEGEN_FAILURES:
+        return None
+    try:
+        from bngsim._codegen import _resolve_codegen_timeout, compute_model_codegen_hash
+
+        return (
+            compute_model_codegen_hash(model),
+            _resolve_codegen_timeout(),
+            os.environ.get("BNGSIM_CODEGEN_JOBS", "").strip().lower(),
+            jit_backend or "cc",
+        )
+    except Exception as exc:  # noqa: BLE001 - no key just means no memo
+        logger.debug("codegen failure key unavailable: %s", exc)
+        return None
+
+
+def _remember_auto_codegen_failure(model, jit_backend, exc: BaseException) -> None:
+    key = _auto_codegen_failure_key(model, jit_backend, force=True)
+    if key is not None:
+        first_line = (str(exc).splitlines() or [type(exc).__name__])[0]
+        _AUTO_CODEGEN_FAILURES[key] = (
+            f"{time.strftime('%H:%M:%S')} ({type(exc).__name__}: {first_line[:200]})"
+        )
+
+
+def _log_auto_codegen_skip(key: tuple) -> None:
+    """Say once per key why the automatic build is not attempted."""
+    if key in _AUTO_CODEGEN_SKIP_LOGGED:
+        return
+    _AUTO_CODEGEN_SKIP_LOGGED.add(key)
+    logger.warning(
+        "Skipping automatic codegen: this model's build failed at %s. The interpreted "
+        "RHS is used instead. Pass codegen=True to retry, or raise "
+        "BNGSIM_CODEGEN_TIMEOUT / BNGSIM_CODEGEN_JOBS, which starts a fresh attempt.",
+        _AUTO_CODEGEN_FAILURES[key],
+    )
 
 
 class Simulator:
@@ -947,23 +1009,35 @@ class Simulator:
                 and not os.environ.get("BNGSIM_NO_CODEGEN")
                 and model.n_species >= int(os.environ.get("BNGSIM_CODEGEN_THRESHOLD", "256"))
             ):
-                try:
-                    if jit_backend:
-                        from bngsim._codegen import prepare_model_codegen_source
+                _failure_key = _auto_codegen_failure_key(model, jit_backend)
+                if _failure_key is not None and _failure_key in _AUTO_CODEGEN_FAILURES:
+                    _log_auto_codegen_skip(_failure_key)
+                else:
+                    try:
+                        if jit_backend:
+                            from bngsim._codegen import prepare_model_codegen_source
 
-                        _cg_src = prepare_model_codegen_source(model)
-                        if _cg_src is not None:
-                            model._codegen_c_source = _cg_src
-                            model_codegen_has_sens = want_sens_run
-                    else:
-                        from bngsim._codegen import prepare_model_codegen
+                            _cg_src = prepare_model_codegen_source(model)
+                            if _cg_src is not None:
+                                model._codegen_c_source = _cg_src
+                                model_codegen_has_sens = want_sens_run
+                        else:
+                            from bngsim._codegen import prepare_model_codegen
 
-                        _cg_so = prepare_model_codegen(model)
-                        if _cg_so is not None:
-                            model._codegen_so_path = str(_cg_so)
-                            model_codegen_has_sens = want_sens_run
-                except Exception as e:
-                    logger.debug("Auto-codegen skipped: %s", e)
+                            _cg_so = prepare_model_codegen(model)
+                            if _cg_so is not None:
+                                model._codegen_so_path = str(_cg_so)
+                                model_codegen_has_sens = want_sens_run
+                        # Aliased: a plain import would make the name local to
+                        # all of __init__ and shadow the module-level one below.
+                        from bngsim._codegen import last_codegen_error as _last_cg_error
+
+                        _failed: BaseException | None = _last_cg_error()
+                    except Exception as e:
+                        logger.debug("Auto-codegen skipped: %s", e)
+                        _failed = e
+                    if _failed is not None:
+                        _remember_auto_codegen_failure(model, jit_backend, _failed)
 
         if codegen and dispatch == "ode":
             # Every model compiles from the model bngsim built (#803): the RHS,
