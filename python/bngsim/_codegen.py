@@ -2330,6 +2330,11 @@ def _names_referenced_in_split(
     return sorted(referenced)
 
 
+# An identifier and whether a call's `(` follows it. The lookbehind keeps the
+# exponent of a numeric literal (`1e5`, `2.5E-3`) from reading as a name.
+_DERIVED_BARE_NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)(\s*\()?")
+
+
 def _prepare_derived_expr(
     expr: str,
     primary_names: set[str],
@@ -2436,6 +2441,17 @@ def _prepare_derived_expr(
     # builds three of its parameters out of ``mratio`` — so this path needs the
     # same binding the rate-law path gets.
     local_dict.update(engine_sympy_bindings(sp))
+    # Every other bare name is a model symbol that is not a parameter — a
+    # species or observable reached through a threshold — and must stay a
+    # free symbol so the check below refuses it. Left unbound, parse_expr
+    # resolved it through sympy's own namespace: an observable named `E` became
+    # Euler's number and `pi` became π, both constants, so `time() > k*E` passed
+    # as a parameter-only clock threshold at t = e*k (issue #756). A name
+    # followed by `(` is a call and keeps its sympy meaning.
+    for m in _DERIVED_BARE_NAME.finditer(s_aliased):
+        name = m.group(1)
+        if m.group(2) is None and name not in local_dict and name not in ("True", "False"):
+            local_dict[name] = sp.Symbol(name)
 
     try:
         sym_expr = parse_expr(s_aliased, local_dict=local_dict, evaluate=True)
