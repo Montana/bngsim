@@ -491,20 +491,15 @@ def test_from_net_with_two_parameters_blocks(tmp_path: Path) -> None:
         parse_net_file(path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="lanl/bngsim#844: a parameter expression reading an observable (or a "
-    "function) compiles and evaluates to 0.0 at load, silently, where BNG2.pl "
-    "refuses the model (predates #803 step 5)",
-)
 @pytest.mark.parametrize("expression", ["Atot*k", "f*2"])
-def test_from_net_on_a_parameter_that_reads_the_state(tmp_path: Path, expression: str) -> None:
-    """k2 reads Atot (100 at t = 0) or f() = Atot*k: either refuse the file, or
-    give k2 its value at the initial state, 200. Not 0.0."""
-    path = _net(
-        tmp_path,
-        f"""
+def test_a_parameter_that_reads_the_state_is_refused_by_every_door(
+    tmp_path: Path, expression: str
+) -> None:
+    """k2 reads Atot or f() = Atot*k. It used to compile, evaluate to 0.0 at load
+    and build silently, where BNG2.pl refuses the model (#844). Refused by
+    from_net, by parse_net_file, and by build_model_from_parsed on a dict whose
+    parameter was edited to read the state."""
+    body = """
         begin parameters
             1 k 2.0
             2 k2 {expression}
@@ -521,13 +516,20 @@ def test_from_net_on_a_parameter_that_reads_the_state(tmp_path: Path, expression
         begin groups
             1 Atot 1
         end groups
-        """,
-    )
-    try:
-        core = bngsim.Model.from_net(str(path))._core
-    except ModelError:
-        return
-    assert core.get_param("k2") == 200.0
+        """
+    path = _net(tmp_path, body.format(expression=expression))
+    with pytest.raises(ModelError, match="reads the"):
+        bngsim.Model.from_net(str(path))
+    with pytest.raises(ValueError, match="reads the"):
+        parse_net_file(path)
+    ok = _net(tmp_path, body.format(expression="k*3"))
+    parsed = parse_net_file(ok)
+    parsed["parameters"] = [
+        (n, v, expression, True) if n == "k2" else (n, v, e, x)
+        for n, v, e, x in parsed["parameters"]
+    ]
+    with pytest.raises(RuntimeError, match="reads the"):
+        build_model_from_parsed(parsed)
 
 
 def test_from_net_refuses_a_directory(tmp_path: Path) -> None:

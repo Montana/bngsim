@@ -344,9 +344,9 @@ parse_species(std::ifstream &file, std::unordered_map<std::string, int> &param_n
 // that is the SBML assignment-rule shape after `.net` conversion, a parameter
 // row shadowed by a same-named function (#266), and the reference reads the
 // parameter's slot.
-static void refuse_parameters_that_read_state(const std::vector<ParsedParam> &params,
-                                              const std::vector<ParsedFunction> &functions,
-                                              const std::vector<ParsedObservable> &observables) {
+void refuse_parameters_that_read_state(const std::vector<ParsedParam> &params,
+                                       const std::vector<ParsedFunction> &functions,
+                                       const std::vector<ParsedObservable> &observables) {
     std::unordered_set<std::string> param_names;
     for (const auto &p : params)
         param_names.insert(p.name);
