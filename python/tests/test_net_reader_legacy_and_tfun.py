@@ -15,13 +15,11 @@ What this file pins:
 * the eight that now load build the *same model*, not merely a model —
   identical `codegen_data()` to `Model.from_net`'s. Loading was never the bar
   (issue #554 was two loaders that both loaded and disagreed by a factor);
-* the two `Sat`/`Hill` files refuse by name. The rewrite is ~150 lines of C++
-  that also allocates non-colliding names and emits deprecation warnings;
-  reimplementing it here would be the second dialect #554 was about, so this
-  reader says what it does not read and points at the loader that does;
-* the reader no longer *drops* a legacy token's operands. `Sat k3 K4` used to
-  parse to a bare `rate_law="Sat"` with `k3 K4` discarded — a lossy parse under
-  a function documented as the universal interchange format.
+* the two `Sat`/`Hill` files build too, since issue #803. They used to be
+  refused by name, because the rewrite lived only in the loader and a second copy
+  would have been the dialect #554 was about. `parse_net_file` now returns the
+  loader's own reading, rewrite included, so the dict carries the explicit
+  function and observables and builds the model `Model.from_net` loads.
 """
 
 from __future__ import annotations
@@ -189,9 +187,8 @@ class TestMichaelisMenten:
 
         `parse_reactions` gates the MM branch on `tokens.size() >= 6` and lets a
         shorter line reach the elementary branch, where `MM` is just an
-        (unresolvable) parameter name. Mirrored here so the two loaders refuse
-        the same line for the same reason rather than one inventing an MM rate
-        law out of a truncated one.
+        (unresolvable) parameter name. Both doors refuse the line for that
+        reason, rather than one inventing an MM rate law out of a truncated one.
         """
         net = tmp_path / "short_mm.net"
         net.write_text(
@@ -213,65 +210,58 @@ class TestMichaelisMenten:
             ).strip()
             + "\n"
         )
-        parsed = parse_net_file(net)
-        (rxn,) = parsed["reactions"]
-        assert rxn["type"] == "elementary"
-        assert rxn["rate_law"] == "MM"
-        assert rxn["legacy_constants"] == []
+        with pytest.raises(ValueError, match="unknown parameter 'MM'"):
+            parse_net_file(net)
+        with pytest.raises(bngsim.ModelError, match="unknown parameter 'MM'"):
+            bngsim.Model.from_net(str(net))
 
 
-class TestLegacySatHillRefused:
-    """Refused by name, with the rewrite to write by hand.
+class TestLegacySatHillRewritten:
+    """`parse_net_file` returns the loader's Sat/Hill rewrite, which builds.
 
-    The `ModelBuilder: failed to compile function '__net_reader_func_0': Hill —
-    ... ERR239 - Undefined symbol: 'Hill'` this replaces named neither the file,
-    the reaction, nor the loader that does read it.
+    Until issue #803 these were refused here by name, since the rewrite lived
+    only in the loader. Now the dict is the loader's reading, rewrite included.
     """
 
-    @pytest.mark.parametrize(
-        ("name", "token", "formula"),
-        [
-            ("hill_rewrite.net", "Hill", "Vmax*S^(h-1)/(Kh^h+S^h)"),
-            ("sat_rewrite.net", "Sat", "k/(K+S)"),
-        ],
-    )
-    def test_message_names_the_reaction_the_token_and_the_way_out(
-        self, data_dir: Path, name: str, token: str, formula: str
-    ) -> None:
-        parsed = parse_net_file(data_dir / name)
-        with pytest.raises(ValueError) as excinfo:
-            build_model_from_parsed(parsed)
-        message = str(excinfo.value)
-        assert "reaction 1" in message
-        assert token in message
-        assert "Model.from_net" in message
-        assert formula in message
+    #: dS/dt written out by hand for each fixture: the functional rate the
+    #: rewrite produces, times its reactant S, as BNGL multiplies them.
+    ODES = {
+        "hill_rewrite.net": lambda s: -1.0 * s**2 / (50.0**2 + s**2),  # Hill k K n
+        "sat_rewrite.net": lambda s: -1.52 * s / (114.418 + s),  # Sat k3 K4
+    }
 
     @pytest.mark.parametrize("name", ["hill_rewrite.net", "sat_rewrite.net"])
-    def test_from_net_still_loads_the_same_file(self, data_dir: Path, name: str) -> None:
-        """The message's advice has to be true: the loader it names must work."""
+    def test_the_dict_carries_the_rewrite_and_its_warning(self, data_dir: Path, name: str) -> None:
         with pytest.warns(UserWarning, match="auto-rewritten by bngsim loader"):
-            model = bngsim.Model.from_net(str(data_dir / name))
-        assert model._core.n_species == 2
-
-    @pytest.mark.parametrize(
-        ("name", "token", "operands"),
-        [
-            ("hill_rewrite.net", "Hill", ["k", "K", "n"]),
-            ("sat_rewrite.net", "Sat", ["k3", "K4"]),
-        ],
-    )
-    def test_parse_carries_the_operands_rather_than_dropping_them(
-        self, data_dir: Path, name: str, token: str, operands: list[str]
-    ) -> None:
-        """A refusal at build time must not cost the parse its fidelity.
-
-        `parse_net_file` is documented as the universal interchange format, so it
-        keeps reporting what the line says — and it used to report a bare
-        `rate_law="Sat"` with the rate constants thrown away entirely.
-        """
-        parsed = parse_net_file(data_dir / name)
+            parsed = parse_net_file(data_dir / name)
         (rxn,) = parsed["reactions"]
-        assert rxn["type"] == "legacy"
-        assert rxn["rate_law"] == token
-        assert rxn["legacy_constants"] == operands
+        assert rxn["type"] == "functional"
+        assert rxn["legacy_constants"] == []
+        assert rxn["rate_law"] in {f for f, _ in parsed["functions"]}
+        assert any(o.startswith("__bngsim_net_rewrite_obs") for o, _ in parsed["observables"])
+
+    @pytest.mark.parametrize("name", ["hill_rewrite.net", "sat_rewrite.net"])
+    def test_it_builds_and_matches_the_hand_written_ode(self, data_dir: Path, name: str) -> None:
+        scipy_integrate = pytest.importorskip("scipy.integrate")
+        import numpy as np
+
+        with pytest.warns(UserWarning):
+            model = build_model_from_parsed(parse_net_file(data_dir / name))
+            loaded = bngsim.Model.from_net(str(data_dir / name))
+        assert model._core.codegen_data() == loaded._core.codegen_data()
+        t = np.linspace(0.0, 50.0, 11)
+        got = bngsim.Simulator(model, method="ode").run(
+            t_span=(0.0, 50.0), n_points=11, rtol=1e-10, atol=1e-10
+        )
+        ode = self.ODES[name]
+        ref = scipy_integrate.solve_ivp(
+            lambda _t, y: [ode(y[0])], (0.0, 50.0), [100.0], t_eval=t, rtol=1e-11, atol=1e-11
+        )
+        np.testing.assert_allclose(np.asarray(got.species)[:, 0], ref.y[0], rtol=1e-6)
+
+    def test_a_hand_built_legacy_entry_is_refused_by_name(self, data_dir: Path) -> None:
+        with pytest.warns(UserWarning):
+            parsed = parse_net_file(data_dir / "sat_rewrite.net")
+        parsed["reactions"][0].update(type="legacy", rate_law="Sat", legacy_constants=["k3", "K4"])
+        with pytest.raises(ValueError, match="reaction 1 has type 'legacy'"):
+            build_model_from_parsed(parsed)
