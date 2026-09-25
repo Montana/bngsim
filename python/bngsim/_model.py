@@ -167,10 +167,10 @@ class Model:
         # Issue #506: why the attempt declined, for analytical_jacobian_status.
         self._jac_decline_reason: str | None = None
         # Set by Model.from_net: the .net file the model was loaded from.
-        # Provenance only since #803: codegen compiles the built model, and the
-        # .net codegen path this used to select (kept for "issue #15's
+        # Provenance only since #803: every backend reads the built model. It
+        # used to select the .net codegen path (kept for "issue #15's
         # derived-parameter chain rules", which the model path expands since
-        # #99) is gone. jacobian="jax" takes its file from Simulator(net_path=).
+        # #99), and jacobian="jax" re-read the file it named, until step 4.
         self._net_path: str = ""
         # Populated by the SBML loader (and only the SBML loader) with a
         # list of SsaIssue records for SSA-incompatible constructs. Empty

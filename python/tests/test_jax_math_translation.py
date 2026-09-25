@@ -47,7 +47,7 @@ def _t(expr: str) -> str:
 
 
 def test_the_issue_expression():
-    assert _t("k1*ln(1+B)") == "params[0]*jnp.log(1+obs[0])"
+    assert _t("k1*ln(1+B)") == "params[0]*jnp.log(1.0+obs[0])"
 
 
 @pytest.mark.parametrize(
@@ -80,7 +80,7 @@ def test_the_logarithms(expr, want):
         ("abs(k1)", "jnp.abs(params[0])"),
         ("min(B,k1)", "jnp.minimum(obs[0],params[0])"),
         ("max(B,k1)", "jnp.maximum(obs[0],params[0])"),
-        ("pow(B,2)", "jnp.power(obs[0],2)"),
+        ("pow(B,2)", "jnp.power(obs[0],2.0)"),
         ("rint(B)", "__bngsim_rint__(obs[0])"),
         ("floor(B)", "jnp.floor(obs[0])"),
         ("ceil(B)", "jnp.ceil(obs[0])"),
@@ -164,7 +164,7 @@ def test_the_jax_jacobian_matches_the_default(tmp_path, body):
             return bngsim.Simulator(model, method="ode", **kw).run(t_span=(0.0, 5.0), n_points=6)
 
     default = np.asarray(_run().species)[:, 0]
-    with_jax = np.asarray(_run(jacobian="jax", net_path=str(net)).species)[:, 0]
+    with_jax = np.asarray(_run(jacobian="jax").species)[:, 0]
     assert with_jax == pytest.approx(default, rel=1e-6, abs=1e-8)
     # ...and the model actually moved, so the agreement is not two flat lines.
     assert default[-1] < default[0]

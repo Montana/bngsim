@@ -32,10 +32,10 @@ regenerating with the defaults yields a *different model* (or no termination).
 
 **The generated ``.net`` outlives the call.** ``Model.from_net`` stashes the
 path in ``_net_path``, and deleting the scratch directory would leave every
-``from_bngl`` model's ``_net_path`` dangling. Until #803 that was a hard failure
-at codegen time, which re-read the file; codegen now compiles the in-memory
-model, but the path still has to name a real file, since it is what a caller
-hands ``Simulator(net_path=...)`` for ``jacobian="jax"``. So networks land in a
+``from_bngl`` model's ``_net_path`` dangling. Until #803 that was a hard failure:
+codegen, and then ``jacobian="jax"``, re-read the file. Nothing does now -- every
+backend reads the in-memory model -- but a provenance path that names a missing
+file is still a trap for anyone who follows it. So networks land in a
 content-addressed cache beside the codegen one, which makes the answer to
 "cache it?" a side effect of getting the lifetime right: reloading unchanged
 BNGL skips network generation entirely.

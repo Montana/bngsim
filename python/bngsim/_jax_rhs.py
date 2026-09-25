@@ -1,14 +1,21 @@
 """bngsim._jax_rhs — JAX-based ODE RHS and AD Jacobian for BNGsim.
 
-Generates a JAX-traced RHS function from a .net file, then uses
+Generates a JAX-traced RHS function from a built model, then uses
 ``jax.jacfwd`` to compute exact dense Jacobians via automatic
 differentiation. This provides exact Jacobians for ALL rate law types
 (Elementary, Functional, MichaelisMenten) without manual derivatives.
 
 Architecture:
-  1. generate_jax_rhs(net_path) -> Callable: Parse .net, build JAX RHS
-  2. generate_jax_jacobian(net_path) -> Callable: jacfwd(rhs) wrapper
-  3. screen_for_discontinuities(net_path) -> bool: Check for floor/ceil/etc.
+  1. generate_jax_rhs(model) -> Callable: build a JAX RHS from codegen_data()
+  2. generate_jax_jacobian(model) -> Callable: jacfwd(rhs) wrapper
+  3. screen_for_discontinuities(model) -> list: Check for floor/ceil/etc.
+
+Each takes a :class:`bngsim.Model` or the path of a ``.net`` file, which is
+loaded with :meth:`bngsim.Model.from_net`. Until issue #803 step 4 the path was
+re-read here by codegen's private ``.net`` parser, a second reading of the file
+that disagreed with the loader's (#608, #784) — and the JAX RHS was wrong on 249
+of 767 corpus networks, most of them because a synthesis reaction's null
+reactant multiplied the rate by the last species.
 
 The JAX Jacobian is fed back to CVODE via the existing user-Jacobian
 callback mechanism (dense matrix). JAX runs on CPU only.
@@ -20,16 +27,18 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 from typing import Any
 
 from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
-    _classify_rate_law,
+    _RATEOF_PREFIX,
+    CodegenDeclined,
     _find_close_paren_strict,
     _normalize_exprtk_operators,
-    _parse_net_file,
     _split_top_level_commas,
+    _topological_function_order,
 )
 
 logger = logging.getLogger("bngsim")
@@ -66,19 +75,94 @@ def jax_available() -> bool:
 _DISCONTINUOUS_FUNCS = {"floor", "ceil", "rint", "round", "Heaviside"}
 
 
-def screen_for_discontinuities(net_path: str) -> list[str]:
+def screen_for_discontinuities(model: Any) -> list[str]:
     """Scan function expressions for constructs that defeat AD.
 
     Returns a list of problematic function names found, or empty list
-    if the model is safe for JAX AD.
+    if the model is safe for JAX AD. ``model`` is a :class:`bngsim.Model` or a
+    ``.net`` path (see the module docstring).
     """
-    model = _parse_net_file(net_path)
     problems = []
-    for _, name, expr in model["functions"]:
+    for f in _codegen_data(_as_model(model))["functions"]:
         for disc_fn in _DISCONTINUOUS_FUNCS:
-            if re.search(rf"\b{disc_fn}\b", expr):
-                problems.append(f"function '{name}' uses {disc_fn}()")
+            if re.search(rf"\b{disc_fn}\b", f["expression"]):
+                problems.append(f"function '{f['name']}' uses {disc_fn}()")
     return problems
+
+
+# ─── The built model, and what the JAX RHS implements of it ─────────────────
+
+
+def _as_model(model: Any) -> Any:
+    """A built model: the argument itself, or the ``.net`` file at that path loaded
+    with :meth:`bngsim.Model.from_net` -- never a second reading of the file."""
+    if isinstance(model, (str, os.PathLike)):
+        from bngsim._model import Model
+
+        return Model.from_net(os.fspath(model))
+    return model
+
+
+def _codegen_data(model: Any) -> dict:
+    return (model._core if hasattr(model, "_core") else model).codegen_data()
+
+
+def _refuse_unsupported(data: dict) -> None:
+    """Raise ``ValueError`` naming the first construct the JAX RHS does not implement.
+
+    It implements what a ``.net`` model contains -- measured, not assumed: over the
+    774 corpus networks of up to 1,000 reactions, every reaction and species field
+    of ``codegen_data()`` sits at one value except the rate-law type and ``fixed``
+    (issue #803). That is Elementary, Functional and Michaelis-Menten reactions
+    with a stat factor and the reactant factor applied, fixed species, observables
+    over unit-volume species, and functions of parameters, observables, species and
+    other functions. Everything else the engine's RHS handles -- compartment
+    volumes, amount-valued species, per-species volume scaling, rate rules, rateOf,
+    table functions -- is refused here rather than approximated, whatever the
+    model was loaded from.
+    """
+
+    def refuse(what: str) -> None:
+        raise ValueError(
+            f"the JAX RHS (jacobian='jax', run_diffrax) does not implement {what}. "
+            "Use jacobian='auto' (the default), which evaluates this model through the "
+            "engine instead."
+        )
+
+    for s in data["species"]:
+        name = s["name"]
+        if s.get("amount_valued", False):
+            refuse(f"an amount-valued species ({name})")
+        if float(s.get("volume_factor", 1.0)) != 1.0:
+            refuse(f"a species in a compartment of size other than 1 ({name})")
+        if int(s.get("volume_param_idx0", -1)) >= 0 or int(s.get("ode_live_volume_idx0", -1)) >= 0:
+            refuse(f"a species whose compartment size is a parameter or a state ({name})")
+    function_names = {f["name"] for f in data["functions"]}
+    for r in data["reactions"]:
+        if r["type"] not in ("elementary", "functional", "mm"):
+            refuse(f"a reaction of type {r['type']!r}")
+        if r["type"] == "mm":
+            # A rate constant that is also a function's name (the #266 shape): the
+            # engine reads the live function there, and the JAX RHS the parameter row.
+            for i in r["rate_param_indices"]:
+                name = data["parameters"][int(i)]["name"]
+                if name in function_names:
+                    refuse(f"a Michaelis-Menten rate constant that a function defines ({name})")
+        if not r.get("apply_species_factor", True):
+            refuse("a reaction whose kinetic law carries its own reactant factor (SBML)")
+        if r.get("per_species_volume_scaling", False):
+            refuse("a cross-compartment reaction (per-species volume scaling)")
+        if r.get("is_rate_rule_ode", False):
+            refuse("a rate rule")
+    if data.get("table_functions"):
+        refuse("a table function (tfun)")
+    for f in data["functions"]:
+        if _RATEOF_PREFIX in f["expression"]:
+            refuse(f"rateOf (function {f['name']})")
+        if "%" in f["expression"]:
+            # ExprTk's % is C's fmod; Python's, which the translated text would
+            # use, is floor-mod, and the two differ on a negative operand.
+            refuse(f"the % operator (function {f['name']})")
 
 
 # ─── Expression translator (.net expression -> JAX/Python) ──────────────────
@@ -195,6 +279,32 @@ _BARE_IDENT_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)")
 # Quoted text is data, not a name — a table function's file name would
 # otherwise be read as a pile of undefined identifiers.
 _STRING_LITERAL_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_JAX_NUMERIC_LITERAL_RE = re.compile(
+    r"(?P<string>'[^']*'|\"[^\"]*\")|"
+    r"(?P<number>(?<![\w.])(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?(?![\w.]))"
+)
+
+
+def _jax_numeric_literals_as_floats(expr: str) -> str:
+    """Make integer literals floating-point without touching strings or indices.
+
+    The JAX expression evaluator mixes translated model literals with JAX
+    arrays. A literal-only subexpression such as ``1500^6`` is evaluated by
+    Python as an arbitrary-precision ``int`` before it reaches JAX; JAX then
+    raises when that value cannot be represented as int64. The engine evaluates
+    all model numbers as doubles, so spell integer tokens as floats here too.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        string = match.group("string")
+        if string is not None:
+            return string
+        number = match.group("number")
+        assert number is not None
+        return number + ".0" if re.fullmatch(r"\d+", number) else number
+
+    return _JAX_NUMERIC_LITERAL_RE.sub(replace, expr)
+
 
 # Longest name first so `asin` wins over `sin`, and no match may start straight
 # after a word character or a `.` — the latter keeps an already-emitted
@@ -380,7 +490,7 @@ def _translate_expr_jax(
     func_names_set: set[str],
     func_order: list[str],
 ) -> str:
-    """Translate a .net function expression to JAX-compatible Python.
+    """Translate a model function expression to JAX-compatible Python.
 
     Replaces:
       - parameter names -> params[idx]
@@ -396,6 +506,7 @@ def _translate_expr_jax(
     # ExprTk's reading of =, <>, -- and relational chains made explicit, as in
     # the C translators and the sympy parsers (issue #734).
     c = _normalize_exprtk_operators(expr)
+    c = _jax_numeric_literals_as_floats(c)
 
     # Bracket the source's grouping before the operators become Python ones,
     # whose precedence differs (GH #579).
@@ -444,20 +555,25 @@ def _translate_expr_jax(
         c = re.sub(rf"\b{re.escape(fname)}\(\)", f"func_{safe}", c)
         c = re.sub(rf"\b{re.escape(fname)}\b", f"func_{safe}", c)
 
-    # Replace observable names (longest first to avoid partial match)
+    # Replace observable and parameter names, each longest first so a name is
+    # never rewritten inside a longer one. The trailing `(?!\[)` keeps a later
+    # pass off an index an earlier pass emitted: model text never indexes, so a
+    # name followed by `[` is always `obs[` or `params[`, and a parameter named
+    # `obs` must not rewrite it. Species are not read by name: only SBML does,
+    # and _refuse_unsupported refuses SBML, so a species pass could only shadow
+    # a parameter of the same name, which the engine reads (issue #803).
     for name in sorted(obs_names.keys(), key=len, reverse=True):
         idx = obs_names[name]
         c = re.sub(
-            rf"(?<!func_)\b{re.escape(name)}\b",
+            rf"(?<!func_)\b{re.escape(name)}\b(?!\[)",
             f"obs[{idx}]",
             c,
         )
 
-    # Replace parameter names (longest first)
     for name in sorted(param_names.keys(), key=len, reverse=True):
         idx = param_names[name]
         c = re.sub(
-            rf"(?<!obs\[)(?<!func_)\b{re.escape(name)}\b",
+            rf"(?<!func_)\b{re.escape(name)}\b(?!\[)",
             f"params[{idx}]",
             c,
         )
@@ -524,22 +640,23 @@ def _safe_py_name(name: str) -> str:
 # ─── JAX RHS generator ──────────────────────────────────────────────────────
 
 
-def generate_jax_rhs(net_path: str) -> Any:
-    """Generate a JAX-traced RHS function from a .net file.
+def generate_jax_rhs(model: Any) -> Any:
+    """Generate a JAX-traced RHS function from a built model.
 
     The returned function has signature::
 
         rhs(y: jnp.ndarray, t: float, params: jnp.ndarray) -> jnp.ndarray
 
-    where y is species (n_species,), params is (n_params,), and the
-    return is dydt (n_species,).
+    where y is species (n_species,), params is (n_params,) in the model's
+    parameter order (``param_names``, derived parameters included at their
+    evaluated values), and the return is dydt (n_species,).
 
     All operations use jnp so the function is JAX-traceable for AD.
 
     Parameters
     ----------
-    net_path : str
-        Path to the .net file.
+    model : Model or str
+        The built model, or a ``.net`` path loaded with ``Model.from_net``.
 
     Returns
     -------
@@ -550,6 +667,9 @@ def generate_jax_rhs(net_path: str) -> Any:
     ------
     ImportError
         If JAX is not installed.
+    ValueError
+        If the model uses a construct the JAX RHS does not implement (see
+        ``_refuse_unsupported``) or an expression it cannot translate.
     """
     if not jax_available():
         raise ImportError(
@@ -558,61 +678,78 @@ def generate_jax_rhs(net_path: str) -> Any:
 
     import jax.numpy as jnp
 
-    model = _parse_net_file(net_path)
-    params_list = model["parameters"]
-    species_list = model["species"]
-    reactions = model["reactions"]
-    observables = model["observables"]
-    functions = model["functions"]
+    data = _codegen_data(_as_model(model))
+    _refuse_unsupported(data)
+    params_list = data["parameters"]
+    species_list = data["species"]
+    reactions = data["reactions"]
+    observables = data["observables"]
+    functions = data["functions"]
 
     n_sp = len(species_list)
     n_params = len(params_list)
 
-    # Build index maps (0-based)
-    param_idx = {name: i for i, (_, name, _, _) in enumerate(params_list)}
-    func_names_set = {name for _, name, _ in functions}
-    func_order = [name for _, name, _ in functions]
-    {name: i for i, (_, name, _) in enumerate(functions)}
-    obs_idx = {name: i for i, (_, name, _) in enumerate(observables)}
+    # Index maps, all 0-based, from the loader's own reading of the model.
+    param_idx = {p["name"]: i for i, p in enumerate(params_list)}
+    obs_idx = {o["name"]: k for k, o in enumerate(observables)}
+    func_names_set = {f["name"] for f in functions}
+    func_order = [f["name"] for f in functions]
+    fixed_sp = frozenset(i for i, s in enumerate(species_list) if s["fixed"])
 
-    # Fixed species (0-based indices)
-    fixed_sp = frozenset(sp[0] - 1 for sp in species_list if sp[3])
+    # obs[k] = sum_j W[k, j] * y[j]. A model with no observables gets a (0, n)
+    # matrix, whose product with y is an empty vector -- not a (0,) array that the
+    # matmul rejects, which is what the .net path built (issue #803).
+    obs_weights = [[0.0] * n_sp for _ in observables]
+    for k, o in enumerate(observables):
+        for sp_i, factor in o["entries"]:
+            obs_weights[k][int(sp_i)] += float(factor)
+    obs_w_array = jnp.array(obs_weights, dtype=jnp.float64).reshape(len(observables), n_sp)
 
-    # Pre-build observable weight matrix as dense array
-    # obs[k] = sum of weight[k, j] * y[j]
-    obs_weights = []
-    for _, _name, entries in observables:
-        row = [0.0] * n_sp
-        for factor, sp_i in entries:
-            row[sp_i - 1] = factor
-        obs_weights.append(row)
-
-    # Pre-translate function expressions to JAX Python
+    # Functions in dependency order, so one that reads another declared after it
+    # sees its value (issue #699 on the .net path). The value is the guarded
+    # ``eval_expression`` where the loader provides one (GH #333), as in the
+    # compiled RHS.
+    try:
+        order = _topological_function_order(list(functions))
+    except CodegenDeclined as exc:
+        raise ValueError(f"the JAX RHS cannot order this model's functions: {exc}") from exc
     func_exprs = []
-    for _, name, expr in functions:
+    for i in order:
+        f = functions[i]
+        expr = f.get("eval_expression") or f["expression"]
         jax_expr = _translate_expr_jax(expr, param_idx, obs_idx, func_names_set, func_order)
-        func_exprs.append((name, jax_expr))
+        func_exprs.append((f["name"], compile(jax_expr, f"<jax:{f['name']}>", "eval")))
 
-    # Pre-classify reactions and build stoichiometry
     rxn_data = []
-    for _, reactants, products, rate_law, _comment in reactions:
-        kind = _classify_rate_law(rate_law, func_names_set)
+    for r in reactions:
+        reactants = [int(i) for i in r["reactants"]]
+        products = [int(i) for i in r["products"]]
+        sf = float(r["stat_factor"])
+        rate_params = [int(i) for i in r["rate_param_indices"]]
+        if r["type"] == "elementary":
+            if not rate_params:
+                raise ValueError("the JAX RHS found an elementary reaction with no rate constant")
+            kind: tuple = ("elementary", rate_params[0], sf)
+        elif r["type"] == "functional":
+            if r["function_name"] not in func_names_set:
+                raise ValueError(
+                    f"the JAX RHS found a reaction driven by an unknown function "
+                    f"{r['function_name']!r}"
+                )
+            kind = ("functional", r["function_name"], sf)
+        else:  # "mm"; _refuse_unsupported admits no other type
+            if len(rate_params) < 2 or len(reactants) < 2:
+                raise ValueError("the JAX RHS found a malformed Michaelis-Menten reaction")
+            kind = ("mm", rate_params[0], rate_params[1], sf)
         rxn_data.append((reactants, products, kind))
-
-    # Build the RHS function source as a closure
-    # We create numpy arrays for the weight matrix at build time
-    obs_w_array = jnp.array(obs_weights, dtype=jnp.float64)
 
     def rhs(y, t, params):
         """JAX-traced ODE RHS: dy/dt = f(y, t, params)."""
-        # Compute observables: obs = W @ y
         obs = obs_w_array @ y
 
         # Evaluate functions in dependency order
         func_vals = {}
-        for fname, jax_expr in func_exprs:
-            _safe_py_name(fname)
-            # Build local namespace for eval
+        for fname, code in func_exprs:
             local_ns = {
                 **_JAX_HELPERS,
                 "jnp": jnp,
@@ -624,64 +761,49 @@ def generate_jax_rhs(net_path: str) -> Any:
             # Add previously computed functions
             for prev_name, prev_val in func_vals.items():
                 local_ns[f"func_{_safe_py_name(prev_name)}"] = prev_val
-            val = eval(jax_expr, {"__builtins__": {}}, local_ns)  # noqa: S307
-            func_vals[fname] = val
+            func_vals[fname] = eval(code, {"__builtins__": {}}, local_ns)  # noqa: S307
 
-        # Compute derivatives
         dydt = jnp.zeros(n_sp, dtype=y.dtype)
-
         for reactants, products, kind in rxn_data:
             if kind[0] == "elementary":
-                _, pname, sf = kind
-                p_i = param_idx.get(pname, -1)
-                rate = params[p_i] * sf if p_i >= 0 else 0.0
+                _, p_i, sf = kind
+                rate = params[p_i] * sf
                 for ri in reactants:
-                    rate = rate * y[ri - 1]
+                    rate = rate * y[ri]
             elif kind[0] == "functional":
                 _, fname, sf = kind
                 rate = func_vals[fname] * sf
                 for ri in reactants:
-                    rate = rate * y[ri - 1]
-            elif kind[0] == "mm":
-                _, kcat_name, km_name, sf = kind
-                kcat_i = param_idx.get(kcat_name, -1)
-                km_i = param_idx.get(km_name, -1)
-                kcat = params[kcat_i] if kcat_i >= 0 else 0.0
-                km = params[km_i] if km_i >= 0 else 0.0
-                if len(reactants) >= 2:
-                    e = y[reactants[0] - 1]
-                    s = y[reactants[1] - 1]
-                    # Stable positive root of x² − delta·x − km·s = 0 (GH #89):
-                    # ½(delta + D) cancels for delta < 0, so that branch uses the
-                    # conjugate form. The denominator is masked before the divide
-                    # so the unselected branch cannot inject a NaN into a tangent.
-                    delta = s - km - e
-                    d_mm = jnp.sqrt(delta * delta + 4.0 * km * s)
-                    neg = delta < 0.0
-                    denom = jnp.where(neg, d_mm - delta, 1.0)
-                    s_free = jnp.where(neg, 2.0 * km * s / denom, 0.5 * (delta + d_mm))
-                    # GH #93: no clamp on s_free (it is negative exactly when s
-                    # is, and the rate continues smoothly there), but the rate's
-                    # denominator is guarded — it vanishes when km*e == 0. Masked
-                    # before the divide for the same reason as above: an unmasked
-                    # 0/0 in the unselected branch NaNs the tangent.
-                    kps = km + s_free
-                    live = kps > 0.0
-                    rate = jnp.where(live, sf * kcat * s_free * e / jnp.where(live, kps, 1.0), 0.0)
-                else:
-                    rate = 0.0
+                    rate = rate * y[ri]
             else:
-                rate = 0.0
+                _, kcat_i, km_i, sf = kind
+                kcat = params[kcat_i]
+                km = params[km_i]
+                e = y[reactants[0]]
+                s = y[reactants[1]]
+                # Stable positive root of x² − delta·x − km·s = 0 (GH #89):
+                # ½(delta + D) cancels for delta < 0, so that branch uses the
+                # conjugate form. The denominator is masked before the divide
+                # so the unselected branch cannot inject a NaN into a tangent.
+                delta = s - km - e
+                d_mm = jnp.sqrt(delta * delta + 4.0 * km * s)
+                neg = delta < 0.0
+                denom = jnp.where(neg, d_mm - delta, 1.0)
+                s_free = jnp.where(neg, 2.0 * km * s / denom, 0.5 * (delta + d_mm))
+                # GH #93: no clamp on s_free (it is negative exactly when s
+                # is, and the rate continues smoothly there), but the rate's
+                # denominator is guarded — it vanishes when km*e == 0. Masked
+                # before the divide for the same reason as above: an unmasked
+                # 0/0 in the unselected branch NaNs the tangent.
+                kps = km + s_free
+                live = kps > 0.0
+                rate = jnp.where(live, sf * kcat * s_free * e / jnp.where(live, kps, 1.0), 0.0)
 
-            # Accumulate stoichiometry
             for ri in reactants:
-                if ri > 0:
-                    dydt = dydt.at[ri - 1].add(-rate)
+                dydt = dydt.at[ri].add(-rate)
             for pi in products:
-                if pi > 0:
-                    dydt = dydt.at[pi - 1].add(rate)
+                dydt = dydt.at[pi].add(rate)
 
-        # Zero fixed species derivatives
         for si in fixed_sp:
             dydt = dydt.at[si].set(0.0)
 
@@ -696,11 +818,93 @@ def generate_jax_rhs(net_path: str) -> Any:
     return rhs_obj
 
 
+#: When ``check_rhs_against_engine`` is not told the horizon (``jacobian="jax"``,
+#: whose ``run()`` has not been called yet): a spread, so a time-dependent rate law
+#: that goes wrong only past ``t = 0`` is seen.
+_CHECK_TIMES = (0.0, 1.7, 13.0, 250.0)
+
+
+def check_rhs_against_engine(model: Any, rhs: Any, times: Any = None) -> None:
+    """Raise ``ValueError`` unless the JAX RHS matches the engine's.
+
+    ``_refuse_unsupported`` names every construct the JAX RHS is known not to
+    implement; this catches one it does not know about. It compares against
+    :meth:`bngsim.Model.rhs` -- the interpreted RHS the solver integrates -- at
+    three strictly positive states (so no rate term vanishes into a zero species)
+    and at each of ``times`` (default ``_CHECK_TIMES``; ``run_diffrax`` passes
+    points across its own interval), so a time-dependent rate law that goes wrong
+    only later is seen too. A mismatch refuses rather than hand the caller a
+    Jacobian, or a trajectory, for a different model.
+
+    Each species is held to 1e-7 of its own gross flux -- the sum of ``|rate|``
+    over every reaction it takes part in, catalysts included -- far above
+    roundoff and far below any semantic difference. A scale shared by every
+    species let a fast reaction hide a 4x error on a slow one (issue #803).
+    Values equal on both sides agree, infinities included; two NaNs agree.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    core = model._core
+    data = _codegen_data(model)
+    n_sp = len(data["species"])
+    # Gross incidence: each appearance on either side, so `A -> A + B` counts A.
+    incidence = np.zeros((n_sp, len(data["reactions"])))
+    for j, r in enumerate(data["reactions"]):
+        for i in list(r["reactants"]) + list(r["products"]):
+            incidence[int(i), j] += 1.0
+
+    y0 = np.abs(np.asarray(core.get_initial_state(), dtype=np.float64))
+    rng = np.random.default_rng(803)
+    scale = max(float(y0.max(initial=0.0)), 1.0)
+    states = [
+        y0 * (1.0 + 0.25 * rng.random(n_sp)) + 0.1 * scale * (0.5 + rng.random(n_sp)),
+        y0 * rng.random(n_sp) + 0.5 * scale * rng.random(n_sp) + 1e-3 * scale,
+        scale * (1.0 + 2.0 * rng.random(n_sp)),
+    ]
+    ts = [float(t) for t in (_CHECK_TIMES if times is None else times)]
+    if not core.functions_use_time:
+        ts = ts[:1]  # nothing reads the clock, so one time says it all
+    ys = np.array([y for y in states for _ in ts], dtype=np.float64)
+    tt = np.array([t for _ in states for t in ts], dtype=np.float64)
+    p = np.array([core.get_param(n) for n in core.param_names], dtype=np.float64)
+    # Never jit: a compile cost more than the check (5.3 s -> 8.8 s of setup at
+    # 1,000 reactions). At 1,032 reactions an eager evaluation is 0.29 s a point
+    # and a vmap pass a flat 1.6 s, so a few points go eagerly and many in one pass.
+    pj = jnp.asarray(p)
+    if len(ys) <= 5:
+        f_jax_all = np.array(
+            [np.asarray(rhs(jnp.asarray(y), t, pj)) for y, t in zip(ys, tt, strict=True)]
+        )
+    else:
+        f_jax_all = np.asarray(
+            jax.vmap(rhs, in_axes=(0, 0, None))(jnp.asarray(ys), jnp.asarray(tt), pj)
+        )
+    f_jax_all = f_jax_all.astype(np.float64)
+    names = list(model.species_names)
+    for y, t, f_jax in zip(ys, tt, f_jax_all, strict=True):
+        f_eng = np.asarray(model.rhs(y, t), dtype=np.float64)
+        gross = incidence @ np.abs(np.asarray(model.propensities(y, t), dtype=np.float64))
+        finite = gross[np.isfinite(gross)]
+        tol = 1e-7 * gross + 1e-12 * float(finite.max(initial=0.0))
+        agree = (
+            (f_jax == f_eng) | (np.isnan(f_eng) & np.isnan(f_jax)) | (np.abs(f_jax - f_eng) <= tol)
+        )
+        if not agree.all():
+            i = int(np.argmin(agree))
+            raise ValueError(
+                f"the JAX RHS disagrees with the engine's for species {names[i]} at "
+                f"t = {t:g} (JAX {f_jax[i]!r}, engine {f_eng[i]!r}), so it would "
+                "describe a different model; refusing. Use jacobian='auto' (the default)."
+            )
+
+
 # ─── JAX Jacobian wrapper ───────────────────────────────────────────────────
 
 
-def generate_jax_jacobian(net_path: str) -> Any:
-    """Generate a JAX AD Jacobian function from a .net file.
+def generate_jax_jacobian(model: Any) -> Any:
+    """Generate a JAX AD Jacobian function from a built model.
 
     Returns a function::
 
@@ -710,8 +914,8 @@ def generate_jax_jacobian(net_path: str) -> Any:
 
     Parameters
     ----------
-    net_path : str
-        Path to the .net file.
+    model : Model or str
+        The built model, or a ``.net`` path loaded with ``Model.from_net``.
 
     Returns
     -------
@@ -722,8 +926,12 @@ def generate_jax_jacobian(net_path: str) -> Any:
     ------
     ImportError
         If JAX is not installed.
-    RuntimeError
-        If model contains discontinuous functions (floor/ceil/etc.).
+    ValueError
+        If the model uses a construct the JAX RHS does not implement.
+
+    A model whose functions use floor/ceil/etc. is built, with a logged warning:
+    its Jacobian is zero across each step, which costs CVODE step size, not
+    correctness.
     """
     if not jax_available():
         raise ImportError(
@@ -734,7 +942,8 @@ def generate_jax_jacobian(net_path: str) -> Any:
     # CVODE uses the Jacobian for Newton convergence, not solution
     # correctness. A locally-zero Jacobian at a discontinuity just
     # means CVODE takes smaller steps there (same as FD behavior).
-    problems = screen_for_discontinuities(net_path)
+    model = _as_model(model)
+    problems = screen_for_discontinuities(model)
     if problems:
         logger.warning(
             "Model functions may produce zero JAX AD gradients at "
@@ -744,7 +953,7 @@ def generate_jax_jacobian(net_path: str) -> Any:
 
     import jax
 
-    rhs = generate_jax_rhs(net_path)
+    rhs = generate_jax_rhs(model)
 
     # Forward-mode AD: differentiate RHS w.r.t. y (argnums=0)
     # Returns (n_species, n_species) Jacobian matrix
@@ -766,17 +975,21 @@ def generate_jax_jacobian(net_path: str) -> Any:
 # ─── Prepare JAX Jacobian for CVODE ─────────────────────────────────────────
 
 
-def prepare_jax_jacobian(net_path: str) -> tuple:
+def prepare_jax_jacobian(model: Any) -> tuple:
     """Prepare a JAX Jacobian evaluator for use with CVODE.
 
-    Returns a tuple (jac_fn, n_species, param_values) where jac_fn
-    is a callable that takes (y_flat, t, param_flat) and returns
-    a flat row-major Jacobian array suitable for C++ consumption.
+    Returns a tuple (jac_fn, n_species) where jac_fn is a callable that
+    takes (y_flat, t, param_flat) and returns a flat column-major Jacobian
+    array, the layout CVODE's dense matrix uses.
+
+    The JAX RHS is first checked against the engine's
+    (:func:`check_rhs_against_engine`), so a model it would misdescribe is
+    refused rather than solved with a Jacobian of some other system.
 
     Parameters
     ----------
-    net_path : str
-        Path to the .net file.
+    model : Model or str
+        The built model, or a ``.net`` path loaded with ``Model.from_net``.
 
     Returns
     -------
@@ -793,7 +1006,9 @@ def prepare_jax_jacobian(net_path: str) -> tuple:
     import jax.numpy as jnp
     import numpy as np
 
-    jac_fn = generate_jax_jacobian(net_path)
+    model = _as_model(model)
+    jac_fn = generate_jax_jacobian(model)
+    check_rhs_against_engine(model, jac_fn.rhs)
     n_sp = jac_fn.n_species
 
     # JIT-compile for speed

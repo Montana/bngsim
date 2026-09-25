@@ -511,6 +511,10 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
 // expression: issue #188's value-keyed override keeps the evaluator so the
 // override stays reversible, and re-deriving an overridden parameter would
 // discard the caller's write on the next set_param of anything at all.
+const std::vector<int> &NetworkModel::derived_param_order() const {
+    return impl_->shared->derived_param_order;
+}
+
 void NetworkModel::refresh_derived_params(int skip_param_idx) {
     for (int pi : impl_->shared->derived_param_order) {
         if (pi == skip_param_idx)
