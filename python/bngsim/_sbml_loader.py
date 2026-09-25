@@ -6779,29 +6779,19 @@ def _build_model_from_sbml_doc(doc):
         # Track which parameters need promotion for event assignments
         event_param_promotions = {}  # param_id → species_idx
 
-        # What a <delay> or <priority> may be constant-folded against (GH #558).
-        # Both are evaluated when the trigger fires (SBML L3v2 §4.11.3/§4.11.4),
-        # so folding at load is only sound for symbols that cannot change
-        # between t=0 and then: the parameters no assignment rule, rate rule or
-        # event assignment writes — `_const_param_ids`, the same predicate the
-        # initial-condition seed uses (see the #379 note there on why
-        # `constant="false"` alone is not the test). Each takes its
-        # initialAssignment value when it has one, else its declared value.
-        # Anything else — a written parameter, a species, a compartment — makes
-        # the fold return None, and the expression goes to the C++ dispatcher,
-        # which evaluates it at trigger time. The context used to hold every
-        # parameter's declared value plus every IA / assignment-rule value at
-        # t=0, so a delay reading a rate-rule parameter fired at t_trigger + d(0).
-        event_fold_ctx = {}
-        for j2 in range(sbml_model.getNumParameters()):
-            p = sbml_model.getParameter(j2)
-            pid = p.getId()
-            if pid not in _const_param_ids:
-                continue
-            if pid in ia_values:
-                event_fold_ctx[pid] = ia_values[pid]
-            else:
-                event_fold_ctx[pid] = p.getValue() if p.isSetValue() else 0.0
+        # What a <delay> or <priority> may be constant-folded against: nothing
+        # but literals. Both are evaluated when the trigger fires (SBML L3v2
+        # §4.11.3/§4.11.4). GH #558 stopped folding a parameter the model writes
+        # (a rule or event target), since it can change between t=0 and the
+        # fire, but still folded every other parameter to its load-time value.
+        # Those are exactly the parameters a caller changes with set_param, so a
+        # delay `d` or a priority `p` read the value in the file forever: a
+        # set_param('d', 0.5) left the event firing at t_trigger + 1, and a
+        # swapped pair of priorities left the old order, with no warning. An
+        # expression that reads any parameter now goes to the C++ dispatcher,
+        # which evaluates it at trigger time against the live value; a delay
+        # or priority that is a plain number still folds.
+        event_fold_ctx: dict[str, float] = {}
 
         for i in range(n_events):
             event = sbml_model.getEvent(i)
