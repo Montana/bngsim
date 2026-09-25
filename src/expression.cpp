@@ -817,6 +817,11 @@ struct ExprTkEvaluator::Impl {
     // ExprTk's grammar would reject as `obs * ()`.
     std::unordered_set<std::string> scalar_variable_names;
 
+    // ExprTk's dependency collector reports constants from the symbol table
+    // alongside variables. Keep their registration keys so dependency queries
+    // can return only model variables, as the public interface promises.
+    std::unordered_set<std::string> constant_symbol_names;
+
     // Built-in functions that take no arguments. Their call form `name()` means
     // the built-in even when the model declares a scalar of the same name,
     // which is then reachable only bare (issue #776). `time` is the only one.
@@ -964,6 +969,7 @@ struct ExprTkEvaluator::Impl {
             mangled_user_names[name] = mapped;
         }
         symbol_table.add_constant(mapped, value);
+        constant_symbol_names.insert(mapped);
         scalar_variable_names.insert(name);
     }
 
@@ -1220,6 +1226,9 @@ std::vector<const double *> ExprTkEvaluator::referenced_variable_addresses(int e
     std::unordered_set<const double *> seen;
     out.reserve(symbols.size());
     for (const auto &sym : symbols) {
+        if (impl_->constant_symbol_names.count(sym.first) != 0) {
+            continue;
+        }
         auto *var = impl_->symbol_table.get_variable(sym.first);
         if (var != nullptr && seen.insert(&var->ref()).second) {
             out.push_back(&var->ref());

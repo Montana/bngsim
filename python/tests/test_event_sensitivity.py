@@ -995,6 +995,25 @@ def _fd_over_builds(build, selector, p0, h=1e-4, t_span=(0, 10), n_points=101):
 
 
 class TestEventTimeSensitivity:
+    def test_builtin_constant_threshold_is_compensated(self):
+        """Issue #821: built-in constants do not make a time trigger stateful."""
+        from bngsim._switch_sensitivity import compute_event_time_sens
+
+        trigger = "time() >= _pi*T0 && time() < 100"
+        m = _onset_model(T0v=1.0, trigger=trigger)
+        result = compute_event_time_sens(m._core, ["T0"], 0.0, 10.0)
+        assert result.reasons == {}
+        assert result.compensated == [0]
+        assert len(result.records) == 1 and result.records[0][0] == 0
+        np.testing.assert_allclose(result.records[0][1], [np.pi])
+
+        t, sens = _xobs_sens(m, ["T0"])
+        _x, dx_d_crossing = _onset_closed_form(t, T0v=np.pi)
+        expected = np.pi * dx_d_crossing
+        mask = (np.abs(expected) > 1e-9) & (np.abs(t - np.pi) > 1e-12)
+        relerr = np.abs(sens[mask, 0] - expected[mask]) / np.abs(expected[mask])
+        assert relerr.max() < 1e-6, f"max relerr {relerr.max():.3e}"
+
     def test_onset_matches_closed_form(self):
         t, sens = _xobs_sens(_onset_model(), ["T0", "kin"])
         _x, dx = _onset_closed_form(t)
