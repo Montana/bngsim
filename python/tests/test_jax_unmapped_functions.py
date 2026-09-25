@@ -47,7 +47,7 @@ def _t(expr: str) -> str:
 
 
 def test_the_issue_expression():
-    assert _t("k1*log10(1+B)") == "params[0]*jnp.log10(1+obs[0])"
+    assert _t("k1*log10(1+B)") == "params[0]*jnp.log10(1.0+obs[0])"
 
 
 @pytest.mark.parametrize(
@@ -107,12 +107,12 @@ def test_every_reserved_name_translates_or_is_one_of_the_refused():
 @pytest.mark.parametrize(
     "expr, want",
     [
-        ("max(B,k1,2)", "jnp.maximum(jnp.maximum(obs[0],params[0]),2)"),
-        ("min(B,k1,2,3)", "jnp.minimum(jnp.minimum(jnp.minimum(obs[0],params[0]),2),3)"),
+        ("max(B,k1,2)", "jnp.maximum(jnp.maximum(obs[0],params[0]),2.0)"),
+        ("min(B,k1,2,3)", "jnp.minimum(jnp.minimum(jnp.minimum(obs[0],params[0]),2.0),3.0)"),
         ("max(B)", "(obs[0])"),
         (
             "max(B, min(k1,B,3))",
-            "jnp.maximum(obs[0], jnp.minimum(jnp.minimum(params[0],obs[0]),3))",
+            "jnp.maximum(obs[0], jnp.minimum(jnp.minimum(params[0],obs[0]),3.0))",
         ),
         # a binary call is left exactly as written, spaces and all
         ("max(B, k1)", "jnp.maximum(obs[0], params[0])"),

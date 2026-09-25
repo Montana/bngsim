@@ -195,6 +195,32 @@ _BARE_IDENT_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)")
 # Quoted text is data, not a name — a table function's file name would
 # otherwise be read as a pile of undefined identifiers.
 _STRING_LITERAL_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_JAX_NUMERIC_LITERAL_RE = re.compile(
+    r"(?P<string>'[^']*'|\"[^\"]*\")|"
+    r"(?P<number>(?<![\w.])(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?(?![\w.]))"
+)
+
+
+def _jax_numeric_literals_as_floats(expr: str) -> str:
+    """Make integer literals floating-point without touching strings or indices.
+
+    The JAX expression evaluator mixes translated model literals with JAX
+    arrays. A literal-only subexpression such as ``1500^6`` is evaluated by
+    Python as an arbitrary-precision ``int`` before it reaches JAX; JAX then
+    raises when that value cannot be represented as int64. The engine evaluates
+    all model numbers as doubles, so spell integer tokens as floats here too.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        string = match.group("string")
+        if string is not None:
+            return string
+        number = match.group("number")
+        assert number is not None
+        return number + ".0" if re.fullmatch(r"\d+", number) else number
+
+    return _JAX_NUMERIC_LITERAL_RE.sub(replace, expr)
+
 
 # Longest name first so `asin` wins over `sin`, and no match may start straight
 # after a word character or a `.` — the latter keeps an already-emitted
@@ -396,6 +422,7 @@ def _translate_expr_jax(
     # ExprTk's reading of =, <>, -- and relational chains made explicit, as in
     # the C translators and the sympy parsers (issue #734).
     c = _normalize_exprtk_operators(expr)
+    c = _jax_numeric_literals_as_floats(c)
 
     # Bracket the source's grouping before the operators become Python ones,
     # whose precedence differs (GH #579).
