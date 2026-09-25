@@ -9,8 +9,9 @@ the clock into it:
   ``time`` because ``time`` was now a registered scalar name, and the bare word
   then remapped to ``r_time``; the ambiguity guard that should have caught it
   runs after the parens are gone;
-* both codegen identifier tables let a model name override the built-in
-  ``time`` entry, so ``time()`` compiled to the scalar's slot.
+* both codegen identifier tables (one since #803 retired the ``.net``
+  emitter's) let a model name override the built-in ``time`` entry, so
+  ``time()`` compiled to the scalar's slot.
 
 The sensitivity layer (sympy) always read ``time()`` as the clock, so
 sensitivities were computed for a model the trajectory was not: on the model
@@ -30,9 +31,7 @@ import numpy as np
 import pytest
 from bngsim import Model, Simulator
 from bngsim._codegen import (
-    _build_ident_lookup,
     _build_ident_lookup_model,
-    _translate_expr,
     _translate_expr_to_c,
 )
 
@@ -160,19 +159,12 @@ def test_sensitivity_agrees_with_its_trajectory(tmp_path, scalar):
     np.testing.assert_allclose(sens, fd, atol=1e-5)
 
 
-def test_codegen_translation_keeps_the_clock():
-    """The C, independent of a compiler: with an observable `time` in the table,
-    `time()` is the clock `t` and bare `time` is the observable's slot."""
-    lookup = _build_ident_lookup({"k": 0}, {"time": 0}, [], use_arrays=True)
-    assert _translate_expr("k*time()", lookup) == "p[0]*t"
-    assert _translate_expr("k*time", lookup) == "p[0]*obs[0]"
-    assert _translate_expr("k*time( )*time", lookup) == "p[0]*t*obs[0]"
-
-
 def test_model_codegen_translation_keeps_the_clock():
-    """The model-path emitter (``_translate_expr_to_c``, used for SBML, Antimony
-    and ModelBuilder models) has its own lookup table and needed the same fix;
-    on main it compiled all three `time` tokens below to the observable's slot."""
+    """The C, independent of a compiler: with an observable `time` in the table,
+    `time()` is the clock `t` and bare `time` is the observable's slot. The
+    translator (``_translate_expr_to_c``, every model's since #803) needed the fix
+    as much as the retired ``.net`` one; before it, it compiled all three `time`
+    tokens below to the observable's slot."""
     lookup = _build_ident_lookup_model({"k": "p[0]"}, {}, {"time": "obs[0]"}, {})
     assert _translate_expr_to_c("k*time()", lookup) == "p[0]*t"
     assert _translate_expr_to_c("k*time", lookup) == "p[0]*obs[0]"

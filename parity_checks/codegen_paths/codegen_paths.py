@@ -355,9 +355,20 @@ def model_row(p: dict, d: Path) -> dict:
             r[f"{arm}_exc"] = f"{m.get('exc_type')}: {(m.get('exc') or '')[:300]}"
         if arm in ("net", "model", "net_sens", "model_sens") and m:
             if ok(m):
-                r[f"{arm}_path_ok"] = m.get("backend") == "cc" and bool(
-                    m.get("sim_net_path")
-                ) == arm.startswith("net")
+                if m.get("net_codegen_path", True):
+                    # A bngsim with the .net codegen path: each arm took its own.
+                    took_its_path = bool(m.get("sim_net_path")) == arm.startswith("net")
+                elif arm.startswith("net"):
+                    # Since #803 step 3 there is one path, so a net cell must have
+                    # built exactly its model twin's artifact.
+                    twin = M[arm.replace("net", "model", 1)]
+                    took_its_path = bool(twin) and ok(twin) and m.get("so") == twin.get("so")
+                else:
+                    # ...and a model cell had no other path to take, so only the
+                    # compiled-code half of the control applies to it.
+                    took_its_path = True
+                    r["one_codegen_path"] = True
+                r[f"{arm}_path_ok"] = m.get("backend") == "cc" and took_its_path
                 r[f"{arm}_codegen_sec"] = m.get("codegen_sec")
                 r[f"{arm}_gen_sec"] = sum(g["sec"] for g in m.get("gen", []))
                 r[f"{arm}_c_bytes"] = sum(c["bytes"] for c in m.get("compiles", []))
@@ -493,9 +504,16 @@ def cmd_report(a) -> None:
         for x in ("net", "model", "net_sens", "model_sens")
         if r.get(f"{x}_path_ok") is False
     ]
-    P(
-        f"\nPositive control (codegen arm ran compiled code on the path it claims): {'FAILED ' + str(bad_pc) if bad_pc else 'held on every cell'}."
-    )
+    if any(r.get("one_codegen_path") for r in rows):
+        # A bngsim with one codegen path (#803 step 3 on): nothing to check that a
+        # model cell took, so say what WAS checked rather than "every cell".
+        claim = (
+            "every codegen cell ran compiled code, and every net cell built exactly "
+            "its model twin's artifact"
+        )
+    else:
+        claim = "every codegen cell ran compiled code on the path it claims"
+    P(f"\nPositive control ({claim}): {'FAILED ' + str(bad_pc) if bad_pc else 'held'}.")
 
     P("\n## Failures by path\n")
     for x_n, x_m, lab in (

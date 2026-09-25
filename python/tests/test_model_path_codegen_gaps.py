@@ -171,10 +171,9 @@ end reactions
     ],
     ids=["relational-chain", "lone-equals", "double-negation"],
 )
-@pytest.mark.parametrize("path", ["net", "model"])
 @pytest.mark.parametrize("sens", [False, True], ids=["codegen", "sensitivity"])
 def test_exprtk_spellings_compile_to_what_the_interpreter_computes(
-    tmp_path, f0, f1, f2, expected, path, sens
+    tmp_path, f0, f1, f2, expected, sens
 ):
     """Constant-rate synthesis from a fixed source over t in [0, 1], so each
     species at t = 1 is its rate: (S0, S1, S2, D) = (f0, f1, f2, k)."""
@@ -183,8 +182,6 @@ def test_exprtk_spellings_compile_to_what_the_interpreter_computes(
     ref = _run(bngsim.Model.from_net(net), codegen=False).species[-1, 1:]
     np.testing.assert_allclose(ref, expected, rtol=1e-9)
     m = bngsim.Model.from_net(net)
-    if path == "model":
-        m._net_path = ""  # the switch Simulator reads (#803)
     r = _run(m, **({"sensitivity_params": ["b"]} if sens else {"codegen": True}))
     np.testing.assert_allclose(r.species[-1, 1:], expected, rtol=1e-9)
     assert m.get_param("k") == 3.0

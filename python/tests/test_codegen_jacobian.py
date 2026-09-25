@@ -501,11 +501,11 @@ _SPARSE_EMIT_NET = (
 
 
 def _assert_only_returns_zero(path: str, label: str) -> str:
-    from bngsim._codegen import generate_combined_c
+    from bngsim._codegen import generate_combined_from_model
 
     m = bngsim.Model.from_net(path)
     m.prepare_analytical_jacobian()
-    src, _ = generate_combined_c(path, model=m, emit_jac=True, emit_outputs=True)
+    src, _ = generate_combined_from_model(m)
     assert src, f"emitter declined {label}; this test needs a real artifact"
     # Guard the premise twice: a source with no exported entry point, or with no
     # compiled Jacobian in it, would pass vacuously.

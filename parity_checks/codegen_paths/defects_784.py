@@ -7,6 +7,10 @@ reads -- and is checked against an oracle that shares no code with bngsim: a
 closed form, or scipy's ``solve_ivp``. The ExprTk-spelling cases (#734) use the
 interpreter, whose reading BNG2.pl's own parenthesisation confirms.
 
+Since #803 step 3 that switch selects nothing -- every model compiles from the
+built model -- so on a current bngsim the ``.net`` column repeats the model one.
+Run it against a bngsim from before that step to see the two paths apart.
+
     python defects_784.py            # markdown table; exit 0 whatever it finds
 
 Needs a C compiler (codegen) and scipy. No BNG2.pl.

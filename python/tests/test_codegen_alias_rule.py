@@ -131,10 +131,8 @@ def _emit_every_path(tmp_path, name: str) -> dict[str, str | None]:
     path.write_text(_ALIAS_TWIN_NET.format(name=name))
     model = bngsim.Model.from_net(str(path))
     return {
-        "rhs (from net)": cg.generate_rhs_c(str(path)),
-        "rhs (from model)": cg.generate_rhs_from_model(model),
+        "rhs": cg.generate_rhs_from_model(model),
         "jacobian": cg.generate_jacobian_from_model(model),
-        "sens rhs (from net)": cg.generate_sens_rhs_c(str(path)),
         "sens rhs (elementary)": cg.generate_sens_from_model(model, functional=False),
         "sens rhs (functional)": cg.generate_sens_from_model(model, functional=True),
         "outputs": cg.generate_outputs_from_model(model),

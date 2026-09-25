@@ -3,12 +3,13 @@
 
 These cover the new code path added so that any model whose reactions are
 all Elementary — including those built directly via ``ModelBuilder`` —
-gets a combined RHS + sensitivity-RHS .so, byte-equivalent to what the
-.net path emits via ``generate_sens_rhs_c``.
+gets a combined RHS + sensitivity-RHS .so. Since #803 it is the only codegen
+path: ``.net`` and BNGL models compile through it too.
 
 Issue refs:
 - #15: ``codegen_data()`` schema gap (no ``is_const``/expression on params),
-       which is why the model path skips the derived-param chain rule.
+       which is why the model path once skipped the derived-param chain rule
+       (it expands it since #99).
 - #16: SBML/Antimony loader emits Elementary for trivially-mass-action
        kinetic laws (closed 2026-05-05). Antimony models with mass-action
        laws now get analytical sens RHS via the model-based path; only

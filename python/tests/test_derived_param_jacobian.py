@@ -150,10 +150,11 @@ class TestPythonKeywordParamNames:
 
 
 class TestPrepareCodegenWithLambdaParam:
-    """End-to-end: `prepare_codegen` must succeed on a model that names a
-    parameter `lambda`. Pre-fix this path raised TokenError out of
+    """End-to-end: codegen must succeed on a model that names a parameter
+    `lambda`. Pre-fix this path raised TokenError out of
     `_compute_derived_param_jacobian`, the bridge caught it broadly, and
-    fell back to interpreted ODE."""
+    fell back to interpreted ODE. (Pinned on the ``.net`` path's
+    ``prepare_codegen`` until #803 routed ``.net`` models through the model.)"""
 
     def test_prepare_codegen_succeeds_on_lambda_named_param(self, tmp_path):
         # Smallest-possible reproducer: a derived param whose expression
@@ -179,9 +180,12 @@ class TestPrepareCodegenWithLambdaParam:
             "end groups\n"
         )
 
-        from bngsim._codegen import prepare_codegen
+        import bngsim
+        from bngsim._codegen import prepare_model_codegen
 
-        so_path = prepare_codegen(str(net))
+        model = bngsim.Model.from_net(str(net))
+        model._want_output_sens = True  # the derived-parameter chain rule is in the sens RHS
+        so_path = prepare_model_codegen(model)
         assert so_path is not None
         assert so_path.exists()
 
@@ -189,14 +193,17 @@ class TestPrepareCodegenWithLambdaParam:
 class TestIssue27EndToEndForwardSens:
     """Issue #27 acceptance criterion: forward sensitivity on a
     ``scaling_example``-shaped model with ``sensitivity_params=['lambda']``
-    must match CVODES internal FD. The shape is the corpus model that
-    motivated the issue: primary param literally named ``lambda``, derived
-    rate constant ``_rateLaw1 = lambda*(1-phi)`` driving the reaction.
+    must be right. The shape is the corpus model that motivated the issue:
+    primary param literally named ``lambda``, derived rate constant
+    ``_rateLaw1 = lambda*(1-phi)`` driving the reaction.
 
     Pre-#27 the codegen Jacobian path silently zeroed ``∂_rateLaw1/∂lambda``
     (the alias-and-Piecewise passes weren't there), so the codegen analytic
-    sens for ``lambda`` was wrong. Post-#27 the chain rule is re-established
-    and codegen sens must match CVODES internal FD.
+    sens for ``lambda`` was wrong. Post-#27 the chain rule is re-established.
+
+    The oracle is the closed form. It used to be "CVODES internal FD", a
+    ``Simulator`` without ``codegen=True`` — but GH #214 retired that path (a
+    sensitivity run always compiles), so both arms were the same compiled RHS.
     """
 
     def _write_scaling_example_net(self, tmp_path):
@@ -224,54 +231,39 @@ class TestIssue27EndToEndForwardSens:
         )
         return str(net)
 
-    def test_codegen_sens_for_lambda_matches_cvodes_fd(self, tmp_path):
-        import platform
-
+    def test_codegen_sens_for_lambda_matches_the_closed_form(self, tmp_path):
         import bngsim
         import numpy as np
-        from bngsim._codegen import CACHE_DIR, compute_model_hash, prepare_codegen
 
         net_path = self._write_scaling_example_net(tmp_path)
-
-        # Force codegen .so re-generation so this test exercises the new
-        # preprocessing passes rather than a stale cached artifact.
-        h = compute_model_hash(net_path)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"rhs_{h}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
         sample_times = list(np.linspace(0.0, 5.0, 51))
 
-        # Reference: CVODES internal FD (codegen=False)
-        m1 = bngsim.Model.from_net(net_path)
-        sim1 = bngsim.Simulator(m1, method="ode", sensitivity_params=["lambda"])
-        r_fd = sim1.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
+        # Codegen analytic sens: _compute_derived_param_jacobian for
+        # ``lambda*(1-phi)`` must return an analytic ∂_rateLaw1/∂lambda = 1-phi
+        # (#27 pass 2).
+        m = bngsim.Model.from_net(net_path)
+        sim = bngsim.Simulator(m, method="ode", sensitivity_params=["lambda"], codegen=True)
+        assert sim._codegen_so_path or sim._codegen_c_source
+        r_cg = sim.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
 
-        # Codegen analytic sens (codegen=True). prepare_codegen exercises the
-        # full path: _compute_derived_param_jacobian for ``lambda*(1-phi)``
-        # must return an analytic ∂_rateLaw1/∂lambda = 1-phi (#27 pass 2).
-        prepare_codegen(net_path)
-        m2 = bngsim.Model.from_net(net_path)
-        sim2 = bngsim.Simulator(
-            m2, method="ode", sensitivity_params=["lambda"], codegen=True, net_path=net_path
-        )
-        r_cg = sim2.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
+        # A -> B at k = lambda*(1-phi) from A0 = 100: A = A0*e^{-k t}, so
+        # dA/dlambda = -(1-phi)*t*A = -dB/dlambda.
+        t = np.asarray(sample_times)
+        k = 0.5 * (1.0 - 0.3)
+        a = 100.0 * np.exp(-k * t)
+        np.testing.assert_allclose(np.asarray(r_cg.species)[:, 0], a, rtol=1e-8, atol=1e-8)
 
-        # Species trajectories must agree first — same model, same params.
-        np.testing.assert_allclose(r_fd.species, r_cg.species, atol=1e-8)
-
-        # Sensitivities ∂y/∂lambda from both methods must match. Pre-#27 the
-        # codegen path silently dropped the chain rule and produced (≈ 0)
-        # contributions for ``lambda`` — they'd be way off.
-        s_fd = r_fd.sensitivities[:, :, 0]
+        # Pre-#27 the codegen path silently dropped the chain rule and produced
+        # (≈ 0) contributions for ``lambda`` — they'd be way off.
+        da = -(1.0 - 0.3) * t * a
+        s_ref = np.stack([da, -da], axis=1)
         s_cg = r_cg.sensitivities[:, :, 0]
-        denom = np.maximum(np.abs(s_fd[1:]), np.abs(s_cg[1:]))
+        denom = np.maximum(np.abs(s_ref[1:]), np.abs(s_cg[1:]))
         mask = denom > 1e-9
-        assert mask.any(), "FD reference sens is identically zero — bad test setup"
-        rel = np.abs(s_fd[1:] - s_cg[1:])[mask] / denom[mask]
-        assert rel.max() < 1e-3, (
-            f"codegen analytic sens for ``lambda`` does not match CVODES FD "
+        assert mask.any(), "closed-form sens is identically zero — bad test setup"
+        rel = np.abs(s_ref[1:] - s_cg[1:])[mask] / denom[mask]
+        assert rel.max() < 1e-6, (
+            f"codegen analytic sens for ``lambda`` does not match the closed form "
             f"(max relerr={rel.max():.3e}); chain rule through _rateLaw1 = "
             f"lambda*(1-phi) likely dropped — see issue #27"
         )
@@ -654,41 +646,43 @@ class TestIssue56SensRhsDeclinedNotWrong:
         p.write_text(self._HEAD.format(decl=decl) + self._TAIL.format(rate=rate))
         return str(p)
 
-    def test_undifferentiable_rate_constant_declines_the_rhs(self, tmp_path, caplog):
-        from bngsim._codegen import generate_sens_rhs_c
+    @staticmethod
+    def _sens_c(net):
+        import bngsim
+        from bngsim._codegen import generate_sens_from_model
 
-        net = self._write(tmp_path, "kd  kf*foo(scale)  # ConstantExpression", "kd")
+        return generate_sens_from_model(bngsim.Model.from_net(net))
+
+    # ``floor()`` rather than the ``foo()`` these used until #803: an unknown
+    # function never reaches the emitter now, because the loader refuses it and the
+    # sensitivity RHS is generated from the model the loader built.
+    def test_undifferentiable_rate_constant_declines_the_rhs(self, tmp_path, caplog):
+        net = self._write(tmp_path, "kd  kf*floor(scale)  # ConstantExpression", "kd")
         with caplog.at_level(logging.WARNING, logger="bngsim"):
-            assert generate_sens_rhs_c(net) is None, (
+            assert self._sens_c(net) is None, (
                 "an undifferentiable derived rate constant must decline the analytic "
                 "sens RHS, not emit one with a zeroed chain rule (issue #56)"
             )
         assert any("analytic sensitivity RHS is declined" in r.message for r in caplog.records)
 
     def test_differentiable_rate_constant_still_emits(self, tmp_path):
-        from bngsim._codegen import generate_sens_rhs_c
-
         net = self._write(tmp_path, "kd  kf*scale  # ConstantExpression", "kd")
-        assert generate_sens_rhs_c(net) is not None
+        assert self._sens_c(net) is not None
 
     def test_compound_condition_rate_constant_still_emits(self, tmp_path):
         """The headline #56 case must now produce an RHS rather than decline."""
-        from bngsim._codegen import generate_sens_rhs_c
-
         net = self._write(
             tmp_path, "kd  if((scale>=1)&&(scale<10), kf, 2*kf)  # ConstantExpression", "kd"
         )
-        assert generate_sens_rhs_c(net) is not None
+        assert self._sens_c(net) is not None
 
     def test_undifferentiable_non_rate_constant_does_not_decline(self, tmp_path, caplog):
         """``kd`` is never a rate constant here — only ``kf`` drives the
         reaction — so its undifferentiable expression is irrelevant to this RHS
         and must neither decline it nor warn."""
-        from bngsim._codegen import generate_sens_rhs_c
-
-        net = self._write(tmp_path, "kd  kf*foo(scale)  # ConstantExpression", "kf")
+        net = self._write(tmp_path, "kd  kf*floor(scale)  # ConstantExpression", "kf")
         with caplog.at_level(logging.WARNING, logger="bngsim"):
-            assert generate_sens_rhs_c(net) is not None
+            assert self._sens_c(net) is not None
         assert not caplog.records
 
 

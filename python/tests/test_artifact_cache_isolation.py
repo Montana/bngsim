@@ -9,7 +9,8 @@ to stand in for another install left an artifact under a key no install has ever
 had, which since #363 shows up as a row in somebody's cache report.
 
 These tests pin the redirect itself. The two files that used to leave the
-recognizable debris — ``test_prepare_codegen_memo.py`` (fabricated key) and
+recognizable debris — ``test_prepare_codegen_memo.py`` (fabricated key; retired
+with the memo it tested by #803) and
 ``test_codegen_sensitivity.py`` (invented model hash) — assert their own
 containment where the artifact is written, since that is where the leak was.
 """

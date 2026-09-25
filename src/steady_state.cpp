@@ -271,8 +271,8 @@ class SteadyStateRhs {
     // The analytical ∂f/∂p exists only in the compiled artifact — there is no
     // interpreted counterpart, so an absent symbol means the caller must
     // difference. Since GH #67 that is no longer "every Functional/MM model":
-    // generate_combined_c falls back to the model-based emitter, which covers a
-    // Functional rate law that is smooth algebra. What is left absent is
+    // the sensitivity emitter (generate_sens_from_model) covers a Functional
+    // rate law that is smooth algebra. What is left absent is
     // Michaelis-Menten and the laws carrying a condition or a non-smooth builtin.
     bool has_analytical_dfdp() const { return sens_fn_ != nullptr; }
 

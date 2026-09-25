@@ -2344,7 +2344,7 @@ class TestTfunWrapperForm:
         """Codegen path: wrapper math + embedded tfun_eval callback gives the
         same numeric answer as the interpreter."""
         model = Model.from_net(wrap_single_net)
-        sim = Simulator(model, method="ode", codegen=True, net_path=wrap_single_net)
+        sim = Simulator(model, method="ode", codegen=True)
         result = sim.run(t_span=(0.0, 2.0), n_points=21)
         Xtot_end = result.observables["Xtot"][-1]
         assert Xtot_end == pytest.approx(1.45, abs=1e-3)
@@ -2352,12 +2352,17 @@ class TestTfunWrapperForm:
     def test_wrap_single_codegen_emits_callback_inside_wrapper(self, wrap_single_net: Path):
         """The emitted C source for the wrapper function body must contain a
         tfun_eval callback nested inside the wrapper arithmetic, not a raw
-        tfun(...) token that would fail to compile."""
-        from bngsim._codegen import generate_rhs_c
+        tfun(...) token -- nor the loader's synthetic ``tfun_<table>()`` reference,
+        which the model path emitted verbatim until #803 -- that would fail to
+        compile."""
+        import bngsim
+        from bngsim._codegen import generate_rhs_from_model
 
-        src = generate_rhs_c(str(wrap_single_net))
-        func_lines = [line for line in src.splitlines() if "func_f_complex" in line]
-        assert func_lines, "codegen did not emit func_f_complex assignment"
+        src = generate_rhs_from_model(bngsim.Model.from_net(str(wrap_single_net)))
+        func_lines = [
+            line for line in src.splitlines() if "/* f_complex */" in line and "func[" in line
+        ]
+        assert func_lines, "codegen did not emit the f_complex assignment"
         rhs = func_lines[0]
         assert "tfun_eval(" in rhs, f"missing tfun_eval callback in: {rhs}"
         # Wrapper math must surround the callback (parentheses + the +5/p[0]
@@ -2366,3 +2371,4 @@ class TestTfunWrapperForm:
         assert "+5.0)/p[" in rhs.replace(" ", ""), f"wrapper math lost in: {rhs}"
         # Raw tfun(...) token must NOT survive — that's the pre-fix compile failure.
         assert "tfun('" not in rhs and 'tfun("' not in rhs, f"raw tfun token in: {rhs}"
+        assert "tfun_f_complex" not in rhs, f"unresolved table reference in: {rhs}"

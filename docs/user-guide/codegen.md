@@ -4,47 +4,34 @@
 
 For ODE simulations, BNGsim can compile model rate laws into native C code,
 which is then loaded via `dlopen()`. This eliminates ExprTk bytecode
-interpretation overhead for large models. The public API has two codegen
-routes:
-
-**BioNetGen `.net` models** use the `.net` codegen path. If the model was
-loaded with `Model.from_net(...)`, BNGsim already remembers the `.net` path:
+interpretation overhead for large models. Codegen compiles the model BNGsim
+built, whatever it was loaded from — `.net`, BNGL, SBML, Antimony or the
+builder — so turning it on is the same argument for every model:
 
 ```python
-net_model = bngsim.Model.from_net("model.net")
+model = bngsim.Model.from_net("model.net")  # or from_bngl, from_sbml, ...
 
-sim = bngsim.Simulator(
-    net_model,
-    method="ode",
-    codegen=True,
-)
+sim = bngsim.Simulator(model, method="ode", codegen=True)
 result = sim.run(t_span=(0, 100), n_points=101)
 ```
 
-You may still pass `net_path="model.net"` explicitly for `.net` models, but
-`net_path` means exactly this: a BioNetGen `.net` file.
+With `codegen=None` (the default) a model compiles automatically at or above
+`BNGSIM_CODEGEN_THRESHOLD` species (256), where native code beats the
+interpreter, and `codegen=False` never compiles. A forward-sensitivity run
+always compiles, because its sensitivity RHS is generated code.
 
-**SBML and Antimony models** use model-based codegen. Do not pass the SBML
-XML file as `net_path`; just enable codegen on the loaded model:
-
-```python
-sbml_model = bngsim.Model.from_sbml("model.xml")
-
-sim = bngsim.Simulator(
-    sbml_model,
-    method="ode",
-    codegen=True,
-)
-result = sim.run(t_span=(0, 100), n_points=101)
-```
-
-Passing an SBML XML file as `net_path` is rejected because the `.net` parser
-cannot interpret SBML. This prevents accidental compilation of an empty RHS.
+Until issue #803, a `.net` or BNGL model was compiled from a second reading of
+its `.net` file, by a parser of codegen's own, and wherever that reading
+disagreed with the loader's the compiled model did too (issue #784). There is
+one reading now. `bngsim.prepare_codegen(net_path)` remains as a deprecated
+wrapper that loads the file and compiles the model, and `Simulator`'s
+`net_path` is read only by `jacobian="jax"`.
 
 Codegen is **enabled by default** in PyBNF's `BngsimModel` (set
 `BNGSIM_NO_CODEGEN=1` to disable). Compiled `.so` files are cached in
-`~/.cache/bngsim/codegen/` by SHA-256 hash — recompilation only happens when
-the `.net` content or model-generated code changes. Compilation builds to a
+`~/.cache/bngsim/codegen/`, keyed on the model's structure and the codegen
+version — recompilation happens when the model or the generated code changes,
+and a parameter-value change almost never causes one. Compilation builds to a
 process-unique temp file and `os.replace()`s it into the cache, so concurrent
 Dask workers compiling the same model never observe a partial `.so`. Set
 `BNGSIM_CODEGEN_CACHE_DIR` to relocate the cache — point it at fast node-local

@@ -24,6 +24,13 @@ DATA = os.environ.get("BNGSIM_TEST_DATA") or os.path.join(
 )
 
 
+def _net_rhs_c(path: str) -> str:
+    """The RHS C a .net model compiles to (from the built model since #803)."""
+    from bngsim import Model
+
+    return cg.generate_rhs_from_model(Model.from_net(path))
+
+
 # ─── struct mirrors for ctypes calls into the compiled .so ──────────────────
 class _CodegenUserData(ctypes.Structure):
     _fields_ = [
@@ -223,7 +230,7 @@ class TestChunkGatingStructure:
 
     def test_flat_below_gate(self, monkeypatch):
         monkeypatch.delenv("BNGSIM_CODEGEN_CHUNK", raising=False)
-        src = cg.generate_rhs_c(os.path.join(DATA, "two_species_reversible.net"))
+        src = _net_rhs_c(os.path.join(DATA, "two_species_reversible.net"))
         assert cg._CHUNK_MARKER not in src
         assert "rxn_blk_" not in src
         # The NOINLINE macro is *defined* in every source now (it shares the
@@ -234,7 +241,7 @@ class TestChunkGatingStructure:
     def test_chunked_above_gate(self, monkeypatch):
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK_SIZE", "1")
-        src = cg.generate_rhs_c(os.path.join(DATA, "two_species_reversible.net"))
+        src = _net_rhs_c(os.path.join(DATA, "two_species_reversible.net"))
         assert cg._CHUNK_MARKER in src[:512]
         assert src.count("BNGSIM_NOINLINE void rxn_blk_") >= 2
         # each block has external linkage (not static) so it can compile as a
@@ -247,7 +254,7 @@ class TestChunkGatingStructure:
 
 @requires_cc
 class TestNetChunkEquivalence:
-    """Chunked .net RHS is bit-identical to the flat one."""
+    """A .net model's chunked RHS is bit-identical to the flat one."""
 
     @pytest.mark.parametrize(
         "net",
@@ -256,16 +263,18 @@ class TestNetChunkEquivalence:
     def test_rhs_bit_identical(self, net, monkeypatch, tmp_path):
         import random
 
+        from bngsim import Model
+
         path = os.path.join(DATA, f"{net}.net")
-        parsed = cg._parse_net_file(path)
-        n_sp = len(parsed["species"])
-        n_par = len(parsed["parameters"])
+        core = Model.from_net(path)._core
+        n_sp = core.n_species
+        n_par = len(core.codegen_data()["parameters"])
 
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "off")
-        flat = cg.generate_rhs_c(path)
+        flat = _net_rhs_c(path)
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK_SIZE", "1")  # 1 rxn/block: max split
-        chunked = cg.generate_rhs_c(path)
+        chunked = _net_rhs_c(path)
 
         assert cg._CHUNK_MARKER not in flat
         assert cg._CHUNK_MARKER in chunked[:512]

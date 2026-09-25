@@ -1,8 +1,9 @@
 """GH #161 — codegen RHS *source generation* must stay ~linear in model size.
 
-The serial generator (``generate_rhs_c`` / ``generate_sens_rhs_c``) hid two
-accidentally-quadratic loops that made source generation ~11 min on a
-113k-reaction genome-scale model, dwarfing the #160-sharded compile:
+The serial ``.net`` generator (``generate_rhs_c`` / ``generate_sens_rhs_c``,
+retired by #803) hid two accidentally-quadratic loops that made source
+generation ~11 min on a 113k-reaction genome-scale model, dwarfing the
+#160-sharded compile:
 
   1. ``set(param_idx.keys())`` was rebuilt once per reaction and handed to
      ``_classify_rate_law``, which never used it. Parameter count scales with
@@ -13,13 +14,15 @@ accidentally-quadratic loops that made source generation ~11 min on a
      ~170k identifiers that is O(n_functions x n_identifiers).
 
 The fixes drop the dead classifier argument and build the identifier lookup
-once via ``_build_ident_lookup``; both leave the emitted source byte-identical.
+once; both leave the emitted source byte-identical. The model-based generator
+had the second quadratic too (``_translate_expr_to_c``), fixed the same way, and
+since #803 it is the generator every ``.net`` model goes through.
 
 These tests pin the properties, not a wall-clock number on one machine:
   * Neither hot function takes the input that invited its per-item rebuild —
     deterministic root-cause guards.
   * An all-elementary model (exercises the RHS + twice-over sensitivity
-    generator) and a function-heavy model (exercises ``_translate_expr``) each
+    generator) and a function-heavy model (exercises function-body translation) each
     generate with large headroom under a budget the quadratic could not have
     met. Pre-fix needed ~minutes; the budgets are tens of seconds, so only a
     re-quadratic-ied generator trips them — machine-speed variance does not.
@@ -32,6 +35,7 @@ import random
 import re
 import time
 
+import bngsim
 from bngsim import _codegen as cg
 
 
@@ -57,7 +61,7 @@ def _elementary_net(path, n_species: int, n_rxn: int, seed: int = 1234) -> None:
 
 def _function_heavy_net(path, n: int, seed: int = 7) -> None:
     """Write a model with ~n parameters, observables, and functions, where every
-    reaction is functional. This drives ``_translate_expr``: each function body
+    reaction is functional. This drives function-body translation: each body
     is translated against a lookup of all ~3n identifiers, so a per-call rebuild
     is O(n_functions x n_identifiers) (GH #161 quadratic #2)."""
     rng = random.Random(seed)
@@ -95,20 +99,8 @@ def test_classify_rate_law_does_not_take_param_name_set():
     )
 
 
-def test_translate_expr_takes_a_prebuilt_lookup():
-    """Root-cause guard: ``_translate_expr`` rewrites against a prebuilt lookup,
-    not the raw index maps. Passing the maps invites the per-call lookup rebuild
-    (all params + observables + functions, with a regex per name) that made
-    function-body translation O(n^2) (GH #161)."""
-    params = list(inspect.signature(cg._translate_expr).parameters)
-    assert params == ["expr", "lookup"], (
-        f"_translate_expr signature is {params!r}; it must take a prebuilt "
-        "lookup (GH #161 — rebuilding it per function body is quadratic)."
-    )
-
-
 def test_translate_expr_to_c_takes_a_prebuilt_lookup():
-    """Same guard for the model-based translator. ``_translate_expr_to_c`` must
+    """Root-cause guard for the translator. ``_translate_expr_to_c`` must
     take a prebuilt lookup, not the per-name maps — rebuilding the combined
     (~245k-entry, species included) table per body was the model-based GH #161
     quadratic that left ``generate_rhs_from_model`` unfinished after >5 min on
@@ -129,22 +121,23 @@ def test_large_model_generation_is_not_quadratic(tmp_path):
     n_rxn = 40_000
     _elementary_net(net, n_species=n_rxn // 3, n_rxn=n_rxn)
 
+    model = bngsim.Model.from_net(str(net))
     t0 = time.perf_counter()
-    source, has_sens = cg.generate_combined_c(str(net))
+    source, has_sens = cg.generate_combined_from_model(model)
     elapsed = time.perf_counter() - t0
 
     # Sanity: this is the path that ran both O(n^2) generators (RHS + sens).
     assert has_sens
     assert "bngsim_codegen_rhs" in source
     assert elapsed < 20.0, (
-        f"generate_combined_c took {elapsed:.1f}s for {n_rxn} reactions — "
+        f"generate_combined_from_model took {elapsed:.1f}s for {n_rxn} reactions — "
         "source generation looks quadratic again (GH #161)."
     )
 
 
 def test_function_heavy_generation_is_not_quadratic(tmp_path):
     """A model with 5000 functions / observables / parameters generates RHS
-    source well under the budget. Pre-#161 ``_translate_expr`` rebuilt the full
+    source well under the budget. Pre-#161 the translator rebuilt the full
     ~15k-identifier lookup (with a regex per observable/function) for each of the
     5000 function bodies — tens of seconds. The lookup is now built once, so this
     is sub-second; the 15 s budget has >15x headroom and trips only on a genuine
@@ -153,8 +146,9 @@ def test_function_heavy_generation_is_not_quadratic(tmp_path):
     n = 5000
     _function_heavy_net(net, n)
 
+    model = bngsim.Model.from_net(str(net))
     t0 = time.perf_counter()
-    source = cg.generate_rhs_c(str(net))
+    source = cg.generate_rhs_from_model(model)
     elapsed = time.perf_counter() - t0
 
     # Every function body must have been emitted (the path that ran the O(n^2)).
@@ -164,6 +158,6 @@ def test_function_heavy_generation_is_not_quadratic(tmp_path):
     n_bodies = source.count("double func_") + len(re.findall(r"\bfunc\[\d+\] =", source))
     assert n_bodies == n
     assert elapsed < 15.0, (
-        f"generate_rhs_c took {elapsed:.1f}s for {n} functions — function-body "
-        "translation looks quadratic again (GH #161 _translate_expr)."
+        f"generate_rhs_from_model took {elapsed:.1f}s for {n} functions — "
+        "function-body translation looks quadratic again (GH #161)."
     )

@@ -38,21 +38,19 @@ class TestCodegenBackend:
         # even on a tiny model (this is exactly how to reach the state a
         # >=256-species model reaches automatically, without a huge fixture).
         m = bngsim.Model.from_net(_net("simple_decay"))
-        sim = bngsim.Simulator(m, method="ode", codegen=True, net_path=_net("simple_decay"))
+        sim = bngsim.Simulator(m, method="ode", codegen=True)
         assert sim.codegen_backend == "cc"
 
     def test_threshold_env_forces_cc(self):
         # The documented threshold override (BNGSIM_CODEGEN_THRESHOLD) is the
         # production path to "cc": drop it to 0 and even a 2-species model
-        # auto-codegens at load.
+        # auto-codegens at ODE-solve setup. A .net model included, since #803:
+        # it used to be excluded from the auto-trigger and needed codegen=True.
         prev = os.environ.get("BNGSIM_CODEGEN_THRESHOLD")
         os.environ["BNGSIM_CODEGEN_THRESHOLD"] = "0"
         try:
-            import bngsim._sbml_loader  # noqa: F401  (kept for parity with SBML path)
-
             m = bngsim.Model.from_net(_net("simple_decay"))
-            # .net models codegen lazily via the Simulator; force it on.
-            sim = bngsim.Simulator(m, method="ode", codegen=True, net_path=_net("simple_decay"))
+            sim = bngsim.Simulator(m, method="ode")
             assert sim.codegen_backend == "cc"
         finally:
             if prev is None:
@@ -152,22 +150,16 @@ class TestCodegenSetupTime:
         net = _net("simple_decay")
         # An EMPTY cache directory is what makes the first construction cold.
         # Unlinking ``get_cached_so(compute_model_hash(net))`` — what this test used
-        # to do — evicts nothing at all: simple_decay has a complete analytical
-        # Jacobian and two observables and is not on a sensitivity run, so its .net
-        # codegen keys under the ":codegen_jac:codegen_outputs:no_sens_rhs" suffix
-        # (the sibling class enumerates the combinations), which hashes to a
-        # different filename than the base model hash ever names. Every construction
-        # in this file therefore reused the .so that ``TestCodegenBackend`` compiled
-        # one screen up. Redirecting CACHE_DIR states "nothing is cached" directly
-        # and cannot fall out of date as suffixes are added — as the enumeration can.
+        # to do — evicted nothing at all: the retired .net path keyed simple_decay
+        # under a suffix (":codegen_jac:codegen_outputs:no_sens_rhs"), which hashed
+        # to a different filename than the base model hash ever named, so every
+        # construction in this file reused the .so that ``TestCodegenBackend``
+        # compiled one screen up. Redirecting CACHE_DIR states "nothing is cached"
+        # directly and cannot fall out of date as the key changes.
         monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "codegen")
-        # The in-process memo answers before CACHE_DIR is ever consulted, so it has
-        # to go too. Swapped for an empty dict rather than cleared, so the entry
-        # pointing into tmp_path does not outlive the directory it names.
-        monkeypatch.setattr(cg, "_PREPARE_CODEGEN_MEMO", {})
 
         m = bngsim.Model.from_net(net)
-        sim = bngsim.Simulator(m, method="ode", codegen=True, net_path=net)
+        sim = bngsim.Simulator(m, method="ode", codegen=True)
         assert sim.codegen_backend == "cc"
         assert sim.codegen_cache_hit is False  # definitive: cc really did run
         cold = sim.last_codegen_sec
@@ -185,7 +177,7 @@ class TestCodegenSetupTime:
         # Reconstruct: the .so this test just compiled is now the cached one, so the
         # second construction reuses it instead of compiling again.
         m2 = bngsim.Model.from_net(net)
-        sim2 = bngsim.Simulator(m2, method="ode", codegen=True, net_path=net)
+        sim2 = bngsim.Simulator(m2, method="ode", codegen=True)
         assert sim2.codegen_cache_hit is True
         assert sim2.last_codegen_sec == m2._codegen_sec
 
@@ -201,43 +193,19 @@ class TestCodegenCacheHit:
         assert sim.codegen_backend == "exprtk"
         assert sim.codegen_cache_hit is None  # no .so involved at all
 
-    def test_cold_compile_then_cache_hit(self):
-        import hashlib
-
+    def test_cold_compile_then_cache_hit(self, monkeypatch, tmp_path):
         import bngsim._codegen as cg
 
         net = _net("simple_decay")
-        # simple_decay has a complete (elementary) analytical Jacobian AND two
-        # observables, so the default jacobian="auto" .net codegen compiles it under
-        # the combined GH #162 ":codegen_jac" + GH #163 ":codegen_outputs" key, not
-        # the plain RHS-only key — clear every suffix combination so the first
-        # construction is truly cold. Issue #209 added a no-sensitivity namespace to
-        # every non-sensitivity key, so each combination has more than one form: it
-        # was ":no_functional_sens" until issue #217 widened the gate to the
-        # Elementary half and renamed it ":no_sens_rhs", leaving ":no_functional_sens"
-        # to mean only what it meant in GH #67 (the A/B hatch). Both are cleared —
-        # an artifact under the old name is still on disk in any checkout that ran
-        # the suite before #217, and a stale one is exactly what makes a "cold"
-        # construction quietly warm.
-        base = cg.compute_model_hash(net)
-        keys = [base]
-        for callbacks in ("", ":codegen_jac", ":codegen_outputs", ":codegen_jac:codegen_outputs"):
-            for suffix in (
-                callbacks,
-                callbacks + ":no_sens_rhs",
-                callbacks + ":no_functional_sens",
-            ):
-                if suffix:
-                    keys.append(hashlib.sha256((base + suffix).encode()).hexdigest()[:16])
-        for key in keys:
-            so = cg.get_cached_so(key)
-            if so is not None:
-                so.unlink()
-        cg._PREPARE_CODEGEN_MEMO.clear()
+        # An empty cache directory is what makes the first construction truly
+        # cold. (This used to unlink every suffix combination of the retired .net
+        # path's key — a list that had to grow with every new suffix, and a stale
+        # artifact under a missed one made a "cold" construction quietly warm.)
+        monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "codegen")
 
         # Cold: no cached .so → compiled fresh.
         m = bngsim.Model.from_net(net)
-        sim = bngsim.Simulator(m, method="ode", codegen=True, net_path=net)
+        sim = bngsim.Simulator(m, method="ode", codegen=True)
         assert sim.codegen_backend == "cc"
         assert sim.codegen_cache_hit is False
 
@@ -245,7 +213,7 @@ class TestCodegenCacheHit:
         # the cache still spends nonzero wall time (so a wall-time heuristic would
         # be unreliable); the accessor reads the actual get_cached_so branch.
         m2 = bngsim.Model.from_net(net)
-        sim2 = bngsim.Simulator(m2, method="ode", codegen=True, net_path=net)
+        sim2 = bngsim.Simulator(m2, method="ode", codegen=True)
         assert sim2.codegen_cache_hit is True
 
 

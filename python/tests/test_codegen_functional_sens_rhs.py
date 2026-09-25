@@ -754,10 +754,10 @@ class TestEndToEnd:
 
     def test_the_analytic_rhs_is_actually_the_one_installed(self, tmp_path):
         """Agreement proves nothing if the run did not take the new path. The
-        artifact the Simulator installed has to carry the symbol — and for a
-        .net-loaded model that means the emitter reached it through
-        ``generate_combined_c``, which is a different hook from the model-based
-        entry points.
+        artifact the Simulator installed has to carry the symbol. (Until #803 a
+        .net-loaded model reached the emitter through the ``.net`` path's own
+        ``generate_combined_c``, a different hook from the model-based entry
+        points; it goes through them now.)
 
         Written against whichever artifact this backend produces, because the MIR
         matrix runs this file with ``BNGSIM_CODEGEN_JIT=mir``: there is a C source

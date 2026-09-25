@@ -13,8 +13,12 @@ between runs on one Model is how a control arm fakes a defect):
   model_sens  sensitivity_params=P, _net_path=""
   fd          interpreter, central FD of the trajectory in each p in P, at two steps
 
-Clearing ``model._net_path`` is the one switch ``Simulator`` reads to choose the
-.net path, so the two codegen arms differ only in the code under test.
+Clearing ``model._net_path`` was the one switch ``Simulator`` read to choose the
+.net path, so the two codegen arms differed only in the code under test. Since
+#803 step 3 there is no .net path: every arm compiles the built model, the net
+arms reproduce the model arms exactly, and ``net_codegen_path`` (recorded below)
+says which bngsim a cell ran against. The arms A/B two paths only on a bngsim
+from before that step, which is how the README's tables were measured.
 
 Writes ``<out_prefix>.npz`` (arrays) and then ``<out_prefix>.json`` (metadata); the
 JSON's presence means the cell finished, OK or with a recorded error. ``PHASE``
@@ -92,8 +96,10 @@ def _timed(name: str) -> None:
     setattr(cg, name, w)
 
 
+rec["net_codegen_path"] = hasattr(cg, "generate_combined_c")
 for _n in ("generate_combined_c", "generate_combined_from_model"):
-    _timed(_n)
+    if hasattr(cg, _n):
+        _timed(_n)
 
 
 def load(model_path: bool):

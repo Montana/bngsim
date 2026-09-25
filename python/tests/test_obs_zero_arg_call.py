@@ -19,8 +19,8 @@ The same `()` has to be dropped on the two paths that consume expression
 fine is broken by turning codegen on:
 
 * the codegen emitters (``bngsim._codegen``) rewrite an observable to a C
-  scalar — ``obs[0]`` / ``obs_Atot`` — so a surviving ``()`` emits
-  ``obs[0]()``, which no C compiler accepts;
+  scalar — ``obs[0]`` — so a surviving ``()`` emits ``obs[0]()``, which no C
+  compiler accepts;
 * the sympy-facing differentiator (``bngsim._jacobian``) reads ``Atot()`` as
   an *applied undefined function* sharing no symbol with the bareword, so
   ``d/d Atot`` of ``100*Atot()`` silently collapses to zero.
@@ -37,11 +37,9 @@ import numpy as np
 import pytest
 from bngsim import Model, Simulator
 from bngsim._codegen import (
-    _build_ident_lookup,
     _build_ident_lookup_model,
-    _translate_expr,
     _translate_expr_to_c,
-    generate_combined_c,
+    generate_combined_from_model,
 )
 from bngsim._jacobian import (
     differentiate_expression_output_partials,
@@ -104,31 +102,10 @@ class TestObsZeroArgCall:
 
 
 class TestIdentLookupEatsEmptyParens:
-    """Unit: every *model* name in either codegen identifier table eats a
-    trailing `()`, because every one of them denotes a C scalar. Only the
-    built-ins that map to real C functions/operators keep their parens."""
-
-    def test_net_path_named_locals(self):
-        lookup = _build_ident_lookup(
-            {"k1": 0},
-            {"Atot": 0, "divide": 1},
-            [(1, "_rateLaw1", "100*divide()")],
-            use_arrays=False,
-        )
-        assert _translate_expr("100*divide()", lookup) == "100.0*obs_divide"
-        assert _translate_expr("k1()*Atot()", lookup) == "p[0]*obs_Atot"
-        assert _translate_expr("_rateLaw1()", lookup) == "func__rateLaw1"
-
-    def test_net_path_arrays(self):
-        """The sharded (GH #165) form reads the arrays, and must strip too."""
-        lookup = _build_ident_lookup(
-            {"k1": 0},
-            {"Atot": 0, "divide": 1},
-            [(1, "_rateLaw1", "100*divide()")],
-            use_arrays=True,
-        )
-        assert _translate_expr("(1-divide())*1", lookup) == "(1.0-obs[1])*1.0"
-        assert _translate_expr("_rateLaw1()", lookup) == "func[0]"
+    """Unit: every *model* name in the codegen identifier table eats a trailing
+    `()`, because every one of them denotes a C scalar. Only the built-ins that
+    map to real C functions/operators keep their parens. (There were two tables
+    until #803 retired the ``.net`` emitter's.)"""
 
     def test_model_path(self):
         lookup = _build_ident_lookup_model(
@@ -218,19 +195,13 @@ class TestObsZeroArgCallCodegen:
         self, obs_zero_arg_call_sens_net: Path
     ):
         model = Model.from_net(obs_zero_arg_call_sens_net)
-        src, has_sens = generate_combined_c(
-            str(obs_zero_arg_call_sens_net),
-            model=model,
-            emit_jac=True,
-            emit_outputs=True,
-            emit_output_sens=True,
-        )
+        model.prepare_analytical_jacobian()
+        model._want_output_sens = True  # a sensitivity run's build: every emitter
+        src, has_sens = generate_combined_from_model(model, emit_output_sens=True)
         assert has_sens, "elementary model: the analytical sens RHS should be emitted"
         hit = _CALL_ON_SCALAR_RE.search(src)
         assert hit is None, f"emitted a call on a C scalar: {hit.group(0) if hit else ''}"
-        # Both reference forms are exercised: the .net RHS emits named locals,
-        # the model-based emitters (outputs / Jacobian / output-sens) arrays.
-        assert "100.0*obs_Atot" in src
+        # The premise: the zero-arg reference was translated, not dropped.
         assert "100.0*obs[0]" in src
 
     def test_codegen_trajectory_matches_the_interpreter(self, obs_zero_arg_call_net: Path):

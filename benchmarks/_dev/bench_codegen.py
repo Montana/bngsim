@@ -13,13 +13,14 @@ import math
 import time
 
 import numpy as np
+from bngsim import Model
 from bngsim._bngsim_core import (
     CvodeSimulator,
     NetworkModel,
     SolverOptions,
     TimeSpec,
 )
-from bngsim._codegen import prepare_codegen
+from bngsim._codegen import prepare_model_codegen
 
 MODELS = [
     # (name, net_path, t_end, n_points, n_runs)
@@ -82,7 +83,7 @@ def main():
             n_rxn = model.n_reactions
 
             # Prepare codegen .so
-            so_path = str(prepare_codegen(path))
+            so_path = str(prepare_model_codegen(Model.from_net(path)))
 
             # Benchmark ExprTk
             et_time, et_steps, et_sp = bench_one(path, t_end, n_pts, n_runs)

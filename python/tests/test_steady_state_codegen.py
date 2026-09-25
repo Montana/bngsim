@@ -30,7 +30,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim._bngsim_core import SteadyStateOptions, find_steady_state
-from bngsim._codegen import prepare_codegen
+from bngsim._codegen import prepare_model_codegen
 
 # run_tests.sh copies the tests to a temp dir, so resolve data via the env var
 # first (same convention as test_codegen.py / test_mir_equivalence.py).
@@ -254,7 +254,7 @@ class TestSensitivityNumerics:
         # Issue #217: a sensitivity consumer must ask for the sens RHS, which is
         # what ``Simulator(sensitivity_params=...)`` does on the production path.
         warm._want_output_sens = True
-        so = str(prepare_codegen(path, warm, emit_jac=True))
+        so = str(prepare_model_codegen(warm))
 
         fd = _core_sensitivity(path, ["kf", "kr"], jacobian="fd")
         closed = _core_sensitivity(path, ["kf", "kr"], so_path=so, jacobian="auto")
@@ -317,7 +317,7 @@ class TestSensitivityNumerics:
         # Issue #217: a sensitivity consumer must ask for the sens RHS, which is
         # what ``Simulator(sensitivity_params=...)`` does on the production path.
         warm._want_output_sens = True
-        so = str(prepare_codegen(path, warm, emit_jac=True))
+        so = str(prepare_model_codegen(warm))
         params = ["kon", "chi", "koff", "_rateLaw1"]
 
         kon, chi, koff = 1.0, 10.0, 0.5

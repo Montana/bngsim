@@ -22,6 +22,7 @@ import random
 import subprocess
 
 import pytest
+from bngsim import Model
 from bngsim import _codegen as cg
 
 
@@ -64,7 +65,7 @@ requires_unix_cc = pytest.mark.skipif(
 def _chunked_combined(net_path, monkeypatch, block_size="4") -> tuple[str, int, int]:
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK_SIZE", block_size)
-    src, has_sens = cg.generate_combined_c(str(net_path))
+    src, has_sens = cg.generate_combined_from_model(Model.from_net(str(net_path)))
     assert cg._CHUNK_MARKER in src[:512]
     assert has_sens
     return src
@@ -159,7 +160,7 @@ class TestShardSplit:
         net = tmp_path / "m.net"
         _synthetic_net(net, 6, 8)
         monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "off")
-        src, _ = cg.generate_combined_c(str(net))
+        src, _ = cg.generate_combined_from_model(Model.from_net(str(net)))
         assert cg._CHUNK_MARKER not in src
         assert cg._split_sharded_source(src) is None
 

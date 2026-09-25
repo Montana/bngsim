@@ -1,7 +1,8 @@
 """Tests for code-generated ODE RHS (Session 21).
 
-Tests the full pipeline: .net parsing → C code generation → compilation
-→ dlopen → CVODE integration → correctness vs ExprTk baseline.
+Tests the full pipeline: .net loading → C code generation from the built
+model (every codegen build since #803) → compilation → dlopen → CVODE
+integration → correctness vs ExprTk baseline.
 """
 
 import os
@@ -17,9 +18,10 @@ import pytest
 from bngsim._codegen import (
     _parse_net_file,
     _replace_power_op,
-    compute_model_hash,
-    generate_rhs_c,
+    compute_model_codegen_hash,
+    generate_rhs_from_model,
     prepare_codegen,
+    prepare_model_codegen,
 )
 
 # Honor BNGSIM_TEST_DATA so this module works under run_tests.sh, which copies
@@ -27,6 +29,25 @@ from bngsim._codegen import (
 DATA = os.environ.get("BNGSIM_TEST_DATA") or os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "data"
 )
+
+
+def _model(path):
+    import bngsim
+
+    return bngsim.Model.from_net(str(path))
+
+
+def _rhs_c(path) -> str:
+    """The RHS C the .net at *path* compiles to: generated from the built model,
+    the one codegen path since #803."""
+    return generate_rhs_from_model(_model(path))
+
+
+def _so(path) -> str:
+    """Compile the .net at *path* the way ``Simulator(codegen=True)`` does."""
+    so = prepare_model_codegen(_model(path))
+    assert so is not None, f"codegen declined {path}"
+    return str(so)
 
 
 class TestReplacePowerOp:
@@ -213,10 +234,10 @@ class TestNetParser:
 
 
 class TestCodeGeneration:
-    """Test C code generation from .net files."""
+    """Test C code generation for .net models."""
 
     def test_generates_valid_c(self):
-        c_code = generate_rhs_c(os.path.join(DATA, "simple_decay.net"))
+        c_code = _rhs_c(os.path.join(DATA, "simple_decay.net"))
         assert "bngsim_codegen_rhs" in c_code
         assert "#include <math.h>" in c_code
         assert "N_SPECIES 2" in c_code
@@ -238,13 +259,13 @@ class TestCodeGeneration:
         )
         if not os.path.exists(lv_path):
             pytest.skip("LV.net not found")
-        c_code = generate_rhs_c(lv_path)
+        c_code = _rhs_c(lv_path)
         # Should NOT contain ydot[-1]
         assert "ydot[-1]" not in c_code
 
     def test_michaelis_menten_net_emits_tqssa_rate(self):
         """BNG's whitespace MM rate law must not become an unknown zero rate."""
-        c_code = generate_rhs_c(os.path.join(DATA, "mm_tqssa.net"))
+        c_code = _rhs_c(os.path.join(DATA, "mm_tqssa.net"))
         assert "UNKNOWN_PARAM MM" not in c_code
         assert "sqrt(" in c_code
         assert "p[0]" in c_code  # kcat
@@ -252,8 +273,8 @@ class TestCodeGeneration:
 
     def test_model_hash_deterministic(self):
         path = os.path.join(DATA, "simple_decay.net")
-        h1 = compute_model_hash(path)
-        h2 = compute_model_hash(path)
+        h1 = compute_model_codegen_hash(_model(path))
+        h2 = compute_model_codegen_hash(_model(path))
         assert h1 == h2
         assert len(h1) == 16
 
@@ -263,7 +284,7 @@ class TestCompilation:
 
     def test_compile_simple_decay(self):
         path = os.path.join(DATA, "simple_decay.net")
-        so_path = prepare_codegen(path)
+        so_path = Path(_so(path))
         assert so_path.exists()
         assert so_path.suffix in (".dylib", ".so", ".dll")
 
@@ -277,14 +298,56 @@ class TestCompilation:
 """
         )
 
-        with pytest.raises(ValueError, match=r"BioNetGen \.net file"):
+        with (
+            pytest.warns(DeprecationWarning),
+            pytest.raises(ValueError, match=r"BioNetGen \.net file"),
+        ):
             prepare_codegen(str(xml))
+
+    def test_prepare_codegen_leaves_a_callers_model_as_it_found_it(self):
+        """#825 review: with ``model=`` the wrapper compiled the caller's model and
+        also derived its analytical Jacobian, which the old path never did. A
+        model loaded here still gets one derived (``emit_jac``), so the compiled
+        Jacobian rides along; a caller's model is compiled as it stands."""
+        import ctypes
+
+        import bngsim
+
+        path = os.path.join(DATA, "saturation.net")  # Functional: derived lazily (GH #145)
+        m = bngsim.Model.from_net(path)
+        assert not m._core.analytical_jacobian_complete
+        with pytest.warns(DeprecationWarning):
+            theirs = prepare_codegen(path, model=m)
+        assert not m._core.analytical_jacobian_complete
+        assert not hasattr(ctypes.CDLL(str(theirs)), "bngsim_codegen_jac")
+
+        with pytest.warns(DeprecationWarning):
+            ours = prepare_codegen(path)
+        assert hasattr(ctypes.CDLL(str(ours)), "bngsim_codegen_jac")
+
+    def test_prepare_codegen_is_a_deprecated_wrapper_over_the_model_path(self):
+        """#803: the public ``prepare_codegen(net_path)`` keeps its signature, warns,
+        and compiles the same artifact ``Simulator(codegen=True)`` does -- the built
+        model's, not a second reading of the file."""
+        path = os.path.join(DATA, "simple_decay.net")
+        with pytest.warns(DeprecationWarning, match="#803"):
+            wrapped = prepare_codegen(path)
+        assert wrapped == Path(_so(path))
 
 
 class TestSimulatorCodegenRouting:
-    """Regression coverage for choosing .net vs model-based codegen."""
+    """Every model compiles from the built model (#803), whatever ``net_path`` the
+    caller passes and whatever file the model came from. GH #101's case -- an
+    SBML file passed as ``net_path`` -- is the first row; a model that remembers
+    its ``.net`` (``Model.from_net``) and an explicit ``.net`` ``net_path`` are the
+    two that used to take the ``.net`` codegen path instead."""
 
-    def test_xml_net_path_on_non_net_model_uses_model_codegen(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize(
+        ("model_net_path", "net_path"),
+        [("", "model.xml"), ("model.net", ""), ("model.net", "model.net")],
+        ids=["xml-net_path", "from_net-model", "explicit-net_path"],
+    )
+    def test_every_model_uses_model_codegen(self, monkeypatch, tmp_path, model_net_path, net_path):
         import bngsim
         import bngsim._codegen as codegen_mod
 
@@ -297,7 +360,7 @@ class TestSimulatorCodegenRouting:
         class DummyModel:
             def __init__(self):
                 self._core = object()
-                self._net_path = ""
+                self._net_path = str(tmp_path / model_net_path) if model_net_path else ""
                 self._codegen_so_path = ""
 
             def prepare_analytical_jacobian(self):
@@ -310,8 +373,8 @@ class TestSimulatorCodegenRouting:
                 self.core = core
 
         model = DummyModel()
-        xml = tmp_path / "model.xml"
-        xml.write_text("<sbml/>")
+        (tmp_path / "model.xml").write_text("<sbml/>")
+        (tmp_path / "model.net").write_text("")
         calls = []
 
         def fake_prepare_model_codegen(arg):
@@ -320,7 +383,7 @@ class TestSimulatorCodegenRouting:
 
         def fake_prepare_codegen(arg):
             calls.append(("net", arg))
-            raise AssertionError("XML net_path should not use .net codegen")
+            raise AssertionError("no model re-reads its file for codegen (#803)")
 
         fake_core = types.ModuleType("bngsim._bngsim_core")
         fake_core.CvodeSimulator = DummyCvodeSimulator
@@ -328,10 +391,14 @@ class TestSimulatorCodegenRouting:
         monkeypatch.setattr(codegen_mod, "prepare_model_codegen", fake_prepare_model_codegen)
         monkeypatch.setattr(codegen_mod, "prepare_codegen", fake_prepare_codegen)
 
-        sim = bngsim.Simulator(model, method="ode", codegen=True, net_path=str(xml))
+        sim = bngsim.Simulator(
+            model,
+            method="ode",
+            codegen=True,
+            net_path=str(tmp_path / net_path) if net_path else "",
+        )
 
         assert calls == [("model", model)]
-        assert sim._net_path == ""
         assert sim._codegen_so_path == str(tmp_path / "model_codegen.so")
         assert model._codegen_so_path == sim._codegen_so_path
 
@@ -430,7 +497,7 @@ class TestCompileConfig:
 
         monkeypatch.setattr(c, "CACHE_DIR", tmp_path)
         path = os.path.join(DATA, "simple_decay.net")
-        c_source = generate_rhs_c(path)
+        c_source = _rhs_c(path)
         so_path = c.compile_rhs(c_source, "feedfacefeedface")
 
         stem = c._artifact_stem("feedfacefeedface")
@@ -480,7 +547,7 @@ class TestCompileConfig:
             return result
 
         monkeypatch.setattr(c, "_run_compile", run_and_litter)
-        so_path = c.compile_rhs(generate_rhs_c(os.path.join(DATA, "simple_decay.net")), "5111dea0")
+        so_path = c.compile_rhs(_rhs_c(os.path.join(DATA, "simple_decay.net")), "5111dea0")
 
         assert so_path.exists(), "the compile itself still has to succeed"
         assert sorted(p.name for p in tmp_path.iterdir()) == [so_path.name]
@@ -498,7 +565,7 @@ class TestCorrectness:
             TimeSpec,
         )
 
-        so_path = str(prepare_codegen(net_path))
+        so_path = _so(net_path)
 
         # ExprTk baseline
         m1 = NetworkModel.from_net(net_path)
@@ -539,7 +606,7 @@ class TestCorrectness:
     def test_analytical_solution(self):
         """Codegen matches analytical solution for simple decay."""
         path = os.path.join(DATA, "simple_decay.net")
-        so_path = str(prepare_codegen(path))
+        so_path = _so(path)
 
         from bngsim._bngsim_core import (
             CvodeSimulator,
@@ -615,7 +682,7 @@ class TestExprTkConstructs:
         )
 
         net = self._write_net(expr, tmp_path)
-        so_path = str(prepare_codegen(net))
+        so_path = _so(net)
 
         ts = TimeSpec()
         ts.t_start = 0.0
@@ -715,16 +782,12 @@ class TestExprTkConstructs:
         )
         net = tmp_path / "null_reactant.net"
         net.write_text(net_src)
-        so_path = str(prepare_codegen(str(net)))
+        so_path = _so(net)
 
         # Generated C must not contain y[-1].
-        c_src_path = so_path.replace(so_path[so_path.rfind(".") :], ".c")
-        from pathlib import Path
-
-        if Path(c_src_path).exists():
-            assert "y[-1]" not in Path(c_src_path).read_text(), (
-                "codegen emitted y[-1] for a null reactant — out-of-bounds read"
-            )
+        assert "y[-1]" not in _rhs_c(net), (
+            "codegen emitted y[-1] for a null reactant — out-of-bounds read"
+        )
 
         ts = TimeSpec()
         ts.t_start = 0.0
@@ -742,120 +805,12 @@ class TestExprTkConstructs:
         assert np.max(np.abs(sp1 - sp2)) < 1e-9
 
 
-class TestTfunCodegen:
-    """Codegen ↔ interpreted parity for whole-function ``tfun(...)`` bodies.
-
-    Before this work, .net codegen treated ``tfun(...)`` as an undeclared C
-    function and the build silently fell back to the ExprTk interpreter.
-    These tests exercise the three index kinds (implicit time, parameter,
-    explicit time + step interpolation) using the canned fixtures under
-    ``bngsim/tests/data``.
-    """
-
-    @staticmethod
-    def _run_parity(net_path, t_end, n_points):
-        from bngsim._bngsim_core import (
-            CvodeSimulator,
-            NetworkModel,
-            SolverOptions,
-            TimeSpec,
-        )
-
-        so_path = str(prepare_codegen(net_path))
-
-        ts = TimeSpec()
-        ts.t_start = 0.0
-        ts.t_end = t_end
-        ts.n_points = n_points
-
-        m1 = NetworkModel.from_net(net_path)
-        r1 = CvodeSimulator(m1).run(ts, SolverOptions())
-        m2 = NetworkModel.from_net(net_path)
-        opts = SolverOptions()
-        opts.codegen_so_path = so_path
-        r2 = CvodeSimulator(m2).run(ts, opts)
-
-        sp1 = np.array(r1.species_data)
-        sp2 = np.array(r2.species_data)
-        return float(np.max(np.abs(sp1 - sp2))), so_path
-
-    def test_tfun_time_indexed(self):
-        """Time-indexed tfun (implicit ``time`` argument)."""
-        path = os.path.join(DATA, "tfun_time_indexed.net")
-        max_diff, so_path = self._run_parity(path, t_end=7.0, n_points=15)
-        assert max_diff < 1e-9, f"max diff {max_diff:.3e}"
-        # Generated C must call tfun_eval, not the undeclared tfun() symbol.
-        from pathlib import Path
-
-        c_path = Path(so_path).with_suffix(".c")
-        if c_path.exists():
-            text = c_path.read_text()
-            assert "tfun_eval" in text
-            assert "tfun(" not in text  # raw BNGL tfun must not survive
-
-    def test_tfun_param_indexed(self):
-        """Parameter-indexed tfun (e.g., ``tfun('dose_response.tfun', drug_conc)``)."""
-        path = os.path.join(DATA, "tfun_param_indexed.net")
-        max_diff, _ = self._run_parity(path, t_end=200.0, n_points=21)
-        assert max_diff < 1e-9, f"max diff {max_diff:.3e}"
-
-    def test_tfun_step(self):
-        """Step interpolation via ``method=>'step'``. The interp method
-        lives inside the TableFunction object; the codegen just emits the
-        callback and the runtime dispatches to the right method."""
-        path = os.path.join(DATA, "tfun_step_time_indexed.net")
-        max_diff, _ = self._run_parity(path, t_end=3.0, n_points=31)
-        assert max_diff < 1e-9, f"max diff {max_diff:.3e}"
-
-    def test_tfun_cache_invalidates_on_data_change(self, tmp_path):
-        """Editing a referenced .tfun file must change the model hash so
-        the cached .so is not reused with stale interpolation data."""
-        from bngsim._codegen import compute_model_hash
-
-        # Copy fixture into tmp_path so we can edit the .tfun freely.
-        net_src = (
-            "begin parameters\n"
-            "    1 k0 0.0\n"
-            "end parameters\n"
-            "begin functions\n"
-            "    1 g()  tfun('g.tfun')\n"
-            "end functions\n"
-            "begin species\n"
-            "    1 A() 1\n"
-            "    2 B() 0\n"
-            "end species\n"
-            "begin reactions\n"
-            "    1 1 1,2 g #_R1\n"
-            "end reactions\n"
-            "begin groups\n"
-            "    1 A_tot 1\n"
-            "    2 B_tot 2\n"
-            "end groups\n"
-        )
-        net = tmp_path / "g.net"
-        net.write_text(net_src)
-        tfun_path = tmp_path / "g.tfun"
-        tfun_path.write_text("# time g\n0 0\n1 1\n2 2\n")
-
-        h1 = compute_model_hash(str(net))
-        # Same content → same hash.
-        assert h1 == compute_model_hash(str(net))
-
-        # Edit y-values; hash must change.
-        tfun_path.write_text("# time g\n0 0\n1 5\n2 9\n")
-        h2 = compute_model_hash(str(net))
-        assert h1 != h2
-
-        # Reverting the data → reverting the hash.
-        tfun_path.write_text("# time g\n0 0\n1 1\n2 2\n")
-        assert h1 == compute_model_hash(str(net))
-
-
 class TestTfunModelCodegen:
-    """Same parity check as TestTfunCodegen, but for the model-based
-    codegen path (``prepare_model_codegen`` / ``generate_rhs_from_model``).
+    """Codegen ↔ interpreted parity for whole-function ``tfun(...)`` bodies,
+    across the three index kinds (implicit time, parameter, explicit time + step
+    interpolation), using the canned fixtures under ``bngsim/tests/data``.
 
-    The model-based path consumes a built NetworkModel via
+    Codegen consumes a built NetworkModel via
     ``codegen_data()`` rather than re-parsing the .net file. Function
     expressions there have already been rewritten to ``tfun_<name>()`` by
     ModelBuilder. Before this work the codegen leaked that rewritten
@@ -900,13 +855,10 @@ class TestTfunModelCodegen:
         assert max_diff < 1e-9, f"max diff {max_diff:.3e}"
         # Make sure the rewritten tfun_<name>() identifier didn't leak
         # through into the generated C.
-        from pathlib import Path
-
-        c_path = Path(so_path).with_suffix(".c")
-        if c_path.exists():
-            text = c_path.read_text()
-            assert "tfun_eval" in text
-            assert "tfun_cumNcases" not in text
+        text = _rhs_c(path)
+        assert "tfun_eval" in text
+        assert "tfun_cumNcases" not in text
+        assert "tfun(" not in text  # raw BNGL tfun must not survive
 
     def test_tfun_param_indexed(self):
         path = os.path.join(DATA, "tfun_param_indexed.net")
@@ -917,6 +869,113 @@ class TestTfunModelCodegen:
         path = os.path.join(DATA, "tfun_step_time_indexed.net")
         max_diff, _ = self._run_parity(path, t_end=3.0, n_points=31)
         assert max_diff < 1e-9, f"max diff {max_diff:.3e}"
+
+    def test_edited_tfun_data_reaches_the_compiled_rhs(self, tmp_path):
+        """Editing a referenced .tfun file must reach the next codegen run.
+
+        The compiled RHS calls back into the loaded table (``tfun_eval``) rather
+        than baking the data in, so the ``.so`` a cached structural key resolves
+        cannot carry stale interpolation data. (The retired ``.net`` path hashed
+        the data into its file key to the same end.) Asserted on the numbers:
+        ``B' = g(t)*A`` with ``A`` a catalyst at 1, so ``B(2)`` is the integral of
+        the table's linear interpolant -- 2 for ``g(t) = t``, 2.5 + 7 = 9.5 once
+        the data is edited -- and the interpreter must agree both times.
+        """
+        import bngsim
+
+        net = tmp_path / "g.net"
+        net.write_text(
+            "begin parameters\n"
+            "    1 k0 0.0\n"
+            "end parameters\n"
+            "begin functions\n"
+            "    1 g()  tfun('g.tfun')\n"
+            "end functions\n"
+            "begin species\n"
+            "    1 A() 1\n"
+            "    2 B() 0\n"
+            "end species\n"
+            "begin reactions\n"
+            "    1 1 1,2 g #_R1\n"
+            "end reactions\n"
+            "begin groups\n"
+            "    1 A_tot 1\n"
+            "    2 B_tot 2\n"
+            "end groups\n"
+        )
+        tfun_path = tmp_path / "g.tfun"
+
+        def b_at_2(codegen):
+            sim = bngsim.Simulator(_model(net), method="ode", codegen=codegen)
+            if codegen:
+                assert sim._codegen_so_path or sim._codegen_c_source
+            r = sim.run(t_span=(0, 2), n_points=3)
+            return float(np.asarray(r.species)[-1, list(r.species_names).index("B()")])
+
+        for data, want in (("0 0\n1 1\n2 2\n", 2.0), ("0 0\n1 5\n2 9\n", 9.5)):
+            tfun_path.write_text("# time g\n" + data)
+            assert b_at_2(True) == pytest.approx(want, rel=1e-5)
+            assert b_at_2(False) == pytest.approx(want, rel=1e-5)
+
+    def test_embedded_tfun_every_index_kind_matches_interpreted(self, tmp_path):
+        """A tfun nested inside arithmetic reaches codegen as a synthetic
+        ``tfun_<table>()`` reference, one table per call. #803 found the model
+        path emitting it verbatim — an undeclared C function, so any .net model
+        with one failed to compile once .net models were routed here. Every index
+        kind, two tables in one function, and a function reading such a function,
+        against the interpreter."""
+        import bngsim
+
+        def table(name, header, rows):
+            (tmp_path / name).write_text(f"# {header}\n" + "".join(f"{x} {y}\n" for x, y in rows))
+
+        table("t_time.tfun", "time f_time", [(0, 0), (1, 1), (2, 4), (3, 9)])
+        table("t_param.tfun", "dose f_param", [(0, 1), (10, 2), (20, 3)])
+        table("t_obs.tfun", "Xtot f_obs", [(0, 1), (1, 3), (2, 2)])
+        table("t_two_a.tfun", "time f_two", [(0, 1), (1, 2), (2, 2), (3, 1)])
+        table("t_two_b.tfun", "dose f_two", [(0, 1), (10, 3)])
+        net = tmp_path / "embedded.net"
+        net.write_text(
+            "begin parameters\n"
+            "    1 k_scale 10.0\n"
+            "    2 dose 5.0\n"
+            "end parameters\n"
+            "begin functions\n"
+            "    1 f_time() (tfun('t_time.tfun',time)+5)/k_scale\n"
+            "    2 f_param() 2*tfun('t_param.tfun', dose) - 1\n"
+            "    3 f_obs() 1 + tfun('t_obs.tfun', Xtot)\n"
+            "    4 f_two() tfun('t_two_a.tfun',time)*tfun('t_two_b.tfun', dose)\n"
+            "    5 f_ref() f_time()*2\n"
+            "end functions\n"
+            "begin species\n"
+            "    1 X() 1\n"
+            "    2 Y() 0\n"
+            "end species\n"
+            "begin reactions\n"
+            "    1 0 1 f_time #_R1\n"
+            "    2 1 2 f_param #_R2\n"
+            "    3 2 0 f_obs #_R3\n"
+            "    4 0 2 f_two #_R4\n"
+            "    5 0 2 f_ref #_R5\n"
+            "end reactions\n"
+            "begin groups\n"
+            "    1 Xtot 1\n"
+            "end groups\n"
+        )
+        src = _rhs_c(net)
+        assert src.count("data->tfun_eval(") == 5
+        assert not re.search(r"\btfun_\w+\(", src.replace("data->tfun_eval(", "")), src
+
+        def run(codegen):
+            sim = bngsim.Simulator(_model(net), method="ode", codegen=codegen)
+            r = sim.run(t_span=(0.0, 3.0), n_points=31, rtol=1e-11, atol=1e-13)
+            return np.asarray(r.species), np.asarray(r.expressions)
+
+        y_cg, e_cg = run(True)
+        y_it, e_it = run(False)
+        assert np.abs(y_it).max() > 1.0  # the tables actually moved something
+        np.testing.assert_allclose(y_cg, y_it, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(e_cg, e_it, rtol=1e-9, atol=1e-12)
 
     def test_codegen_data_exposes_table_functions(self):
         """codegen_data() must return a table_functions list aligned with
@@ -980,7 +1039,7 @@ class TestRealisticModels:
             else:
                 pytest.skip(f"{name} not in benchmarks/models/net/{{ode,ssa}} or tests/data")
 
-        so_path = str(prepare_codegen(path))
+        so_path = _so(path)
 
         ts = TimeSpec()
         ts.t_start = 0.0
@@ -1139,7 +1198,6 @@ class TestCodegenRationalLiterals:
         # Codegen wired (the MIR JIT backend stashes the C source instead of a
         # .so; either proves model-based codegen, not empty-.net parsing, ran).
         assert sim._codegen_so_path or sim._codegen_c_source
-        assert sim._net_path == ""
 
         r_cg = sim.run(t_span=(0, 4), n_points=9)
         np.testing.assert_allclose(r_cg.species, r_ref.species, rtol=1e-7, atol=1e-9)

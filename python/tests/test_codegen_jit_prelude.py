@@ -126,10 +126,11 @@ def _model(tmp_path, text, name="m.net"):
 def _jit_source_input(model) -> str:
     """The C source ``MirJit`` is constructed from — i.e. what reaches
     ``make_jit_source``. Same entry point ``_auto_codegen_for_sensitivity`` uses
-    for a .net model on the JIT backend, with the output-sensitivity block
-    switched on the way ``sensitivity_params`` switches it on."""
+    on the JIT backend (for a .net model too, since #803), with the
+    output-sensitivity block switched on the way ``sensitivity_params`` switches
+    it on."""
     model._want_output_sens = True
-    return cg.prepare_codegen_source(model._net_path, model, emit_jac=True)
+    return cg.prepare_model_codegen_source(model)
 
 
 _COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
@@ -278,9 +279,10 @@ end groups
 """
 
 # A functional rate law over both constants. The RHS evaluates the function
-# inline, so this is the model that puts the two names in the RHS. It cannot also
-# serve the sensitivity sources: a Functional reaction is exactly what the .net
-# sensitivity path declines, which is why the two fixtures are separate.
+# inline, so this is the model that puts the two names in the RHS. It could not
+# also serve the sensitivity sources while the .net sensitivity emitter (retired
+# by #803) declined every Functional reaction, which is why the two fixtures are
+# separate.
 FUNCTIONAL_CONSTANT = """\
 begin parameters
     1 k1   0.3  # Constant
@@ -300,21 +302,15 @@ begin groups
 end groups
 """
 
-# The four generated sources that open with their own ``#include <math.h>``, each
+# The generated sources that open with their own ``#include <math.h>``, each
 # paired with a model that reaches it. The Jacobian, the output evaluator and the
 # output-sensitivity block emit no include of their own and only ever compile
 # behind an RHS, so they are outside this contract by construction.
 STANDALONE_SOURCES = [
-    ("generate_rhs_c", FUNCTIONAL_CONSTANT, lambda net, model: cg.generate_rhs_c(str(net))),
     (
         "generate_rhs_from_model",
         FUNCTIONAL_CONSTANT,
         lambda net, model: cg.generate_rhs_from_model(model),
-    ),
-    (
-        "generate_sens_rhs_c",
-        DERIVED_CONSTANT,
-        lambda net, model: cg.generate_sens_rhs_c(str(net)),
     ),
     (
         "generate_sens_from_model",
@@ -376,14 +372,15 @@ class TestEachSourceDefinesTheMathMacrosItUses:
     def test_no_further_standalone_source_has_appeared(self):
         """The table above is written by hand, so it cannot notice a new source.
         The emitters can: a source that means to stand on its own writes its own
-        ``#include <math.h>``. Three emitters, four entry points — the two
-        sensitivity generators share ``_emit_sens_rhs_body``."""
+        ``#include <math.h>``. Two emitters, two entry points: the RHS and the
+        sensitivity RHS. (Three emitters and four entry points until #803 retired
+        the ``.net`` RHS and sensitivity generators.)"""
         emitters = len(re.findall(r'_emit\("#include <math\.h>"\)', inspect.getsource(cg)))
-        assert emitters == 3, (
-            f"_codegen.py emits `#include <math.h>` from {emitters} places, not the 3 the "
+        assert emitters == 2, (
+            f"_codegen.py emits `#include <math.h>` from {emitters} places, not the 2 the "
             f"table above covers. If a new generated source now stands on its own, give it "
-            f"an entry there and its own M_PI / M_E defines (GH #470). If the three headers "
-            f"were merged into one emitter instead, drop the entries that no longer exist "
+            f"an entry there and its own M_PI / M_E defines (GH #470). If the two headers "
+            f"were merged into one emitter instead, drop the entry that no longer exists "
             f"and lower this count."
         )
 

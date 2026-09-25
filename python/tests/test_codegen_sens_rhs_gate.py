@@ -43,7 +43,8 @@ test below:
   regenerates — ``compute_all_sensitivities`` and ``steady_state``, whose shared
   helper used to gate its regeneration on ``n_functions > 0`` and would therefore
   have kept a plain artifact for every Michaelis-Menten model;
-* the ``.net`` path, whose model-based GH #67 hook emits the same symbol;
+* the ``.net`` path, whose model-based GH #67 hook emitted the same symbol
+  (retired by #803: a ``.net`` model compiles through the model-based path now);
 * and the constructor's artifact-reuse block, which handed a sensitivity Simulator
   the plain ``.so`` an earlier Simulator had left on the model. That one was
   already dropping ``bngsim_codegen_output_sens`` before this issue.
@@ -158,9 +159,9 @@ def _model(tmp_path, text, name="m.net"):
 
 
 def _sbml_functional(tmp_path):
-    """The model-based codegen path (``prepare_model_codegen``), which a .net
-    model never takes — it carries ``_net_path`` and goes through
-    ``prepare_codegen`` instead."""
+    """A Functional model from a second loader, so the gate is pinned for more
+    than ``.net`` input. (Until #803 this was the only way to reach the
+    model-based codegen path, which a ``.net`` model never took.)"""
     pytest.importorskip("antimony")
     return bngsim.Model.from_antimony_string(
         "model mm; S=10; P=0; Vmax=1.4; Km=2.5; J0: S -> P; Vmax*S/(Km + S); end"
@@ -232,23 +233,8 @@ class TestTheGate:
         fsrc, fhas = cg.generate_combined_from_model(func, emit_sens_rhs=True)
         assert fhas is False and "bngsim_codegen_sens_rhs" not in fsrc
 
-    def test_the_net_text_emitter_is_gated_too(self, tmp_path):
-        """``generate_combined_c``'s own half. The .net text emitter produces the
-        Elementary sens RHS without ever consulting the model, so gating
-        ``generate_sens_from_model`` alone left it emitting on every plain build —
-        the 55.6% #217 measured.
-        """
-        m = _model(tmp_path, ELEMENTARY)
-        net = str(tmp_path / "m.net")
-        gated, gated_has = cg.generate_combined_c(net, m, emit_sens_rhs=False)
-        ungated, ungated_has = cg.generate_combined_c(net, m, emit_sens_rhs=True)
-        assert gated_has is False and ungated_has is True
-        assert "bngsim_codegen_sens_rhs" not in gated
-        assert "bngsim_codegen_sens_rhs" in ungated
-        assert len(gated) < len(ungated)
 
-
-# ─── the cache keys, both paths ────────────────────────────────────────────
+# ─── the cache key ────────────────────────────────────────────────────────
 
 
 class TestTheCacheKeyCarriesTheFlag:
@@ -325,17 +311,16 @@ class TestTheCacheKeyCarriesTheFlag:
         assert _emits_sens_rhs(sens_so)
 
     @requires_cc
-    def test_the_net_path_compiles_two_distinct_artifacts(self, tmp_path, monkeypatch):
-        """Same, for ``prepare_codegen``. The .net key is built from the file's
-        bytes plus cheap flags rather than from the source, so every flag that
-        changes the source has to be in it."""
+    def test_a_net_model_compiles_two_distinct_artifacts(self, tmp_path, monkeypatch):
+        """Same, for a ``.net`` model. Until #803 that went through
+        ``prepare_codegen``, whose key was built from the file's bytes plus cheap
+        flags; it goes through ``prepare_model_codegen`` now, and must still split."""
         monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "cache")
-        cg._PREPARE_CODEGEN_MEMO.clear()
         m = _model(tmp_path, FUNCTIONAL)
-        net = str(tmp_path / "m.net")
-        plain_so = cg.prepare_codegen(net, m)
+        plain_so = cg.prepare_model_codegen(m)
         m._want_output_sens = True
-        sens_so = cg.prepare_codegen(net, m)
+        sens_so = cg.prepare_model_codegen(m)
+        assert plain_so is not None and sens_so is not None
         assert plain_so != sens_so
         assert not _emits_sens_rhs(plain_so)
         assert _emits_sens_rhs(sens_so)
@@ -348,9 +333,9 @@ class TestTheCacheKeyCarriesTheFlag:
         For a **Functional** model the hatch and nobody-asking still emit the same
         source — no sens RHS either way — so they may still share a key rather than
         splitting an already 2 GB cache (issue #205). Only the Elementary case
-        needed the split above. Keeping the two apart is what lets the ``.net``
-        suffix stay ``:no_functional_sens`` for the hatch and spend a new
-        ``:no_sens_rhs`` only on the case that actually differs.
+        needed the split above. (Keeping the two apart is what let the retired
+        ``.net`` key suffix stay ``:no_functional_sens`` for the hatch and spend a
+        new ``:no_sens_rhs`` only on the case that actually differs.)
         """
         m = _model(tmp_path, FUNCTIONAL)
         monkeypatch.delenv("BNGSIM_NO_FUNCTIONAL_SENS_RHS", raising=False)

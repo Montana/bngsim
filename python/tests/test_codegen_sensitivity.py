@@ -8,11 +8,12 @@ import os
 import tempfile
 from pathlib import Path
 
+import bngsim
 import numpy as np
 import pytest
 from bngsim._codegen import (
-    generate_combined_c,
-    generate_sens_rhs_c,
+    generate_combined_from_model,
+    generate_sens_from_model,
 )
 
 # Honor BNGSIM_TEST_DATA so this module works under run_tests.sh, which copies
@@ -69,12 +70,27 @@ def _get_ic_derived_compound_net() -> str:
     return str(p)
 
 
+def _sens_c(net: str):
+    """The sensitivity RHS a .net model compiles to (from the built model, #803)."""
+    return generate_sens_from_model(bngsim.Model.from_net(net))
+
+
+def _combined_c(net: str):
+    return generate_combined_from_model(bngsim.Model.from_net(net))
+
+
+def _param_index(net: str, name: str) -> int:
+    """The ``p[]`` slot, and ``bngsim_dfdp`` case label, of parameter *name*."""
+    params = bngsim.Model.from_net(net)._core.codegen_data()["parameters"]
+    return [q["name"] for q in params].index(name)
+
+
 class TestSensRhsCodeGeneration:
     """Test the C code generation for sensitivity RHS."""
 
     def test_elementary_model_generates_code(self):
         """Simple decay is all-Elementary → should produce sens RHS code."""
-        code = generate_sens_rhs_c(_get_simple_decay_net())
+        code = _sens_c(_get_simple_decay_net())
         assert code is not None
         assert "bngsim_codegen_sens_rhs" in code
         assert "bngsim_dfdp" in code
@@ -82,26 +98,26 @@ class TestSensRhsCodeGeneration:
 
     def test_reversible_model_generates_code(self):
         """Reversible model is all-Elementary → should produce code."""
-        code = generate_sens_rhs_c(_get_reversible_net())
+        code = _sens_c(_get_reversible_net())
         assert code is not None
         assert "bngsim_codegen_sens_rhs" in code
 
     def test_combined_generation(self):
-        """generate_combined_c should produce both RHS + sens RHS."""
-        combined, has_sens = generate_combined_c(_get_simple_decay_net())
+        """The combined source should carry both RHS + sens RHS."""
+        combined, has_sens = _combined_c(_get_simple_decay_net())
         assert has_sens is True
         assert "bngsim_codegen_rhs" in combined
         assert "bngsim_codegen_sens_rhs" in combined
 
     def test_dfdp_switch_cases(self):
         """Generated code should have switch cases for rate param indices."""
-        code = generate_sens_rhs_c(_get_simple_decay_net())
+        code = _sens_c(_get_simple_decay_net())
         assert "switch (iP)" in code
         assert "case " in code
 
     def test_jac_vec_reactions(self):
         """Generated Jacobian-vector product should reference reactions."""
-        code = generate_sens_rhs_c(_get_reversible_net())
+        code = _sens_c(_get_reversible_net())
         assert "Reaction" in code
         assert "dv_dxj" in code
 
@@ -114,7 +130,7 @@ class TestSensRhsCompilation:
         import bngsim._codegen as cg
 
         net_path = _get_simple_decay_net()
-        combined, has_sens = generate_combined_c(net_path)
+        combined, has_sens = _combined_c(net_path)
         assert has_sens
 
         # A hash this test invents is a key no install will ever look up, so the
@@ -144,87 +160,59 @@ class TestSensRhsCompilation:
 
 
 class TestSensRhsCorrectness:
-    """Test that codegen sens RHS matches CVODES internal FD sensitivity."""
+    """The codegen sensitivity RHS against oracles that share none of its code: a
+    closed form, and central finite differences of interpreted trajectories.
 
-    def test_simple_decay_matches_fd(self):
-        """Codegen sensitivity should match CVODES FD for simple_decay."""
-        import bngsim
-        from bngsim._codegen import prepare_codegen
+    Until #803 these compared against "CVODES internal FD", a ``Simulator`` built
+    without ``codegen=True``. GH #214 had already retired that path — a
+    sensitivity run always compiles — so both arms were the same compiled RHS.
+    """
 
-        net_path = _get_simple_decay_net()
+    def test_simple_decay_matches_the_closed_form(self):
+        """A → B at k1 from A0 = 100: ``A = A0·e^{-k1·t}``, so
+        ``∂A/∂k1 = -A0·t·e^{-k1·t} = -∂B/∂k1``."""
+        m = bngsim.Model.from_net(_get_simple_decay_net())
+        sim = bngsim.Simulator(m, method="ode", sensitivity_params=["k1"], codegen=True)
+        assert sim._codegen_so_path or sim._codegen_c_source
+        r = sim.run(t_span=(0, 10), n_points=101, rtol=1e-10, atol=1e-12)
 
-        # Clear cache for this model to force re-generation
-        import platform
-
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
-        model_hash = compute_model_hash(net_path)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(model_hash)}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
-        # Run with CVODES internal FD (no codegen)
-        m1 = bngsim.Model.from_net(net_path)
-        sim1 = bngsim.Simulator(m1, method="ode", sensitivity_params=["k1"])
-        r1 = sim1.run(t_span=(0, 10), n_points=101)
-
-        # Run with codegen (includes sens RHS for Elementary models)
-        str(prepare_codegen(net_path))
-        m2 = bngsim.Model.from_net(net_path)
-        sim2 = bngsim.Simulator(
-            m2, method="ode", sensitivity_params=["k1"], codegen=True, net_path=net_path
-        )
-        r2 = sim2.run(t_span=(0, 10), n_points=101)
-
-        # Species should match
-        np.testing.assert_allclose(r1.species, r2.species, atol=1e-8)
-
-        # Sensitivities should match (both are accurate)
-        np.testing.assert_allclose(
-            r1.sensitivities,
-            r2.sensitivities,
-            atol=1e-4,
-            rtol=1e-3,
-            err_msg="Codegen sens != CVODES FD sens",
-        )
+        t = np.asarray(r.time)
+        a = 100.0 * np.exp(-0.1 * t)
+        np.testing.assert_allclose(np.asarray(r.species)[:, 0], a, rtol=1e-8, atol=1e-10)
+        s = np.asarray(r.sensitivities)[:, :, 0]
+        np.testing.assert_allclose(s[:, 0], -t * a, rtol=1e-6, atol=1e-8)
+        np.testing.assert_allclose(s[:, 1], t * a, rtol=1e-6, atol=1e-8)
 
     def test_reversible_two_params(self):
-        """Two-param sensitivity with codegen should match FD."""
-        import platform
-
-        import bngsim
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
+        """A + B <-> C, both rate constants, against a central FD of the
+        interpreted forward trajectory (no sensitivity machinery in the oracle)."""
         net_path = _get_reversible_net()
+        span, n = (0.0, 10.0), 51
 
-        # Clear cache
-        model_hash = compute_model_hash(net_path)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(model_hash)}{suffix}"
-        if cached.exists():
-            cached.unlink()
+        m = bngsim.Model.from_net(net_path)
+        sim = bngsim.Simulator(m, method="ode", sensitivity_params=["kf", "kr"], codegen=True)
+        sens = np.asarray(sim.run(t_span=span, n_points=n, rtol=1e-10, atol=1e-12).sensitivities)
 
-        # FD baseline
-        m1 = bngsim.Model.from_net(net_path)
-        sim1 = bngsim.Simulator(m1, method="ode", sensitivity_params=["kf", "kr"])
-        r1 = sim1.run(t_span=(0, 10), n_points=51)
+        def traj(name, value):
+            mod = bngsim.Model.from_net(net_path)
+            mod.set_param(name, value)
+            r = bngsim.Simulator(mod, method="ode", codegen=False).run(
+                t_span=span, n_points=n, rtol=1e-12, atol=1e-14
+            )
+            return np.asarray(r.species)
 
-        # Codegen
-        m2 = bngsim.Model.from_net(net_path)
-        sim2 = bngsim.Simulator(
-            m2, method="ode", sensitivity_params=["kf", "kr"], codegen=True, net_path=net_path
-        )
-        r2 = sim2.run(t_span=(0, 10), n_points=51)
-
-        # Sensitivities should be close
-        np.testing.assert_allclose(
-            r1.sensitivities,
-            r2.sensitivities,
-            atol=1e-4,
-            rtol=1e-3,
-            err_msg="Codegen sens != CVODES FD sens (reversible)",
-        )
+        for j, (name, value) in enumerate((("kf", 0.001), ("kr", 0.1))):
+            h = value * 1e-4
+            fd = (traj(name, value + h) - traj(name, value - h)) / (2.0 * h)
+            scale = np.abs(fd).max()
+            assert scale > 1.0, f"d(species)/d{name} is ~0: bad test setup"
+            np.testing.assert_allclose(
+                sens[:, :, j],
+                fd,
+                rtol=1e-5,
+                atol=1e-6 * scale,
+                err_msg=f"codegen sensitivity to {name} != FD of the interpreted trajectory",
+            )
 
 
 class TestDerivedRateConstantSens:
@@ -262,25 +250,13 @@ class TestDerivedRateConstantSens:
             method="ode",
             sensitivity_params=["kon"],
             codegen=codegen,
-            net_path=(net_path if codegen else ""),
         )
         r = sim.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
         return r.sensitivities[:, :, 0]
 
     def test_codegen_chain_rule_matches_fd(self):
         """Codegen sens for ``kon`` must include chain rule via ``_rateLaw1 = chi*kon``."""
-        import platform
-
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
         net = _get_derived_rate_const_net()
-        # Clear cache so the (possibly updated) codegen runs.
-        h = compute_model_hash(net)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(h)}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
         fd = self._fd_sens_kon(net)
         sx = self._bngsim_sens_kon(net, codegen=True)
 
@@ -313,15 +289,10 @@ class TestDerivedQuotientChainRule:
     def test_dfdp_emits_quotient_partial(self):
         """Generated dfdp must reference ``-5/pow(p[idx_MEK], 2)``-style
         partial in the case branch for MEK."""
-        from bngsim._codegen import _parse_net_file, generate_sens_rhs_c
-
         net = _get_derived_quotient_net()
-        code = generate_sens_rhs_c(net)
+        code = _sens_c(net)
         assert code is not None
-
-        m = _parse_net_file(net)
-        idxs = {name: i for i, (_, name, _, _) in enumerate(m["parameters"])}
-        mek_idx = idxs["MEK"]
+        mek_idx = _param_index(net, "MEK")
 
         import re
 
@@ -334,18 +305,7 @@ class TestDerivedQuotientChainRule:
 
     def test_quotient_chain_rule_matches_fd(self):
         """Codegen sens for ``MEK`` must include the ``∂(5/MEK)/∂MEK`` chain rule."""
-        import platform
-
-        import bngsim
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
         net = _get_derived_quotient_net()
-        h = compute_model_hash(net)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(h)}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
         sample_times = list(np.linspace(0.0, 5.0, 51))
         nominal = 2.0  # MEK in the fixture
 
@@ -365,7 +325,6 @@ class TestDerivedQuotientChainRule:
             method="ode",
             sensitivity_params=["MEK"],
             codegen=True,
-            net_path=net,
         )
         r = sim.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
         sx = r.sensitivities[:, :, 0]
@@ -391,33 +350,16 @@ class TestNestedDerivedChainRule:
     analytic sensitivity came back too small.
     """
 
-    @staticmethod
-    def _clear_cache(net):
-        import platform
-
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
-        h = compute_model_hash(net)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(h)}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
     def test_dfdp_case_includes_nested_reaction(self):
         """The generated ``bngsim_dfdp`` case for ``kcr`` must carry the
         contribution from the a2prime reaction (species C), not only the
         a1prime reaction — that species-C term is exactly what was dropped."""
         import re
 
-        from bngsim._codegen import _parse_net_file, generate_sens_rhs_c
-
         net = _get_nested_derived_net()
-        code = generate_sens_rhs_c(net)
+        code = _sens_c(net)
         assert code is not None
-
-        m = _parse_net_file(net)
-        idxs = {name: i for i, (_, name, _, _) in enumerate(m["parameters"])}
-        kcr_idx = idxs["kcr"]
+        kcr_idx = _param_index(net, "kcr")
 
         case_match = re.search(rf"    case {kcr_idx}:.*?break;", code, re.DOTALL)
         assert case_match, "kcr case missing from generated dfdp switch"
@@ -435,7 +377,6 @@ class TestNestedDerivedChainRule:
         import bngsim
 
         net = _get_nested_derived_net()
-        self._clear_cache(net)
 
         sample_times = list(np.linspace(0.0, 5.0, 51))
         nominal = 0.33  # kcr in the fixture
@@ -451,9 +392,7 @@ class TestNestedDerivedChainRule:
         fd = (_traj(nominal + eps) - _traj(nominal - eps)) / (2.0 * eps)
 
         mod = bngsim.Model.from_net(net)
-        sim = bngsim.Simulator(
-            mod, method="ode", sensitivity_params=["kcr"], codegen=True, net_path=net
-        )
+        sim = bngsim.Simulator(mod, method="ode", sensitivity_params=["kcr"], codegen=True)
         r = sim.run(sample_times=sample_times, rtol=1e-10, atol=1e-12, max_steps=10**6)
         sx = r.sensitivities[:, :, 0]
 
@@ -496,18 +435,6 @@ class TestDerivedICParamSens:
     silently miss the very IC dependence under test.
     """
 
-    @staticmethod
-    def _clear_cache(net):
-        import platform
-
-        from bngsim._codegen import CACHE_DIR, _artifact_stem, compute_model_hash
-
-        h = compute_model_hash(net)
-        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
-        cached = CACHE_DIR / f"{_artifact_stem(h)}{suffix}"
-        if cached.exists():
-            cached.unlink()
-
     _SAMPLE_TIMES = list(np.linspace(0.0, 3.0, 31))
 
     @classmethod
@@ -539,9 +466,9 @@ class TestDerivedICParamSens:
         import bngsim
 
         m = bngsim.Model.from_net(net)
-        r = bngsim.Simulator(
-            m, method="ode", sensitivity_params=["R0"], codegen=True, net_path=net
-        ).run(sample_times=cls._SAMPLE_TIMES, rtol=1e-11, atol=1e-13, max_steps=10**6)
+        r = bngsim.Simulator(m, method="ode", sensitivity_params=["R0"], codegen=True).run(
+            sample_times=cls._SAMPLE_TIMES, rtol=1e-11, atol=1e-13, max_steps=10**6
+        )
         return np.asarray(r.sensitivities)[:, :, 0]
 
     def test_seed_helper_coefficients(self):
@@ -570,7 +497,6 @@ class TestDerivedICParamSens:
 
     def test_direct_ic_matches_rebuild_fd(self, tmp_path):
         net = _get_ic_direct_net()
-        self._clear_cache(net)
         fd = self._rebuild_fd(net, tmp_path)
         sx = self._analytic(net)
         assert abs(sx[0, 0] - 1.0) < 1e-6, "∂R(0)/∂R0 must seed to 1 for a direct IC"
@@ -579,7 +505,6 @@ class TestDerivedICParamSens:
     def test_derived_ic_matches_rebuild_fd(self, tmp_path):
         """The core #43 regression: derived-parameter IC must seed ∂R/∂R0."""
         net = _get_ic_derived_net()
-        self._clear_cache(net)
         fd = self._rebuild_fd(net, tmp_path)
         sx = self._analytic(net)
         assert np.abs(sx[:, 0]).max() > 1e-3, (
@@ -602,7 +527,6 @@ class TestDerivedICParamSens:
         the answer is unchanged — but the condition used to defeat the partial
         and leave the seed at 0, with the trajectory itself unaffected."""
         net = _get_ic_derived_compound_net()
-        self._clear_cache(net)
         fd = self._rebuild_fd(net, tmp_path)
         sx = self._analytic(net)
         assert np.abs(sx[:, 0]).max() > 1e-3, (

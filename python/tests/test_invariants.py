@@ -322,7 +322,9 @@ def _net(params: str, functions: str, species: str, reactions: str, groups: str)
 
 
 def net_derived(p: Mapping[str, float]) -> bngsim.Model:
-    """``k2 = 2*k1`` is a derived parameter (#694: an override keeps its chain rule)."""
+    """``k2 = 2*k1`` is a derived parameter. #694 (an override kept its chain rule
+    on every Simulator) retired with the ``.net`` codegen path (#803); a Simulator
+    built *before* the override still keeps it, which is #708."""
     k2 = f"{p['k2']!r}  # Constant" if "k2" in p else "2*k1  # ConstantExpression"
     return _net(
         f"    1 k1  {p.get('k1', 0.3)!r}  # Constant\n    2 k2  {k2}\n",
@@ -334,7 +336,8 @@ def net_derived(p: Mapping[str, float]) -> bngsim.Model:
 
 
 def net_sci(p: Mapping[str, float]) -> bngsim.Model:
-    """BNG2.pl's scientific-notation rate factor ``2e-06*kp`` (#689: codegen compiles 0)."""
+    """BNG2.pl's scientific-notation rate factor ``2e-06*kp`` (#689: codegen compiled 0
+    until #803 compiled .net models from the built model)."""
     return _net(
         f"    1 kp  {p.get('kp', 2.0e5)!r}  # Constant\n",
         "",
@@ -345,7 +348,8 @@ def net_sci(p: Mapping[str, float]) -> bngsim.Model:
 
 
 def net_fwd(p: Mapping[str, float]) -> bngsim.Model:
-    """``y()`` references ``x()``, declared after it (#699: emitted in file order)."""
+    """``y()`` references ``x()``, declared after it (#699: emitted in file order until
+    #803 compiled .net models from the built model)."""
     return _net(
         f"    1 kx  {p.get('kx', 0.5)!r}  # Constant\n",
         "    1 y() x()*3\n    2 x() kx*Atot/(1+Atot)\n",
@@ -449,7 +453,11 @@ FIXTURES: tuple[Fixture, ...] = (
         t_end=1.0,
         write=("k2", 5.0),
         sens=("k1",),
-        known=(("set_param_vs_reload", 694, AssertionError),),
+        known=(
+            ("reuse_after_set_param", 708, AssertionError),
+            ("run_batch", 708, AssertionError),
+            ("run_batch_squeeze", 708, AssertionError),
+        ),
     ),
     Fixture(
         "net_sci",
@@ -457,17 +465,12 @@ FIXTURES: tuple[Fixture, ...] = (
         t_end=2.0,
         write=("kp", 4.0e5),
         sens=("kp",),
-        known=(
-            ("codegen_vs_interpreter", 689, AssertionError),
-            ("sens_traj_vs_plain", 689, AssertionError),
-        ),
     ),
     Fixture(
         "net_fwd",
         net_fwd,
         t_end=2.0,
         write=("kx", 1.5),
-        known=(("codegen_vs_interpreter", 699, RuntimeError),),
     ),
     Fixture(
         "net_abs",

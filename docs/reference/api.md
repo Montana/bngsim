@@ -57,12 +57,14 @@ Constructor:
   `method`: `"ode"`, `"ssa"`, `"psa"`, `"nf"`, `"nf_reject"`, `"nfsim"`,
   `"nf_exact"`, `"rulemonkey"`, `"rm"` (and aliases)
 
-  ODE-specific kwargs: `jacobian` (`"auto"`, `"analytical"`, `"fd"`),
-  `codegen` (bool), `net_path` (BioNetGen `.net` path only),
+  ODE-specific kwargs: `jacobian` (`"auto"`, `"analytical"`, `"fd"`,
+  `"jax"`), `codegen` (bool or `None`), `net_path` (BioNetGen `.net` path),
   `sensitivity_params` (list[str])
 
-  For SBML and Antimony models, use `codegen=True` without `net_path`.
-  `net_path` is not a generic model path and should not point to SBML XML.
+  `codegen=True` compiles the model as built, whatever it was loaded from;
+  `None` (the default) compiles at or above `BNGSIM_CODEGEN_THRESHOLD` species
+  (256). `net_path` is read only by `jacobian="jax"`, which parses the `.net`
+  file itself.
 
   PSA: `poplevel` (float, required). Accepts `.net`, SBML, and Antimony
   models (same dispatch as SSA, sharing the `validate_for_ssa` gate).

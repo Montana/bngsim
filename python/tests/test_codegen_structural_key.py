@@ -383,33 +383,33 @@ def test_a_compartment_write_is_a_derived_override_and_the_memo_must_follow_it()
     assert _src_hash(reused, emit_output_sens=True) == _src_hash(fresh, emit_output_sens=True)
 
 
-def test_the_net_cache_key_separates_the_chunking_hatch(monkeypatch, tmp_path):
-    """The sibling key site had the same hole, for the fourth hatch (issue #174).
+def test_a_net_model_key_separates_the_chunking_hatch(monkeypatch, tmp_path):
+    """The chunking hatch reaches the key a ``.net`` model is cached under.
 
-    ``prepare_codegen`` keys on the ``.net``'s bytes plus a suffix per
+    The ``.net`` path's key site (retired by #803) had this hole, for the fourth
+    hatch (issue #174): it keyed on the ``.net``'s bytes plus a suffix per
     process-scoped knob — ``BNGSIM_NO_CODEGEN_JAC``, the GH #67 hatch, the GH #90
-    budget — but not on ``BNGSIM_CODEGEN_CHUNK``, which changes what
-    ``generate_rhs_c`` emits. So a chunked run was served the unchunked ``.so``:
-    a wrong artifact, and an A/B of the feature that measures one binary twice.
+    budget — but not on ``BNGSIM_CODEGEN_CHUNK``, which changes the emitted RHS. So
+    a chunked run was served the unchunked ``.so``: a wrong artifact, and an A/B of
+    the feature that measures one binary twice. A ``.net`` model is keyed
+    structurally now, and this pins that the hatch still separates the two.
     """
     # A TRACKED .net, so this runs in CI too — the gitignored ode_fullnet suite
     # would make it a silent no-op everywhere but the author's checkout.
     nets = sorted((_REPO / "benchmarks/models/net/ode").glob("*.net"))
-    net = next((p for p in nets if len(cg._parse_net_file(str(p))["reactions"]) >= 30), None)
+    net = next((p for p in nets if bngsim.Model.from_net(str(p)).n_reactions >= 30), None)
     assert net is not None, "no tracked .net is large enough to chunk"
 
     monkeypatch.setattr(cg, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(cg, "_PREPARE_CODEGEN_MEMO", {})
 
-    plain_src = cg.generate_rhs_c(str(net))
-    plain_so = cg.prepare_codegen(str(net))
+    plain_src = cg.generate_rhs_from_model(bngsim.Model.from_net(str(net)))
+    plain_so = cg.prepare_model_codegen(bngsim.Model.from_net(str(net)))
 
     monkeypatch.setenv("BNGSIM_CODEGEN_CHUNK", "on")
-    assert cg.generate_rhs_c(str(net)) != plain_src, "the hatch did not change the emitted source"
+    chunked_src = cg.generate_rhs_from_model(bngsim.Model.from_net(str(net)))
+    assert chunked_src != plain_src, "the hatch did not change the emitted source"
 
-    # compute_model_hash is the .net file's bytes and stays put by design; it is
-    # prepare_codegen's suffix that has to separate the two artifacts.
-    assert cg.prepare_codegen(str(net)) != plain_so
+    assert cg.prepare_model_codegen(bngsim.Model.from_net(str(net))) != plain_so
 
 
 # ── The biconditional, on real models ────────────────────────────────────────
