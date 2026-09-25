@@ -246,7 +246,12 @@ _compile_counter = itertools.count()
 # what a model calling rint computes at every negative half, and a .net model's
 # key is content+version, so a cached v30 .so would keep serving the old values.
 # Invalidate v30.
-_CODEGEN_VERSION = "31"
+# v32: lanl/bngsim #660 — `max`/`min` are emitted as bngsim_max/bngsim_min,
+# ExprTk's std::max/std::min, instead of C's fmax/fmin, which return the
+# non-NaN argument where the engine returns the first. That changes what a
+# model computes when an argument goes NaN (and max(-0.0, 0.0)), so a cached
+# v31 .so would keep serving fmax's answer. Invalidate v31.
+_CODEGEN_VERSION = "32"
 
 
 # Modules whose *source* determines the emitted C. ``_codegen`` holds the
@@ -793,9 +798,26 @@ _SPECIAL_FUNCTION_C_LINES = (
     "#endif",
 )
 
+# ExprTk's max/min (issue #660). The engine's binary form is std::max/std::min
+# (exprtk.hpp max_op/min_op) and its variadic form keeps the first argument
+# unless a later one compares strictly greater (less), which is the same left
+# fold. Both return the FIRST argument whenever the comparison is false, so a
+# NaN in first position wins and max(-0.0, 0.0) is -0.0. C's fmax/fmin, which
+# these names used to be renamed to, return the non-NaN argument instead: a
+# model the interpreter refuses as a NaN RHS then ran to completion compiled.
+# Functions rather than a ternary, so each operand is evaluated once and the
+# n-ary fold (GH #556) nests calls instead of doubling the text per argument.
+_MINMAX_C_LINES = (
+    "#ifndef BNGSIM_MINMAX_DEFINED",
+    "#define BNGSIM_MINMAX_DEFINED",
+    "static double bngsim_max(double a, double b) { return (a < b) ? b : a; }",
+    "static double bngsim_min(double a, double b) { return (b < a) ? b : a; }",
+    "#endif",
+)
+
 # What every generated source opens with: the portability macros, then the
 # special functions C does not have.
-_CODEGEN_PRELUDE_LINES = _CODEGEN_MACRO_LINES + _SPECIAL_FUNCTION_C_LINES
+_CODEGEN_PRELUDE_LINES = _CODEGEN_MACRO_LINES + _MINMAX_C_LINES + _SPECIAL_FUNCTION_C_LINES
 
 
 def _chunk_threshold() -> int | None:
@@ -4869,7 +4891,7 @@ def _floatify_int_literals(expr: str) -> str:
 # for every name registered as a scalar variable. Leaving it in emits
 # `obs[3]()`, which C rejects with "called object type 'double' is not a
 # function". eats_empty_parens=False survives only for the entries that really
-# are C *functions* (fabs/log/round/fmax/fmin) or operators (&&/||/!), where
+# are C *functions* (fabs/log/bngsim_max/bngsim_min) or operators (&&/||/!), where
 # `name()` is not valid ExprTk in the first place and the parens must survive
 # for the arguments that follow.
 # The seven physical constants the ExprTk evaluator binds on every expression
@@ -4948,15 +4970,17 @@ _BUILTIN_IDENT_MAP: dict[str, tuple[str, bool]] = {
     "not": ("!", False),
     "ln": ("log", False),
     "abs": ("fabs", False),
-    # ExprTk max/min have no C equivalent under those names; <math.h> spells
-    # them fmax/fmin, which are strictly binary. ExprTk's are variadic, and a
-    # .net (or any expression that skips the loader's sympy round trip) keeps
-    # an n-ary call as written, so _replace_engine_calls first folds
-    # max(a,b,c) into max(max(a,b),c) (GH #556) and this rename then applies to
-    # each binary call. (Both are ExprTk-reserved, so they can never be
-    # user-defined model symbols that would need to win the lookup.)
-    "max": ("fmax", False),
-    "min": ("fmin", False),
+    # ExprTk max/min have no C equivalent under those names. Not <math.h>'s
+    # fmax/fmin, which disagree with the engine on a NaN argument (issue #660):
+    # the prelude's bngsim_max/bngsim_min transcribe std::max/std::min. Both
+    # are binary. ExprTk's are variadic, and a .net (or any expression that
+    # skips the loader's sympy round trip) keeps an n-ary call as written, so
+    # _replace_engine_calls first folds max(a,b,c) into max(max(a,b),c)
+    # (GH #556) and this rename then applies to each binary call. (Both are
+    # ExprTk-reserved, so they can never be user-defined model symbols that
+    # would need to win the lookup.)
+    "max": ("bngsim_max", False),
+    "min": ("bngsim_min", False),
     # A loop, not an expression, so it is a helper the generated source carries
     # rather than a rewrite — see _SPECIAL_FUNCTION_C_LINES (issue #451).
     "mratio": ("bngsim_mratio", False),
@@ -5144,7 +5168,7 @@ def _split_if_args(expr: str, paren_pos: int) -> list[str] | None:
 # symbol that collides is renamed at load. A .net function call is written with
 # empty parens (``sum()``), which is the zero-argument case this leaves alone.
 #
-# ``max``/``min`` join them for their n-ary form only (GH #556): C's fmax/fmin
+# ``max``/``min`` join them for their n-ary form only (GH #556): the C helpers
 # take exactly two arguments, so a three-or-more-argument call is folded into
 # nested binary calls here and left for _BUILTIN_IDENT_MAP to rename.
 #
@@ -5206,11 +5230,11 @@ def _c_engine_call(name: str, args: list[str]) -> str | None:
         # ExprTk reduces a variadic max/min left to right, so fold the same way:
         # max(a,b,c,d) -> max(max(max(a,b),c),d). The result is still spelled
         # max/min, and the identifier pass renames each binary call to
-        # fmax/fmin. A binary call (the only form that ever compiled) is left
+        # bngsim_max/bngsim_min. A binary call (the only form that ever compiled) is left
         # exactly as written, so its emitted source does not change.
         #
         # ExprTk also accepts a single argument and returns it (only the
-        # zero-argument form is rejected), while fmax/fmin would refuse one, so
+        # zero-argument form is rejected), while the binary helpers would refuse one, so
         # max(a) becomes (a). A zero-argument call is left for the compiler.
         if n == 1:
             return f"({args[0]})"

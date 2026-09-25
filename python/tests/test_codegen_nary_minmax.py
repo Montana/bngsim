@@ -108,9 +108,9 @@ def test_a_binary_call_is_left_byte_for_byte(expr):
 
 def test_the_issue_expression_translates_to_binary_c():
     out = _expr_to_c("max(a,b,c)", ["a", "b", "c"], [], [], [])
-    assert out == "fmax(fmax(p[0],p[1]),p[2])"
+    assert out == "bngsim_max(bngsim_max(p[0],p[1]),p[2])"
     out = _expr_to_c("min(a,b,c)", ["a", "b", "c"], [], [], [])
-    assert out == "fmin(fmin(p[0],p[1]),p[2])"
+    assert out == "bngsim_min(bngsim_min(p[0],p[1]),p[2])"
 
 
 @pytest.mark.parametrize(
