@@ -47,7 +47,7 @@ def _t(expr: str) -> str:
 
 
 def test_the_issue_expression():
-    assert _t("k1*ln(1+B)") == "params[0]*jnp.log(1+obs[0])"
+    assert _t("k1*ln(1+B)") == "params[0]*jnp.log(1.0+obs[0])"
 
 
 @pytest.mark.parametrize(
@@ -80,7 +80,7 @@ def test_the_logarithms(expr, want):
         ("abs(k1)", "jnp.abs(params[0])"),
         ("min(B,k1)", "jnp.minimum(obs[0],params[0])"),
         ("max(B,k1)", "jnp.maximum(obs[0],params[0])"),
-        ("pow(B,2)", "jnp.power(obs[0],2)"),
+        ("pow(B,2)", "jnp.power(obs[0],2.0)"),
         ("rint(B)", "__bngsim_rint__(obs[0])"),
         ("floor(B)", "jnp.floor(obs[0])"),
         ("ceil(B)", "jnp.ceil(obs[0])"),
