@@ -62,6 +62,19 @@ v2 = _doc(
 )
 
 
+def _run(doc: str, codegen: bool):
+    # jacobian="fd": the analytic Jacobian of C*k*sqrt(S) is infinite at S = 0
+    # (d sqrt(S)/dS = 1/(2 sqrt(S))), so clamping S cannot make it finite, and
+    # whether CVODE asks for one while S is below zero depends on the platform's
+    # step sequence. That compiled-Jacobian failure is a separate matter (see
+    # #706). What is tested here is the RHS retry, which a difference-quotient
+    # Jacobian goes through too.
+    sim = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(doc), method="ode", codegen=codegen, jacobian="fd"
+    )
+    return sim.run(t_span=(0, 40), n_points=41)
+
+
 def _col(r, name):
     if name in r.species_names:
         return np.asarray(r.species[:, list(r.species_names).index(name)])
@@ -70,9 +83,7 @@ def _col(r, name):
 
 @pytest.mark.parametrize("codegen", [False, True], ids=["interp", "codegen"])
 def test_a_negative_rate_rule_parameter_follows_its_own_ode(codegen):
-    r = bngsim.Simulator(bngsim.Model.from_sbml_string(v1), method="ode", codegen=codegen).run(
-        t_span=(0, 40), n_points=41
-    )
+    r = _run(v1, codegen)
     t = np.asarray(r.time)
     np.testing.assert_allclose(_col(r, "V"), -70.0 + 9.0 * np.exp(-0.1 * t), rtol=1e-4)
     assert _col(r, "S").min() < 0.0  # the retry did fire
@@ -80,8 +91,6 @@ def test_a_negative_rate_rule_parameter_follows_its_own_ode(codegen):
 
 @pytest.mark.parametrize("codegen", [False, True], ids=["interp", "codegen"])
 def test_a_negative_boundary_species_keeps_its_value(codegen):
-    r = bngsim.Simulator(bngsim.Model.from_sbml_string(v2), method="ode", codegen=codegen).run(
-        t_span=(0, 40), n_points=41
-    )
+    r = _run(v2, codegen)
     t = np.asarray(r.time)
     np.testing.assert_allclose(_col(r, "X"), -5.0 * (1.0 - np.exp(-t)), rtol=1e-4, atol=1e-6)
