@@ -364,6 +364,11 @@ struct SteadyStateUserData {
     // Tracking absolute tolerance for the march (issue #213). Inactive for
     // every solve that does not ask for it.
     AtolTracking atol_tracking;
+    // What a callback threw, if one did (issue #589). SUNDIALS is C, so an
+    // exception must not unwind through its frames; guard_ss_callback parks the
+    // first one here and returns the unrecoverable-failure code, and the solve
+    // rethrows it once CVode()/KINSol() has returned.
+    std::exception_ptr callback_error;
 };
 
 // CVODE's error-weight callback for the tracking absolute tolerance (issue
@@ -658,12 +663,42 @@ static const char *ss_linear_solver_name(NetworkModel &model, const SteadyStateR
 // Tier 1: CVODE integration with early termination
 // ---------------------------------------------------------------------------
 
-static int cvode_ss_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
+// Run a SUNDIALS callback body without letting an exception escape into C
+// frames (issue #589): park the first one on the user data and return -1, the
+// unrecoverable-failure code of both CVODE and KINSOL. rethrow_ss_callback_error
+// raises it once the solver call returns. The steady-state twin of
+// guard_cvode_callback in src/cvode_simulator.cpp.
+template <class Data, class Body> static int guard_ss_callback(void *ud, Body &&body) noexcept {
+    try {
+        return body();
+    } catch (...) {
+        auto *data = static_cast<Data *>(ud);
+        if (data != nullptr && !data->callback_error) {
+            data->callback_error = std::current_exception();
+        }
+        return -1;
+    }
+}
+
+template <class Data> static void rethrow_ss_callback_error(Data &data) {
+    if (data.callback_error) {
+        std::exception_ptr err = data.callback_error;
+        data.callback_error = nullptr;
+        std::rethrow_exception(err);
+    }
+}
+
+static int cvode_ss_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const double *yp = N_VGetArrayPointer(y);
     double *yp_dot = N_VGetArrayPointer(ydot);
     data->rhs->eval(static_cast<double>(t), yp, yp_dot);
     return 0;
+}
+
+static int cvode_ss_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_rhs_body(t, y, ydot, ud); });
 }
 
 // The march's Jacobian: the closed form the same object already carries (issue
@@ -679,12 +714,19 @@ static int cvode_ss_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
 // negative concentration) is one the RHS still integrated through. This RHS is
 // not clamped — such a state already fails the march on its f(y) alone — so
 // there is no asymmetry here for the retry to repair.
-static int cvode_ss_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J, void *ud,
-                              N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+static int cvode_ss_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                   void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                   N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     data->rhs->fill_dense_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                    SUNDenseMatrix_Data(J));
     return 0;
+}
+
+static int cvode_ss_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                              N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_dense_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
 }
 
 #ifdef BNGSIM_HAS_KLU
@@ -698,14 +740,21 @@ static int cvode_ss_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMat
 // exists because the time-course RHS is clamped and this one is not, so a state
 // where the closed form goes non-finite is one the march has already failed on
 // f(y) alone.
-static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J, void *ud,
-                               N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+static int cvode_ss_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                    void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                    N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const auto &sp = data->model->jacobian_sparsity();
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
     data->rhs->fill_sparse_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                     SUNSparseMatrix_Data(J));
     return 0;
+}
+
+static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                               N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_sparse_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
 }
 
 // A sparse-routed march with no closed form to install: the Curtis-Powell-Reid
@@ -719,8 +768,8 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMa
 // matrix therefore belongs to the system being integrated even when the two
 // backends differ. cvode_colored_jac on the time-course path predates the
 // codegen RHS and still differences the interpreted one.
-static int cvode_ss_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
-                                N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                     N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const int ns = data->model->n_species();
     // Bare accessor: the marcher materialized the coloring before installing
@@ -738,6 +787,12 @@ static int cvode_ss_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatri
         data->fd_h_vals.data(),
         [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
     return 0;
+}
+
+static int cvode_ss_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_colored_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
 }
 #endif // BNGSIM_HAS_KLU
 
@@ -863,6 +918,9 @@ class SteadyStateMarcher {
             // this loop, which is where a budget belongs.
             int flag = CVode(cvode_mem_, t_stop, y_, &t_, CV_ONE_STEP);
             if (flag < 0) {
+                // A callback that threw is the cause, not a solver failure to
+                // retry on difference quotients: raise it as it was raised.
+                rethrow_ss_callback_error(ud_);
                 // Integration failed -- report unconverged. Remembered, not just
                 // broken out of: under jacobian="auto" a hard integrator failure
                 // is what triggers the retry on difference quotients (issue #127,
@@ -1067,6 +1125,11 @@ struct ReducedKinsolData {
     // at, the full ns×ns fill, and its projection onto the unknowns. Held here so
     // a Jacobian setup allocates nothing.
     std::vector<double> jac_y_full, jac_full, jac_red;
+    // What a callback threw, if one did (issue #589). SUNDIALS is C, so an
+    // exception must not unwind through its frames; guard_ss_callback parks the
+    // first one here and returns the unrecoverable-failure code, and the solve
+    // rethrows it once CVode()/KINSol() has returned.
+    std::exception_ptr callback_error;
 };
 
 // The reduced Jacobian's projection through the conservation-law reconstruction.
@@ -1103,7 +1166,7 @@ static void reconstruct_full(const double *y_ind, double *y_full, int ns,
 }
 
 // Reduced-space KINSOL RHS: evaluate f(y) for independent species only
-static int kinsol_reduced_rhs(N_Vector y_ind, N_Vector fval, void *ud) {
+static int kinsol_reduced_rhs_body(N_Vector y_ind, N_Vector fval, void *ud) {
     auto *data = static_cast<ReducedKinsolData *>(ud);
     NetworkModel *model = data->model;
     const auto &cl = *data->cl;
@@ -1132,6 +1195,11 @@ static int kinsol_reduced_rhs(N_Vector y_ind, N_Vector fval, void *ud) {
     return 0;
 }
 
+static int kinsol_reduced_rhs(N_Vector y_ind, N_Vector fval, void *ud) {
+    return guard_ss_callback<ReducedKinsolData>(
+        ud, [&] { return kinsol_reduced_rhs_body(y_ind, fval, ud); });
+}
+
 // Reduced-space KINSOL Jacobian: ∂f_ind/∂y_ind of the residual above (#127).
 //
 // Two things have to match kinsol_reduced_rhs exactly or the Newton step is a
@@ -1145,8 +1213,8 @@ static int kinsol_reduced_rhs(N_Vector y_ind, N_Vector fval, void *ud) {
 //     ss_reduce_jacobian applies to the full fill. KINSOL's difference quotient
 //     gets it for free by differencing the reduced residual itself; a closed-form
 //     fill is of the FULL system and has to be projected by hand.
-static int kinsol_reduced_jac(N_Vector y_ind, N_Vector /*fval*/, SUNMatrix J, void *ud,
-                              N_Vector /*tmp1*/, N_Vector /*tmp2*/) {
+static int kinsol_reduced_jac_body(N_Vector y_ind, N_Vector /*fval*/, SUNMatrix J, void *ud,
+                                   N_Vector /*tmp1*/, N_Vector /*tmp2*/) {
     auto *data = static_cast<ReducedKinsolData *>(ud);
     NetworkModel &model = *data->model;
     const auto &cl = *data->cl;
@@ -1170,8 +1238,14 @@ static int kinsol_reduced_jac(N_Vector y_ind, N_Vector /*fval*/, SUNMatrix J, vo
     return 0;
 }
 
+static int kinsol_reduced_jac(N_Vector y_ind, N_Vector fval, SUNMatrix J, void *ud, N_Vector tmp1,
+                              N_Vector tmp2) {
+    return guard_ss_callback<ReducedKinsolData>(
+        ud, [&] { return kinsol_reduced_jac_body(y_ind, fval, J, ud, tmp1, tmp2); });
+}
+
 // Full-space KINSOL RHS (for models without conservation laws)
-static int kinsol_rhs(N_Vector y, N_Vector fval, void *ud) {
+static int kinsol_rhs_body(N_Vector y, N_Vector fval, void *ud) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const double *yp = N_VGetArrayPointer(y);
     double *fp = N_VGetArrayPointer(fval);
@@ -1190,6 +1264,10 @@ static int kinsol_rhs(N_Vector y, N_Vector fval, void *ud) {
     return 0;
 }
 
+static int kinsol_rhs(N_Vector y, N_Vector fval, void *ud) {
+    return guard_ss_callback<SteadyStateUserData>(ud, [&] { return kinsol_rhs_body(y, fval, ud); });
+}
+
 // Full-space KINSOL Jacobian: the plain ns×ns fill (issue #127).
 //
 // It matches kinsol_rhs's fixed-species handling without doing anything about
@@ -1198,11 +1276,17 @@ static int kinsol_rhs(N_Vector y, N_Vector fval, void *ud) {
 // ROW as its last step and the emitted C does the same. That row is structurally
 // zero in the difference quotient this replaces too — a full-space system with a
 // fixed species is singular either way, and falls back to integration.
-static int kinsol_jac(N_Vector y, N_Vector /*fval*/, SUNMatrix J, void *ud, N_Vector /*tmp1*/,
-                      N_Vector /*tmp2*/) {
+static int kinsol_jac_body(N_Vector y, N_Vector /*fval*/, SUNMatrix J, void *ud, N_Vector /*tmp1*/,
+                           N_Vector /*tmp2*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     data->rhs->fill_dense_jacobian(0.0, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
     return 0;
+}
+
+static int kinsol_jac(N_Vector y, N_Vector fval, SUNMatrix J, void *ud, N_Vector tmp1,
+                      N_Vector tmp2) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return kinsol_jac_body(y, fval, J, ud, tmp1, tmp2); });
 }
 
 // Which species a restricted steady-state system treats as UNKNOWNS.
@@ -1416,6 +1500,8 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
     // systems, also use KIN_NONE (the auto fallback to integration
     // handles convergence failure gracefully).
     flag = KINSol(kin_mem, y, KIN_NONE, scale, scale);
+    rethrow_ss_callback_error(rd);
+    rethrow_ss_callback_error(ud);
 
     // Distinguish "the linear solver is unusable on this system" from ordinary
     // non-convergence — see the note on `linsolv_failed` above.

@@ -315,6 +315,15 @@ struct CvodeUserData {
     // error, which is a description of the symptom rather than of the cause.
     std::exception_ptr jax_jac_error;
 
+    // The same for every other callback that evaluates the model (issue #589):
+    // the RHS, the codegen RHS and sensitivity RHS, the Jacobians and the event
+    // root function. A rate law may refuse rather than answer (mratio does, and
+    // the rate kernel does for a reaction whose rate parameter never resolved),
+    // and those refusals are C++ exceptions raised inside a SUNDIALS callback.
+    // guard_cvode_callback parks the first one here and returns the
+    // unrecoverable-failure code; the failure path rethrows it.
+    std::exception_ptr callback_error;
+
     // CVODES sensitivity parameter array.
     // When sensitivities are active, CVODES perturbs sens_p[plist[i]] and
     // calls the RHS. The RHS must read parameters from this array, not from
@@ -853,6 +862,11 @@ static void rethrow_pending_callback_error(CvodeUserData &data) {
         data.jax_jac_error = nullptr;
         std::rethrow_exception(err);
     }
+    if (data.callback_error) {
+        std::exception_ptr err = data.callback_error;
+        data.callback_error = nullptr;
+        std::rethrow_exception(err);
+    }
 }
 
 // The message a CVODE hard failure raises with. `flag` gains SUNDIALS' own name
@@ -1029,6 +1043,23 @@ static std::vector<Parameter> &sync_sens_params(CvodeUserData *data) {
     return params;
 }
 
+// Run a CVODE callback body without letting an exception escape into SUNDIALS
+// (issue #589). SUNDIALS is C, so unwinding through its frames is undefined
+// behaviour and leaves the integrator's memory mid-step. The first exception is
+// parked on the user data and the callback returns -1, CVODE's unrecoverable
+// failure code; rethrow_pending_callback_error raises it once CVode() returns.
+template <class Body> static int guard_cvode_callback(void *user_data, Body &&body) noexcept {
+    try {
+        return body();
+    } catch (...) {
+        auto *data = static_cast<CvodeUserData *>(user_data);
+        if (data != nullptr && !data->callback_error) {
+            data->callback_error = std::current_exception();
+        }
+        return -1;
+    }
+}
+
 static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     const double *y_ptr = N_VGetArrayPointer(y);
@@ -1098,7 +1129,8 @@ static void restore_params_after_probe(CvodeUserData *data) {
 }
 
 static int cvode_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
-    const int rc = cvode_rhs_body(t, y, ydot, user_data);
+    const int rc =
+        guard_cvode_callback(user_data, [&] { return cvode_rhs_body(t, y, ydot, user_data); });
     restore_params_after_probe(static_cast<CvodeUserData *>(user_data));
     return rc;
 }
@@ -1163,7 +1195,8 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
 }
 
 static int cvode_codegen_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
-    const int rc = cvode_codegen_rhs_body(t, y, ydot, user_data);
+    const int rc = guard_cvode_callback(
+        user_data, [&] { return cvode_codegen_rhs_body(t, y, ydot, user_data); });
     restore_params_after_probe(static_cast<CvodeUserData *>(user_data));
     return rc;
 }
@@ -1232,9 +1265,9 @@ static void capture_sens_witness(CvodeUserData *data, sunrealtype t, double *y_p
     }
 }
 
-static int cvode_codegen_sens_rhs(int Ns, sunrealtype t, N_Vector y, N_Vector ydot, int iS,
-                                  N_Vector yS, N_Vector ySdot, void *user_data, N_Vector tmp1,
-                                  N_Vector tmp2) {
+static int cvode_codegen_sens_rhs_body(int Ns, sunrealtype t, N_Vector y, N_Vector ydot, int iS,
+                                       N_Vector yS, N_Vector ySdot, void *user_data, N_Vector tmp1,
+                                       N_Vector tmp2) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
 
@@ -1336,6 +1369,14 @@ static int cvode_codegen_sens_rhs(int Ns, sunrealtype t, N_Vector y, N_Vector yd
     return 0;
 }
 
+static int cvode_codegen_sens_rhs(int Ns, sunrealtype t, N_Vector y, N_Vector ydot, int iS,
+                                  N_Vector yS, N_Vector ySdot, void *user_data, N_Vector tmp1,
+                                  N_Vector tmp2) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_codegen_sens_rhs_body(Ns, t, y, ydot, iS, yS, ySdot, user_data, tmp1, tmp2);
+    });
+}
+
 // ─── Analytical Dense Jacobian ───────────────────────────────────────────────
 //
 // For all-Elementary mass-action models using dense solver (N < SPARSE_THRESHOLD
@@ -1343,9 +1384,9 @@ static int cvode_codegen_sens_rhs(int Ns, sunrealtype t, N_Vector y, N_Vector yd
 // O(nnz) cost, zero RHS evaluations, exact (no FD truncation error).
 // Replaces CVODE's internal FD Jacobian which costs O(N) RHS evals.
 
-static int cvode_analytical_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
-                                      void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
-                                      N_Vector /*tmp3*/) {
+static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                           void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                           N_Vector /*tmp3*/) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
     NetworkModel *model = data->model;
@@ -1369,6 +1410,14 @@ static int cvode_analytical_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/
     return 0;
 }
 
+static int cvode_analytical_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                      void *user_data, N_Vector tmp1, N_Vector tmp2,
+                                      N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_analytical_dense_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
+}
+
 // ─── Codegen Dense Analytical Jacobian (GH #76 Task 4) ───────────────────────
 //
 // Compiled-C mirror of fill_dense_analytical_jacobian. Forwards to the dlopen'd
@@ -1379,9 +1428,9 @@ static int cvode_analytical_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/
 // itself. Used in place of cvode_analytical_dense_jac when a model is codegen-
 // compiled and the symbol resolved; the interpreted path stays the fallback.
 
-static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
-                                   void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
-                                   N_Vector /*tmp3*/) {
+static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                        void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                        N_Vector /*tmp3*/) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     double *y_ptr = N_VGetArrayPointer(y);
     double *jac = SUNDenseMatrix_Data(J);
@@ -1406,6 +1455,13 @@ static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, S
                                             data->model->n_species()); // GH #336
     }
     return rc;
+}
+
+static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                   void *user_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_codegen_dense_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
 }
 
 // ─── JAX AD Dense Jacobian ───────────────────────────────────────────────────
@@ -1464,9 +1520,9 @@ static int cvode_jax_dense_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMa
 // Zero RHS evaluations needed. Exact (no truncation error). Dominant speedup
 // for large models: egfr_net 356 sp → O(30K) ops vs 356 RHS evals for FD.
 
-static int cvode_analytical_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
-                                void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
-                                N_Vector /*tmp3*/) {
+static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                     void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                     N_Vector /*tmp3*/) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
     NetworkModel *model = data->model;
@@ -1497,6 +1553,13 @@ static int cvode_analytical_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNM
     return 0; // success
 }
 
+static int cvode_analytical_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                void *user_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_analytical_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
+}
+
 // ─── Codegen Sparse Analytical Jacobian (GH #162) ────────────────────────────
 //
 // Compiled-C mirror of fill_sparse_analytical_jacobian. Like cvode_analytical_jac
@@ -1508,9 +1571,9 @@ static int cvode_analytical_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNM
 // itself. Used in place of cvode_analytical_jac when a sparse-routed model is
 // codegen-compiled and the symbol resolved; the interpreted path stays the
 // fallback.
-static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
-                                    void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
-                                    N_Vector /*tmp3*/) {
+static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
+                                         void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                         N_Vector /*tmp3*/) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     NetworkModel *model = data->model;
 
@@ -1540,6 +1603,13 @@ static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, 
     return rc;
 }
 
+static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                    void *user_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_codegen_sparse_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
+}
+
 // ─── Colored Finite-Difference Sparse Jacobian (Curtis-Powell-Reid) ──────────
 //
 // Computes J = ∂f/∂y using graph-colored finite differences.
@@ -1565,8 +1635,9 @@ static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector /*fy*/, 
 // bngsim/sparse_jacobian.hpp, shared with the steady-state march's sparse route
 // (issue #128); what stays here is the CVODE plumbing around it.
 
-static int cvode_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *user_data,
-                             N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                  void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                  N_Vector /*tmp3*/) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
     NetworkModel *model = data->model;
@@ -1607,6 +1678,13 @@ static int cvode_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J
 
     return 0; // success
 }
+
+static int cvode_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *user_data,
+                             N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_colored_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
+}
 #endif // BNGSIM_HAS_KLU
 
 // ─── Event / discontinuity root function ─────────────────────────────────────
@@ -1615,7 +1693,7 @@ static int cvode_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J
 // discontinuity-trigger condition, subtracting 0.5 so a false→true (or
 // true→false) flip is a sign change. Event roots occupy gout[0,n_events)
 // and discontinuity roots gout[n_events, n_roots).
-static int cvode_event_root_fn(sunrealtype t, N_Vector y, sunrealtype *gout, void *user_data) {
+static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout, void *user_data) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     auto *mdl = data->model;
     const double *y_ptr = N_VGetArrayPointer(y);
@@ -1668,6 +1746,11 @@ static int cvode_event_root_fn(sunrealtype t, N_Vector y, sunrealtype *gout, voi
         }
     }
     return 0;
+}
+
+static int cvode_event_root_fn(sunrealtype t, N_Vector y, sunrealtype *gout, void *user_data) {
+    return guard_cvode_callback(user_data,
+                                [&] { return cvode_event_root_fn_body(t, y, gout, user_data); });
 }
 
 // ─── Forward-sensitivity run state ───────────────────────────────────────────
