@@ -128,10 +128,18 @@ Result convert_rulemonkey_result(const rulemonkey::Result &rm_result,
     return result;
 }
 
+// Upstream's stateless run() starts its SSA clock at 0 and records from
+// t_start onward, so a nonzero t_start used to simulate the pre-history [0,
+// t_start] before the first row (issue #703). A bngsim run starts from the
+// initial state at t_start and never sees [0, t_start], so the request is
+// shifted to elapsed time here (t_start -> 0) and run() labels the rows back
+// with absolute times. That is also BNG2.pl's simulate_nf semantics, which runs
+// NFsim for t_end - t_start from the initial state.
 rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
     rulemonkey::TimeSpec rm_times;
-    rm_times.t_start = times.t_start;
-    rm_times.t_end = times.t_end;
+    const double t0 = times.t_start;
+    rm_times.t_start = 0.0;
+    rm_times.t_end = times.t_end - t0;
     if (!times.sample_times.empty()) {
         // Explicit, possibly non-uniform output instants (GH #169). Upstream
         // RuleMonkey #16 records at exactly these times in a single run_ssa pass
@@ -139,7 +147,9 @@ rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
         // through and leave n_points at its default. The Python layer guarantees
         // sample_times[0] == t_start and t_end == the largest sample time, which
         // satisfies upstream's "t_end bounds the SSA loop" contract.
-        rm_times.sample_times = times.sample_times;
+        rm_times.sample_times.reserve(times.sample_times.size());
+        for (double t : times.sample_times)
+            rm_times.sample_times.push_back(t - t0);
     } else {
         rm_times.n_points = rulemonkey_interval_count(times.n_points);
     }
@@ -208,7 +218,11 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
         // time labels and solver_stats().n_steps now reports for both paths.
         auto rm_result =
             impl_->sim->run(to_rulemonkey_times(times), seed, make_cancel_callback(budget));
-        return convert_rulemonkey_result(rm_result);
+        // Back from elapsed time to the absolute labels the caller asked for.
+        std::vector<double> labels(rm_result.time.begin(), rm_result.time.end());
+        for (double &t : labels)
+            t += times.t_start;
+        return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
         // Upstream raises Cancelled iff our callback returned false, which it
         // does iff the WallClockBudget elapsed past the limit. Translate to
