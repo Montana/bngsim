@@ -98,6 +98,13 @@ def test_large_literal_rate_factor_compiles_and_matches_the_closed_form():
         ("b*--k", "b*- -k"),
         ("a--b", "a- -b"),
         ("---x", "- - -x"),
+        # A quoted span no longer splits the parentheses around it, so a chain
+        # beside a quoted tfun file name is rewritten too (issue #823).
+        ("if(tfun('f.dat', x)==b<1, 1, 2)", "if((tfun('f.dat', x)==b)<1, 1, 2)"),
+        ("if(tfun('f.dat', x)<1<2, 1, 2)", "if((tfun('f.dat', x)<1)<2, 1, 2)"),
+        ("k=2 + tfun('f.dat', x)", "k==2 + tfun('f.dat', x)"),
+        ('tfun("a<b=c.dat", x)<1<2', '(tfun("a<b=c.dat", x)<1)<2'),
+        ("tfun('a<1<2', x)+tfun('b=c', y)", "tfun('a<1<2', x)+tfun('b=c', y)"),
     ],
 )
 def test_normalize_makes_exprtk_reading_explicit(text, normal):
