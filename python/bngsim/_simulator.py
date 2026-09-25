@@ -3681,8 +3681,22 @@ class Simulator:
                     except Exception as e:
                         raise SimulationError(f"Replicate {i} failed: {e}") from e
         else:
+            # The sequential path runs on the live model and simulator (to reuse
+            # the cached dependency graph), so each replicate's reset() and run
+            # leave the model at the last replicate's end state while the
+            # interactive clock, which only run() advances, stays where it was.
+            # A following run_until() then integrated from t_end's state and
+            # labelled it as the old time (issue #748). Put both back, as
+            # parameter_scan does; the parallel path never touches them, since
+            # it runs on per-thread clones, so the two now agree.
+            invocation_state = self._model.get_state()
+            invocation_time = self._current_time
             times = _make_times()
-            results = [_run_one(self._sim, self._model, times, i) for i in range(n_replicates)]
+            try:
+                results = [_run_one(self._sim, self._model, times, i) for i in range(n_replicates)]
+            finally:
+                self._model.set_state(invocation_state)
+                self._current_time = invocation_time
 
         if squeeze:
             return self._stamp(Result.squeeze(results))
