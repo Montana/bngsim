@@ -1415,6 +1415,8 @@ _EXPRTK_BELOW_RELATIONAL: tuple[tuple[str, bool], ...] = (
 _LONE_EQUALS_RE = re.compile(r"(?<![=!<>:])=(?!=)")
 _SIGN_RUN_RE = re.compile(r"([-+])(?=[-+])")
 _RELATIONAL_CHAR_RE = re.compile(r"[<>=!]")
+_QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_QUOTE_PLACEHOLDER_RE = re.compile("\x01(\\d+)\x02")
 
 
 def _normalize_exprtk_operators(expr: str) -> str:
@@ -1426,14 +1428,23 @@ def _normalize_exprtk_operators(expr: str) -> str:
     unchanged without a scan.
     """
     if "'" in expr or '"' in expr:
-        pieces = re.split(r"""('[^']*'|"[^"]*")""", expr)
-        # A quote with no partner splits nothing; recursing on the same text
-        # would never end, so it falls through and is read as plain text.
-        if len(pieces) > 1:
-            return "".join(
-                piece if i % 2 else _normalize_exprtk_operators(piece)
-                for i, piece in enumerate(pieces)
-            )
+        # Mask each quoted span with a placeholder, normalize the whole string,
+        # then put the quoted text back. Normalizing the unquoted pieces one at a
+        # time split the parentheses at every quote, and the relational-chain
+        # pass declines unbalanced text, so no chain in an expression carrying a
+        # quoted string was ever rewritten (issue #823). A placeholder rather
+        # than a same-length mask, because the rewrites below change lengths.
+        # A quote with no partner matches nothing and is read as plain text.
+        quoted: list[str] = []
+
+        def _mask(m: re.Match) -> str:
+            quoted.append(m.group(0))
+            return f"\x01{len(quoted) - 1}\x02"
+
+        masked = _QUOTED_SPAN_RE.sub(_mask, expr)
+        if quoted:
+            out = _normalize_exprtk_operators(masked)
+            return _QUOTE_PLACEHOLDER_RE.sub(lambda m: quoted[int(m.group(1))], out)
     if not (_RELATIONAL_CHAR_RE.search(expr) or _SIGN_RUN_RE.search(expr)):
         return expr
     s = _LONE_EQUALS_RE.sub("==", expr).replace("<>", "!=")
