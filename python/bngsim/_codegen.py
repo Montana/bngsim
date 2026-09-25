@@ -2526,6 +2526,53 @@ def _derivative_is_unevaluated(deriv) -> bool:
     return bool(deriv.has(sp.Derivative))
 
 
+def _guard_zero_base(deriv):
+    """*deriv* with the emitters' zero-base rewrites applied (issue #720).
+
+    The same :func:`bngsim._jacobian._emitter_rewrites` pass ``sympy_to_c``
+    runs, so ``P**e*log(P)`` and ``e*P**e/P`` take their limit at ``P = 0``
+    instead of evaluating to NaN. A rewrite that raises, or that folds a
+    non-finite atom back in (issue #541), leaves *deriv* as it was: the guard
+    is an improvement where it applies, never a new failure.
+    """
+    from bngsim._jacobian import _emitter_rewrites, _folds_nonfinite
+
+    try:
+        guarded = _emitter_rewrites(deriv)
+    except Exception:  # noqa: BLE001 - keep the unguarded derivative
+        return deriv
+    return deriv if _folds_nonfinite(guarded) else guarded
+
+
+def _partial_value(deriv, subs: dict) -> float:
+    """*deriv* at the point *subs*, in IEEE double arithmetic, as the C twin
+    computes it (issue #720).
+
+    The guarded forms divide through by the base, so at a zero base they read
+    ``pow(0, -k)``: C takes that to ``inf`` and ``1/inf`` to 0, the limit, while
+    sympy's ``subs``/``evalf`` takes it to ``zoo`` and the sum to NaN, or leaves a
+    ``zoo`` that ``float()`` refuses. The first disagreed with the C twin at a
+    removable singularity (d/dE of ``E^n/(E^n+h^n)`` at E = 0, n = 2: 0 in C,
+    NaN here); the second made a genuinely infinite partial (d/dE of ``E^n`` at
+    n = 0.5) a *dropped* one, which the event-threshold detector reads as
+    dt*/dp = 0. Evaluated the way C does, the first is 0 and the second ``inf``,
+    which the run refuses by name. Anything numpy cannot evaluate (an engine
+    function it has no name for) goes through sympy as before.
+    """
+    import numpy as np
+    import sympy as sp
+
+    syms = sorted(deriv.free_symbols, key=str)
+    try:
+        fn = sp.lambdify(syms, deriv, modules="numpy")
+        with np.errstate(all="ignore"):
+            # numpy scalars, not Python floats: `0.0 ** -0.5` raises in Python
+            # and is inf in numpy, as in C.
+            return float(fn(*[np.float64(subs[s]) for s in syms]))
+    except Exception:  # noqa: BLE001 - the sympy route below says why, if it fails
+        return float(deriv.subs(subs).evalf())
+
+
 def _direct_derived_partials(
     expr: str,
     primary_names: set[str],
@@ -2574,6 +2621,12 @@ def _direct_derived_partials(
             # way. Asking first is what makes the reason readable, since it is
             # published with the run's df/dp verdict (issue #438).
             return None, _STEP_DERIVATIVE_REASON
+        # The emitters' zero-base guards (#310/#317/#333/#388), which bare
+        # sp.ccode skipped: d(E^n)/dn printed as pow(E,n)*log(E) and d(E^n)/dE
+        # as n*pow(E,n)/E, both NaN at E = 0, so every sensitivity run on such
+        # a model was refused while the same law written inline in a Functional
+        # rate was right (issue #720). The printing itself stays sp.ccode.
+        deriv = _guard_zero_base(deriv)
         try:
             c_str = sp.ccode(deriv)
         except Exception as exc:
@@ -2802,11 +2855,19 @@ def _direct_derived_partials_numeric(
                 _warn_chain_rule_dropped(expr, [p_name], _STEP_DERIVATIVE_REASON)
             continue
         try:
-            val = float(deriv.subs(subs).evalf())
+            # The C twin's zero-base guards, so both agree at a zero base
+            # (issue #720): the raw derivative is NaN there.
+            val = _partial_value(_guard_zero_base(deriv), subs)
         except (TypeError, ValueError) as exc:
             if warn_on_failure:
                 _warn_chain_rule_dropped(expr, [p_name], f"{type(exc).__name__}: {exc}")
             continue
+        # A partial still non-finite after the guards (d(E^n)/dE at E = 0 with
+        # n < 1, a genuinely infinite derivative) is kept, not dropped: a
+        # missing partial reads downstream as a real zero, and the callers that
+        # pass warn_on_failure=False (the switch-time and event-threshold
+        # detectors) would then report dt*/dp = 0 without a word. Kept, it
+        # reaches the run, which refuses the non-finite jump by name.
         if val != 0.0:
             out[p_name] = val
     return (out or None), None

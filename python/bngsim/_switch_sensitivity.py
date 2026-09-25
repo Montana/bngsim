@@ -2783,6 +2783,14 @@ def _threshold_crossing_terms(
         ):
             return CrossingTerms({}, None)  # a root that does not occur
         return None
+    if not all(math.isfinite(v) for v in partials.values()):
+        # A crossing that occurs but whose time has no finite derivative in a
+        # primary (``thr = 1/a`` at a = 0, ``E^n`` at E = 0 with n < 1) has
+        # nothing to jump by, so it is not compensated. The walk keeps such a
+        # partial rather than dropping it (issue #720), since a dropped one
+        # reads as a zero. Asked after the non-real check: a root that does not
+        # occur has no crossing time to differentiate.
+        return None
     # ``value`` is already known to be a number here, so the text scan is the
     # whole of :func:`_fixed_threshold_expr` that is left to check.
     if partials or _threshold_has_no_parameter(threshold_expr, scope):
