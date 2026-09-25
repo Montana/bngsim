@@ -180,7 +180,10 @@ A reaction's `"type"` says how to read its `"rate_law"`:
   a unit conversion folded into it (`1.6605503e-12*kf`); the dict carries that
   as `"rate_law": "k1"` and `"stat_factor": 0.5`, so the rate constant is
   `stat_factor` times the parameter.
-- `"functional"`: a name from the `functions` block.
+- `"functional"`: a name from the `functions` block. The function's value is a
+  rate constant too: the rate is `stat_factor` times the function times the
+  reactant amounts, as for an elementary reaction (`0.5*f1` comes back as
+  `"rate_law": "f1"`, `"stat_factor": 0.5`).
 - `"mm"`: `"<kcat>,<Km>"` for a `MM kcat Km` rate column, with
   `"legacy_constants": [kcat, Km]`.
 

@@ -490,6 +490,17 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
                 } catch (...) {
                     // Not coeff*name, treat as plain name
                 }
+                // stod also takes a sign and C99 hex, so `-1*kf`, `0*kf` and
+                // `0x10*kf` read as a factor of -1, 0 and 16: a reaction run
+                // backwards (a negative SSA propensity), one that never fires,
+                // and a hex literal BNG2.pl never writes. A statistical or
+                // unit-conversion factor is a positive decimal number.
+                if (param_name != rate_token &&
+                    (rxn.stat_factor <= 0.0 || prefix.find_first_of("xXpP") != std::string::npos)) {
+                    throw std::runtime_error("reaction line '" + stripped + "' has stat factor '" +
+                                             prefix +
+                                             "'; a stat factor must be a positive decimal number");
+                }
             }
 
             if (param_name.empty()) {

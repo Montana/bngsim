@@ -2770,20 +2770,35 @@ PYBIND11_MODULE(_bngsim_core, m) {
         [](const std::string &path) {
             // The loader's whole load, parse and build: the values reported are
             // the ones the built model holds, and a file the build refuses is
-            // refused here, as from_net refuses it.
+            // refused here. The dict is built here in its final shape, so
+            // parse_net_file does not walk every reaction a second time in Python.
             bngsim::NetFileStructure parsed;
             std::vector<double> values;
             std::vector<double> initial;
+            std::vector<bngsim::RateLawType> types;
             try {
                 parsed = bngsim::parse_net_file_structure(path);
                 auto model = bngsim::build_net_file_structure(parsed);
+                values.reserve(parsed.params.size());
                 for (const auto &p : parsed.params)
                     values.push_back(model.get_param(p.name));
                 for (const auto &sp : model.species())
                     initial.push_back(sp.initial_conc);
+                // The type build() resolved, not the parse's: an elementary rate
+                // column that names a function is functional. One rule, the
+                // builder's, rather than a second reading of it in Python.
+                for (const auto &rxn : model.reactions())
+                    types.push_back(rxn.rate_law_type);
+                if (initial.size() != parsed.species.size() ||
+                    types.size() != parsed.reactions.size()) {
+                    throw std::runtime_error(
+                        "the built model's species or reactions do not line up with the "
+                        "records they were built from");
+                }
             } catch (const std::exception &e) {
-                // The type and prefix from_net raises, so a file both refuse is
-                // refused the same way.
+                // The prefix the core's from_net uses. Model.from_net re-raises
+                // that as bngsim.ModelError; this one stays ValueError, as
+                // parse_net_file documents.
                 throw py::value_error(std::string("Failed to load .net file: ") + e.what());
             }
             py::list params;
@@ -2792,14 +2807,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 params.append(py::make_tuple(p.name, values[i], p.expression, p.is_expression));
             }
             py::list species;
+            py::list species_ic_params;
             for (size_t i = 0; i < parsed.species.size(); ++i) {
                 const auto &s = parsed.species[i];
-                py::dict d;
-                d["name"] = s.name;
-                d["concentration"] = initial[i];
-                d["fixed"] = s.fixed;
-                d["param_ref"] = s.is_param_ref ? s.param_ref_name : std::string();
-                species.append(std::move(d));
+                species.append(py::make_tuple(s.name, initial[i], s.fixed));
+                if (s.is_param_ref)
+                    species_ic_params.append(py::make_tuple(static_cast<int>(i), s.param_ref_name));
             }
             py::list functions;
             for (const auto &f : parsed.functions)
@@ -2812,7 +2825,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 observables.append(py::make_tuple(o.name, std::move(entries)));
             }
             py::list reactions;
-            for (const auto &r : parsed.reactions) {
+            for (size_t ri = 0; ri < parsed.reactions.size(); ++ri) {
+                const auto &r = parsed.reactions[ri];
                 py::list reactants;
                 for (int i : r.reactant_indices_1based)
                     reactants.append(i - 1);
@@ -2822,7 +2836,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 py::dict d;
                 d["reactants"] = std::move(reactants);
                 d["products"] = std::move(products);
-                switch (r.type) {
+                py::list legacy_constants;
+                switch (types[ri]) {
                 case bngsim::RateLawType::Elementary:
                     d["type"] = "elementary";
                     d["rate_law"] = r.rate_law_name;
@@ -2834,34 +2849,38 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 case bngsim::RateLawType::MichaelisMenten:
                     d["type"] = "mm";
                     d["rate_law"] = r.mm_kcat_name + "," + r.mm_km_name;
+                    legacy_constants.append(r.mm_kcat_name);
+                    legacy_constants.append(r.mm_km_name);
                     break;
                 }
+                d["legacy_constants"] = std::move(legacy_constants);
                 d["stat_factor"] = r.stat_factor;
                 reactions.append(std::move(d));
             }
             py::dict out;
             out["parameters"] = std::move(params);
             out["species"] = std::move(species);
-            out["functions"] = std::move(functions);
+            out["species_ic_params"] = std::move(species_ic_params);
             out["observables"] = std::move(observables);
+            out["functions"] = std::move(functions);
             out["reactions"] = std::move(reactions);
             out["net_file_dir"] = parsed.net_file_dir;
             out["load_warnings"] = parsed.load_warnings;
             return out;
         },
         py::arg("path"),
-        "Read a .net file the way Model.from_net does, without building it. Returns "
-        "{'parameters': [(name, value, expression, is_expression), ...], 'species': "
-        "[{name, concentration, fixed, param_ref}, ...], 'functions': [(name, "
-        "expression), ...], 'observables': [(name, [(species_idx0, factor), ...]), ...], "
-        "'reactions': [{reactants, products, type, rate_law, stat_factor}, ...], "
-        "'net_file_dir', 'load_warnings'}: the records the loader hands ModelBuilder, with "
-        "each parameter's value and each species' concentration taken from the model it "
-        "builds from them. The build runs here too, so a file Model.from_net refuses is "
-        "refused, with ValueError. An expression-valued initial concentration is a lifted "
-        "_InitialConc<N> parameter; Sat/Hill rate laws come back rewritten as functional "
-        "ones. An elementary reaction's rate_law may name a function, which build() "
-        "resolves to functional.");
+        "Read a .net file the way Model.from_net does, and return the reading as "
+        "parse_net_file's dict: {'parameters': [(name, value, expression, is_expression), "
+        "...], 'species': [(name, init_conc, is_fixed), ...], 'species_ic_params': "
+        "[(species_idx0, param_name), ...], 'observables': [(name, [(species_idx0, factor), "
+        "...]), ...], 'functions': [(name, expression), ...], 'reactions': [{reactants, "
+        "products, type, rate_law, legacy_constants, stat_factor}, ...], 'net_file_dir', "
+        "'load_warnings'}. The records are the ones the loader hands ModelBuilder; each "
+        "parameter's value, each species' concentration and each reaction's type are taken "
+        "from the model it builds from them. The build runs here too, so a file "
+        "Model.from_net refuses is refused, with ValueError. An expression-valued initial "
+        "concentration is a lifted _InitialConc<N> parameter; Sat/Hill rate laws come back "
+        "rewritten as functional ones.");
 
     m.def(
         "reserved_names",

@@ -304,12 +304,14 @@ def run_scipy_netreader_ode(net_path, t_end, n_steps):
         dy = np.zeros(nsp)
         for r in rxns:
             rl = r["rate_law"]
+            # A functional rate is a rate constant, like an elementary one: the
+            # engine multiplies it by the reactant amounts too (BNGL convention).
             if r["type"] == "functional":
                 rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
                 rate = r["stat_factor"] * pv.get(rl, 0.0)
-                for ri in r["reactants"]:
-                    rate *= y[ri]
+            for ri in r["reactants"]:
+                rate *= y[ri]
             for ri in r["reactants"]:
                 dy[ri] -= rate
             for pi in r["products"]:
@@ -364,12 +366,14 @@ def run_diffrax_netreader_ode(net_path, t_end, n_steps):
         dy = jnp.zeros(nsp)
         for r in rxns:
             rl = r["rate_law"]
+            # A functional rate is a rate constant, like an elementary one: the
+            # engine multiplies it by the reactant amounts too (BNGL convention).
             if r["type"] == "functional":
                 rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
                 rate = r["stat_factor"] * pv.get(rl, 0.0)
-                for ri in r["reactants"]:
-                    rate = rate * y_np[ri]
+            for ri in r["reactants"]:
+                rate = rate * y_np[ri]
             for ri in r["reactants"]:
                 dy = dy.at[ri].add(-rate)
             for pi in r["products"]:

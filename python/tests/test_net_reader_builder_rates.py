@@ -227,6 +227,35 @@ class TestBuildModelFromParsedRates:
         with pytest.raises(ModelError, match="stat factor but no rate constant"):
             bngsim.Model.from_net(str(net))
 
+    @pytest.mark.parametrize("prefix", ["-1", "0", "0.0", "0x10", "0x1p3"])
+    def test_a_stat_factor_that_is_not_a_positive_decimal_is_refused(
+        self, tmp_path: Path, prefix: str
+    ) -> None:
+        """stod takes a sign and C99 hex: `-1*kp2` ran the reaction backwards (a
+        negative SSA propensity), `0*kp2` built one that never fires, and
+        `0x10*kp2` read as 16. BNG2.pl writes positive decimal factors only."""
+        net = _write_net(
+            tmp_path,
+            f"""
+            begin parameters
+              1 kp2 2.0
+            end parameters
+            begin species
+              1 A() 100
+              2 B() 0
+            end species
+            begin reactions
+              1 1 2 {prefix}*kp2
+            end reactions
+            begin groups
+            end groups
+            """,
+        )
+        with pytest.raises(ValueError, match="must be a positive decimal number"):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match="must be a positive decimal number"):
+            bngsim.Model.from_net(str(net))
+
     def test_a_rate_column_naming_nothing_is_refused(self, tmp_path: Path) -> None:
         """`(0.5*kp2` names no parameter or function; the builder refuses it from
         either door, naming the column."""

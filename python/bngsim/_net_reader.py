@@ -109,49 +109,15 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Net file not found: {path}")
     if path.is_dir():
         raise IsADirectoryError(f"{path} is a directory, not a .net file")
-    s = net_file_structure(os.fspath(path))
-    for message in s["load_warnings"]:
+    parsed = net_file_structure(os.fspath(path))
+    for message in parsed.pop("load_warnings"):
         warnings.warn(message, UserWarning, stacklevel=2)
-
-    # Values and initial concentrations are the built model's, evaluated.
-    parameters = [tuple(p) for p in s["parameters"]]
-    species = [(sp["name"], sp["concentration"], sp["fixed"]) for sp in s["species"]]
-    species_ic_params = [
-        (i, sp["param_ref"]) for i, sp in enumerate(s["species"]) if sp["param_ref"]
-    ]
-
-    functions = [(name, expression) for name, expression in s["functions"]]
-    function_names = {name for name, _ in functions}
-    reactions = []
-    for rxn in s["reactions"]:
-        rtype = rxn["type"]
-        # The loader marks a rate column that names a function elementary and
-        # lets build() reclassify it; the dict says what it is.
-        if rtype == "elementary" and rxn["rate_law"] in function_names:
-            rtype = "functional"
-        reactions.append(
-            {
-                "reactants": list(rxn["reactants"]),
-                "products": list(rxn["products"]),
-                "type": rtype,
-                "rate_law": rxn["rate_law"],
-                # An MM reaction's operands, as the dict has always carried them.
-                "legacy_constants": rxn["rate_law"].split(",") if rtype == "mm" else [],
-                "stat_factor": rxn["stat_factor"],
-            }
-        )
-
-    return {
-        "parameters": parameters,
-        "species": species,
-        "species_ic_params": species_ic_params,
-        "observables": [(name, list(entries)) for name, entries in s["observables"]],
-        "functions": functions,
-        "reactions": reactions,
-        # Absolute, so a build after a change of working directory still finds a
-        # relative tfun file.
-        "net_file_dir": os.path.abspath(s["net_file_dir"]),
-    }
+    # Values, initial concentrations and each reaction's type are the built
+    # model's; the binding returns the dict in this shape, so there is nothing
+    # left to reshape here. Absolute, so a build after a change of working
+    # directory still finds a relative tfun file.
+    parsed["net_file_dir"] = os.path.abspath(parsed["net_file_dir"])
+    return parsed
 
 
 def build_model_from_parsed(parsed: dict[str, Any]):
@@ -251,7 +217,6 @@ def build_model_from_parsed(parsed: dict[str, Any]):
     for observable_name, entries in parsed["observables"]:
         builder.add_observable(observable_name, entries)
 
-    function_names = {name for name, _ in parsed["functions"]}
     for i, rxn in enumerate(parsed["reactions"]):
         rtype = rxn["type"]
         rate_law = rxn["rate_law"]
@@ -266,10 +231,13 @@ def build_model_from_parsed(parsed: dict[str, Any]):
         if not rate_law.strip():
             # ModelBuilder's validation passes an empty name over, so refuse it here.
             raise ValueError(f"reaction {i + 1} has an empty rate_law")
-        # By what the rate law names, not by the label: ModelBuilder builds a
-        # "functional" reaction that names a parameter as one that never fires.
+        # By what the rate law names, not by the label, and by ModelBuilder's
+        # rule rather than a copy of it: an elementary rate that names a
+        # function is resolved to functional in build(), exactly as the loader
+        # relies on. Passing "functional" through would build a reaction that
+        # names a parameter as one that never fires.
         if rtype != "mm":
-            rtype = "functional" if rate_law in function_names else "elementary"
+            rtype = "elementary"
         builder.add_reaction(
             rxn["reactants"], rxn["products"], rtype, rate_law, rxn["stat_factor"]
         )
