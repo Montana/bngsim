@@ -407,10 +407,18 @@ class TestBooleanCoercedToANumber:
         rel = sp.Ne if "!=" in text else sp.Eq
         assert J._exprtk_to_sympy(text) == sp.Piecewise((1, rel(p, 0)), (2, True))
 
-    def test_a_relational_compared_to_a_non_zero_number_is_left_alone(self):
-        """Only zero. ``(x<0) != 1`` is not a spelling anything writes, and
-        reading it as a negation would be a guess."""
-        assert J._rewrite_logicals("((x<0))!=1") == "Ne(((x<0)), 1)"
+    def test_a_relational_compared_to_one_is_the_condition(self):
+        """``1`` is ExprTk's true, so ``(x<0) != 1`` is ``Not(x<0)`` and
+        ``(x<0) == 1`` is ``x<0``. BNG2.pl writes ``if(((a>1)==1),k1,k2)``
+        verbatim; left as ``Eq``/``Ne``, sympy folded it to a constant and the
+        sympy-derived quantities took the wrong branch (issue #754)."""
+        assert J._rewrite_logicals("((x<0))!=1") == "Not(((x<0)))"
+        assert J._rewrite_logicals("((x<0))==1") == "((x<0))"
+
+    def test_a_relational_compared_to_another_number_is_left_alone(self):
+        """Only 0 and 1. ExprTk's 0/1 never equals 2, and sympy's
+        ``Eq(Boolean, 2)`` is already ``False``, so there is nothing to fix."""
+        assert J._rewrite_logicals("((x<0))!=2") == "Ne(((x<0)), 2)"
 
     def test_both_targets_spell_the_boolean_constant_they_are_handed(self):
         """Neither target knows sympy's ``False``, so whatever reaches them has to
