@@ -333,6 +333,66 @@ parse_species(std::ifstream &file, std::unordered_map<std::string, int> &param_n
     return species;
 }
 
+// A parameter is a constant: BNG2.pl refuses a parameter expression that names
+// an observable or a function ("Parameter 'Atot' is referenced but not
+// defined"). bngsim compiled one, because the evaluator's symbol table holds
+// observables and function slots too, and evaluated it once at build, before
+// any of them had a value, so it loaded as 0.0 and a reaction whose rate it was
+// never fired (issue #844). #602 refuses a symbol the model never declares; an
+// observable or a function is declared, so it passed. Refuse it here, naming
+// the parameter and the symbol. A name that is also a parameter is left alone:
+// that is the SBML assignment-rule shape after `.net` conversion, a parameter
+// row shadowed by a same-named function (#266), and the reference reads the
+// parameter's slot.
+void refuse_parameters_that_read_state(const std::vector<ParsedParam> &params,
+                                       const std::vector<ParsedFunction> &functions,
+                                       const std::vector<ParsedObservable> &observables) {
+    std::unordered_set<std::string> param_names;
+    for (const auto &p : params)
+        param_names.insert(p.name);
+    std::unordered_map<std::string, const char *> state;
+    for (const auto &o : observables)
+        if (!param_names.count(o.name))
+            state.emplace(o.name, "observable");
+    for (const auto &f : functions)
+        if (!param_names.count(f.name))
+            state.emplace(f.name, "function");
+    if (state.empty())
+        return;
+
+    for (const auto &p : params) {
+        if (!p.is_expression)
+            continue;
+        const std::string &e = p.expression;
+        for (size_t i = 0; i < e.size();) {
+            const unsigned char c = static_cast<unsigned char>(e[i]);
+            // An identifier starts with a letter or '_' not preceded by a word
+            // character or '.', so the exponent of `1e5` or `2.5E-3` is skipped.
+            const bool starts = (std::isalpha(c) || c == '_') &&
+                                (i == 0 || !(std::isalnum(static_cast<unsigned char>(e[i - 1])) ||
+                                             e[i - 1] == '_' || e[i - 1] == '.'));
+            if (!starts) {
+                ++i;
+                continue;
+            }
+            size_t j = i;
+            while (j < e.size() && (std::isalnum(static_cast<unsigned char>(e[j])) || e[j] == '_'))
+                ++j;
+            const std::string name = e.substr(i, j - i);
+            auto it = state.find(name);
+            if (it != state.end()) {
+                throw std::runtime_error(
+                    "parameter '" + p.name + "' = " + e + " reads the " + it->second + " '" + name +
+                    "', but a parameter is a constant: it is evaluated once, before any "
+                    "observable or function has a value, and would silently be 0. BioNetGen "
+                    "refuses the same model. Write the state-dependent quantity as a function "
+                    "and use that function as the rate law (issue #844).");
+            }
+            i = j;
+        }
+    }
+}
+
 static std::vector<ParsedFunction> parse_functions(std::ifstream &file) {
     std::vector<ParsedFunction> functions;
     std::string line;
@@ -1174,6 +1234,8 @@ NetworkModel build_net_file_structure(const NetFileStructure &parsed) {
     const auto &parsed_functions = parsed.functions;
     const auto &parsed_observables = parsed.observables;
     const auto &parsed_reactions = parsed.reactions;
+
+    refuse_parameters_that_read_state(parsed_params, parsed_functions, parsed_observables);
 
     // ── Phase 2: Feed parsed data into ModelBuilder ──────────────────────
     // `bngsim.build_model_from_parsed` makes these same calls from the same

@@ -160,10 +160,23 @@ def build_model_from_parsed(parsed: dict[str, Any]):
     RuntimeError
         If ``ModelBuilder`` refuses the model, as it refuses the same records
         from the loader: an elementary ``rate_law`` that names neither a
-        parameter nor a function, for instance.
+        parameter nor a function, for instance, or a parameter expression that
+        reads an observable or a function (issue #844).
     """
-    from bngsim._bngsim_core import ModelBuilder, net_function_tables
+    from bngsim._bngsim_core import (
+        ModelBuilder,
+        net_function_tables,
+        net_refuse_parameters_that_read_state,
+    )
     from bngsim._model import Model, _ar_report_map_from_net
+
+    # The loader's own refusal, which phase 2 makes before its first call: a
+    # parameter that reads an observable or a function would build as 0 (#844).
+    net_refuse_parameters_that_read_state(
+        [tuple(p) for p in parsed["parameters"]],
+        [tuple(f) for f in parsed["functions"]],
+        [name for name, _ in parsed["observables"]],
+    )
 
     builder = ModelBuilder()
     # Where a relative `tfun('...')` path resolves from, set before the tables

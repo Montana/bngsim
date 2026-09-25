@@ -2882,6 +2882,34 @@ PYBIND11_MODULE(_bngsim_core, m) {
         "concentration is a lifted _InitialConc<N> parameter; Sat/Hill rate laws come back "
         "rewritten as functional ones.");
 
+    // Issue #844 — the loader's refusal of a parameter that reads the state, for
+    // build_model_from_parsed, which makes phase 2's calls from a dict that may
+    // have been edited. One implementation for both doors.
+    m.def(
+        "net_refuse_parameters_that_read_state",
+        [](const std::vector<std::tuple<std::string, double, std::string, bool>> &params,
+           const std::vector<std::pair<std::string, std::string>> &functions,
+           const std::vector<std::string> &observable_names) {
+            std::vector<bngsim::ParsedParam> ps;
+            ps.reserve(params.size());
+            for (const auto &[name, value, expression, is_expression] : params)
+                ps.push_back({name, value, expression, is_expression});
+            std::vector<bngsim::ParsedFunction> fs;
+            fs.reserve(functions.size());
+            for (const auto &[name, expression] : functions)
+                fs.push_back({name, expression});
+            std::vector<bngsim::ParsedObservable> os;
+            os.reserve(observable_names.size());
+            for (const auto &name : observable_names)
+                os.push_back({name, {}});
+            bngsim::refuse_parameters_that_read_state(ps, fs, os);
+        },
+        py::arg("parameters"), py::arg("functions"), py::arg("observable_names"),
+        "Raise if a parameter expression reads an observable or a function, as the .net "
+        "loader refuses one (issue #844): a parameter is evaluated once at build, before "
+        "either has a value, so it would silently be 0. A name that is also a parameter "
+        "is not state.");
+
     m.def(
         "reserved_names",
         []() {

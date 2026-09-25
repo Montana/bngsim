@@ -6,7 +6,7 @@ import collections.abc
 import numpy
 import numpy.typing
 import typing
-__all__: list[str] = ['CvodeSimulator', 'HAS_KLU', 'HAS_LAPACK_DENSE', 'HAS_MIR', 'HAS_NFSIM', 'HAS_RULEMONKEY', 'ModelBuilder', 'NetworkModel', 'NfsimSimulator', 'ResultCore', 'RuleMonkeySimulator', 'SolverOptions', 'SolverStats', 'SsaDiagnostics', 'SsaSimulator', 'SteadyStateOptions', 'SteadyStateResultCore', 'TimeSpec', 'bench_ssa_propensity_jit', 'emit_ssa_propensity_source_structure', 'find_steady_state', 'net_file_structure', 'net_function_tables', 'reserved_names']
+__all__: list[str] = ['CvodeSimulator', 'HAS_KLU', 'HAS_LAPACK_DENSE', 'HAS_MIR', 'HAS_NFSIM', 'HAS_RULEMONKEY', 'ModelBuilder', 'NetworkModel', 'NfsimSimulator', 'ResultCore', 'RuleMonkeySimulator', 'SolverOptions', 'SolverStats', 'SsaDiagnostics', 'SsaSimulator', 'SteadyStateOptions', 'SteadyStateResultCore', 'TimeSpec', 'bench_ssa_propensity_jit', 'emit_ssa_propensity_source_structure', 'find_steady_state', 'net_file_structure', 'net_function_tables', 'net_refuse_parameters_that_read_state', 'reserved_names']
 class CvodeSimulator:
     def __init__(self, model: NetworkModel) -> None:
         """
@@ -1261,6 +1261,10 @@ def emit_ssa_propensity_source_structure(model: NetworkModel) -> tuple[str, int]
 def find_steady_state(model: NetworkModel, opts: SteadyStateOptions = ...) -> SteadyStateResultCore:
     """
     Find steady state of the ODE system (releases GIL)
+    """
+def net_refuse_parameters_that_read_state(parameters: collections.abc.Sequence[tuple[str, typing.SupportsFloat | typing.SupportsIndex, str, bool]], functions: collections.abc.Sequence[tuple[str, str]], observable_names: collections.abc.Sequence[str]) -> None:
+    """
+    Raise if a parameter expression reads an observable or a function, as the .net loader refuses one (issue #844): a parameter is evaluated once at build, before either has a value, so it would silently be 0. A name that is also a parameter is not state.
     """
 def net_file_structure(path: str) -> dict:
     """

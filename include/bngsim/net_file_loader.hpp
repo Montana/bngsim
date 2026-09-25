@@ -86,6 +86,15 @@ NetFileStructure parse_net_file_structure(const std::string &path);
 /// which is this plus the load warnings.
 NetworkModel build_net_file_structure(const NetFileStructure &parsed);
 
+/// Throw if a parameter expression reads an observable or a function (issue
+/// #844). A parameter is a constant, evaluated once at build before either has
+/// a value, so such a parameter would silently be 0; BNG2.pl refuses the model.
+/// A name that is also a parameter is not state (the #266 shadowed shape).
+/// Phase 2 runs it, and so does `build_model_from_parsed`, its Python twin.
+void refuse_parameters_that_read_state(const std::vector<ParsedParam> &params,
+                                       const std::vector<ParsedFunction> &functions,
+                                       const std::vector<ParsedObservable> &observables);
+
 // ─── .net table functions ────────────────────────────────────────────────────
 
 /// One table function a `.net` functions line asks for, read out of the
