@@ -1379,6 +1379,16 @@ class Simulator:
             # the detector reads that the core's support walk does not.
             reason = sorted(blocked.values())[0] + "."
             detail = ""
+        elif reason is not None and blocked:
+            # Both refused. The core's reason is generic ("could not resolve
+            # the trigger to a threshold"); the detector's names the identifier
+            # that blocks the threshold, which is what the user has to change in
+            # the model. It used to be computed and then dropped (issue #822).
+            # The detector's message already carries what `detail` would add.
+            reason = (
+                reason.rstrip(".") + ". In detail: " + "; ".join(sorted(blocked.values())) + "."
+            )
+            detail = ""
         if reason:
             raise SensitivityUnsupportedError(
                 "Output sensitivities are not supported for this model's events: "

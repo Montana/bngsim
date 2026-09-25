@@ -1395,3 +1395,31 @@ class TestADerivedTriggerParameterGetsItsOwnColumn:
         own terms. Being the same array is the plainest statement of the fix."""
         _t, sens = _xobs_sens(self._model(), ["sigma", "T0"])
         assert sens[:, 0] == pytest.approx(sens[:, 1], rel=1e-12, abs=1e-14)
+
+
+@pytest.mark.parametrize("rule", ["t_first + 0.1*time()", "t_first*floor(time())"])
+def test_a_refused_rule_threshold_names_the_identifier_that_blocks_it(rule):
+    """Issue #822: when the core refuses an event the ahead-of-run detector also
+    blocked, the error keeps the detector's message. The core's reason is
+    generic; only the detector's names `t_rule`, the identifier the user has to
+    change. It used to be computed and then dropped."""
+    b = ModelBuilder()
+    b.add_parameter("kin", KIN)
+    b.add_parameter("kout", KOUT)
+    b.add_parameter("t_first", 1.0)
+    x = b.add_species("X", 1.0)
+    on = b.add_species("on", 0.0)
+    b.add_observable("Xobs", [(x, 1.0)])
+    b.add_function("t_rule", rule)
+    b.add_parameter("t_rule", 0.0)
+    b.add_reaction([on], [on, x], "elementary", "kin")
+    b.add_reaction([x], [], "elementary", "kout")
+    b.add_event("onset", "time() >= t_rule", [(on, "1.0")])
+    m = bngsim.Model(_core=b.build())
+    sim = bngsim.Simulator(m, method="ode", sensitivity_params=["t_first"])
+    with pytest.raises(bngsim.SensitivityUnsupportedError) as exc:
+        sim.run(t_span=(0, 10), n_points=11)
+    msg = str(exc.value)
+    assert "could not resolve the trigger" in msg  # the core's reason
+    assert "the threshold 't_rule'" in msg and "does not reduce to arithmetic" in msg
+    assert msg.count("does not reduce to arithmetic") == 1
