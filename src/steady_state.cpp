@@ -2794,11 +2794,10 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // Cost is one observable pass plus one function evaluation on a solve that
     // has just run thousands of them.
     {
-        // Save and restore the model's species state around this. The
-        // sensitivity block below leaves the model AT the steady state on
-        // purpose, but it only runs on a converged sensitivity solve; this runs
-        // on every solve, and carrying the state out of it silently changes what
-        // a second steady_state() on the same Simulator starts from. Measured:
+        // Save and restore the model's species state around this, as the
+        // sensitivity block below also does (issue #705). Carrying the state out
+        // of it silently changes what a second steady_state() on the same
+        // Simulator starts from. Measured:
         // an accumulator whose plain solve ends at 49990 came back at 99990 on
         // the second call — it had integrated twice.
         auto &species = const_cast<std::vector<Species> &>(model.species());
@@ -2830,9 +2829,27 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
 
     // Compute sensitivity if requested and converged
     if (result.converged && !opts.sensitivity_params.empty()) {
-        // Update model state to steady-state values for sensitivity
+        // The sensitivity solve is taken at the steady state, so the model is
+        // moved there for it, and put back afterwards, on every exit (issue
+        // #705). It used to be left at x_ss with ic_state_dirty still false, so
+        // the next run() integrated from the steady state with a fresh zero
+        // seed (A = [1, 1, 1, 1] instead of relaxing from its initial
+        // condition, with a wrong dA/dp), and a second sensitivity steady_state()
+        // started from the first one's answer and drifted. The plain solve
+        // already left the model untouched; now both do, which is also what
+        // steady_state_batch() does by running on clones.
         auto &species = const_cast<std::vector<Species> &>(model.species());
+        struct RestoreSpecies {
+            std::vector<Species> &species;
+            std::vector<double> saved;
+            ~RestoreSpecies() {
+                for (std::size_t i = 0; i < saved.size(); ++i) {
+                    species[i].concentration = saved[i];
+                }
+            }
+        } restore{species, std::vector<double>(static_cast<std::size_t>(ns))};
         for (int i = 0; i < ns; ++i) {
+            restore.saved[static_cast<std::size_t>(i)] = species[i].concentration;
             species[i].concentration = result.concentrations[i];
         }
         compute_ss_sensitivity(model, rhs, result, opts.sensitivity_params, opts.jacobian, sub);
