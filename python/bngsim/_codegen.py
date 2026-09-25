@@ -1359,6 +1359,106 @@ _LOGICAL_OR_EQUALITY_PRESENT_RE = re.compile(r"[&|]|\band\b|\bor\b|[=!]=")
 _LOGICAL_REWRITE_BUDGET = 100
 
 
+# What reads as a truth value after the logical rewrite: a comparison, or one of
+# the sympy call forms _rewrite_logicals and _translate_bngl_if_to_piecewise emit.
+_BOOLEAN_CALLS = frozenset({"Eq", "Ne", "And", "Or", "Not"})
+_BOOLEAN_TEXT_RE = re.compile(r"[<>]|\b(?:Eq|Ne|And|Or|Not)\(")
+
+
+def _coerce_booleans_used_as_numbers(expr: str) -> str:
+    """Read a truth value used as a number the way ExprTk does (issue #824).
+
+    ExprTk has no boolean type: a comparison is the number 1 or 0, and a
+    condition may do arithmetic or ordering on it -- `(a==b)<1` (BNG2.pl's own
+    parenthesization of `a==b<1`), `(a<b)*2>1`, `(a<b)+(b<a)>0`. sympy has no
+    such coercion, so `Eq(a, b) < 1` raised TypeError, the rate law "could not
+    be parsed for differentiation", and the analytic sensitivity RHS was declined
+    for the whole model. Every truth value that is an operand of arithmetic, of a
+    comparison, of an ordinary function call or a Piecewise *value* is wrapped as
+    `Piecewise((1, cond), (0, True))`, ExprTk's own 1/0. A truth value in its own
+    place -- a Piecewise condition, an argument of And/Or/Not -- is left alone.
+    Text that does not parse as Python is returned unchanged for the caller's
+    parse to refuse, as before.
+    """
+    if not _BOOLEAN_TEXT_RE.search(expr):
+        return expr
+    import ast
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+
+    def is_bool(node: ast.AST) -> bool:
+        if isinstance(node, ast.Compare):
+            return True
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _BOOLEAN_CALLS
+        )
+
+    changed = False
+
+    def num(node: ast.expr) -> ast.expr:
+        nonlocal changed
+        if not is_bool(node):
+            return node
+        changed = True
+        one, zero = ast.Constant(1), ast.Constant(0)
+        return ast.Call(
+            func=ast.Name(id="Piecewise", ctx=ast.Load()),
+            args=[
+                ast.Tuple(elts=[one, node], ctx=ast.Load()),
+                ast.Tuple(elts=[zero, ast.Constant(True)], ctx=ast.Load()),
+            ],
+            keywords=[],
+        )
+
+    class _Coerce(ast.NodeTransformer):
+        def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+            self.generic_visit(node)
+            node.left, node.right = num(node.left), num(node.right)
+            return node
+
+        def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+            self.generic_visit(node)
+            if not isinstance(node.op, ast.Not):
+                node.operand = num(node.operand)
+            return node
+
+        def visit_Compare(self, node: ast.Compare) -> ast.AST:
+            self.generic_visit(node)
+            node.left = num(node.left)
+            node.comparators = [num(c) for c in node.comparators]
+            return node
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            self.generic_visit(node)
+            name = node.func.id if isinstance(node.func, ast.Name) else None
+            if name in ("And", "Or", "Not"):
+                return node  # truth values in their own place
+            if name == "Piecewise":
+                for arg in node.args:
+                    if isinstance(arg, ast.Tuple) and arg.elts:
+                        arg.elts[0] = num(arg.elts[0])  # the value, not the condition
+                return node
+            if name in ("Eq", "Ne"):
+                # Eq(bool, bool) compares truth values; Eq(bool, x) compares a
+                # number with x, which needs the bool as its 1/0.
+                if len(node.args) == 2 and is_bool(node.args[0]) != is_bool(node.args[1]):
+                    node.args = [num(a) for a in node.args]
+                return node
+            node.args = [num(a) for a in node.args]
+            return node
+
+    new_tree = _Coerce().visit(tree)
+    if not changed:
+        return expr
+    ast.fix_missing_locations(new_tree)
+    return ast.unparse(new_tree)
+
+
 def _rewrite_logicals(expr: str) -> str:
     """Rewrite ExprTk logical AND / OR into sympy ``And(...)`` / ``Or(...)`` calls
     and the equality relationals ``==`` / ``!=`` into ``Eq(...)`` / ``Ne(...)``.
@@ -1869,7 +1969,7 @@ def _preprocess_derived_expr(expr: str) -> str:
     s = _translate_bngl_if_to_piecewise(_normalize_exprtk_operators(expr))
     s = s.replace("^", "**")
     s = re.sub(r"\bnot\s*\(", "Not(", s)
-    return _rewrite_logicals(s)
+    return _coerce_booleans_used_as_numbers(_rewrite_logicals(s))
 
 
 def _derived_rate_constant_decline(name: str, expr: str, reason: str) -> str:

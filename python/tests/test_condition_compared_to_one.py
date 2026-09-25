@@ -62,7 +62,12 @@ def test_sensitivity_follows_the_branch_the_trajectory_takes(tmp_path, cond, tak
         ("if((a>1)!=1,k1,k2)", "Piecewise((k1, Not((a>1))), (k2, True))"),
         # Not claimed: a numeric operand, and a literal other than 0 or 1.
         ("if(p==1,k1,k2)", "Piecewise((k1, Eq(p, 1)), (k2, True))"),
-        ("if((a>1)==2,k1,k2)", "Piecewise((k1, Eq((a>1), 2)), (k2, True))"),
+        # Compared with any other number the truth value is its 1/0 (issue #824),
+        # which never equals 2: sympy folds the branch away, as ExprTk would.
+        (
+            "if((a>1)==2,k1,k2)",
+            "Piecewise((k1, Eq(Piecewise((1, a > 1), (0, True)), 2)), (k2, True))",
+        ),
     ],
 )
 def test_rewrite(text, expected):

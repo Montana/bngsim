@@ -50,6 +50,7 @@ from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _PY_KEYWORD_PARAM_NAMES,
     _alias_keyword_param,
+    _coerce_booleans_used_as_numbers,
     _normalize_exprtk_operators,
     _rewrite_logicals,
     _translate_bngl_if_to_piecewise,
@@ -349,7 +350,8 @@ def _preprocess_exprtk(expr: str) -> str:
     # ``Not(x)`` first (all three are bound in the local dict).
     s = re.sub(r"\bnot\s*\(", "Not(", s)
     s = _rewrite_logicals(s)
-    return s
+    # A truth value used as a number becomes ExprTk's 1/0 (issue #824).
+    return _coerce_booleans_used_as_numbers(s)
 
 
 def _build_local_dict(preprocessed: str, sp):
