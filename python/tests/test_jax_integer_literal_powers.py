@@ -59,14 +59,12 @@ def test_reported_net_runs_through_diffrax_and_jax_jacobian(tmp_path):
     net = tmp_path / "integer_power.net"
     net.write_text(NET)
 
-    diffrax_result = run_diffrax(
-        str(net), {"k": 0.4}, t_end=2.0, n_points=3, rtol=1e-10, atol=1e-12
-    )
+    model = bngsim.Model.from_net(str(net))
+    diffrax_result = run_diffrax(model, {"k": 0.4}, t_end=2.0, n_points=3, rtol=1e-10, atol=1e-12)
     expected_a = 3.0 * np.exp(-0.4 * np.asarray(diffrax_result["time"]))
     np.testing.assert_allclose(diffrax_result["species"][:, 0], expected_a, rtol=1e-8)
 
-    model = bngsim.Model.from_net(str(net))
-    result = bngsim.Simulator(model, method="ode", jacobian="jax", net_path=str(net)).run(
-        t_span=(0.0, 2.0), n_points=3, rtol=1e-10, atol=1e-12
-    )
+    with pytest.warns(UserWarning, match="jacobian='jax'"):
+        sim = bngsim.Simulator(model, method="ode", jacobian="jax")
+    result = sim.run(t_span=(0.0, 2.0), n_points=3, rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(result.species[:, 0], expected_a, rtol=1e-8)
