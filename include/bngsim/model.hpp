@@ -187,6 +187,15 @@ class NetworkModel {
     event_sensitivity_unsupported_reason(const std::vector<std::string> &sens_param_names,
                                          const std::vector<int> &event_time_compensated = {}) const;
 
+    // Whether event `event_idx` queues nothing this run: its delay is a literal
+    // 0, or an expression that reads only fixed (non-expression) parameters and
+    // evaluates to 0 for their current values (issue #835). Parameters cannot
+    // move during a run, so neither can such a delay; a delay that reads state,
+    // time or a derived parameter is never fixed. `reads`, when given, receives
+    // the indices into parameters() the expression reads. The answer holds for
+    // the current parameter values only — a later set_param can change it.
+    bool event_delay_is_fixed_zero(int event_idx, std::vector<int> *reads = nullptr) const;
+
     // ─── Event-trigger residuals for a moving crossing (issue #144) ──────────
     //
     // The CVODE root function is the *boolean* trigger offset by 0.5, which is

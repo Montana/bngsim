@@ -206,10 +206,13 @@ def build_gillespy2_from_net(net_path):
         for idx in r["products"]:
             sp = species_map[idx]
             products[sp] = products.get(sp, 0) + 1
+        # The dict splits a `0.5*k1` rate column into rate_law "k1" and
+        # stat_factor 0.5 (issue #803); the rate expression gillespy2 gets is the
+        # column as written, factor included.
+        sf = float(r["stat_factor"])
+        rate = r["rate_law"] if sf == 1.0 else f"{sf!r}*{r['rate_law']}"
         m.add_reaction(
-            gillespy2.Reaction(
-                name=f"R{ri}", reactants=reactants, products=products, rate=r["rate_law"]
-            )
+            gillespy2.Reaction(name=f"R{ri}", reactants=reactants, products=products, rate=rate)
         )
     return m, species_order
 

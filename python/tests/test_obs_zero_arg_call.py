@@ -129,7 +129,7 @@ class TestIdentLookupEatsEmptyParens:
         lookup = _build_ident_lookup_model({"k1": "p[0]"}, {}, {"Atot": "obs[0]"}, {})
         assert _translate_expr_to_c("abs(Atot)", lookup) == "fabs(obs[0])"
         assert _translate_expr_to_c("ln(Atot)", lookup) == "log(obs[0])"
-        assert _translate_expr_to_c("max(Atot,k1)", lookup) == "fmax(obs[0],p[0])"
+        assert _translate_expr_to_c("max(Atot,k1)", lookup) == "bngsim_max(obs[0],p[0])"
         assert _translate_expr_to_c("tanh(Atot)", lookup) == "tanh(obs[0])"
 
 
