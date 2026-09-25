@@ -150,10 +150,45 @@ def _real_literal(v: float) -> str:
     libRoadRunner (GH #92).
     """
     if _math.isfinite(v):
-        return repr(v)
+        # A negative literal is parenthesised, like the -inf form below: the
+        # parent templates splice it in as-is, and bare `-3.0` as a power base
+        # reads as -(3^2) and after a minus as `a--3.0` (GH #744).
+        return f"({v!r})" if _math.copysign(1.0, v) < 0.0 else repr(v)
     if _math.isnan(v):
         return "(0.0/0.0)"
     return "(1.0/0.0)" if v > 0.0 else "(-1.0/0.0)"
+
+
+def _atomic(expr: str) -> str:
+    """Parenthesise substituted expression text unless it is one token.
+
+    A local parameter, a function-definition argument, a species-IC lift or a
+    constant assignment-rule lift is spliced into operator templates as text.
+    Bare `-3` or `a+b` there changes meaning as a power base or after a minus
+    (GH #744), so anything but a name, an unsigned number or an already fully
+    parenthesised group gets parentheses.
+    """
+    if _ATOMIC_TOKEN.fullmatch(expr) or _fully_parenthesised(expr):
+        return expr
+    return f"({expr})"
+
+
+_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
+
+
+def _fully_parenthesised(expr: str) -> bool:
+    """Whether the opening ``(`` of *expr* is closed by its last character."""
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return False
+    depth = 0
+    for i, ch in enumerate(expr):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i == len(expr) - 1
+    return False
 
 
 def _ia_value_changed(new: float, old: float | None) -> bool:
@@ -7504,7 +7539,7 @@ def _ast_to_exprtk_with_funcdefs(node, func_defs, local_params=None):
     if t == libsbml.AST_NAME and local_params:
         name = node.getName()
         if name and name in local_params:
-            return local_params[name]
+            return _atomic(local_params[name])
 
     # Default: recurse through the general translator.
     return _ast_to_exprtk_recursive(node, func_defs, local_params)
@@ -7562,7 +7597,8 @@ def _ast_to_exprtk_recursive(node, func_defs, local_params):
 
     # Leaf: number
     if t == libsbml.AST_INTEGER:
-        return str(node.getInteger())
+        v = node.getInteger()
+        return f"({v})" if v < 0 else str(v)  # see _real_literal (GH #744)
     if t in (libsbml.AST_REAL, libsbml.AST_REAL_E):
         return _real_literal(node.getReal())
     if t == libsbml.AST_RATIONAL:
@@ -7572,7 +7608,7 @@ def _ast_to_exprtk_recursive(node, func_defs, local_params):
     if t == libsbml.AST_NAME:
         name = node.getName()
         if local_params and name in local_params:
-            return local_params[name]
+            return _atomic(local_params[name])
         return _safe_name(name) if name else "0"
     if t == libsbml.AST_NAME_TIME:
         return "time()"
@@ -7844,7 +7880,7 @@ def _substitute_ast(node, subs, func_defs, local_params):
         if name in subs:
             return f"({subs[name]})"
         if local_params and name in local_params:
-            return local_params[name]
+            return _atomic(local_params[name])
         return _safe_name(name) if name else "0"
 
     # For non-name nodes, convert normally but with subs as local_params
