@@ -246,23 +246,28 @@ def _jax_inv_hill_power(x: Any, n: Any) -> Any:
 
     JAX's derivative of the direct power can become ``inf/inf`` even while the
     Hill fraction itself has cleanly saturated to zero (issue #838). For
-    positive bases, ``sigmoid(-n*log(x))`` is the same fraction and has a finite
-    tangent. Keep the direct expression for non-positive bases, where logarithms
-    would change the real-valued behavior of integer powers. Each branch reads
-    a masked base so the branch not taken cannot leak a NaN tangent through
-    ``where`` (and this stays elementwise under ``vmap``, unlike ``lax.cond``).
+    positive bases, with ``z = n*log(x) = log(x**n)``, the fraction is
+    ``1/(1 + e^z)`` for ``z <= 0`` and ``e^-z/(1 + e^-z)`` for ``z > 0``. Each
+    exponential is at most 1, so neither the value nor its tangent overflows,
+    and neither form subtracts from 1: ``sigmoid(-z)`` has the same value, but
+    its tangent ``s*(1 - s)`` cancels to 0 once ``x**n`` drops below ~1e-16,
+    where the true derivative ``-n*x**(n-1)`` can be huge (x = 1e-300, n = 0.5).
+    Keep the direct expression for non-positive bases, where logarithms would
+    change the real-valued behavior of integer powers. Every branch reads masked
+    inputs, ``n`` included, so the branch not taken cannot leak a NaN tangent or
+    cotangent through ``where`` (``0**n`` is inf for a negative ``n``), and this
+    stays elementwise under ``vmap``, unlike ``lax.cond``.
     """
-    import jax
     import jax.numpy as jnp
 
     pos = x > 0.0
-    x_pos = jnp.where(pos, x, 1.0)
-    x_nonpos = jnp.where(pos, 0.0, x)
-    return jnp.where(
-        pos,
-        jax.nn.sigmoid(-n * jnp.log(x_pos)),
-        1.0 / (1.0 + jnp.power(x_nonpos, n)),
-    )
+    z = n * jnp.log(jnp.where(pos, x, 1.0))
+    low = z <= 0.0
+    p = jnp.exp(jnp.where(low, z, 0.0))  # x**n, at most 1
+    q = jnp.exp(-jnp.where(low, 0.0, z))  # x**-n, below 1
+    positive = jnp.where(low, 1.0 / (1.0 + p), q / (1.0 + q))
+    direct = 1.0 / (1.0 + jnp.power(jnp.where(pos, 0.0, x), jnp.where(pos, 1.0, n)))
+    return jnp.where(pos, positive, direct)
 
 
 # The engine's two roundings, neither of which jax.numpy spells. jnp.round

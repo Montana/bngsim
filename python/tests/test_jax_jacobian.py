@@ -289,3 +289,28 @@ class TestExpressionTranslation:
             "k/(1+(Atot/K)^n)", {"k": 0, "K": 1, "n": 2}, {"Atot": 0}, set(), []
         )
         assert "__bngsim_inv_hill_power__" in result
+
+    @pytest.mark.parametrize(
+        ("x", "n"),
+        [(1e-300, 0.5), (1e-8, 2.0), (0.5, 4.0), (1.0, 50.0), (2.0, -3.0), (-2.0, 3.0)],
+    )
+    def test_stable_hill_tangent_matches_the_direct_form(self, x, n):
+        """The stable form keeps the direct form's derivative where that one is
+        finite, in both AD modes. sigmoid(-n*log(x)) has the same value, but its
+        tangent s*(1 - s) cancels to 0 once x**n < ~1e-16 (x = 1e-300, n = 0.5:
+        0 against -5e149), and an unmasked n leaked 0**n = inf from the branch
+        not taken into the reverse-mode dH/dn for a negative n (NaN)."""
+        from bngsim._jax_rhs import _jax_inv_hill_power, jax_available
+
+        assert jax_available()  # enables x64
+
+        def direct(x, n):
+            return 1.0 / (1.0 + jnp.power(x, n))
+
+        args = (jnp.float64(x), jnp.float64(n))
+        np.testing.assert_allclose(_jax_inv_hill_power(*args), direct(*args), rtol=1e-14)
+        for argnum in (0, 1) if x > 0 else (0,):
+            want = jax.grad(direct, argnums=argnum)(*args)
+            for mode in (jax.grad, jax.jacfwd):
+                got = mode(_jax_inv_hill_power, argnums=argnum)(*args)
+                np.testing.assert_allclose(got, want, rtol=1e-12)
