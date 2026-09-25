@@ -2,11 +2,10 @@
 clamp marker when the species carries a `@compartment::` prefix (e.g.
 `@CP::$Sink()`) that BNG2.pl emits for cBNGL models.
 
-Covers both loader paths (codegen's own ``.net`` parser, the third, went in
-#803 step 4):
-- `bngsim._net_reader._strip_fixed_marker` (the shared helper)
-- `bngsim._net_reader.parse_net_file` (the pure-Python ModelBuilder path)
-- C++ `NetworkModel.from_net` reached via `bngsim.Model.from_net`
+Since #803 there is one reading of the format, the C++ loader's; these pin it
+through both of its doors:
+- `bngsim.parse_net_file`, which returns the loader's reading as a dict
+- `NetworkModel.from_net` reached via `bngsim.Model.from_net`
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from pathlib import Path
 import bngsim
 import numpy as np
 import pytest
-from bngsim._net_reader import _strip_fixed_marker, parse_net_file
+from bngsim._net_reader import parse_net_file
 
 
 def _write_compartmental_clamp_net(tmp_path: Path) -> Path:
@@ -47,7 +46,11 @@ def _write_compartmental_clamp_net(tmp_path: Path) -> Path:
 
 
 class TestStripFixedMarker:
-    """Unit tests for the shared `$`-stripping helper."""
+    """The `$`-stripping rule, one species line at a time, as the loader reads it.
+
+    These were unit tests of a Python helper until #803 moved the reading into the
+    loader alone; each case is now a one-species `.net`, read by `parse_net_file`.
+    """
 
     @pytest.mark.parametrize(
         "raw, expected",
@@ -63,12 +66,15 @@ class TestStripFixedMarker:
             ("@", ("@", False)),
         ],
     )
-    def test_strip(self, raw: str, expected: tuple[str, bool]) -> None:
-        assert _strip_fixed_marker(raw) == expected
+    def test_strip(self, tmp_path: Path, raw: str, expected: tuple[str, bool]) -> None:
+        net = tmp_path / "one.net"
+        net.write_text(f"begin species\n    1 {raw} 1\nend species\n")
+        ((name, _ic, fixed),) = parse_net_file(net)["species"]
+        assert (name, fixed) == expected
 
 
 class TestNetReaderCompartmentalClamp:
-    """The pure-Python `_net_reader.parse_net_file` path."""
+    """The `parse_net_file` door."""
 
     def test_clamp_marker_after_compartment_prefix(self, tmp_path: Path) -> None:
         parsed = parse_net_file(_write_compartmental_clamp_net(tmp_path))

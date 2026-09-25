@@ -282,29 +282,16 @@ class TestUnevaluableExpressionIsRefused:
 
 
 class TestWithoutTheCompiledExtension:
-    """`parse_net_file` is documented as usable with no C++ extension present."""
+    """`parse_net_file` reads with the C++ loader since issue #803, so it needs the
+    extension, and says so rather than failing somewhere inside."""
 
-    @pytest.fixture
-    def no_core(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_it_says_it_needs_the_compiled_loader(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         # None in sys.modules makes `from bngsim._bngsim_core import ...` raise
         # ImportError, which is what an install without the extension looks like.
         monkeypatch.setitem(sys.modules, "bngsim._bngsim_core", None)
-
-    def test_plain_arithmetic_still_evaluates(self, no_core: None, tmp_path: Path) -> None:
-        vals = _values(tmp_path, [("NA", "6.022e23"), ("conc", "1e-9"), ("n", "conc*NA")])
-        assert vals["n"] == pytest.approx(6.022e14, rel=1e-12)
-
-    def test_caret_is_exponentiation_on_the_fallback_too(
-        self, no_core: None, tmp_path: Path
-    ) -> None:
-        assert _values(tmp_path, [("A0", "10^2")])["A0"] == 100.0
-
-    def test_bngl_syntax_is_refused_not_guessed(self, no_core: None, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match=r"cannot evaluate .net parameter Rtot"):
-            _values(tmp_path, [("R0", "100"), ("Rtot", "if(R0>1, R0, 0.5*R0)")])
-
-    def test_python_keyword_name_is_refused_not_guessed(
-        self, no_core: None, tmp_path: Path
-    ) -> None:
-        with pytest.raises(ValueError, match=r"cannot evaluate .net parameter x_0"):
-            _values(tmp_path, [("lambda", "3"), ("d", "4"), ("x_0", "lambda/d")])
+        net = tmp_path / "m.net"
+        net.write_text("begin parameters\n  1 k 1\nend parameters\n")
+        with pytest.raises(ImportError, match="compiled .net loader"):
+            parse_net_file(net)

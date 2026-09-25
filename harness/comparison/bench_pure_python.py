@@ -217,12 +217,14 @@ def run_scipy_from_net_reader(net_path, t_end, n_steps):
         dy = np.zeros(nsp)
         for r in rxns:
             rl = r["rate_law"]
+            # A functional rate is a rate constant, like an elementary one: the
+            # engine multiplies it by the reactant amounts too (BNGL convention).
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
-                for ri in r["reactants"]:
-                    rate *= y[ri]
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
+            for ri in r["reactants"]:
+                rate *= y[ri]
             for ri in r["reactants"]:
                 dy[ri] -= rate
             for pi in r["products"]:
