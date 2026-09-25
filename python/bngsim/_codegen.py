@@ -2488,6 +2488,24 @@ def _derivative_is_unevaluated(deriv) -> bool:
     return bool(deriv.has(sp.Derivative))
 
 
+def _guard_zero_base(deriv):
+    """*deriv* with the emitters' zero-base rewrites applied (issue #720).
+
+    The same :func:`bngsim._jacobian._emitter_rewrites` pass ``sympy_to_c``
+    runs, so ``P**e*log(P)`` and ``e*P**e/P`` take their limit at ``P = 0``
+    instead of evaluating to NaN. A rewrite that raises, or that folds a
+    non-finite atom back in (issue #541), leaves *deriv* as it was: the guard
+    is an improvement where it applies, never a new failure.
+    """
+    from bngsim._jacobian import _emitter_rewrites, _folds_nonfinite
+
+    try:
+        guarded = _emitter_rewrites(deriv)
+    except Exception:  # noqa: BLE001 - keep the unguarded derivative
+        return deriv
+    return deriv if _folds_nonfinite(guarded) else guarded
+
+
 def _direct_derived_partials(
     expr: str,
     primary_names: set[str],
@@ -2536,6 +2554,12 @@ def _direct_derived_partials(
             # way. Asking first is what makes the reason readable, since it is
             # published with the run's df/dp verdict (issue #438).
             return None, _STEP_DERIVATIVE_REASON
+        # The emitters' zero-base guards (#310/#317/#333/#388), which bare
+        # sp.ccode skipped: d(E^n)/dn printed as pow(E,n)*log(E) and d(E^n)/dE
+        # as n*pow(E,n)/E, both NaN at E = 0, so every sensitivity run on such
+        # a model was refused while the same law written inline in a Functional
+        # rate was right (issue #720). The printing itself stays sp.ccode.
+        deriv = _guard_zero_base(deriv)
         try:
             c_str = sp.ccode(deriv)
         except Exception as exc:
@@ -2743,6 +2767,8 @@ def _direct_derived_partials_numeric(
     and issue #56's point is only that a missing one must not pass silently for
     a real zero.
     """
+    import math
+
     import sympy as sp
 
     prep, reason = _prepare_derived_expr(expr, primary_names, derived_names)
@@ -2764,10 +2790,17 @@ def _direct_derived_partials_numeric(
                 _warn_chain_rule_dropped(expr, [p_name], _STEP_DERIVATIVE_REASON)
             continue
         try:
-            val = float(deriv.subs(subs).evalf())
+            # The C twin's zero-base guards, so both agree at a zero base
+            # (issue #720): the raw derivative is NaN there.
+            val = float(_guard_zero_base(deriv).subs(subs).evalf())
         except (TypeError, ValueError) as exc:
             if warn_on_failure:
                 _warn_chain_rule_dropped(expr, [p_name], f"{type(exc).__name__}: {exc}")
+            continue
+        if not math.isfinite(val):
+            # NaN != 0.0, so a non-finite partial used to be kept as a real one.
+            if warn_on_failure:
+                _warn_chain_rule_dropped(expr, [p_name], f"non-finite at this point ({val})")
             continue
         if val != 0.0:
             out[p_name] = val
