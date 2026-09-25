@@ -2334,7 +2334,7 @@ def _names_referenced_in_split(
 # exponent of a numeric literal (`1e5`, `2.5E-3`) from reading as a name. Shared
 # with _switch_sensitivity._parse_clock_expr, which binds bare names the same
 # way for the same reason (issue #757), so the two cannot drift.
-_DERIVED_BARE_NAME =re.compile(r"(?<![\w.])([A-Za-z_]\w*)(\s*\()?")
+_DERIVED_BARE_NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)(\s*\()?")
 
 
 def _prepare_derived_expr(
