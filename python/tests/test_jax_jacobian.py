@@ -210,6 +210,48 @@ class TestPrepareJaxJacobian:
         assert abs(flat_jac[2]) < 1e-10  # col 1, row 0
         assert abs(flat_jac[3]) < 1e-10  # col 1, row 1
 
+    def test_saturated_hill_jacobian_is_finite_and_the_solve_completes(self, tmp_path):
+        """Issue #838: AD of x**n used to produce inf/inf in the Hill tangent."""
+        import bngsim
+        from bngsim._jax_rhs import generate_jax_jacobian
+
+        net = tmp_path / "saturated_hill.net"
+        net.write_text(
+            """begin parameters
+ 1 k 2.0
+ 2 K 1.0
+ 3 n 999.898
+ 4 ks 1.0
+end parameters
+begin species
+ 1 A() 5
+ 2 B() 0
+end species
+begin reactions
+ 1 0 2 f #_R1
+ 2 1 0 ks #_R2
+end reactions
+begin groups
+ 1 Atot 1
+end groups
+begin functions
+ 1 f() k/(1+(Atot/K)^n)
+end functions
+""",
+            encoding="utf-8",
+        )
+
+        params = np.array([2.0, 1.0, 999.898, 1.0])
+        jac = np.asarray(generate_jax_jacobian(str(net))(np.array([5.0, 1.0]), 0.0, params))
+        assert np.isfinite(jac).all()
+        np.testing.assert_allclose(jac, [[-1.0, 0.0], [0.0, 0.0]], atol=1e-14)
+
+        model = bngsim.Model.from_net(str(net))
+        with pytest.warns(UserWarning, match="jacobian='jax'"):
+            sim = bngsim.Simulator(model, method="ode", jacobian="jax", net_path=str(net))
+        result = sim.run(t_span=(0.0, 2.0), n_points=3)
+        np.testing.assert_allclose(result.species[-1, 0], 5.0 * np.exp(-2.0), rtol=1e-6)
+
 
 class TestExpressionTranslation:
     """Test .net expression -> JAX translation."""
@@ -239,3 +281,36 @@ class TestExpressionTranslation:
         expr = "k*(x^2)"
         result = _translate_expr_jax(expr, {"k": 0, "x": 1}, {}, set(), [])
         assert "**" in result
+
+    def test_translates_saturating_hill_denominator_stably(self):
+        from bngsim._jax_rhs import _translate_expr_jax
+
+        result = _translate_expr_jax(
+            "k/(1+(Atot/K)^n)", {"k": 0, "K": 1, "n": 2}, {"Atot": 0}, set(), []
+        )
+        assert "__bngsim_inv_hill_power__" in result
+
+    @pytest.mark.parametrize(
+        ("x", "n"),
+        [(1e-300, 0.5), (1e-8, 2.0), (0.5, 4.0), (1.0, 50.0), (2.0, -3.0), (-2.0, 3.0)],
+    )
+    def test_stable_hill_tangent_matches_the_direct_form(self, x, n):
+        """The stable form keeps the direct form's derivative where that one is
+        finite, in both AD modes. sigmoid(-n*log(x)) has the same value, but its
+        tangent s*(1 - s) cancels to 0 once x**n < ~1e-16 (x = 1e-300, n = 0.5:
+        0 against -5e149), and an unmasked n leaked 0**n = inf from the branch
+        not taken into the reverse-mode dH/dn for a negative n (NaN)."""
+        from bngsim._jax_rhs import _jax_inv_hill_power, jax_available
+
+        assert jax_available()  # enables x64
+
+        def direct(x, n):
+            return 1.0 / (1.0 + jnp.power(x, n))
+
+        args = (jnp.float64(x), jnp.float64(n))
+        np.testing.assert_allclose(_jax_inv_hill_power(*args), direct(*args), rtol=1e-14)
+        for argnum in (0, 1) if x > 0 else (0,):
+            want = jax.grad(direct, argnums=argnum)(*args)
+            for mode in (jax.grad, jax.jacfwd):
+                got = mode(_jax_inv_hill_power, argnums=argnum)(*args)
+                np.testing.assert_allclose(got, want, rtol=1e-12)

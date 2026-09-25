@@ -622,14 +622,6 @@ end functions
     np.testing.assert_allclose(r["species"][:, 0], 3.0 * np.exp(-0.4 * r["time"]), rtol=1e-7)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="lanl/bngsim#838 (pre-existing JAX AD defect, not step 4's): forward-mode AD of "
-    "k/(1+x^n) with x^n = inf is inf/inf = NaN where the derivative is 0, so "
-    "Simulator(jacobian='jax') hands CVODE a NaN Jacobian (CV_CONV_FAILURE); four "
-    "corpus models hit it (e.g. m_9f39a8b69b1944ba39ab87a6d4aa3836.net)",
-)
 def test_a_saturated_steep_hill_term_has_a_finite_jacobian(tmp_path):
     net = _write(
         tmp_path,
