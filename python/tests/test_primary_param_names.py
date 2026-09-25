@@ -47,6 +47,7 @@ these sweeps actually read.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import bngsim
@@ -212,43 +213,73 @@ def test_sir_is_the_issues_own_reproduction():
     assert m.get_param("gamma") == 1.0 / 7.0
 
 
-# ── The rule is BNG2.pl's own, and now only one place decides it ────────────
+# ── The rule is BNG2.pl's own ───────────────────────────────────────────────
+
+#: BNG2.pl's kind comment on a parameters-block line.
+_KIND_COMMENT = re.compile(r"#\s*(ConstantExpression|Constant)\b")
+#: Hand-written lines whose comment BNG2.pl would not have written:
+#: `1 p 2+3 # ConstantExpression` names no other parameter, and BNG2.pl
+#: annotates by reference (#181), as the loader classifies.
+_HAND_ANNOTATED = {("expr_param_species.net", "p")}
+
+
+def _annotated_kinds(path: Path) -> dict[str, bool]:
+    """``{name: is_derived}`` as BNG2.pl's ``# Constant`` / ``# ConstantExpression``
+    comments on the parameters block say. Lines without one are left out."""
+    kinds: dict[str, bool] = {}
+    in_block = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        text = line.strip()
+        if text.startswith("begin parameters"):
+            in_block = True
+            continue
+        if text.startswith("end parameters"):
+            break
+        match = _KIND_COMMENT.search(text) if in_block else None
+        if match is None:
+            continue
+        tokens = text.split("#", 1)[0].split()
+        if not tokens:
+            continue
+        name = tokens[1] if tokens[0].isdigit() and len(tokens) > 2 else tokens[0]
+        kinds[name] = match.group(1) == "ConstantExpression"
+    return kinds
 
 
 @pytest.mark.skipif(not _NETS, reason=f".net models not present under {_NET_TREE}")
-def test_the_loader_agrees_with_the_codegen_net_parser():
-    """One rule, two readers — the disagreement #227 reported is closed.
+def test_the_loader_classifies_parameters_as_bng2pl_annotates_them():
+    """BNG2.pl writes each parameter's kind beside it: ``# ConstantExpression``
+    when its value names another parameter, ``# Constant`` when it does not
+    (#181). That is an oracle written by a different program, and the loader's
+    ``param_is_expression`` must reproduce it on every line it annotates.
 
-    ``_classify_parameter_kinds`` (#181) is the codegen ``.net`` parser's answer
-    to the same question, reached from the file text. This is the loaded model's
-    answer, reached from ``ModelBuilder``. They partition the parameter block the
-    same way on every ``.net`` in the tree, which is what makes the model-based
-    and text-based codegen paths emit the same sensitivity RHS for a file.
-
-    Function slots are excluded because they are not in the parameters block at
-    all — the loader synthesizes them, and #227 flags them ``is_internal``.
+    Until #803 step 4 this was checked against codegen's private ``.net`` parser,
+    a second reader in this package; that parser is gone, and BNG2.pl's own
+    comment is the stronger oracle anyway.
     """
-    from bngsim._codegen import _parse_net_file
-
-    compared = 0
+    compared = lines = 0
     for path in _NETS:
+        annotated = _annotated_kinds(path)
+        if not annotated:
+            continue
         try:
-            parsed = _parse_net_file(str(path))
             m = bngsim.Model.load(str(path))
         except Exception:  # a few fixtures are deliberately malformed
             continue
-        text_derived = {name for _, name, _, is_const in parsed["parameters"] if not is_const}
-        model_derived = {
-            n
-            for n, f in zip(m.param_names, m.param_is_expression, strict=True)
-            if f and n not in m._internal_param_names()
-        }
-        if not parsed["parameters"]:
-            continue
+        loaded = dict(zip(m.param_names, m.param_is_expression, strict=True))
+        for name, derived in annotated.items():
+            if (path.name, name) in _HAND_ANNOTATED:
+                continue
+            assert loaded[name] == derived, (
+                f"{path.name}: {name} is annotated "
+                f"{'ConstantExpression' if derived else 'Constant'} but loaded as "
+                f"{'derived' if loaded[name] else 'primary'}"
+            )
+            lines += 1
         compared += 1
-        assert text_derived == model_derived, f"{path.name}: {text_derived ^ model_derived}"
 
-    assert compared > 50, f"only {compared} .net models compared"
+    assert compared > 50, f"only {compared} annotated .net models compared"
+    assert lines > 500, f"only {lines} annotated parameter lines compared"
 
 
 # ── Direction 2: a function is not a knob ───────────────────────────────────

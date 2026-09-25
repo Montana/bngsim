@@ -23,9 +23,10 @@ always compiles, because its sensitivity RHS is generated code.
 Until issue #803, a `.net` or BNGL model was compiled from a second reading of
 its `.net` file, by a parser of codegen's own, and wherever that reading
 disagreed with the loader's the compiled model did too (issue #784). There is
-one reading now. `bngsim.prepare_codegen(net_path)` remains as a deprecated
-wrapper that loads the file and compiles the model, and `Simulator`'s
-`net_path` is read only by `jacobian="jax"`.
+one reading now: `jacobian="jax"` and the diffrax solver read the built model
+too. `bngsim.prepare_codegen(net_path)` remains as a deprecated wrapper that
+loads the file and compiles the model, and `Simulator(net_path=...)` is
+deprecated and ignored.
 
 Codegen is **enabled by default** in PyBNF's `BngsimModel` (set
 `BNGSIM_NO_CODEGEN=1` to disable). Compiled `.so` files are cached in

@@ -2,9 +2,9 @@
 clamp marker when the species carries a `@compartment::` prefix (e.g.
 `@CP::$Sink()`) that BNG2.pl emits for cBNGL models.
 
-Covers all three loader paths:
-- `bngsim._codegen._strip_fixed_marker` (the shared helper)
-- `bngsim._codegen._parse_species_line` (used by the Python codegen)
+Covers both loader paths (codegen's own ``.net`` parser, the third, went in
+#803 step 4):
+- `bngsim._net_reader._strip_fixed_marker` (the shared helper)
 - `bngsim._net_reader.parse_net_file` (the pure-Python ModelBuilder path)
 - C++ `NetworkModel.from_net` reached via `bngsim.Model.from_net`
 """
@@ -17,8 +17,7 @@ from pathlib import Path
 import bngsim
 import numpy as np
 import pytest
-from bngsim._codegen import _parse_species_line, _strip_fixed_marker
-from bngsim._net_reader import parse_net_file
+from bngsim._net_reader import _strip_fixed_marker, parse_net_file
 
 
 def _write_compartmental_clamp_net(tmp_path: Path) -> Path:
@@ -66,10 +65,6 @@ class TestStripFixedMarker:
     )
     def test_strip(self, raw: str, expected: tuple[str, bool]) -> None:
         assert _strip_fixed_marker(raw) == expected
-
-    def test_parse_species_line_compartmental_clamp(self) -> None:
-        idx, name, conc, is_fixed = _parse_species_line("2 @CP::$Sink() 0")
-        assert (idx, name, conc, is_fixed) == (2, "@CP::Sink()", "0", True)
 
 
 class TestNetReaderCompartmentalClamp:

@@ -164,7 +164,7 @@ def test_the_jax_jacobian_matches_the_default(tmp_path, body):
             return bngsim.Simulator(model, method="ode", **kw).run(t_span=(0.0, 5.0), n_points=6)
 
     default = np.asarray(_run().species)[:, 0]
-    with_jax = np.asarray(_run(jacobian="jax", net_path=str(net)).species)[:, 0]
+    with_jax = np.asarray(_run(jacobian="jax").species)[:, 0]
     assert with_jax == pytest.approx(default, rel=1e-6, abs=1e-8)
     # ...and the model actually moved, so the agreement is not two flat lines.
     assert default[-1] < default[0]

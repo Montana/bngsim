@@ -216,7 +216,7 @@ def test_the_jax_jacobian_matches_the_default(tmp_path, body):
             return bngsim.Simulator(model, method="ode", **kw).run(t_span=(0.0, 5.0), n_points=6)
 
     default = np.asarray(_run().species)[:, 0]
-    with_jax = np.asarray(_run(jacobian="jax", net_path=str(net)).species)[:, 0]
+    with_jax = np.asarray(_run(jacobian="jax").species)[:, 0]
     assert with_jax == pytest.approx(default, rel=1e-6, abs=1e-8)
     assert default[-1] < default[0]
 
@@ -298,4 +298,4 @@ def test_an_unmapped_model_fails_at_build_with_the_name(tmp_path):
     with contextlib.redirect_stderr(io.StringIO()):
         model = bngsim.Model.from_net(str(net))
         with pytest.raises(ValueError, match="erf"):
-            bngsim.Simulator(model, method="ode", jacobian="jax", net_path=str(net))
+            bngsim.Simulator(model, method="ode", jacobian="jax")

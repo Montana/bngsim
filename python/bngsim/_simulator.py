@@ -371,9 +371,9 @@ class Simulator:
         (256), where native code beats the interpreter; ``False`` never does.
 
     net_path : str, optional
-        BioNetGen ``.net`` path, required by ``jacobian="jax"``, which reads the
-        file itself. Codegen does not read it: it compiles the model bngsim
-        built.
+        Deprecated and ignored (issue #803). Every backend reads the model it is
+        given -- codegen since step 3, ``jacobian="jax"`` since step 4 -- so
+        passing it warns and changes nothing.
 
     sensitivity_params : list[str], optional
         Parameter names to integrate forward sensitivities for, alongside
@@ -890,6 +890,13 @@ class Simulator:
         jit_backend = _codegen_jit_backend()
         net_path_str = str(net_path) if net_path else ""
         self._net_path = net_path_str
+        if net_path_str:
+            warnings.warn(
+                "Simulator(net_path=...) is deprecated and ignored: every backend, "
+                "jacobian='jax' included, reads the model it is given (issue #803).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         # ── Lazy analytical Functional Jacobian + large-model auto-codegen ────
         # (GH #145) Both are consumed ONLY by ODE solves, so they are deferred
@@ -1080,11 +1087,9 @@ class Simulator:
                 "jacobian='jax' is intended for AD research only.",
                 stacklevel=2,
             )
-            if not net_path:
-                raise ValueError(
-                    "jacobian='jax' requires net_path=... pointing "
-                    "to the .net file used to load the model."
-                )
+            # Built from the model, whatever it was loaded from (#803 step 4); a
+            # model the JAX RHS does not implement, or would misdescribe, is
+            # refused here with the construct named.
             from bngsim._jax_rhs import (
                 jax_available,
                 prepare_jax_jacobian,
@@ -1094,7 +1099,7 @@ class Simulator:
                 raise ImportError(
                     "JAX is required for jacobian='jax'. Install with: pip install jax jaxlib"
                 )
-            eval_fn, n_sp = prepare_jax_jacobian(net_path)
+            eval_fn, n_sp = prepare_jax_jacobian(model)
             self._jax_jac_evaluator = eval_fn
             logger.info("JAX AD Jacobian ready for %d species", n_sp)
         elif jacobian == "jax" and dispatch != "ode":
