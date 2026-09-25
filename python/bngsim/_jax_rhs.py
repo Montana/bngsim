@@ -25,6 +25,7 @@ Optional dependency: ``pip install bngsim[jax]``.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import logging
 import os
@@ -240,6 +241,30 @@ _JAX_CONSTANTS: dict[str, str] = {
 _JAX_NAMES: dict[str, str] = {**_JAX_MATH_FUNCS, **_JAX_CONSTANTS}
 
 
+def _jax_inv_hill_power(x: Any, n: Any) -> Any:
+    """Evaluate ``1 / (1 + x**n)`` without overflowing for positive ``x``.
+
+    JAX's derivative of the direct power can become ``inf/inf`` even while the
+    Hill fraction itself has cleanly saturated to zero (issue #838). For
+    positive bases, ``sigmoid(-n*log(x))`` is the same fraction and has a finite
+    tangent. Keep the direct expression for non-positive bases, where logarithms
+    would change the real-valued behavior of integer powers. Each branch reads
+    a masked base so the branch not taken cannot leak a NaN tangent through
+    ``where`` (and this stays elementwise under ``vmap``, unlike ``lax.cond``).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    pos = x > 0.0
+    x_pos = jnp.where(pos, x, 1.0)
+    x_nonpos = jnp.where(pos, 0.0, x)
+    return jnp.where(
+        pos,
+        jax.nn.sigmoid(-n * jnp.log(x_pos)),
+        1.0 / (1.0 + jnp.power(x_nonpos, n)),
+    )
+
+
 # The engine's two roundings, neither of which jax.numpy spells. jnp.round
 # rounds a half to EVEN, so mapping either name onto it moved every exact half:
 # round(2.5) came out 2 here and 3 in the engine. They are not each other
@@ -262,7 +287,11 @@ def _jax_rint(x: Any) -> Any:
     return jnp.floor(x + 0.5)
 
 
-_JAX_HELPERS: dict[str, Any] = {"__bngsim_round__": _jax_round, "__bngsim_rint__": _jax_rint}
+_JAX_HELPERS: dict[str, Any] = {
+    "__bngsim_round__": _jax_round,
+    "__bngsim_rint__": _jax_rint,
+    "__bngsim_inv_hill_power__": _jax_inv_hill_power,
+}
 
 # What the generated RHS binds around the eval (see generate_jax_rhs), plus the
 # Python keywords an expression may legitimately contain. Every other bare name
@@ -564,6 +593,11 @@ def _translate_expr_jax(
     # Replace ^ with ** for exponentiation
     c = c.replace("^", "**")
 
+    # `1/(1+x**n)` is a reciprocal Hill term. Differentiating its direct power
+    # can produce inf/inf after the fraction has saturated. Rewrite the exact
+    # denominator shape to a stable sigmoid before JAX traces the expression.
+    c = _rewrite_hill_power_denominators(c)
+
     # Spend the clock placeholder last: `t` is the JAX RHS's own time argument,
     # and nothing above may rewrite it (issue #659).
     c = c.replace(_CLOCK_SYM, "t")
@@ -573,6 +607,55 @@ def _translate_expr_jax(
     _reject_untranslated_names(expr, c)
 
     return c
+
+
+class _HillPowerDenominator(ast.NodeTransformer):
+    """Replace ``1 + base**exponent`` denominator terms with a stable helper."""
+
+    def __init__(self) -> None:
+        self.changed = False
+
+    @staticmethod
+    def _is_one(node: ast.expr) -> bool:
+        return isinstance(node, ast.Constant) and node.value == 1
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
+        self.generic_visit(node)  # rewrites the children in place
+        if not isinstance(node.op, ast.Div):
+            return node
+        denominator = node.right
+        if not isinstance(denominator, ast.BinOp) or not isinstance(denominator.op, ast.Add):
+            return node
+        power = None
+        if self._is_one(denominator.left):
+            power = denominator.right
+        elif self._is_one(denominator.right):
+            power = denominator.left
+        if not isinstance(power, ast.BinOp) or not isinstance(power.op, ast.Pow):
+            return node
+        stable_fraction = ast.Call(
+            func=ast.Name(id="__bngsim_inv_hill_power__", ctx=ast.Load()),
+            args=[power.left, power.right],
+            keywords=[],
+        )
+        self.changed = True
+        return ast.copy_location(
+            ast.BinOp(left=node.left, op=ast.Mult(), right=stable_fraction), node
+        )
+
+
+def _rewrite_hill_power_denominators(expr: str) -> str:
+    """Rewrite reciprocal power-sum denominators before JAX differentiates."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+    transformer = _HillPowerDenominator()
+    rewritten = transformer.visit(tree)
+    if not transformer.changed:
+        return expr
+    ast.fix_missing_locations(rewritten)
+    return ast.unparse(rewritten)
 
 
 def _reject_untranslated_names(expr: str, translated: str) -> None:
