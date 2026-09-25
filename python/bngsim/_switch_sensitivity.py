@@ -43,6 +43,7 @@ from typing import NamedTuple
 
 from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
+    _DERIVED_BARE_NAME,
     _derived_expr_partials_numeric,
     _find_close_paren_strict,
     _inline_derived_param_refs,
@@ -480,10 +481,6 @@ def _clock_symbol_sub(expr: str, sym: str, repl: str) -> str:
 # cannot collide with a model parameter, since it is parsed alongside them.
 _CLOCK_SOLVE_SYMBOL = "_bng_clock_t"
 
-# An identifier and whether a call's `(` follows it. The lookbehind keeps the
-# exponent of a numeric literal (`1e5`, `2.5E-3`) from reading as a name.
-_CLOCK_PARSE_NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)(\s*\()?")
-
 # The calls the clock solvers legitimately need sympy's own meaning for: the
 # step functions a schedule is written with, and what `_preprocess_derived_expr`
 # rewrites `if`/`&&`/`||`/`!`/comparisons into.
@@ -528,7 +525,7 @@ def _parse_clock_expr(text: str):
     s = _preprocess_derived_expr(text)
     calls: set[str] = set()
     names: set[str] = set()
-    for m in _CLOCK_PARSE_NAME.finditer(s):
+    for m in _DERIVED_BARE_NAME.finditer(s):
         (calls if m.group(2) else names).add(m.group(1))
     names -= {"True", "False"}
     if names & calls:
@@ -2785,6 +2782,14 @@ def _threshold_crossing_terms(
             threshold_expr, scope.param_idx, scope.values, scope.derived_exprs
         ):
             return CrossingTerms({}, None)  # a root that does not occur
+        return None
+    if not all(math.isfinite(v) for v in partials.values()):
+        # A crossing that occurs but whose time has no finite derivative in a
+        # primary (``thr = 1/a`` at a = 0, ``E^n`` at E = 0 with n < 1) has
+        # nothing to jump by, so it is not compensated. The walk keeps such a
+        # partial rather than dropping it (issue #720), since a dropped one
+        # reads as a zero. Asked after the non-real check: a root that does not
+        # occur has no crossing time to differentiate.
         return None
     # ``value`` is already known to be a number here, so the text scan is the
     # whole of :func:`_fixed_threshold_expr` that is left to check.

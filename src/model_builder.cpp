@@ -2102,6 +2102,37 @@ NetworkModel ModelBuilder::build() {
         }
     }
 
+    // ── 8a. Every reaction resolved its rate parameters (issue #589) ─────
+    // compute_rxn_rate answers an unresolved index with a propensity of 0.0,
+    // which is an ordinary value, not an error: the reaction would be dead for
+    // the whole run with nothing reporting it. It cannot throw there instead —
+    // it runs inside CVODE's right-hand-side callback, and an exception must not
+    // unwind through SUNDIALS' C frames — so the check is made here, once, where
+    // a throw reaches the caller. Validation above already refuses an unknown
+    // name; this catches an index the steps in between failed to resolve.
+    for (size_t ri = 0; ri < sd->reactions.size(); ++ri) {
+        const auto &rxn = sd->reactions[ri];
+        const bool mass_action = rxn.rate_law_type == RateLawType::Elementary ||
+                                 rxn.rate_law_type == RateLawType::Functional;
+        if (mass_action && (rxn.rate_param_idx0 < 0 || rxn.rate_param_idx0 >= np)) {
+            throw std::runtime_error(
+                "ModelBuilder: reaction " + std::to_string(ri) +
+                " has no resolvable rate parameter (index " +
+                std::to_string(rxn.rate_law_param_indices.empty() ? 0
+                                                                  : rxn.rate_law_param_indices[0]) +
+                " of " + std::to_string(np) +
+                " parameters); its rate would silently evaluate to 0 for the whole run.");
+        }
+        if (rxn.rate_law_type == RateLawType::MichaelisMenten &&
+            (rxn.mm_kcat_idx0 < 0 || rxn.mm_km_idx0 < 0)) {
+            throw std::runtime_error(
+                "ModelBuilder: reaction " + std::to_string(ri) +
+                " (MichaelisMenten) has a kcat or Km parameter index outside the model's " +
+                std::to_string(np) +
+                " parameters; its rate would silently evaluate to 0 for the whole run.");
+        }
+    }
+
     // ── 8b. Compile events ───────────────────────────────────────────────
     // Event trigger and assignment expressions are compiled AFTER all
     // parameters, observables, and functions are registered with the

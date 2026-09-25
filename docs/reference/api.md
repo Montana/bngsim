@@ -277,10 +277,10 @@ All inherit from `bngsim.BngsimError` (which inherits `RuntimeError`):
 - **`SensitivityUnsupportedError`** — Forward sensitivity declined for this model: an event whose crossing time moves in a way `dt*/dp` cannot be computed for, or a rate law that does not differentiate to closed form. A declared capability gap, not a failure — catch it to fall back on a derivative-free optimizer. Also inherits `ValueError` (what both sites raised before the class existed), so `except ValueError` still catches it. A missing compiler/JIT is *not* this exception; that stays a plain `RuntimeError`.
 - **`StopConditionMet`** — Stop condition triggered; `.result` has partial data
 
-## Universal `.net` reader
+## `.net` files as a dict
 
-- **`bngsim.parse_net_file(path)`** → `dict` — Parse a `.net` file into an engine-agnostic Python dict with keys: `parameters`, `species`, `species_ic_params`, `observables`, `functions`, `reactions`. Pure Python — no C++ extension needed for parsing. Parameter *expressions* are evaluated by the engine's own evaluator when the extension is importable, so the values are the ones `Model.from_net` puts in the same slots; without it the reader evaluates ordinary arithmetic (`^` is exponentiation, as in BNGL) and raises on BNGL syntax such as `if()` or `&&` rather than guessing a number.
-- **`bngsim.build_model_from_parsed(parsed)`** → `Model` — Build a BNGsim `Model` from the dict returned by `parse_net_file()`. Routes through `ModelBuilder` for full optimization (analytical Jacobian, conservation laws, etc.).
+- **`bngsim.parse_net_file(path)`** → `dict` — The components of a `.net` file as a plain Python dict with keys `parameters`, `species`, `species_ic_params`, `observables`, `functions`, `reactions` and `net_file_dir`. It is the C++ loader's own reading of the file, the one `Model.from_net` builds, with the values the built model holds, so it needs the compiled extension, raises `ValueError` where `Model.from_net` refuses the file (`FileNotFoundError` or `IsADirectoryError` for a path that is not a file), and reports the numbers `Model.from_net` puts in the same slots. Deprecated `Sat`/`Hill` rate laws come back rewritten as explicit functions, with the loader's warning.
+- **`bngsim.build_model_from_parsed(parsed)`** → `Model` — Build a BNGsim `Model` from the dict returned by `parse_net_file()`, or one of the same shape. It makes the `ModelBuilder` calls the loader makes, so an unmodified dict builds the model `Model.from_net` loads.
 
 ## Absolute tolerance (issues #196, #212, #213)
 

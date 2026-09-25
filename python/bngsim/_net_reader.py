@@ -1,95 +1,42 @@
-"""bngsim._net_reader — Pure-Python .net file parser for ModelBuilder.
+"""bngsim._net_reader — a .net file as a dict, and a model built from one.
 
-Parses a BNG .net file into a dictionary of model components that can
-be fed into ``ModelBuilder`` for programmatic model construction. This
-enables users to load .net files into ModelBuilder, inspect/modify the
-structure, and build models — all without requiring the C++ net file
-loader.
+``parse_net_file`` returns the C++ ``.net`` loader's own reading of a file as a
+dictionary of model components; ``build_model_from_parsed`` feeds such a
+dictionary to ``ModelBuilder`` exactly as the loader does. So a file can be
+loaded, inspected or modified, and built — or handed to another engine.
 
-This is the **recommended** pattern for users who want to:
-- Load a .net file and modify it before building
-- Extract model structure for analysis
-- Use .net models as templates for programmatic construction
+There is one reading of the ``.net`` format, ``src/net_file_loader.cpp``'s.
+Until issue #803 this module parsed the text itself, a second reading that had
+to be moved in step with the loader's by hand and was not every time (#554,
+#597, #600, #606). Now ``Model.from_net``, ``parse_net_file`` and every backend
+read a file the same way, and a format fix lands once.
 
 Example
 -------
->>> from bngsim._net_reader import parse_net_file
->>> from bngsim._bngsim_core import ModelBuilder
->>> parsed = parse_net_file("model.net")
->>> builder = ModelBuilder()
->>> for name, value in parsed["parameters"]:
-...     builder.add_parameter(name, value)
->>> # ... add species, reactions, etc.
->>> model = builder.build()
-
-Or use the convenience function:
-
 >>> from bngsim import build_model_from_parsed, parse_net_file
->>> model = build_model_from_parsed(parse_net_file("model.net"))
+>>> parsed = parse_net_file("model.net")
+>>> parsed["parameters"][0]
+('kf', 0.5, '0.5', False)
+>>> model = build_model_from_parsed(parsed)
 """
 
 from __future__ import annotations
 
-import math
-import re
+import os
+import warnings
 from pathlib import Path
 from typing import Any
 
-#: A name and nothing else. Tells a misspelled parameter reference in a species
-#: IC column apart from an arithmetic one: `B0_typo` should have resolved,
-#: `2*A0` is an expression to evaluate (issue #600).
-_BARE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-
-def _check_synthetic_rate_expr(expr: str) -> None:
-    t = expr.strip()
-    if re.search(r"[\+\-\*/\^]\s*$", t):
-        raise ValueError(f"invalid rate expression {expr!r}: ends with an operator")
-    if re.match(r"^\s*[\*/\^]", t):
-        raise ValueError(f"invalid rate expression {expr!r}: starts with invalid operator")
-    depth = 0
-    for c in t:
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth < 0:
-                raise ValueError(f"invalid rate expression {expr!r}: unmatched ')'")
-    if depth != 0:
-        raise ValueError(f"invalid rate expression {expr!r}: unmatched '('")
-
-
-#: The explicit rewrite to write by hand, per legacy rate-law token. These are
-#: the equivalences net_file_loader.cpp's own deprecation warning quotes — note
-#: that a BNGL functional rate multiplies its reactants in separately, which is
-#: why `Sat k K` is `k/(K+S)` and not `k*S/(K+S)`.
-_LEGACY_RATE_LAW_REWRITES = {
-    "Sat": "'Sat k K' on a unit-stoichiometry reaction is f() = k/(K+S)",
-    "Hill": "'Hill Vmax Kh h' is f() = Vmax*S^(h-1)/(Kh^h+S^h)",
-}
-
-
-def _legacy_rate_law_message(reaction_index: int, token: str, rxn: dict[str, Any]) -> str:
-    """Say what a deprecated Sat/Hill rate-law token needs, and who reads one.
-
-    ``Model.from_net`` rewrites these into explicit functions and observables
-    and raises a ``UserWarning`` saying it did. This path does not, so it says so
-    here rather than handing ``ModelBuilder`` a bare ``Hill`` to fail on with an
-    ExprTk ``Undefined symbol`` (issue #597).
-    """
-    operands = " ".join(rxn.get("legacy_constants") or ())
-    return (
-        f"reaction {reaction_index} uses the deprecated .net rate law "
-        f"{' '.join(filter(None, (token, operands)))!r}, which this reader does not "
-        f"rewrite. Load the file with bngsim.Model.from_net(), which rewrites "
-        f"{token} into an explicit function and observables; or rewrite the reaction "
-        f"in the source BNGL as an explicit Functional rate law — "
-        f"{_LEGACY_RATE_LAW_REWRITES[token]}."
-    )
-
 
 def parse_net_file(path: str | Path) -> dict[str, Any]:
-    """Parse a BNG .net file into a structured dictionary.
+    """Read a BNG .net file into a structured dictionary.
+
+    The reading is the C++ loader's (``Model.from_net``'s), so it needs bngsim's
+    compiled extension: the records it hands ModelBuilder, with the values the
+    model it builds from them holds. The build runs here too, so a file
+    ``Model.from_net`` refuses is refused here, and the ``Sat``/``Hill`` rewrite
+    and the lifting of expression-valued initial concentrations happen as they do
+    there.
 
     Parameters
     ----------
@@ -110,61 +57,93 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
             reactions    : list of dict with keys reactants, products (0-based
                            species indices), type, rate_law, legacy_constants,
                            stat_factor
-            net_file_dir : the file's own directory, which is what a relative
-                           ``tfun('...')`` path resolves against
+            net_file_dir : the file's own directory, absolute, which is what a
+                           relative ``tfun('...')`` path resolves against
+
+        Values are evaluated: a parameter's is the number ``Model.from_net``
+        puts in its slot, and a species whose initial concentration names a
+        parameter carries that parameter's value. An expression-valued initial
+        concentration is a synthetic ``_InitialConc<N>`` parameter, as BNG2.pl
+        writes one, and the species names it.
 
         A reaction's ``type`` is one of:
 
         ``"elementary"``
-            ``rate_law`` is a parameter name (or, for a rate column that is
-            neither a parameter nor a declared function,
-            ``build_model_from_parsed`` wraps it as a synthetic function).
+            ``rate_law`` is a parameter name; ``stat_factor`` carries a
+            ``<number>*`` prefix on it.
         ``"functional"``
-            ``rate_law`` names a function in the ``functions`` block.
+            ``rate_law`` names a function in the ``functions`` block. A
+            deprecated ``Sat`` or ``Hill`` rate law comes back as one of these,
+            rewritten into an explicit function (and a single-species observable
+            for each reactant it reads), with the loader's ``UserWarning``.
         ``"mm"``
             Michaelis-Menten (``MM kcat Km``); ``rate_law`` is
             ``"<kcat>,<Km>"``, the form ``ModelBuilder`` takes.
-        ``"legacy"``
-            A deprecated ``Sat`` or ``Hill`` rate-law token. ``rate_law`` is the
-            token and ``legacy_constants`` its operands.
-            ``build_model_from_parsed`` refuses these — see there (issue #597).
+
+        ``legacy_constants`` holds an ``"mm"`` reaction's ``[kcat, Km]`` and is
+        empty otherwise: a ``Sat`` or ``Hill`` rate law, whose operands it used to
+        carry, now comes back rewritten (issue #803).
+
+    Raises
+    ------
+    FileNotFoundError, IsADirectoryError
+        If ``path`` is not a file.
+    ValueError
+        If ``Model.from_net`` would refuse the file. The reading builds the model,
+        so that includes a ``tfun('...')`` data file ``Model.from_net`` would not
+        find beside the ``.net``: put it there to read the file, then set
+        ``net_file_dir`` in the dict to build against another location.
+    ImportError
+        If bngsim's compiled extension is not available.
     """
+    try:
+        from bngsim._bngsim_core import net_file_structure
+    except ImportError as exc:
+        raise ImportError(
+            "parse_net_file reads a .net file with bngsim's compiled .net loader, and "
+            f"bngsim._bngsim_core is not available ({exc}). Since issue #803 there is no "
+            "pure-Python reading of the format to fall back on."
+        ) from exc
+
     path = Path(path)
-    text = path.read_text(encoding="utf-8")
-
-    # Parse each block
-    parameters = _parse_parameters(text)
-    species, species_ic_params, lifted_params = _parse_species(text, parameters)
-    # An expression-valued IC is carried as a synthetic `_InitialConc<N>`
-    # parameter, exactly as BNG2.pl writes one, so it reaches ModelBuilder with
-    # the declared parameters and the species resolves against it (issue #600).
-    parameters = parameters + lifted_params
-    observables = _parse_observables(text)
-    functions = _parse_functions(text)
-    reactions = _parse_reactions(text, functions)
-
-    return {
-        "parameters": parameters,
-        "species": species,
-        "species_ic_params": species_ic_params,
-        "observables": observables,
-        "functions": functions,
-        "reactions": reactions,
-        # A `tfun('drive.tfun')` path is relative to the .net file, not to the
-        # process's working directory — BNG writes the table beside the network
-        # it belongs to. net_file_loader.cpp passes the same directory to
-        # `ModelBuilder::set_net_file_dir` (issue #597).
-        "net_file_dir": str(path.parent),
-    }
+    # The errors a missing file raised when this module read the text itself, and
+    # Model.from_net's for a missing one.
+    if not path.exists():
+        raise FileNotFoundError(f"Net file not found: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"{path} is a directory, not a .net file")
+    parsed = net_file_structure(os.fspath(path))
+    for message in parsed.pop("load_warnings"):
+        warnings.warn(message, UserWarning, stacklevel=2)
+    # Values, initial concentrations and each reaction's type are the built
+    # model's; the binding returns the dict in this shape, so there is nothing
+    # left to reshape here. Absolute, so a build after a change of working
+    # directory still finds a relative tfun file.
+    parsed["net_file_dir"] = os.path.abspath(parsed["net_file_dir"])
+    return parsed
 
 
 def build_model_from_parsed(parsed: dict[str, Any]):
     """Build a NetworkModel from parsed .net data via ModelBuilder.
 
+    It makes the calls ``NetFileLoader::load`` makes, in the same order, so the
+    dictionary ``parse_net_file`` returns builds the model ``Model.from_net``
+    loads, and a modified dictionary builds the modified model. Three things to
+    know when modifying one:
+
+    * a species listed in ``species_ic_params`` takes its initial concentration
+      from that parameter, so change the parameter, or drop the entry, rather than
+      the number in ``species``;
+    * a parameter with ``is_expression`` true is evaluated from its expression,
+      so change the expression, or set ``is_expression`` false with a value;
+    * a reaction's rate law is read by what it names: a function in
+      ``functions`` makes it functional, anything else elementary (``"mm"``
+      aside), whatever its ``type`` says.
+
     Parameters
     ----------
     parsed : dict
-        Output of ``parse_net_file()``.
+        Output of ``parse_net_file()``, or a dictionary of the same shape.
 
     Returns
     -------
@@ -174,51 +153,62 @@ def build_model_from_parsed(parsed: dict[str, Any]):
     Raises
     ------
     ValueError
-        If a reaction carries a deprecated ``Sat`` or ``Hill`` rate-law token.
-        Those two are the one thing ``Model.from_net`` reads that this path does
-        not: the loader rewrites them into explicit functions and observables,
-        and reimplementing that rewrite here would be a second dialect to drift
-        from the first (issue #597, and #554 for what that costs). The message
-        names the reaction and the rewrite to write by hand.
+        If a reaction's ``rate_law`` is empty, or its ``type`` is ``"legacy"``
+        (a ``Sat``/``Hill`` token, which ``parse_net_file`` no longer returns —
+        write the rate law as a function), or a ``species_ic_params`` entry names
+        a parameter the dictionary does not declare or a species it does not have.
+    RuntimeError
+        If ``ModelBuilder`` refuses the model, as it refuses the same records
+        from the loader: an elementary ``rate_law`` that names neither a
+        parameter nor a function, for instance, or a parameter expression that
+        reads an observable or a function (issue #844).
     """
-    from bngsim._bngsim_core import ModelBuilder, net_function_tables
-    from bngsim._model import Model
+    from bngsim._bngsim_core import (
+        ModelBuilder,
+        net_function_tables,
+        net_refuse_parameters_that_read_state,
+    )
+    from bngsim._model import Model, _ar_report_map_from_net
+
+    # The loader's own refusal, which phase 2 makes before its first call: a
+    # parameter that reads an observable or a function would build as 0 (#844).
+    net_refuse_parameters_that_read_state(
+        [tuple(p) for p in parsed["parameters"]],
+        [tuple(f) for f in parsed["functions"]],
+        [name for name, _ in parsed["observables"]],
+    )
 
     builder = ModelBuilder()
     # Where a relative `tfun('...')` path resolves from, set before the tables
     # below are registered against it.
     builder.set_net_file_dir(parsed.get("net_file_dir", ""))
 
-    # Parameters
-    param_map = {}  # name -> value (for resolving species ICs)
     for name, value, expr, is_expr in parsed["parameters"]:
         builder.add_parameter(name, value, expr, is_expr)
-        param_map[name] = value
 
-    # Species
     for name, init_conc, is_fixed in parsed["species"]:
         builder.add_species(name, init_conc, is_fixed)
 
     # A species IC written as a parameter name is handed to the builder as a
-    # reference rather than as the number resolved above, so build() re-resolves
-    # it from the compiled parameter — the step that makes this model's initial
-    # state the one Model.from_net produces (issue #554) — and records the
-    # (species, parameter) pair the forward-sensitivity seeding reads.
+    # reference rather than as a number, so build() re-resolves it from the
+    # compiled parameter and records the (species, parameter) pair the
+    # forward-sensitivity seeding reads (issue #554).
+    declared = {name for name, _, _, _ in parsed["parameters"]}
     for species_idx0, param_name in parsed.get("species_ic_params", ()):
+        # ModelBuilder passes over a reference to an undeclared parameter, which
+        # leaves the species at whatever number the dict gave it.
+        if param_name not in declared:
+            raise ValueError(
+                f"species_ic_params names parameter {param_name!r}, which the parameters "
+                "do not declare"
+            )
+        if not 0 <= species_idx0 < len(parsed["species"]):
+            raise ValueError(f"species_ic_params names species index {species_idx0}")
         builder.add_species_param_ref(species_idx0, param_name)
 
-    # Observables
-    for name, entries in parsed["observables"]:
-        builder.add_observable(name, entries)
-
-    # Functions (track names for reaction rate resolution). A function whose
-    # expression calls `tfun(...)` needs its table registered before build()
-    # compiles the expression, and the spec read out of the call — which is what
-    # `net_function_tables` does, in the .net loader's own C++, so this reader
-    # does not grow a second reading of tfun(...) syntax to disagree with the
-    # loader's (issue #597). A function that names no table comes back with its
-    # expression unchanged and no tables.
-    func_names: set[str] = set()
+    # A function whose expression calls `tfun(...)` needs its table registered
+    # before build() compiles the expression; `net_function_tables` is the
+    # loader's own reading of those calls (issue #597).
     for name, expression in parsed["functions"]:
         analyzed = net_function_tables(name, expression)
         builder.add_function(name, analyzed["expression"])
@@ -239,511 +229,38 @@ def build_model_from_parsed(parsed: dict[str, Any]):
                     table["method"],
                     table["header_name"],
                 )
-        func_names.add(name)
 
-    # Reactions
+    for observable_name, entries in parsed["observables"]:
+        builder.add_observable(observable_name, entries)
+
     for i, rxn in enumerate(parsed["reactions"]):
         rtype = rxn["type"]
         rate_law = rxn["rate_law"]
         if rtype == "legacy":
-            raise ValueError(_legacy_rate_law_message(i + 1, rate_law, rxn))
-        if rtype == "elementary" and rate_law not in param_map:
-            if not rate_law.strip():
-                raise ValueError(
-                    "elementary reaction has empty or whitespace-only rate_law "
-                    "(not a parameter name)"
-                )
-            if rate_law in func_names:
-                rtype = "functional"
-            else:
-                _check_synthetic_rate_expr(rate_law)
-                collision_idx = i
-                auto_func = f"__net_reader_func_{collision_idx}"
-                while auto_func in func_names:
-                    collision_idx += 1
-                    auto_func = f"__net_reader_func_{collision_idx}"
-                builder.add_function(auto_func, rate_law)
-                func_names.add(auto_func)
-                rate_law = auto_func
-                rtype = "functional"
+            raise ValueError(
+                f"reaction {i + 1} has type 'legacy' ({rate_law!r}), which "
+                "build_model_from_parsed does not build. parse_net_file rewrites a "
+                "deprecated Sat or Hill rate law into an explicit function; in a "
+                "dictionary built by hand, write the rate law as a function and give "
+                "the reaction type 'functional'."
+            )
+        if not rate_law.strip():
+            # ModelBuilder's validation passes an empty name over, so refuse it here.
+            raise ValueError(f"reaction {i + 1} has an empty rate_law")
+        # By what the rate law names, not by the label, and by ModelBuilder's
+        # rule rather than a copy of it: an elementary rate that names a
+        # function is resolved to functional in build(), exactly as the loader
+        # relies on. Passing "functional" through would build a reaction that
+        # names a parameter as one that never fires.
+        if rtype != "mm":
+            rtype = "elementary"
         builder.add_reaction(
-            rxn["reactants"],
-            rxn["products"],
-            rtype,
-            rate_law,
-            rxn["stat_factor"],
+            rxn["reactants"], rxn["products"], rtype, rate_law, rxn["stat_factor"]
         )
 
     core = builder.build()
-    return Model(_core=core)
-
-
-# ─── Internal parsers ─────────────────────────────────────────────────
-
-
-def _extract_block(text: str, block_name: str) -> str:
-    """Extract content between 'begin <block>' and 'end <block>'."""
-    pattern = rf"begin\s+{block_name}\s*\n(.*?)end\s+{block_name}"
-    m = re.search(pattern, text, re.DOTALL)
-    return m.group(1) if m else ""
-
-
-def _parse_parameters(text: str) -> list[tuple[str, float, str, bool]]:
-    """Parse parameters block.
-
-    Returns list of (name, value, expression, is_expression).
-    """
-    block = _extract_block(text, "parameters")
-    # Two-pass: first collect all, then evaluate expressions
-    raw_params = []
-    for line in block.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Format: [index] name value_or_expr  # comment. The leading index is
-        # optional, as in the species block: `generate_network` writes
-        # `1 A0 100`, `writeFile({format=>"net"})` writes `A0 100`. Requiring it
-        # discarded an unindexed parameters block silently (issue #600).
-        parts = line.split("#")[0].strip().split()
-        if not parts:
-            continue
-        field = 1 if (parts[0].isascii() and parts[0].isdigit()) else 0
-        if field + 1 >= len(parts):
-            raise ValueError(f"parameter line {line!r} has no name and value to read")
-        name = parts[field]
-        expr = " ".join(parts[field + 1 :])
-        raw_params.append((name, expr))
-
-    # Split literals from expressions the same way net_file_loader.cpp does:
-    # a value the numeric parse consumes whole is a constant, anything else is
-    # an expression. `1/7` and `10^2` land on the expression side in both.
-    decls: list[tuple[str, str, float, bool]] = []
-    for name, expr in raw_params:
-        try:
-            decls.append((name, expr, float(expr), False))
-        except ValueError:
-            decls.append((name, expr, 0.0, True))
-
-    values = _evaluate_parameter_exprs(decls)
-    return [
-        (name, values[i], expr, is_expr) for i, (name, expr, _literal, is_expr) in enumerate(decls)
-    ]
-
-
-def _evaluate_parameter_exprs(decls: list[tuple[str, str, float, bool]]) -> list[float]:
-    """Evaluate declared .net parameters with the engine's own expression evaluator.
-
-    ``decls`` is ``(name, expression, literal_value, is_expression)`` in
-    declaration order; the return is the value of each, positionally.
-
-    The evaluation runs through a parameters-only ``ModelBuilder``, whose
-    ``build()`` compiles and evaluates every expression exactly as the C++ .net
-    loader's does — so ``parse_net_file`` reports the number
-    ``Model.from_net`` would put in the same slot. Evaluating these in Python
-    instead cannot be made to agree: BNGL spells exponentiation ``^``, which
-    Python reads as bitwise XOR (``10^2`` → 8, ``1e-4^3`` → ``TypeError``), and
-    BNGL's ``if(c,t,f)``, ``&&``/``||`` and names like ``lambda`` are not Python
-    at all. Issue #554 — every one of those used to be swallowed into a silent
-    0.0 that then seeded species initial conditions.
-
-    An install with no compiled extension falls through to
-    ``_evaluate_parameter_exprs_without_engine``, which keeps this function's
-    contract as far as arithmetic goes and refuses the rest.
-    """
-    if not decls:
-        return []
-
-    try:
-        from bngsim._bngsim_core import ModelBuilder
-    except ImportError:
-        return _evaluate_parameter_exprs_without_engine(decls)
-
-    builder = ModelBuilder()
-    for name, expr, literal, is_expr in decls:
-        # 0.0 is the pre-evaluation seed net_file_loader.cpp uses. Nothing is
-        # left holding it any more: since #602 `build()` refuses an expression
-        # it cannot compile rather than leaving the seed in place, so a value
-        # that comes back is one the evaluator actually produced.
-        builder.add_parameter(name, 0.0 if is_expr else literal, expr, is_expr)
-    model = builder.build()
-    return [model.get_param(name) for name, _, _, _ in decls]
-
-
-# Namespace for the engine-free fallback below — the one the reader has always
-# had, kept as it was so nothing that evaluated before stops evaluating.
-_FALLBACK_NS: dict[str, Any] = {
-    "__builtins__": {},
-    "pi": math.pi,
-    "e": math.e,
-    "exp": math.exp,
-    "log": math.log,
-    "log10": math.log10,
-    "sqrt": math.sqrt,
-    "pow": pow,
-    "abs": abs,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "asin": math.asin,
-    "acos": math.acos,
-    "atan": math.atan,
-}
-
-
-def _evaluate_parameter_exprs_without_engine(
-    decls: list[tuple[str, str, float, bool]],
-) -> list[float]:
-    """Evaluate parameter expressions with no compiled extension available.
-
-    ``parse_net_file`` is documented as working without one — its dict is the
-    interchange format for handing a ``.net`` model to scipy, gillespy2 or a
-    hand-written RHS — so this path keeps that promise. What it cannot keep is
-    BNGL: it evaluates ordinary arithmetic, reading ``^`` as exponentiation
-    (the one operator Python spells the same and means differently), and
-    *refuses* anything beyond that instead of substituting a number.
-    ``if(c,t,f)``, ``&&``/``||`` and a parameter named for a Python keyword need
-    the engine's evaluator. Silence is what made the old fallback dangerous
-    (issue #554): 0.0 is a perfectly plausible rate constant.
-    """
-    ns = dict(_FALLBACK_NS)
-    values = []
-    for name, expr, literal, is_expr in decls:
-        if not is_expr:
-            value = literal
-        else:
-            try:
-                value = float(eval(expr.replace("^", "**"), ns))  # noqa: S307
-            except Exception as exc:
-                raise ValueError(
-                    f"cannot evaluate .net parameter {name} = {expr!r}: {exc}. "
-                    f"bngsim._bngsim_core is unavailable, so parse_net_file is "
-                    f"evaluating plain arithmetic only; BNGL's if(), && / || and "
-                    f"names Python reserves need the engine's expression "
-                    f"evaluator, which a built bngsim provides."
-                ) from exc
-        ns[name] = value
-        values.append(value)
-    return values
-
-
-def _strip_fixed_marker(name: str) -> tuple[str, bool]:
-    """Return (clean_name, is_fixed) for a species name from a ``.net`` file.
-
-    The clamp `$` may sit at position 0 (`$Sink()`) or right after an
-    `@<compartment>::` prefix (`@CP::$Sink()`). Moved here from ``_codegen``, whose
-    own ``.net`` parser was its other user until #803 removed it.
-    """
-    if name.startswith("$"):
-        return name[1:], True
-    if name.startswith("@"):
-        sep = name.find("::")
-        if sep != -1 and sep + 2 < len(name) and name[sep + 2] == "$":
-            return name[: sep + 2] + name[sep + 3 :], True
-    return name, False
-
-
-def _parse_species(
-    text: str,
-    parameters: list[tuple[str, float, str, bool]],
-) -> tuple[
-    list[tuple[str, float, bool]],
-    list[tuple[int, str]],
-    list[tuple[str, float, str, bool]],
-]:
-    """Parse species block.
-
-    Returns ``(species, ic_param_refs, lifted_params)``. ``species`` is a list of
-    (name, init_conc, is_fixed) and ``ic_param_refs`` pairs the 0-based index of
-    each species whose IC column names a parameter with that parameter's name.
-    The names are what lets ``build_model_from_parsed`` hand the reference to
-    ``ModelBuilder.add_species_param_ref``, which is where the .net loader gets
-    both its re-resolved IC and its forward-sensitivity seed.
-
-    ``lifted_params`` carries the synthetic ``_InitialConc<N>`` parameters minted
-    for expression-valued initial concentrations, in the same shape as the
-    parameters block, for the caller to append (issue #600).
-    """
-    block = _extract_block(text, "species")
-    species: list[tuple[str, float, bool]] = []
-    ic_param_refs: list[tuple[int, str]] = []
-    param_map = {name: val for name, val, _, _ in parameters}
-    taken = set(param_map)
-    lifted: list[tuple[str, str]] = []  # (synthetic name, expression)
-    lifted_slots: list[int] = []  # species rows whose IC the lift will fill
-
-    for line in block.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("#")[0].strip().split()
-        if not parts:
-            continue
-
-        # A species line is `[<index>] <species> [<concentration>]`: the leading
-        # index is OPTIONAL. BNG2.pl strips one only when present
-        # (Perl2/SpeciesList.pm, `s/^\s*\d+\s+//`), and writes both shapes into a
-        # .net — `generate_network` indexed, `writeFile({format=>"net"})` bare.
-        # Requiring three fields dropped every line of an unindexed block
-        # silently, leaving a model with no species at all (issue #600).
-        # `isascii()` keeps this identical to the C++ `std::isdigit` check: bare
-        # `isdigit()` also accepts characters like "²", which is not an index.
-        field = 1 if (parts[0].isascii() and parts[0].isdigit()) else 0
-        if field >= len(parts):
-            raise ValueError(f"species line {line!r} has an index but no species pattern")
-
-        # `$` clamp marker may sit at index 0 or after a `@<compartment>::`
-        # prefix (BNG2.pl emits the latter for cBNGL models).
-        name, is_fixed = _strip_fixed_marker(parts[field])
-        # The concentration is the rest of the line, joined so a spaced
-        # expression survives; omitted means zero, as in BNG2.pl's reader.
-        ic_str = " ".join(parts[field + 1 :])
-        if not ic_str:
-            species.append((name, 0.0, is_fixed))
-            continue
-        try:
-            init_conc = float(ic_str)
-        except ValueError:
-            if ic_str in param_map:
-                ic_param_refs.append((len(species), ic_str))
-                init_conc = param_map[ic_str]
-            elif _BARE_IDENTIFIER.fullmatch(ic_str):
-                # A name and nothing else, naming no declared parameter: a typo,
-                # or a parameter declared after the species block. Seeding 0.0
-                # made that a silently wrong trajectory (issue #571), and
-                # net_file_loader.cpp refuses it with this same message (#554).
-                raise ValueError(
-                    f"species {name!r} initial concentration {ic_str!r} "
-                    "is neither a number nor a declared parameter"
-                ) from None
-            else:
-                # Not a number and not a name, so an expression — and
-                # run_network evaluates one. Lift it into a synthetic parameter
-                # the way BNG2.pl's generate_network lifts a BNGL seed-species
-                # expression, and point the species at that (issue #600). A
-                # symbol the model never declares still fails loudly, because
-                # the parameter compile refuses it (issue #602).
-                n = 1
-                while f"_InitialConc{n}" in taken:
-                    n += 1
-                synthetic = f"_InitialConc{n}"
-                taken.add(synthetic)
-                lifted.append((synthetic, ic_str))
-                lifted_slots.append(len(species))
-                ic_param_refs.append((len(species), synthetic))
-                init_conc = 0.0  # replaced below, once the lift is evaluated
-        species.append((name, init_conc, is_fixed))
-
-    if not lifted:
-        return species, ic_param_refs, []
-
-    # Evaluate the lifted expressions alongside the declared parameters, in the
-    # one place that can: the engine's evaluator, through the same
-    # parameters-only build the parameters block uses. Doing it here rather than
-    # in `_parse_parameters` is what lets a lift reference any declared
-    # parameter regardless of where the species block sits in the file.
-    decls = [(name, expr, value, is_expr) for name, value, expr, is_expr in parameters]
-    decls += [(name, expr, 0.0, True) for name, expr in lifted]
-    values = _evaluate_parameter_exprs(decls)
-
-    lifted_params = [
-        (name, values[len(parameters) + i], expr, True) for i, (name, expr) in enumerate(lifted)
-    ]
-    lifted_value = {name: value for name, value, _, _ in lifted_params}
-    for row in lifted_slots:
-        sp_name, _seed, sp_fixed = species[row]
-        ref = dict(ic_param_refs)[row]
-        species[row] = (sp_name, lifted_value[ref], sp_fixed)
-
-    return species, ic_param_refs, lifted_params
-
-
-def _parse_observables(text: str) -> list[tuple[str, list[tuple[int, float]]]]:
-    """Parse groups (observables) block.
-
-    Returns list of (name, [(species_idx_0based, factor), ...]).
-    """
-    block = _extract_block(text, "groups")
-    observables = []
-
-    for line in block.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("#")[0].strip().split()
-        if not parts:
-            continue
-        # `[<index>] <name> [<entries>]` — the index is optional, and
-        # run_network reads an unindexed groups block. Taking the name from a
-        # fixed second field read the *entry* as the name (issue #600).
-        field = 1 if (parts[0].isascii() and parts[0].isdigit()) else 0
-        if field >= len(parts):
-            raise ValueError(f"group line {line!r} has an index but no observable name")
-        name = parts[field]
-        # Entries are optional: an observable matching no species has none.
-        entries = []
-        for token in parts[field + 1 :]:
-            for sub in token.split(","):
-                sub = sub.strip()
-                if not sub:
-                    continue
-                if "*" in sub:
-                    factor_s, idx_s = sub.split("*", 1)
-                    entries.append((int(idx_s) - 1, float(factor_s)))
-                else:
-                    entries.append((int(sub) - 1, 1.0))
-        observables.append((name, entries))
-
-    return observables
-
-
-def _parse_functions(text: str) -> list[tuple[str, str]]:
-    """Parse functions block.
-
-    Returns list of (name, expression).
-    """
-    block = _extract_block(text, "functions")
-    functions = []
-
-    for line in block.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line.split("#")[0].strip()
-        parts = line.split(None, 2)
-        if not parts:
-            continue
-
-        # `<index> <name>() <expression>`, and unlike the species, parameters
-        # and groups blocks the leading index is NOT optional: run_network
-        # refuses a functions line written without one (`ERROR: Found invalid
-        # line "rate_fn()" while reading functions block`). That refusal covers
-        # the `name() = expression` form `writeFile({format=>"net"})` writes, so
-        # BNG's own writer emits a functions block no BNG reader accepts.
-        # Requiring three fields dropped the unindexed line silently, and taking
-        # the name from a fixed second field read the `=` as the name — a
-        # function literally called `=`, carrying the right expression under the
-        # wrong name, with no error and no warning (issue #606).
-        if not (parts[0].isascii() and parts[0].isdigit()):
-            raise ValueError(
-                f"functions line {line!r} needs a leading index: a .net "
-                "functions line is '<index> <name>() <expression>'"
-            )
-        if len(parts) < 2:
-            raise ValueError(f"functions line {line!r} has an index but no function name")
-
-        # The name field is an identifier, with or without the empty argument
-        # list BNG2.pl writes. `=` is not one, and neither is `rate_fn()=expr`
-        # written without spaces or a function taking arguments — which
-        # run_network refuses too ("Functions cannot contain arguments").
-        name = parts[1][:-2] if parts[1].endswith("()") else parts[1]
-        if not _BARE_IDENTIFIER.fullmatch(name):
-            raise ValueError(
-                f"functions line {line!r} has {parts[1]!r} where a function name belongs"
-            )
-
-        if len(parts) < 3:
-            raise ValueError(f"functions line {line!r} has an index and a name but no expression")
-        expression = parts[2]
-        if expression.startswith("="):
-            # An index in front of the `writeFile` shape. run_network reads the
-            # `=` as the whole expression and refuses it (muParser: "Unexpected
-            # operator \"=\" found at position 0"); this reader used to keep it
-            # as the expression's first character and hand `= k*Atot` back to
-            # the caller as if it were a function body (issue #606).
-            raise ValueError(
-                f"functions line {line!r} separates its name and expression with '=', "
-                "which is BNGL's form and not a .net's"
-            )
-        functions.append((name, expression))
-
-    return functions
-
-
-def _parse_reactions(
-    text: str,
-    functions: list[tuple[str, str]],
-) -> list[dict]:
-    """Parse reactions block.
-
-    Returns list of dicts with reactants, products, type, rate_law, stat_factor.
-    """
-    block = _extract_block(text, "reactions")
-    func_names = {name for name, _ in functions}
-    reactions = []
-
-    for line in block.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line.split("#")[0].strip()
-        parts = line.split()
-        if not parts:
-            continue
-        if len(parts) < 4:
-            # A reaction line's index is NOT optional: run_network refuses a
-            # reactions block written without it. Skipping a short line built a
-            # model with no reactions at all, which loaded clean and integrated
-            # a flat trajectory while reporting success (issue #600).
-            raise ValueError(
-                f"reaction line {line!r} needs an index, reactants, products and a rate law"
-            )
-        # Format: idx reactants products rate_law [rate law operands]
-        # reactants and products are comma-separated species indices
-
-        # The reactant and product fields are 1-based species indices
-        reactant_str = parts[1]
-        product_str = parts[2]
-        rate_law = parts[3]
-
-        # Parse stat_factor if present (not common)
-        stat_factor = 1.0
-
-        # Parse reactants (1-based → 0-based, 0 means null/creation)
-        reactants = []
-        for tok in reactant_str.split(","):
-            tok = tok.strip()
-            if tok and tok != "0":
-                reactants.append(int(tok) - 1)
-
-        # Parse products (1-based → 0-based, 0 means null/degradation)
-        products = []
-        for tok in product_str.split(","):
-            tok = tok.strip()
-            if tok and tok != "0":
-                products.append(int(tok) - 1)
-
-        # A rate column of `MM`, `Sat` or `Hill` is one of BioNetGen's legacy
-        # rate-law tokens, and the operands that follow it on the line belong to
-        # it: `MM kcat Km`, `Sat k K...`, `Hill Vmax Kh h`. Reading only
-        # `parts[3]` threw those operands away and left the bare token behind as
-        # if it were an expression, which build_model_from_parsed then wrapped in
-        # a synthetic function for ExprTk to fail on with "Undefined symbol:
-        # 'Hill'" (issue #597). net_file_loader.cpp reads them the same way,
-        # including the `tokens.size() >= 6` on MM — a shorter MM line falls
-        # through to the elementary branch there, so it does here too.
-        legacy_constants: list[str] = []
-        if rate_law == "MM" and len(parts) >= 6:
-            # Michaelis-Menten needs no rewrite: ModelBuilder has the rate law,
-            # and takes its two parameters as one "kcat,Km" string.
-            rtype = "mm"
-            legacy_constants = parts[4:6]
-            rate_law = ",".join(legacy_constants)
-        elif rate_law in ("Sat", "Hill"):
-            rtype = "legacy"
-            legacy_constants = parts[4:]
-        else:
-            # Determine type: if rate_law is a function name → functional
-            rtype = "functional" if rate_law in func_names else "elementary"
-
-        reactions.append(
-            {
-                "reactants": reactants,
-                "products": products,
-                "type": rtype,
-                "rate_law": rate_law,
-                "legacy_constants": legacy_constants,
-                "stat_factor": stat_factor,
-            }
-        )
-
-    return reactions
+    model = Model(_core=core)
+    # The output columns of species an assignment rule defines (sbml_to_net's
+    # networks), rebuilt as Model.from_net rebuilds them.
+    model._ar_report_map = _ar_report_map_from_net(core)
+    return model
