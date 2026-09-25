@@ -68,3 +68,45 @@ def test_an_event_at_large_time_fires_and_returns(t0, method, path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     x = json.loads(proc.stdout.strip().splitlines()[-1])
     assert x == [0.0, 1.0, 1.0]
+
+
+_CHILD_FIRE_TIME = textwrap.dedent(
+    """
+    import sys
+    import numpy as np
+    import bngsim
+
+    t0 = float(sys.argv[1])
+    m = bngsim.Model.from_antimony_string(
+        "compartment C=1; species X in C=0; species S in C=10; "
+        "J1: S => ; 0.0001*S; "
+        + f"E1: at (time >= {t0!r}): X = time;"
+    )
+    r = bngsim.Simulator(m, method="ssa").run(
+        t_span=(0, 2 * t0), n_points=3, seed=1, timeout=10.0
+    )
+    print(repr(float(np.asarray(r.species)[-1, list(r.species_names).index("X")])))
+    """
+)
+
+
+# The first three sit where a 2-ulp floor (2^-39 > 1e-12) would already have
+# widened the old tolerance and fired those events one ulp late; the last two
+# are past t = 8192, where the old loop never ended at all.
+@pytest.mark.parametrize("t0", [4163.697195, 5026.437503, 5323.619904, 10000.123456, 123456.789])
+def test_an_event_fires_on_the_first_representable_time_its_trigger_holds(t0):
+    """``X := time`` records the firing time. ``time >= T0`` first holds at the
+    double ``T0`` itself, and the bisection must land there bit for bit: below
+    t = 8192 as it always has, and above it now that the loop runs to adjacent
+    doubles instead of forever."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD_FIRE_TIME, repr(t0)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"an event at t={t0!r} did not return in 60 s")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert float(proc.stdout.strip().splitlines()[-1]) == t0
