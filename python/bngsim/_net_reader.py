@@ -89,7 +89,10 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
     FileNotFoundError, IsADirectoryError
         If ``path`` is not a file.
     ValueError
-        If ``Model.from_net`` would refuse the file.
+        If ``Model.from_net`` would refuse the file. The reading builds the model,
+        so that includes a ``tfun('...')`` data file ``Model.from_net`` would not
+        find beside the ``.net``: put it there to read the file, then set
+        ``net_file_dir`` in the dict to build against another location.
     ImportError
         If bngsim's compiled extension is not available.
     """
