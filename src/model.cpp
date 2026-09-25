@@ -3149,6 +3149,23 @@ compute_species_factor_ssa(const std::vector<std::pair<int, int>> &multiplicitie
     return factor;
 }
 
+// A reaction whose rate parameter never resolved (issue #589). This used to
+// return a propensity of 0.0, an ordinary value, so the reaction was dead for
+// the whole run with nothing reporting it. ModelBuilder::build() refuses such a
+// model, so a built one cannot get here; this is the backstop for any path that
+// does. It is safe to throw on the ODE path because every CVODE callback that
+// reaches this runs under guard_cvode_callback (src/cvode_simulator.cpp), which
+// keeps the exception out of SUNDIALS' C frames and rethrows it afterwards.
+[[noreturn]] static void throw_unresolved_rate_param(const Reaction &rxn, int param_idx0,
+                                                     size_t n_params) {
+    const std::string which = rxn.function_name.empty()
+                                  ? std::string("a reaction with no rate name")
+                                  : "the reaction with rate '" + rxn.function_name + "'";
+    throw std::runtime_error(which + " has no resolvable rate parameter (index " +
+                             std::to_string(param_idx0) + " of " + std::to_string(n_params) +
+                             " parameters); refusing to evaluate its rate as 0.");
+}
+
 // Compute a single reaction rate (for both ODE and SSA)
 static double
 compute_rxn_rate(const Reaction &rxn, const std::vector<Parameter> &params, const double *conc,
@@ -3167,7 +3184,7 @@ compute_rxn_rate(const Reaction &rxn, const std::vector<Parameter> &params, cons
         // SBML loader's unified emission does.
         int k_idx = rxn.rate_param_idx0; // pre-computed 0-based index
         if (k_idx < 0 || k_idx >= static_cast<int>(params.size()))
-            return 0.0;
+            throw_unresolved_rate_param(rxn, k_idx, params.size());
 
         rate = params[k_idx].value * rxn.stat_factor;
         if (rxn.apply_species_factor) {
@@ -3227,11 +3244,14 @@ compute_rxn_rate(const Reaction &rxn, const std::vector<Parameter> &params, cons
         // all E/S ratios, and reduces to sQSSA when E << S + Km.
         // E is first reactant, S is second reactant.
         if (rxn.rate_law_param_indices.size() < 2)
-            return 0.0;
+            throw_unresolved_rate_param(rxn, -1, params.size());
         int kcat_idx = rxn.rate_law_param_indices[0] - 1;
         int km_idx = rxn.rate_law_param_indices[1] - 1;
-        if (kcat_idx < 0 || km_idx < 0)
-            return 0.0;
+        const int np = static_cast<int>(params.size());
+        if (kcat_idx < 0 || kcat_idx >= np)
+            throw_unresolved_rate_param(rxn, kcat_idx, params.size());
+        if (km_idx < 0 || km_idx >= np)
+            throw_unresolved_rate_param(rxn, km_idx, params.size());
 
         double kcat = params[kcat_idx].value;
         double Km = params[km_idx].value;
