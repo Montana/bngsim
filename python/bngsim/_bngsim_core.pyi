@@ -6,7 +6,7 @@ import collections.abc
 import numpy
 import numpy.typing
 import typing
-__all__: list[str] = ['CvodeSimulator', 'HAS_KLU', 'HAS_LAPACK_DENSE', 'HAS_MIR', 'HAS_NFSIM', 'HAS_RULEMONKEY', 'ModelBuilder', 'NetworkModel', 'NfsimSimulator', 'ResultCore', 'RuleMonkeySimulator', 'SolverOptions', 'SolverStats', 'SsaDiagnostics', 'SsaSimulator', 'SteadyStateOptions', 'SteadyStateResultCore', 'TimeSpec', 'bench_ssa_propensity_jit', 'emit_ssa_propensity_source_structure', 'find_steady_state', 'net_function_tables', 'reserved_names']
+__all__: list[str] = ['CvodeSimulator', 'HAS_KLU', 'HAS_LAPACK_DENSE', 'HAS_MIR', 'HAS_NFSIM', 'HAS_RULEMONKEY', 'ModelBuilder', 'NetworkModel', 'NfsimSimulator', 'ResultCore', 'RuleMonkeySimulator', 'SolverOptions', 'SolverStats', 'SsaDiagnostics', 'SsaSimulator', 'SteadyStateOptions', 'SteadyStateResultCore', 'TimeSpec', 'bench_ssa_propensity_jit', 'emit_ssa_propensity_source_structure', 'find_steady_state', 'net_file_structure', 'net_function_tables', 'reserved_names']
 class CvodeSimulator:
     def __init__(self, model: NetworkModel) -> None:
         """
@@ -1261,6 +1261,10 @@ def emit_ssa_propensity_source_structure(model: NetworkModel) -> tuple[str, int]
 def find_steady_state(model: NetworkModel, opts: SteadyStateOptions = ...) -> SteadyStateResultCore:
     """
     Find steady state of the ODE system (releases GIL)
+    """
+def net_file_structure(path: str) -> dict:
+    """
+    Read a .net file the way Model.from_net does, and return the reading as parse_net_file's dict: {'parameters': [(name, value, expression, is_expression), ...], 'species': [(name, init_conc, is_fixed), ...], 'species_ic_params': [(species_idx0, param_name), ...], 'observables': [(name, [(species_idx0, factor), ...]), ...], 'functions': [(name, expression), ...], 'reactions': [{reactants, products, type, rate_law, legacy_constants, stat_factor}, ...], 'net_file_dir', 'load_warnings'}. The records are the ones the loader hands ModelBuilder; each parameter's value, each species' concentration and each reaction's type are taken from the model it builds from them. The build runs here too, so a file Model.from_net refuses is refused, with ValueError. An expression-valued initial concentration is a lifted _InitialConc<N> parameter; Sat/Hill rate laws come back rewritten as functional ones.
     """
 def net_function_tables(func_name: str, expression: str) -> dict:
     """

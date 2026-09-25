@@ -304,12 +304,14 @@ def run_scipy_netreader_ode(net_path, t_end, n_steps):
         dy = np.zeros(nsp)
         for r in rxns:
             rl = r["rate_law"]
+            # A functional rate is a rate constant, like an elementary one: the
+            # engine multiplies it by the reactant amounts too (BNGL convention).
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
-                for ri in r["reactants"]:
-                    rate *= y[ri]
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
+            for ri in r["reactants"]:
+                rate *= y[ri]
             for ri in r["reactants"]:
                 dy[ri] -= rate
             for pi in r["products"]:
@@ -364,12 +366,14 @@ def run_diffrax_netreader_ode(net_path, t_end, n_steps):
         dy = jnp.zeros(nsp)
         for r in rxns:
             rl = r["rate_law"]
+            # A functional rate is a rate constant, like an elementary one: the
+            # engine multiplies it by the reactant amounts too (BNGL convention).
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
-                for ri in r["reactants"]:
-                    rate = rate * y_np[ri]
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
+            for ri in r["reactants"]:
+                rate = rate * y_np[ri]
             for ri in r["reactants"]:
                 dy = dy.at[ri].add(-rate)
             for pi in r["products"]:
@@ -430,10 +434,11 @@ def run_gillespy2_netreader_ssa(net_path, t_end, n_steps):
         for idx in r["products"]:
             sp = species_map[idx]
             products[sp] = products.get(sp, 0) + 1
+        # The rate column as written, stat factor included (issue #803).
+        sf = float(r["stat_factor"])
+        rate = r["rate_law"] if sf == 1.0 else f"{sf!r}*{r['rate_law']}"
         m.add_reaction(
-            gillespy2.Reaction(
-                name=f"R{ri}", reactants=reactants, products=products, rate=r["rate_law"]
-            )
+            gillespy2.Reaction(name=f"R{ri}", reactants=reactants, products=products, rate=rate)
         )
 
     m.timespan(np.linspace(0, t_end, n_steps + 1))
