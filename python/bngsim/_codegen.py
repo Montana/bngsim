@@ -1736,6 +1736,15 @@ def _boolean_zero_test(fn: str, left: str, right: str) -> str | None:
             continue
         if _is_zero_literal(other):
             return operand if fn == "Ne" else f"Not({operand})"
+        # The literal 1 is ExprTk's true, so `(cond) == 1` is `cond` and
+        # `(cond) != 1` is `Not(cond)`. Left to Eq/Ne, sympy folds both to a
+        # constant, since a Boolean never equals Integer 1: the if() lost its
+        # condition in every sympy-derived quantity (sensitivity RHS, analytic
+        # Jacobian, steady-state dY/dp) while the trajectory, which ExprTk
+        # evaluates, stayed right (issue #754). Any other literal is fine as it
+        # is: ExprTk's 0/1 never equals 2, and sympy's Eq(Boolean, 2) is False.
+        if _numeric_literal(other) == 1.0:
+            return operand if fn == "Eq" else f"Not({operand})"
         constant = _constant_comparison(other)
         if constant is None:
             continue
