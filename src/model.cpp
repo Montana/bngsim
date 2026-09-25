@@ -1393,6 +1393,41 @@ bool NetworkModel::is_state_address(const double *addr) const {
     return false;
 }
 
+bool NetworkModel::event_delay_is_fixed_zero(int event_idx, std::vector<int> *reads) const {
+    const Event &ev = impl_->events.at(static_cast<std::size_t>(event_idx));
+    if (reads != nullptr) {
+        reads->clear();
+    }
+    if (ev.delay_expr_idx < 0) {
+        return ev.delay == 0.0;
+    }
+    const auto &params = impl_->parameters;
+    const ExpressionEvaluator &eval = *impl_->evaluator;
+    for (const double *addr : eval.referenced_variable_addresses(ev.delay_expr_idx)) {
+        // A delay that reads trajectory state, time, or a derived parameter can
+        // become positive after the run starts. A plain parameter cannot: its
+        // value is fixed for the run (issue #835).
+        int found = -1;
+        for (std::size_t pi = 0; pi < params.size(); ++pi) {
+            if (&params[pi].value == addr) {
+                found = static_cast<int>(pi);
+                break;
+            }
+        }
+        if (found < 0 || params[static_cast<std::size_t>(found)].is_expression) {
+            return false;
+        }
+        if (reads != nullptr) {
+            reads->push_back(found);
+        }
+    }
+    // evaluate() is non-const on the evaluator but has no observable effect
+    // here; the model is logically unchanged. For a parameter-only expression
+    // this reads the current run's value.
+    ExpressionEvaluator &mut = const_cast<ExpressionEvaluator &>(eval);
+    return mut.evaluate(ev.delay_expr_idx) == 0.0;
+}
+
 std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
     const std::vector<std::string> &sens_param_names,
     const std::vector<int> &event_time_compensated) const {
@@ -1401,7 +1436,6 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
         return std::nullopt;
     }
     const auto &params = impl_->parameters;
-    const ExpressionEvaluator &eval = *impl_->evaluator;
 
     // Resolve requested sensitivity-parameter names → bound value addresses.
     // An unknown name is reported (the run path throws on unknown sensitivity
@@ -1447,44 +1481,24 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
     // zero_delay_sens_param is set when the only thing making a zero delay
     // effective is that it reads a requested sensitivity parameter.
     const Parameter *zero_delay_sens_param = nullptr;
-    auto has_effective_delay = [&](const Event &ev) {
+    auto has_effective_delay = [&](int ei) {
         zero_delay_sens_param = nullptr;
-        if (ev.delay_expr_idx >= 0) {
-            const Parameter *reads_sens = nullptr;
-            for (const double *addr : eval.referenced_variable_addresses(ev.delay_expr_idx)) {
-                // A delay that reads trajectory state, time, or a derived
-                // parameter can become positive after the run starts. A plain
-                // parameter cannot: its value is fixed for the run (issue #835).
-                const Parameter *param = nullptr;
-                for (const Parameter &p : params) {
-                    if (&p.value == addr) {
-                        param = &p;
-                        break;
-                    }
-                }
-                if (param == nullptr || param->is_expression) {
-                    return true;
-                }
-                if (reads_sens == nullptr && sens_param_addrs.count(addr) != 0) {
-                    reads_sens = param;
-                }
-            }
-            // evaluate() is non-const on the evaluator but has no observable
-            // effect here; the model is logically unchanged. For parameter-only
-            // expressions this checks the current run's value.
-            ExpressionEvaluator &mut = const_cast<ExpressionEvaluator &>(eval);
-            if (mut.evaluate(ev.delay_expr_idx) != 0.0) {
+        std::vector<int> reads;
+        if (!event_delay_is_fixed_zero(ei, &reads)) {
+            return true;
+        }
+        // A zero delay is still one to differentiate when it reads a requested
+        // parameter: the execution time is t* + d(p), so ∂t_exec/∂p carries
+        // ∂d/∂p, which the immediate path never adds. On `x' = -x`, reset
+        // `x = 1` at `d` after `time > 1` with d = 0, the true ∂x/∂d is x
+        // (right-sided), and passing this gate reported 0.
+        for (const int pidx : reads) {
+            if (sens_param_addrs.count(&params[pidx].value) != 0) {
+                zero_delay_sens_param = &params[pidx];
                 return true;
             }
-            // A zero delay is still one to differentiate when it reads a
-            // requested parameter: the execution time is t* + d(p), so
-            // ∂t_exec/∂p carries ∂d/∂p, which the immediate path never adds. On
-            // `x' = -x`, reset `x = 1` at `d` after `time > 1` with d = 0, the
-            // true ∂x/∂d is x (right-sided), and passing this gate reported 0.
-            zero_delay_sens_param = reads_sens;
-            return reads_sens != nullptr;
         }
-        return ev.delay != 0.0;
+        return false;
     };
 
     const std::unordered_set<int> compensated(event_time_compensated.begin(),
@@ -1493,7 +1507,7 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
     for (std::size_t ei = 0; ei < events.size(); ++ei) {
         const Event &ev = events[ei];
         const std::string id = ev.id.empty() ? std::string("<unnamed>") : ev.id;
-        const bool delayed = has_effective_delay(ev);
+        const bool delayed = has_effective_delay(static_cast<int>(ei));
         if (delayed && zero_delay_sens_param != nullptr) {
             const std::string &pname = zero_delay_sens_param->name;
             return "event '" + id +

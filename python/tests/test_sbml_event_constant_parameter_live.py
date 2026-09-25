@@ -186,3 +186,24 @@ def test_run_batch_row_that_makes_a_zero_delay_positive_is_refused():
     )
     with pytest.raises(bngsim.SimulationError, match="forward-sensitivity run"):
         sim.run_batch(t_span=(0, 3), n_points=4, params=[{"d": 0.5}])
+
+
+_SSA_DELAY_ANT = "model m; species X = 0; const d = {d}; E: at d after (time > 1): X = 5; end"
+
+
+def test_ssa_runs_a_zero_constant_parameter_delay():
+    # A delay that reads only a fixed parameter and is 0 queues nothing, as a
+    # literal 0 does. Before #833 kept it as an expression, it folded to one
+    # and ran under SSA; the expression form must run too.
+    model = bngsim.Model.from_antimony_string(_SSA_DELAY_ANT.format(d=0))
+    result = bngsim.Simulator(model, method="ssa").run(t_span=(0, 2), n_points=3, seed=1)
+    assert list(result.species[:, 0]) == [0.0, 5.0, 5.0]
+
+
+@pytest.mark.parametrize(("load", "set_to"), [(1.0, None), (0.0, 0.5)])
+def test_ssa_refuses_a_nonzero_constant_parameter_delay(load, set_to):
+    model = bngsim.Model.from_antimony_string(_SSA_DELAY_ANT.format(d=load))
+    if set_to is not None:
+        model.set_param("d", set_to)
+    with pytest.raises(bngsim.SimulationError, match="not yet supported under SSA"):
+        bngsim.Simulator(model, method="ssa").run(t_span=(0, 2), n_points=3, seed=1)
