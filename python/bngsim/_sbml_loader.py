@@ -2154,30 +2154,52 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     # would forge spurious adjacent edges. Resolution targets ~1/100 of the
     # shortest period so a dose window down to a few percent of a cycle is caught
     # in a coarse cell; npts is bounded to keep this pure-Python scan sub-second.
-    npts = int(min(max(horizon / (shortest / 100.0), 2000.0), 16000.0))
-    h = horizon / npts
-    centres = [(k + 0.5) * h for k in range(npts)]
-    sigs = [_structural_signature(t) for t in centres]
+    #
+    # Each coarse sign change is bisected to its true edge time so the measured
+    # spacing is the real window width, not the grid pitch. Without this, several
+    # floor / piecewise components flipping in adjacent cells read as edges a
+    # fraction of a cell apart and would shrink max_step needlessly (or,
+    # pathologically, toward zero). Edges nearer than a tight epsilon are the same
+    # physical instant (two components switching together) and collapse to one.
+    #
+    # The bisection runs per COMPONENT that changed, not on the signature as a
+    # whole: the two edges of a pulse narrower than the grid pitch fall in one
+    # cell, and bisecting the whole signature finds only the first of them. The
+    # pulse then reads as a gap of a whole period, and the bound lets CVODE step
+    # over every pulse. A floor/ceiling/modulo component flips once a period, so
+    # per component nothing is lost to the grid; a piecewise branch that opens and
+    # closes inside one cell still is.
+    def _scan_edges(horizon: float) -> list[float]:
+        npts = int(min(max(horizon / (shortest / 100.0), 2000.0), 16000.0))
+        h = horizon / npts
+        centres = [(k + 0.5) * h for k in range(npts)]
+        sigs = [_structural_signature(t) for t in centres]
+        found = []
+        for k in range(1, npts):
+            s_lo, s_hi = sigs[k - 1], sigs[k]
+            if s_lo == s_hi:
+                continue
+            for j in range(len(s_lo)):
+                if s_lo[j] == s_hi[j]:
+                    continue
+                lo, hi = centres[k - 1], centres[k]
+                for _ in range(30):
+                    mid = 0.5 * (lo + hi)
+                    if _structural_signature(mid)[j] == s_lo[j]:
+                        lo = mid
+                    else:
+                        hi = mid
+                found.append(hi)
+        return found
 
-    # Bisect each coarse sign change to its true edge time so the measured spacing
-    # is the real window width, not the grid pitch. Without this, several floor /
-    # piecewise components flipping in adjacent cells read as edges a fraction of a
-    # cell apart and would shrink max_step needlessly (or, pathologically, toward
-    # zero). Edges nearer than a tight epsilon are the same physical instant (two
-    # components switching together) and collapse to one.
-    edges = []
-    for k in range(1, npts):
-        if sigs[k] == sigs[k - 1]:
-            continue
-        lo, hi = centres[k - 1], centres[k]
-        s_lo = sigs[k - 1]
-        for _ in range(30):
-            mid = 0.5 * (lo + hi)
-            if _structural_signature(mid) == s_lo:
-                lo = mid
-            else:
-                hi = mid
-        edges.append(hi)
+    edges = _scan_edges(horizon)
+    if horizon > 128.0:
+        # The widened window (issue #712) is sampled more coarsely than the
+        # 128-unit one it replaces. Scan that one too, at its own pitch, so the
+        # edges are a superset of what it found and the bound is never looser
+        # than it was; that covers a piecewise branch too narrow for the wide grid.
+        edges.extend(_scan_edges(128.0))
+    edges.sort()
     if len(edges) < 2:
         return None  # no resolvable periodic feature
     eps = 1e-7 * max(horizon, 1.0)
