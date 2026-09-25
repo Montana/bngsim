@@ -43,6 +43,7 @@
 #include "bngsim/sundials_guards.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -332,6 +333,17 @@ struct CvodeUserData {
     // whenever their sync moved a parameter off them.
     const double *sens_p_nominal = nullptr;
     bool params_off_nominal = false;
+
+    // Every parameter's value at the nominal point with its derived parameters
+    // re-derived, captured on the first RHS call that is not a probe. Restoring
+    // after a probe then copies it instead of re-deriving, which on a model
+    // with hundreds of derived parameters is most of a probe's cost. Only when
+    // snapshot_restore_ok: every attached derived parameter reads nothing but
+    // parameters, so re-deriving at the nominal point always reproduces these
+    // values bit for bit (a `time()`-reading one would not, and keeps the
+    // re-derivation).
+    bool snapshot_restore_ok = false;
+    std::vector<double> params_nominal_snapshot;
 
     // Switch-time parameters held at their nominal value against CVODES'
     // finite-difference sensitivity probe (issue #48). Non-null only when a
@@ -854,6 +866,86 @@ cvode_failure_message(double t, int flag, CvodeUserData &data,
     return msg + nonfinite_witness_suffix(data);
 }
 
+// Whether a derived parameter's defining expression is a function of the
+// parameters alone: every name in it is a parameter, or a call to a stateless
+// math built-in. `time()` (bare `time` too), a table function, a name that is
+// not a parameter, and any call this list does not name could read state that
+// the parameter snapshot would freeze, so they keep the re-derivation (see
+// CvodeUserData::params_nominal_snapshot). A token scan rather than
+// referenced_variable_addresses(): that re-parses each expression with a fresh
+// parser, which on a model with hundreds of derived parameters cost more per
+// run than the snapshot saves.
+static bool reads_only_parameters(const std::string &expr,
+                                  const std::unordered_set<std::string> &param_names) {
+    static const std::unordered_set<std::string> pure = {
+        "exp", "log", "ln",   "log10", "log2", "sqrt",  "pow",  "abs",
+        "min", "max", "if",   "sign",  "sgn",  "floor", "ceil", "sin",
+        "cos", "tan", "asin", "acos",  "atan", "sinh",  "cosh", "tanh"};
+    const std::size_t n = expr.size();
+    auto digit = [&](std::size_t k) {
+        return k < n && std::isdigit(static_cast<unsigned char>(expr[k])) != 0;
+    };
+    for (std::size_t i = 0; i < n;) {
+        const auto c = static_cast<unsigned char>(expr[i]);
+        if (std::isdigit(c) || (c == '.' && digit(i + 1))) {
+            // A numeric literal, exponent included, so `1e-5` is not read as a name.
+            while (i < n && (digit(i) || expr[i] == '.')) {
+                ++i;
+            }
+            if (i < n && (expr[i] == 'e' || expr[i] == 'E') &&
+                (digit(i + 1) ||
+                 ((i + 1 < n && (expr[i + 1] == '+' || expr[i + 1] == '-')) && digit(i + 2)))) {
+                i += (expr[i + 1] == '+' || expr[i + 1] == '-') ? 2 : 1;
+                while (digit(i)) {
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (!(std::isalpha(c) || c == '_')) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < n && (std::isalnum(static_cast<unsigned char>(expr[j])) || expr[j] == '_')) {
+            ++j;
+        }
+        const std::string name = expr.substr(i, j - i);
+        std::size_t k = j;
+        while (k < n && std::isspace(static_cast<unsigned char>(expr[k]))) {
+            ++k;
+        }
+        const bool call = k < n && expr[k] == '(';
+        if (name == "time" || (call ? pure.count(name) == 0 : param_names.count(name) == 0)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+// Whether the sensitivity sync put a parameter somewhere other than its nominal
+// value, i.e. this call is a CVODES difference-quotient probe (issue #690). A
+// parameter that is NaN is NaN at the nominal point too, and `!=` alone would
+// call every RHS call of such a run a probe.
+static bool off_nominal(double v, double nominal) {
+    return v != nominal && !(std::isnan(v) && std::isnan(nominal));
+}
+
+// After the sync of an RHS call that is not a probe, keep the re-derived
+// nominal point for restore_params_after_probe (see
+// CvodeUserData::params_nominal_snapshot). Once per run.
+static void note_nominal_point(CvodeUserData *data, const std::vector<Parameter> &params) {
+    if (data->params_off_nominal || !data->snapshot_restore_ok ||
+        !data->params_nominal_snapshot.empty()) {
+        return;
+    }
+    data->params_nominal_snapshot.resize(static_cast<std::size_t>(data->n_params));
+    for (int i = 0; i < data->n_params; ++i) {
+        data->params_nominal_snapshot[static_cast<std::size_t>(i)] = params[i].value;
+    }
+}
+
 static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_data) {
     auto *data = static_cast<CvodeUserData *>(user_data);
     const double *y_ptr = N_VGetArrayPointer(y);
@@ -874,7 +966,8 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
             params[i].value = (data->sens_param_pinned != nullptr && data->sens_param_pinned[i])
                                   ? data->sens_param_nominal[i]
                                   : data->sens_p[i];
-            if (data->sens_p_nominal != nullptr && params[i].value != data->sens_p_nominal[i])
+            if (data->sens_p_nominal != nullptr &&
+                off_nominal(params[i].value, data->sens_p_nominal[i]))
                 data->params_off_nominal = true;
         }
         // Re-evaluate constant-expression parameters (e.g., ``_rateLaw{N}``
@@ -885,6 +978,7 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
         // primary parameter (issue #2). In dependency order, so it carries
         // through a derived parameter that reads another one (issue #568).
         const_cast<NetworkModel *>(data->model)->refresh_derived_params();
+        note_nominal_point(data, params);
     }
 
     data->model->compute_derivs(static_cast<double>(t), y_ptr, ydot_ptr);
@@ -912,16 +1006,24 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
 // Put the model's parameters (and the codegen buffer) back at their nominal
 // values after an RHS call whose sensitivity sync moved one to a CVODES
 // finite-difference probe value (issue #690). Only a probe call pays for this:
-// an ordinary RHS call leaves params_off_nominal false.
+// an ordinary RHS call leaves params_off_nominal false. With a nominal snapshot
+// (see CvodeUserData::params_nominal_snapshot) the restore is a copy; without
+// one it re-derives, which gives the same values the slow way.
 static void restore_params_after_probe(CvodeUserData *data) {
     if (!data->params_off_nominal) {
         return;
     }
     auto &params = const_cast<std::vector<Parameter> &>(data->model->parameters());
-    for (int i = 0; i < data->n_params; ++i) {
-        params[i].value = data->sens_p_nominal[i];
+    if (!data->params_nominal_snapshot.empty()) {
+        for (int i = 0; i < data->n_params; ++i) {
+            params[i].value = data->params_nominal_snapshot[static_cast<std::size_t>(i)];
+        }
+    } else {
+        for (int i = 0; i < data->n_params; ++i) {
+            params[i].value = data->sens_p_nominal[i];
+        }
+        const_cast<NetworkModel *>(data->model)->refresh_derived_params();
     }
-    const_cast<NetworkModel *>(data->model)->refresh_derived_params();
     if (data->codegen_param_values != nullptr) {
         for (int i = 0; i < data->n_params; ++i) {
             data->codegen_param_values[i] = params[i].value;
@@ -967,10 +1069,12 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
             params[i].value = (data->sens_param_pinned != nullptr && data->sens_param_pinned[i])
                                   ? data->sens_param_nominal[i]
                                   : data->sens_p[i];
-            if (data->sens_p_nominal != nullptr && params[i].value != data->sens_p_nominal[i])
+            if (data->sens_p_nominal != nullptr &&
+                off_nominal(params[i].value, data->sens_p_nominal[i]))
                 data->params_off_nominal = true;
         }
         const_cast<NetworkModel *>(data->model)->refresh_derived_params();
+        note_nominal_point(data, params);
         for (int i = 0; i < data->n_params; ++i) {
             data->codegen_param_values[i] = params[i].value;
         }
@@ -3527,6 +3631,29 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
     user_data.sens_p = sens_p.data();
     user_data.sens_p_nominal = sens.p_nominal.data();
     user_data.n_params = static_cast<int>(params.size());
+
+    // A probe's restore may copy a snapshot of the re-derived nominal point
+    // rather than re-derive (CvodeUserData::params_nominal_snapshot), but only
+    // if re-deriving there is a function of the parameters alone
+    // (reads_only_parameters). One derived parameter that reads anything else
+    // (`time()`, a table function) keeps the re-derivation for the whole run.
+    {
+        std::unordered_set<std::string> param_names;
+        param_names.reserve(params.size());
+        for (const auto &p : params) {
+            param_names.insert(p.name);
+        }
+        bool ok = true;
+        for (const auto &p : params) {
+            if (p.is_expression && p.evaluator_id >= 0 &&
+                !reads_only_parameters(p.expression, param_names)) {
+                ok = false;
+                break;
+            }
+        }
+        user_data.snapshot_restore_ok = ok;
+        user_data.params_nominal_snapshot.clear();
+    }
 
     // Pin switch-time parameters against the internal-FD probe (issue #48).
     // Only populated when a fitted switch time was detected, so every other

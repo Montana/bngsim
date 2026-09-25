@@ -141,3 +141,26 @@ def test_an_event_assignment_reading_a_sensitivity_parameter_is_exact():
     np.testing.assert_allclose(sens[:, 0], dk, rtol=1e-5, atol=1e-7)
     np.testing.assert_allclose(sens[:, 1], dreset, rtol=1e-5, atol=1e-7)
     assert m.get_param("reset") == 5.0
+
+
+def test_a_time_reading_derived_parameter_still_gets_its_parameters_back():
+    """The restore copies a snapshot of the nominal point only when re-deriving
+    there is a function of the parameters alone. ``kt`` reads ``time()``, so this
+    model takes the re-deriving restore instead, and must end the run at nominal
+    all the same (issue #690)."""
+    from bngsim._bngsim_core import ModelBuilder
+
+    b = ModelBuilder()
+    a = b.add_species("A", 10.0)
+    bb = b.add_species("B", 0.0)
+    b.add_parameter("k", 0.5)
+    b.add_parameter("kt", 0.0, "k*(1 + 0.1*time())", is_expression=True)
+    b.add_observable("Atot", [(a, 1.0)])
+    b.add_function("rf", "kt*abs(Atot)")
+    b.add_reaction([a], [bb], "functional", "rf")
+    m = bngsim.Model(_core=b.build())
+    sim = bngsim.Simulator(m, sensitivity_params=["k"])
+    for _ in range(3):
+        m.reset()
+        sim.run((0, 5), 6, rtol=1e-6)
+        assert m.get_param("k") == 0.5
