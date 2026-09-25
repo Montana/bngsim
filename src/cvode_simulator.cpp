@@ -3163,10 +3163,16 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
             }
         }
     } else if (n_sens_p > 0) {
-        std::unordered_map<int, int> param_to_sens_idx;
+        // Every column a parameter was requested in, not just the first (issue
+        // #759). A list assembled by concatenation can name a parameter twice;
+        // the RHS forcing df/dp already reached every such column, but a
+        // first-wins map left the repeats without their dx(0)/dp seed, so a
+        // pure IC parameter's repeat came back all zeros and a mixed one was
+        // off by the missing seed.
+        std::unordered_map<int, std::vector<int>> param_to_sens_idx;
         param_to_sens_idx.reserve(static_cast<size_t>(n_sens_p));
         for (int iS = 0; iS < n_sens_p; ++iS) {
-            param_to_sens_idx.emplace(sens_param_indices[iS], iS);
+            param_to_sens_idx[sens_param_indices[iS]].push_back(iS);
         }
         const auto &ic_param_sens = opts.sensitivity.ic_param_sens;
         if (!ic_param_sens.empty()) {
@@ -3182,11 +3188,12 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
                 if (it == param_to_sens_idx.end()) {
                     continue; // primary not requested for sensitivity
                 }
-                const int iS = it->second;
                 if (seed.species_idx0 < 0 || seed.species_idx0 >= ns) {
                     continue;
                 }
-                N_VGetArrayPointer(yS_guard[iS])[seed.species_idx0] += seed.d_ic_d_primary;
+                for (const int iS : it->second) {
+                    N_VGetArrayPointer(yS_guard[iS])[seed.species_idx0] += seed.d_ic_d_primary;
+                }
             }
         } else {
             // Legacy fallback (no Python injection, e.g. sympy unavailable):
@@ -3201,7 +3208,6 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
                 if (it == param_to_sens_idx.end()) {
                     continue; // parameter not requested for sensitivity
                 }
-                const int iS = it->second;
                 if (species_idx0 < 0 || species_idx0 >= ns) {
                     continue;
                 }
@@ -3215,7 +3221,9 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
                 if (sp.concentration != sp.initial_conc) {
                     continue;
                 }
-                N_VGetArrayPointer(yS_guard[iS])[species_idx0] = 1.0;
+                for (const int iS : it->second) {
+                    N_VGetArrayPointer(yS_guard[iS])[species_idx0] = 1.0;
+                }
             }
         }
     }
