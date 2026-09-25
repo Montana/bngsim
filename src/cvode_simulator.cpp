@@ -6311,12 +6311,15 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // passed the old clamp, so both fired at trigger time as if the
             // delay were 0, with no error (issue #762). Refuse them by name. A
             // negative within rounding of zero (`T - time()` evaluated at T) is
-            // still read as 0, which is what the clamp was for.
+            // still read as 0, which is what the clamp was for. How far past T
+            // the root finder lands, measured over T = 1e-3 … 1e9 and horizons
+            // up to 1e6·T: at most 1.7e-12·max(1, |t|), with the largest steps.
+            // The tolerance leaves wide margin over that.
             const double tol = 1e-9 * std::max(1.0, std::fabs(t_now));
             if (!std::isfinite(d) || d < -tol) {
                 const std::string id = ev.id.empty() ? std::to_string(ei) : ev.id;
-                throw std::runtime_error("event '" + id + "' fired at t=" + std::to_string(t_now) +
-                                         " with delay " + std::to_string(d) +
+                throw std::runtime_error("event '" + id + "' fired at t=" + diag_number(t_now) +
+                                         " with delay " + diag_number(d) +
                                          "; an event delay must be a finite, non-negative "
                                          "number");
             }

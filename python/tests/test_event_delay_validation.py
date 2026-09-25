@@ -89,7 +89,25 @@ def test_an_invalid_delay_expression_is_refused_at_the_fire(make, caplog):
         pytest.raises(bngsim.SimulationError, match=_REFUSAL) as info,
     ):
         _x(model)
-    assert "'E'" in str(info.value) and "t=1" in str(info.value)
+    assert "event 'E' fired at t=1 with delay" in str(info.value)
     # Not a Jacobian failure, so the jacobian="auto" FD retry must not run
     # (it would blame the Jacobian and fail the same way a second time).
     assert not [r for r in caplog.records if "GH#176" in r.getMessage()]
+
+
+# ─── The refusal names the value it refused ─────────────────────────────────
+
+
+def test_a_small_refused_delay_is_printed_as_itself():
+    """``std::to_string`` printed -5e-09 as "-0.000000": a refusal naming a
+    value that reads as zero. -5e-09 at t = 1 is past the 1e-9 rounding
+    allowance, so it is refused, and the message must say what it was."""
+    with pytest.raises(bngsim.SimulationError, match=_REFUSAL) as info:
+        _x(_builder_model(delay_expr="-5e-9"))
+    assert "with delay -5e-09;" in str(info.value)
+
+
+def test_a_small_refused_constant_delay_is_printed_as_itself():
+    with pytest.raises(RuntimeError, match=_REFUSAL) as info:
+        _builder_model(delay=-1e-7)
+    assert "has delay -1e-07;" in str(info.value)

@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -2148,8 +2149,12 @@ NetworkModel ModelBuilder::build() {
             // were 0 (issue #762). A delay expression is checked where it is
             // evaluated, at the fire.
             if (espec.delay_expr.empty() && (!std::isfinite(espec.delay) || espec.delay < 0.0)) {
+                // Not std::to_string: its fixed six decimals print -1e-07 as
+                // "-0.000000", naming a refused value that reads as zero.
+                std::ostringstream delay;
+                delay << espec.delay;
                 throw std::runtime_error("ModelBuilder: event '" + espec.id + "' has delay " +
-                                         std::to_string(espec.delay) +
+                                         delay.str() +
                                          "; an event delay must be a finite, non-negative number");
             }
 
