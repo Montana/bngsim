@@ -304,6 +304,27 @@ class TestCompilation:
         ):
             prepare_codegen(str(xml))
 
+    def test_prepare_codegen_leaves_a_callers_model_as_it_found_it(self):
+        """#825 review: with ``model=`` the wrapper compiled the caller's model and
+        also derived its analytical Jacobian, which the old path never did. A
+        model loaded here still gets one derived (``emit_jac``), so the compiled
+        Jacobian rides along; a caller's model is compiled as it stands."""
+        import ctypes
+
+        import bngsim
+
+        path = os.path.join(DATA, "saturation.net")  # Functional: derived lazily (GH #145)
+        m = bngsim.Model.from_net(path)
+        assert not m._core.analytical_jacobian_complete
+        with pytest.warns(DeprecationWarning):
+            theirs = prepare_codegen(path, model=m)
+        assert not m._core.analytical_jacobian_complete
+        assert not hasattr(ctypes.CDLL(str(theirs)), "bngsim_codegen_jac")
+
+        with pytest.warns(DeprecationWarning):
+            ours = prepare_codegen(path)
+        assert hasattr(ctypes.CDLL(str(ours)), "bngsim_codegen_jac")
+
     def test_prepare_codegen_is_a_deprecated_wrapper_over_the_model_path(self):
         """#803: the public ``prepare_codegen(net_path)`` keeps its signature, warns,
         and compiles the same artifact ``Simulator(codegen=True)`` does -- the built

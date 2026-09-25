@@ -10451,6 +10451,25 @@ def _record_codegen_error(exc: BaseException | None) -> None:
     _codegen_timing.last_error = exc
 
 
+def _record_codegen_decline(reason: str | None) -> None:
+    """Record why the most recent model-path ``prepare_*`` declined the model, as
+    :func:`_record_codegen_error` records why one failed.
+
+    A caller reporting a ``None`` used to infer the decline from a missing error,
+    which named the one decline that existed (issue #621, a cyclic function graph)
+    and would have named it for any decline added later. Recorded, the reason is
+    the decline's own.
+    """
+    _codegen_timing.last_decline = reason
+
+
+def last_codegen_decline() -> str | None:
+    """Why the most recent model-path ``prepare_*`` on this thread declined the
+    model, or ``None`` when it did not decline. Cleared at the start of every call,
+    with :func:`last_codegen_error`."""
+    return getattr(_codegen_timing, "last_decline", None)
+
+
 def last_codegen_error() -> BaseException | None:
     """The exception behind the most recent model-path ``prepare_*`` ``None``, or
     ``None`` when that call declined (or succeeded) without failing.
@@ -10494,12 +10513,14 @@ def prepare_model_codegen(model) -> Path | None:
     # so an earlier failed build's exception would otherwise be what
     # last_codegen_error() reports as the reason for this one.
     _record_codegen_error(None)
+    _record_codegen_decline(None)
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
         _topological_function_order(list(model._core.codegen_data()["functions"]))
     except CodegenDeclined as exc:
         logger.debug("codegen declined: %s", exc)
+        _record_codegen_decline(str(exc))
         return None
     except Exception:  # noqa: BLE001 - the real emit below reports properly
         pass
@@ -10616,12 +10637,14 @@ def prepare_model_codegen_source(model) -> str | None:
     """
     # Cleared before the decline, as in prepare_model_codegen.
     _record_codegen_error(None)
+    _record_codegen_decline(None)
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
         _topological_function_order(list(model._core.codegen_data()["functions"]))
     except CodegenDeclined as exc:
         logger.debug("codegen declined: %s", exc)
+        _record_codegen_decline(str(exc))
         return None
     except Exception:  # noqa: BLE001 - the real emit below reports properly
         pass
@@ -10717,9 +10740,11 @@ def prepare_codegen(net_path: str, model=None, emit_jac: bool = True) -> Path:
     from ``net_path`` with :meth:`bngsim.Model.from_net` when not given) goes
     through :func:`prepare_model_codegen`. The ``.net`` file is no longer re-read
     by a codegen parser of its own -- the second reading that disagreed with the
-    loader (#784). ``emit_jac`` derives the model's analytical Jacobian first,
-    as ``Simulator`` does, so the compiled one can be appended; the solver uses
-    it only when its ``jacobian`` asks for an analytical Jacobian.
+    loader (#784). ``emit_jac`` derives the analytical Jacobian of a model loaded
+    here, as ``Simulator`` does, so the compiled one is appended; the solver uses
+    it only when its ``jacobian`` asks for an analytical Jacobian. A model the
+    caller passes is compiled as it stands and left as it was: its Jacobian is
+    appended only if the caller already derived it, as the old path did.
 
     Raises
     ------
@@ -10738,7 +10763,8 @@ def prepare_codegen(net_path: str, model=None, emit_jac: bool = True) -> Path:
         DeprecationWarning,
         stacklevel=2,
     )
-    if model is None or not hasattr(model, "_core"):
+    loaded_here = model is None or not hasattr(model, "_core")
+    if loaded_here:
         from bngsim._model import Model
 
         model = Model.from_net(net_path)
@@ -10750,7 +10776,7 @@ def prepare_codegen(net_path: str, model=None, emit_jac: bool = True) -> Path:
             "or Antimony models, load the model first and use Simulator(..., "
             "codegen=True) without passing the SBML/XML file as net_path."
         )
-    if emit_jac:
+    if emit_jac and loaded_here:
         model.prepare_analytical_jacobian()
     so_path = prepare_model_codegen(model)
     if so_path is None:
@@ -10758,7 +10784,6 @@ def prepare_codegen(net_path: str, model=None, emit_jac: bool = True) -> Path:
         if cause is not None:
             raise RuntimeError(f"codegen build failed for {net_path}: {cause}") from cause
         raise RuntimeError(
-            f"codegen declined {net_path}: a cyclic function dependency has no emit "
-            "order (issue #621)"
+            f"codegen declined {net_path}: {last_codegen_decline() or 'no reason was recorded'}"
         )
     return so_path

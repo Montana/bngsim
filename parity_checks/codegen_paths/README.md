@@ -44,10 +44,12 @@ ran, and `Simulator._net_path` was set on the `net` arms and empty on the
 
 **Since #803 step 3 there is one codegen path.** Every model compiles from the
 model bngsim built, so on a current bngsim the `net` arms build exactly the
-`model` arms' artifact and reproduce them bit for bit; each cell records
-`net_codegen_path: false`, and the positive control becomes "the two arms built
-the same artifact". The arms A/B the two paths only when the harness runs against
-a bngsim from before that step, which is how the tables below were measured.
+`model` arms' artifact and reproduce them bit for bit, and each cell records
+`net_codegen_path: false`. The positive control then checks that every codegen
+cell ran compiled code and that every `net` cell built exactly its `model`
+twin's artifact; a `model` cell has no other path to have taken, and the summary
+line says so. The arms A/B the two paths only when the harness runs against a
+bngsim from before that step, which is how the tables below were measured.
 
 ## How a disagreement is judged
 

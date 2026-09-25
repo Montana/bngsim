@@ -42,6 +42,7 @@ from bngsim._atol import (
 )
 from bngsim._codegen import (
     _codegen_jit_backend,
+    last_codegen_decline,
     last_codegen_error,
     read_sens_decline_note,
 )
@@ -221,19 +222,26 @@ _UNAVAILABLE_NF_METHODS: dict[str, str] = _unavailable_nf_methods
 # sensitivity auto-codegen path here share one source of truth.
 
 
-def _codegen_refusal(cause: BaseException | None) -> str:
-    """Why ``codegen=True`` could not be honoured: the build failed (``cause``, as
-    :func:`bngsim._codegen.last_codegen_error` recorded it) or codegen declined the
-    model (a cyclic function graph, issue #621, has no emit order)."""
+def _codegen_refusal(cause: BaseException | None, decline: str | None) -> str:
+    """Why ``codegen=True`` could not be honoured, as the prepare call recorded it:
+    the build failed (``cause``, :func:`bngsim._codegen.last_codegen_error`) or
+    codegen declined the model (``decline``,
+    :func:`bngsim._codegen.last_codegen_decline`). Both are read, never inferred
+    from the other's absence."""
     if cause is not None:
         return (
             "codegen=True requested, but the codegen build failed "
             f"({type(cause).__name__}: {cause})."
         )
+    if decline is not None:
+        return (
+            f"codegen=True requested, but codegen declined this model: "
+            f"{decline.rstrip('.')}. Run it on the interpreted RHS with codegen=None "
+            "or codegen=False."
+        )
     return (
-        "codegen=True requested, but codegen declined this model (a cyclic "
-        "function dependency has no emit order, issue #621); run it on the "
-        "interpreted RHS with codegen=None or codegen=False."
+        "codegen=True requested, but codegen built nothing and recorded no reason; "
+        "please report this as a codegen issue."
     )
 
 
@@ -952,8 +960,6 @@ class Simulator:
             # evaluator (GH #136/#163) and, on a sensitivity run, the sensitivity
             # RHS. A .net or BNGL model used to be re-read from its file by a
             # second parser instead, and the two readings disagreed (#784).
-            from bngsim._codegen import last_codegen_error
-
             if jit_backend:
                 # JIT path: generate the C source string; the C++ MirJit backend
                 # compiles it in-process. No `cc` subprocess, no .so, no dlopen.
@@ -961,7 +967,9 @@ class Simulator:
 
                 src = prepare_model_codegen_source(model)
                 if src is None:
-                    raise RuntimeError(_codegen_refusal(last_codegen_error()))
+                    raise RuntimeError(
+                        _codegen_refusal(last_codegen_error(), last_codegen_decline())
+                    )
                 self._codegen_c_source = src
                 if hasattr(model, "_codegen_c_source"):
                     model._codegen_c_source = self._codegen_c_source
@@ -975,7 +983,9 @@ class Simulator:
 
                 so_path = prepare_model_codegen(model)
                 if so_path is None:
-                    raise RuntimeError(_codegen_refusal(last_codegen_error()))
+                    raise RuntimeError(
+                        _codegen_refusal(last_codegen_error(), last_codegen_decline())
+                    )
                 self._codegen_so_path = str(so_path)
                 if hasattr(model, "_codegen_so_path"):
                     model._codegen_so_path = self._codegen_so_path
@@ -1893,6 +1903,7 @@ class Simulator:
         # is a typed, NON-SCORING outcome in the parity taxonomy, that
         # misattribution would hide a resource limit rather than merely mislabel it.
         cause = last_codegen_error()
+        decline = last_codegen_decline()
         diff_err = (
             "Could not generate an analytical sensitivity RHS for this model: its "
             "rate laws could not be differentiated to closed form (e.g. a "
@@ -1915,6 +1926,15 @@ class Simulator:
                     f"forward sensitivity ({type(cause).__name__}: {cause}). This "
                     "is a BUILD failure, not a statement about the model's "
                     "differentiability."
+                )
+            if decline is not None:
+                # Codegen declined the whole model (a cyclic function graph, issue
+                # #621, today). Recorded rather than inferred: it used to reach the
+                # differentiability message below, which it has nothing to do with.
+                return SensitivityUnsupportedError(
+                    "Forward sensitivity needs a compiled sensitivity RHS, and codegen "
+                    f"declined this model: {decline.rstrip('.')}. bngsim refuses rather "
+                    "than return unreliable finite-difference derivatives (GH #214)."
                 )
             return SensitivityUnsupportedError(diff_err)
 

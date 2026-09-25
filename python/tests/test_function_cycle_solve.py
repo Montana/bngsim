@@ -263,6 +263,48 @@ def test_a_decline_is_not_blamed_on_an_earlier_failed_build(tmp_path, monkeypatc
     assert cg.last_codegen_error() is None
 
 
+def test_the_refusal_prints_the_recorded_decline_reason(tmp_path, monkeypatch):
+    """A decline records its reason (``last_codegen_decline()``), and the refusal
+    prints that reason rather than inferring one from a missing error -- which
+    named the #621 cycle and would have named it for any decline added later. A
+    decline with a reason of its own is injected where the cycle check runs."""
+    import bngsim._codegen as cg
+
+    monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "cg")
+
+    def decline(functions):
+        raise cg.CodegenDeclined("a decline nothing else has ever raised")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cg, "_topological_function_order", decline)
+        with pytest.raises(RuntimeError, match="a decline nothing else has ever raised"):
+            bngsim.Simulator(_cycle_model("k", "1"), method="ode", codegen=True)
+        assert cg.last_codegen_decline() == "a decline nothing else has ever raised"
+
+    # The real cycle records its own, and a later successful build clears it.
+    with pytest.raises(RuntimeError, match="#621"):
+        bngsim.Simulator(_cycle_model("0.5*g + 1", "0.5*f + 1"), method="ode", codegen=True)
+    assert "#621" in cg.last_codegen_decline()
+    bngsim.Simulator(_cycle_model("k", "1"), method="ode", codegen=True)
+    assert cg.last_codegen_decline() is None
+
+
+def test_a_sensitivity_run_on_a_declined_model_names_the_decline(tmp_path, monkeypatch):
+    """The sensitivity refusal inferred too: a build that returned nothing with no
+    error was reported as rate laws that "could not be differentiated", and the
+    only such build is the #621 decline, which has nothing to do with that."""
+    import bngsim._codegen as cg
+    from bngsim import SensitivityUnsupportedError
+
+    monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "cg")
+    with pytest.raises(SensitivityUnsupportedError, match="declined this model") as refused:
+        bngsim.Simulator(
+            _cycle_model("0.5*g + 1", "0.5*f + 1"), method="ode", sensitivity_params=["k"]
+        )
+    assert "#621" in str(refused.value)
+    assert "could not be differentiated" not in str(refused.value)
+
+
 def test_forcing_codegen_on_a_cyclic_model_still_gives_the_right_trajectory():
     """End to end: with the auto-codegen threshold dropped so the cyclic model
     qualifies, the decline has to actually reach the fallback."""
