@@ -80,3 +80,41 @@ def test_sequential_and_parallel_replicates_agree(tmp_path, method, kw):
     for a, b in zip(seq, par, strict=True):
         assert a.seed == b.seed
         np.testing.assert_array_equal(a.species, b.species)
+
+
+_PREEQUIL_NET = Path(__file__).resolve().parents[2] / "tests" / "data" / "preequil_prod_deg.net"
+_TOL = dict(rtol=1e-11, atol=1e-13)
+
+
+@pytest.mark.parametrize("procs", [None, 1, 2], ids=["default", "one", "parallel"])
+def test_replicates_keep_a_shared_models_carried_sensitivity_state(procs):
+    """Each sequential replicate's reset() cleared the pending dx/dθ seed and the
+    advanced-state marker of a model an ODE Simulator was carrying across a
+    pre-equilibration. Its next sensitivity run then seeded the carried state as
+    a fresh start with no refusal (GH #210), and a carry run raised. The
+    parallel path runs on clones and never touched either."""
+    m = bngsim.Model.from_net(str(_PREEQUIL_NET))
+    m.set_param("extra_deg", 0.0)
+    ode = bngsim.Simulator(m, method="ode", sensitivity_params=["k_prod", "k_deg"])
+    ode.run(t_span=(0, 200), n_points=3, steady_state=True, steady_state_tol=1e-12, **_TOL)
+    core = m._core
+    seed = np.array(core.pending_sensitivity_seed())
+
+    bngsim.Simulator(m, method="ssa").run_replicates(
+        2, t_span=(0, 1), n_points=2, seed=1, num_processors=procs
+    )
+
+    assert core.ic_state_dirty
+    np.testing.assert_array_equal(np.array(core.pending_sensitivity_seed()), seed)
+    m.set_param("extra_deg", 2.0)
+    with pytest.raises(bngsim.SimulationError, match="GH #210"):
+        ode.run(t_span=(0, 3), n_points=4, **_TOL)
+    got = ode.run(t_span=(0, 3), n_points=4, carry_sensitivities=True, **_TOL)
+
+    control = bngsim.Model.from_net(str(_PREEQUIL_NET))
+    control.set_param("extra_deg", 0.0)
+    csim = bngsim.Simulator(control, method="ode", sensitivity_params=["k_prod", "k_deg"])
+    csim.run(t_span=(0, 200), n_points=3, steady_state=True, steady_state_tol=1e-12, **_TOL)
+    control.set_param("extra_deg", 2.0)
+    expected = csim.run(t_span=(0, 3), n_points=4, carry_sensitivities=True, **_TOL)
+    np.testing.assert_array_equal(got.sensitivities, expected.sensitivities)
