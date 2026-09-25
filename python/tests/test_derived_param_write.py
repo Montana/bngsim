@@ -212,6 +212,38 @@ def test_force_override_pins_a_derived_parameter_against_an_identity_write():
     assert m.get_param("k_base") == pytest.approx(9.0)
 
 
+def test_force_override_pins_a_parameter_an_ordinary_write_already_overrode():
+    """Issue #769: the pin must hold when an ordinary override came first.
+
+    An ordinary override leaves ``is_expression`` false but keeps the evaluator,
+    which is what lets it re-attach. The forced write keyed its detach on
+    ``is_expression``, so for exactly that parameter it only changed the value
+    and left the evaluator in place: a later write equal to the expression's
+    value re-attached ``k``, and the next primary write moved the "pinned" rate
+    constant (in the issue's model, A(10) came out 80 instead of 30).
+    """
+    m = _two_param_model()
+    m.set_param("k", 5.0)  # ordinary override: reversible
+    m.set_param("k", 7.0, force_override=True)  # ...then pinned
+    assert not _attached(m, "k")
+
+    m.set_param("k_base", 1.5)
+    assert m.get_param("k") == pytest.approx(7.0)
+    m.set_param("k", 3.0)  # == 2 * k_base: re-attached before the fix
+    assert not _attached(m, "k"), "a forced pin must not be lifted by an identity write"
+    m.set_param("k_base", 4.0)
+    assert m.get_param("k") == pytest.approx(3.0), "pinned, so the primary must not move it"
+
+    # "neither reset, clone, nor a later write lifts it"
+    clone = m.clone()
+    m.reset()
+    for model in (m, clone):
+        assert not _attached(model, "k")
+        assert model.get_param("k") == pytest.approx(3.0)
+    r = bngsim.Simulator(m, method="ode").run(t_span=(0.0, 1.0), n_points=2, rtol=1e-10)
+    assert float(np.asarray(r.species)[-1, 0]) == pytest.approx(100.0 * np.exp(-3.0), rel=1e-6)
+
+
 # ── The reported reproducer, inverted ───────────────────────────────────────
 
 

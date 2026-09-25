@@ -451,11 +451,17 @@ void NetworkModel::set_param(const std::string &name, double value, bool force_o
 
     if (expr_live) {
         param.is_expression = (value == from_expr);
-    } else if (param.is_expression) {
+    } else if (force_override ? param.evaluator_id >= 0 : param.is_expression) {
         // Two ways here, and both want the pre-#188 latch — detach, permanently.
         //
         // `force_override`: the caller asked for a pin that no later write can
-        // lift by accident, which is the legacy semantics exactly.
+        // lift by accident, which is the legacy semantics exactly. It keys on the
+        // evaluator, not on is_expression (issue #769): a parameter an ordinary
+        // write already overrode has is_expression == false but still holds its
+        // evaluator, which is what makes that override reversible. Testing
+        // is_expression here skipped the detach for exactly that parameter, so
+        // a later write equal to the expression's value re-attached a "pinned"
+        // parameter and the next primary write moved it.
         //
         // Or an expression that will not evaluate — compilation failed at build
         // time (model_builder swallows that case), or it reads something
