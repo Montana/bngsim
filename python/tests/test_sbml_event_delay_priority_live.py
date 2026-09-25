@@ -58,3 +58,26 @@ def test_a_literal_delay_still_folds():
     """Nothing to keep live: a plain number stays a constant delay."""
     m = bngsim.Model.from_antimony_string("x=0; x'=0; E: at 0.5 after (time > 1): x = 1;")
     assert _x(m) == [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_a_delay_read_through_an_initial_assignment_follows_the_primary():
+    """``d = 2*k`` is an initialAssignment, so the fold used to take its value
+    in the file, 1; a write to ``k`` moved ``get_param('d')`` but not the delay."""
+    m = bngsim.Model.from_antimony_string(
+        "k=0.5; d=2*k; x=0; x'=0; E: at d after (time > 1): x = 1;"
+    )
+    m.set_param("k", 0.25)
+    m.reset()
+    assert m.get_param("d") == 0.5
+    t = np.linspace(0.0, 3.0, 7)
+    assert _x(m) == [1.0 if ti > 1.5 else 0.0 for ti in t]
+
+
+def test_a_non_integer_priority_parameter_follows_set_param():
+    """A non-integer priority took the other fold branch, ``repr(float(value))``:
+    an expression in form, the load-time number in content."""
+    m = bngsim.Model.from_antimony_string(_PRIORITY.format(p1=2.5, p2=1.5))
+    assert _x(m)[-1] == 2.0
+    m.set_param("p1", 0.5)
+    m.reset()
+    assert _x(m)[-1] == 1.0
