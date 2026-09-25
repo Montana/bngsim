@@ -1433,16 +1433,34 @@ std::optional<std::string> NetworkModel::event_sensitivity_unsupported_reason(
     // 0`, so nothing is queued and there is no trigger-time-to-execution-time
     // window at all. Normalize it here rather than in the builder, so the
     // runtime's own delay handling is untouched. A delay *expression* counts as
-    // vacuous only when it reads no model variable (so it cannot become
-    // non-zero later in the run) and evaluates to 0 now.
+    // vacuous when it reads only fixed parameters and evaluates to 0 now; those
+    // parameter values can be changed before a run but not during one.
     auto has_effective_delay = [&](const Event &ev) {
         if (ev.delay_expr_idx >= 0) {
-            if (!eval.referenced_variable_addresses(ev.delay_expr_idx).empty()) {
-                return true;
+            const auto refs = eval.referenced_variable_addresses(ev.delay_expr_idx);
+            for (const double *addr : refs) {
+                // A delay that reads trajectory state (or a non-parameter such
+                // as time) can become positive after the run starts. A plain
+                // parameter expression cannot: its current value is fixed for
+                // the duration of a run, though callers may set it before the
+                // run. Allow a parameter-only expression through this gate
+                // when it currently evaluates to zero (issue #835).
+                bool is_parameter = false;
+                bool is_live_parameter = false;
+                for (const Parameter &p : params) {
+                    if (&p.value == addr) {
+                        is_parameter = true;
+                        is_live_parameter = p.is_expression;
+                        break;
+                    }
+                }
+                if (!is_parameter || is_live_parameter || is_state_address(addr)) {
+                    return true;
+                }
             }
             // evaluate() is non-const on the evaluator but has no observable
-            // effect for a variable-free expression; the model is logically
-            // unchanged.
+            // effect here; the model is logically unchanged. For parameter-only
+            // expressions this checks the current run's value.
             ExpressionEvaluator &mut = const_cast<ExpressionEvaluator &>(eval);
             return mut.evaluate(ev.delay_expr_idx) != 0.0;
         }
