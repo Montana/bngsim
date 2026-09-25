@@ -3660,8 +3660,27 @@ class Simulator:
                     except Exception as e:
                         raise SimulationError(f"Replicate {i} failed: {e}") from e
         else:
+            # The sequential path runs on the live model and simulator (to reuse
+            # the cached dependency graph), so each replicate's reset() and run
+            # leave the model at the last replicate's end state, while the
+            # interactive clock (which _run_one never advances) stays where it
+            # was. A following run_until() then integrated from t_end's state
+            # and labelled it as the old time (issue #748). reset() also clears
+            # the carry-over sensitivity state (the pending dx/dθ seed and the
+            # advanced-state marker), which a Simulator sharing this model may
+            # be carrying across a pre-equilibration; losing the marker lets its
+            # next sensitivity run seed a carried state as a fresh start, with
+            # no refusal. Put the state and the carry-over back, as
+            # parameter_scan does. The parallel path runs on per-thread clones
+            # and touches neither, so the two now agree.
+            invocation_state = self._model.get_state()
+            invocation_carry = self._capture_carryover_state()
             times = _make_times()
-            results = [_run_one(self._sim, self._model, times, i) for i in range(n_replicates)]
+            try:
+                results = [_run_one(self._sim, self._model, times, i) for i in range(n_replicates)]
+            finally:
+                self._model.set_state(invocation_state)
+                self._restore_carryover_state(invocation_carry)
 
         if squeeze:
             return self._stamp(Result.squeeze(results))
