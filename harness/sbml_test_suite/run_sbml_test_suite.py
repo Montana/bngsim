@@ -19,8 +19,6 @@ Output:
 """
 
 import argparse
-import contextlib
-import csv
 import json
 import os
 import re
@@ -49,41 +47,6 @@ CANDIDATES_DIR = Path(
     )
 )
 
-# SBML levels to try, in preference order (newest first)
-SBML_PREF = [
-    "l3v2",
-    "l3v1",
-    "l2v5",
-    "l2v4",
-    "l2v3",
-    "l2v2",
-    "l2v1",
-    "l1v2",
-]
-
-
-def parse_settings(settings_path):
-    """Parse an SBML Test Suite settings file."""
-    s = {}
-    with open(settings_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if ":" in line:
-                key, _, val = line.partition(":")
-                s[key.strip()] = val.strip()
-    return {
-        "start": float(s.get("start", "0")),
-        "duration": float(s.get("duration", "1")),
-        "steps": int(s.get("steps", "50")),
-        "variables": [v.strip() for v in s.get("variables", "").split(",") if v.strip()],
-        "absolute": float(s.get("absolute", "1e-7")),
-        "relative": float(s.get("relative", "1e-4")),
-        "amount": [v.strip() for v in s.get("amount", "").split(",") if v.strip()],
-        "concentration": [v.strip() for v in s.get("concentration", "").split(",") if v.strip()],
-    }
-
 
 def parse_model_desc(model_m_path):
     """Parse the .m model description for tags and test type."""
@@ -106,458 +69,68 @@ def parse_model_desc(model_m_path):
     return tags
 
 
-def find_sbml_file(case_dir, case_id):
-    """Find the best available SBML file for a test case."""
-    for level in SBML_PREF:
-        path = case_dir / f"{case_id}-sbml-{level}.xml"
-        if path.exists():
-            return path
-    return None
+# ── Grading: the shared kernel of benchmarks/suites/sbml_test_suite ──────────
+#
+# That suite replaced this script for Table S8 (GH #225; harness/jobs.yaml).
+# This script kept its own copy of the grading, and the copy fell behind bngsim.
+# It indexed a Result's species block with the MODEL's species list, but a
+# parameter or compartment that an event assigns is promoted to integrator
+# state without being a species column of the Result (GH #71; it is reported as
+# a same-named observable, GH #202), so 79 cases died with an IndexError and
+# stopped the run. It converted concentrations to amounts with each
+# compartment's t=0 volume, so after an event resized a compartment it reported
+# the concentration as the amount. And its resolution and comparison rules had
+# drifted from the kernel's in other ways: graded by the copy, bngsim passed
+# 1391 cases; graded by the kernel, 1576, including all 79. Two graders that
+# disagree cannot both be the answer, so the kernel is now the only one. This
+# script keeps its CLI, its report and the --candidates pool, and scores each
+# case with the same run_case() the suite runs.
+_KERNEL_RUN = (
+    Path(__file__).resolve().parents[2] / "benchmarks" / "suites" / "sbml_test_suite" / "run.py"
+)
+_kernel_module = None
 
 
-def parse_results_csv(csv_path):
-    """Parse expected results CSV. Returns (times, {var: values})."""
-    with open(csv_path) as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        header = [h.strip() for h in header]
-        data = {h: [] for h in header}
-        for row in reader:
-            for h, v in zip(header, row, strict=False):
-                data[h].append(float(v))
-    times = np.array(data.get("time", []))
-    var_data = {k: np.array(v) for k, v in data.items() if k != "time"}
-    return times, var_data
+def _kernel():
+    """The suite's run.py, loaded once (it puts its own directory on sys.path
+    for its _grading / _engines / _effort imports)."""
+    global _kernel_module
+    if _kernel_module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_sbml_suite_kernel", _KERNEL_RUN)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _kernel_module = module
+    return _kernel_module
 
 
-def compare_results(actual, expected, atol, rtol):
-    """Check if actual matches expected within tolerances.
-
-    Returns (pass, max_err) where max_err is the maximum relative error.
-    """
-    if len(actual) != len(expected):
-        return False, float("inf")
-    diffs = np.abs(actual - expected)
-    # SBML test suite uses: |actual - expected| <= atol + rtol * |expected|
-    tol = atol + rtol * np.abs(expected)
-    within = diffs <= tol
-    if np.all(within):
-        # Compute a relative error metric for reporting
-        denom = np.maximum(np.abs(expected), atol)
-        rel = np.max(diffs / denom)
-        return True, float(rel)
-    else:
-        denom = np.maximum(np.abs(expected), atol)
-        rel = np.max(diffs / denom)
-        return False, float(rel)
-
-
-# ── Multi-engine runners ─────────────────────────────────────────────────
-
-
-def run_case_roadrunner(case_dir, case_id, settings, sbml_path, exp_data):
-    """Run a single case with libRoadRunner. Returns status dict."""
-    try:
-        import roadrunner
-    except ImportError:
-        return {"status": "skipped", "error": "roadrunner not installed"}
-
-    try:
-        rr = roadrunner.RoadRunner(str(sbml_path))
-    except Exception as e:
-        return {"status": "load_fail", "error": str(e)[:200]}
-
-    t_start = settings["start"]
-    t_end = t_start + settings["duration"]
-    n_points = settings["steps"] + 1
-
-    try:
-        rr.integrator.absolute_tolerance = 1e-12
-        rr.integrator.relative_tolerance = 1e-8
-        result = rr.simulate(t_start, t_end, n_points)
-    except Exception as e:
-        return {"status": "sim_fail", "error": str(e)[:200]}
-
-    data = np.array(result)
-    colnames = result.colnames
-
-    all_pass = True
-    max_err_overall = 0.0
-
-    for var_name in settings["variables"]:
-        if var_name not in exp_data:
-            continue
-        expected = exp_data[var_name]
-
-        # Find variable in RR output
-        actual = None
-        for ci, cn in enumerate(colnames):
-            clean = cn[1:-1] if cn.startswith("[") else cn
-            if clean == var_name:
-                actual = data[:, ci]
-                break
-
-        if actual is None:
-            return {"status": "var_missing", "error": f"variable '{var_name}' not found"}
-
-        if len(actual) != len(expected):
-            return {
-                "status": "shape_mismatch",
-                "error": f"got {len(actual)}, expected {len(expected)}",
-            }
-
-        ok, max_err = compare_results(actual, expected, settings["absolute"], settings["relative"])
-        max_err_overall = max(max_err_overall, max_err)
-        if not ok:
-            all_pass = False
-
-    if all_pass:
-        return {"status": "pass", "max_err": max_err_overall}
-    else:
-        return {
-            "status": "value_mismatch",
-            "error": f"max_err={max_err_overall:.6g}",
-            "max_err": max_err_overall,
-        }
-
-
-def run_case_amici(case_dir, case_id, settings, sbml_path, exp_data):
-    """Run a single case with AMICI. Returns status dict."""
-    try:
-        import tempfile
-
-        import amici
-    except ImportError:
-        return {"status": "skipped", "error": "amici not installed"}
-
-    t_start = settings["start"]
-    t_end = t_start + settings["duration"]
-    n_points = settings["steps"] + 1
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="amici_sts_") as tmpdir:
-            model_name = f"case_{case_id}"
-            importer = amici.SbmlImporter(str(sbml_path))
-            importer.sbml2amici(model_name, tmpdir)
-
-            model_module = amici.import_model_module(model_name, tmpdir)
-            model = model_module.getModel()
-            solver = model.getSolver()
-
-            model.setTimepoints(np.linspace(t_start, t_end, n_points))
-            solver.setAbsoluteTolerance(1e-12)
-            solver.setRelativeTolerance(1e-8)
-
-            rdata = amici.runAmiciSimulation(model, solver)
-    except Exception as e:
-        return {"status": "load_fail", "error": str(e)[:200]}
-
-    if rdata.x is None:
-        return {"status": "sim_fail", "error": "AMICI returned None"}
-
-    state_ids = list(model.getStateIds())
-
-    all_pass = True
-    max_err_overall = 0.0
-
-    for var_name in settings["variables"]:
-        if var_name not in exp_data:
-            continue
-        expected = exp_data[var_name]
-
-        actual = None
-        if var_name in state_ids:
-            idx = state_ids.index(var_name)
-            actual = rdata.x[:, idx]
-
-        if actual is None:
-            return {"status": "var_missing", "error": f"variable '{var_name}' not found"}
-
-        if len(actual) != len(expected):
-            return {
-                "status": "shape_mismatch",
-                "error": f"got {len(actual)}, expected {len(expected)}",
-            }
-
-        ok, max_err = compare_results(actual, expected, settings["absolute"], settings["relative"])
-        max_err_overall = max(max_err_overall, max_err)
-        if not ok:
-            all_pass = False
-
-    if all_pass:
-        return {"status": "pass", "max_err": max_err_overall}
-    else:
-        return {
-            "status": "value_mismatch",
-            "error": f"max_err={max_err_overall:.6g}",
-            "max_err": max_err_overall,
-        }
-
-
-def run_single_case(case_dir, case_id, timeout=30):
-    """Run a single SBML test suite case. Returns result dict."""
-    import bngsim
-
-    result = {
+def _graded(case_dir, case_id, engines):
+    """Score one case for BNGsim and *engines* through the kernel, in this
+    script's result shape (``tags`` as a dict, per-engine ``<eng>_*`` keys)."""
+    r = _kernel().run_case(case_dir, case_id, ["bngsim", *engines])
+    out = {
         "case": case_id,
-        "status": "unknown",
-        "error": "",
-        "tags": {},
-        "max_err": 0.0,
+        "status": r["status"],
+        "error": r["error"],
+        "tags": parse_model_desc(case_dir / f"{case_id}-model.m"),
+        "max_err": r["max_err"],
     }
+    for eng in engines:
+        for key in ("status", "error", "max_err"):
+            if f"{eng}_{key}" in r:
+                out[f"{eng}_{key}"] = r[f"{eng}_{key}"]
+    return out
 
-    # Parse metadata
-    model_m = case_dir / f"{case_id}-model.m"
-    tags = parse_model_desc(model_m)
-    result["tags"] = tags
 
-    # Only handle TimeCourse tests (skip SteadyState for now)
-    if tags["testType"] != "TimeCourse":
-        result["status"] = "skipped"
-        result["error"] = f"testType={tags['testType']}"
-        return result
-
-    # Parse settings
-    settings_path = case_dir / f"{case_id}-settings.txt"
-    if not settings_path.exists():
-        result["status"] = "skipped"
-        result["error"] = "no settings file"
-        return result
-    settings = parse_settings(settings_path)
-
-    # Find SBML file
-    sbml_path = find_sbml_file(case_dir, case_id)
-    if sbml_path is None:
-        result["status"] = "skipped"
-        result["error"] = "no SBML file found"
-        return result
-
-    # Parse expected results
-    csv_path = case_dir / f"{case_id}-results.csv"
-    if not csv_path.exists():
-        result["status"] = "skipped"
-        result["error"] = "no results CSV"
-        return result
-    exp_times, exp_data = parse_results_csv(csv_path)
-
-    # Load model
-    try:
-        model = bngsim.Model.from_sbml(str(sbml_path))
-    except Exception as e:
-        result["status"] = "load_fail"
-        result["error"] = str(e)[:200]
-        return result
-
-    # Snapshot the model's t=0 compartment volumes BEFORE running the sim.
-    # For non-constant compartments (rate rule on the compartment, or AR
-    # over rate-ruled variables) the parameter slot is updated during the
-    # integration; we want the t=0 value here.
-    comp_vol_at_t0 = {}
-    with contextlib.suppress(Exception):
-        for pn in model.param_names:
-            with contextlib.suppress(Exception):
-                comp_vol_at_t0[pn] = model.get_param(pn)
-
-    # Simulate
-    t_start = settings["start"]
-    t_end = t_start + settings["duration"]
-    n_points = settings["steps"] + 1
-
-    # Parameter-only models (no species): skip simulation, use
-    # constant parameter / assignment-rule values directly.
-    if model.n_species == 0:
-        sim_result = None
-    else:
-        try:
-            sim = bngsim.Simulator(model, method="ode")
-            # Match libRoadRunner's default integrator tolerances. The SBML
-            # Test Suite expects absolute precision down to 1e-8 on small
-            # species concentrations (~1e-5) where BNGsim's default 1e-8/1e-8
-            # leaves no headroom. Tightening to 1e-12/1e-8 brings borderline
-            # event-timing cases (e.g. 00652-00657) inside tolerance without
-            # affecting cases that already pass.
-            sim_result = sim.run(
-                t_span=(t_start, t_end),
-                n_points=n_points,
-                rtol=1e-8,
-                atol=1e-12,
-            )
-        except Exception as e:
-            result["status"] = "sim_fail"
-            result["error"] = str(e)[:200]
-            return result
-
-    # Extract variables and compare
-    species_names = model.species_names
-    param_names = model.param_names
-    obs_names = model.observable_names
-
-    # Build species → compartment volume map from SBML for amount conversion
-    comp_vols = {}
-    species_comps = {}
-    species_hosu = {}
-    try:
-        import libsbml
-
-        doc = libsbml.readSBMLFromFile(str(sbml_path))
-        sbml_m = doc.getModel()
-        if sbml_m:
-            for ci in range(sbml_m.getNumCompartments()):
-                c = sbml_m.getCompartment(ci)
-                comp_vols[c.getId()] = c.getSize() if c.isSetSize() else 1.0
-            for si in range(sbml_m.getNumSpecies()):
-                s = sbml_m.getSpecies(si)
-                species_comps[s.getId()] = s.getCompartment()
-                species_hosu[s.getId()] = s.getHasOnlySubstanceUnits()
-    except Exception:
-        pass
-
-    # When a compartment's volume is overridden by an initialAssignment or
-    # an assignmentRule, the loader's t=0 species concentrations divide by
-    # the AR/IA-resolved volume — not the raw XML size — so the harness has
-    # to use the matching value here. (e.g. 00140: AR sets compartment=1
-    # while raw size=5.) The model parameter holds the AR-resolved value
-    # IF queried before sim runs; afterwards a non-constant compartment's
-    # parameter slot has been updated to the end-of-sim value, which is
-    # not what we want.
-    for cid in list(comp_vols.keys()):
-        try:
-            v = comp_vol_at_t0[cid]
-        except Exception:
-            v = None
-        if v is not None:
-            comp_vols[cid] = v
-
-    all_pass = True
-    max_err_overall = 0.0
-
-    for var_name in settings["variables"]:
-        if var_name not in exp_data:
-            continue
-        expected = exp_data[var_name]
-
-        # Find the variable in BNGsim output
-        actual = None
-        is_species = False
-        lookup_name = var_name
-
-        # Check species (try direct name and _safe_name variant)
-        if sim_result is not None:
-            for try_name in [var_name, f"_ant_{var_name}"]:
-                if try_name in species_names:
-                    idx = species_names.index(try_name)
-                    actual = sim_result.species[:, idx]
-                    is_species = True
-                    lookup_name = var_name
-                    break
-
-        # Check observables (including _obs_ prefixed assignment-rule obs)
-        if actual is None and sim_result is not None:
-            for try_name in [
-                var_name,
-                f"_ant_{var_name}",
-                f"_obs_{var_name}",
-                f"_obs__ant_{var_name}",
-            ]:
-                if try_name in obs_names:
-                    idx = obs_names.index(try_name)
-                    actual = sim_result.observables[:, idx]
-                    is_species = True
-                    lookup_name = var_name
-                    break
-
-        # Check parameters (for compartment volumes, constants, AR params)
-        if actual is None:
-            for try_name in [var_name, f"_ant_{var_name}"]:
-                if try_name in param_names:
-                    val = model.get_param(try_name)
-                    actual = np.full(n_points, val)
-                    break
-
-        if actual is None:
-            result["status"] = "var_missing"
-            result["error"] = f"variable '{var_name}' not found in output"
-            return result
-
-        # Amount conversion: BNGsim tracks concentrations, but the test
-        # may expect amounts. If var is in the 'amount' list and it's a
-        # species with a non-unity compartment, multiply by volume.
-        if is_species and var_name in settings["amount"] and lookup_name in species_comps:
-            comp_id = species_comps[lookup_name]
-            vol = comp_vols.get(comp_id, 1.0)
-            if vol != 1.0:
-                actual = actual * vol
-
-        if len(actual) != len(expected):
-            result["status"] = "shape_mismatch"
-            result["error"] = (
-                f"var '{var_name}': got {len(actual)} points, expected {len(expected)}"
-            )
-            return result
-
-        ok, max_err = compare_results(actual, expected, settings["absolute"], settings["relative"])
-        max_err_overall = max(max_err_overall, max_err)
-        if not ok:
-            all_pass = False
-
-    result["max_err"] = max_err_overall
-    if all_pass:
-        result["status"] = "pass"
-    else:
-        result["status"] = "value_mismatch"
-        result["error"] = f"max_err={max_err_overall:.6g}"
-
-    return result
+def run_single_case(case_dir, case_id):
+    """Run a single SBML test suite case for BNGsim. Returns result dict."""
+    return _graded(case_dir, case_id, [])
 
 
 def _run_multi_engine_case(case_dir, case_id, engines):
-    """Run a single case across all requested engines.
-
-    Returns a dict with BNGsim result + per-engine sub-results.
-    """
-    # BNGsim result (always run)
-    bngsim_result = run_single_case(case_dir, case_id)
-
-    # Parse common metadata for other engines
-    settings_path = case_dir / f"{case_id}-settings.txt"
-    sbml_path = find_sbml_file(case_dir, case_id)
-    csv_path = case_dir / f"{case_id}-results.csv"
-
-    can_run_others = (
-        settings_path.exists()
-        and sbml_path is not None
-        and csv_path.exists()
-        and bngsim_result["tags"].get("testType") == "TimeCourse"
-    )
-
-    if can_run_others:
-        settings = parse_settings(settings_path)
-        _, exp_data = parse_results_csv(csv_path)
-    else:
-        settings = None
-        exp_data = None
-
-    # RoadRunner
-    if "rr" in engines and can_run_others:
-        rr_res = run_case_roadrunner(case_dir, case_id, settings, sbml_path, exp_data)
-        bngsim_result["rr_status"] = rr_res["status"]
-        bngsim_result["rr_error"] = rr_res.get("error", "")
-        bngsim_result["rr_max_err"] = rr_res.get("max_err", 0.0)
-    elif "rr" in engines:
-        bngsim_result["rr_status"] = "skipped"
-        bngsim_result["rr_error"] = "case not runnable"
-
-    # AMICI
-    if "amici" in engines and can_run_others:
-        amici_res = run_case_amici(case_dir, case_id, settings, sbml_path, exp_data)
-        bngsim_result["amici_status"] = amici_res["status"]
-        bngsim_result["amici_error"] = amici_res.get("error", "")
-        bngsim_result["amici_max_err"] = amici_res.get("max_err", 0.0)
-    elif "amici" in engines:
-        bngsim_result["amici_status"] = "skipped"
-        bngsim_result["amici_error"] = "case not runnable"
-
-    return bngsim_result
+    """Run a single case for BNGsim plus *engines* (``rr``, ``amici``)."""
+    return _graded(case_dir, case_id, sorted(engines))
 
 
 def _print_engine_summary(engine_name, results, key_prefix):
