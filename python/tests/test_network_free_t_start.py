@@ -32,9 +32,17 @@ def _available(method: str) -> bool:
         return False
 
 
+# Literal reasons, the ones the other network-free tests give: the skip audit
+# (test_skip_audit.py) reads each reason from the source and cannot read an
+# f-string's.
 METHODS = [
-    pytest.param(m, marks=pytest.mark.skipif(not _available(m), reason=f"{m} not compiled in"))
-    for m in ("nf", "rm")
+    pytest.param(
+        "nf", marks=pytest.mark.skipif(not _available("nf"), reason="NFsim not compiled in")
+    ),
+    pytest.param(
+        "rm",
+        marks=pytest.mark.skipif(not _available("rm"), reason="RuleMonkey not compiled in"),
+    ),
 ]
 
 
