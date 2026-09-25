@@ -589,15 +589,12 @@ end functions
     np.testing.assert_allclose(r["species"][:, 0], 5.0 * np.exp(-1.4 * r["time"]), rtol=1e-7)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="lanl/bngsim#837 (pre-existing JAX translator defect, not step 4's): an "
-    "integer literal power (1500^6) is evaluated as a Python int, which overflows int64 "
-    "when it meets a JAX array; OverflowError escapes Simulator(jacobian='jax') and "
-    "run_diffrax on corpus model m_ae32b88d25287652e5f9b663542644eb.net",
-)
 def test_an_integer_literal_power_beyond_int64(tmp_path):
+    """lanl/bngsim#837: an integer literal power (1500^6) was evaluated as a Python
+    int, which overflows int64 when it meets a JAX array, so OverflowError escaped
+    Simulator(jacobian='jax') and run_diffrax (corpus model
+    m_ae32b88d25287652e5f9b663542644eb.net). The translator now spells integer
+    literals as floats, as the engine evaluates them."""
     run_diffrax = _diffrax()
     net = _write(
         tmp_path,
@@ -621,12 +618,7 @@ begin functions
 end functions
 """,
     )
-    try:
-        r = run_diffrax(_load(net), t_end=2.0, n_points=3, **RUN)
-    except OverflowError as exc:
-        raise AssertionError(f"OverflowError escaped: {exc}") from exc
-    except ValueError:
-        return
+    r = run_diffrax(_load(net), t_end=2.0, n_points=3, **RUN)
     np.testing.assert_allclose(r["species"][:, 0], 3.0 * np.exp(-0.4 * r["time"]), rtol=1e-7)
 
 

@@ -103,6 +103,12 @@ class NetworkModel {
     // which is the probe's whole point.
     void refresh_derived_params(int skip_param_idx = -1);
 
+    // The derived parameters refresh_derived_params() re-derives, in the
+    // dependency order it walks them (0-based into parameters()). A caller that
+    // re-derives only some of them (the dependents of one probed parameter)
+    // must walk them in this order.
+    const std::vector<int> &derived_param_order() const;
+
     // ─── State management ────────────────────────────────────────────────────
     void reset(); // restore species to initial concentrations
 
