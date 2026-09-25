@@ -149,7 +149,7 @@ harness/
 ├── sbml_test_suite/                       # SBML Test Suite harness
 │   ├── SUITE_PIN.json                     # canonical version pin (commit 473e119d); all refs point here
 │   ├── fetch_semantic_suite.py            # clone the pinned semantic corpus into a checkout
-│   ├── run_sbml_test_suite.py             # Table S8: 3-engine pass rates + candidates
+│   ├── run_sbml_test_suite.py             # Table S8 CLI + candidates; grades via benchmarks/suites/sbml_test_suite
 │   ├── sbml_test_suite_results.json       # Cached results
 │   └── dsmts/                             # DSMTS SSA gate (run_dsmts.py)
 │       ├── dsmts_index.json               # 39-case metadata + settings

@@ -59,6 +59,23 @@ def run_bngsim(net_path, t_end, n_steps, bngsim_timeout=None):
     return np.array(result.species)
 
 
+def _jax_inputs(net_path):
+    """The JAX RHS, its parameter vector and the initial state, from the built model.
+
+    All three come from ``Model.from_net``: the vector in the model's parameter
+    order (derived parameters, lifted ``_InitialConc<N>`` rows and function slots
+    included), which is the order the RHS indexes (issue #803).
+    """
+    import bngsim
+    from bngsim._jax_rhs import generate_jax_rhs
+
+    model = bngsim.Model.from_net(net_path)
+    core = model._core
+    params = np.array([core.get_param(n) for n in core.param_names], dtype=np.float64)
+    y0 = np.asarray(core.get_initial_state(), dtype=np.float64)
+    return generate_jax_rhs(model), params, y0
+
+
 # ── Engine 2: scipy BDF + bngsim C++ RHS ────────────────────────
 
 
@@ -70,23 +87,11 @@ def run_scipy_bngsim_rhs(net_path, t_end, n_steps):
     RHS export wasn't available, so this engine instead uses the
     bngsim-derived JAX RHS evaluated with numpy arrays (no JIT).
     """
-    import bngsim
-    from scipy.integrate import solve_ivp
-
-    model = bngsim.Model.from_net(net_path)
-
-    y0 = np.array([model.get_concentration(name) for name in model.species_names])
-
-    from bngsim._codegen import _parse_net_file
-    from bngsim._jax_rhs import generate_jax_rhs
-
-    parsed = _parse_net_file(net_path)
-    param_values = np.array([v for _, _, v, _ in parsed["parameters"]], dtype=np.float64)
-
     # Generate JAX RHS but call it with numpy arrays (no JIT)
     import jax.numpy as jnp
+    from scipy.integrate import solve_ivp
 
-    jax_rhs = generate_jax_rhs(net_path)
+    jax_rhs, param_values, y0 = _jax_inputs(net_path)
 
     def scipy_rhs(t, y):
         return np.array(jax_rhs(jnp.array(y), float(t), jnp.array(param_values)))
@@ -114,19 +119,12 @@ def run_scipy_python_rhs(net_path, t_end, n_steps):
     Uses the JAX RHS generator (which produces numpy-compatible
     functions) but without JAX JIT compilation.
     """
-    from bngsim._codegen import _parse_net_file
-    from scipy.integrate import solve_ivp
-
-    parsed = _parse_net_file(net_path)
-    param_values = np.array([v for _, _, v, _ in parsed["parameters"]], dtype=np.float64)
-    species_ics = np.array([ic for _, _, ic, _ in parsed["species"]], dtype=np.float64)
-
     # Build a pure-numpy RHS from the JAX generator
     # We import jax but use numpy arrays (no tracing)
     import jax.numpy as jnp
-    from bngsim._jax_rhs import generate_jax_rhs
+    from scipy.integrate import solve_ivp
 
-    jax_rhs = generate_jax_rhs(net_path)
+    jax_rhs, param_values, species_ics = _jax_inputs(net_path)
 
     def numpy_rhs(t, y):
         return np.array(jax_rhs(jnp.array(y), float(t), jnp.array(param_values)))
@@ -156,14 +154,10 @@ def run_diffrax(net_path, t_end, n_steps):
     """
     import diffrax
     import jax.numpy as jnp
-    from bngsim._codegen import _parse_net_file
-    from bngsim._jax_rhs import generate_jax_rhs
 
-    parsed = _parse_net_file(net_path)
-    param_values = jnp.array([v for _, _, v, _ in parsed["parameters"]], dtype=jnp.float64)
-    species_ics = jnp.array([ic for _, _, ic, _ in parsed["species"]], dtype=jnp.float64)
-
-    jax_rhs = generate_jax_rhs(net_path)
+    jax_rhs, params_np, y0_np = _jax_inputs(net_path)
+    param_values = jnp.asarray(params_np, dtype=jnp.float64)
+    species_ics = jnp.asarray(y0_np, dtype=jnp.float64)
 
     # Wrap for diffrax API: (t, y, args) -> dy
     def diffrax_rhs(t, y, args):

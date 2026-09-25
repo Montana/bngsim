@@ -7,7 +7,8 @@ generation ~11 min on a 113k-reaction genome-scale model, dwarfing the
 
   1. ``set(param_idx.keys())`` was rebuilt once per reaction and handed to
      ``_classify_rate_law``, which never used it. Parameter count scales with
-     reaction count, so that is O(n_reactions x n_params).
+     reaction count, so that is O(n_reactions x n_params). (The classifier went
+     with the ``.net`` parser in #803 step 4.)
   2. ``_translate_expr`` rebuilt its full identifier lookup (every param +
      observable + function, plus a ``_safe_c_name`` regex per observable and
      function) once per function body. On a model with ~18k functions and
@@ -19,8 +20,8 @@ had the second quadratic too (``_translate_expr_to_c``), fixed the same way, and
 since #803 it is the generator every ``.net`` model goes through.
 
 These tests pin the properties, not a wall-clock number on one machine:
-  * Neither hot function takes the input that invited its per-item rebuild —
-    deterministic root-cause guards.
+  * The translator does not take the input that invited its per-item rebuild —
+    a deterministic root-cause guard.
   * An all-elementary model (exercises the RHS + twice-over sensitivity
     generator) and a function-heavy model (exercises function-body translation) each
     generate with large headroom under a budget the quadratic could not have
@@ -86,17 +87,6 @@ def _function_heavy_net(path, n: int, seed: int = 7) -> None:
         lines.append(f"{i + 1} O{i} {(i % n_sp) + 1}")
     lines += ["end groups"]
     path.write_text("\n".join(lines) + "\n")
-
-
-def test_classify_rate_law_does_not_take_param_name_set():
-    """Root-cause guard: the classifier consults only func_names. Re-adding a
-    parameter-name argument invites the per-reaction ``set(param_idx)`` rebuild
-    that made generation O(n^2) (GH #161)."""
-    params = list(inspect.signature(cg._classify_rate_law).parameters)
-    assert params == ["rate_law", "func_names"], (
-        f"_classify_rate_law signature is {params!r}; it must not accept the "
-        "parameter-name set (GH #161 — building it per reaction is quadratic)."
-    )
 
 
 def test_translate_expr_to_c_takes_a_prebuilt_lookup():

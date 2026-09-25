@@ -7,6 +7,12 @@ No Python↔C++ boundary crossings during the solve.
 Uses Kvaerno5 (5th-order implicit Runge-Kutta, L-stable) for stiff
 biochemical systems, with PID step size control.
 
+The RHS, the parameter values and the initial state all come from the built
+model (issue #803 step 4). They used to be re-read from the ``.net`` text by
+codegen's private parser: a synthesis reaction's rate was multiplied by the last
+species, a model without observables crashed, and an initial concentration
+written as an expression was looked up as a parameter name.
+
 Optional dependency: ``pip install diffrax``.
 """
 
@@ -17,7 +23,8 @@ import logging
 import numpy as np
 
 from bngsim._jax_rhs import (
-    _parse_net_file,
+    _as_model,
+    check_rhs_against_engine,
     generate_jax_rhs,
     jax_available,
 )
@@ -49,8 +56,8 @@ def diffrax_available() -> bool:
 
 
 def run_diffrax(
-    net_path: str,
-    param_dict: dict[str, float],
+    model,
+    param_dict: dict[str, float] | None = None,
     t_start: float = 0.0,
     t_end: float = 100.0,
     n_points: int = 101,
@@ -62,10 +69,16 @@ def run_diffrax(
 
     Parameters
     ----------
-    net_path : str
-        Path to the .net file.
-    param_dict : dict[str, float]
-        Parameter name → value mapping (all params).
+    model : Model or str
+        The built model, or a ``.net`` path loaded with ``Model.from_net``.
+    param_dict : dict[str, float], optional
+        Parameter overrides, applied with ``set_param`` to a clone of the model,
+        so derived parameters and parameter-valued initial conditions follow.
+        Every other parameter keeps the model's value. Naming a derived
+        parameter pins it at the value given. The primary parameters are applied
+        first and the derived ones after, whatever the order of the keys, so a
+        dict naming every parameter -- this function's contract before issue
+        #803 -- runs on exactly those values.
     t_start, t_end : float
         Time interval.
     n_points : int
@@ -80,6 +93,13 @@ def run_diffrax(
     dict
         Keys: 'time' (n_points,), 'species' (n_points, n_sp),
         'species_names' list[str], 'n_steps' int.
+
+    Raises
+    ------
+    ValueError
+        If the model has events, which this solver does not implement, or a
+        construct the JAX RHS does not implement or misdescribes (see
+        :func:`bngsim._jax_rhs.check_rhs_against_engine`).
     """
     if not diffrax_available():
         raise ImportError(
@@ -90,30 +110,34 @@ def run_diffrax(
     import jax
     import jax.numpy as jnp
 
-    # Parse model and build JAX RHS
-    model = _parse_net_file(net_path)
-    rhs = generate_jax_rhs(net_path)
-
-    # Build parameter array in .net file order
-    param_names_ordered = [name for _, name, _, _ in model["parameters"]]
-    params = jnp.array(
-        [param_dict[n] for n in param_names_ordered],
-        dtype=jnp.float64,
+    model = _as_model(model)
+    if param_dict:
+        model = model.clone()
+        derived = {
+            n for n, e in zip(model.param_names, model.param_is_expression, strict=True) if e
+        }
+        # Primaries first: a derived parameter set before one of its inputs would
+        # be recomputed over (set_param re-derives), and a key order would decide.
+        ordered = sorted(param_dict.items(), key=lambda kv: kv[0] in derived)
+        for name, value in ordered:
+            model.set_param(name, value)
+    if model.n_events:
+        raise ValueError(
+            f"run_diffrax does not implement events, and this model has {model.n_events}; "
+            "use Simulator(method='ode')."
+        )
+    rhs = generate_jax_rhs(model)
+    span = float(t_end) - float(t_start)
+    check_rhs_against_engine(
+        model, rhs, times=[float(t_start) + f * span for f in (0.0, 0.37, 0.81, 1.0)]
     )
 
-    # Initial species concentrations
-    y0_list = []
-    for _, _name, conc_str, _is_fixed in model["species"]:
-        try:
-            val = float(conc_str)
-        except (ValueError, TypeError):
-            # Expression — look up in param_dict
-            val = param_dict.get(conc_str, 0.0)
-        y0_list.append(val)
-    y0 = jnp.array(y0_list, dtype=jnp.float64)
-
-    # Species names
-    sp_names = [name for _, name, _, _ in model["species"]]
+    # Parameters in the model's order, derived ones at their evaluated values --
+    # the array the RHS indexes -- and the model's own initial state.
+    core = model._core
+    params = jnp.array([core.get_param(n) for n in core.param_names], dtype=jnp.float64)
+    y0 = jnp.array(np.asarray(core.get_initial_state()), dtype=jnp.float64)
+    sp_names = list(model.species_names)
 
     # Output times
     ts = jnp.linspace(t_start, t_end, n_points)

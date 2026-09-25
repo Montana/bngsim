@@ -156,31 +156,26 @@ class TestJaxJacobian:
         if not os.path.exists(path):
             pytest.skip("CaOscillate_functional.net not found")
 
-        jac_fn = generate_jax_jacobian(path)
+        import bngsim
 
-        # Use model's initial conditions
-        from bngsim._codegen import _parse_net_file
+        m = bngsim.Model.from_net(path)
+        jac_fn = generate_jax_jacobian(m)
+        n_sp = m.n_species
 
-        model = _parse_net_file(path)
-        n_sp = len(model["species"])
-
-        # Evaluate parameter values
-        param_vals = []
-        for _, _name, expr, _is_const in model["parameters"]:
-            try:
-                val = float(expr)
-            except (ValueError, TypeError):
-                val = 1.0  # placeholder for expressions
-            param_vals.append(val)
-        params = jnp.array(param_vals, dtype=jnp.float64)
-
-        # Initial species: use simple values
+        # The model's own parameter values, derived ones evaluated (the .net
+        # reader this used to take them from left every expression at 1.0).
+        core = m._core
+        params = jnp.array([core.get_param(n) for n in core.param_names], dtype=jnp.float64)
         y = jnp.ones(n_sp, dtype=jnp.float64) * 1000.0
 
         J_jax = np.asarray(jac_fn(y, 0.0, params))
         assert J_jax.shape == (n_sp, n_sp)
-        # Should have non-zero entries (it's a coupled system)
-        assert np.any(J_jax != 0.0)
+        assert np.any(J_jax != 0.0)  # a coupled system
+        # ...and it is the engine's Jacobian, not merely a nonzero one.
+        J_eng = m.jacobian(np.asarray(y))
+        np.testing.assert_allclose(
+            J_jax, np.asarray(J_eng), rtol=1e-8, atol=1e-10 * np.abs(J_eng).max()
+        )
 
 
 class TestPrepareJaxJacobian:

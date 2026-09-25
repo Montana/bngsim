@@ -35,8 +35,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-from bngsim._codegen import _strip_fixed_marker
-
 #: A name and nothing else. Tells a misspelled parameter reference in a species
 #: IC column apart from an arithmetic one: `B0_typo` should have resolved,
 #: `2*A0` is an expression to evaluate (issue #600).
@@ -426,6 +424,22 @@ def _evaluate_parameter_exprs_without_engine(
         ns[name] = value
         values.append(value)
     return values
+
+
+def _strip_fixed_marker(name: str) -> tuple[str, bool]:
+    """Return (clean_name, is_fixed) for a species name from a ``.net`` file.
+
+    The clamp `$` may sit at position 0 (`$Sink()`) or right after an
+    `@<compartment>::` prefix (`@CP::$Sink()`). Moved here from ``_codegen``, whose
+    own ``.net`` parser was its other user until #803 removed it.
+    """
+    if name.startswith("$"):
+        return name[1:], True
+    if name.startswith("@"):
+        sep = name.find("::")
+        if sep != -1 and sep + 2 < len(name) and name[sep + 2] == "$":
+            return name[: sep + 2] + name[sep + 3 :], True
+    return name, False
 
 
 def _parse_species(

@@ -58,13 +58,15 @@ Constructor:
   `"nf_exact"`, `"rulemonkey"`, `"rm"` (and aliases)
 
   ODE-specific kwargs: `jacobian` (`"auto"`, `"analytical"`, `"fd"`,
-  `"jax"`), `codegen` (bool or `None`), `net_path` (BioNetGen `.net` path),
-  `sensitivity_params` (list[str])
+  `"jax"`), `codegen` (bool or `None`), `sensitivity_params` (list[str])
 
   `codegen=True` compiles the model as built, whatever it was loaded from;
   `None` (the default) compiles at or above `BNGSIM_CODEGEN_THRESHOLD` species
-  (256). `net_path` is read only by `jacobian="jax"`, which parses the `.net`
-  file itself.
+  (256). `jacobian="jax"` differentiates a JAX RHS built from the model; a
+  model it does not implement (a compartment size that is a parameter, as in
+  every SBML model, amount-valued species, rate rules, `rateOf`, table
+  functions) is refused with the construct named. `net_path` is deprecated and
+  ignored.
 
   PSA: `poplevel` (float, required). Accepts `.net`, SBML, and Antimony
   models (same dispatch as SSA, sharing the `validate_for_ssa` gate).

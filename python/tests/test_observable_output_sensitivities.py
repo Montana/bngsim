@@ -63,7 +63,6 @@ def _chain_result(params=("k1", "k2"), ic=None):
         sensitivity_params=list(params),
         sensitivity_ic=list(ic) if ic else None,
         codegen=True,
-        net_path=CHAIN_NET,
     )
     return sim.run(t_span=T_SPAN, n_points=N_POINTS, **_RUN_KW)
 

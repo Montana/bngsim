@@ -2,8 +2,9 @@
 
 bngsim compiles an ODE right-hand side two ways. A model loaded with
 `Model.from_net` or `Model.from_bngl` goes through the **`.net` path**: codegen
-re-reads the `.net` file with its own parser (`_codegen._parse_net_file`) and
-emits C from that text. SBML, Antimony and builder models go through the
+re-reads the `.net` file with its own parser (`_codegen._parse_net_file`,
+removed in #803 step 4) and emits C from that text. SBML, Antimony and builder
+models go through the
 **model path**: C is emitted from the model bngsim actually built
 (`codegen_data()`, `prepare_model_codegen`). Every `codegen=True` run and every
 forward-sensitivity run of a BNGL model takes the `.net` path, so where the two
