@@ -3942,15 +3942,19 @@ class Simulator:
         if not declared:
             return seed
         species = self._model.species_names
-        col = {name: j for j, name in enumerate(names)}
+        # Every column a parameter occupies: a name requested twice is two
+        # columns, and both carry the declared value (issue #759).
+        cols: dict[str, list[int]] = {}
+        for j, name in enumerate(names):
+            cols.setdefault(name, []).append(j)
         for sp, row in declared.items():
             i = species.index(sp)
             # A declared row is fully specified: unnamed params are 0 (the hook
             # said what this initial condition depends on).
             seed[i, :] = 0.0
             for p, d in row.items():
-                if p in col:
-                    seed[i, col[p]] = d
+                for j in cols.get(p, ()):
+                    seed[i, j] = d
         return seed
 
     def _probe_on_point_ic_sens(

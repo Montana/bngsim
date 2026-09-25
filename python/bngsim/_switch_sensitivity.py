@@ -3734,13 +3734,46 @@ def _emit_switch_records(
     return records
 
 
+def _columns_of(names: Sequence[str]) -> dict[str, tuple[int, ...]]:
+    """Every sensitivity column each requested name occupies (issue #759).
+
+    ``sensitivity_params`` may name a parameter twice — a list built by
+    concatenation does it easily — and each occurrence is a column of its own
+    that must carry the same ∂t*/∂p as the first. A ``{name: column}`` map keeps
+    only the last occurrence, which left the earlier ones without the crossing
+    jump: all zeros for a pure switch or event time.
+    """
+    cols: dict[str, list[int]] = {}
+    for c, name in enumerate(names):
+        cols.setdefault(name, []).append(c)
+    return {name: tuple(c) for name, c in cols.items()}
+
+
+def _dtstar_columns(
+    partials: dict[str, float], col_of: dict[str, tuple[int, ...]], n_cols: int
+) -> tuple[list[float], bool]:
+    """Spread ``∂t*/∂primary`` over the requested columns (see :func:`_columns_of`).
+
+    Also returns whether any requested column received a non-zero partial.
+    """
+    dtstar = [0.0] * n_cols
+    moved = False
+    for prim_name, coeff in partials.items():
+        if coeff == 0.0:
+            continue
+        for col in col_of.get(prim_name, ()):
+            dtstar[col] += float(coeff)
+            moved = True
+    return dtstar, moved
+
+
 def _absorb_schedule_crossings(
     found: list[_Crossing],
     found_index: dict[tuple[int, str], list[int]],
     atom: str,
     scope: SwitchConditionScope,
     core,
-    col_of: dict[str, int],
+    col_of: dict[str, tuple[int, ...]],
     t_start: float,
     t_end: float,
     n_cols: int,
@@ -3819,11 +3852,7 @@ def _absorb_schedule_crossings(
         # filtered by exactly the test a threshold on it would be.
         if not (t_start < t_star <= t_end):
             continue
-        dtstar = [0.0] * n_cols
-        for prim_name, coeff in partials.items():
-            col = col_of.get(prim_name)
-            if col is not None and coeff != 0.0:
-                dtstar[col] += float(coeff)
+        dtstar, _ = _dtstar_columns(partials, col_of, n_cols)
         _absorb_crossing(
             found,
             _Crossing(
@@ -3937,7 +3966,7 @@ def compute_switch_time_sens(
     clock_symbols = set(scope.clock_symbols)
     param_idx = scope.param_idx
     derived_exprs = scope.derived_exprs
-    col_of = {name: c for c, name in enumerate(names)}
+    col_of = _columns_of(names)
     # A requested parameter that is itself derived gets a column of its own, on
     # the same terms the smooth half of that column already uses: the derivative
     # of writing that slot, holding what it is built from (issue #475). It used
@@ -4051,11 +4080,7 @@ def compute_switch_time_sens(
                         # cell: the guards select another branch there, and the
                         # condition does not flip (issue #545).
                         continue
-                    dtstar = [0.0] * len(names)
-                    for prim_name, coeff in partials.items():
-                        col = col_of.get(prim_name)
-                        if col is not None and coeff != 0.0:
-                            dtstar[col] += float(coeff)
+                    dtstar, _ = _dtstar_columns(partials, col_of, len(names))
 
                     if clock_sym in _TIME_SYMBOLS:
                         clock_idx0 = -1
@@ -4313,7 +4338,7 @@ def compute_event_time_sens(
     clocks = scope.clocks
     clock_symbols = set(scope.clock_symbols)
     thresholds = _threshold_scope(scope, ctx)
-    col_of = {name: c for c, name in enumerate(names)}
+    col_of = _columns_of(names)
     # Every body a trigger symbol can stand for, resolvable or not — used only
     # to decide whether an UNREDUCED trigger still depends on a requested
     # parameter. Kept separate from `thresholds.exprs`, which admits only the
@@ -4365,13 +4390,7 @@ def compute_event_time_sens(
             # or never fires in this run. Either way there is no jump to make,
             # and ∂t*/∂p is correctly absent rather than merely unknown.
             continue
-        dtstar = [0.0] * len(names)
-        moved = False
-        for prim_name, coeff in partials.items():
-            col = col_of.get(prim_name)
-            if col is not None and coeff != 0.0:
-                dtstar[col] += float(coeff)
-                moved = True
+        dtstar, moved = _dtstar_columns(partials, col_of, len(names))
         if moved:
             records.append((ei, dtstar))
 
