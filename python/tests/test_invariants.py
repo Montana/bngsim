@@ -478,7 +478,6 @@ FIXTURES: tuple[Fixture, ...] = (
         t_end=5.0,
         write=("kon", 0.2),
         sens=("scale",),
-        known=(("params_unchanged_sens", 690, AssertionError),),
     ),
 )
 
