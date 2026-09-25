@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -2139,6 +2141,21 @@ NetworkModel ModelBuilder::build() {
             } catch (const std::exception &e) {
                 throw std::runtime_error("ModelBuilder: failed to compile event trigger '" +
                                          espec.id + "': " + espec.trigger_expr + " — " + e.what());
+            }
+
+            // SBML L3 §4.11.3: a delay must be a non-negative number. A
+            // constant that is NaN, infinite or negative used to fall through
+            // the ODE loop's `delay > 0` test and fire at trigger time, as if it
+            // were 0 (issue #762). A delay expression is checked where it is
+            // evaluated, at the fire.
+            if (espec.delay_expr.empty() && (!std::isfinite(espec.delay) || espec.delay < 0.0)) {
+                // Not std::to_string: its fixed six decimals print -1e-07 as
+                // "-0.000000", naming a refused value that reads as zero.
+                std::ostringstream delay;
+                delay << espec.delay;
+                throw std::runtime_error("ModelBuilder: event '" + espec.id + "' has delay " +
+                                         delay.str() +
+                                         "; an event delay must be a finite, non-negative number");
             }
 
             // Compile optional delay expression
