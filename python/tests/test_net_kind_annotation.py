@@ -24,9 +24,9 @@ expression references another declared parameter. Two properties are pinned here
   reclassifies 628 of those lines and rewrites the sensitivity RHS of 54 models
   that were never broken.
 
-Since #803 codegen compiles the model the C++ loader built rather than re-reading
-the file, so the emitted-C tests below pin the loader's reading of the kinds; the
-``_parse_net_file`` tests pin the Python reader ``jacobian="jax"`` still uses.
+The rule was first written into codegen's private ``.net`` parser. Since #803
+every backend reads the model the C++ loader built, and that parser is gone, so
+every test here pins the loader's reading of the kinds.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from pathlib import Path
 import bngsim
 import numpy as np
 import pytest
-from bngsim._codegen import _parse_net_file, generate_sens_from_model
+from bngsim._codegen import generate_sens_from_model
 
 _env = os.environ.get("BNGSIM_TEST_DATA")
 DATA_DIR = Path(_env) if _env else Path(__file__).resolve().parent.parent.parent / "tests" / "data"
@@ -85,6 +85,17 @@ def _write(tmp_path: Path, name: str, text: str) -> str:
     return str(p)
 
 
+def _kinds(net: str) -> dict[str, bool]:
+    """``{name: is_primary}`` as the loader classified the parameters block."""
+    m = bngsim.Model.from_net(net)
+    internal = m._internal_param_names()
+    return {
+        n: not is_expr
+        for n, is_expr in zip(m.param_names, m.param_is_expression, strict=True)
+        if n not in internal
+    }
+
+
 def _sens_c(net: str) -> str | None:
     """The sensitivity RHS a sensitivity run of the .net at *net* compiles (GH #67
     extends it to Functional rate laws, so they are compared too)."""
@@ -115,8 +126,7 @@ def _sensitivity_of(net: str, param: str, species: int, times) -> np.ndarray:
 )
 def test_parameter_kinds_are_read_off_the_expressions(tmp_path, text):
     """``a``/``b`` reference ``p``; ``p``/``c1``/``c2`` reference nothing."""
-    parsed = _parse_net_file(_write(tmp_path, "m.net", text))
-    kinds = {name: is_const for _, name, _, is_const in parsed["parameters"]}
+    kinds = _kinds(_write(tmp_path, "m.net", text))
     assert kinds == {"p": True, "c1": True, "c2": True, "a": False, "b": False}
 
 
@@ -172,8 +182,7 @@ def test_literal_arithmetic_parameter_stays_a_differentiation_leaf(tmp_path):
     """
     net = _write(tmp_path, "literal.net", _LITERAL_ARITHMETIC)
 
-    parsed = _parse_net_file(net)
-    assert [(n, is_const) for _, n, _, is_const in parsed["parameters"]] == [("kdeg", True)]
+    assert _kinds(net) == {"kdeg": True}
 
     times = np.array([0.0, 5.0, 20.0])
     measured = _sensitivity_of(net, "kdeg", 0, times)

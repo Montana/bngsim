@@ -968,184 +968,7 @@ def _shard_value_lines(
     return [decl, *call_lines], [*proto_lines, "", *block_defs]
 
 
-# ─── .net file parser (lightweight, Python-only) ────────────────────────
-
-
-def _parse_net_file(net_path: str) -> dict:
-    """Parse a .net file into a dict of model metadata for code generation.
-
-    Returns dict with keys: parameters, species, reactions, observables,
-    functions, fixed_species.
-    """
-    with open(net_path, encoding="utf-8") as f:
-        content = f.read()
-
-    result: dict[str, list] = {
-        "parameters": [],  # [(index, name, expr_or_value, is_const)]
-        "species": [],  # [(index, name, init_conc, is_fixed)]
-        "reactions": [],  # [(index, reactants, products, rate_law, comment)]
-        "observables": [],  # [(index, name, entries)]  entries=[(factor, sp_idx)]
-        "functions": [],  # [(index, name, expression)]
-    }
-
-    section = None
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        if line.startswith("begin "):
-            section = line.split()[1]
-            continue
-        if line.startswith("end "):
-            section = None
-            continue
-
-        if section == "parameters":
-            result["parameters"].append(_parse_parameter_line(line))
-        elif section == "species":
-            result["species"].append(_parse_species_line(line))
-        elif section == "reactions":
-            result["reactions"].append(_parse_reaction_line(line))
-        elif section == "groups":
-            result["observables"].append(_parse_group_line(line))
-        elif section == "functions":
-            result["functions"].append(_parse_function_line(line))
-
-    result["parameters"] = _classify_parameter_kinds(result["parameters"])
-    return result
-
-
-def _classify_parameter_kinds(params: list[tuple]) -> list[tuple]:
-    """Fill in each parameter's ``is_const`` flag from the expressions alone.
-
-    A parameter is *derived* exactly when its value expression references another
-    declared parameter. That, and only that, is what makes the chain rule
-    ``∂p_d/∂θ`` necessary: ``pi = 2*asin(1)`` names nothing else and so
-    differentiates as a leaf, exactly like a literal, while ``a = p*c1`` carries
-    ``∂a/∂p = c1`` into every rate law that uses it.
-
-    This replaces reading BNG2.pl's trailing ``# Constant`` /
-    ``# ConstantExpression`` kind annotation (GH #181). That annotation is a
-    *comment*: a hand-written or third-party ``.net`` need not carry it, and
-    without it every parameter here was taken for a constant — so ``a  p*c1``
-    got no derived expansion, ``∂f/∂p`` had no term to contribute, and ``dX/dp``
-    came back **identically zero with no warning** on a file whose loaded model
-    (``net_file_loader.cpp``, which reads the expression, not the comment)
-    classified the very same parameter correctly. A silently-zero column reads
-    to a gradient fit as "this parameter does not matter".
-
-    Measured over the 1,817 ``.net`` files in this tree — 41,433 annotated
-    parameter lines — this rule reproduces BNG2.pl's own annotation on every
-    line BNG2.pl emits, so an annotated model is classified exactly as before.
-    """
-    split = _split_word_names({name for _, name, _, _ in params})
-    return [
-        (idx, name, expr, not [d for d in _names_referenced_in_split(expr, *split) if d != name])
-        for idx, name, expr, _ in params
-    ]
-
-
-def _parse_parameter_line(line: str) -> tuple:
-    """Parse: '1 kf 0.001  # Constant' -> (1, 'kf', '0.001', True)
-
-    The trailing ``is_const`` is provisional and always ``True`` here — one line
-    cannot see the other parameter names it would have to reference to be
-    derived. ``_parse_net_file`` overwrites the whole column through
-    ``_classify_parameter_kinds`` once the block is read; the kind annotation in
-    the comment is deliberately not consulted (GH #181).
-    """
-    # Remove trailing comment
-    comment_idx = line.find("#")
-    if comment_idx >= 0:
-        line = line[:comment_idx].strip()
-    parts = line.split(None, 2)
-    idx = int(parts[0])
-    name = parts[1]
-    expr = parts[2] if len(parts) > 2 else "0"
-    return (idx, name, expr, True)
-
-
-def _parse_species_line(line: str) -> tuple:
-    """Parse: '1 A() 100' -> (1, 'A()', '100', False)
-    '$' marks a fixed (boundary) species. For cBNGL models BNG2.pl writes
-    the marker after the `@compartment::` prefix (e.g. `@CP::$Sink()`); both
-    forms are recognized and the `$` is stripped from the stored name.
-    """
-    parts = line.split()
-    idx = int(parts[0])
-    name, is_fixed = _strip_fixed_marker(parts[1])
-    conc = parts[2] if len(parts) > 2 else "0"
-    return (idx, name, conc, is_fixed)
-
-
-def _strip_fixed_marker(name: str) -> tuple[str, bool]:
-    """Return (clean_name, is_fixed). The clamp `$` may sit at position 0
-    (`$Sink()`) or right after an `@<compartment>::` prefix (`@CP::$Sink()`).
-    """
-    if name.startswith("$"):
-        return name[1:], True
-    if name.startswith("@"):
-        sep = name.find("::")
-        if sep != -1 and sep + 2 < len(name) and name[sep + 2] == "$":
-            return name[: sep + 2] + name[sep + 3 :], True
-    return name, False
-
-
-def _parse_reaction_line(line: str) -> tuple:
-    """Parse: '1 1,2 3 kf #_R1' -> (1, [1,2], [3], 'kf', '_R1')"""
-    comment = ""
-    comment_idx = line.find("#")
-    if comment_idx >= 0:
-        comment = line[comment_idx + 1 :].strip()
-        line = line[:comment_idx].strip()
-
-    parts = line.split()
-    idx = int(parts[0])
-
-    # Parse reactants
-    reactant_str = parts[1]
-    reactants = [int(x) for x in reactant_str.split(",")]
-
-    # Parse products
-    product_str = parts[2]
-    products = [int(x) for x in product_str.split(",")]
-
-    # Rate law: everything after products. BNG emits multi-token forms such as
-    # ``MM kcat Km``; truncating to parts[3] turns them into an unknown
-    # elementary parameter and silently emits a zero rate.
-    rate_law = " ".join(parts[3:]) if len(parts) > 3 else ""
-
-    return (idx, reactants, products, rate_law, comment)
-
-
-def _parse_group_line(line: str) -> tuple:
-    """Parse: '1 A_tot  1,2*3,5' -> (1, 'A_tot', [(1.0, 1), (2.0, 3), (1.0, 5)])"""
-    parts = line.split()
-    idx = int(parts[0])
-    name = parts[1]
-    entries = []
-    if len(parts) > 2:
-        for token in parts[2].split(","):
-            if "*" in token:
-                factor_str, sp_str = token.split("*", 1)
-                entries.append((float(factor_str), int(sp_str)))
-            else:
-                entries.append((1.0, int(token)))
-    return (idx, name, entries)
-
-
-def _parse_function_line(line: str) -> tuple:
-    """Parse: '1 sat3() k3/(K4+G)' -> (1, 'sat3', 'k3/(K4+G)')"""
-    parts = line.split(None, 2)
-    idx = int(parts[0])
-    # Remove () from function name
-    name = parts[1].rstrip("()")
-    expr = parts[2] if len(parts) > 2 else "0"
-    return (idx, name, expr)
-
-
-# ─── tfun body recognition ───────────────────────────────────────────────
+# ─── Expression scanning ────────────────────────────────────────────────
 
 
 def _find_close_paren_strict(expr: str, open_pos: int) -> int:
@@ -1154,8 +977,9 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
 
     Distinct from the legacy ``_find_matching_paren`` helper used by
     ``_replace_if_calls`` etc. — that one returns ``len(expr) - 1`` on
-    unbalanced input so the caller can keep slicing. tfun extraction needs
-    to fail loudly instead, hence the separate function.
+    unbalanced input so the caller can keep slicing. The callers here (the
+    derived-expression and switch-condition parsers, the JAX translator) need to
+    fail loudly instead, hence the separate function.
     """
     depth = 1
     i = open_pos + 1
@@ -1169,45 +993,6 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
                 return i
         i += 1
     return -1
-
-
-# ─── Rate law classification ─────────────────────────────────────────
-
-
-def _classify_rate_law(rate_law: str, func_names: set):
-    """Classify a rate law string.
-
-    Returns: ('elementary', param_name, stat_factor) or
-             ('functional', func_name, stat_factor) or
-             ('mm', kcat_name, km_name, stat_factor)
-
-    A rate law is MM if it matches the ``MM ...`` form, Functional if its core
-    is a known function name (``func_names``), otherwise Elementary — so only
-    ``func_names`` is consulted. Callers must NOT pass the parameter-name set:
-    classification never reads it, and building ``set(param_idx)`` per reaction
-    is accidentally O(n_reactions × n_params) on genome-scale models (GH #161).
-    """
-    # Check for stat_factor prefix: "2*kf" or "0.5*kf"
-    stat_factor = 1.0
-    core = rate_law.strip()
-    m = re.match(r"^(\d+(?:\.\d*)?)\*(.+)$", core)
-    if m:
-        stat_factor = float(m.group(1))
-        core = m.group(2).strip()
-
-    # Check if it's MM. BNG .net files use whitespace form ("MM kcat Km");
-    # accept the parenthesized form too because older tests and synthetic probes
-    # used it.
-    mm = re.match(r"^MM\((\w+),\s*(\w+)\)$", core) or re.match(r"^MM\s+(\w+)\s+(\w+)$", core)
-    if mm:
-        return ("mm", mm.group(1), mm.group(2), stat_factor)
-
-    # Check if it's a function reference
-    if core in func_names:
-        return ("functional", core, stat_factor)
-
-    # Otherwise it's elementary (parameter reference)
-    return ("elementary", core, stat_factor)
 
 
 # Python keywords (and a couple of always-reserved identifiers) that, when

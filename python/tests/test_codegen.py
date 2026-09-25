@@ -5,18 +5,19 @@ model (every codegen build since #803) → compilation → dlopen → CVODE
 integration → correctness vs ExprTk baseline.
 """
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import types
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 from bngsim._codegen import (
-    _parse_net_file,
     _replace_power_op,
     compute_model_codegen_hash,
     generate_rhs_from_model,
@@ -41,6 +42,14 @@ def _rhs_c(path) -> str:
     """The RHS C the .net at *path* compiles to: generated from the built model,
     the one codegen path since #803."""
     return generate_rhs_from_model(_model(path))
+
+
+@contextlib.contextmanager
+def _no_warning():
+    """Fail on any warning inside the block (the ``pytest.warns`` negative)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        yield
 
 
 def _so(path) -> str:
@@ -204,35 +213,6 @@ class TestReplacePowerOpScientificNotation:
         assert proc.returncode == 0, proc.stderr
 
 
-class TestNetParser:
-    """Test lightweight .net file parser."""
-
-    def test_parse_simple_decay(self):
-        model = _parse_net_file(os.path.join(DATA, "simple_decay.net"))
-        assert len(model["parameters"]) == 1
-        assert len(model["species"]) == 2
-        assert len(model["reactions"]) == 1
-        assert len(model["observables"]) == 2
-        assert model["parameters"][0][1] == "k1"
-
-    def test_parse_reversible(self):
-        model = _parse_net_file(os.path.join(DATA, "two_species_reversible.net"))
-        assert len(model["parameters"]) == 2
-        assert len(model["species"]) == 3
-        assert len(model["reactions"]) == 2
-
-    def test_parse_observables(self):
-        model = _parse_net_file(os.path.join(DATA, "simple_decay.net"))
-        # groups: "1 A_tot  1" and "2 B_tot  2"
-        obs = model["observables"]
-        assert obs[0][1] == "A_tot"
-        assert obs[0][2] == [(1.0, 1)]
-
-    def test_parse_multi_token_mm_rate_law(self):
-        model = _parse_net_file(os.path.join(DATA, "mm_tqssa.net"))
-        assert model["reactions"][0][3] == "MM kcat Km"
-
-
 class TestCodeGeneration:
     """Test C code generation for .net models."""
 
@@ -391,12 +371,16 @@ class TestSimulatorCodegenRouting:
         monkeypatch.setattr(codegen_mod, "prepare_model_codegen", fake_prepare_model_codegen)
         monkeypatch.setattr(codegen_mod, "prepare_codegen", fake_prepare_codegen)
 
-        sim = bngsim.Simulator(
-            model,
-            method="ode",
-            codegen=True,
-            net_path=str(tmp_path / net_path) if net_path else "",
-        )
+        # A net_path is deprecated and ignored since #803 step 4; passing one
+        # still must not route anywhere else.
+        expect = pytest.warns(DeprecationWarning, match="net_path") if net_path else _no_warning()
+        with expect:
+            sim = bngsim.Simulator(
+                model,
+                method="ode",
+                codegen=True,
+                net_path=str(tmp_path / net_path) if net_path else "",
+            )
 
         assert calls == [("model", model)]
         assert sim._codegen_so_path == str(tmp_path / "model_codegen.so")
@@ -1177,7 +1161,8 @@ class TestCodegenRationalLiterals:
 
     def test_sbml_codegen_true_with_xml_net_path_uses_model_codegen(self, tmp_path):
         """Regression for GH #101: an SBML XML path passed as ``net_path`` must
-        not be parsed as an empty .net model when ``codegen=True`` is requested."""
+        not be parsed as an empty .net model when ``codegen=True`` is requested.
+        (Since #803 step 4 nothing reads ``net_path``; it warns and is ignored.)"""
         import bngsim
 
         half = '<cn type="rational"> 1 <sep/> 2 </cn>'
@@ -1189,12 +1174,13 @@ class TestCodegenRationalLiterals:
         r_ref = bngsim.Simulator(m_ref, method="ode", codegen=False).run(t_span=(0, 4), n_points=9)
 
         m_cg = bngsim.Model.from_sbml(str(xml_path))
-        sim = bngsim.Simulator(
-            m_cg,
-            method="ode",
-            codegen=True,
-            net_path=str(xml_path),
-        )
+        with pytest.warns(DeprecationWarning, match="net_path"):
+            sim = bngsim.Simulator(
+                m_cg,
+                method="ode",
+                codegen=True,
+                net_path=str(xml_path),
+            )
         # Codegen wired (the MIR JIT backend stashes the C source instead of a
         # .so; either proves model-based codegen, not empty-.net parsing, ran).
         assert sim._codegen_so_path or sim._codegen_c_source

@@ -45,35 +45,18 @@ def run_cvode(net_path, t_end, n_points, n_runs=5):
 
 
 def run_diffrax_bench(net_path, t_end, n_points, n_runs=5):
-    """Run Diffrax (pure JAX)."""
-    from bngsim._codegen import _parse_net_file
+    """Run Diffrax (pure JAX), on the model loaded from ``net_path``."""
+    import bngsim
     from bngsim._diffrax_solver import run_diffrax
 
-    model = _parse_net_file(net_path)
-
-    # Build param dict with evaluated values
-    # We need to evaluate expressions in order, with math funcs
-    import math
-
-    math_ns = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
-    math_ns["__builtins__"] = {}
-    param_dict = {}
-    for _, name, expr, _ in model["parameters"]:
-        try:
-            val = float(expr)
-        except (ValueError, TypeError):
-            try:
-                ns = {**math_ns, **param_dict}
-                val = eval(expr, ns)  # noqa: S307
-            except Exception:
-                val = 0.0
-        param_dict[name] = val
+    model = bngsim.Model.from_net(net_path)
+    param_dict = None  # the model's own values
 
     # Warmup (JIT compilation)
     print("    JIT compiling...", end="", flush=True)
     t_jit_start = time.perf_counter()
     r = run_diffrax(
-        net_path,
+        model,
         param_dict,
         t_start=0.0,
         t_end=t_end,
@@ -87,7 +70,7 @@ def run_diffrax_bench(net_path, t_end, n_points, n_runs=5):
     for _ in range(n_runs):
         t0 = time.perf_counter()
         r = run_diffrax(
-            net_path,
+            model,
             param_dict,
             t_start=0.0,
             t_end=t_end,
