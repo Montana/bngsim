@@ -2761,6 +2761,108 @@ PYBIND11_MODULE(_bngsim_core, m) {
         "add_inline_table_function_spec (True). A line naming no table comes back with "
         "its expression unchanged and no tables.");
 
+    // Issue #803 — the loader's reading of a whole .net file, before the build,
+    // so `bngsim.parse_net_file` returns this reading instead of parsing the
+    // text a second time in Python. Indices come back 0-based, as ModelBuilder
+    // takes them.
+    m.def(
+        "net_file_structure",
+        [](const std::string &path) {
+            // The loader's whole load, parse and build: the values reported are
+            // the ones the built model holds, and a file the build refuses is
+            // refused here, as from_net refuses it.
+            bngsim::NetFileStructure parsed;
+            std::vector<double> values;
+            std::vector<double> initial;
+            try {
+                parsed = bngsim::parse_net_file_structure(path);
+                auto model = bngsim::build_net_file_structure(parsed);
+                for (const auto &p : parsed.params)
+                    values.push_back(model.get_param(p.name));
+                for (const auto &sp : model.species())
+                    initial.push_back(sp.initial_conc);
+            } catch (const std::exception &e) {
+                // The type and prefix from_net raises, so a file both refuse is
+                // refused the same way.
+                throw py::value_error(std::string("Failed to load .net file: ") + e.what());
+            }
+            py::list params;
+            for (size_t i = 0; i < parsed.params.size(); ++i) {
+                const auto &p = parsed.params[i];
+                params.append(py::make_tuple(p.name, values[i], p.expression, p.is_expression));
+            }
+            py::list species;
+            for (size_t i = 0; i < parsed.species.size(); ++i) {
+                const auto &s = parsed.species[i];
+                py::dict d;
+                d["name"] = s.name;
+                d["concentration"] = initial[i];
+                d["fixed"] = s.fixed;
+                d["param_ref"] = s.is_param_ref ? s.param_ref_name : std::string();
+                species.append(std::move(d));
+            }
+            py::list functions;
+            for (const auto &f : parsed.functions)
+                functions.append(py::make_tuple(f.name, f.expression));
+            py::list observables;
+            for (const auto &o : parsed.observables) {
+                py::list entries;
+                for (const auto &[sp_idx_1, factor] : o.entries)
+                    entries.append(py::make_tuple(sp_idx_1 - 1, factor));
+                observables.append(py::make_tuple(o.name, std::move(entries)));
+            }
+            py::list reactions;
+            for (const auto &r : parsed.reactions) {
+                py::list reactants;
+                for (int i : r.reactant_indices_1based)
+                    reactants.append(i - 1);
+                py::list products;
+                for (int i : r.product_indices_1based)
+                    products.append(i - 1);
+                py::dict d;
+                d["reactants"] = std::move(reactants);
+                d["products"] = std::move(products);
+                switch (r.type) {
+                case bngsim::RateLawType::Elementary:
+                    d["type"] = "elementary";
+                    d["rate_law"] = r.rate_law_name;
+                    break;
+                case bngsim::RateLawType::Functional:
+                    d["type"] = "functional";
+                    d["rate_law"] = r.rate_law_name;
+                    break;
+                case bngsim::RateLawType::MichaelisMenten:
+                    d["type"] = "mm";
+                    d["rate_law"] = r.mm_kcat_name + "," + r.mm_km_name;
+                    break;
+                }
+                d["stat_factor"] = r.stat_factor;
+                reactions.append(std::move(d));
+            }
+            py::dict out;
+            out["parameters"] = std::move(params);
+            out["species"] = std::move(species);
+            out["functions"] = std::move(functions);
+            out["observables"] = std::move(observables);
+            out["reactions"] = std::move(reactions);
+            out["net_file_dir"] = parsed.net_file_dir;
+            out["load_warnings"] = parsed.load_warnings;
+            return out;
+        },
+        py::arg("path"),
+        "Read a .net file the way Model.from_net does, without building it. Returns "
+        "{'parameters': [(name, value, expression, is_expression), ...], 'species': "
+        "[{name, concentration, fixed, param_ref}, ...], 'functions': [(name, "
+        "expression), ...], 'observables': [(name, [(species_idx0, factor), ...]), ...], "
+        "'reactions': [{reactants, products, type, rate_law, stat_factor}, ...], "
+        "'net_file_dir', 'load_warnings'}: the records the loader hands ModelBuilder, with "
+        "each parameter's value and each species' concentration taken from the model it "
+        "builds from them. The build runs here too, so a file Model.from_net refuses is "
+        "refused, with ValueError. An expression-valued initial concentration is a lifted "
+        "_InitialConc<N> parameter; Sat/Hill rate laws come back rewritten as functional "
+        "ones. An elementary reaction's rate_law may name a function, which build() "
+        "resolves to functional.");
+
     m.def(
         "reserved_names",
         []() {

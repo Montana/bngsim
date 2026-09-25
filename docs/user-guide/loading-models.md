@@ -145,20 +145,20 @@ rule templates, and a `qual` document's core layer is typically empty. A
 presentation-only package (`layout`, `render`, `fbc`) declares `required="false"`
 and loads untouched.
 
-## Universal `.net` reader (`parse_net_file`)
+## `.net` files as a dict (`parse_net_file`)
 
-BNGsim includes a pure-Python `.net` file parser that produces engine-agnostic
-model data. This lets you use BNG `.net` files with **any** Python simulation
-engine — BNGsim, scipy, gillespy2, or your own solver — without requiring
-the BNGsim C++ extension for the parsing step.
+`parse_net_file` returns the components of a `.net` file as a plain Python
+dict, which you can inspect, modify and build, or hand to another engine. It is
+the C++ loader's own reading of the file, the one `Model.from_net` builds, with
+the values the built model holds, so the two cannot disagree about what a line
+means, and a file `Model.from_net` refuses is refused here too. It needs
+bngsim's compiled extension.
 
 ```python
 import bngsim
 
-# Parse a .net file into a plain Python dict (no C++ needed)
 parsed = bngsim.parse_net_file("model.net")
 
-# Inspect the parsed data
 print(parsed["parameters"])   # [(name, value, expr, is_expr), ...]
 print(parsed["species"])      # [(name, init_conc, is_fixed), ...]
 print(parsed["species_ic_params"])  # [(sp_idx, param_name), ...] — ICs written
@@ -166,26 +166,34 @@ print(parsed["species_ic_params"])  # [(sp_idx, param_name), ...] — ICs writte
 print(parsed["observables"])  # [(name, [(sp_idx, factor), ...]), ...]
 print(parsed["functions"])    # [(name, expression), ...]
 print(parsed["reactions"])    # [{"reactants": [...], "products": [...],
-                              #   "type": "elementary"|"functional"|"mm"|"legacy",
+                              #   "type": "elementary"|"functional"|"mm",
                               #   "rate_law": "k1", "legacy_constants": [],
                               #   "stat_factor": 1.0}, ...]
 print(parsed["net_file_dir"]) # the file's own directory — what a relative
                               #   tfun('...') path resolves against
 ```
 
-A reaction's `"type"` says how to read its `"rate_law"`: a parameter name for
-`"elementary"`, a name from the `functions` block for `"functional"`, and
-`"<kcat>,<Km>"` for `"mm"` (a `MM kcat Km` rate column). `"legacy"` is one of
-BioNetGen's deprecated `Sat` / `Hill` tokens, with the token in `"rate_law"` and
-its rate constants in `"legacy_constants"`.
+A reaction's `"type"` says how to read its `"rate_law"`:
 
-`parsed["parameters"]` carries each parameter's *evaluated* value alongside its
-expression. Evaluating BNGL is the engine's job, so when `bngsim._bngsim_core` is
-importable the reader evaluates through it and reports exactly what
-`Model.from_net` would — including `^` as exponentiation, `if(c,t,f)`, `&&`/`||`
-and parameters named for Python keywords. Without the extension the reader falls
-back to ordinary arithmetic (still reading `^` as exponentiation) and raises on
-anything further rather than substituting a number.
+- `"elementary"`: a parameter name. BNG2.pl writes a numeric prefix on the
+  rate constant, `0.5*k1`, for a symmetry factor or, in a compartmental model,
+  a unit conversion folded into it (`1.6605503e-12*kf`); the dict carries that
+  as `"rate_law": "k1"` and `"stat_factor": 0.5`, so the rate constant is
+  `stat_factor` times the parameter.
+- `"functional"`: a name from the `functions` block.
+- `"mm"`: `"<kcat>,<Km>"` for a `MM kcat Km` rate column, with
+  `"legacy_constants": [kcat, Km]`.
+
+Values are evaluated: a parameter's is the number `Model.from_net` puts in its
+slot, and a species whose initial concentration names a parameter carries that
+parameter's value. An initial concentration written as an expression comes back
+as a synthetic `_InitialConc<N>` parameter, as BNG2.pl writes one, named by the
+species.
+
+The deprecated `Sat` and `Hill` rate-law tokens come back rewritten, as
+`Model.from_net` rewrites them, with the same warning: the reaction is
+`"functional"`, driven by an explicit function, and a single-species observable
+is added for each reactant the function reads.
 
 **Use with BNGsim** (fastest path — C++ CVODE/SSA):
 
@@ -195,20 +203,22 @@ sim = bngsim.Simulator(model, method="ode")
 result = sim.run(t_span=(0, 100), n_points=101)
 ```
 
-This builds the same model `Model.from_net` does, table functions included: a
-`functions` line calling `tfun('drive.tfun', time)` — or calling one inside
-arithmetic, `(tfun('drive.tfun',time)+5)/k_scale` — is read by the .net loader's
-own code, and a relative path resolves against the `.net` file's directory
-rather than the working directory (issue #597).
+`build_model_from_parsed` makes the `ModelBuilder` calls the loader makes, so an
+unmodified dict builds the model `Model.from_net` loads, table functions and
+rewritten `Sat`/`Hill` rate laws included; a test pins that over every `.net`
+file in the repository. A modified dict builds the modified model. Three things
+to know when modifying one:
 
-The one exception is the deprecated `Sat` and `Hill` rate-law tokens.
-`Model.from_net` rewrites those into explicit functions and observables and warns
-that it did; `build_model_from_parsed` refuses them instead of growing a second
-copy of that rewrite to drift from the first, and its message names the reaction
-and the explicit rate law to write. `MM kcat Km` needs no rewrite and builds
-here.
+- A species listed in `species_ic_params` takes its initial concentration from
+  that parameter, so change the parameter, or drop the entry, rather than the
+  number in `species`.
+- A parameter whose `is_expression` is true is evaluated from its expression, so
+  change the expression, or set `is_expression` false with a value.
+- A reaction's rate law is read by what it names: a function in `functions`
+  makes it functional, anything else elementary (`"mm"` aside), whatever its
+  `"type"` says.
 
-**Use with scipy** (pure Python, no C++ extension needed):
+**Use with scipy**:
 
 ```python
 import numpy as np
@@ -217,18 +227,22 @@ from scipy.integrate import solve_ivp
 parsed = bngsim.parse_net_file("model.net")
 y0 = np.array([ic for _, ic, _ in parsed["species"]])
 pvals = {n: v for n, v, _, _ in parsed["parameters"]}
+fixed = [i for i, (_, _, is_fixed) in enumerate(parsed["species"]) if is_fixed]
 
-# Build your own RHS from the parsed data
+# Build your own RHS from the parsed data (mass-action reactions only)
 def rhs(t, y):
     dydt = np.zeros(len(y))
     for rxn in parsed["reactions"]:
-        rate = pvals[rxn["rate_law"]]
+        if rxn["type"] != "elementary":
+            raise NotImplementedError(rxn["type"])
+        rate = rxn["stat_factor"] * pvals[rxn["rate_law"]]
         for ri in rxn["reactants"]:
             rate *= y[ri]
         for ri in rxn["reactants"]:
             dydt[ri] -= rate
         for pi in rxn["products"]:
             dydt[pi] += rate
+    dydt[fixed] = 0.0  # a `$`-clamped species holds its value
     return dydt
 
 sol = solve_ivp(rhs, (0, 100), y0, method='LSODA')
@@ -245,8 +259,5 @@ for name, val, _, _ in parsed["parameters"]:
     m.add_parameter(gillespy2.Parameter(name=name, expression=str(val)))
 for name, ic, _ in parsed["species"]:
     m.add_species(gillespy2.Species(name=name, initial_value=int(ic)))
-# ... add reactions from parsed["reactions"]
+# ... add reactions from parsed["reactions"], each at stat_factor * rate_law
 ```
-
-The parsed dict is the **universal interchange format** between `.net` files
-and any Python-based simulation framework.

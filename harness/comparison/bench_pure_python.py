@@ -218,9 +218,9 @@ def run_scipy_from_net_reader(net_path, t_end, n_steps):
         for r in rxns:
             rl = r["rate_law"]
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
                 for ri in r["reactants"]:
                     rate *= y[ri]
             for ri in r["reactants"]:

@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -122,48 +124,6 @@ static std::string directory_of(const std::string &filepath) {
         return ".";
     return filepath.substr(0, pos);
 }
-
-// ─── Intermediate data structures for parsed blocks ──────────────────────────
-
-struct ParsedParam {
-    std::string name;
-    double value;
-    std::string expression;
-    bool is_expression;
-};
-
-struct ParsedSpecies {
-    std::string name;
-    double concentration;
-    bool fixed;
-    bool is_param_ref;          // IC references a parameter name
-    std::string param_ref_name; // parameter name for IC
-};
-
-struct ParsedFunction {
-    std::string name;
-    std::string expression;
-};
-
-struct ParsedObservable {
-    std::string name;
-    // Entries: (1-based species index, factor)
-    std::vector<std::pair<int, double>> entries;
-};
-
-struct ParsedReaction {
-    std::string comment;
-    double stat_factor;
-    std::vector<int> reactant_indices_1based; // 1-based species indices
-    std::vector<int> product_indices_1based;  // 1-based species indices
-    RateLawType type;
-    std::string rate_law_name; // param or function name
-    std::string legacy_rate_law_type;
-    std::vector<std::string> legacy_rate_law_constants;
-    // For MM: kcat_name, km_name
-    std::string mm_kcat_name;
-    std::string mm_km_name;
-};
 
 // ─── Parse blocks ────────────────────────────────────────────────────────────
 
@@ -514,14 +474,31 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
             std::string param_name = rate_token;
             auto star = rate_token.find('*');
             if (star != std::string::npos) {
+                // A stat factor is a number and nothing else: `2k*kf` and
+                // `nan*kf` used to read as 2 and NaN times kf, because stod
+                // stops at the first character it cannot use and accepts
+                // "nan". Anything else stays one name, which build() refuses
+                // unless the model declares it (issue #803).
+                const std::string prefix = rate_token.substr(0, star);
                 try {
-                    rxn.stat_factor = std::stod(rate_token.substr(0, star));
-                    param_name = rate_token.substr(star + 1);
+                    size_t used = 0;
+                    const double factor = std::stod(prefix, &used);
+                    if (used == prefix.size() && std::isfinite(factor)) {
+                        rxn.stat_factor = factor;
+                        param_name = rate_token.substr(star + 1);
+                    }
                 } catch (...) {
                     // Not coeff*name, treat as plain name
                 }
             }
 
+            if (param_name.empty()) {
+                // `0.5*` — a stat factor and nothing to multiply. ModelBuilder's
+                // validation passes an empty rate name over, so this loaded as a
+                // reaction that never fires (issue #803).
+                throw std::runtime_error("reaction line '" + stripped +
+                                         "' has a stat factor but no rate constant");
+            }
             rxn.type = RateLawType::Elementary;
             rxn.rate_law_name = param_name;
         }
@@ -1084,23 +1061,43 @@ static std::vector<std::string> rewrite_legacy_sat_hill_rate_laws(
 
 // ─── Main loader ─────────────────────────────────────────────────────────────
 
-NetworkModel NetFileLoader::load(const std::string &path) {
+NetFileStructure parse_net_file_structure(const std::string &path) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        // An ifstream opens a directory and reads nothing, which loaded as an
+        // empty model (issue #803).
+        throw std::runtime_error("Cannot open .net file: " + path + " is a directory");
+    }
     std::ifstream file(path);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open .net file: " + path);
     }
 
-    std::string net_file_dir = directory_of(path);
+    NetFileStructure out;
+    out.net_file_dir = directory_of(path);
 
     // ── Phase 1: Parse all blocks into intermediate data ─────────────────
-    std::vector<ParsedParam> parsed_params;
-    std::vector<ParsedSpecies> parsed_species;
-    std::vector<ParsedFunction> parsed_functions;
-    std::vector<ParsedReaction> parsed_reactions;
-    std::vector<ParsedObservable> parsed_observables;
+    std::vector<ParsedParam> &parsed_params = out.params;
+    std::vector<ParsedSpecies> &parsed_species = out.species;
+    std::vector<ParsedFunction> &parsed_functions = out.functions;
+    std::vector<ParsedReaction> &parsed_reactions = out.reactions;
+    std::vector<ParsedObservable> &parsed_observables = out.observables;
 
     // Build param name→index map incrementally during parse for species IC resolution
     std::unordered_map<std::string, int> param_name_to_idx;
+
+    // A block of each kind may appear once. A second one used to replace the
+    // first: a second parameters block dropped the `_InitialConc<N>` a species
+    // block before it had lifted, and left the name -> index map pointing into
+    // a list that no longer matched, so a species IC read another parameter's
+    // value (issue #803). BNG2.pl writes each block once.
+    std::unordered_set<std::string> blocks_seen;
+    auto once = [&](const char *block) {
+        if (!blocks_seen.insert(block).second) {
+            throw std::runtime_error(std::string("the .net file has more than one ") + block +
+                                     " block");
+        }
+    };
 
     std::string line;
     while (std::getline(file, line)) {
@@ -1111,13 +1108,18 @@ NetworkModel NetFileLoader::load(const std::string &path) {
             continue;
 
         if (trimmed.find("begin parameters") != std::string::npos) {
-            parsed_params = parse_parameters(file);
-            for (int i = 0; i < static_cast<int>(parsed_params.size()); ++i) {
-                param_name_to_idx[parsed_params[i].name] = i;
+            once("parameters");
+            // Appended, not assigned: a species block read first may already
+            // have lifted `_InitialConc<N>` parameters into this list.
+            for (auto &p : parse_parameters(file)) {
+                param_name_to_idx[p.name] = static_cast<int>(parsed_params.size());
+                parsed_params.push_back(std::move(p));
             }
         } else if (trimmed.find("begin species") != std::string::npos) {
+            once("species");
             parsed_species = parse_species(file, param_name_to_idx, parsed_params);
         } else if (trimmed.find("begin functions") != std::string::npos) {
+            once("functions");
             parsed_functions = parse_functions(file);
         } else if (trimmed.find("begin reactions_text") != std::string::npos) {
             // Informational block emitted by BNG2.pl (restates the numeric
@@ -1129,8 +1131,10 @@ NetworkModel NetFileLoader::load(const std::string &path) {
             // substring of "begin reactions_text".
             skip_block(file, "end reactions_text");
         } else if (trimmed.find("begin reactions") != std::string::npos) {
+            once("reactions");
             parsed_reactions = parse_reactions(file);
         } else if (trimmed.find("begin groups") != std::string::npos) {
+            once("groups");
             parsed_observables = parse_groups(file);
         } else if (trimmed.find("begin molecule types") != std::string::npos) {
             skip_block(file, "end molecule types");
@@ -1141,12 +1145,31 @@ NetworkModel NetFileLoader::load(const std::string &path) {
         }
     }
 
-    std::vector<std::string> load_warnings = rewrite_legacy_sat_hill_rate_laws(
-        parsed_reactions, parsed_params, parsed_functions, parsed_observables);
+    out.load_warnings = rewrite_legacy_sat_hill_rate_laws(parsed_reactions, parsed_params,
+                                                          parsed_functions, parsed_observables);
+    return out;
+}
+
+NetworkModel NetFileLoader::load(const std::string &path) {
+    NetFileStructure parsed = parse_net_file_structure(path);
+    NetworkModel model = build_net_file_structure(parsed);
+    model.set_load_warnings_(std::move(parsed.load_warnings));
+    return model;
+}
+
+NetworkModel build_net_file_structure(const NetFileStructure &parsed) {
+    const auto &parsed_params = parsed.params;
+    const auto &parsed_species = parsed.species;
+    const auto &parsed_functions = parsed.functions;
+    const auto &parsed_observables = parsed.observables;
+    const auto &parsed_reactions = parsed.reactions;
 
     // ── Phase 2: Feed parsed data into ModelBuilder ──────────────────────
+    // `bngsim.build_model_from_parsed` makes these same calls from the same
+    // records (issue #803); a change here belongs there too, and the corpus
+    // round-trip test (test_net_reader_round_trip.py) fails until it lands.
     ModelBuilder builder;
-    builder.set_net_file_dir(net_file_dir);
+    builder.set_net_file_dir(parsed.net_file_dir);
 
     // 2a. Parameters
     for (const auto &p : parsed_params) {
@@ -1227,9 +1250,7 @@ NetworkModel NetFileLoader::load(const std::string &path) {
     // - Analytical Jacobian pre-computation
     // - Graph coloring (Curtis-Powell-Reid)
     // - SSA propensity pre-computation
-    NetworkModel model = builder.build();
-    model.set_load_warnings_(std::move(load_warnings));
-    return model;
+    return builder.build();
 }
 
 } // namespace bngsim

@@ -305,9 +305,9 @@ def run_scipy_netreader_ode(net_path, t_end, n_steps):
         for r in rxns:
             rl = r["rate_law"]
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
                 for ri in r["reactants"]:
                     rate *= y[ri]
             for ri in r["reactants"]:
@@ -365,9 +365,9 @@ def run_diffrax_netreader_ode(net_path, t_end, n_steps):
         for r in rxns:
             rl = r["rate_law"]
             if r["type"] == "functional":
-                rate = ns.get(rl, 0.0)
+                rate = r["stat_factor"] * ns.get(rl, 0.0)
             else:
-                rate = pv.get(rl, 0.0)
+                rate = r["stat_factor"] * pv.get(rl, 0.0)
                 for ri in r["reactants"]:
                     rate = rate * y_np[ri]
             for ri in r["reactants"]:
@@ -430,10 +430,11 @@ def run_gillespy2_netreader_ssa(net_path, t_end, n_steps):
         for idx in r["products"]:
             sp = species_map[idx]
             products[sp] = products.get(sp, 0) + 1
+        # The rate column as written, stat factor included (issue #803).
+        sf = float(r["stat_factor"])
+        rate = r["rate_law"] if sf == 1.0 else f"{sf!r}*{r['rate_law']}"
         m.add_reaction(
-            gillespy2.Reaction(
-                name=f"R{ri}", reactants=reactants, products=products, rate=r["rate_law"]
-            )
+            gillespy2.Reaction(name=f"R{ri}", reactants=reactants, products=products, rate=rate)
         )
 
     m.timespan(np.linspace(0, t_end, n_steps + 1))
