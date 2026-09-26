@@ -711,9 +711,10 @@ def main() -> int:
     ap.add_argument(
         "--codegen",
         action="store_true",
-        help="Force bngsim's compiled C RHS (Simulator(codegen=True)) instead of the ExprTk "
-        "interpreter a .net otherwise runs. The compiled path is what every sensitivity run "
-        "uses, and #689/#699 existed only there. Needs a C compiler (GH #702).",
+        help="Force bngsim's compiled C RHS (Simulator(codegen=True)). Without it every job "
+        "is pinned to the ExprTk interpreter (codegen=False), including the >=256-species "
+        "models bngsim would compile by default since #825. The compiled path is what every "
+        "sensitivity run uses, and #689/#699 existed only there. Needs a C compiler (GH #702).",
     )
     args = ap.parse_args()
 
@@ -805,6 +806,8 @@ def main() -> int:
     print(f"  jobs: {len(specs)}   workers: {args.workers}   (ODE/deterministic only)")
     if args.codegen:
         print("  bngsim RHS: compiled C (--codegen), not the ExprTk interpreter")
+    else:
+        print("  bngsim RHS: ExprTk interpreter on every job (codegen=False)")
     print(f"  bngsim {ver['bngsim']}   BNG {ver.get('bng')}   run_network: {run_network_bin}")
     print(
         f"  ODE tol (both engines): rtol={args.rtol:g} atol={args.atol:g}   protocol: _core.differ"
