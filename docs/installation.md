@@ -138,7 +138,7 @@ reconfigures stale editable caches to the current interpreter architecture and r
 the `_bngsim_core` extension target:
 
 ```bash
-uv run --directory bngsim python scripts/rebuild_editable.py
+uv run --no-sync --directory bngsim python scripts/rebuild_editable.py
 ```
 
 This drives cmake against the environment you are in, so `find_package(pybind11)`

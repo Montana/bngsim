@@ -99,7 +99,7 @@ harness disposition:
    `bngsim._build_provenance.print_identity()` at startup; confirm the banner
    says `fresh` (not `STALE`) and that `built=<commit>` matches the source you
    are reasoning about. A stale binary aborts the pytest suite by default.
-2. **Rebuild from the committed state.** `python scripts/rebuild_editable.py`
+2. **Rebuild from the committed state.** `uv run --no-sync python scripts/rebuild_editable.py`
    (the only supported editable rebuild; it reconfigures + rebuilds
    `_bngsim_core` + reinstalls). The guard refuses to declare *fresh* until the
    loaded `.so` is newer than every `src/**`, `include/**`, and `third_party/**`

@@ -753,7 +753,7 @@ def capabilities() -> dict[str, Any]:
         " The Python layer here is current, so this install's compiled "
         "extension is behind it — in a source checkout the extension is built "
         "separately and does not rebuild on import (GH #23). Rebuild it with "
-        "`python scripts/rebuild_editable.py`, or install a wheel, which "
+        "`uv run --no-sync python scripts/rebuild_editable.py`, or install a wheel, which "
         "always carries both halves from one build."
     )
     if not features["event_sensitivities"]:

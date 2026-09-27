@@ -63,8 +63,12 @@ The faster path is an incremental cmake rebuild, which touches nothing else in
 the venv:
 
 ```bash
-python scripts/rebuild_editable.py
+uv run --no-sync python scripts/rebuild_editable.py
 ```
+
+It builds for whichever interpreter runs it, so run it with the venv's: a bare
+`python` may not exist, or may be a different Python. `--no-sync` keeps uv from
+syncing the venv, and possibly reinstalling bngsim, before the fast path starts.
 
 That one needs `pybind11` importable in the venv, which is why the `dev` extra
 declares it: `pybind11` is a `[build-system]` requirement, so uv installs it into
@@ -109,7 +113,7 @@ settings from the configuration it was built with. To change an option for one
 rebuild, set the same-named environment variable:
 
 ```bash
-BNGSIM_ENABLE_MIR=1 python scripts/rebuild_editable.py
+BNGSIM_ENABLE_MIR=1 uv run --no-sync python scripts/rebuild_editable.py
 ```
 
 ### Re-locking after a `pyproject.toml` change

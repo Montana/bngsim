@@ -138,7 +138,7 @@ The in-repo `scripts/rebuild_editable.py` is a convenience wrapper that reads th
 `BNGSIM_ENABLE_MIR=1` env var and adds the same define:
 
 ```sh
-BNGSIM_ENABLE_MIR=1 uv run --directory bngsim python scripts/rebuild_editable.py
+BNGSIM_ENABLE_MIR=1 uv run --no-sync --directory bngsim python scripts/rebuild_editable.py
 ```
 
 A successful configure prints `Building vendored MIR micro-JIT from:
