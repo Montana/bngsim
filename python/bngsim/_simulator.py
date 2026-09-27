@@ -434,7 +434,9 @@ class Simulator:
         generated from the model bngsim built -- whatever it was loaded from
         (``.net``, BNGL, SBML, Antimony or the builder). ``None`` (default)
         compiles automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species
-        (256), where native code beats the interpreter; ``False`` never does.
+        (256), where native code beats the interpreter. ``False`` runs the
+        interpreter: it never compiles, and it ignores an artifact that an
+        earlier Simulator or ``Model.clone()`` left on the model.
 
     net_path : str, optional
         Deprecated and ignored (issue #803). Every backend reads the model it is
@@ -1096,7 +1098,14 @@ class Simulator:
         # that the structural .so cache (issue #174) makes a few stat()s on the
         # second pass. The converse is fine and stays allowed: a sensitivity
         # artifact is a superset, so a plain run may inherit one.
-        codegen_reusable = model_codegen_has_sens or not want_sens_run
+        #
+        # Issue #877 — and nothing at all into codegen=False, which asks for the
+        # interpreter. The artifact an earlier Simulator (auto-codegen or
+        # codegen=True) or Model.clone() left on the model is still compiled
+        # code, so inheriting it ran `cc` or MIR under a codegen=False that never
+        # compiled anything itself, and let a codegen=False sensitivity run skip
+        # the refusal in _auto_codegen_for_sensitivity.
+        codegen_reusable = codegen is not False and (model_codegen_has_sens or not want_sens_run)
         if (
             jit_backend
             and not self._codegen_c_source
