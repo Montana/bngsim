@@ -7,10 +7,14 @@ stopped testing ExprTk on the largest models and its wall time grew x5.8 from
 C compiles. ``codegen=False`` now pins ExprTk, ``True`` pins the compiled RHS, and
 ``None`` leaves bngsim's own choice for the timing benchmarks that want it.
 
-Lowering the threshold to 1 makes a two-species fixture take the auto-compile
-branch, so the pin is observable without a 256-species network. Both harness
-entry points are covered: ``bn_ode_net`` (single segment) and
-``multi_segment_replay`` (the dirty-carryover protocol arm).
+Each case runs at the ``BNGSIM_CODEGEN_THRESHOLD`` where bngsim's own choice
+would pick the other backend, so only an honoured pin passes. At a threshold of 1
+the two-species fixture auto-compiles, and ``False`` has to stop that. At the
+default 256 it runs ExprTk, and ``True`` has to force a compile. ``None`` runs at
+both and follows the threshold. Ambient ``BNGSIM_NO_CODEGEN`` and
+``BNGSIM_CODEGEN_JIT`` are cleared, since either one changes the backend by
+itself. Both harness entry points are covered: ``bn_ode_net`` (single segment)
+and ``multi_segment_replay`` (the dirty-carryover protocol arm).
 """
 
 from __future__ import annotations
@@ -45,41 +49,35 @@ def _have_cc() -> bool:
         return False
 
 
+_NEEDS_CC = pytest.mark.skipif(not _have_cc(), reason="needs bngsim and a C compiler for codegen")
+
+# (codegen, BNGSIM_CODEGEN_THRESHOLD, backend that must run)
 _CASES = [
-    pytest.param(False, "exprtk", id="false-pins-exprtk"),
-    pytest.param(
-        True,
-        "cc",
-        id="true-pins-compiled",
-        marks=pytest.mark.skipif(
-            not _have_cc(), reason="needs bngsim and a C compiler for codegen"
-        ),
-    ),
-    pytest.param(
-        None,
-        "cc",
-        id="none-keeps-auto",
-        marks=pytest.mark.skipif(
-            not _have_cc(), reason="needs bngsim and a C compiler for codegen"
-        ),
-    ),
+    pytest.param(False, "1", "exprtk", id="false-pins-exprtk"),
+    pytest.param(True, "256", "cc", id="true-pins-compiled", marks=_NEEDS_CC),
+    pytest.param(None, "1", "cc", id="none-auto-compiles", marks=_NEEDS_CC),
+    pytest.param(None, "256", "exprtk", id="none-auto-interprets"),
 ]
 
 
 @pytest.fixture
-def auto_compiles_everything(monkeypatch):
+def codegen_env(monkeypatch):
     pytest.importorskip("bngsim")
-    monkeypatch.setenv("BNGSIM_CODEGEN_THRESHOLD", "1")
+    monkeypatch.delenv("BNGSIM_NO_CODEGEN", raising=False)
+    monkeypatch.delenv("BNGSIM_CODEGEN_JIT", raising=False)
+    return monkeypatch
 
 
-@pytest.mark.parametrize(("codegen", "backend"), _CASES)
-def test_bn_ode_net_runs_the_pinned_backend(auto_compiles_everything, codegen, backend):
+@pytest.mark.parametrize(("codegen", "threshold", "backend"), _CASES)
+def test_bn_ode_net_runs_the_pinned_backend(codegen_env, codegen, threshold, backend):
+    codegen_env.setenv("BNGSIM_CODEGEN_THRESHOLD", threshold)
     _t, _v, _n, timing = C.bn_ode_net(_NET, 0.0, 1.0, 11, 1e-8, 1e-8, codegen=codegen)
     assert timing["config"]["codegen"] == backend
 
 
-@pytest.mark.parametrize(("codegen", "backend"), _CASES)
-def test_multi_segment_replay_runs_the_pinned_backend(auto_compiles_everything, codegen, backend):
+@pytest.mark.parametrize(("codegen", "threshold", "backend"), _CASES)
+def test_multi_segment_replay_runs_the_pinned_backend(codegen_env, codegen, threshold, backend):
+    codegen_env.setenv("BNGSIM_CODEGEN_THRESHOLD", threshold)
     step = {
         "kind": "sim",
         "method": "ode",
