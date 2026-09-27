@@ -555,7 +555,7 @@ reinstall:
 If the cached configuration is the one you want, ask for it and this rebuild
 will keep it:
 
-    {keep} python scripts/rebuild_editable.py
+    {keep} uv run --no-sync python scripts/rebuild_editable.py
 
 Giving a differently configured install its own tree is what stops this
 happening again:

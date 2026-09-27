@@ -519,7 +519,7 @@ def format_report(prov: Provenance | None = None) -> str:
             "verdict drawn from it is a statement about OLD code (see GH #125)."
         )
         lines.append(
-            "[bngsim]   Rebuild:  python scripts/rebuild_editable.py   "
+            "[bngsim]   Rebuild:  uv run --no-sync python scripts/rebuild_editable.py   "
             "(or set BNGSIM_ALLOW_STALE_CORE=1 to proceed anyway)."
         )
         if _pybind11_missing():

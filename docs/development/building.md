@@ -21,7 +21,7 @@ C++, the fast path is an incremental cmake rebuild that touches nothing else in
 the venv:
 
 ```bash
-python scripts/rebuild_editable.py
+uv run --no-sync python scripts/rebuild_editable.py
 ```
 
 `uv sync --extra test --reinstall-package bngsim` also works and is the slower,

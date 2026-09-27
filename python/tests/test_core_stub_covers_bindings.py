@@ -27,6 +27,16 @@ also catch a changed *signature*, but it needs a built extension on the leg and
 strictness would be paid for in flakes. The realistic failure is somebody adding
 a binding and not regenerating, and a name-level check catches that with a
 regex, in milliseconds, on every leg, with no build.
+
+The second failure is the same one in disguise: a binding added to the stub by
+hand instead of by regenerating. It carries the right name, so the name check
+passes, but it lands wherever it was pasted. #844 put
+``net_refuse_parameters_that_read_state`` above ``net_file_structure``, and
+every rebuild after that moved it back, a four-line diff with no content. The
+generator's order is a rule rather than an accident: classes, then functions,
+each by name; inside a class, attributes, then methods, then properties, each
+by name. Checking the rule catches a hand placement just as cheaply, and it does
+not move with the tool version the way signatures do.
 """
 
 import os
@@ -61,6 +71,8 @@ _BINDING_PATTERNS = (
     r'\.def_property\(\s*"([A-Za-z_]\w*)"',
     r'\.def_property_readonly\(\s*"([A-Za-z_]\w*)"',
 )
+
+_REBUILD = "uv run --no-sync python scripts/rebuild_editable.py"
 
 # Dunders pybind11 synthesizes or that stubgen renders structurally rather than
 # as a plain `def` line.
@@ -98,7 +110,8 @@ def _declared_in_stub(name: str, stub: str) -> bool:
 def test_every_binding_is_declared_in_the_committed_stub():
     """A binding the stub does not declare is a mypy error waiting for a caller.
 
-    Fix by rebuilding: ``python scripts/rebuild_editable.py`` regenerates the
+    Fix by rebuilding: ``uv run --no-sync python scripts/rebuild_editable.py``
+    regenerates the
     stub from the freshly built module. Commit the regenerated file with the
     binding that made it necessary.
     """
@@ -106,8 +119,8 @@ def test_every_binding_is_declared_in_the_committed_stub():
     missing = sorted(n for n in _bound_names() if not _declared_in_stub(n, stub))
     assert not missing, (
         f"{len(missing)} pybind11 binding(s) are missing from {_STUB.name}: "
-        f"{missing}. Run `python scripts/rebuild_editable.py` and commit the "
-        "regenerated stub alongside the binding."
+        f"{missing}. Run `{_REBUILD}` and commit the regenerated stub "
+        "alongside the binding."
     )
 
 
@@ -127,3 +140,86 @@ def test_the_scan_actually_finds_the_bindings():
     # Spot-check one binding of each kind that must be found by name.
     for expected in ("run", "set_crossing_stops", "rtol", "n_discontinuity_triggers"):
         assert expected in names, f"{expected!r} not seen by the binding scan"
+
+
+def _stub_order_problems(stub: str) -> list[str]:
+    """Every place ``stub`` departs from the order pybind11-stubgen writes.
+
+    Module level: every class before every function, each group by name. Inside a
+    class: a run of annotated attributes, then methods, then properties, each run
+    by name and none split. A ``@x.setter`` belongs to its property, and an
+    overloaded name repeats, so consecutive repeats count once.
+    """
+    problems = []
+    top = re.findall(r"^(class|def) ([A-Za-z_]\w*)", stub, re.M)
+    if [k for k, _ in top] != sorted(k for k, _ in top):
+        problems.append("a module-level function comes before a class")
+    for kind in ("class", "def"):
+        names = [n for k, n in top if k == kind]
+        if names != sorted(names):
+            problems.append(f"module-level `{kind}` names out of order: {names}")
+    for cls, body in re.findall(r"^class (\w+).*?:\n((?:(?:    .*)?\n)*)", stub, re.M):
+        runs: list[str] = []
+        names: dict[str, list[str]] = {}
+        decorator = None
+        for line in body.splitlines():
+            if line.startswith("    @"):
+                decorator = line.strip()
+                continue
+            if m := re.match(r"    def (\w+)", line):
+                name, dec, decorator = m.group(1), decorator, None
+                if dec and dec.endswith(".setter"):
+                    continue
+                group = {"@property": "property", "@staticmethod": "static"}.get(dec, "method")
+            elif m := re.match(r"    (\w+): ", line):
+                name, group = m.group(1), "attribute"
+            else:
+                continue
+            seen = names.setdefault(group, [])
+            if not seen or seen[-1] != name:
+                seen.append(name)
+            if not runs or runs[-1] != group:
+                runs.append(group)
+        if len(runs) != len(set(runs)):
+            problems.append(f"{cls}: member groups split {runs}")
+        problems += [f"{cls}: {g} names out of order" for g, n in names.items() if n != sorted(n)]
+    return problems
+
+
+@pytest.mark.skipif(
+    not _STUB.is_file(),
+    reason=f"no committed stub at {_STUB}",
+)
+def test_the_committed_stub_is_in_stubgen_order():
+    """A hand-placed entry is a diff every rebuild will reproduce.
+
+    Fix by regenerating rather than by moving lines: the rebuild writes the
+    order this checks, and a stub that came from the generator passes it.
+    """
+    problems = _stub_order_problems(_STUB.read_text())
+    assert not problems, (
+        f"{_STUB.name} is not in pybind11-stubgen's order, so it was edited by hand "
+        f"and every rebuild will rewrite it: {problems}. Run `{_REBUILD}` and "
+        "commit the regenerated stub."
+    )
+
+
+@pytest.mark.skipif(
+    not _STUB.is_file(),
+    reason=f"no committed stub at {_STUB}",
+)
+def test_the_order_check_sees_the_stub_and_catches_a_swap():
+    """Guard the guard: the class-body pattern must read real classes, and a
+    misplaced line must fail it, or the order test passes vacuously."""
+    stub = _STUB.read_text()
+    classes = re.findall(r"^class (\w+)", stub, re.M)
+    functions = re.findall(r"^def (\w+)", stub, re.M)
+    assert len(classes) >= 10 and len(functions) >= 5, (classes, functions)
+    assert "SolverOptions" in classes and "net_file_structure" in functions
+
+    swapped = stub.replace("def net_file_structure(", "def zz_net_file_structure(", 1)
+    assert any("module-level `def`" in p for p in _stub_order_problems(swapped))
+    moved = re.sub(
+        r"(?m)^(class SolverStats\b.*:\n)", r"\1    def zz_first(self) -> None: ...\n", stub
+    )
+    assert any(p.startswith("SolverStats:") for p in _stub_order_problems(moved))

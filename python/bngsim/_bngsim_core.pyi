@@ -1262,10 +1262,6 @@ def find_steady_state(model: NetworkModel, opts: SteadyStateOptions = ...) -> St
     """
     Find steady state of the ODE system (releases GIL)
     """
-def net_refuse_parameters_that_read_state(parameters: collections.abc.Sequence[tuple[str, typing.SupportsFloat | typing.SupportsIndex, str, bool]], functions: collections.abc.Sequence[tuple[str, str]], observable_names: collections.abc.Sequence[str]) -> None:
-    """
-    Raise if a parameter expression reads an observable or a function, as the .net loader refuses one (issue #844): a parameter is evaluated once at build, before either has a value, so it would silently be 0. A name that is also a parameter is not state.
-    """
 def net_file_structure(path: str) -> dict:
     """
     Read a .net file the way Model.from_net does, and return the reading as parse_net_file's dict: {'parameters': [(name, value, expression, is_expression), ...], 'species': [(name, init_conc, is_fixed), ...], 'species_ic_params': [(species_idx0, param_name), ...], 'observables': [(name, [(species_idx0, factor), ...]), ...], 'functions': [(name, expression), ...], 'reactions': [{reactants, products, type, rate_law, legacy_constants, stat_factor}, ...], 'net_file_dir', 'load_warnings'}. The records are the ones the loader hands ModelBuilder; each parameter's value, each species' concentration and each reaction's type are taken from the model it builds from them. The build runs here too, so a file Model.from_net refuses is refused, with ValueError. An expression-valued initial concentration is a lifted _InitialConc<N> parameter; Sat/Hill rate laws come back rewritten as functional ones.
@@ -1273,6 +1269,10 @@ def net_file_structure(path: str) -> dict:
 def net_function_tables(func_name: str, expression: str) -> dict:
     """
     Read the tfun(...) calls out of one .net functions line. Returns {'expression': the expression to hand ModelBuilder.add_function, 'tables': [{name, header_name, filepath, xs, ys, index_name, method, is_inline}, ...]} — each entry an argument pack for add_table_function_spec (is_inline False) or add_inline_table_function_spec (True). A line naming no table comes back with its expression unchanged and no tables.
+    """
+def net_refuse_parameters_that_read_state(parameters: collections.abc.Sequence[tuple[str, typing.SupportsFloat | typing.SupportsIndex, str, bool]], functions: collections.abc.Sequence[tuple[str, str]], observable_names: collections.abc.Sequence[str]) -> None:
+    """
+    Raise if a parameter expression reads an observable or a function, as the .net loader refuses one (issue #844): a parameter is evaluated once at build, before either has a value, so it would silently be 0. A name that is also a parameter is not state.
     """
 def reserved_names() -> dict:
     """
