@@ -55,7 +55,10 @@ A night alerts on:
   an EPYC 7763 than on an EPYC 9V45. Constant-factor slowdowns need a timing A/B on
   a fixed machine (`benchmarks/perf_ab.py`); the wall check here only catches a
   blowup.
-- **backend**: on the compiled arm, a good row that did not actually run compiled.
+- **backend**: on either BNG ODE arm, a good row that did not run that arm's
+  backend: ExprTk on the interpreter arm, compiled C on the compiled arm. Without
+  it, a model the interpreter arm compiled by itself shows up only as wall time
+  (#872).
 - **incomplete**: the run compared fewer than 90 % of the baseline's cases.
 
 Improvements, new cases and churn between two failing states are listed in the

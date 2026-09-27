@@ -252,6 +252,33 @@ def test_expected_backend_flags_a_good_case_that_ran_another_backend():
     assert V.diff(base, fresh)["alerts"]["backend"] == 0
 
 
+def test_interpreter_arm_flags_a_case_that_compiled_by_itself():
+    # The #872 shape: a >=256-species model auto-compiled in the interpreter arm and
+    # still passed, so only the backend check can name it. A row that recorded no
+    # backend (bngsim never ran) and a row that is not good are judged by their
+    # outcomes instead, not as backend misses.
+    base = core(
+        {
+            "A|ode": rec("PASS", backend="exprtk"),
+            "B|ode": rec("PASS", backend="exprtk"),
+            "C|ode": rec("BAD_TEST"),
+            "D|ode": rec("DIFF", backend="exprtk"),
+        }
+    )
+    fresh = core(
+        {
+            "A|ode": rec("PASS", backend="exprtk"),
+            "B|ode": rec("PASS", backend="cc"),
+            "C|ode": rec("BAD_TEST"),
+            "D|ode": rec("DIFF", backend="cc"),
+        }
+    )
+    r = V.diff(base, fresh, expect_backend="exprtk")
+    assert r["backend_miss"] == [{"case": "B|ode", "after": "cc", "note": "expected exprtk"}]
+    assert r["alerts"]["backend"] == 1
+    assert V.diff(base, base, expect_backend="exprtk")["alerts"]["backend"] == 0
+
+
 def test_kind_mismatch_is_refused():
     other = dict(BASE, kind="dsmts")
     with pytest.raises(ValueError, match="kind mismatch"):

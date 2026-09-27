@@ -313,7 +313,9 @@ jobs:
 
   # ------------------------------------------------------------------------- #
   # bngsim vs BNG2.pl/run_network on the committed BNGL corpus, interpreter and
-  # compiled arms.
+  # compiled arms. Each arm checks that every good row ran its backend: since #825
+  # a >=256-species .net compiles unless pinned, and the interpreter arm once ran
+  # 26 jobs compiled with only a wall-time alert to show for it (#872).
   # ------------------------------------------------------------------------- #
   bng-ode:
     name: BNG ODE parity · ${{ matrix.arm }}
@@ -326,7 +328,7 @@ jobs:
           - arm: interpreter
             suite: bng_ode
             flags: ""
-            expect: ""
+            expect: "--expect-backend exprtk"
           - arm: codegen
             suite: bng_ode_codegen
             flags: "--codegen"
