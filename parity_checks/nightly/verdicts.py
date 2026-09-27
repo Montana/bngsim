@@ -390,7 +390,8 @@ def diff(
         "alert": wb > 0 and wf > wb * limit,
     }
 
-    # A run meant to exercise a specific backend (the compiled arm) must have run it.
+    # A run meant to exercise a specific backend must have run it: exprtk for the
+    # interpreter arm, cc for the compiled one.
     backend_miss = []
     if expect_backend:
         for c, rec in sorted(f.items()):
@@ -682,7 +683,12 @@ def main(argv=None) -> int:
         "--wall-ratio-any-cpu", type=float, default=4.0, help="wall alert, across CPU models"
     )
     d.add_argument("--min-fraction", type=float, default=0.9)
-    d.add_argument("--expect-backend", default="", help="e.g. 'cc' for the compiled arm")
+    d.add_argument(
+        "--expect-backend",
+        default="",
+        help="the backend every good row must have run, e.g. exprtk (interpreter arm) "
+        "or cc (compiled arm)",
+    )
     d.add_argument(
         "--flaky",
         default="",
