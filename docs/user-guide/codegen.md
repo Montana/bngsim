@@ -17,8 +17,10 @@ result = sim.run(t_span=(0, 100), n_points=101)
 
 With `codegen=None` (the default) a model compiles automatically at or above
 `BNGSIM_CODEGEN_THRESHOLD` species (256), where native code beats the
-interpreter, and `codegen=False` never compiles. A forward-sensitivity run
-always compiles, because its sensitivity RHS is generated code.
+interpreter. `codegen=False` always runs the interpreter: it never compiles,
+and it ignores code that an earlier Simulator on the same model already
+compiled. A forward-sensitivity run always compiles, because its sensitivity
+RHS is generated code, so it refuses `codegen=False`.
 
 Until issue #803, a `.net` or BNGL model was compiled from a second reading of
 its `.net` file, by a parser of codegen's own, and wherever that reading
