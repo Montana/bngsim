@@ -191,6 +191,58 @@ def test_repeated_runs_skip_the_doomed_attempt(
     assert len(fallbacks) == 1
 
 
+# ── The compiled RHS (issue #874) ────────────────────────────────────────────
+#
+# The retry used to skip a compiled RHS. Since #825 a .net model at or above
+# BNGSIM_CODEGEN_THRESHOLD species compiles by default, so that skip removed the
+# retry from the default path of every large model. A threshold of 1 stands in
+# for a 256-species model here, so this 10-species fixture takes the same
+# auto-compile branch. The reference is explicit FD on the same compiled RHS.
+
+
+def _compiled(net: str, **kwargs) -> bngsim.Simulator:
+    sim = bngsim.Simulator(bngsim.Model.from_net(net), method="ode", **kwargs)
+    assert sim.codegen_backend in ("cc", "mir")
+    return sim
+
+
+def _require_compiled_fd_reference(net: str) -> np.ndarray:
+    try:
+        result = _compiled(net, jacobian="fd").run(
+            t_span=T_SPAN, n_points=N_POINTS, rtol=TOL, atol=TOL
+        )
+    except SimulationError:
+        pytest.skip(
+            "the finite-difference Jacobian does not carry this fixture on this "
+            "build, so there is no rescue to assert — see the module docstring"
+        )
+    return np.asarray(result.observables)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"codegen": True}], ids=["auto-compiled", "explicit-codegen"]
+)
+def test_a_compiled_rhs_falls_back_to_fd(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict
+) -> None:
+    monkeypatch.setenv("BNGSIM_CODEGEN_THRESHOLD", "1")
+    net = _net(data_dir)
+    fd_obs = _require_compiled_fd_reference(net)
+    sim = _compiled(net, **kwargs)
+    result = sim.run(t_span=T_SPAN, n_points=N_POINTS, rtol=TOL, atol=TOL)
+    assert sim.jacobian_strategy == "fd"
+    assert np.array_equal(np.asarray(result.observables), fd_obs)
+
+
+def test_a_compiled_explicit_analytical_is_not_second_guessed(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BNGSIM_CODEGEN_THRESHOLD", "1")
+    sim = _compiled(_net(data_dir), codegen=True, jacobian="analytical")
+    with pytest.raises(SimulationError):
+        sim.run(t_span=T_SPAN, n_points=N_POINTS, rtol=TOL, atol=TOL)
+
+
 # ── The steady-state half of the same policy (issue #127) ────────────────────
 #
 # Since #127 the march installs the closed-form Jacobian, so it meets this
