@@ -623,6 +623,24 @@ void ModelBuilder::add_inline_table_function_spec(const std::string &func_name,
 namespace {
 
 // Build stoichiometry from reactions (same logic as net_file_loader.cpp)
+// A 1-based index list, one entry per unit of stoichiometry, as (0-based species,
+// multiplicity) in order of first appearance (issue #801). Out-of-range and
+// placeholder (<= 0) indices are dropped, as the right-hand side drops them.
+static std::vector<std::pair<int, double>> fold_multiplicity(const std::vector<int> &indices) {
+    std::vector<std::pair<int, double>> out;
+    std::unordered_map<int, size_t> slot;
+    for (int si : indices) {
+        if (si < 1)
+            continue;
+        auto [it, inserted] = slot.emplace(si - 1, out.size());
+        if (inserted)
+            out.emplace_back(si - 1, 1.0);
+        else
+            out[it->second].second += 1.0;
+    }
+    return out;
+}
+
 std::vector<StoichEntry> build_stoich(const std::vector<Reaction> &reactions) {
     std::vector<StoichEntry> entries;
     for (const auto &rxn : reactions) {
@@ -2037,6 +2055,10 @@ NetworkModel ModelBuilder::build() {
 
     // ── 6. Build stoichiometry ───────────────────────────────────────────
     sd->stoichiometry = build_stoich(sd->reactions);
+    for (auto &rxn : sd->reactions) {
+        rxn.reactant_multiplicity = fold_multiplicity(rxn.reactant_indices);
+        rxn.product_multiplicity = fold_multiplicity(rxn.product_indices);
+    }
 
     // ── 7. Jacobian sparsity + analytical Jacobian ───────────────────────
     const int ns = static_cast<int>(impl.species.size());
