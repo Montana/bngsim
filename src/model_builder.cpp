@@ -1490,10 +1490,9 @@ NetworkModel ModelBuilder::build() {
                                          std::to_string(ns) + ")");
             }
             if (b.param_name_to_idx.find(ref.param_name) == b.param_name_to_idx.end()) {
-                throw std::runtime_error("ModelBuilder::validate: species '" +
-                                         b.species[ref.species_idx0].name +
-                                         "' takes its initial value from unknown parameter '" +
-                                         ref.param_name + "'");
+                throw std::runtime_error(
+                    "ModelBuilder::validate: species '" + b.species[ref.species_idx0].name +
+                    "' takes its initial value from unknown parameter '" + ref.param_name + "'");
             }
         }
 
