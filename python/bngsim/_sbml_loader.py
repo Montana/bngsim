@@ -1644,7 +1644,13 @@ def _eval_ast_numeric(
         i = 0
         while i < nc - 1:
             cond = _c(i + 1)
-            if cond is not None and cond != 0:
+            if cond is None:
+                # Undecided, so no branch is known to be taken. Reading it as
+                # false returned a later branch's finite value for a condition
+                # the engine decides (`1/0 > 0` is true), and a caller trusts a
+                # fold that answered (issue #871).
+                return None
+            if cond != 0:
                 return _c(i)
             i += 2
         if nc % 2 == 1:
@@ -4902,6 +4908,64 @@ def _build_model_from_sbml_doc(doc):
             f"initialAssignment for '{_sym}' cannot be evaluated: {_why}. bngsim will not "
             "use the declared value in its place, since an initialAssignment overrides it."
         )
+
+    # Issue #871: the two passes above put a failed fold back on the engine only
+    # for a parameter or a species. A compartment or speciesReference target is
+    # never lifted, and a fold that READS a failed target answered with that
+    # target's declared value, which seeds the fold's context. So close the
+    # failed targets over every initialAssignment and assignment rule that
+    # reads one, and refuse any initialAssignment target in the closure that
+    # the engine does not evaluate. One the engine evaluates reads its inputs
+    # live, and each input is either evaluated too or refused here.
+    import os
+
+    _ia_failed = {_sym for _sym, _m in _ia_math.items() if not _ia_folds(_m)}
+    if _ia_failed and os.environ.get(_ALLOW_UNDEFINED_SYMBOLS_ENV) == "1":
+        # GH #119's escape hatch drops an initialAssignment that reads an
+        # undefined symbol and keeps the declared value, having warned about it.
+        # That is the documented behaviour, not a fold failure to refuse.
+        _ia_failed = {
+            _sym
+            for _sym in _ia_failed
+            if all(_model_declares_symbol(sbml_model, _n) for _n in _ast_name_set(_ia_math[_sym]))
+        }
+    if _ia_failed:
+        _reads = {
+            **{_sym: _ast_name_set(_m) for _sym, _m in _ar_math.items()},
+            **{_sym: _ast_name_set(_m) for _sym, _m in _ia_math.items()},
+        }
+        _taint = {_sym: _sym for _sym in _ia_failed}  # target -> the failed fold it reads
+        _grew = True
+        while _grew:
+            _grew = False
+            for _sym, _names in _reads.items():
+                if _sym in _taint:
+                    continue
+                _hit = next((_n for _n in sorted(_names) if _n in _taint), None)
+                if _hit is not None:
+                    _taint[_sym] = _taint[_hit]
+                    _grew = True
+        _engine_evaluated = (
+            lifted_ia_param_expr.keys()
+            | ia_param_expr.keys()
+            | {_s for _s, _p in ia_single_param_ref.items() if _p in _declared_param_ids}
+        )
+        for _sym in _ia_math:
+            if _sym not in _taint or _sym in _engine_evaluated:
+                continue
+            from bngsim._exceptions import ModelError
+
+            _root = _taint[_sym]
+            _cause = (
+                "it cannot be evaluated at load"
+                if _root == _sym
+                else f"it reads '{_root}', whose initialAssignment cannot be evaluated at load"
+            )
+            raise ModelError(
+                f"initialAssignment for '{_sym}' cannot be evaluated: {_cause}, and bngsim "
+                "does not evaluate this target's initialAssignment in the engine. bngsim "
+                "will not use a declared value in its place."
+            )
 
     # (#170) The residue: a section-0 fold of a live size that neither §2 nor the
     # loop above put back on the size. An initial condition still folded, a named

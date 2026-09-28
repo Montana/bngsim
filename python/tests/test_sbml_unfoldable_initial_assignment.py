@@ -9,6 +9,10 @@ never applied and its target silently kept its declared value.
 Now a failed fold is evaluated by the engine at the initial time, with IEEE
 semantics (what SBML suite case 00950 expects), and an IA the translator
 refuses raises ModelError, as the same construct does in any other rule.
+
+GH #871 closes what that left: a compartment or speciesReference target is
+never put back on the engine, a fold that reads a failed target answered with
+its declared value, and a piecewise fold read an undecidable condition as false.
 """
 
 from __future__ import annotations
@@ -33,7 +37,9 @@ _DISTRIB_NS = (
 )
 
 
-def _doc(params: str, ias: str, species: str = "", distrib: bool = False) -> str:
+def _doc(
+    params: str, ias: str, species: str = "", distrib: bool = False, reactions: str = ""
+) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core"{_DISTRIB_NS if distrib else ""}
  level="3" version="2">
@@ -42,6 +48,7 @@ def _doc(params: str, ias: str, species: str = "", distrib: bool = False) -> str
 <listOfSpecies>{species}</listOfSpecies>
 <listOfParameters>{params}</listOfParameters>
 <listOfInitialAssignments>{ias}</listOfInitialAssignments>
+<listOfReactions>{reactions}</listOfReactions>
 </model></sbml>"""
 
 
@@ -102,3 +109,70 @@ def test_a_distrib_draw_is_refused_not_dropped(mean):
     doc = _doc(_param("P", -1) + _param("mu", 10), _ia("P", body), distrib=True)
     with pytest.raises(ModelError, match="initialAssignment for 'P' cannot be evaluated"):
         bngsim.Model.from_sbml_string(doc)
+
+
+# ── GH #871 ──────────────────────────────────────────────────────────────────
+
+_S = (
+    '<species id="S" compartment="C" initialConcentration="5" hasOnlySubstanceUnits="false"'
+    ' boundaryCondition="false" constant="false"/>'
+)
+_INF = _div("<cn>1</cn>", "<cn>0</cn>")
+
+
+def test_a_fold_that_reads_a_failed_target_is_refused():
+    # Q's fold "answered" 6 from S's declared 5; S itself lands as inf.
+    ias = _ia("S", _INF) + _ia("Q", "<apply><plus/><ci>S</ci><cn>1</cn></apply>")
+    doc = _doc(_param("Q", 0), ias, species=_S)
+    with pytest.raises(ModelError, match="for 'Q' cannot be evaluated: it reads 'S'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_failed_compartment_ia_is_refused():
+    with pytest.raises(ModelError, match="for 'C' cannot be evaluated"):
+        bngsim.Model.from_sbml_string(_doc("", _ia("C", _INF)))
+
+
+def test_a_failed_stoichiometry_ia_is_refused():
+    reaction = (
+        '<reaction id="R" reversible="false"><listOfReactants>'
+        '<speciesReference id="S1" species="S" stoichiometry="1" constant="true"/>'
+        f'</listOfReactants><kineticLaw><math xmlns="{_M}"><ci>k</ci></math></kineticLaw>'
+        "</reaction>"
+    )
+    doc = _doc(_param("k", 0.1), _ia("S1", _INF), species=_S, reactions=reaction)
+    with pytest.raises(ModelError, match="for 'S1' cannot be evaluated"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_piecewise_condition_the_fold_cannot_decide_goes_to_the_engine():
+    # ExprTk: inf > 0 is true, so P = 1. The fold read the condition as false.
+    body = (
+        f"<piecewise><piece><cn>1</cn><apply><gt/>{_INF}<cn>0</cn></apply></piece>"
+        "<otherwise><cn>2</cn></otherwise></piecewise>"
+    )
+    m = bngsim.Model.from_sbml_string(_doc(_param("P", 0), _ia("P", body)))
+    assert m._core.get_param("P") == 1.0
+
+
+def test_a_piecewise_decided_before_an_undecidable_condition_still_folds():
+    body = (
+        "<piecewise><piece><cn>3</cn><apply><gt/><cn>1</cn><cn>0</cn></apply></piece>"
+        f"<piece><cn>4</cn><apply><gt/>{_INF}<cn>0</cn></apply></piece></piecewise>"
+    )
+    m = bngsim.Model.from_sbml_string(_doc(_param("P", 0), _ia("P", body)))
+    assert m._core.get_param("P") == 3.0
+
+
+def test_a_parameter_reading_a_failed_parameter_is_evaluated_not_refused():
+    # Both are lifted, so the engine evaluates Q from P's inf.
+    ias = _ia("P", _INF) + _ia("Q", "<apply><plus/><ci>P</ci><cn>1</cn></apply>")
+    m = bngsim.Model.from_sbml_string(_doc(_param("P", 0) + _param("Q", 0), ias))
+    assert m._core.get_param("Q") == math.inf
+
+
+def test_a_species_reading_a_failed_species_is_evaluated_not_refused():
+    s2 = _S.replace('id="S"', 'id="S2"')
+    ias = _ia("S", _INF) + _ia("S2", "<apply><plus/><ci>S</ci><cn>1</cn></apply>")
+    m = bngsim.Model.from_sbml_string(_doc("", ias, species=_S + s2))
+    assert m._core.get_concentration("S2") == math.inf
