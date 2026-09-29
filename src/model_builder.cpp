@@ -984,6 +984,17 @@ AnalyticalJacobianData build_anal_jac(const std::vector<Reaction> &reactions, in
             ajd.reactions.emplace_back();
             continue;
         }
+        if (rxn.per_species_volume_scaling) {
+            // The terms below have no per-row compartment divide (1/V_i, live
+            // for a varying compartment), so they would read the rate as if
+            // every species shared one volume: -k where the RHS has -k/V_A.
+            // Loaders route a cross-compartment law through a function, whose
+            // path does divide; only the builder API reaches this, as does a
+            // Functional reaction naming a parameter since issue #863.
+            has_unsupported = true;
+            ajd.reactions.emplace_back();
+            continue;
+        }
 
         AnalyticalJacobianData::ReactionTerms terms;
         terms.stat_factor = rxn.stat_factor;

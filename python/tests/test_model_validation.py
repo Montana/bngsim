@@ -148,6 +148,25 @@ class TestFunctionalNamingParameter:
         assert finals == pytest.approx([100.0 * np.exp(-0.2)] * 2, rel=1e-6)
 
     @pytest.mark.parametrize("rate_type", ["elementary", "functional"])
+    def test_jacobian_keeps_the_per_species_volume_divide(self, rate_type):
+        # Cross-compartment accumulation divides each row by its species'
+        # volume, dA/dt = -k*A/2 and dB/dt = k*A/5. The elementary analytical
+        # Jacobian had no such divide and returned -k and k.
+        import numpy as np
+        from bngsim._model import Model
+
+        b = _builder()
+        b.add_parameter("k", 2.0, "2.0", False)
+        b.add_species("A()", 100.0, False, 2.0)
+        b.add_species("B()", 0.0, False, 5.0)
+        b.add_observable("Atot", [(0, 1.0)])
+        b.add_reaction([0], [1], rate_type, "k", 1.0, True, 1.0, True)
+        m = Model(_core=b.build())
+        y = np.array([100.0, 3.0])
+        np.testing.assert_allclose(m.rhs(y), [-100.0, 40.0])
+        np.testing.assert_allclose(m.jacobian(y), [[-1.0, 0.0], [0.4, 0.0]], atol=1e-6)
+
+    @pytest.mark.parametrize("rate_type", ["elementary", "functional"])
     def test_parameter_rate_without_species_factor_refused(self, rate_type):
         # The interpreted kernel read this as dA/dt = -k, while the generated
         # RHS and the analytical Jacobian applied the reactant factor, -k*A.
