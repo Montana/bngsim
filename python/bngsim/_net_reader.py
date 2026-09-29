@@ -195,8 +195,8 @@ def build_model_from_parsed(parsed: dict[str, Any]):
     # forward-sensitivity seeding reads (issue #554).
     declared = {name for name, _, _, _ in parsed["parameters"]}
     for species_idx0, param_name in parsed.get("species_ic_params", ()):
-        # ModelBuilder passes over a reference to an undeclared parameter, which
-        # leaves the species at whatever number the dict gave it.
+        # ModelBuilder refuses both of these as well (issue #863); checking here
+        # first names the dict field the caller got wrong.
         if param_name not in declared:
             raise ValueError(
                 f"species_ic_params names parameter {param_name!r}, which the parameters "

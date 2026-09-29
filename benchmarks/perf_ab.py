@@ -184,7 +184,11 @@ def resolve_side(spec: str, python: str) -> dict:
     if spec.startswith("python:"):
         py = Path(spec[len("python:") :]).expanduser()
         if not py.is_absolute():
-            py = (Path.cwd() / py).resolve()
+            # Absolute, but NOT resolved: a venv's bin/python is a symlink to the
+            # base interpreter, and Python finds its venv (pyvenv.cfg) from the
+            # path it was started by. Following the link runs the side outside the
+            # venv, where bngsim is not installed.
+            py = Path(os.path.abspath(py))
         label = str(py)
     else:
         sha = _git("rev-parse", "--verify", f"{spec}^{{commit}}")

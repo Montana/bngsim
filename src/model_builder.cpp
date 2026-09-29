@@ -27,6 +27,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef BNGSIM_HAS_KLU
+#include <klu.h>
+#endif
+
 namespace bngsim {
 
 // Call `fn(token)` once per identifier in `expr`, in source order, under
@@ -980,6 +984,17 @@ AnalyticalJacobianData build_anal_jac(const std::vector<Reaction> &reactions, in
             ajd.reactions.emplace_back();
             continue;
         }
+        if (rxn.per_species_volume_scaling) {
+            // The terms below have no per-row compartment divide (1/V_i, live
+            // for a varying compartment), so they would read the rate as if
+            // every species shared one volume: -k where the RHS has -k/V_A.
+            // Loaders route a cross-compartment law through a function, whose
+            // path does divide; only the builder API reaches this, as does a
+            // Functional reaction naming a parameter since issue #863.
+            has_unsupported = true;
+            ajd.reactions.emplace_back();
+            continue;
+        }
 
         AnalyticalJacobianData::ReactionTerms terms;
         terms.stat_factor = rxn.stat_factor;
@@ -1383,6 +1398,65 @@ const JacobianSparsity &ensure_jacobian_coloring(const SharedModelData &sd) {
     return sd.jac_sparsity;
 }
 
+// Estimated nnz(L+U) / n^2 of the Newton matrix I - gamma*J, from KLU's symbolic
+// analysis of the Jacobian pattern plus the diagonal (M always has a full
+// diagonal; the pattern need not). lnz and unz each count the diagonal, and
+// entries of the off-diagonal BTF blocks are stored separately (nzoff), so the
+// factor holds lnz + unz - n + nzoff values.
+//
+// The analysis runs with klu_defaults' AMD ordering, the only one for which KLU
+// reports lnz/unz — an estimate from the symmetric pattern A + A^T. The sparse
+// route's solver orders with COLAMD (SUNDIALS' default) and pivots, and on the
+// rule-derived nets that fills in more, not less: SuperLU with COLAMD measures
+// 0.23-0.64 where this says 0.21-0.35 (metapop_sir_100 agrees at 0.02). So the
+// estimate errs toward keeping KLU, which is the safe side of a threshold. The
+// analysis costs well under a millisecond on hundreds of species.
+static double compute_lu_fill_estimate(const JacobianSparsity &sp) {
+#ifdef BNGSIM_HAS_KLU
+    const int64_t n = sp.n;
+    if (n <= 0)
+        return 0.0;
+    std::vector<int64_t> Ap(static_cast<size_t>(n) + 1, 0);
+    std::vector<int64_t> Ai;
+    Ai.reserve(static_cast<size_t>(sp.nnz) + static_cast<size_t>(n));
+    for (int64_t j = 0; j < n; ++j) {
+        bool diag = false;
+        for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+            const int64_t i = sp.row_indices[k];
+            if (i == j) {
+                diag = true;
+            } else if (i > j && !diag) {
+                Ai.push_back(j); // keep rows ascending within the column
+                diag = true;
+            }
+            Ai.push_back(i);
+        }
+        if (!diag)
+            Ai.push_back(j);
+        Ap[j + 1] = static_cast<int64_t>(Ai.size());
+    }
+    klu_l_common common;
+    if (!klu_l_defaults(&common))
+        return -1.0;
+    klu_l_symbolic *sym = klu_l_analyze(n, Ap.data(), Ai.data(), &common);
+    if (sym == nullptr)
+        return -1.0;
+    const double stored =
+        sym->lnz + sym->unz - static_cast<double>(n) + static_cast<double>(sym->nzoff);
+    klu_l_free_symbolic(&sym, &common);
+    return stored / (static_cast<double>(n) * static_cast<double>(n));
+#else
+    (void)sp;
+    return -1.0;
+#endif
+}
+
+double ensure_lu_fill_estimate(const SharedModelData &sd) {
+    std::call_once(sd.lu_fill_once,
+                   [&] { sd.lu_fill_estimate = compute_lu_fill_estimate(sd.jac_sparsity); });
+    return sd.lu_fill_estimate;
+}
+
 // ─── Build ───────────────────────────────────────────────────────────────────
 
 NetworkModel ModelBuilder::build() {
@@ -1477,9 +1551,43 @@ NetworkModel ModelBuilder::build() {
                                              "parameters (expected 'kcat_name,km_name')");
                 }
             }
+
+            // A rate that names a parameter and no function resolves as
+            // Elementary (step 5), and only the interpreted kernel honours
+            // apply_species_factor=false there: the generated RHS and the
+            // analytical Jacobian multiply a parameter rate by the reactant
+            // factor unconditionally, so the backends would disagree
+            // (issue #863). No loader emits this; a kinetic law that carries
+            // its own reactant factor goes through a function.
+            if (!rxn.apply_species_factor && rxn.rate_law_type != RateLawType::MichaelisMenten &&
+                b.param_name_to_idx.count(rxn.function_name) &&
+                !b.function_name_to_idx.count(rxn.function_name)) {
+                throw std::runtime_error(
+                    "ModelBuilder::validate: reaction " + std::to_string(ri) +
+                    " takes its rate from parameter '" + rxn.function_name +
+                    "' with apply_species_factor=false; a parameter rate is mass action, so "
+                    "pass the whole rate law as a function instead");
+            }
         }
 
-        // 0d. Observable group species indices in range
+        // 0d. Species IC references resolve. build() cannot place a reference
+        // to an undeclared parameter, and would keep the species' own number
+        // with no record of the reference (issue #863).
+        for (const auto &ref : b.species_param_refs) {
+            if (ref.species_idx0 < 0 || ref.species_idx0 >= ns) {
+                throw std::runtime_error("ModelBuilder::validate: species IC reference to '" +
+                                         ref.param_name + "' names species index " +
+                                         std::to_string(ref.species_idx0) + " out of range [0, " +
+                                         std::to_string(ns) + ")");
+            }
+            if (b.param_name_to_idx.find(ref.param_name) == b.param_name_to_idx.end()) {
+                throw std::runtime_error(
+                    "ModelBuilder::validate: species '" + b.species[ref.species_idx0].name +
+                    "' takes its initial value from unknown parameter '" + ref.param_name + "'");
+            }
+        }
+
+        // 0e. Observable group species indices in range
         for (int oi = 0; oi < static_cast<int>(b.observables.size()); ++oi) {
             const auto &obs = b.observables[oi];
             for (const auto &entry : obs.entries) {
@@ -2021,6 +2129,12 @@ NetworkModel ModelBuilder::build() {
     }
 
     // ── 5. Resolve Functional reaction param indices ─────────────────────
+    // A name that is a function makes the reaction Functional whatever its
+    // declared type; a Functional reaction naming only a parameter is the
+    // mirror case and resolves as Elementary, which the kernel evaluates the
+    // same way (validation refused it with apply_species_factor=false). Left
+    // Functional, its rate index stays unresolved and step 8a refuses it
+    // (issue #863).
     for (auto &rxn : sd->reactions) {
         if (!rxn.function_name.empty()) {
             if (sd->function_name_to_idx.count(rxn.function_name)) {
@@ -2030,6 +2144,12 @@ NetworkModel ModelBuilder::build() {
                     if (pit != sd->param_name_to_idx.end()) {
                         rxn.rate_law_param_indices[0] = impl.parameters[pit->second].index;
                     }
+                }
+            } else if (rxn.rate_law_type == RateLawType::Functional) {
+                auto pit = sd->param_name_to_idx.find(rxn.function_name);
+                if (pit != sd->param_name_to_idx.end()) {
+                    rxn.rate_law_type = RateLawType::Elementary;
+                    rxn.rate_law_param_indices.assign(1, impl.parameters[pit->second].index);
                 }
             }
         }

@@ -95,6 +95,8 @@ Interactive:
 - **`save_concentrations(label=None)`** / **`restore_concentrations(label=None)`** — Snapshot / restore the model's concentrations by name (delegates to `Model`); pair with `parameter_scan(reset_to=label)` for a preincubate → save → scan protocol
 - **`snapshot()`** → `dict` — Save state
 - **`restore(snapshot)`** — Restore state
+- **`get_state()`** → `ndarray` / **`set_state(state, *, time=None)`** — Bulk species vector; `time=` also sets `current_time`, so a step can be redone from a saved state and time without `restore`'s backend rebuild ([rolling a step back](../user-guide/simulation.md#rolling-a-step-back))
+- **`set_time(t)`** — Set `current_time` (finite, else `ValueError`); the next `run_until` integrates from there
 
 Stop conditions:
 - **`add_stop_condition(condition, *, label)`** — `str` expression or `callable`

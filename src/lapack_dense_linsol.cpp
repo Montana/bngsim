@@ -277,6 +277,16 @@ SUNLinearSolver make_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx
     return SUNLinSol_Dense(y, A, ctx);
 }
 
+SUNLinearSolver make_fill_routed_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx) {
+    SUNLinearSolver S = make_lapack_dense(A, ctx);
+    if (S == nullptr)
+        return SUNLinSol_Dense(y, A, ctx); // allocation failure → built-in solver
+    auto *c = static_cast<LapackDenseContent *>(S->content);
+    c->switch_after = 0; // BLAS from the first factorization
+    c->min_n = 0;
+    return S;
+}
+
 // Identify the custom adaptive solver by its setup op (ls_setup has internal
 // linkage but is visible here in the same TU). The built-in SUNLinSol_Dense and
 // KLU solvers carry a different setup function, so these guards correctly skip
@@ -305,6 +315,10 @@ long lapack_dense_blas_factor_count(SUNLinearSolver S) {
 
 SUNLinearSolver make_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx,
                                          bool /*prefer_lapack*/) {
+    return SUNLinSol_Dense(y, A, ctx);
+}
+
+SUNLinearSolver make_fill_routed_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx) {
     return SUNLinSol_Dense(y, A, ctx);
 }
 

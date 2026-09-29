@@ -1595,6 +1595,9 @@ const JacobianSparsity &NetworkModel::ensure_jacobian_coloring() const {
     // Qualified: the member name hides the namespace-scope helper it forwards to.
     return bngsim::ensure_jacobian_coloring(*impl_->shared);
 }
+double NetworkModel::estimated_lu_fill() const {
+    return bngsim::ensure_lu_fill_estimate(*impl_->shared);
+}
 const AnalyticalJacobianData &NetworkModel::analytical_jacobian() const {
     return impl_->shared->analytical_jac;
 }
@@ -1673,6 +1676,26 @@ FunctionalJacobianContext NetworkModel::functional_jacobian_context() const {
     for (const auto &p : impl_->parameters)
         if (sd.function_name_to_idx.find(p.name) == sd.function_name_to_idx.end())
             ctx.constant_names.push_back(p.name);
+
+    // Table functions that do not read the state: indexed by time, or by a
+    // constant parameter. The evaluator registers each as the zero-argument
+    // function `tfun_<name>` (register_table_function_), which is how it reaches
+    // the rate-law text, so that is the name the symbolic core must be allowed
+    // to treat as a constant — exactly as it treats `time()`. Its value at the
+    // current time is what the derivative needs; no derivative of the table
+    // itself is ever taken, because nothing it depends on is a species. A table
+    // indexed by an observable depends on the state and stays out, so a rate
+    // law that reads one keeps declining to finite differences.
+    for (const auto &tf : impl_->table_functions) {
+        bool constant_index = is_time_index(tf->index_name());
+        if (!constant_index) {
+            const std::string idx = strip_paren_suffix(tf->index_name());
+            constant_index = sd.param_name_to_idx.count(idx) > 0 &&
+                             sd.function_name_to_idx.find(idx) == sd.function_name_to_idx.end();
+        }
+        if (constant_index)
+            ctx.constant_names.push_back("tfun_" + tf->name());
+    }
 
     return ctx;
 }
