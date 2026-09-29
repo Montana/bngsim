@@ -108,6 +108,7 @@ def _register_ic_param_ref(
     sym: str,
     ia_single_param_ref: dict[str, str],
     ia_expr_param: dict[str, str],
+    declared_params: set[str],
 ) -> None:
     """Link a state's initial condition to the parameter(s) that define it.
 
@@ -122,12 +123,14 @@ def _register_ic_param_ref(
     coefficient 1 by the legacy identity path; a compound expression links to
     the synthetic derived parameter §3 lowered it to, which reaches issue #43's
     sympy chain rule to primaries. ``add_species_param_ref`` resolves by
-    parameter *name* at build time and silently drops a name that is not a
-    builder parameter, so a reference to a symbol this loader turned into a
-    species registers nothing rather than mis-seeding.
+    parameter *name* at build time and refuses a name that is not a builder
+    parameter (issue #863), so a bare ``<ci>`` naming a symbol this loader
+    turned into a species (not in ``declared_params``) registers nothing
+    rather than mis-seeding.
     """
     if sym in ia_single_param_ref:
-        builder.add_species_param_ref(species_idx0, _safe_name(ia_single_param_ref[sym]))
+        if ia_single_param_ref[sym] in declared_params:
+            builder.add_species_param_ref(species_idx0, _safe_name(ia_single_param_ref[sym]))
     elif sym in ia_expr_param:
         builder.add_species_param_ref(species_idx0, ia_expr_param[sym])
 
@@ -4834,8 +4837,7 @@ def _build_model_from_sbml_doc(doc):
         if math.getNumChildren() == 0 and math.getType() == libsbml.AST_NAME:
             ref = math.getName()
             if ref in _ic_const_ar:
-                # A rule owns the named slot, so linking the IC to it registers
-                # nothing (`add_species_param_ref` drops a non-parameter name).
+                # A rule owns the named slot, so the IC is not linked to it.
                 # Its constant expansion is a parameter expression, though.
                 ia_param_expr[sym] = _ic_const_ar[ref]
             elif ref in _param_ids:
@@ -5252,7 +5254,9 @@ def _build_model_from_sbml_doc(doc):
         # register the link so CVODES forward sensitivity seeds yS for them —
         # directly for a bare <ci>, or through the synthetic derived parameter
         # that carries a compound expression to issue #43's chain rule.
-        _register_ic_param_ref(builder, idx, sid, ia_single_param_ref, ia_expr_param)
+        _register_ic_param_ref(
+            builder, idx, sid, ia_single_param_ref, ia_expr_param, _declared_param_ids
+        )
 
     # ── 3b. Model / species conversionFactor (GH #232) ────────────────
     # SBML's conversionFactor scales how a species' AMOUNT changes per unit
@@ -6009,7 +6013,9 @@ def _build_model_from_sbml_doc(doc):
                 species_idx[var] = sp_i
                 species_ids.append(var)
                 builder.add_observable(_safe_name(var), [(sp_i, 1.0)])
-                _register_ic_param_ref(builder, sp_i, var, ia_single_param_ref, ia_expr_param)
+                _register_ic_param_ref(
+                    builder, sp_i, var, ia_single_param_ref, ia_expr_param, _declared_param_ids
+                )
 
             expr = "0" if math is None else _ast_to_exprtk_with_funcdefs(math, func_defs)
             fname = f"_rhs_{_safe_name(var)}"
@@ -7257,7 +7263,9 @@ def _build_model_from_sbml_doc(doc):
                     species_idx[var] = sp_i
                     species_ids.append(var)
                     builder.add_observable(_safe_name(var), [(sp_i, 1.0)])
-                    _register_ic_param_ref(builder, sp_i, var, ia_single_param_ref, ia_expr_param)
+                    _register_ic_param_ref(
+                        builder, sp_i, var, ia_single_param_ref, ia_expr_param, _declared_param_ids
+                    )
                     assignments.append((sp_i, value_expr))
 
             if assignment_value_expr_by_var and ar_comp_targets:
