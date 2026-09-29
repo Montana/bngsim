@@ -984,6 +984,17 @@ AnalyticalJacobianData build_anal_jac(const std::vector<Reaction> &reactions, in
             ajd.reactions.emplace_back();
             continue;
         }
+        if (rxn.per_species_volume_scaling) {
+            // The terms below have no per-row compartment divide (1/V_i, live
+            // for a varying compartment), so they would read the rate as if
+            // every species shared one volume: -k where the RHS has -k/V_A.
+            // Loaders route a cross-compartment law through a function, whose
+            // path does divide; only the builder API reaches this, as does a
+            // Functional reaction naming a parameter since issue #863.
+            has_unsupported = true;
+            ajd.reactions.emplace_back();
+            continue;
+        }
 
         AnalyticalJacobianData::ReactionTerms terms;
         terms.stat_factor = rxn.stat_factor;
@@ -1540,9 +1551,43 @@ NetworkModel ModelBuilder::build() {
                                              "parameters (expected 'kcat_name,km_name')");
                 }
             }
+
+            // A rate that names a parameter and no function resolves as
+            // Elementary (step 5), and only the interpreted kernel honours
+            // apply_species_factor=false there: the generated RHS and the
+            // analytical Jacobian multiply a parameter rate by the reactant
+            // factor unconditionally, so the backends would disagree
+            // (issue #863). No loader emits this; a kinetic law that carries
+            // its own reactant factor goes through a function.
+            if (!rxn.apply_species_factor && rxn.rate_law_type != RateLawType::MichaelisMenten &&
+                b.param_name_to_idx.count(rxn.function_name) &&
+                !b.function_name_to_idx.count(rxn.function_name)) {
+                throw std::runtime_error(
+                    "ModelBuilder::validate: reaction " + std::to_string(ri) +
+                    " takes its rate from parameter '" + rxn.function_name +
+                    "' with apply_species_factor=false; a parameter rate is mass action, so "
+                    "pass the whole rate law as a function instead");
+            }
         }
 
-        // 0d. Observable group species indices in range
+        // 0d. Species IC references resolve. build() cannot place a reference
+        // to an undeclared parameter, and would keep the species' own number
+        // with no record of the reference (issue #863).
+        for (const auto &ref : b.species_param_refs) {
+            if (ref.species_idx0 < 0 || ref.species_idx0 >= ns) {
+                throw std::runtime_error("ModelBuilder::validate: species IC reference to '" +
+                                         ref.param_name + "' names species index " +
+                                         std::to_string(ref.species_idx0) + " out of range [0, " +
+                                         std::to_string(ns) + ")");
+            }
+            if (b.param_name_to_idx.find(ref.param_name) == b.param_name_to_idx.end()) {
+                throw std::runtime_error(
+                    "ModelBuilder::validate: species '" + b.species[ref.species_idx0].name +
+                    "' takes its initial value from unknown parameter '" + ref.param_name + "'");
+            }
+        }
+
+        // 0e. Observable group species indices in range
         for (int oi = 0; oi < static_cast<int>(b.observables.size()); ++oi) {
             const auto &obs = b.observables[oi];
             for (const auto &entry : obs.entries) {
@@ -2084,6 +2129,12 @@ NetworkModel ModelBuilder::build() {
     }
 
     // ── 5. Resolve Functional reaction param indices ─────────────────────
+    // A name that is a function makes the reaction Functional whatever its
+    // declared type; a Functional reaction naming only a parameter is the
+    // mirror case and resolves as Elementary, which the kernel evaluates the
+    // same way (validation refused it with apply_species_factor=false). Left
+    // Functional, its rate index stays unresolved and step 8a refuses it
+    // (issue #863).
     for (auto &rxn : sd->reactions) {
         if (!rxn.function_name.empty()) {
             if (sd->function_name_to_idx.count(rxn.function_name)) {
@@ -2093,6 +2144,12 @@ NetworkModel ModelBuilder::build() {
                     if (pit != sd->param_name_to_idx.end()) {
                         rxn.rate_law_param_indices[0] = impl.parameters[pit->second].index;
                     }
+                }
+            } else if (rxn.rate_law_type == RateLawType::Functional) {
+                auto pit = sd->param_name_to_idx.find(rxn.function_name);
+                if (pit != sd->param_name_to_idx.end()) {
+                    rxn.rate_law_type = RateLawType::Elementary;
+                    rxn.rate_law_param_indices.assign(1, impl.parameters[pit->second].index);
                 }
             }
         }
