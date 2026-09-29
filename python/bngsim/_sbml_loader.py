@@ -3719,6 +3719,11 @@ def _build_model_from_sbml_doc(doc):
     # parameters shadow eval_ctx for the law evaluation, mirroring the rateOf
     # initial resolver. Guard ``not in eval_ctx`` — reaction ids are a disjoint
     # namespace, so this never clobbers a species/param/compartment.
+    #
+    # The seed reads the DECLARED values, so the loops below refold it as the
+    # initialAssignments and rules resolve (`_refresh_reaction_ids`): `p1 = J0`
+    # with J0's law `k*S` and `S = 10` over a declared 5 folded 5, not 10.
+    _rid_laws: list[tuple[str, object, dict]] = []
     for j in range(sbml_model.getNumReactions()):
         _rxn = sbml_model.getReaction(j)
         _rid = _rxn.getId()
@@ -3727,17 +3732,32 @@ def _build_model_from_sbml_doc(doc):
         _kl = _rxn.getKineticLaw()
         if _kl is None or not _kl.isSetMath():
             continue
-        _law_ctx = eval_ctx
+        _lps: dict[str, float] = {}
         _n_lp = _kl.getNumLocalParameters() if hasattr(_kl, "getNumLocalParameters") else 0
-        if _n_lp:
-            _law_ctx = dict(eval_ctx)
-            for k in range(_n_lp):
-                _lp = _kl.getLocalParameter(k)
-                if _lp.isSetValue():
-                    _law_ctx[_lp.getId()] = _lp.getValue()
-        _rv = _eval_ast_numeric(_kl.getMath(), _law_ctx, func_defs)
+        for k in range(_n_lp):
+            _lp = _kl.getLocalParameter(k)
+            if _lp.isSetValue():
+                _lps[_lp.getId()] = _lp.getValue()
+        _rid_laws.append((_rid, _kl.getMath(), _lps))
+        _rv = _eval_ast_numeric(_kl.getMath(), {**eval_ctx, **_lps}, func_defs)
         if _rv is not None and _math.isfinite(_rv):
             eval_ctx[_rid] = _rv
+
+    def _refresh_reaction_ids() -> bool:
+        """Refold each reaction id at the current initial values; True if one moved.
+        One that no longer folds to a finite rate leaves the context, so a fold
+        that reads it fails (and is lifted or refused) rather than reading a
+        stale number."""
+        moved = False
+        for _rid, _law, _lps in _rid_laws:
+            _rv = _eval_ast_numeric(_law, {**eval_ctx, **_lps} if _lps else eval_ctx, func_defs)
+            if _rv is not None and _math.isfinite(_rv):
+                if _ia_value_changed(_rv, eval_ctx.get(_rid)):
+                    eval_ctx[_rid] = _rv
+                    moved = True
+            elif eval_ctx.pop(_rid, None) is not None:
+                moved = True
+        return moved
 
     if sbml_model.getNumInitialAssignments() > 0:
         # Evaluate SBML assignment rules AND initialAssignments together
@@ -3786,6 +3806,8 @@ def _build_model_from_sbml_doc(doc):
                     if _ia_value_changed(val, old):
                         eval_ctx[sym] = val
                         changed = True
+            if _refresh_reaction_ids():
+                changed = True
             if not changed:
                 break
 
@@ -3859,6 +3881,8 @@ def _build_model_from_sbml_doc(doc):
                     eval_ctx[var] = val
                     ia_values[var] = val
                     changed = True
+            if _refresh_reaction_ids():
+                changed = True
             if not changed:
                 break
 
