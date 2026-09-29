@@ -622,25 +622,44 @@ void ModelBuilder::add_inline_table_function_spec(const std::string &func_name,
 
 namespace {
 
-// Build stoichiometry from reactions (same logic as net_file_loader.cpp)
 // A 1-based index list, one entry per unit of stoichiometry, as (0-based species,
 // multiplicity) in order of first appearance (issue #801). Out-of-range and
 // placeholder (<= 0) indices are dropped, as the right-hand side drops them.
+// A side almost always names one to three species, so they are found by a
+// linear scan; a hash map was 7-8 % of a large network's load, paid twice per
+// reaction. Past kScanMax distinct species the map takes over, so a wide side
+// stays linear too.
 static std::vector<std::pair<int, double>> fold_multiplicity(const std::vector<int> &indices) {
+    constexpr size_t kScanMax = 16;
     std::vector<std::pair<int, double>> out;
     std::unordered_map<int, size_t> slot;
     for (int si : indices) {
         if (si < 1)
             continue;
-        auto [it, inserted] = slot.emplace(si - 1, out.size());
+        const int s0 = si - 1;
+        if (out.size() <= kScanMax) {
+            auto it = std::find_if(out.begin(), out.end(),
+                                   [s0](const std::pair<int, double> &e) { return e.first == s0; });
+            if (it != out.end()) {
+                it->second += 1.0;
+                continue;
+            }
+            out.emplace_back(s0, 1.0);
+            if (out.size() > kScanMax)
+                for (size_t k = 0; k < out.size(); ++k)
+                    slot.emplace(out[k].first, k);
+            continue;
+        }
+        auto [it, inserted] = slot.emplace(s0, out.size());
         if (inserted)
-            out.emplace_back(si - 1, 1.0);
+            out.emplace_back(s0, 1.0);
         else
             out[it->second].second += 1.0;
     }
     return out;
 }
 
+// Build stoichiometry from reactions (same logic as net_file_loader.cpp)
 std::vector<StoichEntry> build_stoich(const std::vector<Reaction> &reactions) {
     std::vector<StoichEntry> entries;
     for (const auto &rxn : reactions) {

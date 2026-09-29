@@ -117,3 +117,27 @@ def test_the_jax_rhs_applies_the_coefficient_once(tmp_path):
     y = jnp.array([1.0, 0.0], dtype=jnp.float64)
     got = np.asarray(rhs(y, 0.0, jnp.array([0.1], dtype=jnp.float64)))
     np.testing.assert_allclose(got, m.rhs(np.array([1.0, 0.0])), rtol=1e-15)
+
+
+def test_a_side_wider_than_the_linear_scan_folds_the_same():
+    # 20 distinct products, each three times and interleaved, so the fold
+    # passes its linear-scan limit and keeps meeting repeats afterwards.
+    from bngsim._bngsim_core import ModelBuilder
+    from bngsim._model import Model
+
+    def model() -> Model:
+        b = ModelBuilder()
+        b.add_parameter("k", 0.1, "0.1", False)
+        b.add_species("A()", 1.0, False)
+        for i in range(20):
+            b.add_species(f"P{i}()", 0.0, False)
+        b.add_observable("Atot", [(0, 1.0)])
+        b.add_reaction([0], [1 + i for _ in range(3) for i in range(20)], "elementary", "k", 1.0)
+        return Model(_core=b.build())
+
+    assert model().rhs(np.array([1.0] + [0.0] * 20)).tolist() == [-0.1] + [3.0 * 0.1] * 20
+    runs = []
+    for codegen in (False, True):
+        sim = bngsim.Simulator(model(), method="ode", codegen=codegen, jacobian="fd")
+        runs.append(np.asarray(sim.run(t_span=(0, 5), n_points=6).species))
+    assert np.array_equal(runs[0], runs[1])
