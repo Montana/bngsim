@@ -38,16 +38,23 @@ _DISTRIB_NS = (
 
 
 def _doc(
-    params: str, ias: str, species: str = "", distrib: bool = False, reactions: str = ""
+    params: str,
+    ias: str,
+    species: str = "",
+    distrib: bool = False,
+    reactions: str = "",
+    rules: str = "",
+    compartment: str = '<compartment id="C" size="1" constant="true"/>',
 ) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core"{_DISTRIB_NS if distrib else ""}
  level="3" version="2">
 <model id="m">
-<listOfCompartments><compartment id="C" size="1" constant="true"/></listOfCompartments>
+<listOfCompartments>{compartment}</listOfCompartments>
 <listOfSpecies>{species}</listOfSpecies>
 <listOfParameters>{params}</listOfParameters>
 <listOfInitialAssignments>{ias}</listOfInitialAssignments>
+<listOfRules>{rules}</listOfRules>
 <listOfReactions>{reactions}</listOfReactions>
 </model></sbml>"""
 
@@ -176,3 +183,133 @@ def test_a_species_reading_a_failed_species_is_evaluated_not_refused():
     ias = _ia("S", _INF) + _ia("S2", "<apply><plus/><ci>S</ci><cn>1</cn></apply>")
     m = bngsim.Model.from_sbml_string(_doc("", ias, species=_S + s2))
     assert m._core.get_concentration("S2") == math.inf
+
+
+# The same leak through the channels the name-only closure missed: a reaction id
+# (bound to its kinetic law's initial value), an assignment rule whose own fold
+# fails, a compartment an assignment rule sizes, and a constant stoichiometryMath.
+
+
+def _ar(var: str, body: str) -> str:
+    return f'<assignmentRule variable="{var}"><math xmlns="{_M}">{body}</math></assignmentRule>'
+
+
+def _plus_one(sym: str) -> str:
+    return f"<apply><plus/><ci>{sym}</ci><cn>1</cn></apply>"
+
+
+_PW = (
+    f"<piecewise><piece><cn>1</cn><apply><gt/>{_INF}<cn>0</cn></apply></piece>"
+    "<otherwise><cn>2</cn></otherwise></piecewise>"
+)
+
+
+def test_a_fold_through_a_reaction_id_is_refused():
+    # p1 = J0 folded k*S at S's declared 5.
+    reaction = (
+        '<reaction id="J0" reversible="false"><listOfReactants>'
+        '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfReactants>'
+        f'<kineticLaw><math xmlns="{_M}"><apply><times/><ci>k</ci><ci>S</ci></apply></math>'
+        "</kineticLaw></reaction>"
+    )
+    doc = _doc(
+        _param("k", 1) + _param("p1", 0),
+        _ia("S", _INF) + _ia("p1", "<ci>J0</ci>"),
+        species=_S,
+        reactions=reaction,
+    )
+    with pytest.raises(ModelError, match="for 'p1' cannot be evaluated: it depends through 'J0'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_fold_through_a_rate_of_is_refused():
+    # rateOf(S2) is k*S at S's declared 5; no name in it says so.
+    rate_of = (
+        "<apply><csymbol encoding='text' definitionURL='http://www.sbml.org/sbml/symbols/rateOf'>"
+        "rateOf</csymbol><ci>S2</ci></apply>"
+    )
+    reaction = (
+        '<reaction id="J0" reversible="false"><listOfReactants>'
+        '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfReactants>'
+        '<listOfProducts><speciesReference species="S2" stoichiometry="1" constant="true"/>'
+        f'</listOfProducts><kineticLaw><math xmlns="{_M}"><apply><times/><ci>k</ci><ci>S</ci>'
+        "</apply></math></kineticLaw></reaction>"
+    )
+    doc = _doc(
+        _param("k", 1) + _param("p2", 0),
+        _ia("S", _INF) + _ia("p2", rate_of),
+        species=_S + _S.replace('id="S"', 'id="S2"'),
+        reactions=reaction,
+    )
+    with pytest.raises(ModelError, match="for 'p2' cannot be evaluated: it depends on 'S'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_failed_rule_is_not_read_as_its_declared_value():
+    # C = Y + 1 folded 6 from Y's declared 5; the rule makes Y inf.
+    y = '<parameter id="Y" value="5" constant="false"/>'
+    doc = _doc(y, _ia("C", _plus_one("Y")), rules=_ar("Y", _INF))
+    with pytest.raises(ModelError, match="for 'C' cannot be evaluated: it reads 'Y'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_rule_the_fold_cannot_decide_is_not_read_as_its_declared_value():
+    # The piecewise fold no longer answers 2, so C would have read Y's declared 7.
+    y = '<parameter id="Y" value="7" constant="false"/>'
+    doc = _doc(y, _ia("C", "<ci>Y</ci>"), rules=_ar("Y", _PW))
+    with pytest.raises(ModelError, match="for 'C' cannot be evaluated: it reads 'Y'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+@pytest.mark.parametrize(
+    ("rule", "ias", "params"),
+    [
+        (_plus_one("P"), _ia("P", _INF), _param("P", 0)),  # reads a failed fold
+        (_PW, "", ""),  # its own fold cannot decide
+    ],
+)
+def test_a_compartment_a_rule_sizes_over_a_failed_fold_is_refused(rule, ias, params):
+    # The load converts X's amount by the folded size: 10 where 10/inf or 10/1.
+    comp = '<compartment id="C" size="3" constant="false"/>'
+    x = (
+        '<species id="X" compartment="C" initialAmount="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="false" constant="false"/>'
+    )
+    doc = _doc(params, ias, species=x, rules=_ar("C", rule), compartment=comp)
+    with pytest.raises(ModelError, match="assignment rule for 'C' cannot be evaluated"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+@pytest.mark.parametrize("body", [_INF, _PW])
+def test_a_constant_stoichiometry_math_that_fails_is_refused(body):
+    # It fell back to the speciesReference's stoichiometry, 1.
+    doc = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4"><model id="m">
+<listOfCompartments><compartment id="C" size="1"/></listOfCompartments>
+<listOfSpecies><species id="S" compartment="C" initialConcentration="5"/>
+<species id="P" compartment="C" initialConcentration="0"/></listOfSpecies>
+<listOfParameters><parameter id="k" value="1"/></listOfParameters>
+<listOfReactions><reaction id="R" reversible="false">
+<listOfReactants><speciesReference species="S"/></listOfReactants>
+<listOfProducts><speciesReference species="P"><stoichiometryMath>
+<math xmlns="{_M}">{body}</math></stoichiometryMath></speciesReference></listOfProducts>
+<kineticLaw><math xmlns="{_M}"><ci>k</ci></math></kineticLaw></reaction></listOfReactions>
+</model></sbml>"""
+    with pytest.raises(ModelError, match="stoichiometryMath for 'P' in reaction 'R'"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_species_reading_a_failed_rule_is_evaluated_not_refused():
+    y = '<parameter id="Y" value="5" constant="false"/>'
+    m = bngsim.Model.from_sbml_string(
+        _doc(y, _ia("S", _plus_one("Y")), species=_S, rules=_ar("Y", _INF))
+    )
+    assert m._core.get_concentration("S") == math.inf
+
+
+def test_a_species_reading_an_undecidable_rule_is_evaluated_not_refused():
+    y = '<parameter id="Y" value="7" constant="false"/>'
+    m = bngsim.Model.from_sbml_string(
+        _doc(y, _ia("S", "<ci>Y</ci>"), species=_S, rules=_ar("Y", _PW))
+    )
+    assert m._core.get_concentration("S") == 1.0
