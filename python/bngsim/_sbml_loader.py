@@ -4807,8 +4807,7 @@ def _build_model_from_sbml_doc(doc):
         if math.getNumChildren() == 0 and math.getType() == libsbml.AST_NAME:
             ref = math.getName()
             if ref in _ic_const_ar:
-                # A rule owns the named slot, so linking the IC to it registers
-                # nothing (`add_species_param_ref` drops a non-parameter name).
+                # A rule owns the named slot, so the IC is not linked to it.
                 # Its constant expansion is a parameter expression, though.
                 ia_param_expr[sym] = _ic_const_ar[ref]
             elif ref in _param_ids:

@@ -200,6 +200,35 @@ class TestRateRulePromotedParameter:
         np.testing.assert_allclose(s[:, 0, 0], 0.1 * np.exp(-0.5 * t), rtol=1e-7, atol=1e-9)
         np.testing.assert_allclose(s[:, 0, 1], 3.0 * np.exp(-0.5 * t), rtol=1e-7, atol=1e-9)
 
+    def test_ic_naming_the_promoted_symbol_links_nothing(self):
+        """``Y(0) = X`` names a parameter this loader turned into a species, so
+        there is no builder parameter to link to. The builder refuses such a
+        reference since issue #863 (it used to drop it), so the loader must
+        leave it out rather than fail the load."""
+        sbml = (
+            SBML_IA_PROMOTED_PARAM.replace(
+                '<parameter id="X" constant="false"/>',
+                '<parameter id="X" constant="false"/>\n      <parameter id="Y" constant="false"/>',
+            )
+            .replace(
+                "</listOfInitialAssignments>",
+                '  <initialAssignment symbol="Y">\n'
+                '        <math xmlns="http://www.w3.org/1998/Math/MathML"><ci>X</ci></math>\n'
+                "      </initialAssignment>\n    </listOfInitialAssignments>",
+            )
+            .replace(
+                "</listOfRules>",
+                '  <rateRule variable="Y">\n'
+                '        <math xmlns="http://www.w3.org/1998/Math/MathML"><cn>0</cn></math>\n'
+                "      </rateRule>\n    </listOfRules>",
+            )
+        )
+        m = bngsim.Model.from_sbml_string(sbml)
+        core = m._core
+        names, params = list(core.species_names), list(core.param_names)
+        assert [(names[s], params[p]) for s, p in core.species_ic_param_refs] == [("X", "X0")]
+        assert core.get_concentration("Y") == pytest.approx(0.1)
+
 
 class TestNotLowered:
     """What must NOT be lowered. A wrong initial condition is far worse than a

@@ -103,19 +103,19 @@ class TestRateLawResolution:
             b.build()
 
 
-def _a_to_b(rate_type, rate_law, ic_ref=None):
+def _a_to_b(rate_type, rate_law, ic_ref=None, apply_species_factor=True, a_seed=100.0):
     """A -> B at k = 2 from A(0) = 100, so dA/dt = -200 at the initial state."""
     from bngsim._model import Model
 
     b = _builder()
     b.add_parameter("k", 2.0, "2.0", False)
     b.add_parameter("A0", 100.0, "100", False)
-    b.add_species("A()", 100.0, False)
+    b.add_species("A()", a_seed, False)
     b.add_species("B()", 0.0, False)
     if ic_ref is not None:
         b.add_species_param_ref(*ic_ref)
     b.add_observable("Atot", [(0, 1.0)])
-    b.add_reaction([0], [1], rate_type, rate_law, 1.0)
+    b.add_reaction([0], [1], rate_type, rate_law, 1.0, apply_species_factor)
     return Model(_core=b.build())
 
 
@@ -137,13 +137,34 @@ class TestFunctionalNamingParameter:
         m.set_param("k", 3.0)
         assert m.rhs([100.0, 0.0])[0] == pytest.approx(-300.0)
 
+    def test_generated_rhs_agrees(self):
+        import bngsim
+        import numpy as np
+
+        finals = []
+        for codegen in (False, True):
+            sim = bngsim.Simulator(_a_to_b("functional", "k"), method="ode", codegen=codegen)
+            finals.append(np.asarray(sim.run(t_span=(0, 0.1), n_points=2).species)[-1, 0])
+        assert finals == pytest.approx([100.0 * np.exp(-0.2)] * 2, rel=1e-6)
+
+    @pytest.mark.parametrize("rate_type", ["elementary", "functional"])
+    def test_parameter_rate_without_species_factor_refused(self, rate_type):
+        # The interpreted kernel read this as dA/dt = -k, while the generated
+        # RHS and the analytical Jacobian applied the reactant factor, -k*A.
+        with pytest.raises(
+            RuntimeError, match="takes its rate from parameter 'k' with apply_species_factor=false"
+        ):
+            _a_to_b(rate_type, "k", apply_species_factor=False)
+
 
 class TestSpeciesICReference:
     """A species IC reference must name a declared parameter and species (issue #863)."""
 
     def test_declared_reference_is_kept(self):
-        m = _a_to_b("elementary", "k", ic_ref=(0, "A0"))
+        m = _a_to_b("elementary", "k", ic_ref=(0, "A0"), a_seed=0.0)
         assert list(m._core.species_ic_param_refs) == [(0, 1)]
+        # The IC comes from A0, not the number add_species was given.
+        assert m.rhs(m._core.get_state())[0] == pytest.approx(-200.0)
 
     def test_undeclared_parameter(self):
         # Was dropped: the species kept add_species' number and no reference.

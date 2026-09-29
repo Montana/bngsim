@@ -1540,6 +1540,23 @@ NetworkModel ModelBuilder::build() {
                                              "parameters (expected 'kcat_name,km_name')");
                 }
             }
+
+            // A rate that names a parameter and no function resolves as
+            // Elementary (step 5), and only the interpreted kernel honours
+            // apply_species_factor=false there: the generated RHS and the
+            // analytical Jacobian multiply a parameter rate by the reactant
+            // factor unconditionally, so the backends would disagree
+            // (issue #863). No loader emits this; a kinetic law that carries
+            // its own reactant factor goes through a function.
+            if (!rxn.apply_species_factor && rxn.rate_law_type != RateLawType::MichaelisMenten &&
+                b.param_name_to_idx.count(rxn.function_name) &&
+                !b.function_name_to_idx.count(rxn.function_name)) {
+                throw std::runtime_error(
+                    "ModelBuilder::validate: reaction " + std::to_string(ri) +
+                    " takes its rate from parameter '" + rxn.function_name +
+                    "' with apply_species_factor=false; a parameter rate is mass action, so "
+                    "pass the whole rate law as a function instead");
+            }
         }
 
         // 0d. Species IC references resolve. build() cannot place a reference
@@ -2104,8 +2121,9 @@ NetworkModel ModelBuilder::build() {
     // A name that is a function makes the reaction Functional whatever its
     // declared type; a Functional reaction naming only a parameter is the
     // mirror case and resolves as Elementary, which the kernel evaluates the
-    // same way. Left Functional, its rate index stays unresolved and step 8a
-    // refuses it (issue #863).
+    // same way (validation refused it with apply_species_factor=false). Left
+    // Functional, its rate index stays unresolved and step 8a refuses it
+    // (issue #863).
     for (auto &rxn : sd->reactions) {
         if (!rxn.function_name.empty()) {
             if (sd->function_name_to_idx.count(rxn.function_name)) {
