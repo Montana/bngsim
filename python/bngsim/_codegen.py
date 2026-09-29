@@ -5359,8 +5359,8 @@ def _c_engine_call(name: str, args: list[str]) -> str | None:
 
 
 def _replace_engine_calls(expr: str) -> str:
-    """Rewrite every ``sign``/``sgn``/``rint``/``clamp``/``avg``/``sum`` call to C, and
-    fold an n-ary ``max``/``min`` into nested binary calls (GH #556).
+    """Rewrite every ``sign``/``sgn``/``rint``/``clamp``/``avg``/``sum``/``mod`` call to
+    C, and fold an n-ary ``max``/``min`` into nested binary calls (GH #556).
 
     Runs after ``_replace_if_calls`` and before identifier substitution, in both
     translation pipelines, so the arguments are still the model's own text and

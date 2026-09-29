@@ -44,6 +44,7 @@ from typing import NamedTuple
 from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _DERIVED_BARE_NAME,
+    _ORDERING_OPS,
     _derived_expr_partials_numeric,
     _find_close_paren_strict,
     _inline_derived_param_refs,
@@ -2162,9 +2163,9 @@ def time_discontinuity_conditions(core, ctx=None) -> tuple[str, ...]:
     return tuple(found)
 
 
-# Resolved schedule edge lists, keyed the same way :data:`_CROSSING_CACHE` is:
-# on the condition text, the run window, and the value of every parameter the
-# condition reads once derived names are inlined. Recognizing a schedule and
+# Resolved schedule and step-edge lists, keyed by :func:`_stop_memo_key`: the
+# condition text with derived names inlined, the run window, and the value of
+# every parameter that text reads. Recognizing a schedule and
 # then checking it against the model's own residual is seven sympy round trips,
 # which is 7 ms on a model spelling 38 conditions and is paid on every ``run()``
 # — so a fit paid it on every evaluation. Everything a schedule's answer depends
@@ -2282,15 +2283,6 @@ def _resolve_schedule_stop_times(
     return [value for value, _partials in edges]
 
 
-# The orderings a stop is placed on, as the truth of ``lhs - rhs`` against 0.
-_RESIDUAL_TRUTH = {
-    "<": lambda r: r < 0.0,
-    "<=": lambda r: r <= 0.0,
-    ">": lambda r: r > 0.0,
-    ">=": lambda r: r >= 0.0,
-}
-
-
 def _step_edge_stop_times(
     cond: str, scope: SwitchConditionScope, t_start: float, t_end: float
 ) -> list[float] | None:
@@ -2342,12 +2334,13 @@ def _resolve_step_edge_stop_times(
     split = _relational_split_op(atom)
     if split is not None:
         lhs, op, rhs = split
-        truth = _RESIDUAL_TRUTH.get(op)
-        if truth is None:
+        # The truth of the comparison, read off the sign of ``lhs - rhs``.
+        compare = _ORDERING_OPS.get(op)
+        if compare is None:
             return None  # an equality; see _switches_on_clock_alone
         text = f"({lhs})-({rhs})"
     else:
-        truth = None
+        compare = None
         text = atom
     text = _inline_derived_param_refs(text, scope.derived_exprs) or text
     for sym in sorted(_TIME_SYMBOLS, key=len, reverse=True):
@@ -2462,7 +2455,7 @@ def _resolve_step_edge_stop_times(
     if edges[-1:] != [t_end]:
         bounds.append(t_end)
     out: list[float] = []
-    before: float | None = None  # the value just before the current edge
+    before: float | None = None  # the limit just before the current edge
     for i in range(len(bounds) - 1):
         lo, hi = bounds[i], bounds[i + 1]
         if hi <= lo:
@@ -2471,11 +2464,24 @@ def _resolve_step_edge_stop_times(
         at_lo, at_hi = a * lo + b, a * hi + b
         if not (math.isfinite(at_lo) and math.isfinite(at_hi)):
             return None
+        if compare is not None:
+            # A comparison is judged on its one-sided limits inside the piece,
+            # not on its value at a bound. A residual that is exactly 0 at an
+            # edge holds that value for one instant, and the side it is on is
+            # the side its slope comes from: `mod(time(), 24) < 24` reaches 0
+            # only at each jump and is true everywhere else, so nothing changes.
+            if at_lo == 0.0:
+                at_lo = a
+            if at_hi == 0.0:
+                at_hi = -a
         if before is not None:
-            changed = truth(before) != truth(at_lo) if truth else before != at_lo
+            if compare is not None:
+                changed = compare(before, 0.0) != compare(at_lo, 0.0)
+            else:
+                changed = before != at_lo
             if changed:
                 out.append(lo)
-        if truth is not None and a != 0.0 and truth(at_lo) != truth(at_hi):
+        if compare is not None and a != 0.0 and compare(at_lo, 0.0) != compare(at_hi, 0.0):
             root = -b / a
             if lo < root <= hi:
                 out.append(root)
@@ -2484,22 +2490,21 @@ def _resolve_step_edge_stop_times(
 
 
 def _stop_memo_key(atom: str, scope: SwitchConditionScope, t_start: float, t_end: float):
-    """The memo key the stop resolvers share: the text, the run window, and
-    the value of every parameter the text reads once derived names are inlined."""
-    read = sorted(
-        {
-            m.group(0)
-            for m in _IDENTIFIER.finditer(
-                _inline_derived_param_refs(atom, scope.derived_exprs) or atom
-            )
-            if m.group(0) in scope.param_idx
-        }
-    )
+    """The memo key the stop resolvers share: the text with derived names
+    inlined, the run window, and the value of every parameter that text reads,
+    with whether it is a run constant.
+
+    The inlined text, not the atom as written. The cache outlives a model, and
+    two models can spell one atom over a derived name defined differently in
+    each (``onset = t0 + 1`` in one, ``t0 * 5`` in the other), which read the
+    same leaf values and still have different edges."""
+    flat = _inline_derived_param_refs(atom, scope.derived_exprs) or atom
+    read = sorted({m.group(0) for m in _IDENTIFIER.finditer(flat)} & scope.param_idx.keys())
     return (
-        atom,
+        flat,
         t_start,
         t_end,
-        tuple((n, scope.values[scope.param_idx[n]]) for n in read),
+        tuple((n, scope.values[scope.param_idx[n]], n in scope.run_constants) for n in read),
     )
 
 
@@ -2625,7 +2630,7 @@ def fixed_crossing_stops(core, t_start: float, t_end: float, conditions=()) -> l
     ctx = core.functional_jacobian_context()
     scope = switch_condition_scope(core, ctx)
     aliases = _time_alias_bodies(ctx)
-    out: list[CrossingStop] = []
+    found: list[CrossingStop] = []
     for cond in conditions:
         rewrite = _rewrite_counter_clock(core, cond, scope, t_start)
         if rewrite is None:
@@ -2646,22 +2651,25 @@ def fixed_crossing_stops(core, t_start: float, t_end: float, conditions=()) -> l
             # rewrite rather than off the recognized threshold text is what keeps
             # the two in step whichever resolver placed the stop, and for a
             # schedule there is no single threshold text to read.
-            stop = CrossingStop(t_cross, clock_idx, t_cross + offset if clock_idx >= 0 else 0.0)
-            near = [
-                i
-                for i, seen in enumerate(out)
-                if abs(t_cross - seen.time) <= 1e-12 * max(abs(t_cross), 1.0)
-            ]
-            if not near:
-                out.append(stop)
-            elif clock_idx >= 0 and out[near[0]].clock_species_idx < 0:
-                # Two conditions crossing at one instant, one on a counter and
-                # one on literal time. Keep the counter record: it does
-                # everything the plain one does and also lands the counter on
-                # its threshold, which the plain one would leave a couple of ulp
-                # short and the counter's own condition reading false.
-                out[near[0]] = stop
-    out.sort()
+            found.append(
+                CrossingStop(t_cross, clock_idx, t_cross + offset if clock_idx >= 0 else 0.0)
+            )
+    # Merge the stops that land on one instant. In time order each needs only
+    # the last one kept: comparing each against every one kept was quadratic,
+    # and a step of time can put thousands of stops in a window (issue #869).
+    # The sort is stable, so among equal times the first condition's stop wins.
+    found.sort(key=lambda stop: stop.time)
+    out: list[CrossingStop] = []
+    for stop in found:
+        if not out or abs(stop.time - out[-1].time) > 1e-12 * max(abs(stop.time), 1.0):
+            out.append(stop)
+        elif stop.clock_species_idx >= 0 and out[-1].clock_species_idx < 0:
+            # Two conditions crossing at one instant, one on a counter and
+            # one on literal time. Keep the counter record: it does
+            # everything the plain one does and also lands the counter on
+            # its threshold, which the plain one would leave a couple of ulp
+            # short and the counter's own condition reading false.
+            out[-1] = stop
     return out
 
 
