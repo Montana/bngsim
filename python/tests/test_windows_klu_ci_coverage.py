@@ -79,6 +79,12 @@ REQUIRED_SOURCE_TRIGGERS = (
 #: blind, not the check failing.
 KNOWN_GATED = frozenset({"test_codegen_jacobian_sparse.py", "test_steady_state_linear_solver.py"})
 
+#: Known KLU-gated files the BLAS exemption below takes out of the required
+#: list. Guards the exemption the other way: a scanner that stopped recognising
+#: the BLAS gate would put them back, which fails loudly; one that matched too
+#: much would take out a file this leg should run, which only this catches.
+KNOWN_BLAS_EXEMPT = frozenset({"test_lu_fill_routing.py"})
+
 pytestmark = pytest.mark.skipif(not WORKFLOW.exists(), reason=".github/ not in this checkout")
 
 
@@ -146,12 +152,35 @@ def _every_test_is_klu_gated(tree: ast.Module, gates: set[str]) -> bool:
     )
 
 
+def _module_needs_blas(tree: ast.Module) -> bool:
+    """``pytestmark`` also skips the module without the GH #84 BLAS dense factor.
+
+    No Windows leg links one — the Windows wheels report ``HAS_LAPACK_DENSE``
+    False (docs/installation.md), and this leg installs no LAPACK — so such a
+    file skips in full here, where the summary must show 0 skipped. Its home is
+    the ``python-tests.yml`` legs that assert a backend (macOS Accelerate, the
+    ubuntu ``liblapack-dev`` leg), which run every file.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            text = ast.unparse(node.value)
+            if "pytestmark" in targets and re.search(
+                r"skipif\(\s*not [\w.]*HAS_LAPACK_DENSE", text
+            ):
+                return True
+    return False
+
+
 def entirely_klu_gated() -> set[str]:
-    """Test files in which nothing can run without a KLU build."""
+    """Test files in which nothing can run without a KLU build, and which this
+    leg can run (not also gated on a BLAS dense factor it does not have)."""
     gated = set()
     for path in sorted(TESTS_DIR.glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         gates = _klu_gate_names(tree)
+        if _module_needs_blas(tree):
+            continue
         if _module_is_klu_gated(tree, gates) or _every_test_is_klu_gated(tree, gates):
             gated.add(path.name)
     return gated
@@ -180,6 +209,20 @@ class TestTheLegRunsEveryFileThatNeedsIt:
             "the file grew a case that runs without KLU (fine -- update KNOWN_GATED) "
             "or the scanner went blind (not fine)."
         )
+
+    def test_the_blas_exemption_takes_out_only_what_needs_blas(self):
+        exempt = {
+            path.name
+            for path in TESTS_DIR.glob("test_*.py")
+            if _module_needs_blas(ast.parse(path.read_text(encoding="utf-8")))
+        }
+        assert exempt >= KNOWN_BLAS_EXEMPT, (
+            f"{sorted(KNOWN_BLAS_EXEMPT - exempt)} no longer scan as needing a BLAS "
+            "dense factor; _module_needs_blas went blind or the file changed its gate."
+        )
+        for name in exempt:
+            text = (TESTS_DIR / name).read_text(encoding="utf-8")
+            assert "HAS_LAPACK_DENSE" in text, name
 
     def test_every_entirely_klu_gated_file_is_executed(self):
         """The regression itself, in the form it would come back.

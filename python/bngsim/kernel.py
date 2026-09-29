@@ -146,7 +146,7 @@ class ReactionKernel:
         """
         return self._sim.get_state()
 
-    def set_state(self, state: NDArray[np.float64]) -> None:
+    def set_state(self, state: NDArray[np.float64], *, time: float | None = None) -> None:
         """Bulk-assign the live species-concentration vector (GH #102).
 
         Parameters
@@ -156,8 +156,25 @@ class ReactionKernel:
             :attr:`state_names`. Copied into the model's live concentrations;
             the next :meth:`advance` reads them as its initial condition. The
             ``set`` half of the per-step kernel exchange.
+        time : float, optional
+            Also set :attr:`time` to this value (``Simulator.set_time``). With
+            a state saved by :meth:`get_state` and its :attr:`time`, this redoes
+            a step — the rollback a predictor-corrector coupling loop needs,
+            and the only way to get it right when the model reads the clock
+            (a time-indexed table function, ``time()`` in a rate law):
+
+            >>> saved, t0 = kernel.get_state(), kernel.time
+            >>> kernel.advance(dt)                    # predictor
+            >>> kernel.set_state(corrected, time=t0)  # roll back, correct
+            >>> kernel.advance(dt)                    # corrector
+
+        Raises
+        ------
+        ValueError
+            If ``state`` has the wrong length or ``time`` is not finite; the
+            call then changes neither the state nor the clock.
         """
-        self._sim.set_state(state)
+        self._sim.set_state(state, time=time)
         # The injected state invalidates any cached t=0 observables.
         self._initial_observables = None
 
@@ -231,7 +248,7 @@ class ReactionKernel:
         scratch. Clears any cached step result.
         """
         self._sim.model.reset()
-        self._sim._current_time = 0.0
+        self._sim.set_time(0.0)
         self._last_result = None
         self._initial_observables = None
 

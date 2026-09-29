@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "bngsim/lapack_dense_linsol.hpp"
 #include "bngsim/types.hpp"
 
 #include <algorithm>
@@ -43,9 +44,81 @@ namespace bngsim {
 //
 // The choice of dense backend once this says "dense" (built-in dense LU vs the
 // GH #84 BLAS dgetrf solver) is a separate question, answered by
-// should_use_lapack_dense() in bngsim/lapack_dense_linsol.hpp.
+// should_use_lapack_dense() in bngsim/lapack_dense_linsol.hpp — except for a
+// model the LU-fill test below moved off KLU, which always takes the BLAS
+// factor (make_fill_routed_dense_linear_solver).
 inline constexpr int SPARSE_THRESHOLD = 50;
 inline constexpr double SPARSE_DENSITY_MAX = 0.10; // 10%
+
+// ── LU fill: a sparse Jacobian whose factor is not ───────────────────────────
+//
+// SPARSE_DENSITY_MAX tests the Jacobian, but KLU factors I - gamma*J, and what
+// it costs is the density of the *factor*. On the rule-derived networks of
+// benchmarks/_dev/suite_ode.json with 354-3,744 species the Jacobian is 1-7%
+// dense while its LU fills to at least 20-35% of n^2 (hub species — a free
+// enzyme, an adaptor, a ligand — couple to most complexes). KLU is left-looking with no
+// BLAS, so on those models it spends >90% of a run in klu_l_refactor, and the
+// BLAS dense factor (GH #84) is 3.6-10x faster end to end; a genuinely sparse
+// network (metapop_sir_100, fill 2%) keeps KLU 6x ahead. See
+// benchmarks/_dev/bench_linear_solver_fill.py for the sweep.
+//
+// So a model the size/density test sends to KLU goes dense instead when all of:
+//   * a BLAS dense factor is linked (the built-in unblocked LU is not reliably
+//     faster than KLU even at this fill — multisite_phos 2.4x slower);
+//   * LU_FILL_DENSE_MIN_N <= n <= LU_FILL_DENSE_MAX_N (below, KLU and the dense
+//     factor tie: SHP2_base_model, 149 species, 26% fill; above, two dense n^2
+//     copies stop being a reasonable amount of memory — 400 MB at the cap);
+//   * the analytical Jacobian is complete and requested (auto / analytical):
+//     the dense route's only other Jacobian is CVODE's difference quotient, n
+//     RHS evaluations, where the sparse route colors its differences;
+//   * KLU's symbolic analysis estimates fill >= LU_FILL_DENSE_MIN (an AMD
+//     estimate, low on these nets — compute_lu_fill_estimate, model_builder.cpp).
+// Neither force flag is overridden: force_sparse_linear_solver keeps KLU, and
+// is the escape hatch for a model this rule misjudges.
+inline constexpr double LU_FILL_DENSE_MIN = 0.10;
+inline constexpr int LU_FILL_DENSE_MIN_N = 256;
+inline constexpr int LU_FILL_DENSE_MAX_N = 5000;
+
+// Can the fill test change this model's route? True only for a model the size
+// and density test would send to KLU, in the size window above, on a build with
+// both KLU and a BLAS dense factor. Callers use it to skip the fill estimate —
+// a KLU symbolic analysis — for every model it cannot affect.
+inline bool lu_fill_matters(const JacobianSparsity &sp, int ns) {
+#ifdef BNGSIM_HAS_KLU
+    return lapack_dense_available() && !sp.empty() && ns >= SPARSE_THRESHOLD &&
+           sp.density < SPARSE_DENSITY_MAX && ns >= LU_FILL_DENSE_MIN_N &&
+           ns <= LU_FILL_DENSE_MAX_N;
+#else
+    (void)sp;
+    (void)ns;
+    return false;
+#endif
+}
+
+// The fill estimate a routing decision needs, or -1 when the fill test does not
+// apply: outside lu_fill_matters, or without a complete analytical Jacobian the
+// requested strategy will use. `Model` is NetworkModel (a template only so this
+// header need not include model.hpp); estimated_lu_fill() is computed once per
+// model and shared across clones.
+template <class Model>
+double routing_lu_fill(const Model &model, int ns, const std::string &jacobian_strategy) {
+    const auto &sp = model.jacobian_sparsity();
+    if (!lu_fill_matters(sp, ns))
+        return -1.0;
+    if (!(jacobian_strategy == "auto" || jacobian_strategy == "analytical") ||
+        !model.analytical_jacobian_complete())
+        return -1.0;
+    return model.estimated_lu_fill();
+}
+
+// Does the fill test send this model to the dense BLAS factor instead of KLU?
+// `lu_fill` is routing_lu_fill()'s answer; -1 (not applicable) never does.
+inline bool fill_routes_to_dense(const JacobianSparsity &sp, int ns, double lu_fill,
+                                 const std::string &jacobian_strategy, bool force_dense,
+                                 bool force_sparse) {
+    return !force_dense && !force_sparse && jacobian_strategy != "jax" &&
+           lu_fill >= LU_FILL_DENSE_MIN && lu_fill_matters(sp, ns);
+}
 
 // Should this model's Newton matrix be a CSC SUNSparseMatrix factored by KLU?
 //
@@ -63,21 +136,28 @@ inline constexpr double SPARSE_DENSITY_MAX = 0.10; // 10%
 // only as a belt-and-braces default.
 //
 // `jacobian_strategy` is SolverOptions::jacobian / SteadyStateOptions::jacobian.
-// Only "jax" changes the routing: "fd" stays sparse and takes the colored
-// difference quotient below, exactly as it does on the time-course path.
+// "jax" forces dense; "fd" stays sparse and takes the colored difference
+// quotient below, exactly as it does on the time-course path (routing_lu_fill
+// returns -1 for it, so the fill test never moves an "fd" model).
+//
+// `lu_fill` is routing_lu_fill(model, ns, jacobian_strategy): a model the size
+// and density test sends to KLU goes dense when fill_routes_to_dense says so.
 inline bool route_to_sparse_linear_solver(const JacobianSparsity &sp, int ns,
                                           const std::string &jacobian_strategy, bool force_dense,
-                                          bool force_sparse) {
+                                          bool force_sparse, double lu_fill) {
 #ifdef BNGSIM_HAS_KLU
     const bool sparse_ok = (jacobian_strategy != "jax") && !sp.empty();
     return sparse_ok && !force_dense &&
-           (force_sparse || ((ns >= SPARSE_THRESHOLD) && (sp.density < SPARSE_DENSITY_MAX)));
+           (force_sparse ||
+            ((ns >= SPARSE_THRESHOLD) && (sp.density < SPARSE_DENSITY_MAX) &&
+             !fill_routes_to_dense(sp, ns, lu_fill, jacobian_strategy, force_dense, force_sparse)));
 #else
     (void)sp;
     (void)ns;
     (void)jacobian_strategy;
     (void)force_dense;
     (void)force_sparse;
+    (void)lu_fill;
     return false;
 #endif
 }

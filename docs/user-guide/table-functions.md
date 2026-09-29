@@ -124,6 +124,21 @@ Multiple `tfun(...)` calls per function body work, each getting its own
 synthetic name and `tf_id`. That is a strict extension of BioNetGen's own
 parser, which stores only one `tfunData` per expression.
 
+## Table functions and the Jacobian
+
+A table indexed by `time` or by a parameter does not depend on the state, so a
+rate law that reads one keeps the analytical Jacobian: the table's current value
+enters `∂f/∂y` as a coefficient, the way `time()` does, and is never itself
+differentiated. `sim.jacobian_strategy` reports `"analytical"` for such a model.
+
+- With codegen, the compiled Jacobian reads a table that is a whole function
+  body (`f() tfun(...)`) from the value the function recomputation already
+  holds. A table embedded in arithmetic (`f() 2*tfun(...)`) leaves the compiled
+  Jacobian to the interpreted analytical one, which is equally exact.
+- A table indexed by an **observable** depends on the state through its index,
+  and a rate law that reads one uses the finite-difference Jacobian.
+- Sensitivities treat a parameter-indexed table as depending on its parameter.
+
 ## How it works
 
 BNGsim parses `tfun()` syntax directly in `net_file_loader.cpp`. No change to

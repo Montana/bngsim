@@ -16,6 +16,7 @@
 #include <bngsim/cc_jit.hpp>
 #include <bngsim/function_columns.hpp>
 #include <bngsim/mir_jit.hpp>
+#include <bngsim/sparse_jacobian.hpp>
 #include <bngsim/steady_state.hpp>
 #include <bngsim/wallclock.hpp>
 
@@ -334,6 +335,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                        &bngsim::SolverOptions::force_dense_linear_solver)
         .def_readwrite("force_sparse_linear_solver",
                        &bngsim::SolverOptions::force_sparse_linear_solver)
+        .def_readwrite("continues_trajectory", &bngsim::SolverOptions::continues_trajectory)
         .def_readwrite("codegen_so_path", &bngsim::SolverOptions::codegen_so_path)
         .def_readwrite("codegen_c_source", &bngsim::SolverOptions::codegen_c_source)
         .def_readwrite("timeout_seconds", &bngsim::SolverOptions::timeout_seconds)
@@ -1619,6 +1621,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 out["n"] = sp.n;
                 out["nnz"] = sp.nnz;
                 out["density"] = sp.density;
+                out["lu_fill_estimate"] = self.estimated_lu_fill();
                 out["col_ptrs"] = py::array_t<int64_t>(static_cast<py::ssize_t>(sp.col_ptrs.size()),
                                                        sp.col_ptrs.data());
                 out["row_indices"] = py::array_t<int64_t>(
@@ -1627,7 +1630,9 @@ PYBIND11_MODULE(_bngsim_core, m) {
             },
             "The structural Jacobian sparsity pattern in CSC form: n, nnz, density, "
             "col_ptrs (n+1, int64) and row_indices (nnz, int64), copied. Conservative "
-            "for a model with Functional rate laws. Issue #523.")
+            "for a model with Functional rate laws. Issue #523. Also lu_fill_estimate: "
+            "nnz(L+U)/n^2 KLU's symbolic analysis predicts for the Newton matrix, which "
+            "the linear-solver routing consults (-1 on a build without KLU).")
         .def(
             "compute_propensity",
             [](bngsim::NetworkModel &self, int rxn_index,
@@ -1724,6 +1729,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
 #else
                 out["has_klu"] = false;
 #endif
+                // The route the solver takes with default options — the shared rule,
+                // LU-fill test included — so the emitter builds the Jacobian shape
+                // that will be factored rather than re-deriving the rule.
+                out["routes_sparse"] = bngsim::route_to_sparse_linear_solver(
+                    sp, ns, "auto", false, false, bngsim::routing_lu_fill(self, ns, "auto"));
                 py::list elem, mm, fixed_rows;
                 if (avail) {
                     const auto &ajd = self.analytical_jacobian();

@@ -329,6 +329,56 @@ unsupported: selecting one raises an error naming the budget and this variable,
 the same way selecting a function containing a non-differentiable construct does.
 Observable and species sensitivities are unaffected.
 
+## Linear solver
+
+Each Newton iteration solves a linear system in `I - γJ`, and how that matrix is
+factored is chosen per model, separately from how `J` is computed.
+`result.solver_stats["linear_solver"]` reports the choice: `0` for the built-in
+dense LU, `1` for sparse KLU, `2` for the BLAS dense factor.
+
+| Route | When (default options) |
+|---|---|
+| KLU (sparse) | at least 50 species, a Jacobian under 10% dense, and an LU factor that stays sparse (below) |
+| BLAS dense factor | a model KLU would take whose LU factor fills in, on a build with BLAS |
+| built-in dense LU | everything else |
+
+**The LU-fill test.** A sparse Jacobian does not mean a sparse factor. On
+rule-derived networks a few hub species (a free enzyme, an adaptor, a ligand)
+couple to most complexes, and the LU of a Jacobian that is 1–7% dense fills
+20–35% of `n²` or more. KLU has no BLAS, so there it spends most of a run
+refactoring, and the BLAS dense factor is several times faster. A model of
+256–5,000 species whose estimated fill is at least 10% therefore goes dense,
+when all of these hold:
+
+- the build links a BLAS dense factor (`bngsim.HAS_LAPACK_DENSE`: the macOS
+  wheels, and source builds that find a LAPACK);
+- the analytical Jacobian is in use (`jacobian="auto"` or `"analytical"`, and
+  `sim.jacobian_strategy == "analytical"`). With `"fd"` the dense route would
+  difference every column, where KLU colors its differences, so KLU stays.
+
+| model (species, Jacobian density, LU fill) | KLU | BLAS dense |
+|---|---|---|
+| `fceri_ji` (354, 6.8%, 0.35) | 0.111 s | **0.025 s** |
+| `multisite_phos` (1026, 1.2%, 0.21) | 2.37 s | **0.66 s** |
+| `fceri_gamma` (3744, 0.9%, 0.30) | 47.4 s | **4.68 s** |
+| `metapop_sir_100` (300, 1%, 0.02) | **0.025 s** | 0.159 s — stays KLU |
+
+`sim.model._core.jacobian_sparsity["lu_fill_estimate"]` reports the estimate,
+which comes from KLU's own symbolic analysis. `force_sparse_linear_solver=True`
+keeps a model on KLU whatever its fill, and `force_dense_linear_solver=True`
+takes the built-in dense LU (or, with `BNGSIM_LAPACK_DENSE=1`, the adaptive BLAS
+solver below). The route changes the cost, not the answer: trajectories agree to
+solver tolerance. `steady_state()` routes its march by the same rule and reports
+it as `"lapack-dense"`.
+
+**The opt-in BLAS solver (`BNGSIM_LAPACK_DENSE=1`).** Every other dense model
+stays on the built-in LU unless this variable is set. The solver it enables
+starts on the built-in factor and switches to BLAS after five factorizations, so
+a short run pays no BLAS overhead. That count belongs to an *integration*: the
+steps of a coupling loop (`run_until`, `ReactionKernel.advance`) continue it, and
+an independent `run()` restarts it. `solver_stats["n_dense_blas_factorizations"]`
+counts the run's own BLAS factorizations.
+
 ## When a solve fails on a rate law's domain
 
 bngsim evaluates a rate law literally. A logarithm, a `sqrt` or a fractional

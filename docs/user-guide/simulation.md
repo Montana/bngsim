@@ -79,6 +79,37 @@ sim.run_until(t=200)
 sim.restore(snap)  # back to t=50
 ```
 
+### Rolling a step back
+
+`restore` rebuilds the backend, which is the right cost for an occasional
+checkpoint and the wrong one inside a loop. A predictor-corrector coupling loop
+redoes *every* step: advance, correct the coupling input, advance the same
+interval again from the saved point. `set_state(state, time=t)` moves the state
+and the clock together and keeps the warm ODE solver:
+
+```python
+saved, t0 = sim.get_state().copy(), sim.current_time
+sim.run_until(t0 + dt)                   # predictor
+corrected = saved.copy()
+corrected[idx] = coupling_value          # e.g. from the other half of the split
+sim.set_state(corrected, time=t0)        # back to t0, with the correction
+sim.run_until(t0 + dt)                   # corrector, over the same interval
+```
+
+The clock matters whenever the model reads it — a time-indexed table function,
+`time()` in a rate law or function. Rolling back the state alone leaves
+`current_time` a step ahead, and the redone step then sees its forcing at the
+wrong times. `sim.set_time(t)` sets the clock on its own. Both calls validate
+before they assign: a non-finite time raises `ValueError`, and a rejected call
+changes neither the state nor the clock.
+
+`ReactionKernel.set_state(state, time=t)` does the same for a kernel.
+
+A `run_until` step continues the trajectory the previous one ended, which the
+ODE solver uses to keep its linear-solver state across the steps of a loop (see
+[Linear solver](solvers.md#linear-solver)). An independent `run()` starts
+afresh.
+
 ## Species manipulation
 
 ```python

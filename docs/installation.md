@@ -228,11 +228,15 @@ it, not fixed at import (which also keeps `import bngsim` from ever pulling in
 `bionetgen`), and it tracks an environment variable you export at runtime.
 
 `HAS_LAPACK_DENSE` is the one flag that is `True` on the macOS wheels
-(Accelerate) and `False` on the manylinux and Windows ones. Nothing is missing
-when it is `False`: dense factorizations use the built-in LU, which is the
-default everywhere — the BLAS path is opt-in via `BNGSIM_LAPACK_DENSE=1` and
-gives the same trajectory. The flag answers whether setting that variable will
-do anything on this install. A source build picks the backend up from a system
+(Accelerate) and `False` on the manylinux and Windows ones. When it is `False`,
+every result is the same and some are slower. A large rule-derived network whose
+LU factor fills in (see [Linear solver](user-guide/solvers.md#linear-solver))
+stays on KLU instead of the BLAS dense factor, typically 4-10x slower on
+networks of a few hundred to a few thousand species. Other dense factorizations
+use the built-in LU on every install; the BLAS path for them is opt-in via
+`BNGSIM_LAPACK_DENSE=1` and gives the same trajectory. So the flag answers
+both whether that variable does anything and whether the fill routing is
+available. A source build picks the backend up from a system
 LAPACK (`apt-get install liblapack-dev`, `dnf install lapack-devel`, or a
 conda-forge `openblas`) with no other configuration.
 

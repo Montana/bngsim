@@ -21,6 +21,7 @@ import contextlib
 import copy
 import ctypes
 import logging
+import math
 import os
 import threading
 import time
@@ -359,6 +360,14 @@ def _log_auto_codegen_skip(key: tuple) -> None:
     )
 
 
+def _finite_time(t: float) -> float:
+    """``t`` as a float, for :meth:`Simulator.set_time`; ``ValueError`` unless finite."""
+    t = float(t)
+    if not math.isfinite(t):
+        raise ValueError(f"time must be finite, got {t}")
+    return t
+
+
 class Simulator:
     """Unified simulation interface for ODE, SSA, PSA, and network-free methods.
 
@@ -551,6 +560,16 @@ class Simulator:
         Jacobian — so it is likewise a no-op in a build without KLU. Passing
         both force flags raises :class:`ValueError`.
 
+        It also keeps KLU where the *LU-fill* test would leave it. A model of
+        256 to 5,000 species with a sparse Jacobian but an LU factor estimated
+        to fill 10% or more of ``n²`` — typical of rule-derived networks, where
+        a few hub species couple to most complexes — is factored with the BLAS
+        dense solver by default, on a build that has one
+        (``bngsim.HAS_LAPACK_DENSE``) and with the analytical Jacobian in use.
+        ``force_sparse_linear_solver=True`` is the way back to KLU for a model
+        that rule misjudges; ``model._core.jacobian_sparsity["lu_fill_estimate"]``
+        reports the estimate.
+
         Intended for measuring the auto-selection rule against its own
         alternative: forced-dense shows what KLU buys on large sparse networks,
         forced-sparse shows KLU's setup and indexing overhead on the small dense
@@ -625,6 +644,9 @@ class Simulator:
         # Interactive simulation state
         "_current_time",
         "_snapshot_stack",
+        # True only inside run_until: the run continues the stored trajectory
+        # (SolverOptions.continues_trajectory — keeps the GH #132 gate's count)
+        "_continues_trajectory",
         # NFsim-specific
         "_xml_path",
         # PSA-specific
@@ -945,6 +967,7 @@ class Simulator:
 
         # Interactive simulation state
         self._current_time: float = 0.0
+        self._continues_trajectory = False
         self._snapshot_stack: list[dict] = []
 
         # Code-generated RHS support, including model-based codegen reuse.
@@ -3273,6 +3296,7 @@ class Simulator:
                 opts.jacobian = self._jacobian
                 opts.force_dense_linear_solver = self._force_dense_linear_solver
                 opts.force_sparse_linear_solver = self._force_sparse_linear_solver
+                opts.continues_trajectory = self._continues_trajectory
                 opts.timeout_seconds = timeout_seconds
                 opts.steady_state = bool(steady_state)
                 opts.steady_state_tol = ss_tol_value
@@ -6568,14 +6592,22 @@ class Simulator:
         # instead would be skipped by the StopConditionMet that run() raises when
         # a condition triggers, and by any other post-solve raise, leaving the
         # clock behind the state.
-        return self.run(
-            t_span=(self._current_time, t),
-            n_points=n_points,
-            seed=seed,
-            rtol=rtol,
-            atol=atol,
-            max_steps=max_steps,
-        )
+        #
+        # This run continues the stored trajectory, which the ODE warm path uses
+        # to keep its adaptive dense-factor count across the steps of a coupling
+        # loop (SolverOptions.continues_trajectory).
+        self._continues_trajectory = True
+        try:
+            return self.run(
+                t_span=(self._current_time, t),
+                n_points=n_points,
+                seed=seed,
+                rtol=rtol,
+                atol=atol,
+                max_steps=max_steps,
+            )
+        finally:
+            self._continues_trajectory = False
 
     def intervene(self, params: dict[str, float]) -> None:
         """Apply a perturbation (parameter change) mid-simulation.
@@ -6727,7 +6759,7 @@ class Simulator:
         """
         return self._model.get_state()
 
-    def set_state(self, state: np.ndarray) -> None:
+    def set_state(self, state: np.ndarray, *, time: float | None = None) -> None:
         """Bulk-assign the live species-concentration vector (GH #102).
 
         Thin delegator to :meth:`Model.set_state`. The C++ simulator reads the
@@ -6735,8 +6767,41 @@ class Simulator:
         the next ``run_until``/``run``, so a bulk ``set_state`` between steps is
         the per-step ``set`` half of the kernel exchange (e.g. injecting the
         SSA-subset coupling species before advancing the ODE subset).
+
+        ``time``, when given, also sets :attr:`current_time` (see
+        :meth:`set_time`), so the state and the clock it belongs to move
+        together — what a predictor-corrector loop needs to redo a step. Both
+        are validated before either is assigned, so a rejected call changes
+        neither.
         """
+        t = None if time is None else _finite_time(time)
         self._model.set_state(state)
+        if t is not None:
+            self._current_time = t
+
+    def set_time(self, t: float) -> None:
+        """Set :attr:`current_time`, the time the stored state is at.
+
+        The next :meth:`run_until` integrates from here, and everything that
+        reads the clock sees it: time-indexed table functions, ``time()`` in
+        rate laws and functions. Paired with :meth:`set_state` (or
+        ``set_state(state, time=t)``) this rolls a stepped simulation back to
+        a saved point — a predictor-corrector coupling loop advances a step,
+        corrects the coupling input, and redoes the step from the saved state
+        and time. Unlike :meth:`restore`, it does not rebuild the backend, so
+        the ODE solver's warm state (and its linear-solver setup) is kept.
+
+        Parameters
+        ----------
+        t : float
+            The new time; must be finite.
+
+        Raises
+        ------
+        ValueError
+            If ``t`` is not finite.
+        """
+        self._current_time = _finite_time(t)
 
     # ─── Solver configuration (ODE) ────────────────────────────────
 

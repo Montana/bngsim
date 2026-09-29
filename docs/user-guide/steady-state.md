@@ -105,8 +105,10 @@ below.
 The march routes its Newton matrix to **sparse KLU or a dense LU by the same
 rule `run()` uses** (issue #128): KLU when the model has at least
 `SPARSE_THRESHOLD` = 50 species, a Jacobian sparsity density under
-`SPARSE_DENSITY_MAX` = 10%, and a structural nonzero to factor. `ss.linear_solver`
-reports which one ran — `"klu"`, `"dense"` or `"lapack-dense"`.
+`SPARSE_DENSITY_MAX` = 10%, and a structural nonzero to factor — unless the
+LU-fill test moves it to the BLAS dense factor, as it does for `run()` (see
+[Linear solver](solvers.md#linear-solver)). `ss.linear_solver` reports which one
+ran — `"klu"`, `"dense"` or `"lapack-dense"`.
 
 `force_sparse_linear_solver` and `force_dense_linear_solver` on the Simulator
 override the size and density gates in either direction and now reach

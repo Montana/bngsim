@@ -100,6 +100,20 @@ struct SharedModelData {
     mutable JacobianSparsity jac_sparsity;
     mutable std::once_flag jac_coloring_once;
 
+    // Estimated fill of an LU factorization of the Newton matrix I - gamma*J:
+    // nnz(L+U) / n^2 from KLU's symbolic analysis (BTF + AMD) of `jac_sparsity`
+    // plus the diagonal — an underestimate of what the COLAMD-ordered solver
+    // fills on the nets it matters for (compute_lu_fill_estimate has the
+    // numbers). The linear-solver routing reads it
+    // (bngsim/sparse_jacobian.hpp: a Jacobian that is sparse but whose LU fills
+    // in is factored densely), and only for models in the size range where that
+    // question arises, so it is computed lazily, once, by
+    // ensure_lu_fill_estimate() and shared across clones — the same sanctioned
+    // deferred write as the coloring above. -1 until computed, and on a build
+    // without KLU.
+    mutable double lu_fill_estimate = -1.0;
+    mutable std::once_flag lu_fill_once;
+
     // Analytical Jacobian pre-computed structure.
     AnalyticalJacobianData analytical_jac;
 
@@ -140,6 +154,11 @@ const ConservationLaws &ensure_conservation_laws(const SharedModelData &sd,
 // stays 0) — there is nothing to perturb. Defined in model_builder.cpp next to
 // compute_coloring().
 const JacobianSparsity &ensure_jacobian_coloring(const SharedModelData &sd);
+
+// Lazily compute (once) and return SharedModelData::lu_fill_estimate. -1 on a
+// build without KLU or when the symbolic analysis fails. Defined in
+// model_builder.cpp next to compute_coloring().
+double ensure_lu_fill_estimate(const SharedModelData &sd);
 
 // The value to STORE in `species[i].concentration` / `.initial_conc` when
 // parameter `param_value` names species `sp`'s initial condition — i.e. one
