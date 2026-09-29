@@ -49,7 +49,12 @@ struct SolverStats {
     // solver runs the built-in dense GETRF for the first K factorizations (K=5 by
     // default) and only switches to dgetrf once a run refactors past K at N>=256,
     // so a short LAPACK-dense run reports 0 here (it stayed byte-identical to the
-    // built-in dense LU). 0 on every other solver/backend.
+    // built-in dense LU). Two exceptions: a model the LU-fill test moved off KLU
+    // (bngsim/sparse_jacobian.hpp) takes dgetrf from its first factorization, and
+    // a run that continues the previous one (SolverOptions::continues_trajectory)
+    // keeps the count it started with, so it can be past K from its first
+    // factorization. Either way the figure counts this run's factorizations
+    // only. 0 on every other solver/backend.
     int n_dense_blas_factorizations = 0;
 
     // Steady-state early-termination flags (set when SolverOptions::steady_state

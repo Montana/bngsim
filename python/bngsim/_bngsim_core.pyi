@@ -332,7 +332,7 @@ class NetworkModel:
     @property
     def jacobian_sparsity(self) -> dict:
         """
-        The structural Jacobian sparsity pattern in CSC form: n, nnz, density, col_ptrs (n+1, int64) and row_indices (nnz, int64), copied. Conservative for a model with Functional rate laws. Issue #523.
+        The structural Jacobian sparsity pattern in CSC form: n, nnz, density, col_ptrs (n+1, int64) and row_indices (nnz, int64), copied. Conservative for a model with Functional rate laws. Issue #523. Also lu_fill_estimate: nnz(L+U)/n^2 KLU's symbolic analysis predicts for the Newton matrix, which the linear-solver routing consults (-1 on a build without KLU).
         """
     @property
     def load_warnings(self) -> list[str]:
@@ -782,6 +782,7 @@ class SolverOptions:
     carry_sensitivities: bool
     codegen_c_source: str
     codegen_so_path: str
+    continues_trajectory: bool
     force_dense_linear_solver: bool
     force_sparse_linear_solver: bool
     jacobian: str

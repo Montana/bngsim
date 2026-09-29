@@ -2184,6 +2184,7 @@ struct CvodeSimulator::Impl {
 
     // Dense vs sparse (KLU) matrix decision, including the two force flags.
     bool choose_use_sparse(const SolverOptions &opts, int ns) const;
+    bool fill_routed_dense(const SolverOptions &opts, int ns) const;
 
     // Create the SUNContext / state vector / CVODE memory, seed y from the
     // model, wire the (cached) codegen RHS into user_data, and apply the
@@ -2239,6 +2240,12 @@ struct CvodeSimulator::Impl {
     // Copy CVODE's counters into the Result's solver_stats block. Used by the
     // warm path too — the two recorded the same counters in the same order.
     void record_solver_stats(void *cvode_mem, SUNLinearSolver ls, Result &result);
+
+    // The adaptive dense solver's BLAS-factorization count when this run began, so
+    // SolverStats::n_dense_blas_factorizations stays per-run when a continuing
+    // warm run keeps the solver's count (SolverOptions::continues_trajectory).
+    // 0 on every path that starts from a fresh or reset count.
+    long blas_factor_base = 0;
 
     // Publish the final state (and the forward-sensitivity carry-over seed)
     // back onto the model for the next action in a multi-action sequence.
@@ -2503,10 +2510,55 @@ int CvodeSimulator::Impl::choose_linear_solver_kind(bool use_sparse, const Solve
 #else
     (void)use_sparse;
 #endif
+    if (fill_routed_dense(opts, ns)) {
+        return LINEAR_SOLVER_LAPACK_DENSE;
+    }
     const bool use_lapack = should_use_lapack_dense(ns, model.jacobian_sparsity().density,
                                                     opts.force_dense_linear_solver);
     return use_lapack ? LINEAR_SOLVER_LAPACK_DENSE : LINEAR_SOLVER_DENSE;
 }
+
+#ifdef BNGSIM_HAS_KLU
+// ─── KLU across CVodeReInit ──────────────────────────────────────────────────
+//
+// SUNLinSolInitialize_KLU sets first_factorize on every CVODE (re)init, so each
+// warm re-entry (run_warm's CVodeReInit — a coupling loop's every step) and
+// each event re-init re-ran klu_analyze (the AMD/COLAMD ordering) and a full
+// klu_factor, although the Newton matrix's pattern is the model's and never
+// changes (every Jacobian fill reinstates it; install_csc_structure). These two
+// ops keep the analysis instead:
+//   * initialize leaves first_factorize clear once a factorization exists, so
+//     the next setup refactors on the existing symbolic/numeric objects —
+//     SUNLinSolSetup_KLU's refactor path already re-factors from scratch when
+//     rcond/condest say the old pivot order has gone bad;
+//   * setup falls back to that full analysis + factor when a refactor itself
+//     fails (a zero pivot in the old order), which stock SUNDIALS reports as a
+//     recoverable failure and would retry with the same pivot order.
+static SUNErrCode klu_initialize_keep_symbolic(SUNLinearSolver S) {
+    auto *c = static_cast<SUNLinearSolverContent_KLU>(S->content);
+    if (c != nullptr && c->symbolic != nullptr && c->numeric != nullptr) {
+        c->last_flag = SUN_SUCCESS;
+        return SUN_SUCCESS;
+    }
+    return SUNLinSolInitialize_KLU(S);
+}
+
+static int klu_setup_refactor_or_factor(SUNLinearSolver S, SUNMatrix A) {
+    auto *c = static_cast<SUNLinearSolverContent_KLU>(S->content);
+    const bool refactor = c != nullptr && c->first_factorize == 0;
+    int flag = SUNLinSolSetup_KLU(S, A);
+    if (refactor && flag == SUNLS_PACKAGE_FAIL_REC) {
+        c->first_factorize = 1;
+        flag = SUNLinSolSetup_KLU(S, A);
+    }
+    return flag;
+}
+
+static void keep_klu_symbolic_across_reinit(SUNLinearSolver S) {
+    S->ops->initialize = klu_initialize_keep_symbolic;
+    S->ops->setup = klu_setup_refactor_or_factor;
+}
+#endif
 
 void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx, N_Vector y,
                                                 SUNMatrixGuard &A_guard, SUNLinSolGuard &LS_guard,
@@ -2536,6 +2588,7 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
         if (!LS_guard) {
             throw std::runtime_error("SUNLinSol_KLU failed");
         }
+        keep_klu_symbolic_across_reinit(LS_guard);
         linear_solver_used = linear_solver_kind;
     } else
 #endif
@@ -2547,7 +2600,9 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
         // / codegen dense Jacobian callbacks below are unaffected.
         A_guard = SUNMatrixGuard(SUNDenseMatrix(ns, ns, ctx));
         const bool use_lapack = (linear_solver_kind == LINEAR_SOLVER_LAPACK_DENSE);
-        LS_guard = SUNLinSolGuard(make_dense_linear_solver(y, A_guard, ctx, use_lapack));
+        LS_guard = SUNLinSolGuard(fill_routed_dense(opts, ns)
+                                      ? make_fill_routed_dense_linear_solver(y, A_guard, ctx)
+                                      : make_dense_linear_solver(y, A_guard, ctx, use_lapack));
         if (!LS_guard) {
             throw std::runtime_error("dense linear solver creation failed");
         }
@@ -2876,7 +2931,16 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
     // only the warm reuse needs this. No-op for the sparse/KLU and built-in
     // dense solvers (they carry a different setup op). Harmless on the fresh-
     // build branch above, where the counter is already 0.
-    lapack_dense_reset_factor_count(w.LS);
+    //
+    // Not for a run that continues the previous one (run_until, and so every
+    // ReactionKernel.advance): that is one integration cut into steps, and
+    // restarting the count per step kept a coupling loop — typically 1-3
+    // factorizations a step — on the built-in factor forever, 2.5x slower on a
+    // 361-species loop than the BLAS factor it earns by its third step.
+    if (!opts.continues_trajectory) {
+        lapack_dense_reset_factor_count(w.LS);
+    }
+    blas_factor_base = std::max(0L, lapack_dense_blas_factor_count(w.LS));
 
     // Same restart, for the same reason, on the issue #182 counters: the
     // re-entry CVodeReInit above zeroed CVODE's own, and the carried half is an
@@ -3122,9 +3186,17 @@ Result CvodeSimulator::Impl::run_algebraic_only(const TimeSpec &times) {
 // the steady-state march takes too (issue #128). Kept as a member so the call
 // sites below read as they did; the decision itself is not duplicated.
 bool CvodeSimulator::Impl::choose_use_sparse(const SolverOptions &opts, int ns) const {
-    return route_to_sparse_linear_solver(model.jacobian_sparsity(), ns, opts.jacobian,
-                                         opts.force_dense_linear_solver,
-                                         opts.force_sparse_linear_solver);
+    return route_to_sparse_linear_solver(
+        model.jacobian_sparsity(), ns, opts.jacobian, opts.force_dense_linear_solver,
+        opts.force_sparse_linear_solver, routing_lu_fill(model, ns, opts.jacobian));
+}
+
+// Did the LU-fill test (bngsim/sparse_jacobian.hpp) move this model off KLU?
+// Such a model factors with the BLAS dense solver from its first factorization.
+bool CvodeSimulator::Impl::fill_routed_dense(const SolverOptions &opts, int ns) const {
+    return fill_routes_to_dense(model.jacobian_sparsity(), ns,
+                                routing_lu_fill(model, ns, opts.jacobian), opts.jacobian,
+                                opts.force_dense_linear_solver, opts.force_sparse_linear_solver);
 }
 
 // ─── SUNDIALS v7 setup ───────────────────────────────────────────────────────
@@ -3178,6 +3250,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     // Fresh CVODE memory, so its own counters start at 0; the carried half of
     // the run's totals is an Impl member and has to be cleared (issue #182).
     closed_segments = SegmentCounters{};
+    blas_factor_base = 0; // a fresh solver: its count starts at 0
     // Fresh CVODE memory has no forward sensitivities on it either, whatever a
     // previous run left behind (issue #447). setup_forward_sensitivities sets
     // this again if this run asks for them.
@@ -4376,8 +4449,9 @@ void CvodeSimulator::Impl::record_solver_stats(void *cvode_mem, SUNLinearSolver 
     // and the adaptive K gate was crossed). `ls` is the caller's linear solver —
     // run()'s LS_guard, or the warm cache's persistent w.LS.
     {
-        const long bc = lapack_dense_blas_factor_count(ls);
+        const long bc = lapack_dense_blas_factor_count(ls) - blas_factor_base;
         result.solver_stats().n_dense_blas_factorizations = bc > 0 ? static_cast<int>(bc) : 0;
+        blas_factor_base = 0;
     }
 
     // Checked HERE because this is the one point the cold and warm run paths

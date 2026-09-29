@@ -95,16 +95,21 @@ class ReactionKernel:
     workers, build one kernel per :meth:`bngsim.Model.clone`.
     """
 
-    __slots__ = ("_sim", "_last_result", "_initial_observables")
+    __slots__ = ("_sim", "_last_result", "_last_result_is_current", "_state_observables")
 
     def __init__(self, model: Model, *, method: str = "ode", **simulator_kwargs) -> None:
         if not isinstance(model, Model):
             raise TypeError(f"model must be a bngsim.Model, got {type(model).__name__}")
         self._sim = Simulator(model, method=method, **simulator_kwargs)
         self._last_result: Result | None = None
-        # Lazily filled t=0 observables for observables() before the first
-        # advance (see _observables_at_current_state).
-        self._initial_observables: NDArray[np.float64] | None = None
+        # Whether the live state is still the one _last_result ended at: set by
+        # a completed advance, cleared by anything that moves the state after
+        # it (set_state, an advance that raised). observables() reads the step
+        # result only while it is set.
+        self._last_result_is_current = False
+        # Lazily filled observables at the live state, for observables() when
+        # there is no current step result (see _observables_at_current_state).
+        self._state_observables: NDArray[np.float64] | None = None
 
     @classmethod
     def from_simulator(cls, simulator: Simulator) -> ReactionKernel:
@@ -131,7 +136,8 @@ class ReactionKernel:
         self = cls.__new__(cls)
         self._sim = simulator
         self._last_result = None
-        self._initial_observables = None
+        self._last_result_is_current = False
+        self._state_observables = None
         return self
 
     # ─── State exchange ─────────────────────────────────────────────────────
@@ -146,7 +152,7 @@ class ReactionKernel:
         """
         return self._sim.get_state()
 
-    def set_state(self, state: NDArray[np.float64]) -> None:
+    def set_state(self, state: NDArray[np.float64], *, time: float | None = None) -> None:
         """Bulk-assign the live species-concentration vector (GH #102).
 
         Parameters
@@ -156,10 +162,29 @@ class ReactionKernel:
             :attr:`state_names`. Copied into the model's live concentrations;
             the next :meth:`advance` reads them as its initial condition. The
             ``set`` half of the per-step kernel exchange.
+        time : float, optional
+            Also set :attr:`time` to this value (``Simulator.set_time``). With
+            a state saved by :meth:`get_state` and its :attr:`time`, this redoes
+            a step — the rollback a predictor-corrector coupling loop needs,
+            and the only way to get it right when the model reads the clock
+            (a time-indexed table function, ``time()`` in a rate law):
+
+            >>> saved, t0 = kernel.get_state(), kernel.time
+            >>> kernel.advance(dt)                    # predictor
+            >>> kernel.set_state(corrected, time=t0)  # roll back, correct
+            >>> kernel.advance(dt)                    # corrector
+
+        Raises
+        ------
+        ValueError
+            If ``state`` has the wrong length or ``time`` is not finite; the
+            call then changes neither the state nor the clock.
         """
-        self._sim.set_state(state)
-        # The injected state invalidates any cached t=0 observables.
-        self._initial_observables = None
+        self._sim.set_state(state, time=time)
+        # The injected state is no longer the one the last step ended at, nor
+        # the one any cached probe was computed at.
+        self._last_result_is_current = False
+        self._state_observables = None
 
     # ─── Stepping ───────────────────────────────────────────────────────────
 
@@ -220,7 +245,14 @@ class ReactionKernel:
             raise ValueError(f"dt must be > 0, got {dt}")
 
         target = self._sim.current_time + dt
+        # The state is about to move. A run_until that raises can still have
+        # moved it — StopConditionMet is raised after the whole interval was
+        # integrated and written back — and then neither the previous step's
+        # result nor a cached probe describes it.
+        self._last_result_is_current = False
+        self._state_observables = None
         self._last_result = self._sim.run_until(target, n_points=n_points, seed=seed, **run_kwargs)
+        self._last_result_is_current = True
         return self._sim.get_state()
 
     def reset(self) -> None:
@@ -231,9 +263,10 @@ class ReactionKernel:
         scratch. Clears any cached step result.
         """
         self._sim.model.reset()
-        self._sim._current_time = 0.0
+        self._sim.set_time(0.0)
         self._last_result = None
-        self._initial_observables = None
+        self._last_result_is_current = False
+        self._state_observables = None
 
     # ─── Observables ────────────────────────────────────────────────────────
 
@@ -241,13 +274,15 @@ class ReactionKernel:
         """Observable values at the current simulation state.
 
         Returns a ``float64`` array of length :attr:`n_observables`, ordered
-        like :attr:`observable_names`. After an :meth:`advance` these are the
-        post-step observables (read straight from the step result, no
-        recomputation). Before the first advance — or after a :meth:`set_state`
-        with no advance since — they are computed once, side-effect-free, from
-        the current state via a throwaway model clone.
+        like :attr:`observable_names`. Right after an :meth:`advance` these are
+        the post-step observables (read straight from the step result, no
+        recomputation). Otherwise — before the first advance, after a
+        :meth:`set_state` (with or without ``time=``), or after an advance that
+        raised having moved the state (a stop condition) — they are computed
+        once, side-effect-free, from the current state via a throwaway model
+        clone. :attr:`last_result` is left as it was either way.
         """
-        if self._last_result is not None:
+        if self._last_result is not None and self._last_result_is_current:
             return np.asarray(self._last_result.observables[-1], dtype=np.float64)
         return self._observables_at_current_state()
 
@@ -260,17 +295,17 @@ class ReactionKernel:
         at exactly this state without touching the kernel's own model. Cached
         until the next :meth:`set_state` / :meth:`advance` / :meth:`reset`.
         """
-        if self._initial_observables is not None:
-            return self._initial_observables
+        if self._state_observables is not None:
+            return self._state_observables
         if self.n_observables == 0:
-            self._initial_observables = np.empty(0, dtype=np.float64)
-            return self._initial_observables
+            self._state_observables = np.empty(0, dtype=np.float64)
+            return self._state_observables
         probe_model = self._sim.model.clone()
         probe = Simulator(probe_model, method="ode")
         # Any positive span works: row 0 is the pre-integration initial state.
         row0 = probe.run(t_span=(0.0, 1.0), n_points=2).observables[0]
-        self._initial_observables = np.asarray(row0, dtype=np.float64)
-        return self._initial_observables
+        self._state_observables = np.asarray(row0, dtype=np.float64)
+        return self._state_observables
 
     # ─── Introspection ──────────────────────────────────────────────────────
 
@@ -325,7 +360,8 @@ class ReactionKernel:
 
         ``None`` before the first advance. Carries the full sub-step
         trajectory of the last step (per ``n_points``), beyond the endpoint
-        state :meth:`get_state` returns.
+        state :meth:`get_state` returns. It keeps describing that step after a
+        :meth:`set_state`, when it no longer describes the live state.
         """
         return self._last_result
 
