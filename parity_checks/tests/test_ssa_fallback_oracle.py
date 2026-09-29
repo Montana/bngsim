@@ -77,6 +77,18 @@ def test_the_ensemble_event_cap_is_deterministic(tmp_path, monkeypatch):
     assert "MAX_ENSEMBLE_EVENTS = 50" in out.describe()
 
 
+def test_the_ensemble_cap_bounds_cost_at_every_network_size():
+    # An event scans the reactions, so on a 1,500-reaction network it costs about
+    # 14x what it does on a 10-reaction one. A flat event cap admitted ~1,000 s of
+    # work there, which a fast runner finishes and a slow one stops. The cap is
+    # scaled so the worst admitted ensemble costs the same at any size.
+    assert ng.ensemble_event_cap(10) == ng.MAX_ENSEMBLE_EVENTS
+    budget = ng.MAX_ENSEMBLE_EVENTS * (ng._EVENT_FIXED_COST + 10)
+    for nr in (1, 10, 100, 500, ng.MAX_REACTIONS):
+        assert ng.ensemble_event_cap(nr) * (ng._EVENT_FIXED_COST + nr) <= budget
+    assert ng.ensemble_event_cap(ng.MAX_REACTIONS) < ng.MAX_ENSEMBLE_EVENTS // 10
+
+
 def test_the_wall_budget_is_reported_as_the_safety_stop(tmp_path):
     # 0 -> A at 1e5/s for 1 s passes the 65,536-event deadline check once.
     net = _net(tmp_path, k="1e5", a0="0", reaction="0 1")

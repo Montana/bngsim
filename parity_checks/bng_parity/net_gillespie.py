@@ -179,14 +179,30 @@ class NetModel:
 # the same on every machine, and so is which oracle scores the row (issue #881).
 MAX_REACTIONS = 1_500
 MAX_EVENTS = 5_000_000
+# The ensemble cap for a 10-reaction network. A larger network gets fewer events,
+# because an event costs a fixed overhead plus a linear scan over the reactions:
+# measured 3.8 us at 10 reactions and 51.5 us at 1,500 on an Apple M-series, which
+# is (110 + n_reactions) scan-steps of about 0.032 us each. Capping events alone
+# admitted 20 M events on a 1,500-reaction network, ~1,000 s there, which a fast
+# runner finishes and a slow one stops, so the verdict would follow runner speed
+# again. See ensemble_event_cap().
 MAX_ENSEMBLE_EVENTS = 20_000_000
+_EVENT_FIXED_COST = 110  # the fixed part of one event, in reaction-scan steps
 # A SAFETY STOP only, never the thing that decides support. It used to be 90 s and
 # also chose the oracle: v08's 10-replicate ensemble (5.2 M events, ~30 s on an
 # Apple M-series) ran out of it on the slower nightly runners, which then scored the
 # row against RoadRunner instead, so the verdict followed runner speed (issue #881).
-# An ensemble the event caps admit runs ~110 s at most at 5.6 us/event; this leaves
-# several-fold headroom for a slow, loaded runner. Hitting it is reported as such.
+# An ensemble the caps admit runs ~75 s at most on an Apple M-series, at any network
+# size; this leaves several-fold headroom for a slow, loaded runner. Hitting it is
+# reported as such.
 DEFAULT_WALL_BUDGET_SEC = 900.0
+
+
+def ensemble_event_cap(n_reactions: int) -> int:
+    """The most events an ensemble on an *n_reactions* network may fire: the same
+    cost as ``MAX_ENSEMBLE_EVENTS`` events on a 10-reaction network. It depends on
+    the network alone, so whether an ensemble fits is the same on every machine."""
+    return MAX_ENSEMBLE_EVENTS * (_EVENT_FIXED_COST + 10) // (_EVENT_FIXED_COST + n_reactions)
 
 
 class _TooCostly(Exception):
@@ -365,9 +381,11 @@ def _simulate_one(
     touched by the fired reaction are recomputed (O(degree) per step, not O(nr)).
 
     ``tally``, when given, is a one-element list holding the events the ensemble has
-    fired so far; it is advanced here and checked against ``MAX_ENSEMBLE_EVENTS``."""
+    fired so far; it is advanced here and checked against :func:`ensemble_event_cap`
+    for this network."""
     x = net.x0.copy().astype(np.int64)
     rxns = net.reactions
+    ensemble_cap = ensemble_event_cap(len(rxns))
     mults = net.mults
     dep = net.dep_rxns
     nr = len(rxns)
@@ -424,9 +442,11 @@ def _simulate_one(
             raise _TooCostly("event_cap", f"one trajectory passed MAX_EVENTS = {MAX_EVENTS}")
         if tally is not None:
             tally[0] += 1
-            if tally[0] > MAX_ENSEMBLE_EVENTS:
+            if tally[0] > ensemble_cap:
                 raise _TooCostly(
-                    "event_cap", f"the ensemble passed MAX_ENSEMBLE_EVENTS = {MAX_ENSEMBLE_EVENTS}"
+                    "event_cap",
+                    f"the ensemble passed {ensemble_cap} events, MAX_ENSEMBLE_EVENTS = "
+                    f"{MAX_ENSEMBLE_EVENTS} scaled to {nr} reactions",
                 )
         if deadline is not None and (events & 0xFFFF) == 0 and _now() > deadline:
             raise _TooCostly("wall_budget", "wall budget exceeded")
