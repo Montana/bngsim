@@ -159,9 +159,11 @@ _IC_SENS_PROBE_TOL = 1e-4
 # unwritable compartment sizes — spell themselves out in full and do not use this.
 _SKIP_WARN_NAME_LIMIT = 8
 
-# How every CVODE hard failure's message starts (`cvode_failure_message` in
-# src/cvode_simulator.cpp). The jacobian="auto" retry is for that failure only.
-_CVODE_FAILURE = "CVODE integration failed at t="
+# How the core's CVODE hard failures start, in src/cvode_simulator.cpp: an error
+# flag (`cvode_failure_message`) and a step that collapsed to no progress
+# (`retry_while_advancing`), the second being the parked-on-a-discontinuity case
+# the FD Jacobian most often rescues. The jacobian="auto" retry is for these only.
+_CVODE_FAILURES = ("CVODE integration failed at t=", "CVODE made no progress ")
 
 
 def _abbreviate(names: list[str], limit: int = _SKIP_WARN_NAME_LIMIT) -> str:
@@ -2977,7 +2979,7 @@ class Simulator:
             # would then return the result the refusal exists to withhold. Those
             # refusals first reached the retry when it was opened to a compiled
             # RHS (issue #874), which is what sensitivity runs mostly use.
-            if _CVODE_FAILURE not in str(e):
+            if not any(prefix in str(e) for prefix in _CVODE_FAILURES):
                 raise
             logger.warning(
                 "GH#176 analytical Jacobian: CVODE integration failed (%s); "
