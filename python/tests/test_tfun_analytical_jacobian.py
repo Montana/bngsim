@@ -208,7 +208,13 @@ def test_sensitivity_derivative_is_not_given_the_table_as_a_constant(tmp_path):
         s = bngsim.Simulator(model, method="ode")
         return np.asarray(s.run(t_span=(0, 10), n_points=11, rtol=1e-11, atol=1e-13).species)
 
-    h = 1e-5
+    # A central difference of two trajectories carries their integration error
+    # divided by 2h on top of its O(h²) truncation. At h = 1e-5 that noise was
+    # the size of atol on A and B, which do not depend on kp (true value 0):
+    # 6.8e-7 on macOS, 6.1e-6 on Linux CI. The table is linear in kp on [1, 2],
+    # so a wider step adds no truncation from the table; at 1e-3 the A/B noise
+    # is ~20x smaller and C/D still match to ~1e-6 relative (1e-2 is too coarse).
+    h = 1e-3
     fd = (final(1.5 + h) - final(1.5 - h)) / (2 * h)
     assert np.max(np.abs(fd)) > 1e-3  # premise: kp moves the trajectory
     np.testing.assert_allclose(sens, fd, rtol=1e-4, atol=1e-6)
