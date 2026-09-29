@@ -607,11 +607,27 @@ static double lu_diag_rcond(const double *lu, int n) {
 // does not currently consult it (nor n, nor density) — it is threaded through so
 // the two solvers cannot answer this question from different inputs if it ever
 // does.
+//
+// `fill_routed` is ss_fill_routed_dense() for the march's full system: a model the
+// LU-fill test moved off KLU factors with the BLAS solver from its first call,
+// exactly as run() does. The reduced systems of the polish and the sensitivity
+// solve never had a sparse route and keep the gate above.
 static SUNLinearSolver ss_make_dense_linsol(N_Vector v, SUNMatrix A, SUNContext ctx,
-                                            NetworkModel &model, int n, bool force_dense = false) {
+                                            NetworkModel &model, int n, bool force_dense = false,
+                                            bool fill_routed = false) {
+    if (fill_routed)
+        return make_fill_routed_dense_linear_solver(v, A, ctx);
     const bool use_lapack = should_use_lapack_dense(n, model.jacobian_sparsity().density,
                                                     /*force_dense=*/force_dense);
     return make_dense_linear_solver(v, A, ctx, use_lapack);
+}
+
+// Did the LU-fill test (bngsim/sparse_jacobian.hpp) move the march off KLU? The
+// same predicate CvodeSimulator::Impl::fill_routed_dense asks, from the same inputs.
+static bool ss_fill_routed_dense(NetworkModel &model, const SteadyStateOptions &opts, int ns) {
+    return fill_routes_to_dense(model.jacobian_sparsity(), ns,
+                                routing_lu_fill(model, ns, opts.jacobian), opts.jacobian,
+                                opts.force_dense_linear_solver, opts.force_sparse_linear_solver);
 }
 
 // Does the CVODE march factor with KLU rather than densely (issue #128)?
@@ -637,7 +653,8 @@ static bool ss_use_sparse_linsol(NetworkModel &model, const SteadyStateRhs &rhs,
                                  const SteadyStateOptions &opts, int ns) {
     const auto &sp = model.jacobian_sparsity();
     if (!route_to_sparse_linear_solver(sp, ns, opts.jacobian, opts.force_dense_linear_solver,
-                                       opts.force_sparse_linear_solver)) {
+                                       opts.force_sparse_linear_solver,
+                                       routing_lu_fill(model, ns, opts.jacobian))) {
         return false;
     }
     // A closed form fills any pattern; otherwise it takes a coloring, which
@@ -653,8 +670,9 @@ static const char *ss_linear_solver_name(NetworkModel &model, const SteadyStateR
     if (ss_use_sparse_linsol(model, rhs, opts, ns)) {
         return "klu";
     }
-    return should_use_lapack_dense(ns, model.jacobian_sparsity().density,
-                                   opts.force_dense_linear_solver)
+    return ss_fill_routed_dense(model, opts, ns) ||
+                   should_use_lapack_dense(ns, model.jacobian_sparsity().density,
+                                           opts.force_dense_linear_solver)
                ? "lapack-dense"
                : "dense";
 }
@@ -1067,8 +1085,9 @@ class SteadyStateMarcher {
         }
 #endif
         A_ = SUNMatrixGuard(SUNDenseMatrix(ns_, ns_, ctx_));
-        LS_ = SUNLinSolGuard(
-            ss_make_dense_linsol(y_, A_, ctx_, model, ns_, opts.force_dense_linear_solver));
+        LS_ = SUNLinSolGuard(ss_make_dense_linsol(y_, A_, ctx_, model, ns_,
+                                                  opts.force_dense_linear_solver,
+                                                  ss_fill_routed_dense(model, opts, ns_)));
         CVodeSetLinearSolver(cvode_mem_, LS_, A_);
 
         if (ss_install_solver_jacobian(rhs, opts)) {

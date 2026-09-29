@@ -1447,7 +1447,8 @@ struct SolverOptions {
     // auto-select sparse KLU (GH #102). The Jacobian *strategy* (analytical /
     // fd / jax above) is orthogonal to the linear-solver *kind* (dense vs
     // sparse): this only overrides the latter. Default false keeps the
-    // size/density auto-selection (SPARSE_THRESHOLD / SPARSE_DENSITY_MAX). Set
+    // auto-selection (SPARSE_THRESHOLD / SPARSE_DENSITY_MAX, then the LU-fill
+    // test — route_to_sparse_linear_solver in bngsim/sparse_jacobian.hpp). Set
     // true to benchmark the dense path against KLU on the same model; has no
     // effect in a build without KLU (already always dense).
     bool force_dense_linear_solver = false;
@@ -1457,12 +1458,23 @@ struct SolverOptions {
     // force_dense_linear_solver above: that flag can only push the decision
     // toward dense, so without this one the auto rule cannot be measured
     // against its own alternative on the models it sends to dense. Bypasses
-    // only the SPARSE_THRESHOLD / SPARSE_DENSITY_MAX gates — the hard
+    // only the SPARSE_THRESHOLD / SPARSE_DENSITY_MAX gates and the LU-fill test
+    // (so it keeps on KLU a model whose factor fill would move it off) — the hard
     // requirements (KLU compiled in, non-empty sparsity pattern, non-JAX
     // Jacobian) still hold, so this is a no-op in a build without KLU. Setting
     // it together with force_dense_linear_solver is an error, not a precedence
     // question; CvodeSimulator::run() rejects the pair.
     bool force_sparse_linear_solver = false;
+
+    // This run continues the trajectory the previous run on the same simulator
+    // left off (Simulator.run_until, and so ReactionKernel.advance), rather than
+    // starting an independent one. The warm path then keeps the GH #132 adaptive
+    // factorization count instead of restarting it: the gate asks whether an
+    // *integration* is factorization-bound, and a coupling loop is one
+    // integration cut into many short runs, each of which alone would stay under
+    // BNGSIM_LAPACK_DENSE_K forever. An independent run still restarts it, so a
+    // short run is not pushed onto the BLAS factor by a long one before it.
+    bool continues_trajectory = false;
 
     // JAX AD Jacobian callback.
     // If set, CVODE calls this function to fill the dense Jacobian matrix.

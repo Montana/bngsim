@@ -85,6 +85,16 @@ bool should_use_lapack_dense(int n, double density, bool force_dense);
 SUNLinearSolver make_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx,
                                          bool prefer_lapack);
 
+// The dense solver for a model the LU-fill test (bngsim/sparse_jacobian.hpp)
+// moved off KLU: the same custom solver, taking the BLAS dgetrf factor from its
+// first factorization (no GH #132 count gate, no minimum N). The count gate
+// exists so a model that was always dense does not pay BLAS overhead on a short
+// run; a fill-routed model's alternative is KLU refactoring a 10-50%-dense
+// factor, which the BLAS factor beats from the first call. Only reached when a
+// BLAS backend is linked (the routing requires one); without one it returns the
+// built-in SUNLinSol_Dense, like make_dense_linear_solver.
+SUNLinearSolver make_fill_routed_dense_linear_solver(N_Vector y, SUNMatrix A, SUNContext ctx);
+
 // Reset the GH #132 adaptive factorization counter to zero, so the gate next
 // starts from the built-in factor again. The warm CVODE fast path
 // (CvodeSimulator::Impl::run_warm) reuses ONE persistent solver across run()

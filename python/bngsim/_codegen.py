@@ -6752,7 +6752,7 @@ def _mm_jacobian_groups(plan_mm, add) -> list[list[str]] | None:
 
 
 def _functional_jacobian_groups(
-    core, data, add, deadline: float | None = None
+    core, data, add, deadline: float | None = None, table_c: dict[str, str] | None = None
 ) -> tuple[list[list[str]], ...] | None:
     """Reconstruct every Functional reaction's Jacobian contribution as balanced
     ``{ … }`` C line-groups, scattered through the caller's ``add``.
@@ -6770,6 +6770,13 @@ def _functional_jacobian_groups(
     that fuses the matvec — ``Jv_out[row] += value·v[col]`` — so ``bngsim_jac_vec``
     covers Functional models with no ``n×n`` buffer and no second derivation. The
     two consumers cannot drift because there is one reconstruction.
+
+    ``table_c`` maps the symbol of a table function that does not read the state
+    (``tfun_<name>``, which the engine lists among the derivation's constants) to
+    the C value its caller already holds. A derivative that keeps such a table as
+    a factor needs its current value; a caller that passes nothing (the
+    sensitivity RHS, whose user data cannot evaluate a table) declines that
+    derivative exactly as before.
 
     Mirrors ``bngsim._jacobian.attach_functional_jacobian``: the per-species chain
     rule and the per-observable product rule follow ``set_functional_jacobian`` /
@@ -6825,6 +6832,8 @@ def _functional_jacobian_groups(
     def resolve_symbol(name: str):
         if name == _TIME_SYM:
             return "t"
+        if table_c and name in table_c:
+            return table_c[name]
         return c_ref.get(name)
 
     # ── Functional context (read like attach_functional_jacobian) ───────────
@@ -7143,14 +7152,20 @@ def generate_jacobian_from_model(model) -> str | None:
     # models the CVODE solver routes to the sparse KLU path, and the dense one
     # (bngsim_codegen_jac) otherwise. A dense n×n emit is infeasible at scale (a
     # 75k-species dense Jacobian is ~45 GB), so large sparse models need the
-    # nnz-length CSC form. The structural gate mirrors cvode_simulator.cpp
-    # `use_sparse` (ns >= SPARSE_THRESHOLD=50, density < SPARSE_DENSITY_MAX=0.10,
-    # non-empty pattern, KLU build). The runtime-only factors (force_dense,
-    # jacobian="jax") only *relax* sparse routing, and a structurally-sparse model
-    # run dense simply finds no bngsim_codegen_jac symbol and falls back to the
-    # interpreted dense Jacobian — never a wrong one.
+    # nnz-length CSC form. `routes_sparse` is the engine's own default-options
+    # route (bngsim/sparse_jacobian.hpp: size, density and the LU-fill test), so
+    # this cannot drift from it; the size/density expression is the fallback for
+    # a core too old to report it. The runtime-only factors (force_dense,
+    # force_sparse, jacobian="jax") can still route a model the other way, and
+    # each side then finds no symbol of its shape and falls back to the
+    # interpreted Jacobian of that shape — never a wrong one.
     nnz = int(plan["nnz"])
-    is_sparse = bool(plan["has_klu"]) and ns >= 50 and nnz > 0 and float(plan["density"]) < 0.10
+    is_sparse = bool(
+        plan.get(
+            "routes_sparse",
+            bool(plan["has_klu"]) and ns >= 50 and nnz > 0 and float(plan["density"]) < 0.10,
+        )
+    )
 
     # Scatter target for a single contribution. Dense writes the column-major
     # jac[col*N_SPECIES + row]; sparse writes the CSC value slot jac_data[csc].
@@ -7241,7 +7256,21 @@ def generate_jacobian_from_model(model) -> str | None:
     # Reconstructed by the shared builder the sensitivity RHS's bngsim_jac_vec
     # also uses (GH #67); the only difference between the two consumers is where
     # a contribution lands, which is what `_jac_add` supplies.
-    groups = _functional_jacobian_groups(core, data, _jac_add)
+    # A table function used as a whole function body (``f() tfun(...)``) is
+    # evaluated into that function's func[] slot by the recomputation below, so a
+    # derivative that keeps the table as a factor reads the slot — no table call in
+    # a shard block, which has no ``t`` or user data. Only tables that do not read
+    # the state (time- or parameter-indexed) can appear in a derivative at all.
+    table_c = {
+        f"tfun_{f['name']}": f"func[{i}]"
+        for i, f in enumerate(functions)
+        if f["name"] in tfun_call_by_name
+        and any(
+            spec["name"] == f["name"] and spec["index_kind"] in ("time", "parameter")
+            for spec in tfun_specs
+        )
+    }
+    groups = _functional_jacobian_groups(core, data, _jac_add, table_c=table_c)
     if groups is None:
         return None
     per_species_groups, per_species_volume_groups, per_observable_groups = groups
@@ -7249,9 +7278,12 @@ def generate_jacobian_from_model(model) -> str | None:
     # GH #171: the varvol column groups also read func[] (and the obs[] the func
     # recomputation depends on), so they count toward has_functional / need_func —
     # otherwise func[] would be referenced but never computed for a psvs model
-    # whose only Functional terms are per-species (no per-observable block).
+    # whose only Functional terms are per-species (no per-observable block). A
+    # per-species term that reads a table's func[] slot (table_c) needs it too.
     has_functional = bool(per_species_groups or per_species_volume_groups or per_observable_groups)
-    need_func = bool(per_observable_groups or per_species_volume_groups)
+    need_func = bool(per_observable_groups or per_species_volume_groups) or any(
+        "func[" in ln for grp in per_species_groups for ln in grp
+    )
 
     # ── Elementary + Michaelis–Menten contribution groups ───────────────────
     # Each reaction's scatter is a balanced ``{ … }`` group, built here (rather

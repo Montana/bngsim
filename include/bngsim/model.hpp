@@ -310,6 +310,13 @@ class NetworkModel {
     // one degenerates to one column per color, i.e. plain FD.
     const JacobianSparsity &ensure_jacobian_coloring() const;
 
+    // Estimated nnz(L+U)/n^2 of an LU factorization of the Newton matrix
+    // I - gamma*J, from KLU's symbolic analysis of the sparsity pattern
+    // (computed on first call, then cached and shared across clones). The
+    // linear-solver routing consults it (bngsim/sparse_jacobian.hpp); -1 on a
+    // build without KLU.
+    double estimated_lu_fill() const;
+
     const AnalyticalJacobianData &analytical_jacobian() const;
     const ConservationLaws &conservation_laws() const;
 
