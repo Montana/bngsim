@@ -27,6 +27,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef BNGSIM_HAS_KLU
+#include <klu.h>
+#endif
+
 namespace bngsim {
 
 // Call `fn(token)` once per identifier in `expr`, in source order, under
@@ -1381,6 +1385,65 @@ const ConservationLaws &ensure_conservation_laws(const SharedModelData &sd,
 const JacobianSparsity &ensure_jacobian_coloring(const SharedModelData &sd) {
     std::call_once(sd.jac_coloring_once, [&] { compute_coloring(sd.jac_sparsity); });
     return sd.jac_sparsity;
+}
+
+// Estimated nnz(L+U) / n^2 of the Newton matrix I - gamma*J, from KLU's symbolic
+// analysis of the Jacobian pattern plus the diagonal (M always has a full
+// diagonal; the pattern need not). lnz and unz each count the diagonal, and
+// entries of the off-diagonal BTF blocks are stored separately (nzoff), so the
+// factor holds lnz + unz - n + nzoff values.
+//
+// The analysis runs with klu_defaults' AMD ordering, the only one for which KLU
+// reports lnz/unz — an estimate from the symmetric pattern A + A^T. The sparse
+// route's solver orders with COLAMD (SUNDIALS' default) and pivots, and on the
+// rule-derived nets that fills in more, not less: SuperLU with COLAMD measures
+// 0.23-0.64 where this says 0.21-0.35 (metapop_sir_100 agrees at 0.02). So the
+// estimate errs toward keeping KLU, which is the safe side of a threshold. The
+// analysis costs well under a millisecond on hundreds of species.
+static double compute_lu_fill_estimate(const JacobianSparsity &sp) {
+#ifdef BNGSIM_HAS_KLU
+    const int64_t n = sp.n;
+    if (n <= 0)
+        return 0.0;
+    std::vector<int64_t> Ap(static_cast<size_t>(n) + 1, 0);
+    std::vector<int64_t> Ai;
+    Ai.reserve(static_cast<size_t>(sp.nnz) + static_cast<size_t>(n));
+    for (int64_t j = 0; j < n; ++j) {
+        bool diag = false;
+        for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+            const int64_t i = sp.row_indices[k];
+            if (i == j) {
+                diag = true;
+            } else if (i > j && !diag) {
+                Ai.push_back(j); // keep rows ascending within the column
+                diag = true;
+            }
+            Ai.push_back(i);
+        }
+        if (!diag)
+            Ai.push_back(j);
+        Ap[j + 1] = static_cast<int64_t>(Ai.size());
+    }
+    klu_l_common common;
+    if (!klu_l_defaults(&common))
+        return -1.0;
+    klu_l_symbolic *sym = klu_l_analyze(n, Ap.data(), Ai.data(), &common);
+    if (sym == nullptr)
+        return -1.0;
+    const double stored =
+        sym->lnz + sym->unz - static_cast<double>(n) + static_cast<double>(sym->nzoff);
+    klu_l_free_symbolic(&sym, &common);
+    return stored / (static_cast<double>(n) * static_cast<double>(n));
+#else
+    (void)sp;
+    return -1.0;
+#endif
+}
+
+double ensure_lu_fill_estimate(const SharedModelData &sd) {
+    std::call_once(sd.lu_fill_once,
+                   [&] { sd.lu_fill_estimate = compute_lu_fill_estimate(sd.jac_sparsity); });
+    return sd.lu_fill_estimate;
 }
 
 // ─── Build ───────────────────────────────────────────────────────────────────

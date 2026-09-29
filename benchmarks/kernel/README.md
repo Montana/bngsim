@@ -88,8 +88,36 @@ pip install -e . --no-build-isolation
 Verify with `bngsim._bngsim_core` — `ModelBuilder().build().codegen_jacobian_plan()["has_klu"]`
 is `True` when the sparse path is available. Note that even with KLU compiled in,
 bngsim still auto-selects the *dense* solver for small / high-density models
-(`SPARSE_THRESHOLD`, `SPARSE_DENSITY_MAX` in `cvode_simulator.cpp`), so the dense
-path is always exercised where it wins.
+(`SPARSE_THRESHOLD`, `SPARSE_DENSITY_MAX` in `bngsim/sparse_jacobian.hpp`), so the
+dense path is always exercised where it wins — and, on a build with BLAS, sends a
+256–5,000-species model to the BLAS dense factor when its *LU* fills in though its
+Jacobian is sparse (the rule-derived case; see `docs/user-guide/solvers.md`).
+
+### Coupling loops on rule-derived networks
+
+`bench_coupling_loop.py` times the four cases that motivated that fill test and
+the two coupling-loop changes beside it, on networks you pass in (the ones that
+exposed them are too large to commit):
+
+| case | what it runs |
+|---|---|
+| `full` | one long ODE run of a large network, with the solver bngsim picks |
+| `loop` | 720 × (`set_state` with one coupling species overwritten → `advance(60 s)`) |
+| `rollback` | the same loop as predictor-corrector: advance, `set_state(saved, time=t0)`, advance again |
+| `tfun` | a function replaced by a time-indexed table: Jacobian strategy and run time |
+
+```bash
+uv run --no-sync python benchmarks/kernel/bench_coupling_loop.py \
+    --full-net egfr_erk.net --param egf_nM=30 --tfun-func egf_in \
+    --loop-net egfr_sos.net --loop-species 'ERK(S~PP)' --loop-value 1e6
+```
+
+Measured on an M-series Mac, a 1,319-species EGFR/ERK network (12 h, rtol 1e-6,
+atol 1e-2) and a 361-species EGFR/SOS loop, before → after: full 19.1 → 2.63 s,
+loop 9.50 → 1.91 s, rollback 19.0 → 3.82 s, tfun 23.4 s (FD Jacobian, KLU) →
+2.51 s (analytical, dense). `--loop-force-dense` isolates the factorization count
+kept across steps: with `BNGSIM_LAPACK_DENSE=1` the loop went 4.73 → 1.90 s from
+that change alone.
 
 ## Synthetic model
 

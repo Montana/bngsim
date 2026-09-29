@@ -223,6 +223,51 @@ class TestObservables:
         k.advance(10.0)
         np.testing.assert_allclose(k.observables(), k.last_result.observables[-1])
 
+    def test_observables_reflect_set_state_after_advance(self):
+        """The step result stops describing the state once set_state replaces
+        it; observables() used to keep returning the step's endpoint."""
+        k = _kernel(4, observables=True)
+        k.advance(5.0)
+        step = k.last_result
+        step_obs = np.array(step.observables[-1])
+        k.set_state(np.array([10.0, 20.0, 30.0, 40.0]))
+        obs = k.observables()
+        assert obs[0] == pytest.approx(100.0)  # Total = 10+20+30+40
+        assert obs[1] == pytest.approx(70.0)  # Tail = S2 + S3
+        assert not np.allclose(obs, step_obs)  # premise: the step ended elsewhere
+        # last_result still describes the step it came from.
+        assert k.last_result is step
+        np.testing.assert_array_equal(step.observables[-1], step_obs)
+
+    def test_rollback_then_redo_step(self):
+        """The predictor-corrector shape: after set_state(saved, time=t0) the
+        observables are the saved state's, and the redone step's afterwards."""
+        k = _kernel(5, observables=True)
+        k.advance(2.0)
+        saved, t0 = k.get_state().copy(), k.time
+        saved_obs = k.observables().copy()
+        k.advance(3.0)  # predictor
+        k.set_state(saved, time=t0)
+        np.testing.assert_allclose(k.observables(), saved_obs, rtol=1e-12)
+        k.advance(3.0)  # corrector
+        np.testing.assert_allclose(k.observables(), k.last_result.observables[-1])
+
+    def test_observables_after_a_stop_condition_reflect_the_moved_state(self):
+        """StopConditionMet is raised after the whole interval was integrated and
+        written back, so the state has moved but advance() never stored the
+        step's result: observables() must not fall back to the previous step's."""
+        sim = bngsim.Simulator(bngsim.Model(_core=_linear_chain(5, observables=True)))
+        k = ReactionKernel.from_simulator(sim)
+        k.advance(1.0)
+        before = np.array(k.observables())
+        sim.add_stop_condition("Tail > 1", label="tail")
+        with pytest.raises(bngsim.StopConditionMet):
+            k.advance(20.0)
+        state = k.get_state()
+        obs = k.observables()
+        assert obs[1] == pytest.approx(state[2] + state[3] + state[4], rel=1e-12)
+        assert not np.allclose(obs, before)
+
     def test_no_observables_returns_empty(self):
         k = _kernel(4, observables=False)
         assert k.observables().shape == (0,)

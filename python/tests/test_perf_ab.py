@@ -82,6 +82,23 @@ def test_the_default_model_set_is_committed():
         assert (_ROOT / "benchmarks" / m["net_file"]).is_file(), m["net_file"]
 
 
+def test_a_relative_interpreter_stays_in_its_venv(monkeypatch):
+    """``--candidate python:.venv/bin/python``, the command CONTRIBUTING documents.
+
+    A venv's interpreter is a symlink to the base one, and Python locates its venv
+    from the path it was started by. Resolving the relative spec followed the link
+    out of the venv, so the side could not import bngsim and the A/B stopped
+    before measuring anything. Run from the directory holding this test's own
+    interpreter, so the spec is relative the way that command's is.
+    """
+    exe = os.path.abspath(sys.executable)
+    base = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
+    monkeypatch.chdir(base)
+    side = P.resolve_side("python:" + os.path.relpath(exe, base), "3.12")
+    assert side["python"] == exe
+    assert "version" in side["identity"], side["identity"]
+
+
 def test_help_does_not_measure(capsys):
     with pytest.raises(SystemExit) as e:
         P.main(["--help"])

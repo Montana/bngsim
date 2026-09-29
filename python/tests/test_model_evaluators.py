@@ -71,9 +71,26 @@ def time_dependent(data_dir):
 
 @pytest.fixture
 def table_function(data_dir):
-    """A -> A + B at the tabulated rate cumNcases(t) — 22 at t = 7 — which the
-    symbolic differentiator declines, so the analytical Jacobian is incomplete."""
+    """A -> A + B at the tabulated rate cumNcases(t) — 22 at t = 7. The table is
+    indexed by time, so it is a coefficient to ``∂f/∂y`` and the analytical
+    Jacobian is complete."""
     return bngsim.Model.from_net(str(data_dir / "tfun_time_indexed.net"))
+
+
+@pytest.fixture
+def observable_table(tmp_path):
+    """A -> A + B at F(B_tot), a table with slope 2 on [0, 10]: dB/dt = 2·B·A.
+    The table reads the state through its index, which the symbolic
+    differentiator declines, so the analytical Jacobian is incomplete."""
+    path = tmp_path / "tfun_observable_indexed.net"
+    path.write_text(
+        "begin parameters\n  1 k0 0.0\nend parameters\n"
+        "begin functions\n  1 F() tfun([0,10],[0,20],B_tot)\nend functions\n"
+        "begin species\n  1 A() 1\n  2 B() 0\nend species\n"
+        "begin reactions\n  1 1 1,2 F\nend reactions\n"
+        "begin groups\n  1 A_tot 1\n  2 B_tot 2\nend groups\n"
+    )
+    return bngsim.Model.from_net(str(path))
 
 
 # ── stoichiometry_matrix ────────────────────────────────────────────────────
@@ -225,22 +242,32 @@ class TestJacobian:
             fd = model._core.fill_dense_fd_jacobian(0.0, np.asarray(y))
             np.testing.assert_allclose(fd, analytical, rtol=1e-6, atol=1e-9)
 
-    def test_incomplete_analytical_jacobian_is_differenced_and_says_so(self, table_function):
-        """A tabulated rate law has no symbolic derivative. The partial closed
-        form is never returned as if it were whole: the matrix is the
-        difference quotient, and `source` reports it — the same label
+    def test_incomplete_analytical_jacobian_is_differenced_and_says_so(self, observable_table):
+        """A table indexed by the state has no symbolic derivative here. The
+        partial closed form is never returned as if it were whole: the matrix is
+        the difference quotient, and `source` reports it — the same label
         SteadyStateResult.solver_jacobian_source uses for the same fallback."""
-        assert not table_function.prepare_analytical_jacobian()
-        J = table_function.jacobian([1.0, 0.0], t=7.0)
+        assert not observable_table.prepare_analytical_jacobian()
+        J = observable_table.jacobian([1.0, 3.0])
         assert J.source == "finite-difference"
-        # dB/dt = cumNcases(t)·A = 22·A at t = 7, and nothing else moves.
-        np.testing.assert_allclose(J, [[0.0, 0.0], [22.0, 0.0]], rtol=1e-6, atol=1e-9)
+        # dB/dt = F(B)·A = 2·B·A: ∂/∂A = F(3) = 6, ∂/∂B = 2·A = 2.
+        np.testing.assert_allclose(J, [[0.0, 0.0], [6.0, 2.0]], rtol=1e-6, atol=1e-9)
 
-    def test_sparse_form_is_the_same_matrix(self, reversible, table_function):
+    def test_time_indexed_table_is_analytical(self, table_function):
+        """A table indexed by time reads no species: its value at t is the
+        coefficient, exactly as ``time()`` would be."""
+        assert table_function.prepare_analytical_jacobian()
+        J = table_function.jacobian([1.0, 0.0], t=7.0)
+        assert J.source == "analytical"
+        # dB/dt = cumNcases(t)·A = 22·A at t = 7, and nothing else moves.
+        np.testing.assert_allclose(J, [[0.0, 0.0], [22.0, 0.0]], rtol=1e-12, atol=1e-12)
+
+    def test_sparse_form_is_the_same_matrix(self, reversible, table_function, observable_table):
         sparse = pytest.importorskip("scipy.sparse")
         for model, y, t, source in (
             (reversible, [100.0, 50.0, 3.0], 0.0, "analytical"),
-            (table_function, [1.0, 0.0], 7.0, "finite-difference"),
+            (table_function, [1.0, 0.0], 7.0, "analytical"),
+            (observable_table, [1.0, 3.0], 0.0, "finite-difference"),
         ):
             dense = model.jacobian(y, t=t)
             M = model.jacobian(y, t=t, sparse=True)
