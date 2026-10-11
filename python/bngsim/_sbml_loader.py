@@ -1879,14 +1879,8 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             kl = rxn.getKineticLaw()
             if kl is None or not kl.isSetMath():
                 return None
-            law_ctx = ctx
-            n_lp = kl.getNumLocalParameters() if hasattr(kl, "getNumLocalParameters") else 0
-            if n_lp:
-                law_ctx = dict(ctx)
-                for k in range(n_lp):
-                    lp = kl.getLocalParameter(k)
-                    if lp.isSetValue():
-                        law_ctx[lp.getId()] = lp.getValue()
+            _lv = _kinetic_law_local_values(kl)
+            law_ctx = {**ctx, **_lv} if _lv else ctx
             v = _eval_ast_numeric(kl.getMath(), law_ctx, func_defs)
             if v is None:
                 return None
@@ -3929,12 +3923,39 @@ def _classify_mass_action_ast(
     )
 
 
-def _collect_local_params(kl, rid, builder):
-    """Collect local parameters from a KineticLaw, handling both L2 and L3.
+def _kinetic_law_local_params(kl) -> list:
+    """A kinetic law's local parameters, on either SBML level.
 
-    SBML L2 stores local parameters under kl.getParameter(j) (accessed
-    via getNumParameters()), while L3 uses kl.getLocalParameter(j)
-    (accessed via getNumLocalParameters()).  963/978 BioModels are L2.
+    L3 lists them under ``getLocalParameter``. libsbml lists an L2 law's under
+    ``getParameter`` only: its ``getNumLocalParameters()`` is 0, so a reader that
+    asks just that sees no local parameter on 963/978 BioModels and resolves the
+    law's names to any global of the same id instead (issue #580).
+    """
+    n = kl.getNumLocalParameters()
+    if n > 0:
+        return [kl.getLocalParameter(j) for j in range(n)]
+    return [kl.getParameter(j) for j in range(kl.getNumParameters())]
+
+
+def _local_param_value(lp) -> float:
+    """A local parameter's value. An unset one has none: NaN, so nothing passes
+    it off as a number, or the 0.0 ``BNGSIM_ALLOW_UNSET_PARAMS=1`` asks for. A law
+    that reads an unset one is refused without that (C2b, issue #580)."""
+    if lp.isSetValue():
+        return lp.getValue()
+    import os
+
+    return 0.0 if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1" else float("nan")
+
+
+def _kinetic_law_local_values(kl) -> dict[str, float]:
+    """id → value of a kinetic law's local parameters, unset ones included so
+    that each shadows a global of the same id, as SBML scoping requires."""
+    return {lp.getId(): _local_param_value(lp) for lp in _kinetic_law_local_params(kl)}
+
+
+def _collect_local_params(kl, rid, builder):
+    """Register a KineticLaw's local parameters, on either SBML level.
 
     Returns ``(local_param_map, local_param_values)`` — the first maps
     original_id → mangled_id for expression rewriting, the second maps
@@ -3944,31 +3965,11 @@ def _collect_local_params(kl, rid, builder):
     """
     local_param_map = {}
     local_param_values: dict[str, float] = {}
-    n_lp_l3 = kl.getNumLocalParameters()
-    if n_lp_l3 > 0:
-        # SBML L3 path (or libsbml's L2 backwards-compat wrapper)
-        for j in range(n_lp_l3):
-            lp = kl.getLocalParameter(j)
-            orig_id = lp.getId()
-            lpid = f"_lp_{rid}_{orig_id}"
-            # An unset value is libsbml's NaN on this path. A law that reads it
-            # was refused at load (C2b, #580); one that does not gets the same
-            # 0.0 placeholder an unread global parameter does.
-            val = lp.getValue() if lp.isSetValue() else 0.0
-            builder.add_parameter(lpid, val)
-            local_param_map[orig_id] = lpid
-            local_param_values[lpid] = val
-    else:
-        # SBML L2 path: local params stored under KineticLaw directly
-        n_lp_l2 = kl.getNumParameters()
-        for j in range(n_lp_l2):
-            lp = kl.getParameter(j)
-            orig_id = lp.getId()
-            lpid = f"_lp_{rid}_{orig_id}"
-            val = lp.getValue() if lp.isSetValue() else 0.0
-            builder.add_parameter(lpid, val)
-            local_param_map[orig_id] = lpid
-            local_param_values[lpid] = val
+    for orig_id, val in _kinetic_law_local_values(kl).items():
+        lpid = f"_lp_{rid}_{orig_id}"
+        builder.add_parameter(lpid, val)
+        local_param_map[orig_id] = lpid
+        local_param_values[lpid] = val
     return local_param_map, local_param_values
 
 
@@ -4234,12 +4235,7 @@ def _build_model_from_sbml_doc(doc):
         _kl = _rxn.getKineticLaw()
         if _kl is None or not _kl.isSetMath():
             continue
-        _lps: dict[str, float] = {}
-        _n_lp = _kl.getNumLocalParameters() if hasattr(_kl, "getNumLocalParameters") else 0
-        for k in range(_n_lp):
-            _lp = _kl.getLocalParameter(k)
-            if _lp.isSetValue():
-                _lps[_lp.getId()] = _lp.getValue()
+        _lps = _kinetic_law_local_values(_kl)
         _rid_laws.append((_rid, _kl.getMath(), _lps))
         _rv = _eval_ast_numeric(_kl.getMath(), {**eval_ctx, **_lps}, func_defs)
         if _rv is not None and _math.isfinite(_rv):
@@ -4493,28 +4489,25 @@ def _build_model_from_sbml_doc(doc):
                     "default-to-0 behavior, set BNGSIM_ALLOW_UNSET_PARAMS=1."
                 )
 
-    # ── C2b: the same for a kineticLaw's LOCAL parameters (issue #580) ──
+    # ── C2b: a kineticLaw's valueless LOCAL parameter (issue #580) ──
     # C2 above walks only the model's global <parameter>s. A local one with no
-    # `value=` reached `_collect_local_params`, which read it as 0.0 on the L2
-    # path and as libsbml's NaN on the L3 one: the first loaded and ran with the
-    # reaction silently switched off, the second failed in CVODE with a message
-    # about logarithms of negative states. A local parameter is in scope only in
-    # its own law and nothing can assign it, so "unset and read by its law" is the
-    # whole test. Same refusal and same hatch as C2; RoadRunner is no stricter
-    # here (it runs the L2 shape with the zero), but no model in the BioModels
-    # corpus or the SBML semantic suite has a valueless local parameter a law
-    # reads, so refusing costs nothing a reference engine runs.
+    # `value=` used to load as 0.0 on L2 (the reaction silently switched off) and
+    # as libsbml's NaN on L3 (a CVODE failure blaming negative states). A local
+    # parameter is in scope only in its own law and nothing can assign it, so
+    # "unset and named by its law" is the whole test. Like C2 it goes by what the
+    # math names, not what it uses, so `piecewise(k, false, 1)` or a function
+    # that ignores the argument still refuses; no corpus model has either. Same
+    # refusal and hatch as C2. RoadRunner is no stricter here (it runs the L2
+    # shape with the zero), but no model in the BioModels corpus or the SBML
+    # semantic suite has a valueless local parameter its law reads, so refusing
+    # costs nothing a reference engine runs.
     _unset_local: list[tuple[str, str]] = []
     for j in range(sbml_model.getNumReactions()):
         _rx = sbml_model.getReaction(j)
         _kl = _rx.getKineticLaw()
         if _kl is None or not _kl.isSetMath():
             continue
-        if _kl.getNumLocalParameters() > 0:
-            _lps = [_kl.getLocalParameter(k) for k in range(_kl.getNumLocalParameters())]
-        else:
-            _lps = [_kl.getParameter(k) for k in range(_kl.getNumParameters())]
-        _unset_ids = {lp.getId() for lp in _lps if not lp.isSetValue()}
+        _unset_ids = {lp.getId() for lp in _kinetic_law_local_params(_kl) if not lp.isSetValue()}
         if not _unset_ids:
             continue
         _read: set[str] = set()
@@ -4525,24 +4518,25 @@ def _build_model_from_sbml_doc(doc):
 
         from bngsim._exceptions import UnderSpecifiedModelError
 
-        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
-            for rid, lpid in _unset_local:
-                logger.warning(
-                    "Local parameter '%s' of reaction '%s' has no value "
-                    "attribute, but its kineticLaw reads it. bngsim defaults the "
-                    "value to 0.0 (BNGSIM_ALLOW_UNSET_PARAMS=1); this will "
-                    "silently zero out the rate law. Set the parameter value.",
-                    lpid,
-                    rid,
-                )
+        names = ", ".join(f"{lpid!r} (reaction {rid!r})" for rid, lpid in _unset_local)
+        if len(_unset_local) == 1:
+            lead = f"Local parameter {names} has no value attribute, but its kineticLaw reads it"
         else:
-            names = ", ".join(f"{lpid!r} (reaction {rid!r})" for rid, lpid in _unset_local)
-            noun = "parameter" if len(_unset_local) == 1 else "parameters"
+            lead = (
+                f"Local parameters {names} have no value attribute, but their "
+                "kineticLaws read them"
+            )
+        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            logger.warning(
+                "%s. bngsim defaults the value to 0.0 (BNGSIM_ALLOW_UNSET_PARAMS=1), "
+                "which silently zeroes out the rate law. Set the value.",
+                lead,
+            )
+        else:
             raise UnderSpecifiedModelError(
-                f"Local {noun} {names} {'has' if len(_unset_local) == 1 else 'have'} "
-                "no value attribute, but the reaction's kineticLaw reads it. The "
-                "model is under-specified: bngsim refuses to default the value to "
-                "0.0, which would silently zero out the rate law and return a "
+                f"{lead}. "
+                "The model is under-specified: bngsim refuses to default the value "
+                "to 0.0, which would silently zero out the rate law and return a "
                 "wrong-but-plausible trajectory. Set the parameter value. To "
                 "restore the legacy lenient default-to-0 behavior, set "
                 "BNGSIM_ALLOW_UNSET_PARAMS=1."
@@ -5593,8 +5587,7 @@ def _build_model_from_sbml_doc(doc):
             _rx = sbml_model.getReaction(_j)
             _kl = _rx.getKineticLaw()
             if _rx.getId() in eval_ctx and _kl is not None and _kl.isSetMath():
-                _lps = [_kl.getLocalParameter(_k) for _k in range(_kl.getNumLocalParameters())]
-                _loc = {_lp.getId(): _lp.getValue() for _lp in _lps if _lp.isSetValue()}
+                _loc = _kinetic_law_local_values(_kl)
                 _folds.append(("reaction", _rx.getId(), _rx.getId(), _kl.getMath(), _loc or None))
     _grew = bool(_cause)
     while _grew:

@@ -61,9 +61,10 @@ class UnderSpecifiedModelError(ModelError):
     Typed (issue #323) so a caller can tell "this model is under-specified" from
     the other things :class:`ModelError` covers — a ``.net`` parse failure, an
     invalid model state. Parity suites bucket it ``UNSUPPORTED``: a clean,
-    documented refusal, not an actionable bngsim bug. Set the parameter's value,
-    add an ``<initialAssignment>``, or opt into the legacy lenient behavior with
-    ``BNGSIM_ALLOW_UNSET_PARAMS=1`` (which downgrades this to a warning).
+    documented refusal, not an actionable bngsim bug. Set the parameter's value
+    (a global one can take an ``<initialAssignment>`` instead), or opt into the
+    legacy lenient behavior with ``BNGSIM_ALLOW_UNSET_PARAMS=1`` (which
+    downgrades this to a warning).
     """
 
 

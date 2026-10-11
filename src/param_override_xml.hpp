@@ -97,8 +97,8 @@ inline std::optional<std::string> extract_xml_attr(const std::string &line, cons
 
 // Parse a whole `value=` payload as a double. False when it is not one number,
 // so the caller can refuse rather than invent a value (issue #580). strtod rather
-// than std::stod: stod throws on ERANGE, so an overflowing `1e400` used to land
-// in the catch-all below as 0.0 when the double it denotes is inf.
+// than std::stod: stod throws on ERANGE, and the catch-all that used to wrap it
+// here turned an overflowing `1e400` into 0.0 when the double it denotes is inf.
 inline bool parse_xml_number(const std::string &text, double &out) {
     const char *begin = text.c_str();
     char *end = nullptr;

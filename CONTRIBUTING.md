@@ -348,7 +348,7 @@ preference:
    `UnderSpecifiedModelError`, which names the symbol and the
    `BNGSIM_ALLOW_UNSET_PARAMS=1` opt-out (SBML global and local parameters, #94,
    #323, #580). The `.net` loader refuses an expression it cannot compile and an
-   initial concentration that names no parameter (#554, #571).
+   initial concentration that names no parameter (#602, #571).
 2. **Return something the caller cannot mistake for a value:** `None`,
    `std::optional`, or a placeholder paired with a flag that the reader of the
    flag replaces, like the `.net` loader's `is_expression`.
@@ -356,8 +356,8 @@ preference:
    reference engine runs with the same default. That is why a non-finite
    compartment size (#353) and a species with no initial value (#580) warn
    instead of refusing: RoadRunner runs both shapes, and corpus models depend on
-   it. Say what was substituted and for which names, once per load and not once
-   per symbol.
+   it. Say what was substituted and for which names, in one message per load
+   rather than one per symbol.
 
 The shapes to look for in review are `except Exception: x = 0.0`,
 `d.get(name, 0.0)` for a name that ought to be there, `catch (...) { v = 0.0; }`,

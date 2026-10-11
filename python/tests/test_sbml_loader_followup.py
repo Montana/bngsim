@@ -9,6 +9,8 @@ regression cases.
 
 from __future__ import annotations
 
+import math
+
 import bngsim
 import pytest
 
@@ -343,8 +345,14 @@ def test_c2_unset_param_with_initial_assignment_does_not_warn(caplog):
 # as libsbml's NaN on the L3 path (a CVODE failure blaming negative states).
 
 
-def _local_param_sbml(level: int, local_decl: str, law_reads: str = "k") -> str:
-    """`A -> 0` at rate `<law_reads> * A`, with `local_decl` as the law's local list."""
+def _local_param_sbml(
+    level: int, local_decl: str, law_reads: str = "k", model_k: bool = False
+) -> str:
+    """`A -> 0` at rate `<law_reads> * A`, with `local_decl` as the law's local list.
+
+    `model_k` adds a global `k = 5` for the local one to shadow, and `p`, whose
+    initialAssignment reads the reaction id `R1` (its rate, `k * A` at t=0).
+    """
     if level == 2:
         head = '<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">'
         comp = '<compartment id="c" size="1"/>'
@@ -352,6 +360,7 @@ def _local_param_sbml(level: int, local_decl: str, law_reads: str = "k") -> str:
         rxn = '<reaction id="R1" reversible="false">'
         ref = '<speciesReference species="A"/>'
         lps = f"<listOfParameters>{local_decl}</listOfParameters>"
+        params = '<parameter id="k" value="5"/><parameter id="p"/>'
     else:
         head = '<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">'
         comp = '<compartment id="c" size="1" constant="true"/>'
@@ -362,11 +371,23 @@ def _local_param_sbml(level: int, local_decl: str, law_reads: str = "k") -> str:
         rxn = '<reaction id="R1" reversible="false" fast="false">'
         ref = '<speciesReference species="A" stoichiometry="1" constant="true"/>'
         lps = f"<listOfLocalParameters>{local_decl}</listOfLocalParameters>"
+        params = '<parameter id="k" value="5" constant="true"/><parameter id="p" constant="true"/>'
+    globals_ = (
+        f"""<listOfParameters>{params}</listOfParameters>
+        <listOfInitialAssignments>
+          <initialAssignment symbol="p">
+            <math xmlns="http://www.w3.org/1998/Math/MathML"><ci>R1</ci></math>
+          </initialAssignment>
+        </listOfInitialAssignments>"""
+        if model_k
+        else ""
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
     {head}
       <model id="m">
         <listOfCompartments>{comp}</listOfCompartments>
         <listOfSpecies>{spec}</listOfSpecies>
+        {globals_}
         <listOfReactions>
           {rxn}
             <listOfReactants>{ref}</listOfReactants>
@@ -426,8 +447,91 @@ def test_c2b_unset_local_param_the_law_does_not_read_loads(monkeypatch, caplog, 
     )
     spare = local.replace('id="k" value="0.5"', 'id="spare"')
     with caplog.at_level(logging.WARNING, logger="bngsim"):
-        bngsim.Model.from_sbml_string(_local_param_sbml(level, local + spare))
+        model = bngsim.Model.from_sbml_string(_local_param_sbml(level, local + spare))
     assert not [r for r in caplog.records if "spare" in r.getMessage()]
+    # It has no value, and reads as none rather than as a plausible 0.0.
+    assert math.isnan(model.get_param("_lp_R1_spare"))
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_unset_local_param_shadowing_a_global_refuses(monkeypatch, level):
+    """SBML scoping: the law's `k` is the local one, so a global `k` does not
+    give it a value."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    with pytest.raises(bngsim.UnderSpecifiedModelError, match="'k' \\(reaction 'R1'\\)"):
+        bngsim.Model.from_sbml_string(_local_param_sbml(level, _unset_local(level), model_k=True))
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_local_param_shadows_global_where_initial_values_fold(level):
+    """`p = R1` folds R1's law at load. On L2 that fold read only
+    `getLocalParameter`, which libsbml leaves empty there, so the global `k = 5`
+    stood in for the local `k = 0.5`: p came out 50 where RoadRunner gives 5."""
+    local = (
+        '<parameter id="k" value="0.5"/>'
+        if level == 2
+        else ('<localParameter id="k" value="0.5"/>')
+    )
+    model = bngsim.Model.from_sbml_string(_local_param_sbml(level, local, model_k=True))
+    assert model.get_param("p") == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_hatch_zero_reaches_initial_value_folds(monkeypatch, level):
+    """Under the hatch the unset local `k` is 0.0 in the fold too. The fold used
+    to skip it and read the global `k = 5`, giving p = 50 beside a warning that
+    the rate law was zeroed."""
+    monkeypatch.setenv("BNGSIM_ALLOW_UNSET_PARAMS", "1")
+    model = bngsim.Model.from_sbml_string(
+        _local_param_sbml(level, _unset_local(level), model_k=True)
+    )
+    assert model.get_param("p") == 0.0
+
+
+def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
+    """Same for `rateOf(A)` in an initialAssignment, which folds R1's law too:
+    it read the global `k = 5` and gave p = -50."""
+    monkeypatch.setenv("BNGSIM_ALLOW_UNSET_PARAMS", "1")
+    sbml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+      <model id="m">
+        <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+        <listOfSpecies>
+          <species id="A" compartment="c" initialConcentration="10"
+                   hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+        </listOfSpecies>
+        <listOfParameters>
+          <parameter id="k" value="5" constant="true"/>
+          <parameter id="p" constant="true"/>
+        </listOfParameters>
+        <listOfInitialAssignments>
+          <initialAssignment symbol="p">
+            <math xmlns="http://www.w3.org/1998/Math/MathML">
+              <apply>
+                <csymbol encoding="text"
+                         definitionURL="http://www.sbml.org/sbml/symbols/rateOf">rateOf</csymbol>
+                <ci>A</ci>
+              </apply>
+            </math>
+          </initialAssignment>
+        </listOfInitialAssignments>
+        <listOfReactions>
+          <reaction id="R1" reversible="false">
+            <listOfReactants>
+              <speciesReference species="A" stoichiometry="1" constant="true"/>
+            </listOfReactants>
+            <kineticLaw>
+              <math xmlns="http://www.w3.org/1998/Math/MathML">
+                <apply><times/><ci>k</ci><ci>A</ci></apply>
+              </math>
+              <listOfLocalParameters><localParameter id="k"/></listOfLocalParameters>
+            </kineticLaw>
+          </reaction>
+        </listOfReactions>
+      </model>
+    </sbml>"""
+    model = bngsim.Model.from_sbml_string(sbml)
+    assert model.get_param("p") == 0.0
 
 
 # ─── #580: a species the model never gives an initial value ─────────────
