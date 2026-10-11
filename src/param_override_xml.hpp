@@ -30,6 +30,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -94,6 +95,27 @@ inline std::optional<std::string> extract_xml_attr(const std::string &line, cons
     return std::nullopt;
 }
 
+// Parse a whole `value=` payload as a double. False when it is not one number,
+// so the caller can refuse rather than invent a value (issue #580). strtod rather
+// than std::stod: stod throws on ERANGE, so an overflowing `1e400` used to land
+// in the catch-all below as 0.0 when the double it denotes is inf.
+inline bool parse_xml_number(const std::string &text, double &out) {
+    const char *begin = text.c_str();
+    char *end = nullptr;
+    const double v = std::strtod(begin, &end);
+    if (end == begin) {
+        return false;
+    }
+    while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    out = v;
+    return true;
+}
+
 struct XmlParam {
     std::string name;
     std::string expr;
@@ -110,6 +132,10 @@ class XmlParamTable {
         if (loaded) {
             return;
         }
+        // A load that threw part-way leaves `loaded` false; start clean so the
+        // next call does not append a second copy of the rows it did read.
+        params.clear();
+        index.clear();
         std::ifstream in(xml_path);
         if (!in) {
             throw std::runtime_error("XmlParamTable: cannot open XML file '" + xml_path + "'");
@@ -140,15 +166,20 @@ class XmlParamTable {
             }
             XmlParam p;
             p.name = *id;
-            if (auto v = extract_xml_attr(trimmed, "value")) {
-                try {
-                    p.xml_value = std::stod(*v);
-                } catch (const std::exception &) {
-                    p.xml_value = 0.0;
-                }
-            }
             if (auto e = extract_xml_attr(trimmed, "expr")) {
                 p.expr = *e;
+            }
+            // With an `expr=`, `value=` only seeds the slot the expression is
+            // re-evaluated into. Without one it IS the value, and gets baked into
+            // the override XML the engine reads, so an unreadable one used to
+            // become a 0.0 the file never said (issue #580): refuse it instead.
+            auto v = extract_xml_attr(trimmed, "value");
+            const bool have_value = v && parse_xml_number(*v, p.xml_value);
+            if (!have_value && p.expr.empty()) {
+                throw std::runtime_error(
+                    "XmlParamTable: parameter '" + p.name + "' has no expr= and " +
+                    (v ? "its value= ('" + *v + "') is not a number" : "no value=") +
+                    ", so it has no value to propagate parameter overrides from");
             }
             index[p.name] = params.size();
             params.push_back(std::move(p));

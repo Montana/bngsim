@@ -3951,7 +3951,10 @@ def _collect_local_params(kl, rid, builder):
             lp = kl.getLocalParameter(j)
             orig_id = lp.getId()
             lpid = f"_lp_{rid}_{orig_id}"
-            val = lp.getValue()
+            # An unset value is libsbml's NaN on this path. A law that reads it
+            # was refused at load (C2b, #580); one that does not gets the same
+            # 0.0 placeholder an unread global parameter does.
+            val = lp.getValue() if lp.isSetValue() else 0.0
             builder.add_parameter(lpid, val)
             local_param_map[orig_id] = lpid
             local_param_values[lpid] = val
@@ -4489,6 +4492,61 @@ def _build_model_from_sbml_doc(doc):
                     "initialAssignment. To restore the legacy lenient "
                     "default-to-0 behavior, set BNGSIM_ALLOW_UNSET_PARAMS=1."
                 )
+
+    # ── C2b: the same for a kineticLaw's LOCAL parameters (issue #580) ──
+    # C2 above walks only the model's global <parameter>s. A local one with no
+    # `value=` reached `_collect_local_params`, which read it as 0.0 on the L2
+    # path and as libsbml's NaN on the L3 one: the first loaded and ran with the
+    # reaction silently switched off, the second failed in CVODE with a message
+    # about logarithms of negative states. A local parameter is in scope only in
+    # its own law and nothing can assign it, so "unset and read by its law" is the
+    # whole test. Same refusal and same hatch as C2; RoadRunner is no stricter
+    # here (it runs the L2 shape with the zero), but no model in the BioModels
+    # corpus or the SBML semantic suite has a valueless local parameter a law
+    # reads, so refusing costs nothing a reference engine runs.
+    _unset_local: list[tuple[str, str]] = []
+    for j in range(sbml_model.getNumReactions()):
+        _rx = sbml_model.getReaction(j)
+        _kl = _rx.getKineticLaw()
+        if _kl is None or not _kl.isSetMath():
+            continue
+        if _kl.getNumLocalParameters() > 0:
+            _lps = [_kl.getLocalParameter(k) for k in range(_kl.getNumLocalParameters())]
+        else:
+            _lps = [_kl.getParameter(k) for k in range(_kl.getNumParameters())]
+        _unset_ids = {lp.getId() for lp in _lps if not lp.isSetValue()}
+        if not _unset_ids:
+            continue
+        _read: set[str] = set()
+        _walk_name_refs(_kl.getMath(), _unset_ids, _read)
+        _unset_local.extend((_rx.getId(), lpid) for lpid in sorted(_read))
+    if _unset_local:
+        import os
+
+        from bngsim._exceptions import UnderSpecifiedModelError
+
+        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            for rid, lpid in _unset_local:
+                logger.warning(
+                    "Local parameter '%s' of reaction '%s' has no value "
+                    "attribute, but its kineticLaw reads it. bngsim defaults the "
+                    "value to 0.0 (BNGSIM_ALLOW_UNSET_PARAMS=1); this will "
+                    "silently zero out the rate law. Set the parameter value.",
+                    lpid,
+                    rid,
+                )
+        else:
+            names = ", ".join(f"{lpid!r} (reaction {rid!r})" for rid, lpid in _unset_local)
+            noun = "parameter" if len(_unset_local) == 1 else "parameters"
+            raise UnderSpecifiedModelError(
+                f"Local {noun} {names} {'has' if len(_unset_local) == 1 else 'have'} "
+                "no value attribute, but the reaction's kineticLaw reads it. The "
+                "model is under-specified: bngsim refuses to default the value to "
+                "0.0, which would silently zero out the rate law and return a "
+                "wrong-but-plausible trajectory. Set the parameter value. To "
+                "restore the legacy lenient default-to-0 behavior, set "
+                "BNGSIM_ALLOW_UNSET_PARAMS=1."
+            )
 
     # Pre-scan rate-rule targets and event-assignment targets up front so
     # both step 1 (compartments) and step 2 (parameters) can skip IDs that
@@ -5625,6 +5683,9 @@ def _build_model_from_sbml_doc(doc):
         for _sr in range(_rxn.getNumProducts()):
             reaction_species.add(_rxn.getProduct(_sr).getSpecies())
 
+    # (#580) Species the model never gives a starting value; see the warning
+    # after this loop.
+    unset_ic_species: list[str] = []
     for i in range(sbml_model.getNumSpecies()):
         sp = sbml_model.getSpecies(i)
         sid = sp.getId()
@@ -5662,6 +5723,11 @@ def _build_model_from_sbml_doc(doc):
             declared_amount = float(amt)
         else:
             ic = 0.0
+            # An assignment rule or a (not numerically folded) initialAssignment
+            # gives the value later; only a species with neither starts at a 0.0
+            # the model never wrote.
+            if sid not in assignment_targets and sid not in _ia_math:
+                unset_ic_species.append(sid)
 
         # Boundary species with rate rules should NOT be fixed —
         # the rate rule provides their dynamics via step 8.
@@ -5756,6 +5822,30 @@ def _build_model_from_sbml_doc(doc):
         # that carries a compound expression to issue #43's chain rule.
         _register_ic_param_ref(
             builder, idx, sid, ia_single_param_ref, ia_expr_param, _declared_param_ids
+        )
+
+    # (#580) SBML leaves such a species' initial value undefined, so the 0.0 above
+    # is bngsim's choice, not the model's, and it must not pass for a value the
+    # model wrote. Warn rather than refuse, as #353 does for a non-finite
+    # compartment size: RoadRunner starts these species at 0 too, and 7 of the 8
+    # BioModels that have one pass rr_parity with it (5 are genome-scale models
+    # with thousands each, hence one capped message rather than one per species).
+    # C2/C2b refuse a valueless parameter instead because a zero rate constant
+    # silently switches a reaction off, and RoadRunner refuses the global case.
+    if unset_ic_species:
+        shown = ", ".join(repr(s) for s in unset_ic_species[:10])
+        more = len(unset_ic_species) - 10
+        if more > 0:
+            shown += f", ... ({more} more)"
+        logger.warning(
+            "%d species %s no initialAmount, initialConcentration, initialAssignment "
+            "or assignmentRule, so SBML leaves the initial value undefined; bngsim "
+            "starts %s at 0.0, as RoadRunner does: %s. Set the initial value if 0 is "
+            "not what the model means.",
+            len(unset_ic_species),
+            "has" if len(unset_ic_species) == 1 else "have",
+            "it" if len(unset_ic_species) == 1 else "them",
+            shown,
         )
 
     # ── 3b. Model / species conversionFactor (GH #232) ────────────────
