@@ -1360,16 +1360,20 @@ def _collect_state_discontinuity_conditions(
                         child_names = _ast_name_set(child)
                         next_expr[pname] = _ast_to_exprtk_recursive(child, func_defs, local_expr)
                         val = _eval_ast_numeric(child, ctx, func_defs, time_value=None)
-                        if val is None:
-                            next_values.pop(pname, None)
-                        else:
-                            next_values[pname] = val
+                        # An argument with no load-time value binds the formal to
+                        # NaN, which yields no threshold: dropping it let a global
+                        # of the formal's name supply the start value (#580).
+                        next_values[pname] = float("nan") if val is None else val
                         if (
                             _ast_references_time(child)
                             or bool((child_names - local_expr.keys()) & time_dependent_names)
                             or bool(child_names & local_time_dependent)
                         ):
                             next_td.add(pname)
+                        else:
+                            # Rebinding clears what an outer formal of this name
+                            # carried in.
+                            next_td.discard(pname)
                     stack.append((body, next_expr, next_values, next_td, seen_funcs | {fname}))
 
 
@@ -4546,9 +4550,9 @@ def _build_model_from_sbml_doc(doc):
         if not _unset_ids:
             continue
         _read: set[str] = set()
-        # A name in a called function's body that is not one of its formals
-        # resolves to the law's local (the translator merges that scope in), so
-        # it is read as surely as one in the law itself.
+        # A name in a called function's body that is not a formal of it or of any
+        # function on the call path resolves to the law's local (the translator
+        # merges that scope in), so it is read as surely as one in the law itself.
         for _body, _scope, _ in _iter_funcdef_scan_frames(
             _kl.getMath(), func_defs, lambda *_: False
         ):

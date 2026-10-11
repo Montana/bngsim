@@ -638,6 +638,103 @@ def test_c2b_unset_local_param_read_through_a_function_body_refuses(monkeypatch,
         bngsim.Model.from_sbml_string(sbml)
 
 
+def _with_functions(sbml: str, defs: dict[str, tuple[list[str], str]]) -> str:
+    """Insert <functionDefinition>s: name -> (formals, body MathML)."""
+    fds = "".join(
+        f'<functionDefinition id="{name}"><math xmlns="http://www.w3.org/1998/Math/MathML">'
+        f"<lambda>{''.join(f'<bvar><ci>{a}</ci></bvar>' for a in formals)}{body}</lambda>"
+        "</math></functionDefinition>"
+        for name, (formals, body) in defs.items()
+    )
+    return sbml.replace(
+        "<listOfCompartments>",
+        f"<listOfFunctionDefinitions>{fds}</listOfFunctionDefinitions><listOfCompartments>",
+        1,
+    )
+
+
+@pytest.mark.parametrize("level", [2, 3])
+@pytest.mark.parametrize(
+    "defs",
+    [
+        {"f": (["k"], "<apply><times/><cn>2</cn><ci>k</ci></apply>")},
+        {
+            "f": (["k"], "<apply><ci>g</ci><ci>A</ci></apply>"),
+            "g": (["y"], "<apply><times/><ci>k</ci><ci>y</ci></apply>"),
+        },
+    ],
+    ids=["formal-k", "outer-formal-k"],
+)
+def test_c2b_function_formal_named_like_an_unset_local_is_not_a_read(monkeypatch, level, defs):
+    """A formal `k`, or an outer function's formal `k` that a nested body reads,
+    binds `k` on that path; the unset local `k` is not read and must not refuse."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    sbml = _with_functions(
+        _local_param_sbml(level, _unset_local(level)).replace(
+            "<apply><times/><ci>k</ci><ci>A</ci></apply>", "<apply><ci>f</ci><ci>A</ci></apply>"
+        ),
+        defs,
+    )
+    model = bngsim.Model.from_sbml_string(sbml)
+    assert not [n for n in model.param_names if n == "_lp_R1_k"]
+
+
+def _root_count(law: str, defs: dict, extra_params: str = "") -> int:
+    sbml = _with_functions(
+        _local_param_sbml(3, "").replace("<apply><times/><ci>k</ci><ci>A</ci></apply>", law), defs
+    )
+    sbml = sbml.replace(
+        "<listOfReactions>",
+        f"<listOfParameters>{extra_params}</listOfParameters><listOfReactions>"
+        if extra_params
+        else "<listOfReactions>",
+    )
+    return bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers
+
+
+_TIME = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+def test_floor_ceiling_formal_rebound_to_a_constant_is_not_time_dependent():
+    """`f(a, x) = g(0.5, x)` with `g(a, x) = ceiling(a*x)`: g's `a` is 0.5 whatever
+    f's `a` was, so `f(time, A)` gets the roots `f(0.5, A)` does. The scan kept
+    f's time dependence on the rebound name and registered none."""
+    defs = {
+        "f": (["a", "x"], "<apply><ci>g</ci><cn>0.5</cn><ci>x</ci></apply>"),
+        "g": (["a", "x"], "<apply><ceiling/><apply><times/><ci>a</ci><ci>x</ci></apply></apply>"),
+    }
+    reference = _root_count("<apply><ci>f</ci><cn>0.5</cn><ci>A</ci></apply>", defs)
+    assert reference > 0
+    assert _root_count(f"<apply><ci>f</ci>{_TIME}<ci>A</ci></apply>", defs) == reference
+
+
+def test_floor_ceiling_formal_with_no_load_time_value_does_not_read_a_global():
+    """`g(q, x) = ceiling(q*x)` called as `g(B, A)`, B a species with no value at
+    load: the scan dropped `q` and started from the global `q = 2` instead,
+    registering 20 roots on a value the model never has."""
+    ceil_qx = "<apply><ceiling/><apply><times/><ci>q</ci><ci>x</ci></apply></apply>"
+    defs = {"g": (["q", "x"], ceil_qx)}
+    law = "<apply><ci>g</ci><ci>B</ci><ci>A</ci></apply>"
+    sbml_b = (
+        '<species id="B" compartment="c" hasOnlySubstanceUnits="false" '
+        'boundaryCondition="false" constant="false"/>'
+    )
+    sbml = _with_functions(
+        _local_param_sbml(3, "")
+        .replace("<apply><times/><ci>k</ci><ci>A</ci></apply>", law)
+        .replace("</listOfSpecies>", sbml_b + "</listOfSpecies>")
+        .replace(
+            "<listOfReactions>",
+            '<listOfParameters><parameter id="q" value="2" constant="true"/>'
+            "</listOfParameters><listOfReactions>",
+        ),
+        defs,
+    )
+    assert bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers == 0
+
+
 def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
     """Same for `rateOf(A)` in an initialAssignment, which folds R1's law too:
     it read the global `k = 5` and gave p = -50."""
