@@ -132,10 +132,6 @@ class XmlParamTable {
         if (loaded) {
             return;
         }
-        // A load that threw part-way leaves `loaded` false; start clean so the
-        // next call does not append a second copy of the rows it did read.
-        params.clear();
-        index.clear();
         std::ifstream in(xml_path);
         if (!in) {
             throw std::runtime_error("XmlParamTable: cannot open XML file '" + xml_path + "'");

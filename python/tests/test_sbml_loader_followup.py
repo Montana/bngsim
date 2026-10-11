@@ -336,6 +336,191 @@ def test_c2_unset_param_with_initial_assignment_does_not_warn(caplog):
     assert not [m for m in msgs if "kdeg" in m and "no value attribute" in m], msgs
 
 
+# ─── C2b (#580): a kineticLaw's valueless LOCAL parameter ───────────────
+#
+# C2 above covers only the model's global <parameter>s. A local one with no
+# `value=` loaded as 0.0 on the L2 path (the reaction silently switched off) and
+# as libsbml's NaN on the L3 path (a CVODE failure blaming negative states).
+
+
+def _local_param_sbml(level: int, local_decl: str, law_reads: str = "k") -> str:
+    """`A -> 0` at rate `<law_reads> * A`, with `local_decl` as the law's local list."""
+    if level == 2:
+        head = '<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">'
+        comp = '<compartment id="c" size="1"/>'
+        spec = '<species id="A" compartment="c" initialConcentration="10"/>'
+        rxn = '<reaction id="R1" reversible="false">'
+        ref = '<speciesReference species="A"/>'
+        lps = f"<listOfParameters>{local_decl}</listOfParameters>"
+    else:
+        head = '<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">'
+        comp = '<compartment id="c" size="1" constant="true"/>'
+        spec = (
+            '<species id="A" compartment="c" initialConcentration="10" '
+            'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+        )
+        rxn = '<reaction id="R1" reversible="false" fast="false">'
+        ref = '<speciesReference species="A" stoichiometry="1" constant="true"/>'
+        lps = f"<listOfLocalParameters>{local_decl}</listOfLocalParameters>"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    {head}
+      <model id="m">
+        <listOfCompartments>{comp}</listOfCompartments>
+        <listOfSpecies>{spec}</listOfSpecies>
+        <listOfReactions>
+          {rxn}
+            <listOfReactants>{ref}</listOfReactants>
+            <kineticLaw>
+              <math xmlns="http://www.w3.org/1998/Math/MathML">
+                <apply><times/><ci>{law_reads}</ci><ci>A</ci></apply>
+              </math>
+              {lps}
+            </kineticLaw>
+          </reaction>
+        </listOfReactions>
+      </model>
+    </sbml>"""
+
+
+def _unset_local(level: int) -> str:
+    return '<parameter id="k"/>' if level == 2 else '<localParameter id="k"/>'
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_unset_local_param_read_by_its_law_refuses(monkeypatch, level):
+    """Refused like a global one, naming the parameter, its reaction and the hatch."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    with pytest.raises(bngsim.UnderSpecifiedModelError) as exc:
+        bngsim.Model.from_sbml_string(_local_param_sbml(level, _unset_local(level)))
+    msg = str(exc.value)
+    assert "'k'" in msg and "'R1'" in msg, msg
+    assert "BNGSIM_ALLOW_UNSET_PARAMS" in msg
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_unset_local_param_hatch_loads_at_zero(monkeypatch, caplog, level):
+    """Under the hatch both levels load at 0.0 and say so. L3 used to read
+    libsbml's NaN here and fail in CVODE instead, so the two paths now agree."""
+    import logging
+
+    import numpy as np
+
+    monkeypatch.setenv("BNGSIM_ALLOW_UNSET_PARAMS", "1")
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(_local_param_sbml(level, _unset_local(level)))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert [m for m in msgs if "'k'" in m and "'R1'" in m and "no value" in m], msgs
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0, 1), n_points=3)
+    np.testing.assert_array_equal(result.species[:, 0], [10.0, 10.0, 10.0])
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_unset_local_param_the_law_does_not_read_loads(monkeypatch, caplog, level):
+    """A valueless local parameter its law never reads changes nothing: no
+    refusal and no warning, as for an unread global one."""
+    import logging
+
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    local = (
+        '<parameter id="k" value="0.5"/>' if level == 2 else '<localParameter id="k" value="0.5"/>'
+    )
+    spare = local.replace('id="k" value="0.5"', 'id="spare"')
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        bngsim.Model.from_sbml_string(_local_param_sbml(level, local + spare))
+    assert not [r for r in caplog.records if "spare" in r.getMessage()]
+
+
+# ─── #580: a species the model never gives an initial value ─────────────
+#
+# SBML leaves it undefined. bngsim starts it at 0.0, as RoadRunner does (7 of the
+# 8 BioModels with one pass rr_parity that way), but says so instead of passing
+# the zero off as a value the model wrote.
+
+
+def _species_sbml(species: str, extra: str = "") -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">
+      <model id="m">
+        <listOfCompartments>
+          <compartment id="c" size="1" constant="true"/>
+        </listOfCompartments>
+        <listOfSpecies>{species}</listOfSpecies>
+        <listOfParameters>
+          <parameter id="k" value="2" constant="true"/>
+        </listOfParameters>
+        {extra}
+      </model>
+    </sbml>"""
+
+
+def _sp(sid: str, ic: str = "") -> str:
+    return (
+        f'<species id="{sid}" compartment="c" {ic} hasOnlySubstanceUnits="false" '
+        'boundaryCondition="false" constant="false"/>'
+    )
+
+
+def test_unset_species_initial_value_warns_and_names_it(caplog):
+    import logging
+
+    sbml = _species_sbml(_sp("A") + _sp("B", 'initialConcentration="1"'))
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(sbml)
+    hits = [r.getMessage() for r in caplog.records if "initial value undefined" in r.getMessage()]
+    assert len(hits) == 1, [r.getMessage() for r in caplog.records]
+    assert "'A'" in hits[0] and "'B'" not in hits[0], hits[0]
+    # The value itself is unchanged: still RoadRunner's 0.0.
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0, 1), n_points=2)
+    assert result.species[0, result.species_names.index("A")] == 0.0
+
+
+def test_unset_species_initial_value_warning_is_one_capped_message(caplog):
+    """A genome-scale model has thousands of these: one message, not one each."""
+    import logging
+
+    sbml = _species_sbml("".join(_sp(f"S{i}") for i in range(15)))
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        bngsim.Model.from_sbml_string(sbml)
+    hits = [r.getMessage() for r in caplog.records if "initial value undefined" in r.getMessage()]
+    assert len(hits) == 1, hits
+    assert hits[0].startswith("15 species have") and "(5 more)" in hits[0], hits[0]
+    assert "'S9'" in hits[0] and "'S10'" not in hits[0], hits[0]
+
+
+# `k * C` reads a species with no value, so the rule cannot fold to a number at
+# load and `A` reaches the no-initial-value branch; a foldable `A := k` would be
+# resolved before it and test nothing. The model still defines `A` (through `C`),
+# so only `C` is named.
+@pytest.mark.parametrize(
+    "extra",
+    [
+        """<listOfInitialAssignments>
+             <initialAssignment symbol="A">
+               <math xmlns="http://www.w3.org/1998/Math/MathML">
+                 <apply><times/><ci>k</ci><ci>C</ci></apply>
+               </math>
+             </initialAssignment>
+           </listOfInitialAssignments>""",
+        """<listOfRules>
+             <assignmentRule variable="A">
+               <math xmlns="http://www.w3.org/1998/Math/MathML">
+                 <apply><times/><ci>k</ci><ci>C</ci></apply>
+               </math>
+             </assignmentRule>
+           </listOfRules>""",
+    ],
+    ids=["initialAssignment", "assignmentRule"],
+)
+def test_species_valued_by_a_rule_or_assignment_is_not_named(caplog, extra):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        bngsim.Model.from_sbml_string(_species_sbml(_sp("A") + _sp("C"), extra))
+    hits = [r.getMessage() for r in caplog.records if "initial value undefined" in r.getMessage()]
+    assert len(hits) == 1, hits
+    assert "'C'" in hits[0] and "'A'" not in hits[0], hits[0]
+
+
 # ─── GH #91: one reaction's kineticLaw references another reaction's id ──
 
 
