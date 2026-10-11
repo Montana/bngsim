@@ -556,17 +556,41 @@ def test_floor_ceiling_roots_read_the_laws_local_parameter(level):
     local `k` read the global `k` (wrong thresholds) or nothing (no roots). The
     roots for `ceiling(k*A)` with a local `k = 0.5` match a global `k = 0.5`."""
 
-    def triggers(local: str, global_k: str) -> int:
-        sbml = _local_param_sbml(level, local).replace(
-            "<apply><times/><ci>k</ci><ci>A</ci></apply>",
-            "<apply><ceiling/><apply><times/><ci>k</ci><ci>A</ci></apply></apply>",
+    def triggers(local: str, global_k: str, k_moves: bool = False, via_g: bool = False) -> int:
+        # via_g: the same law as `g(k, A)` with `g(a, x) = ceiling(a*x)`, so the
+        # scan meets the local as a call argument rather than in the law itself.
+        law = (
+            "<apply><ci>g</ci><ci>k</ci><ci>A</ci></apply>"
+            if via_g
+            else "<apply><ceiling/><apply><times/><ci>k</ci><ci>A</ci></apply></apply>"
         )
+        sbml = _local_param_sbml(level, local).replace(
+            "<apply><times/><ci>k</ci><ci>A</ci></apply>", law
+        )
+        if via_g:
+            sbml = sbml.replace(
+                "<listOfCompartments>",
+                '<listOfFunctionDefinitions><functionDefinition id="g">'
+                '<math xmlns="http://www.w3.org/1998/Math/MathML"><lambda>'
+                "<bvar><ci>a</ci></bvar><bvar><ci>x</ci></bvar><apply><ceiling/>"
+                "<apply><times/><ci>a</ci><ci>x</ci></apply></apply></lambda></math>"
+                "</functionDefinition></listOfFunctionDefinitions><listOfCompartments>",
+                1,
+            )
         if global_k:
-            const = "" if level == 2 else ' constant="true"'
+            const = ' constant="false"' if k_moves else ("" if level == 2 else ' constant="true"')
+            rule = (
+                '<listOfRules><assignmentRule variable="k">'
+                '<math xmlns="http://www.w3.org/1998/Math/MathML"><apply><plus/><cn>5</cn>'
+                '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">'
+                "t</csymbol></apply></math></assignmentRule></listOfRules>"
+                if k_moves
+                else ""
+            )
             sbml = sbml.replace(
                 "<listOfReactions>",
                 f'<listOfParameters><parameter id="k" value="{global_k}"{const}/>'
-                "</listOfParameters><listOfReactions>",
+                f"</listOfParameters>{rule}<listOfReactions>",
             )
         return bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers
 
@@ -575,6 +599,43 @@ def test_floor_ceiling_roots_read_the_laws_local_parameter(level):
     assert reference > 0
     assert triggers(f'<{tag} id="k" value="0.5"/>', "") == reference
     assert triggers(f'<{tag} id="k" value="0.5"/>', "5") == reference
+    # The global `k` moving with time says nothing about the local one, in the
+    # law or passed into a function.
+    assert triggers(f'<{tag} id="k" value="0.5"/>', "5", k_moves=True) == reference
+    assert triggers(f'<{tag} id="k" value="0.5"/>', "5", k_moves=True, via_g=True) == reference
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_local_param_with_an_explicit_nan_value_is_kept(level):
+    """`value="NaN"` is a value the model wrote: the local is registered and the
+    law reads it, not the global `k = 5` it shadows."""
+    tag = "parameter" if level == 2 else "localParameter"
+    const = "" if level == 2 else ' constant="true"'
+    sbml = _local_param_sbml(level, f'<{tag} id="k" value="NaN"/>').replace(
+        "<listOfReactions>",
+        f'<listOfParameters><parameter id="k" value="5"{const}/></listOfParameters>'
+        "<listOfReactions>",
+    )
+    model = bngsim.Model.from_sbml_string(sbml)
+    assert math.isnan(model.get_param("_lp_R1_k"))
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2b_unset_local_param_read_through_a_function_body_refuses(monkeypatch, level):
+    """`f(x) = k*x` called as `f(A)`: the body's free `k` resolves to the law's
+    local (invalid SBML, but the translator allows it), so it counts as read."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    sbml = _local_param_sbml(level, _unset_local(level), model_k=True).replace(
+        "<apply><times/><ci>k</ci><ci>A</ci></apply>", "<apply><ci>f</ci><ci>A</ci></apply>"
+    )
+    fdef = """<listOfFunctionDefinitions><functionDefinition id="f">
+          <math xmlns="http://www.w3.org/1998/Math/MathML"><lambda><bvar><ci>x</ci></bvar>
+          <apply><times/><ci>k</ci><ci>x</ci></apply></lambda></math>
+        </functionDefinition></listOfFunctionDefinitions>
+        <listOfCompartments>"""
+    sbml = sbml.replace("<listOfCompartments>", fdef, 1)
+    with pytest.raises(bngsim.UnderSpecifiedModelError, match="'k' \\(reaction 'R1'\\)"):
+        bngsim.Model.from_sbml_string(sbml)
 
 
 def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):

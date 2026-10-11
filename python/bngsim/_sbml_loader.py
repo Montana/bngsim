@@ -1324,7 +1324,7 @@ def _collect_state_discontinuity_conditions(
             names = _ast_name_set(arg)
             if names and not (
                 _ast_references_time(arg)
-                or bool(names & time_dependent_names)
+                or bool((names - local_expr.keys()) & time_dependent_names)
                 or bool(names & local_time_dependent)
             ):
                 ctx = dict(base_ctx)
@@ -1366,7 +1366,7 @@ def _collect_state_discontinuity_conditions(
                             next_values[pname] = val
                         if (
                             _ast_references_time(child)
-                            or bool(child_names & time_dependent_names)
+                            or bool((child_names - local_expr.keys()) & time_dependent_names)
                             or bool(child_names & local_time_dependent)
                         ):
                             next_td.add(pname)
@@ -3977,11 +3977,15 @@ def _collect_local_params(kl, rid, builder):
     hatch = os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1"
     local_param_map = {}
     local_param_values: dict[str, float] = {}
-    for orig_id, val in _kinetic_law_local_values(kl).items():
-        if _math.isnan(val) and not hatch:
-            # Unset, and C2b refused it if the law named it: nothing can read it.
-            # Registering it would put a NaN parameter into every writer's output.
+    for lp in _kinetic_law_local_params(kl):
+        if not lp.isSetValue() and not hatch:
+            # C2b refused it if the law (or a function body the law calls) names
+            # it, so nothing can read it, and registering its NaN would put one
+            # into every writer's output. An explicit value="NaN" is the model's
+            # own and stays.
             continue
+        orig_id = lp.getId()
+        val = _local_param_value(lp)
         lpid = f"_lp_{rid}_{orig_id}"
         builder.add_parameter(lpid, val)
         local_param_map[orig_id] = lpid
@@ -4509,8 +4513,9 @@ def _build_model_from_sbml_doc(doc):
     # C2 above walks only the model's global <parameter>s. A local one with no
     # `value=` used to load as 0.0 on L2 (the reaction silently switched off) and
     # as libsbml's NaN on L3 (a CVODE failure blaming negative states). A local
-    # parameter is in scope only in its own law and nothing can assign it, so
-    # "unset and named by its law" is the whole test. Like C2 it goes by what the
+    # parameter is in scope only in its own law (and, through the translator, in
+    # the bodies of functions the law calls) and nothing can assign it, so "unset
+    # and named there" is the whole test. Like C2 it goes by what the
     # math names, not what it uses, so `piecewise(k, false, 1)` or a function
     # that ignores the argument still refuses; no corpus model has either. Same
     # refusal and hatch as C2. RoadRunner is no stricter here (it runs the L2
@@ -4541,7 +4546,13 @@ def _build_model_from_sbml_doc(doc):
         if not _unset_ids:
             continue
         _read: set[str] = set()
-        _walk_name_refs(_kl.getMath(), _unset_ids, _read)
+        # A name in a called function's body that is not one of its formals
+        # resolves to the law's local (the translator merges that scope in), so
+        # it is read as surely as one in the law itself.
+        for _body, _scope, _ in _iter_funcdef_scan_frames(
+            _kl.getMath(), func_defs, lambda *_: False
+        ):
+            _walk_name_refs(_body, _unset_ids - set(_scope or ()), _read)
         _unset_local.extend((_rx.getId(), lpid) for lpid in sorted(_read))
     if _unset_local:
         import os
