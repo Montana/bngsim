@@ -346,7 +346,7 @@ preference:
 
 1. **Raise.** For a model that reads a value it never defines, that is
    `UnderSpecifiedModelError`, which names the symbol and the
-   `BNGSIM_ALLOW_UNSET_PARAMS=1` opt-out (SBML global and local parameters, #94,
+   `BNGSIM_ALLOW_UNSET_PARAMS=1` opt-out (SBML global and local parameters, internal#94,
    #323, #580). The `.net` loader refuses an expression it cannot compile and an
    initial concentration that names no parameter (#602, #571).
 2. **Return something the caller cannot mistake for a value:** `None`,

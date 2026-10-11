@@ -370,7 +370,7 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
 #   * ``fast="true"``   — a fast-equilibrium constraint; under ODE the kinetic
 #                         law integrated as an ordinary reaction.
 #
-# We refuse all three loud-by-default, mirroring the GH #94 unset-parameter
+# We refuse all three loud-by-default, mirroring the internal#94 unset-parameter
 # gate (hard ``ModelError`` + ``BNGSIM_ALLOW_UNSUPPORTED_CONSTRUCTS=1`` opt-out
 # that restores the legacy silent-approximation behavior for deliberate triage,
 # e.g. bngsim↔RoadRunner comparison). ``delay`` and ``AlgebraicRule`` are
@@ -1292,7 +1292,7 @@ def _collect_state_discontinuity_conditions(
     time_dependent_names: set[str],
     out: list[str],
     local_params: dict[str, str] | None = None,
-    local_values: dict[str, float] | None = None,
+    local_values: dict[str, float | None] | None = None,
 ) -> None:
     """Append root conditions for bounded state-dependent floor/ceiling jumps.
 
@@ -1361,9 +1361,11 @@ def _collect_state_discontinuity_conditions(
                         next_expr[pname] = _ast_to_exprtk_recursive(child, func_defs, local_expr)
                         val = _eval_ast_numeric(child, ctx, func_defs, time_value=None)
                         # An argument with no load-time value binds the formal to
-                        # NaN, which yields no threshold: dropping it let a global
-                        # of the formal's name supply the start value (#580).
-                        next_values[pname] = float("nan") if val is None else val
+                        # None: the evaluator reads that as unknown, so nothing that
+                        # reads the formal folds (NaN did, through a comparison in
+                        # a piecewise), and it still shadows the global of the
+                        # formal's name that dropping it let through (#580).
+                        next_values[pname] = val
                         if (
                             _ast_references_time(child)
                             or bool((child_names - local_expr.keys()) & time_dependent_names)
@@ -2006,7 +2008,9 @@ def _periodic_disc_escapes_roots(
 
     So this is value-position reachability from the ODE RHS, followed through
     the assignment rules and pruned at every rooted condition; ``True`` means
-    some periodic disc node survives that pruning.
+    some periodic disc node survives that pruning. ``rhs_maths`` holds
+    ``(math, local_map)`` pairs, ``local_map`` being a kinetic law's local
+    parameters (``{}`` for a rate rule).
 
     A note for anyone extending this: it is deliberately ONE pass that carries
     context down, rather than two passes compared afterwards. libsbml returns a
@@ -2021,33 +2025,42 @@ def _periodic_disc_escapes_roots(
         libsbml.AST_FUNCTION_REM,
     }
 
-    def _scan(node, names_out: list) -> bool:
-        """True as soon as an unrooted time-dependent disc node is reached."""
+    def _scan(node, names_out: list, local_map: dict | None = None) -> bool:
+        """True as soon as an unrooted time-dependent disc node is reached.
+
+        ``local_map`` is a kinetic law's local parameters (id -> registered
+        name): they shadow the globals, and a root on a condition that reads one
+        was registered under its registered name (#580)."""
+        local = local_map or {}
         stack = [node]
         while stack:
             n = stack.pop()
             ntype = n.getType()
-            if ntype in disc_types and (_ast_references_time(n) or (_ast_name_set(n) & td)):
+            if ntype in disc_types and (
+                _ast_references_time(n) or ((_ast_name_set(n) - local.keys()) & td)
+            ):
                 return True
             if ntype == libsbml.AST_FUNCTION_PIECEWISE:
                 conds, vals = _piecewise_branches(n)
                 stack.extend(vals)
                 for cond in conds:
                     emitted: list[str] = []
-                    _collect_time_discontinuity_conditions(cond, func_defs, emitted, None, td)
+                    _collect_time_discontinuity_conditions(
+                        cond, func_defs, emitted, local_map or None, td
+                    )
                     # Emitted AND registered ⇒ the integrator stops at this edge.
                     if emitted and all(e in registered_conditions for e in emitted):
                         continue
                     stack.append(cond)
                 continue
-            if ntype == libsbml.AST_NAME:
+            if ntype == libsbml.AST_NAME and n.getName() not in local:
                 names_out.append(n.getName())
             stack.extend(n.getChild(k) for k in range(n.getNumChildren()))
         return False
 
     pending: list[str] = []
-    for math in rhs_maths:
-        if _scan(math, pending):
+    for math, local_map in rhs_maths:
+        if _scan(math, pending, local_map):
             return True
     seen: set[str] = set()
     while pending:
@@ -2060,7 +2073,9 @@ def _periodic_disc_escapes_roots(
     return False
 
 
-def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_conditions=None):
+def _periodic_time_disc_max_step(
+    sbml_model, func_defs, base_ctx, registered_conditions=None, reaction_local_maps=None
+):
     """Recommend a ``max_step_size`` that resolves periodic floor/modulo dosing
     discontinuities in the ODE RHS, or ``None`` when the model has none.
 
@@ -2079,6 +2094,12 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     :func:`_periodic_disc_escapes_roots`. Omitting it keeps the pre-#274
     behaviour: a caller that has not run the root scan has no basis for that
     judgement, and the safe default is to bound.
+
+    ``reaction_local_maps`` (reaction index -> {local id: registered name}) is
+    each kinetic law's local-parameter scope. A law's floor/modulo nodes are
+    evaluated with its locals over the globals they shadow; without them a local
+    `period` read the global `period`, or nothing, and the bound came out wrong
+    or not at all (#580).
     """
     global _DISC_FUNCS
     if _DISC_FUNCS is None:
@@ -2088,9 +2109,11 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
             libsbml.AST_FUNCTION_REM,
         }
 
-    # Assignment rules (var → math) and the maths that ARE the ODE RHS.
+    # Assignment rules (var → math) and the maths that ARE the ODE RHS, each RHS
+    # math with its local scope: (math, local id -> value, local id -> name).
     asg_math: dict[str, libsbml.ASTNode] = {}
     rhs_maths: list[libsbml.ASTNode] = []
+    rhs_scopes: list[tuple[dict, dict]] = []
     for i in range(sbml_model.getNumRules()):
         rule = sbml_model.getRule(i)
         m = rule.getMath()
@@ -2100,10 +2123,14 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
             asg_math[rule.getVariable()] = m
         elif rule.isRate():
             rhs_maths.append(m)
+            rhs_scopes.append(({}, {}))
     for i in range(sbml_model.getNumReactions()):
         kl = sbml_model.getReaction(i).getKineticLaw()
         if kl and kl.getMath():
             rhs_maths.append(kl.getMath())
+            rhs_scopes.append(
+                (_kinetic_law_local_values(kl), (reaction_local_maps or {}).get(i) or {})
+            )
     if not asg_math or not rhs_maths:
         return None
 
@@ -2123,7 +2150,11 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
 
     # Symbols feeding the ODE RHS, closed transitively through assignment rules.
     feed: set[str] = set()
-    work = [n for m in rhs_maths for n in _ast_name_set(m)]
+    work = [
+        n
+        for m, (lv, _) in zip(rhs_maths, rhs_scopes, strict=True)
+        for n in _ast_name_set(m) - lv.keys()
+    ]
     while work:
         name = work.pop()
         if name in feed:
@@ -2135,20 +2166,22 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     # Periodic iff some floor/ceil/modulo with a time-dependent argument actually
     # feeds the RHS. Plain `time < const` schedules (BIOMD879) have no such node
     # and fall through to None — their monotonic roots already resolve them.
-    relevant = list(rhs_maths) + [asg_math[v] for v in feed if v in asg_math]
-    disc_nodes: list[tuple[int, libsbml.ASTNode]] = []  # (kind, node)
-    piecewise_nodes: list[libsbml.ASTNode] = []
+    relevant = [(m, lv) for m, (lv, _) in zip(rhs_maths, rhs_scopes, strict=True)] + [
+        (asg_math[v], {}) for v in feed if v in asg_math
+    ]
+    disc_nodes: list[tuple[int, libsbml.ASTNode, dict]] = []  # (kind, node, locals)
+    piecewise_nodes: list[tuple[libsbml.ASTNode, dict]] = []
     has_periodic = False
-    for m in relevant:
+    for m, lv in relevant:
         for n in _iter_ast_subtree(m):
             ntype = n.getType()
             if ntype in _DISC_FUNCS:
-                arg_td = _ast_references_time(n) or bool(_ast_name_set(n) & td)
-                disc_nodes.append((ntype, n))
+                arg_td = _ast_references_time(n) or bool((_ast_name_set(n) - lv.keys()) & td)
+                disc_nodes.append((ntype, n, lv))
                 if arg_td:
                     has_periodic = True
             elif ntype == libsbml.AST_FUNCTION_PIECEWISE:
-                piecewise_nodes.append(n)
+                piecewise_nodes.append((n, lv))
     if not has_periodic:
         return None
 
@@ -2159,7 +2192,11 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     # None. ``registered_conditions=None`` means the caller did not run the root
     # scan and cannot make this judgement, so the bound stands.
     if registered_conditions is not None and not _periodic_disc_escapes_roots(
-        rhs_maths, asg_math, td, func_defs, registered_conditions
+        [(m, lm) for m, (_, lm) in zip(rhs_maths, rhs_scopes, strict=True)],
+        asg_math,
+        td,
+        func_defs,
+        registered_conditions,
     ):
         return None
 
@@ -2188,22 +2225,24 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
             if val is not None:
                 ctx[v] = val
         sig = []
-        for kind, n in disc_nodes:
+        for kind, n, lv in disc_nodes:
+            nctx = {**ctx, **lv} if lv else ctx
             if kind == libsbml.AST_FUNCTION_REM:
-                a = _eval_ast_numeric(n.getChild(0), ctx, func_defs, time_value=t)
-                b = _eval_ast_numeric(n.getChild(1), ctx, func_defs, time_value=t)
+                a = _eval_ast_numeric(n.getChild(0), nctx, func_defs, time_value=t)
+                b = _eval_ast_numeric(n.getChild(1), nctx, func_defs, time_value=t)
                 sig.append(None if (a is None or b is None or b == 0) else _math.floor(a / b))
             else:
-                a = _eval_ast_numeric(n.getChild(0), ctx, func_defs, time_value=t)
+                a = _eval_ast_numeric(n.getChild(0), nctx, func_defs, time_value=t)
                 fn = _math.floor if kind == libsbml.AST_FUNCTION_FLOOR else _math.ceil
                 sig.append(None if a is None else fn(a))
-        for n in piecewise_nodes:
+        for n, lv in piecewise_nodes:
+            nctx = {**ctx, **lv} if lv else ctx
             nc = n.getNumChildren()
             branch = nc  # default: "otherwise"
             i = 0
             idx = 0
             while i < nc - 1:
-                cond = _eval_ast_numeric(n.getChild(i + 1), ctx, func_defs, time_value=t)
+                cond = _eval_ast_numeric(n.getChild(i + 1), nctx, func_defs, time_value=t)
                 if cond is not None and cond != 0:
                     branch = idx
                     break
@@ -2215,11 +2254,11 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     # Median |d(arg)/dt| over a short probe — robust to the sawtooth jumps a
     # nested modulo argument takes, so it reads the underlying ramp rate (how
     # fast the floor argument climbs toward its next integer crossing).
-    def _slope(arg_node) -> float:
+    def _slope(arg_node, lv: dict) -> float:
         pts: list[tuple[float, float]] = []
         for k in range(1, 9):
             tt = 0.05 * k
-            v = _eval_ast_numeric(arg_node, dict(base_ctx), func_defs, time_value=tt)
+            v = _eval_ast_numeric(arg_node, {**base_ctx, **lv}, func_defs, time_value=tt)
             if v is not None:
                 pts.append((tt, v))
         diffs = sorted(
@@ -2233,14 +2272,14 @@ def _periodic_time_disc_max_step(sbml_model, func_defs, base_ctx, registered_con
     # every branch phase; the FASTEST (smallest period) sets how fine the grid
     # must be to resolve the narrowest dose pulse within it.
     periods = []
-    for kind, n in disc_nodes:
+    for kind, n, lv in disc_nodes:
         if kind == libsbml.AST_FUNCTION_REM:
             # rem(a,b) jumps when a/b crosses an integer; slope ≈ |a'|/|b|.
-            a_s = _slope(n.getChild(0))
-            b = _eval_ast_numeric(n.getChild(1), dict(base_ctx), func_defs, time_value=0.0)
+            a_s = _slope(n.getChild(0), lv)
+            b = _eval_ast_numeric(n.getChild(1), {**base_ctx, **lv}, func_defs, time_value=0.0)
             s = a_s / abs(b) if b else 0.0
         else:
-            s = _slope(n.getChild(0))
+            s = _slope(n.getChild(0), lv)
         if s > 0.0:
             periods.append(1.0 / s)
     longest = max(periods) if periods else 1.0
@@ -4408,7 +4447,7 @@ def _build_model_from_sbml_doc(doc):
             if not changed:
                 break
 
-    # ── C2: reject missing-value parameters that are actually consumed (#94) ──
+    # ── C2: reject missing-value parameters that are actually consumed (internal#94) ──
     # SBML allows <parameter id="X"/> with no `value=` attribute. Defaulting it
     # to 0.0 is harmless when X is never consumed (extension-package
     # placeholders, doc-only params) but silently produces wrong dynamics when X
@@ -4457,8 +4496,11 @@ def _build_model_from_sbml_doc(doc):
             _scan(sbml_model.getRule(j).getMath())
         for j in range(sbml_model.getNumReactions()):
             kl = sbml_model.getReaction(j).getKineticLaw()
-            if kl is not None:
-                _scan(kl.getMath())
+            if kl is not None and kl.getMath() is not None:
+                # A law's own local parameter shadows a global of the same id, so
+                # the law does not read that global (#580).
+                _shadow = {lp.getId() for lp in _kinetic_law_local_params(kl)}
+                _walk_name_refs(kl.getMath(), _unset_param_ids - _shadow, _consumed)
         for j in range(sbml_model.getNumEvents()):
             ev = sbml_model.getEvent(j)
             if ev.isSetTrigger():
@@ -8528,7 +8570,7 @@ def _build_model_from_sbml_doc(doc):
     # already gated by one of the roots just registered — hence `seen_disc`,
     # which is what makes that judgement possible rather than a guess.
     periodic_disc_max_step = _periodic_time_disc_max_step(
-        sbml_model, func_defs, eval_ctx, seen_disc
+        sbml_model, func_defs, eval_ctx, seen_disc, reaction_local_param_maps
     )
 
     # ── 10.6. rateOf csymbol support (GH #106) ─────────────────────────

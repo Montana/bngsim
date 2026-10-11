@@ -735,6 +735,96 @@ def test_floor_ceiling_formal_with_no_load_time_value_does_not_read_a_global():
     assert bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers == 0
 
 
+@pytest.mark.parametrize("level", [2, 3])
+def test_c2_global_shadowed_by_the_laws_local_is_not_read(monkeypatch, level):
+    """A valueless global `k` that the law's local `k = 0.5` shadows is not read
+    by the law, so C2 must not refuse it (it named the global as read)."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    tag = "parameter" if level == 2 else "localParameter"
+    const = "" if level == 2 else ' constant="true"'
+    sbml = _local_param_sbml(level, f'<{tag} id="k" value="0.5"/>').replace(
+        "<listOfReactions>",
+        f'<listOfParameters><parameter id="k"{const}/></listOfParameters><listOfReactions>',
+    )
+    model = bngsim.Model.from_sbml_string(sbml)
+    assert model.get_param("_lp_R1_k") == 0.5
+
+
+def test_floor_ceiling_formal_with_no_load_time_value_reads_as_unknown():
+    """Bound to an unknown argument, a formal must stay unknown through a
+    comparison: `ceiling(piecewise(1, q >= 0, 2) * x)` gets no thresholds, so the
+    roots are the piecewise edges alone. A NaN binding chose the `otherwise`
+    branch (NaN >= 0 is false) and registered 20; the global `q` gave 10."""
+    sp_b = (
+        '<species id="B" compartment="c" hasOnlySubstanceUnits="false" '
+        'boundaryCondition="false" constant="false"/>'
+    )
+    pw = (
+        "<apply><times/><piecewise><piece><cn>1</cn><apply><geq/><ci>q</ci><cn>0</cn>"
+        "</apply></piece><otherwise><cn>2</cn></otherwise></piecewise><ci>x</ci></apply>"
+    )
+
+    def triggers(body: str) -> int:
+        sbml = _with_functions(
+            _local_param_sbml(3, "")
+            .replace(
+                "<apply><times/><ci>k</ci><ci>A</ci></apply>",
+                "<apply><ci>g</ci><ci>B</ci><ci>A</ci></apply>",
+            )
+            .replace("</listOfSpecies>", sp_b + "</listOfSpecies>")
+            .replace(
+                "<listOfReactions>",
+                '<listOfParameters><parameter id="q" value="2" constant="true"/>'
+                "</listOfParameters><listOfReactions>",
+            ),
+            {"g": (["q", "x"], body)},
+        )
+        return bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers
+
+    assert triggers(f"<apply><ceiling/>{pw}</apply>") == triggers(pw)
+
+
+@pytest.mark.parametrize(
+    ("period", "global_period"),
+    [("0.5", ""), ("0.5", "5"), ("100", ""), ("100", "0.5")],
+    ids=["local", "local-over-global", "long-local", "long-local-over-short-global"],
+)
+def test_periodic_step_bound_reads_the_laws_local_period(period, global_period):
+    """GH #88's step bound for `A * rem(floor(time/period), 2)` with a local
+    `period` matches the bound for a global one. Read in global scope it
+    vanished (no `period`) or came out 10x too wide (a global `period = 5`);
+    and a long local period read through a short global one sized the scan
+    window too short to see a cycle, losing the bound."""
+
+    def bound(local: str, global_period: str) -> float | None:
+        law = (
+            "<apply><times/><ci>A</ci><apply><rem/><apply><floor/><apply><divide/>"
+            f"{_TIME}<ci>period</ci></apply></apply><cn>2</cn></apply></apply>"
+        )
+        params = '<parameter id="z" constant="false"/>' + (
+            f'<parameter id="period" value="{global_period}" constant="true"/>'
+            if global_period
+            else ""
+        )
+        sbml = (
+            _local_param_sbml(3, local)
+            .replace("<apply><times/><ci>k</ci><ci>A</ci></apply>", law)
+            .replace(
+                "<listOfReactions>",
+                f"<listOfParameters>{params}</listOfParameters>"
+                '<listOfRules><assignmentRule variable="z">'
+                '<math xmlns="http://www.w3.org/1998/Math/MathML"><ci>A</ci></math>'
+                "</assignmentRule></listOfRules><listOfReactions>",
+            )
+        )
+        return bngsim.Model.from_sbml_string(sbml)._periodic_disc_max_step
+
+    reference = bound("", period)
+    assert reference is not None
+    got = bound(f'<localParameter id="period" value="{period}"/>', global_period)
+    assert got == pytest.approx(reference)
+
+
 def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
     """Same for `rateOf(A)` in an initialAssignment, which folds R1's law too:
     it read the global `k = 5` and gave p = -50."""
