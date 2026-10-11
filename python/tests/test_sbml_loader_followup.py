@@ -360,7 +360,7 @@ def _local_param_sbml(
         rxn = '<reaction id="R1" reversible="false">'
         ref = '<speciesReference species="A"/>'
         lps = f"<listOfParameters>{local_decl}</listOfParameters>"
-        params = '<parameter id="k" value="5"/><parameter id="p"/>'
+        params = '<parameter id="k" value="5"/><parameter id="p" value="7"/>'
     else:
         head = '<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">'
         comp = '<compartment id="c" size="1" constant="true"/>'
@@ -371,7 +371,10 @@ def _local_param_sbml(
         rxn = '<reaction id="R1" reversible="false" fast="false">'
         ref = '<speciesReference species="A" stoichiometry="1" constant="true"/>'
         lps = f"<listOfLocalParameters>{local_decl}</listOfLocalParameters>"
-        params = '<parameter id="k" value="5" constant="true"/><parameter id="p" constant="true"/>'
+        params = (
+            '<parameter id="k" value="5" constant="true"/>'
+            '<parameter id="p" value="7" constant="true"/>'
+        )
     globals_ = (
         f"""<listOfParameters>{params}</listOfParameters>
         <listOfInitialAssignments>
@@ -449,8 +452,10 @@ def test_c2b_unset_local_param_the_law_does_not_read_loads(monkeypatch, caplog, 
     with caplog.at_level(logging.WARNING, logger="bngsim"):
         model = bngsim.Model.from_sbml_string(_local_param_sbml(level, local + spare))
     assert not [r for r in caplog.records if "spare" in r.getMessage()]
-    # It has no value, and reads as none rather than as a plausible 0.0.
-    assert math.isnan(model.get_param("_lp_R1_spare"))
+    # Nothing can read it, so it is not registered: not as a plausible 0.0, and
+    # not as a NaN that a writer would then refuse to serialise.
+    assert not [n for n in model.param_names if "spare" in n]
+    assert all(math.isfinite(model.get_param(n)) for n in model.param_names)
 
 
 @pytest.mark.parametrize("level", [2, 3])
@@ -488,6 +493,90 @@ def test_c2b_hatch_zero_reaches_initial_value_folds(monkeypatch, level):
     assert model.get_param("p") == 0.0
 
 
+@pytest.mark.parametrize("level", [2, 3])
+def test_duplicate_local_param_id_refuses(level):
+    """Two locals with one id is invalid SBML with no right value to pick. The
+    builder's duplicate-name check used to refuse it; an id -> value map must not
+    quietly keep one of the two."""
+    tag = "parameter" if level == 2 else "localParameter"
+    dup = f'<{tag} id="k" value="0.5"/><{tag} id="k" value="2"/>'
+    with pytest.raises(
+        bngsim.ModelError, match="'R1' declares local parameter 'k' more than once"
+    ):
+        bngsim.Model.from_sbml_string(_local_param_sbml(level, dup))
+
+
+def test_unfoldable_global_does_not_refuse_a_fold_its_local_shadows():
+    """The failure trace behind "initialAssignment ... cannot be evaluated" refolds
+    each reaction's law. On L2 it saw no locals, so `p = R1` was blamed on the
+    global `k`, which an assignment rule over a valueless species leaves unfoldable,
+    though the law reads the local `k = 0.5`. It loads, at RoadRunner's p = 5."""
+    sbml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+      <model id="m">
+        <listOfCompartments><compartment id="c" size="1"/></listOfCompartments>
+        <listOfSpecies>
+          <species id="A" compartment="c" initialConcentration="10"/>
+          <species id="B" compartment="c"/>
+        </listOfSpecies>
+        <listOfParameters>
+          <parameter id="k" value="5" constant="false"/>
+          <parameter id="p" value="7"/>
+        </listOfParameters>
+        <listOfInitialAssignments>
+          <initialAssignment symbol="p">
+            <math xmlns="http://www.w3.org/1998/Math/MathML"><ci>R1</ci></math>
+          </initialAssignment>
+        </listOfInitialAssignments>
+        <listOfRules>
+          <assignmentRule variable="k">
+            <math xmlns="http://www.w3.org/1998/Math/MathML"><ci>B</ci></math>
+          </assignmentRule>
+        </listOfRules>
+        <listOfReactions>
+          <reaction id="R1" reversible="false">
+            <listOfReactants><speciesReference species="A"/></listOfReactants>
+            <kineticLaw>
+              <math xmlns="http://www.w3.org/1998/Math/MathML">
+                <apply><times/><ci>k</ci><ci>A</ci></apply>
+              </math>
+              <listOfParameters><parameter id="k" value="0.5"/></listOfParameters>
+            </kineticLaw>
+          </reaction>
+        </listOfReactions>
+      </model>
+    </sbml>"""
+    model = bngsim.Model.from_sbml_string(sbml)
+    assert model.get_param("p") == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_floor_ceiling_roots_read_the_laws_local_parameter(level):
+    """The state-threshold scan (GH #244) evaluated a law with no local scope: a
+    local `k` read the global `k` (wrong thresholds) or nothing (no roots). The
+    roots for `ceiling(k*A)` with a local `k = 0.5` match a global `k = 0.5`."""
+
+    def triggers(local: str, global_k: str) -> int:
+        sbml = _local_param_sbml(level, local).replace(
+            "<apply><times/><ci>k</ci><ci>A</ci></apply>",
+            "<apply><ceiling/><apply><times/><ci>k</ci><ci>A</ci></apply></apply>",
+        )
+        if global_k:
+            const = "" if level == 2 else ' constant="true"'
+            sbml = sbml.replace(
+                "<listOfReactions>",
+                f'<listOfParameters><parameter id="k" value="{global_k}"{const}/>'
+                "</listOfParameters><listOfReactions>",
+            )
+        return bngsim.Model.from_sbml_string(sbml)._core.n_discontinuity_triggers
+
+    tag = "parameter" if level == 2 else "localParameter"
+    reference = triggers("", "0.5")
+    assert reference > 0
+    assert triggers(f'<{tag} id="k" value="0.5"/>', "") == reference
+    assert triggers(f'<{tag} id="k" value="0.5"/>', "5") == reference
+
+
 def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
     """Same for `rateOf(A)` in an initialAssignment, which folds R1's law too:
     it read the global `k = 5` and gave p = -50."""
@@ -502,7 +591,7 @@ def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
         </listOfSpecies>
         <listOfParameters>
           <parameter id="k" value="5" constant="true"/>
-          <parameter id="p" constant="true"/>
+          <parameter id="p" value="7" constant="true"/>
         </listOfParameters>
         <listOfInitialAssignments>
           <initialAssignment symbol="p">

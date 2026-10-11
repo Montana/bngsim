@@ -1291,8 +1291,15 @@ def _collect_state_discontinuity_conditions(
     base_ctx: dict,
     time_dependent_names: set[str],
     out: list[str],
+    local_params: dict[str, str] | None = None,
+    local_values: dict[str, float] | None = None,
 ) -> None:
-    """Append root conditions for bounded state-dependent floor/ceiling jumps."""
+    """Append root conditions for bounded state-dependent floor/ceiling jumps.
+
+    ``local_params`` / ``local_values`` are a kinetic law's local parameters (id ->
+    registered name, id -> value): the scope its names are written in. Without
+    them a local `k` read as a global `k`, or as nothing (issue #580).
+    """
     if node is None:
         return
     disc_funcs = {
@@ -1305,7 +1312,9 @@ def _collect_state_discontinuity_conditions(
     # BNG-roundtripped observables produce (one frame per operand, GH #111) — the
     # same reason every other AST scanner here is iterative. Each stack frame
     # carries the lexical scope threaded through user-defined-function inlining.
-    stack: list[tuple[libsbml.ASTNode, dict, dict, set, set]] = [(node, {}, {}, set(), set())]
+    stack: list[tuple[libsbml.ASTNode, dict, dict, set, set]] = [
+        (node, dict(local_params or {}), dict(local_values or {}), set(), set())
+    ]
     while stack:
         n, local_expr, local_values, local_time_dependent, seen_funcs = stack.pop()
         ntype = n.getType()
@@ -3963,9 +3972,16 @@ def _collect_local_params(kl, rid, builder):
     a kinetic-law local parameter participates in a synthesized derived
     rate constant).
     """
+    import os
+
+    hatch = os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1"
     local_param_map = {}
     local_param_values: dict[str, float] = {}
     for orig_id, val in _kinetic_law_local_values(kl).items():
+        if _math.isnan(val) and not hatch:
+            # Unset, and C2b refused it if the law named it: nothing can read it.
+            # Registering it would put a NaN parameter into every writer's output.
+            continue
         lpid = f"_lp_{rid}_{orig_id}"
         builder.add_parameter(lpid, val)
         local_param_map[orig_id] = lpid
@@ -4507,7 +4523,21 @@ def _build_model_from_sbml_doc(doc):
         _kl = _rx.getKineticLaw()
         if _kl is None or not _kl.isSetMath():
             continue
-        _unset_ids = {lp.getId() for lp in _kinetic_law_local_params(_kl) if not lp.isSetValue()}
+        _lps = _kinetic_law_local_params(_kl)
+        _ids = [lp.getId() for lp in _lps]
+        _dup = sorted({i for i in _ids if _ids.count(i) > 1})
+        if _dup:
+            # Invalid SBML (libsbml consistency error 10303), and there is no right
+            # value to pick: the builder's duplicate-name check used to refuse it,
+            # and a name -> value map would keep one of the two without a word.
+            from bngsim._exceptions import ModelError
+
+            raise ModelError(
+                f"Reaction {_rx.getId()!r} declares local parameter "
+                f"{', '.join(repr(i) for i in _dup)} more than once; a kineticLaw's "
+                "local parameter ids must be unique."
+            )
+        _unset_ids = {lp.getId() for lp in _lps if not lp.isSetValue()}
         if not _unset_ids:
             continue
         _read: set[str] = set()
@@ -4527,10 +4557,14 @@ def _build_model_from_sbml_doc(doc):
                 "kineticLaws read them"
             )
         if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            one = len(_unset_local) == 1
             logger.warning(
-                "%s. bngsim defaults the value to 0.0 (BNGSIM_ALLOW_UNSET_PARAMS=1), "
-                "which silently zeroes out the rate law. Set the value.",
+                "%s. bngsim defaults %s to 0.0 (BNGSIM_ALLOW_UNSET_PARAMS=1), which "
+                "silently zeroes out what %s. Set the %s.",
                 lead,
+                "it" if one else "them",
+                "reads it" if one else "reads them",
+                "value" if one else "values",
             )
         else:
             raise UnderSpecifiedModelError(
@@ -8456,7 +8490,13 @@ def _build_model_from_sbml_doc(doc):
         kl = sbml_model.getReaction(i).getKineticLaw()
         if kl and kl.getMath():
             _collect_state_discontinuity_conditions(
-                kl.getMath(), func_defs, eval_ctx, time_dependent_names, disc_conditions
+                kl.getMath(),
+                func_defs,
+                eval_ctx,
+                time_dependent_names,
+                disc_conditions,
+                reaction_local_param_maps.get(i),
+                _kinetic_law_local_values(kl),
             )
 
     seen_disc: set[str] = set()
@@ -8576,9 +8616,7 @@ def _build_model_from_sbml_doc(doc):
         _rid_f = _rxn_f.getId()
         if not _rid_f or _kl_f is None or _rid_f not in _reads:
             continue
-        _own = {_kl_f.getLocalParameter(_j).getId() for _j in range(_kl_f.getNumLocalParameters())}
-        if not _own:
-            _own = {_kl_f.getParameter(_j).getId() for _j in range(_kl_f.getNumParameters())}
+        _own = {_lp.getId() for _lp in _kinetic_law_local_params(_kl_f)}
         if _own:
             _reads[_rid_f] = {f"_lp_{_rid_f}_{_n}" if _n in _own else _n for _n in _reads[_rid_f]}
     for _j in range(sbml_model.getNumSpecies()):
