@@ -354,10 +354,11 @@ preference:
    flag replaces, like the `.net` loader's `is_expression`.
 3. **Warn, at minimum**, and only when refusing would turn away models a
    reference engine runs with the same default. That is why a non-finite
-   compartment size (#353) and a species with no initial value (#580) warn
-   instead of refusing: RoadRunner runs both shapes, and corpus models depend on
-   it. Say what was substituted and for which names, in one message per load
-   rather than one per symbol.
+   compartment size (#353), a species with no initial value and a compartment
+   with no size (#580) warn instead of refusing: RoadRunner runs all three, and
+   corpus models depend on it. Say what was substituted and for which names, in
+   one message per load rather than one per symbol, and only where the substitute
+   can reach a number.
 
 The shapes to look for in review are `except Exception: x = 0.0`,
 `d.get(name, 0.0)` for a name that ought to be there, `catch (...) { v = 0.0; }`,

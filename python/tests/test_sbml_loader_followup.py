@@ -962,6 +962,226 @@ def test_species_valued_by_a_rule_or_assignment_is_not_named(caplog, extra):
     assert "'C'" in hits[0] and "'A'" not in hits[0], hits[0]
 
 
+# ─── #580: a compartment the model never gives a size ───────────────────
+#
+# SBML Level 2 and 3 leave it undefined (Level 1 defaults it to 1.0). bngsim
+# uses 1.0, as RoadRunner does, and says so where the 1.0 can reach a number.
+
+
+def _compartment_sbml(level: int, comp: str, species: str, extra: str = "") -> str:
+    head = (
+        '<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">'
+        if level == 2
+        else '<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">'
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    {head}
+      <model id="m">
+        <listOfCompartments>{comp}</listOfCompartments>
+        <listOfSpecies>{species}</listOfSpecies>
+        {extra}
+      </model>
+    </sbml>"""
+
+
+def _comp(level: int, attrs: str = "") -> str:
+    const = "" if level == 2 else ' constant="true"'
+    return f'<compartment id="c"{const} {attrs}/>'
+
+
+def _species_in_c(level: int, ic: str, hosu: bool) -> str:
+    extra = "" if level == 2 else ' boundaryCondition="false" constant="false"'
+    return (
+        f'<species id="A" compartment="c" {ic} '
+        f'hasOnlySubstanceUnits="{str(hosu).lower()}"{extra}/>'
+    )
+
+
+_RULE_READS_C = """<listOfParameters><parameter id="p" constant="false"/></listOfParameters>
+        <listOfRules><assignmentRule variable="p">
+          <math xmlns="http://www.w3.org/1998/Math/MathML"><ci>c</ci></math>
+        </assignmentRule></listOfRules>"""
+
+
+def _size_warnings(caplog, sbml: str):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(sbml)
+    hits = [r.getMessage() for r in caplog.records if "size undefined" in r.getMessage()]
+    return model, hits
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_unsized_compartment_warns_and_names_it(caplog, level):
+    """A concentration-valued species makes the size reach a number. The value
+    is unchanged, RoadRunner's 1.0, but the load says it was chosen."""
+    sbml = _compartment_sbml(
+        level, _comp(level), _species_in_c(level, 'initialConcentration="2"', False)
+    )
+    model, hits = _size_warnings(caplog, sbml)
+    assert len(hits) == 1 and "'c'" in hits[0], hits
+    assert model.get_param("c") == 1.0
+
+
+@pytest.mark.parametrize("level", [2, 3])
+@pytest.mark.parametrize(
+    ("extra", "warns"), [("", False), (_RULE_READS_C, True)], ids=["unread", "rule-reads-c"]
+)
+def test_unsized_compartment_warns_only_when_something_reads_the_size(caplog, level, extra, warns):
+    """An amount-only species given an amount never touches the size; a rule
+    that names the compartment does."""
+    sbml = _compartment_sbml(
+        level, _comp(level), _species_in_c(level, 'initialAmount="2"', True), extra
+    )
+    _, hits = _size_warnings(caplog, sbml)
+    assert bool(hits) is warns, hits
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        """<listOfInitialAssignments><initialAssignment symbol="c">
+             <math xmlns="http://www.w3.org/1998/Math/MathML"><cn>2</cn></math>
+           </initialAssignment></listOfInitialAssignments>""",
+        """<listOfRules><assignmentRule variable="c">
+             <math xmlns="http://www.w3.org/1998/Math/MathML"><cn>2</cn></math>
+           </assignmentRule></listOfRules>""",
+    ],
+    ids=["initialAssignment", "assignmentRule"],
+)
+def test_compartment_sized_by_an_assignment_or_rule_is_silent(caplog, extra):
+    comp = '<compartment id="c" constant="false"/>' if "Rule" in extra else _comp(3)
+    sbml = _compartment_sbml(3, comp, _species_in_c(3, 'initialConcentration="2"', False), extra)
+    model, hits = _size_warnings(caplog, sbml)
+    assert not hits, hits
+    assert model.get_param("c") == 2.0
+
+
+def test_zero_dimensional_compartment_is_silent(caplog):
+    """A 0-D compartment has no size to leave undefined."""
+    sbml = _compartment_sbml(
+        3,
+        _comp(3, 'spatialDimensions="0"'),
+        _species_in_c(3, 'initialAmount="2"', True),
+        _RULE_READS_C,
+    )
+    _, hits = _size_warnings(caplog, sbml)
+    assert not hits, hits
+
+
+def test_kinetic_law_local_named_like_the_compartment_does_not_read_it(caplog):
+    """A law's local `c` shadows the compartment `c`, so the law reads its local;
+    the size still reaches no number."""
+    rxn = """<listOfReactions><reaction id="R1" reversible="false" fast="false">
+          <listOfReactants>
+            <speciesReference species="A" stoichiometry="1" constant="true"/>
+          </listOfReactants>
+          <kineticLaw>
+            <math xmlns="http://www.w3.org/1998/Math/MathML">
+              <apply><times/><ci>c</ci><ci>A</ci></apply>
+            </math>
+            <listOfLocalParameters><localParameter id="c" value="0.5"/></listOfLocalParameters>
+          </kineticLaw>
+        </reaction></listOfReactions>"""
+    sbml = _compartment_sbml(3, _comp(3), _species_in_c(3, 'initialAmount="2"', True), rxn)
+    _, hits = _size_warnings(caplog, sbml)
+    assert not hits, hits
+
+
+def _comp_doc(main_comp: str, sub_size: str = "") -> str:
+    """A comp document: `main_comp` in the main model, which holds species A, and
+    a submodel `S` whose definition declares compartment `C`."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1"
+          xmlns:comp="http://www.sbml.org/sbml/level3/version1/comp/version1"
+          comp:required="true">
+      <model id="m">
+        <listOfCompartments>{main_comp}</listOfCompartments>
+        <listOfSpecies>
+          <species id="A" compartment="c" initialConcentration="2"
+                   hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+        </listOfSpecies>
+        <comp:listOfSubmodels>
+          <comp:submodel comp:id="S" comp:modelRef="sub"/>
+        </comp:listOfSubmodels>
+      </model>
+      <comp:listOfModelDefinitions>
+        <comp:modelDefinition id="sub">
+          <listOfCompartments>
+            <compartment id="C" spatialDimensions="3" {sub_size} constant="true"/>
+          </listOfCompartments>
+        </comp:modelDefinition>
+      </comp:listOfModelDefinitions>
+    </sbml>"""
+
+
+@pytest.mark.parametrize("source", ["string", "file"])
+@pytest.mark.parametrize(
+    ("main_comp", "sub_size", "sizes", "want"),
+    [
+        ('<compartment id="c" constant="true"/>', "", None, None),
+        ('<compartment id="c" constant="true"/>', "", {"c": 3.0}, 3.0),
+        (
+            '<compartment id="c" constant="true">'
+            '<comp:replacedBy comp:idRef="C" comp:submodelRef="S"/></compartment>',
+            'size="4"',
+            None,
+            4.0,
+        ),
+    ],
+    ids=["unsized", "compartment_sizes", "replacedBy-sized"],
+)
+def test_comp_model_compartment_size_is_checked_after_flattening(
+    caplog, tmp_path, source, main_comp, sub_size, sizes, want
+):
+    """A comp model is checked once flattened. An unsized main-model compartment
+    still warns. A size the caller passes is a chosen one, and a placeholder
+    `replacedBy` a sized submodel compartment takes that size (SBML test suite
+    01374-01379): both stay silent."""
+    import logging
+
+    sbml = _comp_doc(main_comp, sub_size)
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        if source == "string":
+            model = bngsim.Model.from_sbml_string(sbml, compartment_sizes=sizes)
+        else:
+            path = tmp_path / "comp.xml"
+            path.write_text(sbml)
+            model = bngsim.Model.from_sbml(str(path), compartment_sizes=sizes)
+    hits = [r.getMessage() for r in caplog.records if "size undefined" in r.getMessage()]
+    if want is None:
+        assert len(hits) == 1 and "'c'" in hits[0], hits
+        assert model.get_param("c") == 1.0
+    else:
+        assert not hits, hits
+        assert model.get_param("c") == want
+
+
+def test_level1_compartment_takes_the_spec_default_silently(caplog):
+    """Level 1 defines a missing volume as 1.0, so nothing was invented."""
+    sbml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level1" level="1" version="2">
+      <model name="m">
+        <listOfCompartments><compartment name="c"/></listOfCompartments>
+        <listOfSpecies>
+          <species name="A" compartment="c" initialAmount="2"/>
+          <species name="B" compartment="c" initialAmount="0"/>
+        </listOfSpecies>
+        <listOfReactions>
+          <reaction name="R1" reversible="false">
+            <listOfReactants><speciesReference species="A"/></listOfReactants>
+            <listOfProducts><speciesReference species="B"/></listOfProducts>
+            <kineticLaw formula="0.1 * A"/>
+          </reaction>
+        </listOfReactions>
+      </model>
+    </sbml>"""
+    model, hits = _size_warnings(caplog, sbml)
+    assert not hits, hits
+    assert model.get_param("c") == 1.0
+
+
 # ─── GH #91: one reaction's kineticLaw references another reaction's id ──
 
 

@@ -3975,6 +3975,15 @@ def _classify_mass_action_ast(
     )
 
 
+def _capped_names(names: list[str], cap: int = 10) -> str:
+    """``'a', 'b', ... (N more)``: a load warning that names a genome-scale
+    model's symbols one by one would run to thousands of entries."""
+    shown = ", ".join(repr(s) for s in names[:cap])
+    if len(names) > cap:
+        shown += f", ... ({len(names) - cap} more)"
+    return shown
+
+
 def _kinetic_law_local_params(kl) -> list:
     """A kinetic law's local parameters, on either SBML level.
 
@@ -4004,6 +4013,74 @@ def _kinetic_law_local_values(kl) -> dict[str, float]:
     """id → value of a kinetic law's local parameters, unset ones included so
     that each shadows a global of the same id, as SBML scoping requires."""
     return {lp.getId(): _local_param_value(lp) for lp in _kinetic_law_local_params(kl)}
+
+
+def _unsized_compartments_read(sbml_model, ar_targets) -> list[str]:
+    """Compartments whose size SBML leaves undefined and something can read, in
+    declaration order (issue #580).
+
+    Undefined: Level 2 or 3, no ``size``, more than zero dimensions, and no
+    initialAssignment, assignmentRule or algebraic rule that could define it.
+    A comp model is checked after flattening, which resolves a placeholder
+    compartment ``replacedBy`` a sized one to that size.
+    Read: it holds a species stored as a concentration (``hasOnlySubstanceUnits``
+    false) or given an ``initialConcentration``, or a rule, initialAssignment,
+    event, stoichiometryMath or kinetic law names it (a law's own local of that
+    id shadows it).
+    """
+    if sbml_model.getLevel() < 2:
+        return []
+    defined = set(ar_targets)
+    for j in range(sbml_model.getNumInitialAssignments()):
+        ia = sbml_model.getInitialAssignment(j)
+        if ia.getMath() is not None:
+            defined.add(ia.getSymbol())
+    maths: list = []
+    for j in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(j)
+        if rule.getMath() is None:
+            continue
+        if rule.isAlgebraic():
+            # An algebraic rule may be what determines the size.
+            defined |= _ast_name_set(rule.getMath())
+        maths.append(rule.getMath())
+    cands = []
+    for j in range(sbml_model.getNumCompartments()):
+        c = sbml_model.getCompartment(j)
+        if c.isSetSize() or c.getSpatialDimensionsAsDouble() == 0 or c.getId() in defined:
+            continue
+        cands.append(c.getId())
+    if not cands:
+        return []
+    read: set[str] = set()
+    for j in range(sbml_model.getNumSpecies()):
+        sp = sbml_model.getSpecies(j)
+        if sp.getCompartment() in cands and (
+            not sp.getHasOnlySubstanceUnits() or sp.isSetInitialConcentration()
+        ):
+            read.add(sp.getCompartment())
+    for j in range(sbml_model.getNumInitialAssignments()):
+        maths.append(sbml_model.getInitialAssignment(j).getMath())
+    for j in range(sbml_model.getNumEvents()):
+        ev = sbml_model.getEvent(j)
+        for part in (ev.getTrigger(), ev.getDelay(), ev.getPriority()):
+            if part is not None:
+                maths.append(part.getMath())
+        for k in range(ev.getNumEventAssignments()):
+            maths.append(ev.getEventAssignment(k).getMath())
+    for sr in _iter_species_references(sbml_model):
+        if hasattr(sr, "isSetStoichiometryMath") and sr.isSetStoichiometryMath():
+            maths.append(sr.getStoichiometryMath().getMath())
+    targets = set(cands)
+    for j in range(sbml_model.getNumReactions()):
+        kl = sbml_model.getReaction(j).getKineticLaw()
+        if kl is not None and kl.getMath() is not None:
+            shadow = {lp.getId() for lp in _kinetic_law_local_params(kl)}
+            _walk_name_refs(kl.getMath(), targets - shadow - read, read)
+    for m in maths:
+        if m is not None:
+            _walk_name_refs(m, targets - read, read)
+    return [cid for cid in cands if cid in read]
 
 
 def _collect_local_params(kl, rid, builder):
@@ -4864,6 +4941,24 @@ def _build_model_from_sbml_doc(doc):
         # not survive the next evaluation — refuse rather than appear to take.
         if cid in ar_comp_targets:
             compartment_write_refused.add(cid)
+
+    # (#580) A compartment with no size and nothing that defines one: SBML Level
+    # 2 and 3 leave its size undefined (Level 1 defaults it to 1.0). bngsim uses
+    # 1.0, as RoadRunner does, and 6 of the 8 BioModels with one pass rr_parity
+    # that way, so warn rather than refuse, once per load, as for a species with
+    # no initial value. Only where the 1.0 can reach a number: a species stored
+    # as a concentration or given one, or math that names the compartment. A size
+    # nothing reads stays silent, as an unread valueless parameter does (C2).
+    _unsized = _unsized_compartments_read(sbml_model, _ar_targets)
+    if _unsized:
+        logger.warning(
+            "%d %s no size, initialAssignment or assignmentRule, so SBML leaves the "
+            "size undefined; bngsim uses 1.0, as RoadRunner does: %s. Set the size "
+            "if 1 is not what the model means.",
+            len(_unsized),
+            "compartment has" if len(_unsized) == 1 else "compartments have",
+            _capped_names(_unsized),
+        )
 
     # (#170) The compartments whose size is a parameter that ONLY a `set_param`
     # can move. Everything downstream — the storage convention bound to each
@@ -5917,10 +6012,7 @@ def _build_model_from_sbml_doc(doc):
     # C2/C2b refuse a valueless parameter instead because a zero rate constant
     # silently switches a reaction off, and RoadRunner refuses the global case.
     if unset_ic_species:
-        shown = ", ".join(repr(s) for s in unset_ic_species[:10])
-        more = len(unset_ic_species) - 10
-        if more > 0:
-            shown += f", ... ({more} more)"
+        shown = _capped_names(unset_ic_species)
         logger.warning(
             "%d species %s no initialAmount, initialConcentration, initialAssignment "
             "or assignmentRule, so SBML leaves the initial value undefined; bngsim "
