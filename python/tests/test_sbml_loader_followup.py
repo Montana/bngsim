@@ -1024,18 +1024,93 @@ def test_unsized_compartment_warns_and_names_it(caplog, level):
     assert model.get_param("c") == 1.0
 
 
-@pytest.mark.parametrize("level", [2, 3])
-@pytest.mark.parametrize(
-    ("extra", "warns"), [("", False), (_RULE_READS_C, True)], ids=["unread", "rule-reads-c"]
+_MATH = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+_SP_D = (
+    '<species id="D" compartment="d" initialAmount="1" hasOnlySubstanceUnits="true" '
+    'boundaryCondition="false" constant="false"/>'
 )
-def test_unsized_compartment_warns_only_when_something_reads_the_size(caplog, level, extra, warns):
-    """An amount-only species given an amount never touches the size; a rule
-    that names the compartment does."""
-    sbml = _compartment_sbml(
-        level, _comp(level), _species_in_c(level, 'initialAmount="2"', True), extra
-    )
-    _, hits = _size_warnings(caplog, sbml)
+_TIME_GT_1 = (
+    f'<trigger initialValue="false" persistent="true">{_MATH}<apply><gt/>'
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+    "</csymbol><cn>1</cn></apply></math></trigger>"
+)
+_READERS = {
+    # case -> (species in c as "<ic attr> hosu=<bool>", extra model elements, warns?)
+    "empty": ("", "", False),
+    "conc-species": ('initialConcentration="2" hosu=false', "", True),
+    "amount-species": ('initialAmount="2" hosu=false', "", True),
+    "amount-only-species": ('initialAmount="2" hosu=true', "", True),
+    "amount-only-species-given-conc": ('initialConcentration="2" hosu=true', "", True),
+    "rule-names-c": ("", _RULE_READS_C, True),
+    "initialAssignment-names-c": (
+        "",
+        '<listOfParameters><parameter id="p" constant="true"/></listOfParameters>'
+        f'<listOfInitialAssignments><initialAssignment symbol="p">{_MATH}<ci>c</ci></math>'
+        "</initialAssignment></listOfInitialAssignments>",
+        True,
+    ),
+    "law-names-c": (
+        "",
+        '<listOfReactions><reaction id="R1" reversible="false" fast="false">'
+        '<listOfReactants><speciesReference species="D" stoichiometry="1" constant="true"/>'
+        f"</listOfReactants><kineticLaw>{_MATH}<apply><times/><ci>c</ci><ci>D</ci></apply>"
+        "</math></kineticLaw></reaction></listOfReactions>",
+        True,
+    ),
+    "event-trigger-names-c": (
+        "",
+        '<listOfParameters><parameter id="p" value="0" constant="false"/></listOfParameters>'
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{_MATH}<apply><gt/><ci>c</ci>'
+        "<cn>5</cn></apply></math></trigger><listOfEventAssignments>"
+        f'<eventAssignment variable="p">{_MATH}<cn>1</cn></math></eventAssignment>'
+        "</listOfEventAssignments></event></listOfEvents>",
+        True,
+    ),
+    "rate-rule-sets-c": (
+        "",
+        f'<listOfRules><rateRule variable="c">{_MATH}<cn>0.5</cn></math></rateRule></listOfRules>',
+        True,
+    ),
+    "event-sets-c": (
+        "",
+        f'<listOfEvents><event id="E" useValuesFromTriggerTime="true">{_TIME_GT_1}'
+        f'<listOfEventAssignments><eventAssignment variable="c">{_MATH}<cn>5</cn></math>'
+        "</eventAssignment></listOfEventAssignments></event></listOfEvents>",
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_READERS))
+def test_unsized_compartment_warns_only_where_the_size_reaches_a_number(caplog, case):
+    """Each way the 1.0 reaches a result warns on its own: a species in `c`
+    (bngsim reports every species as amount over its size), math naming `c`, or a
+    rate rule or event setting `c` (a state that starts at the size). An empty
+    compartment nothing names stays silent."""
+    sp, extra, warns = _READERS[case]
+    species = _SP_D
+    if sp:
+        ic, hosu = sp.rsplit(" hosu=", 1)
+        species += _species_in_c(3, ic, hosu == "true")
+    const = ' constant="false"' if "sets-c" in case else ' constant="true"'
+    comps = f'<compartment id="c"{const}/><compartment id="d" size="1" constant="true"/>'
+    _, hits = _size_warnings(caplog, _compartment_sbml(3, comps, species, extra))
     assert bool(hits) is warns, hits
+    if warns:
+        assert "1 compartment has" in hits[0] and "'c'" in hits[0] and "'d'" not in hits[0]
+
+
+def test_unsized_compartment_warning_names_each_in_one_message(caplog):
+    comps = '<compartment id="c1" constant="true"/><compartment id="c2" constant="true"/>'
+    species = "".join(
+        f'<species id="{s}" compartment="{c}" initialConcentration="1" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+        for s, c in (("A", "c1"), ("B", "c2"))
+    )
+    _, hits = _size_warnings(caplog, _compartment_sbml(3, comps, species))
+    assert len(hits) == 1, hits
+    assert hits[0].startswith("2 compartments have") and "'c1', 'c2'" in hits[0], hits[0]
 
 
 @pytest.mark.parametrize(
@@ -1084,7 +1159,9 @@ def test_kinetic_law_local_named_like_the_compartment_does_not_read_it(caplog):
             <listOfLocalParameters><localParameter id="c" value="0.5"/></listOfLocalParameters>
           </kineticLaw>
         </reaction></listOfReactions>"""
-    sbml = _compartment_sbml(3, _comp(3), _species_in_c(3, 'initialAmount="2"', True), rxn)
+    comps = '<compartment id="c" constant="true"/><compartment id="d" size="1" constant="true"/>'
+    rxn = rxn.replace('species="A"', 'species="D"').replace("<ci>A</ci>", "<ci>D</ci>")
+    sbml = _compartment_sbml(3, comps, _SP_D, rxn)
     _, hits = _size_warnings(caplog, sbml)
     assert not hits, hits
 

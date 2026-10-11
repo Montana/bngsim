@@ -4023,10 +4023,12 @@ def _unsized_compartments_read(sbml_model, ar_targets) -> list[str]:
     initialAssignment, assignmentRule or algebraic rule that could define it.
     A comp model is checked after flattening, which resolves a placeholder
     compartment ``replacedBy`` a sized one to that size.
-    Read: it holds a species stored as a concentration (``hasOnlySubstanceUnits``
-    false) or given an ``initialConcentration``, or a rule, initialAssignment,
-    event, stoichiometryMath or kinetic law names it (a law's own local of that
-    id shadows it).
+    Read: it holds any species (bngsim reports every species as amount over its
+    compartment's size, whatever ``hasOnlySubstanceUnits`` says, so this can warn
+    where the size happens to cancel, e.g. a constant species given as a
+    concentration); a rate rule or event sets it (it becomes a state that starts
+    at the size); or a rule, initialAssignment, event, stoichiometryMath or kinetic
+    law names it (a law's own local of that id shadows it).
     """
     if sbml_model.getLevel() < 2:
         return []
@@ -4041,7 +4043,10 @@ def _unsized_compartments_read(sbml_model, ar_targets) -> list[str]:
         if rule.getMath() is None:
             continue
         if rule.isAlgebraic():
-            # An algebraic rule may be what determines the size.
+            # An algebraic rule may be what determines the size. Which name it
+            # determines is not recorded, so every name it mentions counts; that
+            # can silence one it only reads, but bngsim refuses algebraic rules
+            # unless BNGSIM_ALLOW_UNSUPPORTED_CONSTRUCTS=1 drops them.
             defined |= _ast_name_set(rule.getMath())
         maths.append(rule.getMath())
     cands = []
@@ -4052,13 +4057,15 @@ def _unsized_compartments_read(sbml_model, ar_targets) -> list[str]:
         cands.append(c.getId())
     if not cands:
         return []
+    targets = set(cands)
     read: set[str] = set()
     for j in range(sbml_model.getNumSpecies()):
-        sp = sbml_model.getSpecies(j)
-        if sp.getCompartment() in cands and (
-            not sp.getHasOnlySubstanceUnits() or sp.isSetInitialConcentration()
-        ):
-            read.add(sp.getCompartment())
+        if sbml_model.getSpecies(j).getCompartment() in targets:
+            read.add(sbml_model.getSpecies(j).getCompartment())
+    for j in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(j)
+        if rule.isRate() and rule.getVariable() in targets:
+            read.add(rule.getVariable())
     for j in range(sbml_model.getNumInitialAssignments()):
         maths.append(sbml_model.getInitialAssignment(j).getMath())
     for j in range(sbml_model.getNumEvents()):
@@ -4067,11 +4074,13 @@ def _unsized_compartments_read(sbml_model, ar_targets) -> list[str]:
             if part is not None:
                 maths.append(part.getMath())
         for k in range(ev.getNumEventAssignments()):
-            maths.append(ev.getEventAssignment(k).getMath())
+            ea = ev.getEventAssignment(k)
+            maths.append(ea.getMath())
+            if ea.getVariable() in targets:
+                read.add(ea.getVariable())
     for sr in _iter_species_references(sbml_model):
         if hasattr(sr, "isSetStoichiometryMath") and sr.isSetStoichiometryMath():
             maths.append(sr.getStoichiometryMath().getMath())
-    targets = set(cands)
     for j in range(sbml_model.getNumReactions()):
         kl = sbml_model.getReaction(j).getKineticLaw()
         if kl is not None and kl.getMath() is not None:
@@ -4944,11 +4953,11 @@ def _build_model_from_sbml_doc(doc):
 
     # (#580) A compartment with no size and nothing that defines one: SBML Level
     # 2 and 3 leave its size undefined (Level 1 defaults it to 1.0). bngsim uses
-    # 1.0, as RoadRunner does, and 6 of the 8 BioModels with one pass rr_parity
-    # that way, so warn rather than refuse, once per load, as for a species with
-    # no initial value. Only where the 1.0 can reach a number: a species stored
-    # as a concentration or given one, or math that names the compartment. A size
-    # nothing reads stays silent, as an unread valueless parameter does (C2).
+    # 1.0, as RoadRunner does, and refusing would turn away the 8 BioModels that
+    # have one, so warn rather than refuse, once per load, as for a species with
+    # no initial value. Only where the 1.0 can reach a number: a species in it,
+    # a rate rule or event that sets it, or math that names it. A size nothing
+    # reads stays silent, as an unread valueless parameter does (C2).
     _unsized = _unsized_compartments_read(sbml_model, _ar_targets)
     if _unsized:
         logger.warning(
