@@ -45,10 +45,12 @@ class UnderSpecifiedModelError(ModelError):
 
     Raised at load when a ``<parameter>`` has no ``value`` attribute and no
     ``<initialAssignment>``, yet is referenced by a kineticLaw / rule / event /
-    initialAssignment expression. SBML leaves such a value undefined, so there is
-    nothing to integrate; bngsim refuses rather than default it to ``0.0``, which
-    would silently zero out every expression that consumes it and return a
-    wrong-but-plausible trajectory. RoadRunner refuses the same models.
+    initialAssignment expression, or when a kineticLaw's local parameter has no
+    ``value`` and the law reads it (issue #580). SBML leaves such a value
+    undefined, so there is nothing to integrate; bngsim refuses rather than
+    default it to ``0.0``, which would silently zero out every expression that
+    consumes it and return a wrong-but-plausible trajectory. RoadRunner refuses
+    the global case too (it runs a Level 2 local one at 0).
 
     That failure mode is not hypothetical. `MODEL1006230032` under
     ``BNGSIM_ALLOW_UNSET_PARAMS=1`` integrates to **all five species identically
