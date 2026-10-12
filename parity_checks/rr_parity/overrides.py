@@ -75,38 +75,6 @@ from __future__ import annotations
 # Accepted / genuine divergences — reclassified DIFF -> PASS with the reason.
 # Keyed "model_id:method". `issue` is an optional tracker reference.
 # --------------------------------------------------------------------------- #
-# RoadRunner fires a `time == c` trigger, or an open window such as
-# `(time > a) && (time < b)`, only when one of its output times lands on the
-# instant or inside the window, so on the sweep grid it skips an event whose
-# instant falls between two samples. Since #1015 bngsim stops on the instant and
-# fires it, as SBML's trigger semantics require. Before #1015 bngsim skipped the
-# same events, and the two agreed. Each entry below names the events RoadRunner
-# skips and gives rr_run's own verdict (`_compare_ode`) twice: on the job grid,
-# and with RoadRunner given output points at the event instants (the triggers'
-# constants and every 0.25 time units) and sampled back onto the job grid, where
-# it fires them too.
-#
-# The cost: a known artifact turns ANY DIFF on its model into PASS, so while one
-# of these entries stands the RoadRunner comparison checks nothing else on that
-# model. Running RoadRunner through the event instants in rr_run itself would
-# restore the comparison and retire these entries.
-_BETWEEN_SAMPLES = (
-    "RoadRunner bug (bngsim correct, #1015): RoadRunner fires a time == c trigger, "
-    "or an open (time > a) && (time < b) window, only when one of its output times "
-    "lands on the instant or inside the window, so on the sweep grid it skips the "
-    "events below; bngsim stops on each instant and fires it. Before #1015 bngsim "
-    "skipped them too, and the two agreed. Given output points at the event "
-    "instants (the triggers' constants and every 0.25) and sampled back onto the "
-    "job grid, RoadRunner fires them as well and agrees with bngsim under rr_run's "
-    "own _compare_ode. While this entry stands, every DIFF on this model reads "
-    "PASS. "
-)
-
-
-def _between_samples(events: str, cells: str) -> dict:
-    return {"issue": 1015, "reason": _BETWEEN_SAMPLES + events + " " + cells}
-
-
 KNOWN_ARTIFACT: dict[str, dict] = {
     # ── ODE artifacts attributed during the 2026-05-29 rr_parity DIFF triage ──
     # (28-REAL ledger, dev/notes/rr_parity_diff_resolution.md §🅰). Each was
@@ -316,66 +284,12 @@ KNOWN_ARTIFACT: dict[str, dict] = {
     # job and the override keyed nothing (stale_keys flagged it). Its exclusion
     # rationale now lives in the validation pipeline; see git history for the text.
     #
-    # ── Events between output samples (#1015); see _BETWEEN_SAMPLES above ──
-    "BIOMD0000000570:ode": _between_samples(
-        "Skipped: time == ModelValue_52 (5), == ModelValue_53 (360) and == their "
-        "sum (365), which set is_rising, is_maximum, is_falling and v_stim_constant.",
-        "Job grid: 18,642 of 22,022 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000814:ode": _between_samples(
-        "Skipped: all five injection schedules, (time % 28) == 27 and "
-        "(time % 28) == 0 for 54 < time < 608, and time == 57 || 85 || ..., "
-        "time == 58 || 86 || ... and time == 59 || 87 || ... .",
-        "Job grid: 2,005 of 3,003 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000816:ode": _between_samples(
-        "Skipped: the Oncolytic_Adenovirus_V injections at time == 2 and "
-        "time == 4 (the third, time == 0, is true at the start and fires in neither "
-        "engine).",
-        "Job grid: 6,408 of 8,008 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000817:ode": _between_samples(
-        "Skipped: the Oncolytic_Adenovirus_V injections at time == 2 and "
-        "time == 4 (the third, time == 0, is true at the start and fires in neither "
-        "engine).",
-        "Job grid: 5,546 of 8,008 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000829:ode": _between_samples(
-        "Skipped: the decrements u_1, u_2 -= 1 at time == 3 || 15 || ... || 159. "
-        "The increments on (time % 12) == 0 land on grid points (the grid steps "
-        "by 0.16), so both engines always fired those; on the job grid RoadRunner's "
-        "u_1 climbs to 13, as bngsim's did before #1015. With both events fired Glucose_G turns negative, "
-        "identically in both engines: (time % 12) == 0 is true at t = 0 and so "
-        "cannot fire there, the t = 3 decrement fires first (u_1 = -1), and the "
-        "glucose dose rate is compartment * u_1.",
-        "Job grid: 11,761 of 13,013 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000928:ode": _between_samples(
-        "Skipped: a tenfold dilution of solution0 at time == 20.",
-        "Job grid: 752 of 1,544 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000994:ode": _between_samples(
-        "Skipped: the TGFb doses at time == 1e-6 and time == 180.1. The wash "
-        "window (time > 179) && (time < 179.5) holds the grid point 179.2, so "
-        "both engines fire the wash.",
-        "Job grid: 21,798 of 23,023 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000995:ode": _between_samples(
-        "Skipped: the TGFb doses at time == 1e-6 and time == 480.1, and the wash "
-        "WASH_LIGAND = 1e6 on (time > 479) && (time < 479.5), which holds no grid "
-        "point.",
-        "Job grid: 22,550 of 23,023 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000000996:ode": _between_samples(
-        "Skipped: the TGFb doses at time == 1e-6 and time == 360.1, and the wash "
-        "WASH_LIGAND = 1e6 on (time > 359) && (time < 359.5), which holds no grid "
-        "point.",
-        "Job grid: 22,991 of 23,023 cells fail; through the instants, no hard or soft failure.",
-    ),
-    "BIOMD0000001059:ode": _between_samples(
-        "Skipped: k7 = 0.025 at time == 2000.",
-        "Job grid: 4,290 of 10,010 cells fail; through the instants, no hard or soft failure.",
-    ),
+    # NOTE: BIOMD0000000570, 814, 816, 817, 829, 928, 994, 995, 996 and 1059 (ode)
+    # were known artifacts for a while after #1015 (#1021): RoadRunner skipped
+    # their `time == c` and open-window events between output samples, which
+    # bngsim fires. rr_run now runs RoadRunner through those instants
+    # (_rr_common.event_instants), so it fires them too and the comparison is
+    # real again; all 10 pass on their own. See git history for the entries.
 }
 
 # --------------------------------------------------------------------------- #

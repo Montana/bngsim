@@ -355,9 +355,10 @@ def bn_ode(
     import bngsim
     from _core.work import work_counters
 
-    # 1. File I/O (if xml is a path)
+    # 1. File I/O (if xml is a path; SBML text itself can be too long for a
+    # file name, which Path.exists() raises on)
     t0 = time.perf_counter()
-    if Path(xml).exists():
+    if not str(xml).lstrip().startswith("<") and Path(xml).exists():
         xml_string = Path(xml).read_text()
         io_sec = time.perf_counter() - t0
     else:
@@ -659,10 +660,273 @@ def _rr_colnames(res) -> list[str]:
     return cols[1:]
 
 
+# ── Event instants: RoadRunner sees a trigger only at its output times ───────
+#
+# RoadRunner does not fire a `time == c` event trigger between its output
+# times, nor a time window such as `(time > a) && (time < b)` narrower than its
+# integrator's step (strict or closed edges alike), unless an output time lands
+# on the instant or inside the window. On a sweep grid with no sample there it
+# skips the event, while bngsim (since #1015) stops on the instant and fires it,
+# so the comparison reads a RoadRunner miss as a bngsim divergence. 10 BioModels
+# were recorded as known artifacts for that (#1021). The instants a trigger's
+# time-only comparisons change value at are found here from the SBML, so rr_ode
+# can run RoadRunner through them and still report the job's own grid.
+
+# A comparison more instants than this is not a schedule; leave it as it was.
+_MAX_INSTANTS_PER_ATOM = 20_000
+
+
+def _effectively_constant(model) -> set[str]:
+    """Parameter and compartment ids nothing changes after the start: no rule
+    targets them and no event assigns them. Their value at the start (after any
+    initialAssignment) is their value throughout."""
+    changed = {r.getVariable() for r in model.getListOfRules() if r.isSetVariable()}
+    for e in model.getListOfEvents():
+        changed.update(a.getVariable() for a in e.getListOfEventAssignments())
+
+    # An algebraic rule names no variable; whatever non-constant symbol it reads
+    # may be the one it determines.
+    def names(node):
+        yield node.getName()
+        for i in range(node.getNumChildren()):
+            yield from names(node.getChild(i))
+
+    for r in model.getListOfRules():
+        if r.isAlgebraic() and r.isSetMath():
+            for name in names(r.getMath()):
+                el = model.getParameter(name) if name else None
+                el = el if el is not None else (model.getCompartment(name) if name else None)
+                if el is not None and not el.getConstant():
+                    changed.add(name)
+    ids = [x.getId() for x in model.getListOfParameters()]
+    ids += [x.getId() for x in model.getListOfCompartments()]
+    return {i for i in ids if i not in changed}
+
+
+def _mod_form(node, value_of):
+    """``("rem", a, b, P)`` where ``node`` is a modulo of ``a*time + b`` by a
+    constant P written out as ``x - P*floor(x/P)`` (or ``ceil``), or as the
+    piecewise of the two that COPASI exports for ``%`` (libsbml prints it back as
+    ``%``, but the AST holds the expansion)."""
+    import libsbml
+
+    ty = node.getType()
+    if ty == libsbml.AST_FUNCTION_PIECEWISE:
+        n = node.getNumChildren()
+        forms = [_mod_form(node.getChild(i), value_of) for i in range(0, n, 2)]
+        if forms and forms[0] is not None and all(f == forms[0] for f in forms):
+            return forms[0]
+        return None
+    if ty != libsbml.AST_MINUS or node.getNumChildren() != 2:
+        return None
+    x, prod = node.getChild(0), node.getChild(1)
+    if prod.getType() != libsbml.AST_TIMES or prod.getNumChildren() != 2:
+        return None
+    for p_node, f_node in (
+        (prod.getChild(0), prod.getChild(1)),
+        (prod.getChild(1), prod.getChild(0)),
+    ):
+        if f_node.getType() not in (libsbml.AST_FUNCTION_FLOOR, libsbml.AST_FUNCTION_CEILING):
+            continue
+        q = f_node.getChild(0) if f_node.getNumChildren() == 1 else None
+        if q is None or q.getType() != libsbml.AST_DIVIDE or q.getNumChildren() != 2:
+            continue
+        arg, arg2 = _affine(x, value_of), _affine(q.getChild(0), value_of)
+        per, per2 = _affine(p_node, value_of), _affine(q.getChild(1), value_of)
+        if None in (arg, arg2, per, per2) or arg != arg2 or per != per2:
+            continue
+        if arg[0] == per[0] == "aff" and per[1] == 0.0 and per[2] != 0.0:
+            return ("rem", arg[1], arg[2], per[2])
+    return None
+
+
+def _affine(node, value_of):
+    """``node`` as ``("aff", a, b)`` meaning ``a*time + b``, as ``("rem", a, b, P)``
+    meaning ``rem(a*time + b, P)``, or None where it is neither (a species, a
+    parameter something changes, a function this does not read)."""
+    import libsbml
+
+    ty = node.getType()
+    kids = [node.getChild(i) for i in range(node.getNumChildren())]
+    if ty == libsbml.AST_NAME_TIME:
+        return ("aff", 1.0, 0.0)
+    if ty in (libsbml.AST_INTEGER, libsbml.AST_REAL, libsbml.AST_REAL_E, libsbml.AST_RATIONAL):
+        return ("aff", 0.0, float(node.getValue()))
+    if ty == libsbml.AST_CONSTANT_PI:
+        return ("aff", 0.0, float(np.pi))
+    if ty == libsbml.AST_CONSTANT_E:
+        return ("aff", 0.0, float(np.e))
+    if ty == libsbml.AST_NAME:
+        v = value_of(node.getName())
+        return None if v is None else ("aff", 0.0, float(v))
+    if ty in (libsbml.AST_FUNCTION_PIECEWISE, libsbml.AST_MINUS):
+        mod = _mod_form(node, value_of)
+        if mod is not None:
+            return mod
+    parts = [_affine(k, value_of) for k in kids]
+    if any(x is None for x in parts):
+        return None
+    if ty == libsbml.AST_FUNCTION_REM and len(parts) == 2:
+        (x, p) = parts
+        if x[0] == "aff" and p[0] == "aff" and p[1] == 0.0 and p[2] != 0.0:
+            return ("rem", x[1], x[2], p[2])
+        return None
+    if any(x[0] != "aff" for x in parts):
+        return None
+    if ty == libsbml.AST_PLUS:
+        return ("aff", sum(x[1] for x in parts), sum(x[2] for x in parts))
+    if ty == libsbml.AST_MINUS:
+        if len(parts) == 1:
+            return ("aff", -parts[0][1], -parts[0][2])
+        if len(parts) == 2:
+            return ("aff", parts[0][1] - parts[1][1], parts[0][2] - parts[1][2])
+        return None
+    if ty == libsbml.AST_TIMES:
+        a, b = 0.0, 1.0
+        for x in parts:
+            if x[1] != 0.0 and a != 0.0:
+                return None  # time * time is not affine
+            a, b = a * x[2] + x[1] * b, b * x[2]
+        return ("aff", a, b)
+    if ty == libsbml.AST_DIVIDE and len(parts) == 2 and parts[1][1] == 0.0 and parts[1][2] != 0.0:
+        return ("aff", parts[0][1] / parts[1][2], parts[0][2] / parts[1][2])
+    return None
+
+
+def _atom_instants(left, right, t_start: float, t_end: float) -> tuple[list[float], list[float]]:
+    """Where ``left ⋈ right`` can change value: ``(levels, wraps)``, the times
+    the two sides meet and, for a ``rem``, the times it wraps back to 0."""
+    if left is None or right is None:
+        return [], []
+    if left[0] == "rem" and right[0] == "aff" and right[1] == 0.0:
+        left, right = right, left
+    if left[0] == "aff" and left[1] == 0.0 and right[0] == "rem":
+        # rem(a*t + b, P) against a constant r: where the argument passes r + kP
+        # (the comparison's level) and kP (where rem wraps).
+        r, (_, a, b, period) = left[2], right
+        if a == 0.0:
+            return [], []
+        lo, hi = sorted((a * t_start + b, a * t_end + b))
+        period = abs(period)
+        if (hi - lo) / period > _MAX_INSTANTS_PER_ATOM / 2:
+            return [], []
+        out: tuple[list[float], list[float]] = ([], [])
+        # rem takes values in (-P, P) (C's sign, or COPASI's floor form in [0, P)),
+        # so a level outside that is never met.
+        reachable = abs(r) < period and not (lo >= 0 and r < 0) and not (hi <= 0 and r > 0)
+        levels = [r] if reachable else []
+        for level, into in [*((lv, out[0]) for lv in levels), (0.0, out[1])]:
+            k = np.arange(np.floor((lo - level) / period), np.ceil((hi - level) / period) + 1)
+            into.extend(((level + k * period) - b) / a)
+        return out
+    if left[0] == "aff" and right[0] == "aff":
+        a, b = left[1] - right[1], left[2] - right[2]
+        return ([], []) if a == 0.0 else ([-b / a], [])
+    return [], []
+
+
+def event_instants(sbml: str, t_start: float, t_end: float, value_of=None) -> list[float]:
+    """Output times in (t_start, t_end] that let RoadRunner see the time-only
+    comparisons of the event triggers it would otherwise skip:
+
+    * ``==``: the instant itself; RoadRunner does not fire it between samples.
+      ``!=`` also gets a sample just after it, where it turns true again.
+    * ``>``, ``>=``, ``<``, ``<=``: a sample just after each boundary (and, for
+      a ``rem``, just after each wrap), which lands inside any window the
+      comparison opens. RoadRunner fires a lone inequality at its own root, but
+      not a window narrower than its integrator's step, strict or closed.
+      Never a sample ON an inequality's boundary: one on the instant of a jump
+      makes RoadRunner's integrator fail at the harness tolerances
+      (MODEL0911120000's ``time >= 16.16`` pulse end: CV_CONV_FAILURE).
+
+    A window that opens exactly at ``t_start`` gets no sample (its boundary is
+    not inside the run); no corpus job has one.
+
+    Reads comparisons of `time` (and affine forms of it, `rem` of one included)
+    against constants: numbers, and parameters or compartments nothing changes
+    after the start, valued by ``value_of(id)`` (RoadRunner's value after the
+    initial assignments; the SBML value when None). A comparison that reads a
+    species, or anything else, gives no instants: RoadRunner finds those itself.
+    """
+    import libsbml
+
+    doc = libsbml.readSBMLFromString(sbml)
+    model = doc.getModel()
+    if model is None or model.getNumEvents() == 0:
+        return []
+    constant = _effectively_constant(model)
+    if value_of is None:
+
+        def value_of(i):
+            par = model.getParameter(i)
+            if par is not None:
+                return par.getValue() if par.isSetValue() else None
+            comp = model.getCompartment(i)
+            return comp.getSize() if comp is not None and comp.isSetSize() else None
+
+    def known(i):
+        return value_of(i) if i in constant else None
+
+    relational = {
+        libsbml.AST_RELATIONAL_EQ,
+        libsbml.AST_RELATIONAL_NEQ,
+        libsbml.AST_RELATIONAL_GT,
+        libsbml.AST_RELATIONAL_GEQ,
+        libsbml.AST_RELATIONAL_LT,
+        libsbml.AST_RELATIONAL_LEQ,
+    }
+    equality = {libsbml.AST_RELATIONAL_EQ, libsbml.AST_RELATIONAL_NEQ}
+    out: set[float] = set()
+
+    def add(boundary: float, after: bool = False) -> None:
+        # The boundary decides whether it is inside the run, not the sample.
+        if not (np.isfinite(boundary) and t_start < boundary <= t_end):
+            return
+        t = boundary + 1e-9 * max(1.0, abs(boundary)) if after else boundary
+        if t <= t_end:
+            out.add(float(t))
+
+    def walk(node):
+        ty = node.getType()
+        if ty in relational:
+            sides = [_affine(node.getChild(i), known) for i in range(node.getNumChildren())]
+            for left, right in zip(sides, sides[1:], strict=False):
+                levels, wraps = _atom_instants(left, right, t_start, t_end)
+                if ty in equality:
+                    for t in levels:
+                        add(t)
+                        if ty == libsbml.AST_RELATIONAL_NEQ:
+                            add(t, after=True)
+                else:
+                    for t in levels + wraps:
+                        add(t, after=True)
+            return
+        for i in range(node.getNumChildren()):
+            walk(node.getChild(i))
+
+    for e in model.getListOfEvents():
+        if e.isSetTrigger() and e.getTrigger().isSetMath():
+            walk(e.getTrigger().getMath())
+    return sorted(out)
+
+
 def rr_ode(
-    xml: str, t_start: float, t_end: float, n_points: int, rtol: float, atol: float
+    xml: str,
+    t_start: float,
+    t_end: float,
+    n_points: int,
+    rtol: float,
+    atol: float,
+    *,
+    through_event_instants: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict]:
     """One RoadRunner cvode run. Returns (time, values[n_time,n_sp], names, timing).
+
+    With ``through_event_instants`` RoadRunner is also given output times at the
+    instants :func:`event_instants` finds, so it fires the events a sample on
+    the job grid would miss, and the rows on the job grid are what is returned.
+    A model whose triggers give no instants runs exactly as without it. The
+    timing dict records ``event_instants`` (how many were added).
 
     Selections are forced to **concentration** (``[id]``) for every species,
     floating and boundary alike. RoadRunner's *default* timecourse selection
@@ -696,9 +960,10 @@ def rr_ode(
 
     import roadrunner
 
-    # 1. File I/O (if xml is a path)
+    # 1. File I/O (if xml is a path; SBML text itself can be too long for a
+    # file name, which Path.exists() raises on)
     t0 = time.perf_counter()
-    if Path(xml).exists():
+    if not str(xml).lstrip().startswith("<") and Path(xml).exists():
         xml_string = Path(xml).read_text()
         io_sec = time.perf_counter() - t0
     else:
@@ -735,12 +1000,30 @@ def rr_ode(
     except AttributeError:
         load = {}
 
+    instants: list[float] = []
+    if through_event_instants:
+
+        def _value(i):
+            try:
+                return float(rr.getValue(i))
+            except Exception:
+                return None
+
+        instants = event_instants(xml_string, t_start, t_end, _value)
+    grid = np.linspace(t_start, t_end, n_points) if instants else None
+    times = list(np.union1d(grid, instants)) if instants else None
+
+    def _simulate():
+        if times is None:
+            return rr.simulate(t_start, t_end, n_points)
+        return rr.simulate(times=times)
+
     # 3. Integration (cold + warm), same recipe as bngsim for a fair comparison.
     # First simulate() is COLD (RR's one-time CVODE first-solve setup); its
     # trajectory feeds the parity verdict. Warm reps reset() to IC each (RR
     # continues from state otherwise) and reuse the warm integrator.
     t1 = time.perf_counter()
-    res = rr.simulate(t_start, t_end, n_points)
+    res = _simulate()
     cold_sec = time.perf_counter() - t1
     warm: list[float] = []
     for _ in range(_warm_rep_count(cold_sec)):
@@ -750,7 +1033,7 @@ def rr_ode(
         try:
             rr.reset()
             t1 = time.perf_counter()
-            rr.simulate(t_start, t_end, n_points)
+            _simulate()
             warm.append(time.perf_counter() - t1)
         except Exception:
             break
@@ -764,6 +1047,7 @@ def rr_ode(
         "parse_interpret_codegen_sec": round(parse_interpret_codegen_sec, 6),
         # integrate_sec (= warm-min headline) + cold/min/max/median/n_warm.
         **integ,
+        "event_instants": len(instants),
         "config": {
             "codegen": "LLVM JIT",
             # CVODE uses a difference-quotient Jacobian (CVODEIntegrator.cpp:745,
@@ -793,8 +1077,14 @@ def rr_ode(
             }
         )
 
+    names = _rr_colnames(res)
     arr = np.asarray(res)
-    return arr[:, 0].copy(), arr[:, 1:], _rr_colnames(res), timing
+    if times is not None:
+        rows = np.searchsorted(arr[:, 0], grid)
+        if rows.max() >= len(arr) or not np.allclose(arr[rows, 0], grid, rtol=0, atol=1e-9):
+            raise RuntimeError("RoadRunner did not report every time of the job grid")
+        arr = arr[rows]
+    return arr[:, 0].copy(), arr[:, 1:], names, timing
 
 
 def rr_ssa(

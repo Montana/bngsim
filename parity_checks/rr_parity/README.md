@@ -265,6 +265,40 @@ Schoeberl EGFR — 1855 hard-ceiling cells). A model that genuinely can't integr
 at the tight tol surfaces as `EXCEPTION`; the bng_parity-style per-model
 "tighten/loosen both stacks, with a reason" override is the escape hatch (TODO).
 
+### Event instants — RoadRunner runs through them, the job grid is compared
+
+RoadRunner does not fire a `time == c` trigger between its output times. It also
+skips a time window such as `(time > a) && (time < b)`, or `(time >= a) &&
+(time <= b)`, when the window is narrower than its integrator's step, unless an
+output time lands inside it. A lone inequality like `time > a` it fires at its
+own root. bngsim fires all of these wherever the instant falls (#1015). So on a
+job grid with no sample there, the comparison used to read RoadRunner's miss as
+a bngsim divergence: 10 BioModels went PASS → DIFF and sat as known artifacts for
+a while (#1021).
+
+`rr_run.py` now passes `through_event_instants=True` to `_rr_common.rr_ode`.
+`event_instants` reads the event triggers' time-only comparisons: `time`, an
+affine form of it, or its `rem`, against numbers and parameters/compartments no
+rule (algebraic ones included) or event changes, valued after the initial
+assignments. COPASI's piecewise expansion of `%` is read as a `rem`. Each
+comparison gives RoadRunner output times as follows:
+
+- `==`: a sample on the instant. `!=` also gets one just after it.
+- `>`, `>=`, `<`, `<=`: a sample just after each boundary (and each `rem` wrap),
+  which lands inside any window the comparison opens. Never a sample on the
+  boundary itself: one on the instant of a jump makes RoadRunner's integrator
+  fail at the harness tolerances (MODEL0911120000's `time >= 16.16` pulse end,
+  CV_CONV_FAILURE). A window opening exactly at the run's start gets no sample;
+  no corpus job has one.
+
+RoadRunner integrates through the union of the job grid and these times, and only
+the job-grid rows are returned, so the compared grid is unchanged. A model whose
+triggers give none runs exactly as before. 75 of the 1,323 ODE jobs get any. On
+those, the A/B against the previous harness changed no outcome and no bngsim work
+counter. The 10 known artifacts pass on their own, and BIOMD0000000822 went from
+1,304 soft-failing cells to 0. The row's comment says `RR through N event
+instants`, and the RoadRunner timing records `event_instants`.
+
 The ODE keep-set definition (`manifest.csv`) still lives under
 `benchmarks/suites/biomodels/` (override via `$BIOMODELS_SUITE_DIR`). The SSA
 corpus `ssa_candidates.json` is now vendored here beside `build_ssa_jobs.py` /

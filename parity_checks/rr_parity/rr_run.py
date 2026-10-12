@@ -428,7 +428,18 @@ def _worker(spec: dict, q) -> None:
     rr_wall = 0.0
     try:
         t0 = time.perf_counter()
-        rr = rc.rr_ode(xml, t_int, p["t_end"], p["n_points"], p["rtol"], p["atol"])
+        # Through the instants its event triggers switch at: RoadRunner fires a
+        # `time == c` event only on an output time, which the job grid seldom
+        # holds, and bngsim fires it wherever it falls (#1015).
+        rr = rc.rr_ode(
+            xml,
+            t_int,
+            p["t_end"],
+            p["n_points"],
+            p["rtol"],
+            p["atol"],
+            through_event_instants=True,
+        )
         rr_wall = time.perf_counter() - t0
         # rr_ode now returns (time, species, names, timing)
         if len(rr) == 4:
@@ -471,6 +482,9 @@ def _worker(spec: dict, q) -> None:
     # --- both ran: compare (shared _core.differ protocol; metric realized here) ---
     try:
         status, value, comment, metric, m_tol, covers = _compare_ode(bn, rr)
+        n_instants = (rr_timing or {}).get("event_instants", 0)
+        if n_instants:
+            comment = f"{comment}; RR through {n_instants} event instants"
         res["status"], res["value"], res["comment"] = status, value, comment
         res["metric"], res["tol"] = metric, m_tol
         # Only an INVALID_REFERENCE override reads this: on a DIFF, is the whole
