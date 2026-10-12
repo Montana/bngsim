@@ -69,14 +69,32 @@ def _rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
+#: The variables that tell git WHICH repository to use. Only these are dropped.
+#: The rest (GIT_CONFIG_GLOBAL, GIT_EXEC_PATH, GIT_SSH_*) are a caller's own
+#: choices about how git behaves, and stripping them would undo, say, a
+#: deliberate GIT_CONFIG_GLOBAL=/dev/null.
+_REPO_LOCATING = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    }
+)
+
+
 def git_env() -> dict[str, str]:
-    """The environment minus every ``GIT_*`` variable.
+    """The environment minus the variables that pick the repository.
 
     An exported ``GIT_DIR`` or ``GIT_WORK_TREE`` points git at some other
     repository whatever ``-C`` says. The split would then be computed against
     that repository's index, and a test that commits would commit into it.
     """
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return {k: v for k, v in os.environ.items() if k not in _REPO_LOCATING}
 
 
 def _git(*args: str) -> bytes:
@@ -88,16 +106,21 @@ def _git(*args: str) -> bytes:
 def _git_tracked() -> frozenset[str] | None:
     """Every tracked ``.net`` path under ROOTS, relative to ROOT, or None.
 
-    None when git is missing, or when ROOT is not the top of a work tree. The
-    second case is a tree with no ``.git`` of its own that sits inside some
-    other repository, such as an export unpacked under a home directory kept in
-    git. That repository tracks none of these files, and calling all of them
-    local would empty TRACKED rather than fall back.
+    None when git is missing, or when the repository around ROOT does not track
+    ROOT's own ``pyproject.toml``. The second case is a tree with no ``.git`` of
+    its own that sits inside some unrelated repository, such as an export
+    unpacked under a home directory kept in git. That repository tracks none of
+    these files, and calling all of them local would empty TRACKED rather than
+    fall back.
+
+    The anchor is the tracked ``pyproject.toml``, not "ROOT is the top of the
+    work tree", because upstream development keeps bngsim as a ``bngsim/``
+    subdirectory of a monorepo (``git subtree split -P bngsim``, per
+    .pre-commit-config.yaml). There ROOT is below the top, and ``ls-files`` run
+    from ROOT still reports paths relative to ROOT.
     """
     try:
-        top = os.fsdecode(_git("rev-parse", "--show-toplevel").strip())
-        if Path(top).resolve() != ROOT.resolve():
-            return None
+        _git("ls-files", "--error-unmatch", "--", "pyproject.toml")
         out = _git("ls-files", "-z", "--", *ROOTS)
     except (OSError, subprocess.CalledProcessError):
         return None

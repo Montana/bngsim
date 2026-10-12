@@ -59,6 +59,7 @@ def _git(cwd: Path, *args: str) -> str:
         "user.name": "t",
         "commit.gpgsign": "false",
         "core.hooksPath": os.devnull,
+        "core.excludesFile": os.devnull,
     }
     flags = [arg for key, value in config.items() for arg in ("-c", f"{key}={value}")]
     return subprocess.run(
@@ -78,24 +79,30 @@ def _touch(root: Path, rel: str) -> Path:
     return path
 
 
-def _make_repo(base: Path) -> tuple[Path, list[Path], list[Path]]:
+def _make_repo(base: Path, subdir: str = "") -> tuple[Path, list[Path], list[Path]]:
     """A git repo under a directory named ``build``, carrying every shape.
 
-    Returns the root, the files git tracks there, and the untracked ones a
-    sweep should see.
+    With ``subdir``, the bngsim tree is that subdirectory of a larger repo, as
+    in the upstream monorepo, beside a sibling project with ``.net`` files of
+    its own. Returns the bngsim root, the files git tracks there, and the
+    untracked ones a sweep should see.
     """
-    root = base / "build" / "checkout"
+    top = base / "build" / "checkout"
+    root = top / subdir if subdir else top
     root.mkdir(parents=True)
-    _git(root, "init", "-q", "--template=")
+    _git(top, "init", "-q", "--template=")
     (root / ".gitignore").write_text("benchmarks/suites/*/nets/\n", encoding="utf-8")
+    _touch(root, "pyproject.toml")
+    if subdir:
+        _touch(top, "sibling_project/tests/not_bngsims.net")
     tracked = [
         _touch(root, "benchmarks/models/net/ode/a.net"),
         _touch(root, "tests/data/b.net"),
         _touch(root, "parity_checks/fixtures/c.net"),
     ]
     gone = _touch(root, "tests/data/deleted_from_disk.net")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-q", "-m", "fixtures")
+    _git(top, "add", "-A")
+    _git(top, "commit", "-q", "-m", "fixtures")
     gone.unlink()
 
     local = [
@@ -177,6 +184,7 @@ class TestTheSplit:
         outer = tmp_path / "home"
         outer.mkdir()
         _git(outer, "init", "-q", "--template=")
+        _touch(outer / "export", "pyproject.toml")
         on_disk = sorted(
             [
                 _touch(outer / "export", "tests/data/a.net"),
@@ -185,6 +193,14 @@ class TestTheSplit:
         )
         monkeypatch.setattr(_net_corpus, "ROOT", outer / "export")
         assert _net_corpus._split() == (on_disk, [], False)
+
+    def test_a_subtree_of_a_monorepo_still_splits(self, tmp_path, monkeypatch):
+        """Upstream keeps bngsim as ``bngsim/`` inside a monorepo, so ROOT is
+        below the top of the work tree. The split must hold there, with paths
+        relative to ROOT and none of the sibling project's files."""
+        root, tracked, local = _make_repo(tmp_path, subdir="bngsim")
+        monkeypatch.setattr(_net_corpus, "ROOT", root)
+        assert _net_corpus._split() == (tracked, local, True)
 
     def test_without_git_everything_on_disk_counts_as_tracked(self, repo, monkeypatch):
         """No split is possible, so this falls back to what the rglob always
