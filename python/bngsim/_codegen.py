@@ -9726,7 +9726,7 @@ def _edge_parameters_by_name(
                 raise ValueError("a rate law that is not read")
             if not {symbol.name for symbol in parsed.free_symbols} & clocks:
                 continue
-            found: list[tuple[str, str]] = []
+            found: list[tuple[str | None, str]] = []
             for node in sorted(set(_pow_nodes_in_values(parsed, sp)), key=_term_order.srepr):
                 if not _singular_power(node, clocks, sp):
                     continue
@@ -9746,8 +9746,8 @@ def _edge_parameters_by_name(
                         found.append((name, test))
         except Exception:  # noqa: BLE001 - a law that is not read
             found = [(None, "1")]
-        for name, test in found:
-            idx = -1 if name is None else scope.param_idx_by_name[name]
+        for listed, test in found:
+            idx = -1 if listed is None else scope.param_idx_by_name[listed]
             tests.setdefault(idx, []).append(test)
     return tuple((idx, tuple(dict.fromkeys(tests[idx]))) for idx in sorted(tests))
 

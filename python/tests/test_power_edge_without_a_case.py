@@ -32,10 +32,12 @@ Nothing is sampled on a window's edge.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import bngsim
 import numpy as np
 import pytest
+from bngsim._bngpath import resolve_bng
 
 T = [0.0, 1.0, 2.0, 4.0, 5.0, 5.5, 6.5, 6.75, 6.99, 7.01, 8.0, 10.0]
 
@@ -200,6 +202,13 @@ def _with_a_case(model) -> set[str]:
 
 SINGULAR = "((p[2] - 1.0) < 1.0 && (p[2] - 1.0) != 0.0)"
 
+
+def _singular_in(model) -> str:
+    """``SINGULAR`` where ``a`` is not the third parameter (a model from SBML)."""
+    names = [p["name"] for p in model._core.codegen_data()["parameters"]]
+    return SINGULAR.replace("p[2]", f"p[{names.index('a')}]")
+
+
 # ─── The refusal ─────────────────────────────────────────────────────────────
 
 NO_CASE = [
@@ -212,7 +221,7 @@ NO_CASE = [
     ("product", "kk"),  # 0.55% off
     ("product", "wb"),  # CVODE made no progress
     ("scale", "dw"),  # 0.37% off
-    ("rate", "r"),  # 0.4% off: a width written as a rate, s = (t - on)*r
+    ("rate", "r"),  # 0.32% off: a width written as a rate, s = (t - on)*r
     ("square", "D"),  # 0.30% off
     ("opening", "wb"),  # CVODE made no progress
     ("both", "wb"),  # CVODE made no progress
@@ -830,7 +839,9 @@ def test_a_model_with_no_case_refuses_the_column_that_needed_one(kind):
     how their rows move with the clock (issue #749). Their plain columns are
     right where nothing is singular, which is what #749 measured, at a = 3.
     At a = 1.5 the onset's column needs its frame, and the run ended in a
-    solver error (CV_ERR_FAILURE) that named a non-finite right-hand side."""
+    solver error: one that named a non-finite right-hand side for the sum
+    weighted by a live size, and CVODE's no-progress error for the compartment
+    that is the clock."""
     text, times = _no_cases(kind, 1.5)
     sim = bngsim.Simulator(
         bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["on"]
@@ -867,6 +878,351 @@ def test_a_model_with_no_case_keeps_the_columns_that_need_none(kind, a, param):
     run = sim.run(sample_times=times, rtol=1e-8, atol=1e-10, timeout=120)
     got = np.asarray(run.sensitivities)[:, list(run.species_names).index("X"), 0]
     assert _worst(got, want) < 1e-5
+
+
+# ─── No case at all, and edges that are found as roots ───────────────────────
+
+# Every parameter of the base is in the onset's denominator: no shift is a
+# number, the model has no case, and the solver sets up no frames for it.
+NO_CASE_AT_ALL = ("closing", "3/(wb-wa)", "4", (("wb", 2.0), ("wa", 1.0)))
+
+
+@pytest.mark.parametrize("a, param", [(1.1, "wb"), (1.1, "wa"), (1.5, "wb")])
+def test_on_a_counter_a_model_with_no_case_at_all_is_refused(tmp_path, a, param):
+    """A window on a counter has its edges found as roots, and the refusal
+    was first asked only where the frames were on. A model with no case has
+    none: dX/d(wa) came back 0.55% off at a = 1.1 (2.09534 for 2.10906), and
+    the run of ``wb`` ended in CVODE's no-progress error."""
+    model = _model(tmp_path, NO_CASE_AT_ALL, a)
+    assert "bngsim_codegen_comoving_case" not in _source(model)
+    assert _without_a_case(model) == {"wb": SINGULAR, "wa": SINGULAR}
+    _refused(model, param)
+
+
+@pytest.mark.parametrize("param", ["wb", "wa"])
+def test_on_a_counter_a_model_with_no_case_where_nothing_is_singular(tmp_path, param):
+    """Control."""
+    want = _differences(tmp_path, NO_CASE_AT_ALL, 3.0, param)
+    assert _worst(_column(_model(tmp_path, NO_CASE_AT_ALL, 3.0), param), want) < 5e-6
+
+
+def _at_a_root_with_no_case(shape, a, wb=2.0):
+    """A power whose edge is where a state crosses, in a model with no case
+    at all: its base reads ``wb`` and ``wa`` alone, in a denominator."""
+    if shape == "opening":
+        return bngsim.Model.from_antimony_string(
+            f"species X, Z; X = 1; Z = 0; k0 = 0.1; k1 = 1; a = {a}; wb = {wb!r}; wa = 1\n"
+            "J0: -> X; (k0 + k1*piecewise(((time - 10/(wb - wa))/20)^(a - 1), "
+            "time - Z >= 10/(wb - wa), 0))*X\n"
+        )
+    onset = "(3/(wb - wa))"
+    s = f"((time - {onset})/4)"
+    return bngsim.Model.from_antimony_string(
+        f"species X, Z; X = 0; Z = 0; k0 = 0.1; k1 = 2; a = {a}; kdeg = 0.3; "
+        f"wb = {wb!r}; wa = 1\n"
+        f"J1: -> X; k0 + piecewise(piecewise(k1*{s}*(1 - {s})^(a - 1), "
+        f"time - Z <= {onset} + 4, 0), time - Z >= {onset}, 0)\n"
+        "J2: X -> ; kdeg*X\n"
+    )
+
+
+ROOT_TIMES = {"opening": [0.0, 5.0, 12.0, 18.0], "closing": T}
+
+
+@pytest.mark.parametrize("shape, a", [("closing", 1.5), ("opening", 1.8), ("opening", 1.95)])
+def test_an_edge_found_as_a_root_in_a_model_with_no_case_is_refused(shape, a):
+    """The same through SBML, where the edge is a root because its condition
+    reads a species. The closing power's column came back at a = 1.5, and the
+    opening power's run ended in a solver error on the first step after the
+    root."""
+    model = _at_a_root_with_no_case(shape, a)
+    assert "bngsim_codegen_comoving_case" not in _source(model)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["wb"])
+    with pytest.raises(
+        bngsim.SimulationError, match=r"parameter 'wb' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=ROOT_TIMES[shape], rtol=1e-8, atol=1e-10, timeout=120)
+
+
+@pytest.mark.parametrize("shape", ["closing", "opening"])
+def test_an_edge_found_as_a_root_in_a_model_with_no_case_and_no_singular_power(shape):
+    """Control."""
+    times = ROOT_TIMES[shape]
+
+    def x(wb):
+        run = bngsim.Simulator(_at_a_root_with_no_case(shape, 3.0, wb), method="ode").run(
+            sample_times=times, rtol=1e-12, atol=1e-14, timeout=120
+        )
+        return np.asarray(run.species)[:, list(run.species_names).index("X")]
+
+    h = 1e-4
+    coarse = (x(2 + h) - x(2 - h)) / (2 * h)
+    fine = (x(2 + h / 2) - x(2 - h / 2)) / h
+    sim = bngsim.Simulator(
+        _at_a_root_with_no_case(shape, 3.0), method="ode", sensitivity_params=["wb"]
+    )
+    run = sim.run(sample_times=times, rtol=1e-8, atol=1e-10, timeout=120)
+    got = np.asarray(run.sensitivities)[:, list(run.species_names).index("X"), 0]
+    assert _worst(got, (4 * fine - coarse) / 3) < 1e-5
+
+
+# ─── A base that holds a condition, or is one term ───────────────────────────
+
+CHOSEN_TIMES = [0.0, 1.0, 2.0, 5.0, 6.0, 8.0, 8.7, 8.9, 10.0, 12.0]
+
+
+def _chosen_by_a_parameter(a, **moved):
+    """The onset is chosen by ``mode``, between ``on/(wc + wb - wa)`` and
+    ``on2``, on the literal time. The window closes at 4.0 + 4.79, which is
+    no number a double holds: the base's numerator there is what rounding
+    leaves of 0."""
+    v = {"on": 4.0, "D": 4.79, "wb": 1.5} | moved
+    onset = "piecewise(on/(wc + wb - wa), mode > 0.5, on2)"
+    s = f"((time - {onset})/D)"
+    return bngsim.Model.from_antimony_string(
+        f"species X; X = 0; k0 = 0.1; k1 = 2; a = {a}; on = {v['on']!r}; D = {v['D']!r}; "
+        f"kdeg = 0.3; wb = {v['wb']!r}; wa = 1; wc = 0.5; mode = 1; on2 = 30\n"
+        f"J1: -> X; k0 + piecewise(piecewise(k1*{s}*(1 - {s})^(a - 1), "
+        f"time <= {onset} + D, 0), time >= {onset}, 0)\n"
+        "J2: X -> ; kdeg*X\n"
+    )
+
+
+def _from_plain_runs(build, param, start, times, h=1e-4):
+    def x(value):
+        run = bngsim.Simulator(build(**{param: value}), method="ode").run(
+            sample_times=list(times), rtol=1e-12, atol=1e-14, timeout=120
+        )
+        return np.asarray(run.species)[:, list(run.species_names).index("X")]
+
+    coarse = (x(start + h) - x(start - h)) / (2 * h)
+    fine = (x(start + h / 2) - x(start - h / 2)) / h
+    return (4 * fine - coarse) / 3
+
+
+@pytest.mark.parametrize("param", ["wb", "on"])
+def test_a_base_that_holds_a_condition_is_asked_to_rounding(param):
+    """The numerator of the base holds the condition on ``mode``. Asked
+    against itself alone it was asked whether it is exactly 0, and at this
+    edge it is 9e-16: the column was not refused, and its run ended in
+    CVODE's no-progress error. It is asked against the sum of its terms, the
+    condition taken each way."""
+    model = _chosen_by_a_parameter(1.1)
+    assert "fmax(" in _without_a_case(model)[param]
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(
+        bngsim.SimulationError, match=rf"parameter '{param}' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=CHOSEN_TIMES, rtol=1e-8, atol=1e-10, timeout=120)
+
+
+@pytest.mark.parametrize("a, param, start", [(3.0, "wb", 1.5), (3.0, "on", 4.0), (1.1, "D", 4.79)])
+def test_a_base_that_holds_a_condition_keeps_the_columns_that_are_right(a, param, start):
+    """Control. Where nothing is singular, and the width, which has its case."""
+    want = _from_plain_runs(
+        lambda **moved: _chosen_by_a_parameter(a, **moved), param, start, CHOSEN_TIMES
+    )
+    got = _column(_chosen_by_a_parameter(a), param, times=CHOSEN_TIMES)
+    assert _worst(got, want) < 5e-6
+
+
+def _closing_as_a_cosine(a, **moved):
+    """``s·cos(pi·s/2)^(a-1)``: the base is one term, and 6e-17 at its edge."""
+    v = {"on": 3.0, "D": 4.0} | moved
+    s = "((time - on)/D)"
+    return bngsim.Model.from_antimony_string(
+        f"species X; X = 0; k0 = 0.1; k1 = 2; a = {a}; on = {v['on']!r}; D = {v['D']!r}; "
+        "kdeg = 0.3\n"
+        f"J1: -> X; k0 + piecewise(piecewise(k1*{s}*cos(pi*{s}/2)^(a - 1), "
+        "time <= on + D, 0), time >= on, 0)\n"
+        "J2: X -> ; kdeg*X\n"
+    )
+
+
+def test_a_base_of_one_term_is_not_asked():
+    """A base with a single term has no sum to be asked against, and
+    ``cos(pi/2)`` is not 0 in a double: asked whether it is, the column of
+    ``D`` was not refused. It is listed with its exponent alone, and refused
+    at any crossing ``D`` moves."""
+    model = _closing_as_a_cosine(1.1)
+    assert _without_a_case(model) == {"D": _singular_in(model)}
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["D"])
+    with pytest.raises(
+        bngsim.SimulationError, match=r"parameter 'D' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=T, rtol=1e-8, atol=1e-10, timeout=120)
+
+
+@pytest.mark.parametrize("a, param, start", [(3.0, "D", 4.0), (1.1, "on", 3.0)])
+def test_a_base_of_one_term_keeps_the_columns_that_are_right(a, param, start):
+    """Control. Where nothing is singular, and the onset, which has its case."""
+    want = _from_plain_runs(lambda **moved: _closing_as_a_cosine(a, **moved), param, start, T)
+    assert _worst(_column(_closing_as_a_cosine(a), param), want) < 5e-6
+
+
+# ─── A case that is for another power ────────────────────────────────────────
+
+
+def test_a_case_made_for_one_window_does_not_cover_another(tmp_path):
+    """``on`` is the plain onset of the first window, where it has its case,
+    and the onset of the second window is chosen by a condition, which the
+    case's shift does not carry: the second power stays in the column. A
+    parameter with a case was taken to need nothing more, and its run ended
+    in CVODE's no-progress error."""
+    onset = "(if(t<tsw,on,on2)+10)"
+    text = (
+        _text(("closing", "on", "D", (("on2", 30.0), ("tsw", 20.0))), 1.1)
+        .replace(
+            "end functions",
+            f"    3 s2() (t-{onset})/D\n"
+            f"    4 prod2() if(t>={onset},if(t<=({onset}+D),k1*s2()*((1-s2())^(a-1)),0),0)\n"
+            "end functions",
+        )
+        .replace("end reactions", "    4 0 1 prod2\nend reactions")
+    )
+    model = _load(tmp_path, text)
+    assert _with_a_case(model) == {"on", "D"}
+    assert _without_a_case(model) == {"on": SINGULAR, "on2": SINGULAR}
+    _refused(model, "on")
+
+
+# ─── A base that reads a state ───────────────────────────────────────────────
+
+STATE_TIMES = [0.0, 1.0, 2.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0]
+
+
+def _closing_on_a_state(a, second_window=False, **moved):
+    """``s·(1 - s - Y)^(a-1)``: the power closes where ``1 - s - Y`` crosses
+    0, and ``Y`` is a species that ``kY`` drives. With ``second_window``, a
+    window on the literal time whose onset is ``on2/kY``, far beyond the run:
+    ``kY`` is listed for that power too."""
+    v = {"kY": 0.3, "on": 3.0, "D": 4.0} | moved
+    s = "((time - on)/D)"
+    s2 = "((time - on2/kY)/D)"
+    more = (
+        f"J4: -> X; piecewise(piecewise(k1*{s2}*(1 - {s2})^(a - 1), "
+        "time <= on2/kY + D, 0), time >= on2/kY, 0)\n"
+        if second_window
+        else ""
+    )
+    return bngsim.Model.from_antimony_string(
+        f"species X, Y; X = 0; Y = 0; k0 = 0.1; k1 = 2; a = {a}; on = {v['on']!r}; "
+        f"D = {v['D']!r}; kdeg = 0.3; kY = {v['kY']!r}; on2 = 30\n"
+        f"J1: -> X; k0 + piecewise(k1*{s}*(1 - {s} - Y)^(a - 1), "
+        f"(time >= on) && (1 - {s} - Y > 0), 0)\n"
+        "J2: X -> ; kdeg*X\n"
+        "J3: -> Y; kY*(1 - Y)\n" + more
+    )
+
+
+def _refused_on_a_state(model, param):
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(
+        bngsim.SimulationError, match=rf"parameter '{param}' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=STATE_TIMES, rtol=1e-8, atol=1e-10, timeout=120)
+
+
+def test_a_base_that_reads_a_state_is_listed_for_every_parameter():
+    """``kY`` is in no power's base, and it moves the zero of this one
+    through ``Y``. Only the parameters written in a base were listed, and its
+    column was returned plain."""
+    model = _closing_on_a_state(1.5)
+    assert _without_a_case(model)[EVERY] == _singular_in(model)
+    _refused_on_a_state(model, "kY")
+
+
+def test_a_base_that_reads_a_state_where_nothing_is_singular():
+    """Control."""
+    want = _from_plain_runs(
+        lambda **moved: _closing_on_a_state(3.0, **moved), "kY", 0.3, STATE_TIMES
+    )
+    assert _worst(_column(_closing_on_a_state(3.0), "kY", times=STATE_TIMES), want) < 1e-5
+
+
+def test_a_parameter_listed_for_one_power_is_asked_of_a_state_power_too():
+    """``kY`` is listed for the second window, whose base is nowhere near 0
+    at the crossing ``1 - s - Y`` makes at 4.15, and it moves that crossing
+    through ``Y``. What holds for every parameter holds for a listed one."""
+    model = _closing_on_a_state(1.5, second_window=True)
+    listed = _without_a_case(model)
+    singular = _singular_in(model)
+    assert listed[EVERY] == singular
+    assert listed["kY"].startswith(f"(({singular}) && (!(fabs(")
+    assert listed["kY"].endswith(f" || {singular}")
+    _refused_on_a_state(model, "kY")
+
+
+def test_by_name_a_base_that_reads_a_state_is_listed_for_every_parameter(monkeypatch):
+    """The same where the plan ended early."""
+    model = _closing_on_a_state(1.5)
+    _ending_early(monkeypatch, RuntimeError("plan"))
+    assert _without_a_case(model)[EVERY] == _singular_in(model)
+
+
+# ─── A model of several seasons (SIR_v5) ─────────────────────────────────────
+
+_SIR_V5 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/bng_parity/models/original/bngl_models/my_models/ode/SIR_v5.bngl"
+)
+_BNG = resolve_bng()
+needs_sir_v5 = pytest.mark.skipif(
+    not (_BNG.ok and _SIR_V5.exists()),
+    reason=f"BNG2.pl unavailable or SIR_v5.bngl absent: {_BNG.why_not()}",
+)
+# Off every year end and every season's edges: the 2023 season runs from 862
+# to 1058.56.
+SIR_TIMES = [0.0, 400.0, 700.0, 800.0, 870.0, 900.0, 1000.0, 1050.0, 1070.0, 1090.0]
+
+
+def _sir_v5(**values):
+    model = bngsim.Model.from_bngl(str(_SIR_V5))
+    for name, value in values.items():
+        model.set_param(name, value)
+    return model
+
+
+@needs_sir_v5
+@pytest.mark.parametrize("param", ["dt_2023", "fD_2023"])
+def test_sir_v5_with_a_singular_exponent_is_refused(param):
+    """Each season is ``s^(a-1)·(1 - s^a)^(b-1)`` on a counter, with its
+    onset, width and exponents chosen by year. The model has no case at all,
+    and at its own values no exponent is under 1. With ``a_2023 = 1.5`` the
+    2023 season opens as a root: a column that moves its edges is refused."""
+    model = _sir_v5(a_2023=1.5)
+    assert "bngsim_codegen_comoving_case" not in _source(model)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(
+        bngsim.SimulationError, match=rf"parameter '{param}' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=SIR_TIMES, rtol=1e-8, atol=1e-10, timeout=300)
+
+
+@needs_sir_v5
+def test_sir_v5_at_its_own_values_keeps_its_columns():
+    """Control. Nothing is singular at the model's own values, and the
+    listed parameters keep their columns."""
+    index = None
+
+    def infected(run):
+        nonlocal index
+        index = list(run.species_names).index("I()")
+        return np.asarray(run.species)[:, index]
+
+    def x(value):
+        run = bngsim.Simulator(_sir_v5(dt_2023=value), method="ode").run(
+            sample_times=SIR_TIMES, rtol=1e-12, atol=1e-14, timeout=300
+        )
+        return infected(run)
+
+    h = 0.132
+    coarse = (x(132 + h) - x(132 - h)) / (2 * h)
+    fine = (x(132 + h / 2) - x(132 - h / 2)) / h
+    sim = bngsim.Simulator(_sir_v5(), method="ode", sensitivity_params=["dt_2023"])
+    run = sim.run(sample_times=SIR_TIMES, rtol=1e-8, atol=1e-10, timeout=300)
+    got = np.asarray(run.sensitivities)[:, index, 0]
+    assert _worst(got, (4 * fine - coarse) / 3) < 5e-5
 
 
 # ─── Whether a parameter moves the zero of a base ────────────────────────────
