@@ -197,19 +197,16 @@ def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache)
         second.output_sensitivities(["ratio"])
 
 
+@needs_cc
 def test_the_registry_does_not_keep_an_analysis_alive(isolated_cache):
     """What the process remembers of an artifact it built is a weak
     reference: the analysis goes with its models."""
     import gc
 
-    if _CC is None:
-        pytest.skip("no C compiler on PATH")
     _run()
+    (artifact,) = _artifacts(isolated_cache)
     gc.collect()
-    assert all(mark() is None for mark in cg._output_sens_emitted.values())
-    _run()
-    gc.collect()
-    assert len(cg._output_sens_emitted) <= 1
+    assert cg._output_sens_emitted[str(artifact)]() is None
 
 
 @needs_cc

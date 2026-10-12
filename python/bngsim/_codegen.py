@@ -8350,11 +8350,11 @@ def output_sens_support_of_artifact(
     *model*, or ``None`` where the artifact does not say (issue #1004).
 
     The model whose analysis the artifact's code was emitted from, in this
-    process, answers from that analysis, as it did before there was a note: a
-    process loads the artifact it has just built at once, and what another
-    process writes beside it afterwards does not describe that image. Any
-    other model, one that was handed the artifact from the cache among them,
-    is told by the note. ``None`` where there is neither, and the caller
+    process, and its clones, answer from that analysis, as they did before
+    there was a note: what another process writes beside the artifact
+    afterwards need not describe the image this process loaded. Any other
+    model, one that was handed the artifact from the cache among them, is
+    told by the note. ``None`` where there is neither, and the caller
     analyses the model.
     """
     mark = _output_sens_emitted.get(str(so_path))
