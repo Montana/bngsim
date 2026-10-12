@@ -47,6 +47,7 @@ from bngsim._codegen import (
     _codegen_jit_backend,
     last_codegen_decline,
     last_codegen_error,
+    output_sens_support_of_artifact,
     read_sens_decline_note,
 )
 from bngsim._exceptions import (
@@ -3306,16 +3307,43 @@ class Simulator:
         # unsupported while it is attached and not while it is pinned, and the
         # artifact can be replaced on that account by more than one route
         # (issue #708).
-        attached = _attachment(self._model)
+        #
+        # And with the artifact (issue #1004): the map is the compiled code's
+        # own, written beside it when it was built. The analysis behind it runs
+        # under a wall-clock budget, so one made again here need not be cut
+        # where the build's was, and would call a function supported that the
+        # artifact holds NaN for. Read, a warm process does not pay for the
+        # analysis either. The model whose own analysis the artifact was
+        # emitted from answers from that, and an artifact with no note is
+        # analysed as before.
+        attached = (_attachment(self._model), self._codegen_so_path)
         kept = self._expr_sens_support_memo
         if kept is not None and kept[0] == attached:
             return kept[1]
-        try:
-            from bngsim._codegen import output_sens_support
+        memo = None
+        if self._codegen_so_path:
+            try:
+                names = list(self._model._core.function_names)
+            except Exception:  # noqa: BLE001 - no names to hold the note to
+                names = None
+            memo = output_sens_support_of_artifact(self._model, self._codegen_so_path, names)
+            unavailable = [name for name, reason in (memo or {}).items() if reason is not None]
+            if memo is not None and unavailable:
+                logger.info(
+                    "The compiled code has no output sensitivity for %d of %d function(s) "
+                    "(%s): %s",
+                    len(unavailable),
+                    len(memo),
+                    ", ".join(unavailable[:5]),
+                    memo[unavailable[0]],
+                )
+        if memo is None:
+            try:
+                from bngsim._codegen import output_sens_support
 
-            memo = output_sens_support(self._model)
-        except Exception:  # pragma: no cover - defensive; analysis is best-effort
-            memo = {}
+                memo = output_sens_support(self._model)
+            except Exception:  # pragma: no cover - defensive; analysis is best-effort
+                memo = {}
         self._expr_sens_support_memo = (attached, memo)
         return memo
 
