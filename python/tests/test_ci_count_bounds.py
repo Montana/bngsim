@@ -142,7 +142,7 @@ class Call(NamedTuple):
     call: str  #: the call, backslash continuations joined
     block: str  #: the step's ``run:`` block up to the call: where a ``set +e`` would be
     step: str  #: the whole step: where a ``continue-on-error`` would be
-    job: str  #: the job's keys before its steps: the job-level ``continue-on-error``
+    job: str  #: the job's own keys, either side of ``steps:``: a job-level ``continue-on-error``
 
 
 def _indent(line: str) -> int:
@@ -184,13 +184,21 @@ def _calls() -> dict[str, list[Call]]:
                 (j for j in range(step) if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j])),
                 default=0,
             )
+            job_end = next(
+                (
+                    k
+                    for k in range(job + 1, len(lines))
+                    if lines[k].strip() and _indent(lines[k]) <= 2
+                ),
+                len(lines),
+            )
             out.setdefault(path.name, []).append(
                 Call(
                     name=match.group(1),
                     call=" ".join(continued_block(lines, i)),
                     block="\n".join(lines[run : i + 1]),
                     step="\n".join(lines[step:end]),
-                    job="\n".join(line for line in lines[job + 1 : step] if _indent(line) == 4),
+                    job="\n".join(line for line in lines[job + 1 : job_end] if _indent(line) == 4),
                 )
             )
     return out
@@ -306,7 +314,7 @@ class TestTheWorkflowsUseIt:
         into a green check.
         """
         bad = []
-        unless_false = re.compile(r"^\s*continue-on-error:\s*(?!false\b)\S", re.M)
+        unless_false = re.compile(r"^\s*(?:-\s+)?continue-on-error:\s*(?!false\b)\S", re.M)
         for wf, calls in _calls().items():
             for c in calls:
                 name, call = c.name, c.call

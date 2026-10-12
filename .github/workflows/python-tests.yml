@@ -270,7 +270,7 @@ jobs:
           #      into skips for a *declared* reason that BNGSIM_SKIP_AUDIT=strict
           #      accepts, e.g. an extra silently failing to install, provided
           #      the group is larger than the ceiling's headroom on that leg
-          #      (30 to 55 tests; see ci/test_floors.env). This used to be a
+          #      (30 to 56 tests; see ci/test_floors.env). This used to be a
           #      floor on PASSED, which had to keep moving as the suite grew; a
           #      skip count does not move when tests are added.
           #
