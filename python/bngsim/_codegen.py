@@ -8077,27 +8077,17 @@ _OUTPUT_SENS_NOTE_VERSION = 1
 #: it found installed and handed back (issue #1004).
 _compile_installs = threading.local()
 
-#: For the artifacts this process built (issue #1004): ``{artifact path: (the
-#: file as it was installed, the mark of the output-sensitivity analysis its code
-#: was emitted from)}``. A model that still holds that analysis answers for the
-#: artifact itself while the file is the one it installed; any other is told by
-#: the note. The mark is held weakly: an entry goes when its analysis does.
-_output_sens_emitted: dict[str, tuple[tuple[int, int, int], weakref.ref]] = {}
+#: For the artifacts this process built (issue #1004): ``{artifact path: the mark
+#: of the output-sensitivity analysis its code was emitted from}``. A model that
+#: still holds that analysis answers for the artifact itself; any other is told
+#: by the note. The mark is held weakly: an entry goes when its analysis does.
+_output_sens_emitted: dict[str, weakref.ref] = {}
 
 
 class _EmittedMark:
     """What stands for one output-sensitivity analysis in the registry above."""
 
     __slots__ = ("__weakref__",)
-
-
-def _file_signature(path: str | os.PathLike[str]) -> tuple[int, int, int] | None:
-    """Which file is at *path*: another build installed over it is another."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 _sens_declines = threading.local()
@@ -8321,21 +8311,17 @@ def output_sens_support_of_artifact(
     *model*, or ``None`` where the artifact does not say (issue #1004).
 
     The model whose analysis the artifact's code was emitted from, in this
-    process, answers from that analysis while the file is the one this process
-    installed: it is the artifact's by construction, whatever another process
-    has since written beside it. Any other model is told by the note: one that
-    was handed the artifact from the cache, and the builder itself where
-    another process's build has been installed over its own. ``None`` where
-    there is neither, and the caller analyses the model.
+    process, answers from that analysis, as it did before there was a note: a
+    process loads the artifact it has just built at once, and what another
+    process writes beside it afterwards does not describe that image. Any
+    other model, one that was handed the artifact from the cache among them,
+    is told by the note. ``None`` where there is neither, and the caller
+    analyses the model.
     """
-    entry = _output_sens_emitted.get(str(so_path))
+    mark = _output_sens_emitted.get(str(so_path))
     own = getattr(model, "_output_sens_analysis", None)
-    if entry is not None and own is not None:
-        installed, mark = entry
-        if own[1].get("emitted_mark") is mark() is not None and (
-            _file_signature(so_path) == installed
-        ):
-            return _support_of_analysis(own[1])
+    if mark is not None and own is not None and own[1].get("emitted_mark") is mark() is not None:
+        return _support_of_analysis(own[1])
     return read_output_sens_support_note(so_path, function_names)
 
 
@@ -11856,12 +11842,11 @@ def prepare_model_codegen(model) -> Path | None:
             try:
                 emitted = _analyze_output_sens(model)
                 support = _support_of_analysis(emitted)
-                installed = _file_signature(so_path)
-                if support and installed is not None:
+                if support:
                     mark = emitted.setdefault("emitted_mark", _EmittedMark())
-                    for path in [k for k, v in _output_sens_emitted.items() if v[1]() is None]:
+                    for path in [k for k, v in _output_sens_emitted.items() if v() is None]:
                         del _output_sens_emitted[path]
-                    _output_sens_emitted[str(so_path)] = (installed, weakref.ref(mark))
+                    _output_sens_emitted[str(so_path)] = weakref.ref(mark)
                 write_output_sens_support_note(so_path, support)
             except Exception as e:  # noqa: BLE001 - a note, not the build
                 logger.debug("Could not work out the output-sensitivity support (%s)", e)

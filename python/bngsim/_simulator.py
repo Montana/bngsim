@@ -4664,11 +4664,6 @@ class Simulator:
                 self._apply_crossing_stops(opts, t_start, t_end)
                 if self._codegen_so_path:
                     opts.codegen_so_path = self._codegen_so_path
-                    if self._sensitivity_params or self._sensitivity_ic:
-                        # Issue #1004: what the artifact holds is asked where it
-                        # is handed to the solver, not after the run: another
-                        # process may install its own build over it meanwhile.
-                        self._expression_sens_support()
                 if self._codegen_c_source:
                     opts.codegen_c_source = self._codegen_c_source
 
@@ -6111,11 +6106,6 @@ class Simulator:
                 # per-θ loop of run() produce identical results.
                 if self._codegen_so_path:
                     opts.codegen_so_path = self._codegen_so_path
-                    if self._sensitivity_params or self._sensitivity_ic:
-                        # Issue #1004: what the artifact holds is asked where it
-                        # is handed to the solver, not after the run: another
-                        # process may install its own build over it meanwhile.
-                        self._expression_sens_support()
                 if self._codegen_c_source:
                     opts.codegen_c_source = self._codegen_c_source
                 # This row's own discontinuity crossings, for the same reason the

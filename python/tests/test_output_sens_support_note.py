@@ -174,7 +174,9 @@ def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache)
     analysis the code was emitted from does not ask the note: with a note
     beside it that calls every function supported, as a build that was not
     cut writes, it raises its own reason, as it did before there was a note.
-    Reading the note here returned NaN in 3 of 8 concurrent cold starts."""
+    Reading the note here returned NaN in 3 of 8 concurrent cold starts, and
+    reading it once the file had been replaced in 17 of 24: the process has
+    loaded its own build by then."""
     model = bngsim.Model.from_net(CHAIN_NET)
 
     def run():
@@ -195,48 +197,16 @@ def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache)
         second.output_sensitivities(["ratio"])
 
 
-@needs_cc
-def test_the_builder_is_told_by_the_note_once_its_artifact_is_replaced(isolated_cache):
-    """The other order of the same race: a build that was not cut installs
-    its artifact, and before it runs again another process installs one that
-    was cut, with its note. The file is no longer the one this model built,
-    so the model is told by the note, and raises; it returned NaN."""
-    model = bngsim.Model.from_net(CHAIN_NET)
-
-    def run():
-        sim = bngsim.Simulator(
-            model, method="ode", codegen=True, sensitivity_params=["k1", "scale"]
-        )
-        return sim.run(t_span=(0.0, 8.0), n_points=5)
-
-    first = run()
-    assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
-    (artifact,) = _artifacts(isolated_cache)
-    # Another process's build lands on the path: the same bytes under a new
-    # file, with a note that says what a cut build's would.
-    replaced = artifact.with_name("other" + artifact.name)
-    shutil.copy2(artifact, replaced)
-    os.replace(replaced, artifact)
-    reason = "the build-time d(function)/dθ derivation exceeded its 20s budget"
-    cg.write_output_sens_support_note(
-        artifact, {"scaled": None, "ratio": reason, "combo": reason, "tdep": reason}
-    )
-    model.reset()
-    second = run()
-    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
-        second.output_sensitivities(["ratio"])
-
-
 def test_the_registry_does_not_keep_an_analysis_alive(isolated_cache):
-    """What the process remembers of an artifact it built is a file's
-    signature and a weak reference: the analysis goes with its models."""
+    """What the process remembers of an artifact it built is a weak
+    reference: the analysis goes with its models."""
     import gc
 
     if _CC is None:
         pytest.skip("no C compiler on PATH")
     _run()
     gc.collect()
-    assert all(mark() is None for _installed, mark in cg._output_sens_emitted.values())
+    assert all(mark() is None for mark in cg._output_sens_emitted.values())
     _run()
     gc.collect()
     assert len(cg._output_sens_emitted) <= 1
