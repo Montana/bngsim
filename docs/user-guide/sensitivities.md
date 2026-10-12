@@ -385,7 +385,8 @@ Five cases are refused:
   time, and the column is refused at any crossing its parameter moves. A base that
   reads a species has a zero that any parameter can move through the state,
   so there the column of every parameter is asked, whether or not the base
-  is written in it. A parameter that is in the base and does not move its
+  is written in it, and so is the column of an initial value
+  (`sensitivity_ic`). A parameter that is in the base and does not move its
   zero, `kk` in `(kk*(1 - s))^(a-1)`, keeps its column. A `β` made for one
   power does not stand for another: `on` with a plain onset in one window
   and an onset chosen by a condition in a second has its `V` for the first
@@ -455,11 +456,11 @@ plain column meets the singular forcing as before. Where the RHS goes
 non-finite at the onset the failure names the sensitivity column and `∂f/∂on`,
 or the restart where the step gave out. A closing power whose base is not
 linear in the time, `(1 - s^2)^(a-1)`, has no shift for the window's length at
-all, and that column comes back a few parts in a thousand off with nothing
-said. An exponent of
+all, and that column is refused (issue #1003, above). An exponent of
 2 or more (`a >= 2`) keeps the derivative finite, and leaving the onset
 parameter out of `sensitivity_params` avoids it. `BNGSIM_SENS_COMOVING=0` keeps
-every column plain, for comparison.
+every column plain, for comparison; a column that is refused because it has
+no `β` is refused with the switch too.
 
 ### What is declined
 

@@ -5288,14 +5288,15 @@ void CvodeSimulator::Impl::comoving_refuse_without_a_case(const SensitivityState
         msg << "Forward sensitivity: " << who
             << " moves the crossing at t=" << std::setprecision(17) << t
             << ", which is the edge of a rate law's power that is singular at this run's values "
-               "(an exponent under 1), or cannot be told from one: the power's base is 0 there, "
-               "or it reads a counter or a species and cannot be asked at the crossing's time. A "
-               "column is carried across such an edge in a frame that moves with it, and this "
-               "column has none: the rate at which the edge's time changes with it is not a "
-               "number that holds along the run (a parameter in the denominator or the scale of "
-               "the edge's time, a base that is not linear in the time, or one that reads a "
-               "species, whose zero anything can move through the state), or the frames of this "
-               "model were not worked out. The plain column has a forcing that is unbounded at "
+               "(an exponent under 1), or cannot be told from one: the power's base is 0 there; "
+               "or it reads a counter or a species and cannot be asked at the crossing's time; or "
+               "the frames of this model were not worked out, and every crossing a column moves "
+               "is taken for such an edge. A column is carried across the edge in a frame that "
+               "moves with it, and this column has none: the rate at which the edge's time "
+               "changes with it is not a number that holds along the run (a parameter in the "
+               "denominator or the scale of the edge's time, a base that is not linear in the "
+               "time, or one that reads a species, whose zero anything can move through the "
+               "state). The plain column has a forcing that is unbounded at "
                "the edge: it comes back up to 12% off, or ends in a solver error (issue #1003). "
                "Drop it from the sensitivities asked for, or difference plain runs.";
         throw std::runtime_error(msg.str());
@@ -10981,7 +10982,7 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
         // here too, in a model that has no case at all and so no frames.
         const bool frames_on = sens.comoving.enabled || sens.comoving.off_for_events;
         const bool edges_listed = codegen_edge_without_case_fn != nullptr &&
-                                  sens.comoving.edge_param_values != nullptr && sens.n_p > 0;
+                                  sens.comoving.edge_param_values != nullptr && sens.n_total > 0;
         if (frames_on || edges_listed) {
             sync(x, t_evt);
             std::vector<double> tau_enter;
@@ -10993,7 +10994,9 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
             } catch (const std::exception &) {
                 tau_enter.clear();
             }
-            if (tau_enter.size() >= static_cast<std::size_t>(sens.n_p)) {
+            // One entry a column, the initial-condition ones after the
+            // parameters'; none where it was not to be had.
+            if (!tau_enter.empty() && tau_enter.size() >= static_cast<std::size_t>(sens.n_p)) {
                 comoving_refuse_without_a_case(sens, t_evt, tau_enter);
                 if (frames_on) {
                     comoving_enter(sens, ns, comoving_cols.data(), t_evt, f_minus, f_minus, f_minus,
@@ -11004,7 +11007,7 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
                 // taken to move it.
                 comoving_refuse_without_a_case(
                     sens, t_evt,
-                    std::vector<double>(static_cast<std::size_t>(sens.n_p),
+                    std::vector<double>(static_cast<std::size_t>(sens.n_total),
                                         std::numeric_limits<double>::quiet_NaN()));
             }
             // Issue #760: and the stops of the stretch this crossing begins.

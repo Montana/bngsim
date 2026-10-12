@@ -1292,22 +1292,27 @@ def test_a_base_that_reads_a_state_where_nothing_is_singular():
     assert _worst(_column(_closing_on_a_state(3.0), "kY", times=STATE_TIMES), want) < 1e-5
 
 
-def _column_of_an_initial_value(model):
-    sim = bngsim.Simulator(model, method="ode", sensitivity_ic=["Y"])
+def _column_of_an_initial_value(model, beside=None):
+    sim = bngsim.Simulator(model, method="ode", sensitivity_ic=["Y"], sensitivity_params=beside)
     run = sim.run(sample_times=STATE_TIMES, rtol=1e-8, atol=1e-10, timeout=120)
     return np.asarray(run.sensitivities_ic)[:, list(run.species_names).index("X"), 0]
 
 
-def test_an_initial_value_that_moves_the_zero_of_a_base_is_refused():
+@pytest.mark.parametrize("a", [1.5, 1.6, 1.8])
+@pytest.mark.parametrize("beside", [None, ["k0"]], ids=["alone", "beside a parameter"])
+def test_an_initial_value_that_moves_the_zero_of_a_base_is_refused(a, beside):
     """The initial value of ``Y`` moves the zero of ``1 - s - Y`` as ``kY``
     does, and it is no parameter: only the parameters' columns were asked,
     and dX/dY(0) came back plain (0.56% off at a = 1.2 and a tolerance of
-    1e-5)."""
+    1e-5). Asked for alone, with no parameter beside it, it was still
+    returned where the rate does not jump at the crossing (from a = 1.502
+    up: 6.2e-4 off at a = 1.6 and a tolerance of 1e-5), because that site
+    asked only where there was a parameter's column."""
     with pytest.raises(
         bngsim.SimulationError,
         match=r"initial value of species 'Y' moves.*singular.*\(issue #1003\)",
     ):
-        _column_of_an_initial_value(_closing_on_a_state(1.5))
+        _column_of_an_initial_value(_closing_on_a_state(a), beside)
 
 
 def test_an_initial_value_where_nothing_is_singular():
