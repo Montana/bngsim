@@ -140,6 +140,31 @@ def test_the_other_way_round_the_artifact_that_was_not_cut_is_not_refused(isolat
         np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["ratio"])), want)
 
 
+@needs_cc
+def test_a_build_that_finds_the_artifact_installed_leaves_its_note(isolated_cache, monkeypatch):
+    """Two processes can miss the cache together. The one that compiles second
+    finds the artifact installed and is handed it, with whatever its own
+    budget did: the note beside it is the first one's, and stays."""
+    _sim, first = _run()
+    want = np.asarray(first.output_sensitivities(["ratio"]))
+    (note,) = _notes(isolated_cache)
+    before = note.read_text()
+
+    real = cg.get_cached_so
+    looked = [0]
+
+    def missed_once(model_hash):
+        looked[0] += 1
+        return None if looked[0] == 1 else real(model_hash)
+
+    monkeypatch.setattr(cg, "get_cached_so", missed_once)
+    with _cut_after_the_first():
+        _sim, second = _run()
+        assert looked[0] >= 2
+        assert note.read_text() == before
+        np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["ratio"])), want)
+
+
 # ─── The note ────────────────────────────────────────────────────────────────
 
 
