@@ -635,6 +635,7 @@ def _parse_clock_expr(text: str):
         _preprocess_derived_expr,
         _substitute_symbols_once,
     )
+    from bngsim._jacobian import builtin_shadow_bindings
 
     s = _preprocess_derived_expr(text)
     calls: set[str] = set()
@@ -652,6 +653,8 @@ def _parse_clock_expr(text: str):
         s = _substitute_symbols_once(s, renamed)
 
     local_dict: dict = {c: getattr(sp, c) for c in _CLOCK_PARSE_CALLS}
+    # `round` would otherwise be Python's, which folds round(2.5) to 2 (#684).
+    local_dict.update(builtin_shadow_bindings(sp))
     local_dict.update({a: sp.Symbol(a) for a in alias.values()})
     expr = parse_expr(s, local_dict=local_dict, evaluate=True)
 
