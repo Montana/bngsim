@@ -30,9 +30,10 @@ import _net_corpus  # noqa: E402
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-#: Modules allowed to rglob ``.net`` files themselves, and why each is not a
-#: sweep of the corpus. Anything else that rglobs ``*.net`` is a fourth copy. A
-#: plain ``glob`` of one directory is not a sweep and is not checked.
+#: Modules allowed to walk the tree for ``.net`` files themselves, and why each
+#: is not a sweep of the corpus. Anything else that does, through ``rglob`` or a
+#: ``**`` glob, is a fourth copy. A plain ``glob`` of one directory is not a
+#: sweep, and an ``os.walk`` is not detected.
 OWN_GLOBS = {
     "_net_corpus.py": "the one place the sweep's corpus is listed",
     "test_curated_benchmark_corpus.py": "scoped to two named suites, results/ excluded",
@@ -45,22 +46,29 @@ needs_git = pytest.mark.skipif(
 )
 
 
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.email=t@example.com",
-            "-c",
-            "user.name=t",
-            "-c",
-            "commit.gpgsign=false",
-            *args,
-        ],
+def _git(cwd: Path, *args: str) -> str:
+    """Git in ``cwd`` and nowhere else.
+
+    Without ``GIT_*`` from the environment, so an exported ``GIT_DIR`` cannot
+    turn the fixture's commit into a commit on the developer's own repository.
+    Without the user's hooks or signing, so a global ``core.hooksPath`` does not
+    run on a throwaway commit.
+    """
+    config = {
+        "user.email": "t@example.com",
+        "user.name": "t",
+        "commit.gpgsign": "false",
+        "core.hooksPath": os.devnull,
+    }
+    flags = [arg for key, value in config.items() for arg in ("-c", f"{key}={value}")]
+    return subprocess.run(
+        ["git", *flags, *args],
         cwd=cwd,
         check=True,
         capture_output=True,
-    )
+        text=True,
+        env=_net_corpus.git_env(),
+    ).stdout
 
 
 def _touch(root: Path, rel: str) -> Path:
@@ -70,12 +78,15 @@ def _touch(root: Path, rel: str) -> Path:
     return path
 
 
-@pytest.fixture
-def repo(tmp_path, monkeypatch):
-    """A git repo under a directory named ``build``, carrying every shape."""
-    root = tmp_path / "build" / "checkout"
+def _make_repo(base: Path) -> tuple[Path, list[Path], list[Path]]:
+    """A git repo under a directory named ``build``, carrying every shape.
+
+    Returns the root, the files git tracks there, and the untracked ones a
+    sweep should see.
+    """
+    root = base / "build" / "checkout"
     root.mkdir(parents=True)
-    _git(root, "init", "-q")
+    _git(root, "init", "-q", "--template=")
     (root / ".gitignore").write_text("benchmarks/suites/*/nets/\n", encoding="utf-8")
     tracked = [
         _touch(root, "benchmarks/models/net/ode/a.net"),
@@ -93,14 +104,20 @@ def repo(tmp_path, monkeypatch):
     ]
     clone = root / "parity_checks" / "bng_parity" / ".sources_cache" / "upstream@abc"
     clone.mkdir(parents=True)
-    _git(clone, "init", "-q")
+    _git(clone, "init", "-q", "--template=")
     local.append(_touch(clone, "models/in_a_nested_clone.net"))
     _touch(root, "benchmarks/build/generated.net")
     _touch(root, "tests/.pytest_cache/cached.net")
     _touch(root, "elsewhere/outside_the_roots.net")
 
-    monkeypatch.setattr(_net_corpus, "ROOT", root)
     return root, sorted(tracked), sorted(local)
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    root, tracked, local = _make_repo(tmp_path)
+    monkeypatch.setattr(_net_corpus, "ROOT", root)
+    return root, tracked, local
 
 
 @needs_git
@@ -129,6 +146,45 @@ class TestTheSplit:
         assert got_tracked == tracked
         names = {p.name for p in got_tracked + got_local}
         assert "generated.net" not in names and "cached.net" not in names
+
+    def test_an_exported_git_dir_neither_redirects_the_split_nor_takes_a_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """With ``GIT_DIR`` and ``GIT_WORK_TREE`` exported to another repository,
+        git ignores ``-C``. The helper then listed that repository's index, and
+        the fixture's commit landed on its current branch."""
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        _git(victim, "init", "-q", "--template=")
+        _touch(victim, "kept.txt")
+        _git(victim, "add", "-A")
+        _git(victim, "commit", "-q", "-m", "the developer's work")
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(victim))
+
+        root, tracked, local = _make_repo(tmp_path / "fixture")
+        monkeypatch.setattr(_net_corpus, "ROOT", root)
+        got_tracked, got_local, git = _net_corpus._split()
+
+        assert _git(victim, "rev-list", "--count", "HEAD").strip() == "1"
+        assert (git, got_tracked, got_local) == (True, tracked, local)
+
+    def test_a_tree_inside_another_repository_falls_back(self, tmp_path, monkeypatch):
+        """A tree with no ``.git`` of its own, sitting inside some other repo,
+        such as an export unpacked under a home directory kept in git. That
+        repo tracks none of these files. Calling them all local would empty
+        TRACKED, so this falls back as if there were no git at all."""
+        outer = tmp_path / "home"
+        outer.mkdir()
+        _git(outer, "init", "-q", "--template=")
+        on_disk = sorted(
+            [
+                _touch(outer / "export", "tests/data/a.net"),
+                _touch(outer / "export", "benchmarks/b.net"),
+            ]
+        )
+        monkeypatch.setattr(_net_corpus, "ROOT", outer / "export")
+        assert _net_corpus._split() == (on_disk, [], False)
 
     def test_without_git_everything_on_disk_counts_as_tracked(self, repo, monkeypatch):
         """No split is possible, so this falls back to what the rglob always
@@ -170,6 +226,7 @@ def test_in_this_checkout_tracked_is_exactly_git_ls_files():
         ["git", "-C", str(_net_corpus.ROOT), "ls-files", "-z", "--", *_net_corpus.ROOTS],
         capture_output=True,
         check=True,
+        env=_net_corpus.git_env(),
     ).stdout.decode("utf-8")
     expected = {p for p in out.split("\0") if p.endswith(".net")}
     got = {p.relative_to(_net_corpus.ROOT).as_posix() for p in _net_corpus.TRACKED}
@@ -184,7 +241,10 @@ def test_no_other_module_rolls_its_own_sweep():
     own = sorted(
         path.name
         for path in TESTS_DIR.glob("*.py")
-        if re.search(r"""\.rglob\(\s*["']\*\.net["']""", path.read_text("utf-8"))
+        if re.search(
+            r"""\.rglob\(\s*["']\*\.net["']|glob\(\s*[^)]*\*\*/\*\.net""",
+            path.read_text("utf-8"),
+        )
     )
     assert "_net_corpus.py" in own, "the scan no longer sees the helper's own glob"
     extra = [name for name in own if name not in OWN_GLOBS]

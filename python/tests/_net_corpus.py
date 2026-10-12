@@ -69,17 +69,41 @@ def _rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
+def git_env() -> dict[str, str]:
+    """The environment minus every ``GIT_*`` variable.
+
+    An exported ``GIT_DIR`` or ``GIT_WORK_TREE`` points git at some other
+    repository whatever ``-C`` says. The split would then be computed against
+    that repository's index, and a test that commits would commit into it.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _git(*args: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *args], capture_output=True, check=True, env=git_env()
+    ).stdout
+
+
 def _git_tracked() -> frozenset[str] | None:
-    """Every tracked ``.net`` path under ROOTS, relative to ROOT, or None without git."""
+    """Every tracked ``.net`` path under ROOTS, relative to ROOT, or None.
+
+    None when git is missing, or when ROOT is not the top of a work tree. The
+    second case is a tree with no ``.git`` of its own that sits inside some
+    other repository, such as an export unpacked under a home directory kept in
+    git. That repository tracks none of these files, and calling all of them
+    local would empty TRACKED rather than fall back.
+    """
     try:
-        out = subprocess.run(
-            ["git", "-C", str(ROOT), "ls-files", "-z", "--", *ROOTS],
-            capture_output=True,
-            check=True,
-        ).stdout
+        top = os.fsdecode(_git("rev-parse", "--show-toplevel").strip())
+        if Path(top).resolve() != ROOT.resolve():
+            return None
+        out = _git("ls-files", "-z", "--", *ROOTS)
     except (OSError, subprocess.CalledProcessError):
         return None
-    return frozenset(p for p in out.decode("utf-8").split("\0") if p.endswith(".net"))
+    # fsdecode, not utf-8: a filename that is not valid UTF-8 (possible on
+    # Linux) would otherwise raise here, at collection, in all four modules.
+    return frozenset(name for name in map(os.fsdecode, out.split(b"\0")) if name.endswith(".net"))
 
 
 def _on_disk() -> list[Path]:
