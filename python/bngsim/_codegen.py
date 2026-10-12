@@ -29,6 +29,7 @@ import struct
 import subprocess
 import threading
 import time
+import weakref
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -5067,6 +5068,7 @@ def compile_rhs(c_source: str, model_hash: str) -> Path:
             )
             _compile_sharded(driver_src, units, tmp_so_path, opt_flag, jobs, timeout, compiler)
             os.replace(tmp_so_path, so_path)
+            _compile_installs.last = str(so_path)
         else:
             c_path = CACHE_DIR / f"{stem}.{token}.c"
             # UTF-8: generated source has non-ASCII comment glyphs; the locale
@@ -5079,6 +5081,7 @@ def compile_rhs(c_source: str, model_hash: str) -> Path:
                 if result.returncode != 0:
                     raise RuntimeError(f"Codegen compilation failed:\n{result.stderr}")
                 os.replace(tmp_so_path, so_path)
+                _compile_installs.last = str(so_path)
             finally:
                 c_path.unlink(missing_ok=True)
     except subprocess.TimeoutExpired as err:
@@ -8099,6 +8102,33 @@ _SENS_DECLINE_AT_MOVING_CROSSING = "declined_at_moving_crossing"
 #: very long one.
 _SENS_DECLINE_MAX_CHARS = 4000
 
+#: Extension of the note written beside an artifact that was built with the
+#: output-sensitivity code (issue #1004): which functions it holds a derivative
+#: for, and why not for the others. ``bngsim.cache`` reads the name from here, as
+#: it does the decline note's.
+_OUTPUT_SENS_NOTE_EXT = ".outputs.json"
+
+#: Note format. An unrecognized version reads as no note at all, and the map is
+#: then worked out from the model, as it was before issue #1004.
+_OUTPUT_SENS_NOTE_VERSION = 1
+
+#: The artifact :func:`compile_rhs` last installed on this thread, as against one
+#: it found installed and handed back (issue #1004).
+_compile_installs = threading.local()
+
+#: For the artifacts this process built (issue #1004): ``{artifact path: the mark
+#: of the output-sensitivity analysis its code was emitted from}``. A model that
+#: still holds that analysis answers for the artifact itself; any other is told
+#: by the note. The mark is held weakly: an entry goes when its analysis does.
+_output_sens_emitted: dict[str, weakref.ref] = {}
+
+
+class _EmittedMark:
+    """What stands for one output-sensitivity analysis in the registry above."""
+
+    __slots__ = ("__weakref__",)
+
+
 _sens_declines = threading.local()
 
 
@@ -8233,6 +8263,155 @@ def read_sens_decline_note(so_path: str | os.PathLike[str]) -> str | None:
     if not isinstance(text, str) or not text:
         return None
     return _sens_decline_typed(text, payload.get("class", _SENS_DECLINE_PLAIN))
+
+
+def _output_sens_note_path(so_path: str | os.PathLike[str]) -> Path:
+    """The output-sensitivity note that belongs to the artifact at *so_path*."""
+    return Path(so_path).with_suffix(_OUTPUT_SENS_NOTE_EXT)
+
+
+def _output_sens_note_key(model) -> str:
+    """What a model's output-sensitivity analysis is keyed by, as text a note
+    can hold (issue #1004).
+
+    An artifact does not fix the analysis of every model that runs it: a table
+    function given to a model after load takes the place of the function it is
+    named for, in the same compiled code, and that function then has no
+    derivative (issue #979). :func:`_output_sens_analysis_key` tells such
+    models apart, and a note answers only for a model keyed as its builder
+    was.
+    """
+    core = getattr(model, "_core", model)
+    key = _output_sens_analysis_key(core, model if model is not core else None)
+    return hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:32]
+
+
+def write_output_sens_support_note(
+    so_path: str | os.PathLike[str], support: dict[str, str | None], key: str | None = None
+) -> Path | None:
+    """Persist *support*, ``{function: why it has no output sensitivity, or
+    None}``, beside the artifact at *so_path* (issue #1004); return the note's
+    path. *key* is the builder's :func:`_output_sens_note_key`.
+
+    The map is of the analysis the artifact's output-sensitivity code was
+    emitted from. That analysis runs under a wall-clock budget, so it is not a
+    function of the model alone: a build that the budget cut holds a NaN
+    sentinel for every function it did not reach. The artifact's cache key does
+    not say how far the analysis got, so a later process that is handed this
+    artifact has to be told, and cannot find out by analysing the model again.
+
+    Best effort and silent when it fails, written to a process-unique name and
+    ``os.replace``d into place: as :func:`write_sens_decline_note`, and for its
+    reasons. What is lost is the map on a later cache hit, which is then worked
+    out from the model as before.
+    """
+    note = _output_sens_note_path(so_path)
+    token = f"{os.getpid()}_{next(_compile_counter)}"
+    tmp = note.with_name(f"{Path(so_path).stem}.{token}{_OUTPUT_SENS_NOTE_EXT}")
+    payload = {
+        "version": _OUTPUT_SENS_NOTE_VERSION,
+        "key": key,
+        "functions": [[name, reason] for name, reason in support.items()],
+    }
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, note)
+    except Exception as e:
+        # Broad on purpose, as in write_sens_decline_note.
+        logger.debug("Could not record the output-sensitivity support at %s (%s)", note, e)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return None
+    return note
+
+
+def read_output_sens_support_note(
+    so_path: str | os.PathLike[str],
+    function_names: list[str] | None = None,
+    key: str | None = None,
+) -> dict[str, str | None] | None:
+    """The output-sensitivity support map of the artifact at *so_path*, or
+    ``None`` where there is no note to read (issue #1004).
+
+    ``None`` for an artifact built before the note existed, one built without
+    the output-sensitivity code, a note that could not be written, one that is
+    unreadable or of another version, one that does not list exactly
+    *function_names*, in order, where they are given, and one whose builder was
+    not keyed by *key* (:func:`_output_sens_note_key`), where that is given: the
+    caller then works the map out from the model.
+    """
+    try:
+        payload = json.loads(_output_sens_note_path(so_path).read_text(encoding="utf-8"))
+    except Exception:
+        # Broad for the reason read_sens_decline_note is: no way of failing to
+        # read a note may break the run that asked.
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _OUTPUT_SENS_NOTE_VERSION:
+        return None
+    if key is not None and payload.get("key") != key:
+        return None
+    listed = payload.get("functions")
+    if not isinstance(listed, list):
+        return None
+    support: dict[str, str | None] = {}
+    for item in listed:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            return None
+        if item[1] is not None and not isinstance(item[1], str):
+            return None
+        support[item[0]] = item[1]
+    if function_names is not None and list(support) != list(function_names):
+        return None
+    return support
+
+
+def output_sens_support_of_artifact(
+    model, so_path: str | os.PathLike[str], function_names: list[str] | None = None
+) -> dict[str, str | None] | None:
+    """The output-sensitivity support map of the artifact at *so_path* for
+    *model*, or ``None`` where the artifact does not say (issue #1004).
+
+    The model whose analysis the artifact's code was emitted from, in this
+    process, and its clones, answer from that analysis, as they did before
+    there was a note: what another process writes beside the artifact
+    afterwards need not describe the image this process loaded. Any other
+    model, one that was handed the artifact from the cache among them, is
+    told by the note. ``None`` where there is neither, and the caller
+    analyses the model.
+
+    Either answers only for the model as it is keyed now
+    (:func:`_output_sens_analysis_key`): one that has been given a table
+    function since runs the same artifact, and is analysed for itself. What
+    the note of a build keyed otherwise calls unsupported still holds for it:
+    the compiled code has no derivative for that function, whoever runs it,
+    and the model's own analysis, which may not have been cut where the
+    build's was, would call it supported. The two are put together, the
+    model's own reason first.
+    """
+    core = getattr(model, "_core", model)
+    key = _output_sens_analysis_key(core, model if model is not core else None)
+    mark = _output_sens_emitted.get(str(so_path))
+    own = getattr(model, "_output_sens_analysis", None)
+    if (
+        mark is not None
+        and own is not None
+        and own[0] == key
+        and own[1].get("emitted_mark") is mark() is not None
+    ):
+        return _support_of_analysis(own[1])
+    noted = read_output_sens_support_note(so_path, function_names, _output_sens_note_key(model))
+    if noted is not None:
+        return noted
+    other = read_output_sens_support_note(so_path)
+    if other is None or all(reason is None for reason in other.values()):
+        return None
+    try:
+        mine = output_sens_support(model)
+    except Exception:  # noqa: BLE001 - the build's reasons hold whatever the model's are
+        return other
+    return {
+        name: reason if reason is not None else other.get(name) for name, reason in mine.items()
+    }
 
 
 def _replay_sens_decline(so_path: str | os.PathLike[str]) -> None:
@@ -11350,7 +11529,10 @@ def output_sens_support(model) -> dict[str, str | None]:
     :class:`Result` by the Simulator so a selector can fail loudly with the
     specific reason instead of a bare empty-block error.
     """
-    analysis = _analyze_output_sens(model)
+    return _support_of_analysis(_analyze_output_sens(model))
+
+
+def _support_of_analysis(analysis: dict) -> dict[str, str | None]:
     if analysis["decline"] is not None:
         return {f["name"]: analysis["decline"] for f in analysis["functions"]}
     return {info["name"]: info["reason"] for info in analysis["func_infos"]}
@@ -12067,13 +12249,34 @@ def prepare_model_codegen(model) -> Path | None:
                 len(c_source),
             )
         cache_hit = False
+        # Issue #1004: whether the artifact is this build's own. Another process
+        # may have installed one under this key since the lookup above, cut
+        # elsewhere by its own budget; compile_rhs then hands that one back, and
+        # its note is the one to keep.
+        _compile_installs.last = None
         so_path = compile_rhs(c_source, model_hash)
+        built_here = getattr(_compile_installs, "last", None) == str(so_path)
         if declines and not has_sens:
             # Issue #438: beside the artifact, so the next construction of this
             # model — which will resolve that same .so from the cache without
             # generating a line of source — can still say why it is on the
             # difference quotient.
             write_sens_decline_note(so_path, declines[0])
+        if emit_output_sens and built_here:
+            # Issue #1004: the map of the analysis this artifact's output
+            # sensitivities were emitted from (the model's own, memoized), for
+            # the process that is handed the artifact and has made none.
+            try:
+                emitted = _analyze_output_sens(model)
+                support = _support_of_analysis(emitted)
+                if support:
+                    mark = emitted.setdefault("emitted_mark", _EmittedMark())
+                    for path in [k for k, v in _output_sens_emitted.items() if v() is None]:
+                        del _output_sens_emitted[path]
+                    _output_sens_emitted[str(so_path)] = weakref.ref(mark)
+                write_output_sens_support_note(so_path, support, _output_sens_note_key(model))
+            except Exception as e:  # noqa: BLE001 - a note, not the build
+                logger.debug("Could not work out the output-sensitivity support (%s)", e)
         return so_path
     except Exception as e:
         logger.warning("Model codegen failed: %s", e)
