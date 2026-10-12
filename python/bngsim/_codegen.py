@@ -8030,6 +8030,16 @@ _SENS_DECLINE_AT_MOVING_CROSSING = "declined_at_moving_crossing"
 #: very long one.
 _SENS_DECLINE_MAX_CHARS = 4000
 
+#: Extension of the note written beside an artifact that was built with the
+#: output-sensitivity code (issue #1004): which functions it holds a derivative
+#: for, and why not for the others. ``bngsim.cache`` reads the name from here, as
+#: it does the decline note's.
+_OUTPUT_SENS_NOTE_EXT = ".outputs.json"
+
+#: Note format. An unrecognized version reads as no note at all, and the map is
+#: then worked out from the model, as it was before issue #1004.
+_OUTPUT_SENS_NOTE_VERSION = 1
+
 _sens_declines = threading.local()
 
 
@@ -8164,6 +8174,86 @@ def read_sens_decline_note(so_path: str | os.PathLike[str]) -> str | None:
     if not isinstance(text, str) or not text:
         return None
     return _sens_decline_typed(text, payload.get("class", _SENS_DECLINE_PLAIN))
+
+
+def _output_sens_note_path(so_path: str | os.PathLike[str]) -> Path:
+    """The output-sensitivity note that belongs to the artifact at *so_path*."""
+    return Path(so_path).with_suffix(_OUTPUT_SENS_NOTE_EXT)
+
+
+def write_output_sens_support_note(
+    so_path: str | os.PathLike[str], support: dict[str, str | None]
+) -> Path | None:
+    """Persist *support*, ``{function: why it has no output sensitivity, or
+    None}``, beside the artifact at *so_path* (issue #1004); return the note's
+    path.
+
+    The map is of the analysis the artifact's output-sensitivity code was
+    emitted from. That analysis runs under a wall-clock budget, so it is not a
+    function of the model alone: a build that the budget cut holds a NaN
+    sentinel for every function it did not reach. The artifact's cache key does
+    not say how far the analysis got, so a later process that is handed this
+    artifact has to be told, and cannot find out by analysing the model again.
+
+    Best effort and silent when it fails, written to a process-unique name and
+    ``os.replace``d into place: as :func:`write_sens_decline_note`, and for its
+    reasons. What is lost is the map on a later cache hit, which is then worked
+    out from the model as before.
+    """
+    note = _output_sens_note_path(so_path)
+    token = f"{os.getpid()}_{next(_compile_counter)}"
+    tmp = note.with_name(f"{Path(so_path).stem}.{token}{_OUTPUT_SENS_NOTE_EXT}")
+    payload = {
+        "version": _OUTPUT_SENS_NOTE_VERSION,
+        "functions": [[name, reason] for name, reason in support.items()],
+    }
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, note)
+    except Exception as e:
+        # Broad on purpose, as in write_sens_decline_note.
+        logger.debug("Could not record the output-sensitivity support at %s (%s)", note, e)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return None
+    return note
+
+
+def read_output_sens_support_note(
+    so_path: str | os.PathLike[str], function_names: list[str] | None = None
+) -> dict[str, str | None] | None:
+    """The output-sensitivity support map of the artifact at *so_path*, or
+    ``None`` where there is no note to read (issue #1004).
+
+    ``None`` for an artifact built before the note existed, one built without
+    the output-sensitivity code, a note that could not be written, one that is
+    unreadable or of another version, and one that does not list exactly
+    *function_names*, in order, where they are given: the caller then works the
+    map out from the model.
+    """
+    try:
+        payload = json.loads(_output_sens_note_path(so_path).read_text(encoding="utf-8"))
+    except Exception:
+        # Broad for the reason read_sens_decline_note is: no way of failing to
+        # read a note may break the run that asked.
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _OUTPUT_SENS_NOTE_VERSION:
+        return None
+    listed = payload.get("functions")
+    if not isinstance(listed, list):
+        return None
+    support: dict[str, str | None] = {}
+    for item in listed:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            return None
+        if item[1] is not None and not isinstance(item[1], str):
+            return None
+        support[item[0]] = item[1]
+    if len(support) != len(listed):
+        return None
+    if function_names is not None and list(support) != list(function_names):
+        return None
+    return support
 
 
 def _replay_sens_decline(so_path: str | os.PathLike[str]) -> None:
@@ -11660,6 +11750,10 @@ def prepare_model_codegen(model) -> Path | None:
                 len(c_source),
             )
         cache_hit = False
+        # Issue #1004: whether the artifact is this build's own. Another process
+        # may have installed one under this key since the lookup above, cut
+        # elsewhere by its own budget, and its notes are then the ones to keep.
+        built_here = get_cached_so(model_hash) is None
         so_path = compile_rhs(c_source, model_hash)
         if declines and not has_sens:
             # Issue #438: beside the artifact, so the next construction of this
@@ -11667,6 +11761,14 @@ def prepare_model_codegen(model) -> Path | None:
             # generating a line of source — can still say why it is on the
             # difference quotient.
             write_sens_decline_note(so_path, declines[0])
+        if emit_output_sens and built_here:
+            # Issue #1004: the map of the analysis this artifact's output
+            # sensitivities were emitted from (the model's own, memoized), for
+            # the process that is handed the artifact and has made none.
+            try:
+                write_output_sens_support_note(so_path, output_sens_support(model))
+            except Exception as e:  # noqa: BLE001 - a note, not the build
+                logger.debug("Could not work out the output-sensitivity support (%s)", e)
         return so_path
     except Exception as e:
         logger.warning("Model codegen failed: %s", e)

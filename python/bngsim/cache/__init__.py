@@ -138,7 +138,9 @@ holding ``.o`` files. Removed in a ``finally``, so one on disk means SIGKILL."""
 
 KIND_NOTE = "note"
 """A ``rhs_<key>_<hash>.sens.json`` recording why the artifact of the same name was
-built without an analytic sensitivity RHS (issue #438).
+built without an analytic sensitivity RHS (issue #438), or a
+``rhs_<key>_<hash>.outputs.json`` recording which functions it holds an output
+sensitivity for (issue #1004).
 
 A few hundred bytes, written only for a model that declined, and read back on a
 cache hit so the reason survives a warm cache — which is the whole point of it,
@@ -172,7 +174,7 @@ _KIND_LABELS: dict[str, str] = {
     KIND_RHS: "rhs",
     KIND_SSAPROP: "ssaprop",
     KIND_SRC: "src (fallback)",
-    KIND_NOTE: "decline note",
+    KIND_NOTE: "note",
     KIND_PARTIAL_C: "partial (.c)",
     KIND_PARTIAL_LIB: "partial (lib)",
     KIND_SHARD: "shard dir",
@@ -224,6 +226,9 @@ _KEY_FIELD_MARKER = _codegen._KEY_FIELD_MARKER
 #: rather than spelled again here: a file bngsim writes and this module does not
 #: recognize would be reported as somebody else's and never swept.
 _NOTE_EXT = _codegen._SENS_DECLINE_NOTE_EXT
+#: And the note of an artifact's output-sensitivity support (issue #1004), which
+#: is named, paired and swept as the decline note is.
+_NOTE_EXTS = (_NOTE_EXT, _codegen._OUTPUT_SENS_NOTE_EXT)
 
 DEFAULT_MIN_AGE = 3600.0
 """Seconds an entry must be untouched before any sweep will remove it.
@@ -267,8 +272,9 @@ def _note_family(name: str) -> str:
     matches no artifact, which is how one left behind by a killed process is
     collected rather than kept forever.
     """
-    if name.endswith(_NOTE_EXT):
-        return name[: -len(_NOTE_EXT)]
+    for ext in _NOTE_EXTS:
+        if name.endswith(ext):
+            return name[: -len(ext)]
     suffix = PurePath(name).suffix
     return name[: -len(suffix)] if suffix else name
 
@@ -292,7 +298,7 @@ def classify(path: str | os.PathLike[str], *, is_dir: bool | None = None) -> str
         return KIND_SHARD if name.startswith(_SHARD_PREFIX) else KIND_FOREIGN
     if not name.startswith(_ARTIFACT_PREFIX):
         return KIND_FOREIGN
-    if name.endswith(_NOTE_EXT):
+    if name.endswith(_NOTE_EXTS):
         # Before the temp-token branch, so the process-unique name a note is
         # written under on its way into place is still recognized as a note. It has
         # no artifact of its own name, which is what makes ``prune`` collect it.

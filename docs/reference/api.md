@@ -320,8 +320,13 @@ one. See the [codegen guide](../user-guide/codegen.md#managing-the-artifact-cach
 
 Beside an artifact whose analytic `∂f/∂p` was declined, bngsim writes a small
 decline note (`rhs_<key>_<hash>.sens.json`, issue #438) so the reason survives a
-warm cache. It is one of bngsim's own files: counted under its own kind, removed by
-`clear`, and removed by `prune` exactly when the artifact it describes is removed.
+warm cache. Beside an artifact built with the output-sensitivity code it writes a
+second note (`rhs_<key>_<hash>.outputs.json`, issue #1004): which functions the
+artifact holds a derivative for, and why not for the others. A process that is
+handed the artifact from the cache reads it, so `output_sensitivities([...])`
+raises the reason the build recorded, and the map is not worked out again. Both
+are bngsim's own files: counted under one kind, removed by `clear`, and removed by
+`prune` exactly when the artifact they describe is removed.
 
 Entries bngsim did not write are classified `foreign`, reported, and **never**
 removed — by `clear` as much as by `clean` — because `BNGSIM_CODEGEN_CACHE_DIR` is a
