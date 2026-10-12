@@ -169,17 +169,26 @@ def _source(model) -> str:
 EXPORT = "int bngsim_codegen_edge_without_case(int iP, double t,"
 
 
+EVERY = "every parameter"
+
+
 def _without_a_case(model, source=None) -> dict[str, str]:
-    """``{parameter: its C test}`` as the sensitivity source lists them."""
+    """``{parameter: its C test}`` as the sensitivity source lists them, and
+    under ``EVERY`` the test that holds for any parameter, where there is one
+    (a power whose base reads a state, or a law that was not read)."""
     source = _source(model) if source is None else source
     if EXPORT not in source:
         return {}
     body = source.split(EXPORT)[1].split("\n}")[0]
     names = [p["name"] for p in model._core.codegen_data()["parameters"]]
-    return {
+    listed = {
         names[int(index)]: test
         for index, test in re.findall(r"case (\d+): return \((.*)\) \? 1 : 0;", body)
     }
+    (every,) = re.findall(r"default: return \((.*)\) \? 1 : 0;", body)
+    if every != "0":
+        listed[EVERY] = every
+    return listed
 
 
 def _with_a_case(model) -> set[str]:
@@ -489,7 +498,7 @@ def test_a_power_whose_base_is_never_zero_is_listed_with_its_base():
     and the test it is listed with asks the base at the crossing's time."""
     listed = _without_a_case(_never_zero())
     assert "t0" in listed
-    assert listed["t0"].startswith("(!(fabs(") and "> 1e-9 * (fabs(" in listed["t0"]
+    assert listed["t0"].startswith("(!(fabs(") and "> 1e-9 * (fmax(fabs(" in listed["t0"]
 
 
 def test_a_power_whose_base_is_never_zero_keeps_its_columns():
@@ -717,7 +726,7 @@ def test_by_name_a_derived_parameter_and_what_it_is_defined_from(tmp_path, monke
 
 def test_by_name_a_law_that_is_not_read_lists_every_parameter(tmp_path, monkeypatch):
     """Where a rate law cannot be read, nothing says it has no such power:
-    every parameter is listed, at every value."""
+    it is listed for every parameter, at every value."""
     import sys
 
     from bngsim import _jacobian
@@ -732,8 +741,7 @@ def test_by_name_a_law_that_is_not_read_lists_every_parameter(tmp_path, monkeypa
         return real(text, *args, **kwargs)
 
     monkeypatch.setattr(_jacobian, "_exprtk_to_sympy", unread)
-    names = [p["name"] for p in model._core.codegen_data()["parameters"]]
-    assert _without_a_case(model) == dict.fromkeys(names, "1")
+    assert _without_a_case(model) == {EVERY: "1"}
 
 
 def test_by_name_a_model_with_no_singular_power_lists_nothing(tmp_path, monkeypatch):
