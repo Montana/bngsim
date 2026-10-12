@@ -303,22 +303,47 @@ def test_what_a_cut_build_has_no_derivative_for_holds_under_another_key(isolated
     np.testing.assert_array_equal(np.asarray(result.output_sensitivities(["scaled"])), want)
 
 
-@needs_cc
-def test_the_models_own_reason_and_the_builds_are_put_together(isolated_cache):
-    """A cut build, and a model handed its artifact that is then given a
-    table function over ``scaled``, which the build has a derivative for:
-    ``scaled`` is refused for the table and ``ratio`` for the budget."""
+def _handed_a_cut_artifact_then_given_a_table_over(name):
+    """A model that is handed the artifact of a cut build, runs it, and is
+    then given a table function."""
     with _cut_after_the_first():
         _run()
     model = bngsim.Model.from_net(CHAIN_NET)
     bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
     model.reset()
-    model.add_table_function("scaled", **TABLE)
+    model.add_table_function(name, **TABLE)
+    return model
+
+
+@needs_cc
+@pytest.mark.parametrize("over, cut", [("scaled", "ratio"), ("ratio", "tdep")])
+def test_the_models_own_reason_and_the_builds_are_put_together(isolated_cache, over, cut):
+    """The table is over ``scaled``, which the build has a derivative for, or
+    over ``ratio``, which it was cut before: the function is refused for the
+    table, the model's own reason coming first, and one the model has no
+    reason of its own for is refused for the budget."""
+    model = _handed_a_cut_artifact_then_given_a_table_over(over)
     result = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
-    with pytest.raises(Exception, match="'scaled' has no output sensitivity"):
-        result.output_sensitivities(["scaled"])
+    with pytest.raises(Exception, match=f"'{over}' has no output sensitivity.*table-function"):
+        result.output_sensitivities([over])
+    with pytest.raises(Exception, match=f"'{cut}' has no output sensitivity.*budget"):
+        result.output_sensitivities([cut])
+
+
+@needs_cc
+def test_the_builds_reasons_hold_where_the_model_cannot_be_analysed(isolated_cache, monkeypatch):
+    """The same model, and its own analysis fails: what the note says the
+    build has no derivative for is what there is to go by."""
+    model = _handed_a_cut_artifact_then_given_a_table_over("a_table_of_its_own")
+
+    def fails(_model):
+        raise RuntimeError("no analysis to be had")
+
+    monkeypatch.setattr(cg, "output_sens_support", fails)
+    result = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
     with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
         result.output_sensitivities(["ratio"])
+    assert np.all(np.isfinite(np.asarray(result.output_sensitivities(["scaled"]))))
 
 
 @needs_cc
