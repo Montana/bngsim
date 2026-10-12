@@ -28,7 +28,7 @@ name: native-tests
 # registered suite through `ctest` rather than one named target, so any binary
 # added with add_test() in tests/CMakeLists.txt is picked up here without
 # editing this workflow: test_bngsim, test_validation, test_lapack_dense_linsol,
-# test_c_api, test_seed_count_rounding.
+# test_dense_eigenvalues, test_c_api, test_seed_count_rounding.
 #
 # Scope: Linux only, and deliberately lean. KLU, NFsim and RuleMonkey are all
 # OFF — the tests run here link none of them, and skipping the vendored builds

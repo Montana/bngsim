@@ -29,10 +29,13 @@ floors did:
 
 * the bounds file is strict ``NAME=integer``, one direction plus a slack per
   NAME;
-* no workflow hard-codes a bound, so a new guard written the old way fails here;
+* no workflow hard-codes a bound, so a new guard written with the old
+  ``*_FLOOR`` names, or against a literal, fails here (one that hides its bound
+  under another name does not);
 * every bound is checked by some workflow, and every check names a bound;
-* a check can fail its step, and a leg with a paths filter fires when the file
-  holding its bound changes;
+* a check can fail its step and its job, and a leg with a paths filter fires
+  when the file holding its bound changes;
+* both files check out with LF endings on Windows, where Git Bash runs them;
 * the helper fails at exactly the edges the file declares, in both directions.
 """
 
@@ -44,6 +47,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -131,26 +135,62 @@ def _bounds() -> dict[str, tuple[str, int, int]]:
     return out
 
 
-def _calls() -> dict[str, list[tuple[str, str, str]]]:
-    """``workflow -> [(NAME, call text, run-block text up to the call)]``.
+class Call(NamedTuple):
+    """One call to the helper, with the text around it that can defeat it."""
 
-    The call text includes any backslash continuation lines. The run-block text
-    runs from the step's ``run:`` line to the call, which is where a ``set +e``
-    that would let the call fail silently has to be.
+    name: str  #: the NAME argument
+    call: str  #: the call, backslash continuations joined
+    block: str  #: the step's ``run:`` block up to the call: where a ``set +e`` would be
+    step: str  #: the whole step: where a ``continue-on-error`` would be
+    job: str  #: the job's keys before its steps: the job-level ``continue-on-error``
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _calls() -> dict[str, list[Call]]:
+    """``workflow -> [Call]`` for every call to the helper in every workflow.
+
+    Steps and jobs are found by indentation, the way the parsers in
+    ``_ci_workflow.py`` read a workflow, rather than by a YAML load: PyYAML is
+    only a transitive dependency here.
     """
-    out: dict[str, list[tuple[str, str, str]]] = {}
+    out: dict[str, list[Call]] = {}
     for path in sorted(WORKFLOWS.glob("*.yml")):
         lines = strip_comments(path.read_text(encoding="utf-8")).splitlines()
         for i, line in enumerate(lines):
             match = CALL.search(line)
             if not match:
                 continue
-            start = max((j for j in range(i) if re.match(r"^\s*run:", lines[j])), default=0)
-            out.setdefault(path.name, []).append(
+            run = max((j for j in range(i) if re.match(r"^\s*run:", lines[j])), default=0)
+            step = max(
                 (
-                    match.group(1),
-                    " ".join(continued_block(lines, i)),
-                    "\n".join(lines[start : i + 1]),
+                    j
+                    for j in range(run + 1)
+                    if re.match(r"^\s*-\s", lines[j]) and _indent(lines[j]) < _indent(lines[run])
+                ),
+                default=run,
+            )
+            end = next(
+                (
+                    k
+                    for k in range(i + 1, len(lines))
+                    if lines[k].strip() and _indent(lines[k]) <= _indent(lines[step])
+                ),
+                len(lines),
+            )
+            job = max(
+                (j for j in range(step) if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j])),
+                default=0,
+            )
+            out.setdefault(path.name, []).append(
+                Call(
+                    name=match.group(1),
+                    call=" ".join(continued_block(lines, i)),
+                    block="\n".join(lines[run : i + 1]),
+                    step="\n".join(lines[step:end]),
+                    job="\n".join(line for line in lines[job + 1 : step] if _indent(line) == 4),
                 )
             )
     return out
@@ -217,7 +257,7 @@ class TestTheWorkflowsUseIt:
     def test_the_scan_still_sees_every_known_check(self):
         calls = _calls()
         missing = {
-            wf: sorted(names - {name for name, _, _ in calls.get(wf, [])})
+            wf: sorted(names - {c.name for c in calls.get(wf, [])})
             for wf, names in KNOWN_CHECKS.items()
             if (WORKFLOWS / wf).exists()
         }
@@ -249,7 +289,7 @@ class TestTheWorkflowsUseIt:
         without failing anything. A check naming no bound exits 2 in CI, so
         catch it here first.
         """
-        checked = {name for calls in _calls().values() for name, _, _ in calls}
+        checked = {c.name for calls in _calls().values() for c in calls}
         assert set(_NAMES) - checked == set(), (
             f"bounds no workflow checks: {sorted(set(_NAMES) - checked)}"
         )
@@ -260,18 +300,24 @@ class TestTheWorkflowsUseIt:
     def test_every_check_can_fail_its_step(self):
         """``bash`` rather than ``./``, so the file mode a Windows checkout
         drops does not matter. Three arguments, as the helper requires. Nothing
-        that swallows the exit status: ``||``, a trailing ``&``, or ``set +e``
-        earlier in the same run block. GitHub runs every step's bash with -e.
+        that swallows the exit status: ``||``, a trailing ``&``, ``set +e``
+        earlier in the same run block (GitHub runs every step's bash with -e),
+        or ``continue-on-error`` on the step or its job, which turns a red guard
+        into a green check.
         """
         bad = []
+        unless_false = re.compile(r"^\s*continue-on-error:\s*(?!false\b)\S", re.M)
         for wf, calls in _calls().items():
-            for name, call, block in calls:
+            for c in calls:
+                name, call = c.name, c.call
                 if not re.search(r"(?:^|\s)bash\s+ci/check_test_count\.sh\s", call):
                     bad.append(f"{wf} {name}: not invoked as `bash ci/check_test_count.sh`")
                 if "||" in call or re.search(r"&\s*$", call):
                     bad.append(f"{wf} {name}: the exit status is swallowed")
-                if re.search(r"^\s*set\s+\+\w*e", block, re.M):
+                if re.search(r"^\s*set\s+\+\w*e", c.block, re.M):
                     bad.append(f"{wf} {name}: `set +e` earlier in the run block")
+                if unless_false.search(c.step) or unless_false.search(c.job):
+                    bad.append(f"{wf} {name}: continue-on-error on its step or job")
                 args = re.search(r"check_test_count\.sh\s+\S+\s+\"\$\w+\"\s+\"[^\"]+\"\s*$", call)
                 if not args:
                     bad.append(f'{wf} {name}: expected NAME "$count" "what crossing it means"')
@@ -288,6 +334,32 @@ class TestTheWorkflowsUseIt:
             if entries:
                 missing += [f"{wf}: {t}" for t in TRIGGERS if t not in entries]
         assert not missing, f"paths filters missing the bound's files: {missing}"
+
+
+class TestTheFilesSurviveAWindowsCheckout:
+    def test_both_check_out_with_lf_endings(self):
+        """A windows-latest checkout rewrites LF to CRLF (f562ae3). Git Bash
+        then reads ``set -euo pipefail\\r`` and the helper dies before it reads
+        a count, so both Windows legs fail at the guard. Neither Windows leg
+        runs this module, so the attribute has to be asserted rather than
+        observed.
+        """
+        if shutil.which("git") is None:
+            pytest.skip("not a git checkout: git is not on PATH")
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-attr", "eol", "--", *TRIGGERS],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"not a git checkout: {result.stderr.strip()}")
+        wrong = [line for line in result.stdout.splitlines() if not line.endswith(": eol: lf")]
+        assert len(result.stdout.splitlines()) == len(TRIGGERS), result.stdout
+        assert not wrong, (
+            f"not pinned to LF by .gitattributes: {wrong}. A CRLF checkout of the "
+            "helper fails both Windows legs at the guard step."
+        )
 
 
 @needs_bash

@@ -266,11 +266,13 @@ jobs:
           #      same number, because a CI checkout has no gitignored corpora (a
           #      developer checkout that has them collects more; see
           #      ci/test_floors.env).
-          #   2. SKIPPED has a ceiling. A rise means a group of tests turned into
-          #      skips for a *declared* reason that BNGSIM_SKIP_AUDIT=strict
-          #      accepts, e.g. an extra silently failing to install. This used to
-          #      be a floor on PASSED, which had to keep moving as the suite grew;
-          #      a skip count does not move when tests are added.
+          #   2. SKIPPED has a ceiling. Crossing it means a group of tests turned
+          #      into skips for a *declared* reason that BNGSIM_SKIP_AUDIT=strict
+          #      accepts, e.g. an extra silently failing to install, provided
+          #      the group is larger than the ceiling's headroom on that leg
+          #      (30 to 55 tests; see ci/test_floors.env). This used to be a
+          #      floor on PASSED, which had to keep moving as the suite grew; a
+          #      skip count does not move when tests are added.
           #
           # The bounds live in ci/test_floors.env and ci/check_test_count.sh
           # holds each count to its own (issue #584). The check fails in both
