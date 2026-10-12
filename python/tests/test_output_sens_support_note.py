@@ -190,7 +190,9 @@ def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache)
     with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
         first.output_sensitivities(["ratio"])
     (artifact,) = _artifacts(isolated_cache)
-    cg.write_output_sens_support_note(artifact, dict.fromkeys(FUNCTIONS))
+    cg.write_output_sens_support_note(
+        artifact, dict.fromkeys(FUNCTIONS), cg._output_sens_note_key(model)
+    )
     model.reset()
     second = run()
     with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
@@ -270,6 +272,53 @@ def test_the_builder_given_a_table_function_does_not_answer_from_what_it_built(i
     assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
     with pytest.raises(Exception, match="'ratio' has no output sensitivity"):
         second.output_sensitivities(["ratio"])
+
+
+@needs_cc
+@pytest.mark.parametrize("who", ["the builder", "a model handed the artifact"])
+def test_what_a_cut_build_has_no_derivative_for_holds_under_another_key(isolated_cache, who):
+    """The build was cut after ``scaled``. The model is then given a table
+    function that is named for none of its functions, which is enough for it
+    to be keyed otherwise, and it keeps its artifact. Its own analysis, not
+    cut, calls ``ratio`` supported, and the compiled code holds NaN for it:
+    with the note read as no note at all, ``[nan, nan, nan, nan]`` came
+    back, which is the issue again. The build's reason is raised."""
+    with _cut_after_the_first():
+        model = bngsim.Model.from_net(CHAIN_NET)
+        built_sim = bngsim.Simulator(model, **RUN)
+        built = built_sim.run(t_span=(0.0, 8.0), n_points=5)
+    want = np.asarray(built.output_sensitivities(["scaled"]))
+    if who != "the builder":
+        model = bngsim.Model.from_net(CHAIN_NET)
+        handed = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
+        with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+            handed.output_sensitivities(["ratio"])
+    model.reset()
+    model.add_table_function("a_table_of_its_own", **TABLE)
+    sim = bngsim.Simulator(model, **RUN)
+    result = sim.run(t_span=(0.0, 8.0), n_points=5)
+    assert Path(sim._codegen_so_path) == Path(built_sim._codegen_so_path)
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+        result.output_sensitivities(["ratio"])
+    np.testing.assert_array_equal(np.asarray(result.output_sensitivities(["scaled"])), want)
+
+
+@needs_cc
+def test_the_models_own_reason_and_the_builds_are_put_together(isolated_cache):
+    """A cut build, and a model handed its artifact that is then given a
+    table function over ``scaled``, which the build has a derivative for:
+    ``scaled`` is refused for the table and ``ratio`` for the budget."""
+    with _cut_after_the_first():
+        _run()
+    model = bngsim.Model.from_net(CHAIN_NET)
+    bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
+    model.reset()
+    model.add_table_function("scaled", **TABLE)
+    result = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
+    with pytest.raises(Exception, match="'scaled' has no output sensitivity"):
+        result.output_sensitivities(["scaled"])
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+        result.output_sensitivities(["ratio"])
 
 
 @needs_cc

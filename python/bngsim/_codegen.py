@@ -8381,7 +8381,12 @@ def output_sens_support_of_artifact(
 
     Either answers only for the model as it is keyed now
     (:func:`_output_sens_analysis_key`): one that has been given a table
-    function since runs the same artifact, and is analysed for itself.
+    function since runs the same artifact, and is analysed for itself. What
+    the note of a build keyed otherwise calls unsupported still holds for it:
+    the compiled code has no derivative for that function, whoever runs it,
+    and the model's own analysis, which may not have been cut where the
+    build's was, would call it supported. The two are put together, the
+    model's own reason first.
     """
     core = getattr(model, "_core", model)
     key = _output_sens_analysis_key(core, model if model is not core else None)
@@ -8394,7 +8399,19 @@ def output_sens_support_of_artifact(
         and own[1].get("emitted_mark") is mark() is not None
     ):
         return _support_of_analysis(own[1])
-    return read_output_sens_support_note(so_path, function_names, _output_sens_note_key(model))
+    noted = read_output_sens_support_note(so_path, function_names, _output_sens_note_key(model))
+    if noted is not None:
+        return noted
+    other = read_output_sens_support_note(so_path)
+    if other is None or all(reason is None for reason in other.values()):
+        return None
+    try:
+        mine = output_sens_support(model)
+    except Exception:  # noqa: BLE001 - the build's reasons hold whatever the model's are
+        return other
+    return {
+        name: reason if reason is not None else other.get(name) for name, reason in mine.items()
+    }
 
 
 def _replay_sens_decline(so_path: str | os.PathLike[str]) -> None:
