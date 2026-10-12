@@ -587,7 +587,7 @@ double expr_compat::mratio(double a, double b, double z) {
 class NonFiniteWarningSet {
   public:
     void warn_if_nonfinite(const char *fname, std::initializer_list<double> args, double result) {
-        if (std::isfinite(result)) {
+        if (muted || std::isfinite(result)) {
             return;
         }
         std::string key(fname);
@@ -613,6 +613,11 @@ class NonFiniteWarningSet {
                      "arguments will be silent."
                   << std::endl;
     }
+
+    // Set while an expression is probed at times of the caller's choosing
+    // (evaluate_over_times): a value that is not finite there is not one the
+    // run computed, and is neither reported nor remembered as reported.
+    bool muted = false;
 
   private:
     std::unordered_set<std::string> seen_;
@@ -1427,6 +1432,10 @@ double ExprTkEvaluator::evaluate(int expr_id) {
 }
 
 void ExprTkEvaluator::set_time_ptr(double *time_addr) { impl_->set_time_ptr(time_addr); }
+
+void ExprTkEvaluator::set_nonfinite_warnings_muted(bool muted) {
+    impl_->nonfinite_warner.muted = muted;
+}
 
 // ─── Clone support ───────────────────────────────────────────────────────────
 

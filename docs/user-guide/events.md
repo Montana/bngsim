@@ -43,6 +43,30 @@ BNGsim's event implementation uses CVODE rootfinding (`CVodeRootInit`) for
 precise event detection — the integrator finds the exact time point where the
 trigger crosses zero, applies the assignments, and restarts.
 
+#### A trigger that holds at one instant
+
+`at (time == 2)` is true at a single time. No root finder brackets it, since
+the trigger reads false on both sides of any step across it, so the run stops
+on the instant instead and the event fires there, on any output grid, in the
+ODE and stochastic engines alike. The instant is the time at which the model's
+evaluator reads the equality as true: for `time == tau/7` that is the
+evaluator's own rounding of `tau/7`, and `time == pi` or `time^2 == 4` is found
+the same way. An equality of things that hold their values, such as
+`floor(time/24) == 3`, is true for a stretch and is an ordinary window.
+
+Two cases are outside this:
+
+- An equality that no time satisfies in double arithmetic, such as
+  `time - 1 == 1.3` (2.3 − 1 rounds to 1.2999999999999998, and the next
+  double gives 1.3000000000000003). Where that equality is the whole trigger
+  the event could never fire, and the run is refused with an error that names
+  it. Write the instant on one side (`time == 2.3`), or use `>=`. Inside a
+  larger trigger (`time - 1 == 1.3 || time >= 4`) the event can fire through
+  the rest, and nothing is refused.
+- An equality on a model variable rather than on `time` (`at (x == 2)` with a
+  rate rule `x' = 1`, or on a species). The variable is integrated and does not
+  land on the value exactly; use an ordering.
+
 #### Triggers that start on their threshold
 
 A trigger reading false whose *residual* is exactly zero at the start time is
@@ -88,7 +112,7 @@ rise fires. Runs without sensitivities are unaffected.
 | `initialValue` attribute | ✅ | Events that can fire at t=0; a `run_until` leg continues the previous leg's trigger state instead (issue #693) |
 | Delay | ✅ | Constant delay (queued with cancellation) |
 | Parameter → species promotion | ✅ | Parameters targeted by events auto-promoted |
-| Priority ordering | ✅ | Real-valued priority; equal-priority ties broken by seed-keyed RNG (§4.11.6) |
+| Priority ordering | ✅ | Real-valued priority, read when each event executes; equal-priority ties broken by seed-keyed RNG (§4.11.6) |
 | Same-instant cascade | ✅ | Delay-0 events an assignment triggers join the batch (§4.11.6) |
 | `useValuesFromTriggerTime` | ✅ | SBML L3 default (`True`): assignment RHS frozen at trigger time. `False` evaluates at firing time |
 | SSA / PSA events | ✅ | Non-delayed events only — see limitations below |
@@ -98,6 +122,13 @@ rise fires. Runs without sensitivities are unaffected.
 Events with a delay queue their assignments and apply them after the delay
 period has elapsed. Non-persistent events whose trigger reverts to false
 before the delay expires are cancelled.
+
+Everything that executes at one instant is one batch, whether it was triggered
+just then or a delay ago: the event of highest priority executes next, and the
+priorities are read again after each execution, so a priority that changed
+during a delay counts at its value when the event executes. Two events are on
+one instant when their execution times are the same number. Delayed events of
+equal priority execute in the order they were triggered in.
 
 ```python
 # Antimony delayed event example
