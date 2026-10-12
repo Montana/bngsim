@@ -257,6 +257,14 @@ def test_a_second_simulator_is_refused_from_the_cached_code(tmp_path):
     _refused(_model(tmp_path, "quotient", 1.1), "wb")
 
 
+def test_refused_with_the_frames_switched_off(tmp_path, monkeypatch):
+    """``BNGSIM_SENS_COMOVING=0`` keeps every column plain, for a comparison.
+    A column that has no case is plain either way: with the refusal switched
+    off beside the frames, dX/d(wb) came back -2.40245 for -2.10906 again."""
+    monkeypatch.setenv("BNGSIM_SENS_COMOVING", "0")
+    _refused(_model(tmp_path, "quotient", 1.1), "wb")
+
+
 def test_the_exponent_is_asked_when_the_run_asks(tmp_path):
     """Built where nothing is singular and set to where the power is: the
     refusal reads the run's values, not those the code was written at."""
@@ -807,6 +815,23 @@ def test_the_counters_powers_ending_the_plan_lists_by_name(tmp_path, monkeypatch
     assert set(_without_a_case(model, source)) == {"on", "D", "wc", "wb", "wa"}
 
 
+def test_a_listing_that_does_not_finish_keeps_the_cases_and_lists_by_name(tmp_path, monkeypatch):
+    """The listing comes after the cases are made. Where it raises, the cases
+    stand, and every parameter a singular power's base reads is listed, the
+    ones with a case among them: a column too many is refused, and none is
+    returned plain."""
+    from bngsim import _codegen
+
+    model = _model(tmp_path, "quotient", 1.1)
+
+    def ends(*_args, **_kwargs):
+        raise RuntimeError("the base at the crossing")
+
+    monkeypatch.setattr(_codegen, "_base_is_zero_at", ends)
+    assert _with_a_case(model) == {"on", "D"}
+    assert set(_without_a_case(model)) == {"on", "D", "wc", "wb", "wa"}
+
+
 def test_by_name_a_law_that_is_not_read_lists_every_parameter(tmp_path, monkeypatch):
     """Where a rate law cannot be read, nothing says it has no such power:
     it is listed for every parameter, at every value."""
@@ -1223,7 +1248,7 @@ def _closing_on_a_state(a, second_window=False, **moved):
     0, and ``Y`` is a species that ``kY`` drives. With ``second_window``, a
     window on the literal time whose onset is ``on2/kY``, far beyond the run:
     ``kY`` is listed for that power too."""
-    v = {"kY": 0.3, "on": 3.0, "D": 4.0} | moved
+    v = {"kY": 0.3, "on": 3.0, "D": 4.0, "y0": 0.0} | moved
     s = "((time - on)/D)"
     s2 = "((time - on2/kY)/D)"
     more = (
@@ -1233,7 +1258,7 @@ def _closing_on_a_state(a, second_window=False, **moved):
         else ""
     )
     return bngsim.Model.from_antimony_string(
-        f"species X, Y; X = 0; Y = 0; k0 = 0.1; k1 = 2; a = {a}; on = {v['on']!r}; "
+        f"species X, Y; X = 0; Y = {v['y0']!r}; k0 = 0.1; k1 = 2; a = {a}; on = {v['on']!r}; "
         f"D = {v['D']!r}; kdeg = 0.3; kY = {v['kY']!r}; on2 = 30\n"
         f"J1: -> X; k0 + piecewise(k1*{s}*(1 - {s} - Y)^(a - 1), "
         f"(time >= on) && (1 - {s} - Y > 0), 0)\n"
@@ -1265,6 +1290,32 @@ def test_a_base_that_reads_a_state_where_nothing_is_singular():
         lambda **moved: _closing_on_a_state(3.0, **moved), "kY", 0.3, STATE_TIMES
     )
     assert _worst(_column(_closing_on_a_state(3.0), "kY", times=STATE_TIMES), want) < 1e-5
+
+
+def _column_of_an_initial_value(model):
+    sim = bngsim.Simulator(model, method="ode", sensitivity_ic=["Y"])
+    run = sim.run(sample_times=STATE_TIMES, rtol=1e-8, atol=1e-10, timeout=120)
+    return np.asarray(run.sensitivities_ic)[:, list(run.species_names).index("X"), 0]
+
+
+def test_an_initial_value_that_moves_the_zero_of_a_base_is_refused():
+    """The initial value of ``Y`` moves the zero of ``1 - s - Y`` as ``kY``
+    does, and it is no parameter: only the parameters' columns were asked,
+    and dX/dY(0) came back plain (0.56% off at a = 1.2 and a tolerance of
+    1e-5)."""
+    with pytest.raises(
+        bngsim.SimulationError,
+        match=r"initial value of species 'Y' moves.*singular.*\(issue #1003\)",
+    ):
+        _column_of_an_initial_value(_closing_on_a_state(1.5))
+
+
+def test_an_initial_value_where_nothing_is_singular():
+    """Control."""
+    want = _from_plain_runs(
+        lambda **moved: _closing_on_a_state(3.0, **moved), "y0", 0.0, STATE_TIMES, h=1e-3
+    )
+    assert _worst(_column_of_an_initial_value(_closing_on_a_state(3.0)), want) < 1e-5
 
 
 def test_a_parameter_listed_for_one_power_is_asked_of_a_state_power_too():

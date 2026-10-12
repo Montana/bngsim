@@ -5096,12 +5096,14 @@ void CvodeSimulator::Impl::setup_comoving_frames(SensitivityState &sens, int ns,
     user_data.comoving_plist = nullptr;
     // BNGSIM_SENS_COMOVING=0 keeps every column plain, which is the pre-#545 solve,
     // for an A/B. Read per run, onto the run's own state. Diagnostic only.
+    // Issue #1003: what the refusal of a column with no case is asked at. Set
+    // ahead of the switch below: a column that has no case is plain with the
+    // frames on or off, and is refused either way.
+    frames.edge_param_values = user_data.codegen_param_values;
     const char *env = std::getenv("BNGSIM_SENS_COMOVING");
     if (env != nullptr && std::string(env) == "0") {
         return;
     }
-    // Issue #1003: what the refusal of a column with no case is asked at.
-    frames.edge_param_values = user_data.codegen_param_values;
     // Issue #948: asked of the powers themselves, whether or not the model has
     // a case: a window written in numbers has none.
     if (codegen_counter_power_fn != nullptr && user_data.codegen_param_values != nullptr) {
@@ -5255,33 +5257,47 @@ void CvodeSimulator::Impl::comoving_refuse_without_a_case(const SensitivityState
     if (codegen_edge_without_case_fn == nullptr || frames.edge_param_values == nullptr) {
         return;
     }
-    for (int c = 0; c < sens.n_p && static_cast<size_t>(c) < dtstar_dp.size(); ++c) {
+    // Every column, the initial-condition ones after the parameters': an
+    // initial value moves the zero of a base that reads a species, as any
+    // parameter does, and is asked what holds for every parameter (-1).
+    for (int c = 0; c < sens.n_total && static_cast<size_t>(c) < dtstar_dp.size(); ++c) {
         if (dtstar_dp[static_cast<size_t>(c)] == 0.0) {
             continue; // this column does not move this crossing
         }
-        const int param = sens.plist[static_cast<size_t>(c)];
+        const bool of_a_parameter = c < sens.n_p;
+        const int param = of_a_parameter ? sens.plist[static_cast<size_t>(c)] : -1;
         if (codegen_edge_without_case_fn(param, t, frames.edge_param_values) == 0) {
             continue;
         }
-        const auto &params = model.parameters();
-        const std::string name = param >= 0 && static_cast<size_t>(param) < params.size()
-                                     ? params[static_cast<size_t>(param)].name
-                                     : std::string("?");
+        std::string who = "?";
+        if (of_a_parameter) {
+            const auto &params = model.parameters();
+            if (param >= 0 && static_cast<size_t>(param) < params.size()) {
+                who = "parameter '" + params[static_cast<size_t>(param)].name + "'";
+            }
+        } else {
+            const auto ic = static_cast<size_t>(c - sens.n_p);
+            const auto &species = model.species();
+            if (ic < sens.ic_species_indices.size() && sens.ic_species_indices[ic] >= 0 &&
+                static_cast<size_t>(sens.ic_species_indices[ic]) < species.size()) {
+                who = "the initial value of species '" +
+                      species[static_cast<size_t>(sens.ic_species_indices[ic])].name + "'";
+            }
+        }
         std::ostringstream msg;
-        msg << "Forward sensitivity: parameter '" << name
-            << "' moves the crossing at t=" << std::setprecision(17) << t
-            << ", and it moves the edge of a rate law's power of the time, or of a counter, "
-               "that is singular at this run's values, one with an exponent under 1. A column "
-               "is carried across such an edge in a frame that moves with it, and the column "
-               "of '"
-            << name << "' has none: either the rate at which the edge's time changes with '" << name
-            << "' is not a number that holds along the run (the parameter is in the "
-               "denominator or the scale of the edge's time, or the power's base is not linear "
-               "in the time or reads a species), or the frames of this model were not worked "
-               "out. The plain "
-               "column has a forcing that is unbounded at the edge: it comes back up to 12% "
-               "off, or ends in a solver error (issue #1003). Drop '"
-            << name << "' from sensitivity_params, or difference plain runs.";
+        msg << "Forward sensitivity: " << who
+            << " moves the crossing at t=" << std::setprecision(17) << t
+            << ", which is the edge of a rate law's power that is singular at this run's values "
+               "(an exponent under 1), or cannot be told from one: the power's base is 0 there, "
+               "or it reads a counter or a species and cannot be asked at the crossing's time. A "
+               "column is carried across such an edge in a frame that moves with it, and this "
+               "column has none: the rate at which the edge's time changes with it is not a "
+               "number that holds along the run (a parameter in the denominator or the scale of "
+               "the edge's time, a base that is not linear in the time, or one that reads a "
+               "species, whose zero anything can move through the state), or the frames of this "
+               "model were not worked out. The plain column has a forcing that is unbounded at "
+               "the edge: it comes back up to 12% off, or ends in a solver error (issue #1003). "
+               "Drop it from the sensitivities asked for, or difference plain runs.";
         throw std::runtime_error(msg.str());
     }
 }

@@ -9624,35 +9624,40 @@ def _functional_comoving_plan(
 
     not_state = set(clock_weights) | param_aliases | set(_MATH_CONSTANT_C)
     edges: dict[int, list[str]] = {}
-    for text in sorted(rxns_of_law):
-        for on_cell, _cond in laws[text]:
-            for node in sorted(set(_pow_nodes_in_values(on_cell, sp)), key=_term_order.srepr):
-                if not _singular_power(node, clock_names, sp):
-                    continue
-                under_one = _exponent_under_one(node.exp, over_parameters, sp)
-                if not under_one:
-                    continue
-                test = " || ".join(under_one)
-                at_zero = _base_is_zero_at(node.base, time_and_parameters, sp)
-                if at_zero != "1":
-                    test = at_zero if test == "1" else f"(({test}) && {at_zero})"
-                in_base = _value_symbol_names(sp.numer(sp.together(node.base)), sp)
-                if in_base - not_state:
-                    edges.setdefault(-1, []).append(test)
-                named: set[str] = set()
-                for alias in in_base & param_aliases:
-                    name = scope.param_of_alias[alias]
-                    named.add(name)
-                    if name in derived_names:
-                        named |= above(name) | primaries_of(name)
-                for name in sorted(named):
-                    alias = alias_of_name.get(name, "")
-                    if asked.get(alias, {}).get(node) is False:
-                        continue  # in the base, and its zero is where it was
-                    if has_its_case(node.base, alias):
+    listed = True
+    try:
+        for text in sorted(rxns_of_law):
+            for on_cell, _cond in laws[text]:
+                for node in sorted(set(_pow_nodes_in_values(on_cell, sp)), key=_term_order.srepr):
+                    if not _singular_power(node, clock_names, sp):
                         continue
-                    edges.setdefault(scope.param_idx_by_name[name], []).append(test)
-    if edges_out is not None:
+                    under_one = _exponent_under_one(node.exp, over_parameters, sp)
+                    if not under_one:
+                        continue
+                    test = " || ".join(under_one)
+                    at_zero = _base_is_zero_at(node.base, time_and_parameters, sp)
+                    if at_zero != "1":
+                        test = at_zero if test == "1" else f"(({test}) && {at_zero})"
+                    in_base = _value_symbol_names(sp.numer(sp.together(node.base)), sp)
+                    if in_base - not_state:
+                        edges.setdefault(-1, []).append(test)
+                    named: set[str] = set()
+                    for alias in in_base & param_aliases:
+                        name = scope.param_of_alias[alias]
+                        named.add(name)
+                        if name in derived_names:
+                            named |= above(name) | primaries_of(name)
+                    for name in sorted(named):
+                        alias = alias_of_name.get(name, "")
+                        if asked.get(alias, {}).get(node) is False:
+                            continue  # in the base, and its zero is where it was
+                        if has_its_case(node.base, alias):
+                            continue
+                        edges.setdefault(scope.param_idx_by_name[name], []).append(test)
+    except Exception as exc:  # noqa: BLE001 - the cases stand; the caller lists by name
+        logger.debug("issue #1003: the parameters without a case were not worked out: %s", exc)
+        listed = False
+    if edges_out is not None and listed:
         edges_out.append(tuple((idx, tuple(dict.fromkeys(edges[idx]))) for idx in sorted(edges)))
     if not cases:
         return None
