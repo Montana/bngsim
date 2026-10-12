@@ -399,10 +399,20 @@ written in the time and the parameters. `comoving_refuse_without_a_case`
 refuses the column at a crossing its parameter moves, ahead of the run for
 the switch times and at the crossing for a root. A parameter that is in the
 base and does not move its zero (`∂N/∂p` is 0 where `N` is, worked out for an
-`N` that is linear in the clock) is not listed. Where the plan ends early (the
-budget, an exception, a model given no case) every parameter that a singular
-power's numerator reads is listed by name (`_edge_parameters_by_name`), `on`
-and `D` among them: the model then has no case at all.
+`N` that is linear in the clock) is not listed. A parameter with a case is
+listed for a power all the same unless one of its cases holds that power's
+base still along its shift (`_base_stays`): a case made for another power
+does not remove this one. A numerator that reads a species or an observable
+has a zero that any parameter can move through the state, and is listed for
+every parameter (index −1, the export's `default:`). The numerator is asked
+at `t` against the sum of its terms, each condition in it taken each way
+(`_base_is_zero_at`); one that is a single term which is no product of the
+time and the parameters, `cos(pi·s/2)`, has no sum to be asked against and
+is taken to be 0 at every crossing. Where the plan ends early (the budget, an
+exception, a model given no case) every parameter that a singular power's
+numerator reads is listed by name (`_edge_parameters_by_name`), `on` and `D`
+among them: the model then has no case at all and no frames, and the refusal
+is asked at its crossings whether or not the frames are on.
 
 - **Open:** a parameter in the denominator or the scale of the edge's time has
   no case and is refused (#1003). For an `N = A·t + B` that is linear in the

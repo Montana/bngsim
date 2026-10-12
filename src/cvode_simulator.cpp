@@ -5245,7 +5245,9 @@ void CvodeSimulator::Impl::comoving_refuse_ahead_without_a_frame(const Sensitivi
 // parameters, and at any crossing its parameter moves where it could not (a
 // base that reads a counter or a state): ahead of the run for the switch times
 // it has, and at the crossing for one that is only found as a root. A run that
-// reaches none of them keeps its column.
+// reaches none of them keeps its column. The switch times of a run and its
+// parameter values are fixed when it starts, so nothing is asked again where
+// a switch time's jump is applied.
 
 void CvodeSimulator::Impl::comoving_refuse_without_a_case(const SensitivityState &sens, double t,
                                                           const std::vector<double> &dtstar_dp) {
@@ -8050,7 +8052,6 @@ void CvodeSimulator::Impl::apply_switch_sensitivity_jump(void *cvode_mem, N_Vect
         comoving_leave(sens, ns, sens_cols.data(),
                        t_evt == sens.comoving.t_entry ? sens.comoving.f_entry_after : sw_f_minus);
     }
-    comoving_refuse_without_a_case(sens, t_evt, dtstar_p); // issue #1003
     comoving_enter(sens, ns, sens_cols.data(), t_evt, sw_f_jump, sw_f_plus, f_instant, dtstar_p,
                    1e-9);
     // Issue #949: a crossing that shares its instant with another is read by

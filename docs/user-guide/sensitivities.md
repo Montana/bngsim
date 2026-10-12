@@ -378,13 +378,21 @@ Five cases are refused:
   run, and these have none, so the column stayed in `S`: dX/d(wb) was 12% off
   at `a = 1.1`, and under an opening power the run ended in a solver error.
   The column is refused at a crossing its parameter moves where the power's
-  base is 0, ahead of the run for the switch times it has. Where the base
-  reads a counter or a state it cannot be asked at the crossing's time, and
-  the column is refused at any crossing its parameter moves. A parameter that
-  is in the base and does not move its zero, `kk` in `(kk*(1 - s))^(a-1)`,
-  keeps its column. A column that needed its `V` is refused too in a model
-  whose `β` were not worked out: the derivation budget ran out, or the model
-  is one that is given none.
+  base is 0, ahead of the run for the switch times it has. The exponent is
+  asked at the run's parameter values; one that reads a species, the time or
+  a quantity an event assigns cannot be, and is taken to be under 1. Where
+  the base reads a counter or a state it cannot be asked at the crossing's
+  time, and the column is refused at any crossing its parameter moves. A base that
+  reads a species has a zero that any parameter can move through the state,
+  so there the column of every parameter is asked, whether or not the base
+  is written in it. A parameter that is in the base and does not move its
+  zero, `kk` in `(kk*(1 - s))^(a-1)`, keeps its column. A `β` made for one
+  power does not stand for another: `on` with a plain onset in one window
+  and an onset chosen by a condition in a second has its `V` for the first
+  and is refused for the second. A column that needed its `V` is refused too
+  in a model whose `β` were not worked out: the derivation budget ran out, or
+  the model is one that is given none, and then at a root as at a switch
+  time.
 
 Whether a power is singular is asked at the run's own parameter values, for
 the last three: with `a = 3` nothing is unbounded there, every column is right in

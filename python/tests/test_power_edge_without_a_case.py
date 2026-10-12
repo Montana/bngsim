@@ -539,6 +539,25 @@ def test_beside_an_event_a_column_with_a_case_is_refused_for_the_event():
     _refused_in_sbml(_antimony(1.1, event=True), "on", issue=958)
 
 
+def test_an_exponent_that_an_event_assigns_is_taken_to_be_singular():
+    """``a`` is 3 from start to end, and an event assigns it: it is then no
+    parameter, and the exponent cannot be asked at the run's values. Such a
+    power is singular at every value, as one whose exponent reads a species
+    is, and the column is refused though it was right."""
+    onset = "(on/(wb - wa))"
+    s = f"((time - {onset})/D)"
+    model = bngsim.Model.from_antimony_string(
+        "species X; X = 0; k0 = 0.1; k1 = 2; a = 3; on = 3; D = 4; kdeg = 0.3; wb = 2; wa = 1\n"
+        f"J1: -> X; k0 + piecewise(piecewise(k1*{s}*(1 - {s})^(a - 1), "
+        f"time <= {onset} + D, 0), time >= {onset}, 0)\n"
+        "J2: X -> ; kdeg*X\n"
+        "E1: at (time > 1): a = 3\n"
+    )
+    assert set(_without_a_case(model)) == {"wb", "wa"}
+    assert all(test.startswith("(!(fabs(") for test in _without_a_case(model).values())
+    _refused_in_sbml(model, "wb")
+
+
 def test_through_sbml_a_power_that_is_not_singular_keeps_its_column():
     """Control."""
     assert _worst(_column(_antimony(3.0), "wb"), _antimony_differences(3.0, T)) < 5e-6
@@ -610,12 +629,35 @@ def test_an_exponent_chosen_by_a_condition_and_singular_on_no_branch(tmp_path):
     assert np.all(np.isfinite(_column(model, "wb")))
 
 
-def test_an_exponent_chosen_among_numbers_of_one_or_more_is_not_listed(tmp_path):
+@pytest.mark.parametrize("first", [2, 1])
+def test_an_exponent_chosen_among_numbers_of_one_or_more_is_not_listed(tmp_path, first):
     """Control. ``if(t<tsw, 2, 3) - 1`` is no number, so the power is singular
-    by its shape, and neither value is under 1: nothing to list."""
-    model = _model(tmp_path, CHOSEN, 3.0, shape="s()*((1-s())^(if(t<tsw,2,3)-1))")
+    by its shape, and neither value is under 1: nothing to list. Nor with
+    ``if(t<tsw, 1, 3) - 1``, whose first value is 0: the power is the
+    constant 1 there."""
+    model = _model(tmp_path, CHOSEN, 3.0, shape=f"s()*((1-s())^(if(t<tsw,{first},3)-1))")
     assert _without_a_case(model) == {}
     assert np.all(np.isfinite(_column(model, "wb")))
+
+
+def test_an_exponent_chosen_among_numbers_one_of_them_under_one_is_listed(tmp_path):
+    """``if(t<tsw, 1.1, 3) - 1``: 0.1 on one branch, whatever the parameters."""
+    model = _model(tmp_path, CHOSEN, 3.0, shape="s()*((1-s())^(if(t<tsw,1.1,3)-1))")
+    assert _without_a_case(model) == dict.fromkeys({"wc", "wb", "wa"}, "1")
+    _refused(model, "wb")
+
+
+def test_an_exponent_with_more_branches_than_are_taken_is_not_asked():
+    """Seven conditions are 128 ways round, and 64 are taken: the exponent is
+    then singular at every value, which is the answer that refuses."""
+    import sympy as sp
+    from bngsim._codegen import _exponent_under_one
+
+    t = sp.Symbol("t")
+    exponent = sum(sp.Piecewise((2, t < k), (3, True)) for k in range(1, 8))
+    assert _exponent_under_one(exponent, lambda _e: None, sp) == ["1"]
+    six = sum(sp.Piecewise((2, t < k), (3, True)) for k in range(1, 7))
+    assert _exponent_under_one(six, lambda _e: None, sp) == []
 
 
 SEASONS = ("closing", "if(t<tsw,on,on2)", "D", (("on2", 30.0), ("tsw", 20.0)))
@@ -731,6 +773,38 @@ def test_by_name_a_derived_parameter_and_what_it_is_defined_from(tmp_path, monke
     model = _model(tmp_path, "derived", 1.1)
     _ending_early(monkeypatch, RuntimeError("plan"))
     assert set(_without_a_case(model)) == {"on", "D", "wd", "wb", "wa"}
+
+
+CHAIN = (
+    "closing",
+    "on/wd",
+    "D",
+    (("wb", 2.0), ("wa", 1.0), ("we", "wb-wa"), ("wd", "1*we")),
+)
+
+
+def test_a_derived_parameter_defined_from_another_lists_both(tmp_path):
+    """``wd = 1·we`` and ``we = wb - wa``: the edge moves with ``we`` too, and
+    it is neither in the base nor a primary."""
+    model = _model(tmp_path, CHAIN, 1.1)
+    assert _without_a_case(model) == dict.fromkeys({"wd", "we", "wb", "wa"}, SINGULAR)
+    _refused(model, "we")
+
+
+def test_the_counters_powers_ending_the_plan_lists_by_name(tmp_path, monkeypatch):
+    """The powers of the counters are worked out ahead of the plan, under the
+    same budget. Where that is what raised, the model has no case either."""
+    from bngsim import _codegen
+
+    model = _model(tmp_path, "quotient", 1.1)
+
+    def ends(*_args, **_kwargs):
+        raise RuntimeError("the counters' powers")
+
+    monkeypatch.setattr(_codegen, "_counter_powers", ends)
+    source = _source(model)
+    assert "bngsim_codegen_comoving_case" not in source
+    assert set(_without_a_case(model, source)) == {"on", "D", "wc", "wb", "wa"}
 
 
 def test_by_name_a_law_that_is_not_read_lists_every_parameter(tmp_path, monkeypatch):
@@ -906,6 +980,32 @@ def test_on_a_counter_a_model_with_no_case_where_nothing_is_singular(tmp_path, p
     assert _worst(_column(_model(tmp_path, NO_CASE_AT_ALL, 3.0), param), want) < 5e-6
 
 
+# The onset is chosen by a condition on the counter, as a season's is by the
+# year, and the width is a number: ``on`` and ``on2`` are in the base, a shift
+# of 1 is read off for each, and neither removes the power, whose base holds
+# the condition. No case at all, and every edge is found as a root where the
+# rate is continuous.
+NO_CASE_SEASONS = ("closing", "if(t<tsw,on,on2)", "4", (("on2", 30.0), ("tsw", 20.0)))
+
+
+@pytest.mark.parametrize("a", [1.1, 1.5])
+def test_a_season_chosen_onset_in_a_model_with_no_case_at_all_is_refused(tmp_path, a):
+    """SIR_v5's shape, without BNG2.pl. At a root where the rate does not
+    jump, the refusal was asked only with the frames on, and this model has
+    none: the run of ``on`` ended in CVODE's no-progress error at a = 1.1 and
+    its column came back at 1.5."""
+    model = _model(tmp_path, NO_CASE_SEASONS, a)
+    assert "bngsim_codegen_comoving_case" not in _source(model)
+    assert _without_a_case(model) == {"on": SINGULAR, "on2": SINGULAR}
+    _refused(model, "on")
+
+
+def test_a_season_chosen_onset_in_a_model_with_no_case_and_no_singular_power(tmp_path):
+    """Control."""
+    want = _differences(tmp_path, NO_CASE_SEASONS, 3.0, "on")
+    assert _worst(_column(_model(tmp_path, NO_CASE_SEASONS, 3.0), "on"), want) < 5e-6
+
+
 def _at_a_root_with_no_case(shape, a, wb=2.0):
     """A power whose edge is where a state crosses, in a model with no case
     at all: its base reads ``wb`` and ``wa`` alone, in a denominator."""
@@ -1051,6 +1151,33 @@ def test_a_base_of_one_term_is_not_asked():
         bngsim.SimulationError, match=r"parameter 'D' moves.*singular.*\(issue #1003\)"
     ):
         sim.run(sample_times=T, rtol=1e-8, atol=1e-10, timeout=120)
+
+
+def _closing_as_a_sine(a, **moved):
+    """``sin(w·time)^(a-1)`` up to ``pi/w``: one term again, with no sum
+    anywhere in it, and 1.2e-16 at its closing edge."""
+    v = {"w": 0.5} | moved
+    return bngsim.Model.from_antimony_string(
+        f"species X; X = 0; k0 = 0.1; k1 = 2; a = {a}; w = {v['w']!r}; kdeg = 0.3\n"
+        "J1: -> X; k0 + piecewise(k1*sin(w*time)^(a - 1), time <= pi/w, 0)\n"
+        "J2: X -> ; kdeg*X\n"
+    )
+
+
+def test_a_base_that_is_a_function_of_a_product_is_not_asked():
+    model = _closing_as_a_sine(1.1)
+    assert _without_a_case(model) == {"w": _singular_in(model)}
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["w"])
+    with pytest.raises(
+        bngsim.SimulationError, match=r"parameter 'w' moves.*singular.*\(issue #1003\)"
+    ):
+        sim.run(sample_times=T, rtol=1e-8, atol=1e-10, timeout=120)
+
+
+def test_a_base_that_is_a_function_of_a_product_where_nothing_is_singular():
+    """Control."""
+    want = _from_plain_runs(lambda **moved: _closing_as_a_sine(3.0, **moved), "w", 0.5, T)
+    assert _worst(_column(_closing_as_a_sine(3.0), "w"), want) < 5e-6
 
 
 @pytest.mark.parametrize("a, param, start", [(3.0, "D", 4.0), (1.1, "on", 3.0)])
@@ -1245,3 +1372,10 @@ def test_whether_a_parameter_moves_the_zero_of_a_numerator():
     assert moved((D - t) * w + on, w)  # the denominator of the onset
     assert moved(D**2 - (t - on) ** 2, D)  # not linear in the time: not worked out
     assert moved(kk * (D**2 - (t - on) ** 2), kk)  # likewise, though it does not move it
+    # Not linear in the time, with a zero at t = w that the formula for a
+    # linear numerator does not see: it reads the other zero, at 0.
+    assert moved(t**2 - w * t, w)
+    # A numerator that holds a condition is not worked out either, though
+    # ``kk`` does not move its zero.
+    mode, on2 = sp.symbols("mode on2")
+    assert moved(kk * (t - sp.Piecewise((on, mode > 0.5), (on2, True))), kk)
