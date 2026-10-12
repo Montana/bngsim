@@ -8279,8 +8279,6 @@ def read_output_sens_support_note(
         if item[1] is not None and not isinstance(item[1], str):
             return None
         support[item[0]] = item[1]
-    if len(support) != len(listed):
-        return None
     if function_names is not None and list(support) != list(function_names):
         return None
     return support
