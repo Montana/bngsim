@@ -47,7 +47,7 @@ from bngsim._codegen import (
     _codegen_jit_backend,
     last_codegen_decline,
     last_codegen_error,
-    read_output_sens_support_note,
+    output_sens_support_of_artifact,
     read_sens_decline_note,
 )
 from bngsim._exceptions import (
@@ -3313,7 +3313,9 @@ class Simulator:
         # under a wall-clock budget, so one made again here need not be cut
         # where the build's was, and would call a function supported that the
         # artifact holds NaN for. Read, a warm process does not pay for the
-        # analysis either. An artifact with no note is analysed as before.
+        # analysis either. The model whose own analysis the artifact was
+        # emitted from answers from that, and an artifact with no note is
+        # analysed as before.
         attached = (_attachment(self._model), self._codegen_so_path)
         kept = self._expr_sens_support_memo
         if kept is not None and kept[0] == attached:
@@ -3324,7 +3326,17 @@ class Simulator:
                 names = list(self._model._core.function_names)
             except Exception:  # noqa: BLE001 - no names to hold the note to
                 names = None
-            memo = read_output_sens_support_note(self._codegen_so_path, names)
+            memo = output_sens_support_of_artifact(self._model, self._codegen_so_path, names)
+            unavailable = [name for name, reason in (memo or {}).items() if reason is not None]
+            if memo is not None and unavailable:
+                logger.info(
+                    "The compiled code has no output sensitivity for %d of %d function(s) "
+                    "(%s): %s",
+                    len(unavailable),
+                    len(memo),
+                    ", ".join(unavailable[:5]),
+                    memo[unavailable[0]],
+                )
         if memo is None:
             try:
                 from bngsim._codegen import output_sens_support

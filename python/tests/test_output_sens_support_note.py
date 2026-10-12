@@ -142,9 +142,11 @@ def test_the_other_way_round_the_artifact_that_was_not_cut_is_not_refused(isolat
 
 @needs_cc
 def test_a_build_that_finds_the_artifact_installed_leaves_its_note(isolated_cache, monkeypatch):
-    """Two processes can miss the cache together. The one that compiles second
-    finds the artifact installed and is handed it, with whatever its own
-    budget did: the note beside it is the first one's, and stays."""
+    """Two processes can miss the cache together. One that reaches the
+    compiler after the other has installed the artifact is handed that one,
+    with whatever its own budget did: the note beside it is the first one's,
+    and stays. (Two that are both compiling each install their own: see the
+    pull request's "Left alone".)"""
     _sim, first = _run()
     want = np.asarray(first.output_sensitivities(["ratio"]))
     (note,) = _notes(isolated_cache)
@@ -160,9 +162,54 @@ def test_a_build_that_finds_the_artifact_installed_leaves_its_note(isolated_cach
     monkeypatch.setattr(cg, "get_cached_so", missed_once)
     with _cut_after_the_first():
         _sim, second = _run()
-        assert looked[0] >= 2
+        assert looked[0] >= 1
         assert note.read_text() == before
         np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["ratio"])), want)
+
+
+@needs_cc
+def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache):
+    """Two processes that both compile each install their own artifact, and
+    the note beside the one that lands can be the other's. The model whose
+    analysis the code was emitted from does not ask the note: with a note
+    beside it that calls every function supported, as a build that was not
+    cut writes, it raises its own reason, as it did before there was a note.
+    Reading the note here returned NaN in 3 of 8 concurrent cold starts."""
+    model = bngsim.Model.from_net(CHAIN_NET)
+
+    def run():
+        sim = bngsim.Simulator(
+            model, method="ode", codegen=True, sensitivity_params=["k1", "scale"]
+        )
+        return sim.run(t_span=(0.0, 8.0), n_points=5)
+
+    with _cut_after_the_first():
+        first = run()
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+        first.output_sensitivities(["ratio"])
+    (artifact,) = _artifacts(isolated_cache)
+    cg.write_output_sens_support_note(artifact, dict.fromkeys(FUNCTIONS))
+    model.reset()
+    second = run()
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+        second.output_sensitivities(["ratio"])
+
+
+@needs_cc
+def test_a_note_that_cannot_be_installed_does_not_fail_the_build(isolated_cache):
+    """Control. Something that is no file sits where the note goes: the
+    artifact is built, the run returns, and the map is worked out from the
+    model."""
+    _sim, first = _run()
+    want = np.asarray(first.output_sensitivities(["ratio"]))
+    (artifact,) = _artifacts(isolated_cache)
+    (note,) = _notes(isolated_cache)
+    artifact.unlink()
+    note.unlink()
+    note.mkdir()
+    _sim, second = _run()
+    assert artifact.exists() and note.is_dir()
+    np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["ratio"])), want)
 
 
 # ─── The note ────────────────────────────────────────────────────────────────
@@ -284,7 +331,7 @@ def test_what_is_written_is_what_is_read(tmp_path):
 def _pair(cache_dir: Path, model_hash: str) -> tuple[Path, Path]:
     artifact = cache_dir / f"{cg._artifact_stem(model_hash)}{cg._shared_lib_suffix()}"
     artifact.write_bytes(b"x" * 1024)
-    note = cg._output_sens_note_path(artifact)
+    note = artifact.with_suffix(".outputs.json")
     note.write_text('{"version": 1, "functions": []}')
     return artifact, note
 

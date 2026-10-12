@@ -5028,6 +5028,7 @@ def compile_rhs(c_source: str, model_hash: str) -> Path:
             )
             _compile_sharded(driver_src, units, tmp_so_path, opt_flag, jobs, timeout, compiler)
             os.replace(tmp_so_path, so_path)
+            _compile_installs.last = str(so_path)
         else:
             c_path = CACHE_DIR / f"{stem}.{token}.c"
             # UTF-8: generated source has non-ASCII comment glyphs; the locale
@@ -5040,6 +5041,7 @@ def compile_rhs(c_source: str, model_hash: str) -> Path:
                 if result.returncode != 0:
                     raise RuntimeError(f"Codegen compilation failed:\n{result.stderr}")
                 os.replace(tmp_so_path, so_path)
+                _compile_installs.last = str(so_path)
             finally:
                 c_path.unlink(missing_ok=True)
     except subprocess.TimeoutExpired as err:
@@ -8070,6 +8072,15 @@ _OUTPUT_SENS_NOTE_EXT = ".outputs.json"
 #: then worked out from the model, as it was before issue #1004.
 _OUTPUT_SENS_NOTE_VERSION = 1
 
+#: The artifact :func:`compile_rhs` last installed on this thread, as against one
+#: it found installed and handed back (issue #1004).
+_compile_installs = threading.local()
+
+#: ``{artifact path: the output-sensitivity analysis its code was emitted from}``
+#: for the artifacts this process built (issue #1004). A model that still holds
+#: that analysis answers for the artifact itself; any other is told by the note.
+_output_sens_emitted: dict[str, dict] = {}
+
 _sens_declines = threading.local()
 
 
@@ -8282,6 +8293,25 @@ def read_output_sens_support_note(
     if function_names is not None and list(support) != list(function_names):
         return None
     return support
+
+
+def output_sens_support_of_artifact(
+    model, so_path: str | os.PathLike[str], function_names: list[str] | None = None
+) -> dict[str, str | None] | None:
+    """The output-sensitivity support map of the artifact at *so_path* for
+    *model*, or ``None`` where the artifact does not say (issue #1004).
+
+    The model whose analysis the artifact's code was emitted from, in this
+    process, answers from that analysis: it is the artifact's by construction,
+    whatever another process has since written beside it. Any other model,
+    one that was handed the artifact from the cache among them, is told by the
+    note. ``None`` where there is neither, and the caller analyses the model.
+    """
+    emitted = _output_sens_emitted.get(str(so_path))
+    own = getattr(model, "_output_sens_analysis", None)
+    if emitted is not None and own is not None and own[1] is emitted:
+        return _support_of_analysis(emitted)
+    return read_output_sens_support_note(so_path, function_names)
 
 
 def _replay_sens_decline(so_path: str | os.PathLike[str]) -> None:
@@ -11061,7 +11091,10 @@ def output_sens_support(model) -> dict[str, str | None]:
     :class:`Result` by the Simulator so a selector can fail loudly with the
     specific reason instead of a bare empty-block error.
     """
-    analysis = _analyze_output_sens(model)
+    return _support_of_analysis(_analyze_output_sens(model))
+
+
+def _support_of_analysis(analysis: dict) -> dict[str, str | None]:
     if analysis["decline"] is not None:
         return {f["name"]: analysis["decline"] for f in analysis["functions"]}
     return {info["name"]: info["reason"] for info in analysis["func_infos"]}
@@ -11780,9 +11813,11 @@ def prepare_model_codegen(model) -> Path | None:
         cache_hit = False
         # Issue #1004: whether the artifact is this build's own. Another process
         # may have installed one under this key since the lookup above, cut
-        # elsewhere by its own budget, and its notes are then the ones to keep.
-        built_here = get_cached_so(model_hash) is None
+        # elsewhere by its own budget; compile_rhs then hands that one back, and
+        # its note is the one to keep.
+        _compile_installs.last = None
         so_path = compile_rhs(c_source, model_hash)
+        built_here = getattr(_compile_installs, "last", None) == str(so_path)
         if declines and not has_sens:
             # Issue #438: beside the artifact, so the next construction of this
             # model — which will resolve that same .so from the cache without
@@ -11794,7 +11829,9 @@ def prepare_model_codegen(model) -> Path | None:
             # sensitivities were emitted from (the model's own, memoized), for
             # the process that is handed the artifact and has made none.
             try:
-                write_output_sens_support_note(so_path, output_sens_support(model))
+                emitted = _analyze_output_sens(model)
+                _output_sens_emitted[str(so_path)] = emitted
+                write_output_sens_support_note(so_path, _support_of_analysis(emitted))
             except Exception as e:  # noqa: BLE001 - a note, not the build
                 logger.debug("Could not work out the output-sensitivity support (%s)", e)
         return so_path

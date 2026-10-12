@@ -142,11 +142,13 @@ built without an analytic sensitivity RHS (issue #438), or a
 ``rhs_<key>_<hash>.outputs.json`` recording which functions it holds an output
 sensitivity for (issue #1004).
 
-A few hundred bytes, written only for a model that declined, and read back on a
-cache hit so the reason survives a warm cache — which is the whole point of it,
-since a warm cache generates no source and therefore derives no reason. Not an
-artifact: nothing loads it, and it is worth nothing without the artifact it
-describes, so ``prune`` keeps a note exactly as long as it keeps that artifact."""
+The first is a few hundred bytes, written only for a model that declined. The
+second is written for every artifact with the output-sensitivity code: about 25
+bytes a function, and the reason beside each one that has none. Both are read back
+on a cache hit, since a warm cache generates no source and therefore derives
+nothing. Not artifacts: nothing loads them, and they are worth nothing without the
+artifact they describe, so ``prune`` keeps a note exactly as long as it keeps that
+artifact."""
 
 KIND_FOREIGN = "foreign"
 """Anything bngsim does not recognize as its own. Counted and reported, never
