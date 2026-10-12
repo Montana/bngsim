@@ -324,7 +324,9 @@ warm cache. Beside an artifact built with the output-sensitivity code it writes 
 second note (`rhs_<key>_<hash>.outputs.json`, issue #1004): which functions the
 artifact holds a derivative for, and why not for the others. A process that is
 handed the artifact from the cache reads it, so `output_sensitivities([...])`
-raises the reason the build recorded, and the map is not worked out again. Both
+raises the reason the build recorded, and the map is not worked out again. (The
+note answers for a model whose tables are the builder's: one given a table
+function after it ran keeps its artifact and is analysed for itself.) Both
 are bngsim's own files: counted under one kind, removed by `clear`, and removed by
 `prune` exactly when the artifact they describe is removed.
 

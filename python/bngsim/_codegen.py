@@ -8270,12 +8270,28 @@ def _output_sens_note_path(so_path: str | os.PathLike[str]) -> Path:
     return Path(so_path).with_suffix(_OUTPUT_SENS_NOTE_EXT)
 
 
+def _output_sens_note_key(model) -> str:
+    """What a model's output-sensitivity analysis is keyed by, as text a note
+    can hold (issue #1004).
+
+    An artifact does not fix the analysis of every model that runs it: a table
+    function given to a model after load takes the place of the function it is
+    named for, in the same compiled code, and that function then has no
+    derivative (issue #979). :func:`_output_sens_analysis_key` tells such
+    models apart, and a note answers only for a model keyed as its builder
+    was.
+    """
+    core = getattr(model, "_core", model)
+    key = _output_sens_analysis_key(core, model if model is not core else None)
+    return hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:32]
+
+
 def write_output_sens_support_note(
-    so_path: str | os.PathLike[str], support: dict[str, str | None]
+    so_path: str | os.PathLike[str], support: dict[str, str | None], key: str | None = None
 ) -> Path | None:
     """Persist *support*, ``{function: why it has no output sensitivity, or
     None}``, beside the artifact at *so_path* (issue #1004); return the note's
-    path.
+    path. *key* is the builder's :func:`_output_sens_note_key`.
 
     The map is of the analysis the artifact's output-sensitivity code was
     emitted from. That analysis runs under a wall-clock budget, so it is not a
@@ -8294,6 +8310,7 @@ def write_output_sens_support_note(
     tmp = note.with_name(f"{Path(so_path).stem}.{token}{_OUTPUT_SENS_NOTE_EXT}")
     payload = {
         "version": _OUTPUT_SENS_NOTE_VERSION,
+        "key": key,
         "functions": [[name, reason] for name, reason in support.items()],
     }
     try:
@@ -8309,16 +8326,19 @@ def write_output_sens_support_note(
 
 
 def read_output_sens_support_note(
-    so_path: str | os.PathLike[str], function_names: list[str] | None = None
+    so_path: str | os.PathLike[str],
+    function_names: list[str] | None = None,
+    key: str | None = None,
 ) -> dict[str, str | None] | None:
     """The output-sensitivity support map of the artifact at *so_path*, or
     ``None`` where there is no note to read (issue #1004).
 
     ``None`` for an artifact built before the note existed, one built without
     the output-sensitivity code, a note that could not be written, one that is
-    unreadable or of another version, and one that does not list exactly
-    *function_names*, in order, where they are given: the caller then works the
-    map out from the model.
+    unreadable or of another version, one that does not list exactly
+    *function_names*, in order, where they are given, and one whose builder was
+    not keyed by *key* (:func:`_output_sens_note_key`), where that is given: the
+    caller then works the map out from the model.
     """
     try:
         payload = json.loads(_output_sens_note_path(so_path).read_text(encoding="utf-8"))
@@ -8327,6 +8347,8 @@ def read_output_sens_support_note(
         # read a note may break the run that asked.
         return None
     if not isinstance(payload, dict) or payload.get("version") != _OUTPUT_SENS_NOTE_VERSION:
+        return None
+    if key is not None and payload.get("key") != key:
         return None
     listed = payload.get("functions")
     if not isinstance(listed, list):
@@ -8356,12 +8378,23 @@ def output_sens_support_of_artifact(
     model, one that was handed the artifact from the cache among them, is
     told by the note. ``None`` where there is neither, and the caller
     analyses the model.
+
+    Either answers only for the model as it is keyed now
+    (:func:`_output_sens_analysis_key`): one that has been given a table
+    function since runs the same artifact, and is analysed for itself.
     """
+    core = getattr(model, "_core", model)
+    key = _output_sens_analysis_key(core, model if model is not core else None)
     mark = _output_sens_emitted.get(str(so_path))
     own = getattr(model, "_output_sens_analysis", None)
-    if mark is not None and own is not None and own[1].get("emitted_mark") is mark() is not None:
+    if (
+        mark is not None
+        and own is not None
+        and own[0] == key
+        and own[1].get("emitted_mark") is mark() is not None
+    ):
         return _support_of_analysis(own[1])
-    return read_output_sens_support_note(so_path, function_names)
+    return read_output_sens_support_note(so_path, function_names, _output_sens_note_key(model))
 
 
 def _replay_sens_decline(so_path: str | os.PathLike[str]) -> None:
@@ -12224,7 +12257,7 @@ def prepare_model_codegen(model) -> Path | None:
                     for path in [k for k, v in _output_sens_emitted.items() if v() is None]:
                         del _output_sens_emitted[path]
                     _output_sens_emitted[str(so_path)] = weakref.ref(mark)
-                write_output_sens_support_note(so_path, support)
+                write_output_sens_support_note(so_path, support, _output_sens_note_key(model))
             except Exception as e:  # noqa: BLE001 - a note, not the build
                 logger.debug("Could not work out the output-sensitivity support (%s)", e)
         return so_path

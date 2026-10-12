@@ -198,15 +198,94 @@ def test_the_model_that_built_the_artifact_answers_for_it_itself(isolated_cache)
 
 
 @needs_cc
-def test_the_registry_does_not_keep_an_analysis_alive(isolated_cache):
+def test_the_registry_does_not_keep_an_analysis_alive(isolated_cache, caplog):
     """What the process remembers of an artifact it built is a weak
-    reference: the analysis goes with its models."""
+    reference: the analysis goes with its models. (A DEBUG record of the run
+    names its model, and a captured record keeps it alive for the length of
+    the test: the logger is held at WARNING, wherever an earlier test left
+    it.)"""
     import gc
+    import logging
 
+    caplog.set_level(logging.WARNING, logger="bngsim")
     _run()
     (artifact,) = _artifacts(isolated_cache)
     gc.collect()
     assert cg._output_sens_emitted[str(artifact)]() is None
+
+
+# ─── A model that is not keyed as the builder was ────────────────────────────
+
+RUN = dict(method="ode", sensitivity_params=["k1", "scale"])
+TABLE = dict(times=[0.0, 10.0], values=[1.0, 3.0])
+
+
+def _given_a_table_after_a_run(model, name="ratio"):
+    """*model* is run, given a table function named for one of its functions,
+    and run again: both results and both artifacts. (At the default
+    ``codegen``, where a model that has run keeps its artifact. With
+    ``codegen=True`` the code is generated again, with the table in it.)"""
+    first_sim = bngsim.Simulator(model, **RUN)
+    first = first_sim.run(t_span=(0.0, 8.0), n_points=5)
+    model.reset()
+    model.add_table_function(name, **TABLE)
+    second_sim = bngsim.Simulator(model, **RUN)
+    second = second_sim.run(t_span=(0.0, 8.0), n_points=5)
+    return first, second, first_sim._codegen_so_path, second_sim._codegen_so_path
+
+
+@needs_cc
+def test_a_model_given_a_table_function_is_not_told_by_the_note(isolated_cache):
+    """A table function with a function's name takes that function's place,
+    and it then has no derivative (issue #979). A model that has run
+    keeps its artifact when it is given one, so the note beside the artifact
+    is of a model with no table and lists ``ratio`` as supported. The model
+    here was handed the artifact from the cache and told its map by the
+    note; given the table, it is analyzed for itself, and the selector
+    raises as it did before there was a note. ``scaled`` is still
+    returned."""
+    _sim, built = _run()
+    want = np.asarray(built.output_sensitivities(["scaled"]))
+    (artifact,) = _artifacts(isolated_cache)
+    assert cg.read_output_sens_support_note(artifact, FUNCTIONS)["ratio"] is None
+
+    first, second, so_first, so_second = _given_a_table_after_a_run(
+        bngsim.Model.from_net(CHAIN_NET)
+    )
+    assert Path(so_first) == Path(so_second) == artifact
+    assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity"):
+        second.output_sensitivities(["ratio"])
+    np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["scaled"])), want)
+
+
+@needs_cc
+def test_the_builder_given_a_table_function_does_not_answer_from_what_it_built(isolated_cache):
+    """Control. The same for the model that built the artifact: the analysis
+    its code was emitted from is not this model's any more."""
+    first, second, so_first, so_second = _given_a_table_after_a_run(
+        bngsim.Model.from_net(CHAIN_NET)
+    )
+    assert Path(so_first) == Path(so_second)
+    assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity"):
+        second.output_sensitivities(["ratio"])
+
+
+@needs_cc
+def test_a_note_is_read_by_its_builders_key(isolated_cache):
+    """The note names what its builder's analysis was keyed by, and reads as
+    no note under any other key."""
+    sim, _result = _run()
+    (artifact,) = _artifacts(isolated_cache)
+    key = cg._output_sens_note_key(sim._model)
+    assert json.loads(_notes(isolated_cache)[0].read_text())["key"] == key
+    assert cg.read_output_sens_support_note(artifact, FUNCTIONS, key) is not None
+    assert cg.read_output_sens_support_note(artifact, FUNCTIONS, "another") is None
+    tabled = bngsim.Model.from_net(CHAIN_NET)
+    tabled.add_table_function("ratio", **TABLE)
+    assert cg._output_sens_note_key(tabled) != key
+    assert cg._output_sens_note_key(bngsim.Model.from_net(CHAIN_NET)) == key
 
 
 @needs_cc
