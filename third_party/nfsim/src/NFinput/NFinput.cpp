@@ -2769,7 +2769,12 @@ bool NFinput::initReactionRulePermutation(
 						if (ts->getNreactants() == 0) {
 							r->volumeConversionFactor = volumeConversion;
 							if (r->getRxnType() != ReactionClass::OBS_DEPENDENT_RXN) {
-								r->setBaseRate(r->getBaseRate() * volumeConversion, "");
+								// Keep the rate's parameter name, so a later
+								// setParameter() still refreshes this rule
+								// (resetBaseRateFromSystemParamter() reapplies
+								// the conversion). bngsim GH #854.
+								r->setBaseRate(r->getBaseRate() * volumeConversion,
+								               r->getBaseRateParameterName());
 							}
 						}
 

@@ -323,6 +323,23 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-zero-order-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Keep a zero-order rule's rate parameter name when NFinput folds the rule's "
+            "volume conversion into its base rate, and reapply the conversion in "
+            "resetBaseRateFromSystemParamter(). NFinput re-set the rate with an empty name, "
+            "so a setParameter() after load (bngsim's post-init set_param) skipped the rule "
+            "and it kept producing at its old rate, silently. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "07d5fff2da2cd9a89431794f408bd8e10923f8df",
+                "summary": "bngsim: keep a zero-order rule's rate parameter through its volume conversion",
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12

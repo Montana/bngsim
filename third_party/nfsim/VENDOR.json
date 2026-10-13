@@ -7,11 +7,11 @@
     "local_origin_remote": "https://github.com/RuleWorld/nfsim.git",
     "fork_remote": null,
     "branch_or_ref": "bngsim/vendor",
-    "commit": "8876d77dd27ef9afea41193fae85857c5c83f590",
+    "commit": "07d5fff2da2cd9a89431794f408bd8e10923f8df",
     "base_ref": "origin/master",
     "base_commit": "1a54f38701ab2213de831f9ba272cbb14f7c371f"
   },
-  "imported_at_utc": "2026-10-12T17:16:01+00:00",
+  "imported_at_utc": "2026-10-13T23:49:52+00:00",
   "pruning": {
     "included_paths": [
       "CMakeLists.txt",
@@ -189,6 +189,17 @@
         {
           "commit": "8876d77dd27ef9afea41193fae85857c5c83f590",
           "summary": "bngsim: read mu::Parser literals as strtod does via host expr_compat"
+        }
+      ]
+    },
+    {
+      "topic": "bngsim/carry-zero-order-rate-refresh",
+      "kind": "local",
+      "status": "Keep a zero-order rule's rate parameter name when NFinput folds the rule's volume conversion into its base rate, and reapply the conversion in resetBaseRateFromSystemParamter(). NFinput re-set the rate with an empty name, so a setParameter() after load (bngsim's post-init set_param) skipped the rule and it kept producing at its old rate, silently. See bngsim GH #854.",
+      "commits": [
+        {
+          "commit": "07d5fff2da2cd9a89431794f408bd8e10923f8df",
+          "summary": "bngsim: keep a zero-order rule's rate parameter through its volume conversion"
         }
       ]
     }

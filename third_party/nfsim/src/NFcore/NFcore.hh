@@ -1308,6 +1308,7 @@ namespace NFcore
 			string getName() const { return name; };
 			int getFireCounter() const { return fireCounter; };
 			double getBaseRate() const { return baseRate; };
+			string getBaseRateParameterName() const { return baseRateParameterName; };
 			int getRxnType() const { return reactionType; };
 
 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
