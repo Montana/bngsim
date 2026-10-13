@@ -10,6 +10,11 @@ This doc is BNGsim-specific. The tree under `bngsim/third_party/nfsim` is
 generated source. If a change needs to survive the next vendor refresh, land
 it in the NFsim checkout first and then re-run `vendor_nfsim.py`.
 
+Paths written `bngsim/...` here, as in the scripts' messages and `VENDOR.json`,
+name the bngsim checkout, whatever its directory is called: a worktree such as
+`bngsim-wt/<topic>` works the same. Every `scripts/vendor_*.py` finds the
+checkout from its own location, so run it by any path to it (GH #864).
+
 ## Current Baseline
 
 - `bngsim/third_party/nfsim/VENDOR.json` currently records source ref
@@ -140,25 +145,25 @@ under `bngsim/scripts/nfsim_vendor_patches/`, and re-run `vendor_nfsim.py`.
 Fresh clone from the canonical upstream remote:
 
 ```sh
-REPO_ROOT=/path/to/repo   # the checkout root that contains bngsim/
+BNGSIM_ROOT=/path/to/bngsim   # this checkout, whatever its directory is called
 git clone https://github.com/RuleWorld/nfsim.git /tmp/nfsim-vendor-candidate
 git -C /tmp/nfsim-vendor-candidate fetch origin --prune
 git -C /tmp/nfsim-vendor-candidate checkout -B bngsim/vendor origin/master
 git -C /tmp/nfsim-vendor-candidate am \
-  "$REPO_ROOT"/bngsim/scripts/nfsim_vendor_patches/*.patch
+  "$BNGSIM_ROOT"/scripts/nfsim_vendor_patches/*.patch
 git -C /tmp/nfsim-vendor-candidate status --short --branch
 ```
 
 Optional bootstrap from a local cache checkout:
 
 ```sh
-REPO_ROOT=/path/to/repo   # the checkout root that contains bngsim/
+BNGSIM_ROOT=/path/to/bngsim   # this checkout, whatever its directory is called
 git clone /path/to/nfsim-cache /tmp/nfsim-vendor-candidate
 git -C /tmp/nfsim-vendor-candidate remote set-url origin https://github.com/RuleWorld/nfsim.git
 git -C /tmp/nfsim-vendor-candidate fetch origin --prune
 git -C /tmp/nfsim-vendor-candidate checkout -B bngsim/vendor origin/master
 git -C /tmp/nfsim-vendor-candidate am \
-  "$REPO_ROOT"/bngsim/scripts/nfsim_vendor_patches/*.patch
+  "$BNGSIM_ROOT"/scripts/nfsim_vendor_patches/*.patch
 git -C /tmp/nfsim-vendor-candidate status --short --branch
 ```
 
@@ -178,11 +183,11 @@ the baseline note above), check out the `base_commit` recorded in
 from the merge base with `origin/master`, so it verifies either way:
 
 ```sh
-REPO_ROOT=/path/to/repo   # the checkout root that contains bngsim/
+BNGSIM_ROOT=/path/to/bngsim   # this checkout, whatever its directory is called
 git -C /tmp/nfsim-vendor-candidate fetch origin --prune
 git -C /tmp/nfsim-vendor-candidate checkout -B bngsim/vendor origin/master
 git -C /tmp/nfsim-vendor-candidate am \
-  "$REPO_ROOT"/bngsim/scripts/nfsim_vendor_patches/*.patch
+  "$BNGSIM_ROOT"/scripts/nfsim_vendor_patches/*.patch
 ```
 
 Expected carry order:
@@ -208,7 +213,8 @@ afterward.
 
 ### 2. Preview Before Writing
 
-From the repo root:
+From the directory above the checkout (or drop the `bngsim/` prefix and run
+from inside it):
 
 ```sh
 python3 bngsim/scripts/vendor_nfsim.py \
@@ -283,10 +289,10 @@ The restart bundle lives in `bngsim/dev/notes/`:
 After any intentional change to `bngsim/vendor`, regenerate the patch export:
 
 ```sh
-REPO_ROOT=/path/to/repo   # the checkout root that contains bngsim/
-rm -f "$REPO_ROOT"/bngsim/scripts/nfsim_vendor_patches/*.patch
+BNGSIM_ROOT=/path/to/bngsim   # this checkout, whatever its directory is called
+rm -f "$BNGSIM_ROOT"/scripts/nfsim_vendor_patches/*.patch
 git -C /tmp/nfsim-vendor-candidate format-patch \
-  -o "$REPO_ROOT"/bngsim/scripts/nfsim_vendor_patches \
+  -o "$BNGSIM_ROOT"/scripts/nfsim_vendor_patches \
   origin/master..bngsim/vendor
 ```
 

@@ -20,8 +20,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BNGSIM_ROOT = REPO_ROOT / "bngsim"
+# The bngsim checkout itself: scripts/ sits directly under it. Derive it from
+# this file, not as <parent>/bngsim, which names a missing directory in a
+# checkout called anything else and the other checkout in a clone beside one
+# (GH #864).
+BNGSIM_ROOT = Path(__file__).resolve().parents[1]
 VENDOR_DIR = BNGSIM_ROOT / "third_party" / "rulemonkey"
 METADATA_NAME = "VENDOR.json"
 DEFAULT_RULEMONKEY_REPO = Path("/tmp/rulemonkey-vendor-candidate")
@@ -80,6 +83,15 @@ EXPRTK_SYNC_FILES = {
     ),
     "third_party/bngsim_expr/src/expression.cpp": BNGSIM_ROOT / "src" / "expression.cpp",
 }
+
+
+def display_path(path: Path) -> str:
+    """``path`` as ``bngsim/<path under the checkout>``, whatever the checkout's name.
+
+    The form messages and VENDOR.json use, so the recorded metadata does not
+    depend on where the checkout lives (GH #864).
+    """
+    return f"bngsim/{path.relative_to(BNGSIM_ROOT).as_posix()}"
 
 
 def run(cmd: list[str], cwd: Path | None = None, text: bool = True) -> subprocess.CompletedProcess:
@@ -220,7 +232,7 @@ def exprtk_sync_drift(rulemonkey_repo: Path) -> list[str]:
         if not bngsim_path.exists():
             raise RuntimeError(f"Missing BNGsim ExprTk sync file: {bngsim_path}")
         if rulemonkey_path.read_bytes() != bngsim_path.read_bytes():
-            drift.append(f"{rulemonkey_rel} != {bngsim_path.relative_to(REPO_ROOT)}")
+            drift.append(f"{rulemonkey_rel} != {display_path(bngsim_path)}")
     return drift
 
 
@@ -417,15 +429,15 @@ def export_rulemonkey_tree(rulemonkey_repo: Path, commit: str, destination: Path
 def ensure_clean_destination(force: bool) -> None:
     if force:
         return
-    # Query git from BNGSIM_ROOT, not REPO_ROOT: REPO_ROOT is the *parent* of
-    # the bngsim checkout, which is not itself a work tree in a standalone
-    # clone — `git -C <parent> status` then exits 128 and this guard aborts the
-    # whole refresh instead of checking anything.
+    # Query git from BNGSIM_ROOT, the checkout itself, never its parent: the
+    # parent is not a work tree in a standalone clone — `git -C <parent>
+    # status` then exits 128 and this guard aborts the whole refresh instead
+    # of checking anything.
     rel_vendor = VENDOR_DIR.relative_to(BNGSIM_ROOT)
     status = run(["git", "status", "--porcelain", "--", str(rel_vendor)], cwd=BNGSIM_ROOT).stdout
     if status.strip():
         raise RuntimeError(
-            f"{VENDOR_DIR.relative_to(REPO_ROOT)} has uncommitted changes. "
+            f"{display_path(VENDOR_DIR)} has uncommitted changes. "
             "Commit/stash them or rerun with --force."
         )
 
@@ -480,7 +492,7 @@ def metadata(rulemonkey_repo: Path, ref: str, commit: str, checkout_info: dict[s
             "rulemonkey_vendor_note": str(RULEMONKEY_EXPRTK_VENDOR_NOTE),
             "pinned_bngsim_commit": checkout_info["exprtk_pin"],
             "verified_against_bngsim_paths": [
-                str(p.relative_to(REPO_ROOT)) for p in EXPRTK_SYNC_FILES.values()
+                str(display_path(p)) for p in EXPRTK_SYNC_FILES.values()
             ],
         },
         "normalizations": [
@@ -631,7 +643,7 @@ def print_summary(
         print(f"Current vendored source: {current_label} @ {current_commit}")
 
     print()
-    print(f"Tree delta vs {VENDOR_DIR.relative_to(REPO_ROOT)}:")
+    print(f"Tree delta vs {display_path(VENDOR_DIR)}:")
     counts = difference_counts(differences)
     print(f"  total differences: {len(differences)}")
     print(f"  changed: {counts.get('changed', 0)}")
@@ -753,7 +765,7 @@ def main() -> int:
         if args.check:
             if differences:
                 print(
-                    f"{VENDOR_DIR.relative_to(REPO_ROOT)} differs from "
+                    f"{display_path(VENDOR_DIR)} differs from "
                     f"{resolved_ref}{resolution_note} @ {commit}:"
                 )
                 for diff in differences[:80]:
@@ -761,18 +773,14 @@ def main() -> int:
                 if len(differences) > 80:
                     print(f"  ... {len(differences) - 80} more")
                 return 1
-            print(
-                f"{VENDOR_DIR.relative_to(REPO_ROOT)} matches "
-                f"{resolved_ref}{resolution_note} @ {commit}"
-            )
+            print(f"{display_path(VENDOR_DIR)} matches {resolved_ref}{resolution_note} @ {commit}")
             return 0
 
         ensure_clean_destination(args.force)
         copy_tree(source, VENDOR_DIR)
         write_metadata(rulemonkey_repo, resolved_ref, commit, checkout_info)
         print(
-            f"Refreshed {VENDOR_DIR.relative_to(REPO_ROOT)} from "
-            f"{resolved_ref}{resolution_note} @ {commit}"
+            f"Refreshed {display_path(VENDOR_DIR)} from {resolved_ref}{resolution_note} @ {commit}"
         )
     return 0
 

@@ -1,10 +1,10 @@
 """A vendor script's clean-destination guard must run git inside a work tree.
 
-`scripts/vendor_*.py` all derive their paths from
+`scripts/vendor_*.py` once derived their paths from
 ``REPO_ROOT = Path(__file__).resolve().parents[2]`` — the directory that
-*contains* the bngsim checkout. That is the Git repo root in the monorepo layout
-these scripts were written for, but in a standalone bngsim clone it is the
-directory *above* the repo and is not a work tree at all.
+*contains* the bngsim checkout — and took the checkout to be
+``REPO_ROOT / "bngsim"``. That is the monorepo layout these scripts were written
+for. In a standalone clone the parent is not a work tree at all.
 
 `vendor_nfsim.py:ensure_clean_destination` ran ``git status`` with
 ``cwd=REPO_ROOT``, so in a standalone checkout the documented step-3 refresh died
@@ -18,9 +18,11 @@ the only way past it was ``--force``, which *skips* the check outright. So the
 failure mode was not a broken guard but a disabled one — the refresh still ran,
 with nothing standing between it and a dirty destination.
 
-`vendor_rulemonkey.py` had already been fixed the same way (query git from
-``BNGSIM_ROOT``), which is what made this a one-of-N-sites drift rather than a
-plain bug. These tests pin the invariant for the whole family.
+Running git from ``BNGSIM_ROOT`` fixed that, but ``BNGSIM_ROOT`` was still
+``<parent>/bngsim``: a missing directory in a checkout named anything else (a
+worktree such as ``bngsim-wt/<topic>``), and the *other* checkout in a clone
+beside one (GH #864). Every script now takes the checkout from its own location,
+``parents[1]``. These tests pin both invariants for the whole family.
 """
 
 from __future__ import annotations
@@ -154,13 +156,8 @@ class TestGuardRunsGitInsideAWorkTree:
         mod.ensure_clean_destination(force=True)
 
 
-class TestNoVendorScriptRunsGitFromRepoRoot:
-    """The family-wide invariant, so this cannot drift back in one script.
-
-    `REPO_ROOT` stays legitimate for building paths and for the display form
-    ``bngsim/third_party/...`` in messages. It is only ever wrong as a *git
-    working directory*, which is precisely what this pins.
-    """
+class TestNoVendorScriptRunsGitOutsideTheCheckout:
+    """The family-wide invariant, so this cannot drift back in one script."""
 
     def test_guard_scripts_do_not_use_repo_root_as_a_git_cwd(self) -> None:
         scripts = _vendor_scripts_with_the_guard()
@@ -183,11 +180,62 @@ class TestNoVendorScriptRunsGitFromRepoRoot:
             )
 
 
+# ─── GH #864: the checkout is wherever scripts/ is, whatever it is called ────
+
+
+def _vendor_scripts() -> list[Path]:
+    scripts = sorted(SCRIPTS_DIR.glob("vendor_*.py"))
+    assert scripts, "no scripts/vendor_*.py in this checkout"
+    return scripts
+
+
+@pytest.mark.parametrize("script", _vendor_scripts(), ids=lambda p: p.stem)
+def test_bngsim_root_is_this_checkout(script: Path) -> None:
+    mod = _load(script, f"_{script.stem}_root_under_test")
+    assert mod.BNGSIM_ROOT == REPO_ROOT
+    assert mod.VENDOR_DIR.parent == REPO_ROOT / "third_party"
+    assert mod.VENDOR_DIR.is_dir()
+
+
+@pytest.mark.parametrize("script", _vendor_scripts(), ids=lambda p: p.stem)
+def test_bngsim_root_does_not_depend_on_the_checkout_name(script: Path, tmp_path: Path) -> None:
+    # A worktree named bngsim-wt/<topic>, with a clone called bngsim beside it:
+    # <parent>/bngsim is the wrong checkout, and the path arithmetic this
+    # replaces picked it. The suite's own checkout is usually named bngsim, so
+    # only a copy run from elsewhere can show the difference.
+    other = tmp_path / "bngsim"
+    (other / "third_party").mkdir(parents=True)
+    checkout = tmp_path / "bngsim-wt-864"
+    (checkout / "scripts").mkdir(parents=True)
+    copy = checkout / "scripts" / script.name
+    copy.write_bytes(script.read_bytes())
+
+    mod = _load(copy, f"_{script.stem}_renamed_under_test")
+    assert checkout.resolve() == mod.BNGSIM_ROOT
+    assert mod.VENDOR_DIR.is_relative_to(checkout.resolve())
+
+
+@pytest.mark.parametrize("script", _vendor_scripts(), ids=lambda p: p.stem)
+def test_no_vendor_script_names_the_checkout(script: Path) -> None:
+    source = script.read_text(encoding="utf-8")
+    assert "parents[2]" not in source, f"{script.name} reaches above the checkout"
+    assert 'ROOT / "bngsim"' not in source, f"{script.name} names the checkout as <parent>/bngsim"
+
+
+@pytest.mark.parametrize("name", ["vendor_nfsim", "vendor_rulemonkey"])
+def test_display_paths_keep_the_bngsim_prefix(name: str) -> None:
+    # Messages and VENDOR.json record paths as bngsim/<path in the checkout>
+    # (rulemonkey's exprtk_sync.verified_against_bngsim_paths among them), so the
+    # metadata a refresh writes does not change with the checkout's name.
+    mod = _load(SCRIPTS_DIR / f"{name}.py", f"_{name}_display_under_test")
+    assert mod.display_path(mod.VENDOR_DIR) == f"bngsim/third_party/{mod.VENDOR_DIR.name}"
+
+
 def test_vendor_dir_is_unchanged_by_the_bngsim_root_refactor() -> None:
-    # BNGSIM_ROOT was introduced between REPO_ROOT and the vendored paths. The
-    # paths themselves must land exactly where they did before.
+    # The vendored paths land exactly where they did when the checkout was
+    # reached as <parent>/bngsim, in a checkout that is named bngsim.
     mod = _vendor_nfsim()
-    assert mod.VENDOR_DIR == mod.REPO_ROOT / "bngsim" / "third_party" / "nfsim"
-    assert mod.PATCHES_DIR == mod.REPO_ROOT / "bngsim" / "scripts" / "nfsim_vendor_patches"
+    assert mod.VENDOR_DIR == mod.BNGSIM_ROOT / "third_party" / "nfsim"
+    assert mod.PATCHES_DIR == mod.BNGSIM_ROOT / "scripts" / "nfsim_vendor_patches"
     assert mod.VENDOR_DIR.is_dir()
     assert mod.PATCHES_DIR.is_dir()
