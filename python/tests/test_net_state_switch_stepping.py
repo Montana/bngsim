@@ -656,6 +656,7 @@ def test_a_residual_on_an_unstable_surface_steps_on(data_dir, tmp_path, spelling
     result = bngsim.Simulator(model).run(**window)
     assert result.solver_stats["n_steps"] < 5_000
     unrooted = _write(tmp_path, text, "ql_unrooted.net")
+    assert unrooted.state_switch_root_conditions()
     unrooted._state_switch_root_conditions = ()
     reference = bngsim.Simulator(unrooted).run(**window)
     got = np.asarray(result.species)

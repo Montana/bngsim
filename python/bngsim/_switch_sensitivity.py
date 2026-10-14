@@ -416,6 +416,42 @@ def _unit_rate_clock_indices(core) -> frozenset[int]:
     no counter can be dismissed without building a context that runs to tens of
     thousands of entries on a large model.
     """
+    candidates = unit_rate_clock_candidates(core)
+    if not candidates:
+        return frozenset()
+    return _structurally_unit_rate(core, set(candidates))
+
+
+def clock_probe_can_matter(core) -> bool:
+    """Whether :func:`time_discontinuity_conditions` can depend on which species
+    are clocks: whether any function or derived-parameter text spells a
+    condition, a step, a comparison or a bend. Where none does, the scan returns
+    ``()`` from its texts alone and never probes, so neither does the key that
+    keeps it current (issue #726), which would otherwise evaluate the RHS where
+    the model never asked for it, and a law that is out of its domain at the
+    initial state would warn for a probe."""
+    from bngsim._jacobian import has_condition_construct
+
+    if core.n_functions == 0:
+        return False
+    return any(
+        has_condition_construct(t)
+        or _STEP_CALL.search(t)
+        or _RELATIONAL.search(t)
+        or _BEND_CALL.search(t)
+        for t in (*core.function_expressions, *core.param_expressions)
+    )
+
+
+def unit_rate_clock_candidates(core) -> frozenset[int]:
+    """The species indices at ``dc/dt = 1`` on both of two RHS probes.
+
+    The half of :func:`_unit_rate_clock_indices` that parameter values decide:
+    what follows it reads only structure. A counter fed at ``k_t`` passes at
+    ``k_t = 1`` and not at 0 or 0.5, so whatever is derived from which species
+    are clocks is derived again when this moves (issue #726). It costs two RHS
+    evaluations, where the structural half reads the whole model.
+    """
     n_species = core.n_species
     if n_species == 0:
         return frozenset()
@@ -438,10 +474,7 @@ def _unit_rate_clock_indices(core) -> frozenset[int]:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("switch-time: second RHS probe failed: %s", exc)
         return frozenset()
-    clock_idx = {i for i in clock_idx if deriv2[i] == _CLOCK_SLOPE}
-    if not clock_idx:
-        return frozenset()
-    return _structurally_unit_rate(core, clock_idx)
+    return frozenset(i for i in clock_idx if deriv2[i] == _CLOCK_SLOPE)
 
 
 # The clock, read by a rate law that is therefore not constant. rateOf accessors

@@ -115,7 +115,10 @@ class Model:
         "_time_disc_conditions",
         "_event_disc_conditions",
         "_derived_time_disc_conditions",
+        "_derived_time_disc_clocks",
+        "_clock_probe_can_matter",
         "_state_switch_root_conditions",
+        "_state_switch_root_covered",
         "_ssa_reads_clock",
         "_table_breaks",
         "_ssa_clock_functions",
@@ -291,10 +294,18 @@ class Model:
         # None means "not looked yet"; a tuple (often empty) means the scan has
         # run. See time_discontinuity_conditions().
         self._derived_time_disc_conditions: tuple[str, ...] | None = None
+        # Issue #726: which species passed the clock probes when it was derived.
+        # A counter is a clock by its rate's value, so the scan is done again
+        # when that moves.
+        self._derived_time_disc_clocks: frozenset[int] | None = None
+        # Whether the scan can read a clock at all, from the texts: structural.
+        self._clock_probe_can_matter: bool | None = None
         # Issue #897: the rate-law conditions over model state that a run without
         # sensitivities roots on, derived on first ask and cached like the line
         # above. See state_switch_root_conditions().
         self._state_switch_root_conditions: tuple[str, ...] | None = None
+        # ...and the time conditions it left out as covered (issue #726).
+        self._state_switch_root_covered: tuple[str, ...] | None = None
         # Issue #719: whether an SSA run needs breakpoints; structural, so once.
         self._ssa_reads_clock: bool | None = None
         # Issue #709: where the model's tables break, with how many tables it
@@ -864,8 +875,15 @@ class Model:
         re-deriving one is what keeps the stops a subset of the roots. A
         ``.net``/BNGL model is built entirely in C++, so its loader has no seam
         to register a root at and there is nothing to read back; the conditions
-        are recovered from the built model's own function bodies instead, once,
-        and cached, and only when something asks.
+        are recovered from the built model's own function bodies instead, and
+        only when something asks.
+
+        The recovery is cached, keyed by which species pass the unit-rate clock
+        probes at the model's current values (issue #726). A BNGL counter fed at ``k_t``
+        is a clock at ``k_t = 1`` and not otherwise, so its thresholds are time
+        conditions at one value and not at another. Cached once, a model first
+        run at ``k_t = 0`` and then at 1 got no stop at a clock-gated window,
+        and one first run at 1 and then at 0.5 got neither a stop nor a root.
 
         A recovered entry is not always a condition. Since issue #869 it can
         also be a bare step call of a clock, such as ``floor((time()-t0)/P)``,
@@ -879,7 +897,15 @@ class Model:
         an SBML model had no entry at all, and was stepped over where the same
         pulse alone was not.
         """
-        if self._derived_time_disc_conditions is None:
+        from bngsim._switch_sensitivity import clock_probe_can_matter, unit_rate_clock_candidates
+
+        if self._clock_probe_can_matter is None:
+            self._clock_probe_can_matter = clock_probe_can_matter(self._core)
+        clocks = (
+            unit_rate_clock_candidates(self._core) if self._clock_probe_can_matter else frozenset()
+        )
+        if self._derived_time_disc_conditions is None or self._derived_time_disc_clocks != clocks:
+            self._derived_time_disc_clocks = clocks
             try:
                 from bngsim._switch_sensitivity import (
                     _strip_redundant_parens,
@@ -916,15 +942,23 @@ class Model:
 
         The crossings :meth:`time_discontinuity_conditions` already covers are
         left out, and so is every condition in a function that no rate law
-        reads. The answer depends on the model's structure alone, so it is
-        derived once and cached, and a clone inherits it.
+        reads. Past those, the answer depends on the model's structure alone,
+        so it is cached for the covered set it was derived beside, and a clone
+        inherits it. The covered set moves with a clock's rate (issue #726): a
+        threshold on a counter is covered while the counter is a clock and has
+        to be rooted once it is not.
         """
-        if self._state_switch_root_conditions is None:
+        covered = self.time_discontinuity_conditions()
+        if (
+            self._state_switch_root_conditions is None
+            or self._state_switch_root_covered != covered
+        ):
+            self._state_switch_root_covered = covered
             try:
                 from bngsim._switch_sensitivity import state_switch_root_conditions
 
                 self._state_switch_root_conditions = state_switch_root_conditions(
-                    self._core, covered=self.time_discontinuity_conditions()
+                    self._core, covered=covered
                 )
             except Exception as e:  # pragma: no cover - defensive
                 # Detection is best-effort: without it a model keeps the stepping
@@ -1137,7 +1171,10 @@ class Model:
         m._time_disc_conditions = self._time_disc_conditions
         m._event_disc_conditions = self._event_disc_conditions
         m._derived_time_disc_conditions = self._derived_time_disc_conditions
+        m._derived_time_disc_clocks = self._derived_time_disc_clocks
+        m._clock_probe_can_matter = self._clock_probe_can_matter
         m._state_switch_root_conditions = self._state_switch_root_conditions
+        m._state_switch_root_covered = self._state_switch_root_covered
         m._ssa_reads_clock = self._ssa_reads_clock
         m._table_breaks = self._table_breaks
         m._ssa_clock_functions = self._ssa_clock_functions
