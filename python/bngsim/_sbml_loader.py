@@ -361,11 +361,16 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
 
     SBML defines no rate of change for such a variable (L3V2 §3.4.6, validation
     rule 10224). Unchecked, the initial-value fold took it for a constant and
-    gave the rate as 0, a value the model does not have, while a rule, kinetic
-    law or event emitted a ``rate_of__x`` accessor that nothing binds, which
-    ExprTk refused without naming anything in the model. One check before
-    either path runs covers both, for the csymbol and for a call to COPASI's
-    rateOf functionDefinition idiom alike.
+    gave the rate as 0, a value the model does not have. A rule, kinetic law or
+    event emitted a ``rate_of__x`` accessor: for a parameter nothing binds it,
+    and ExprTk refused it without naming anything in the model; for a species
+    the builder binds it, and the model ran with the rate as 0. One check
+    before either path runs covers both, for the csymbol and for a call to
+    COPASI's rateOf functionDefinition idiom alike.
+
+    Only the math the model itself holds is walked. A rateOf inside a
+    functionDefinition body takes the body's argument, which libsbml already
+    rejects there (rule 20304), and is not checked.
 
     A kinetic law's own local parameter shadows a global of its id, so
     ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
@@ -421,10 +426,11 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         "Model reads the rate of change of a variable that an assignmentRule sets:\n"
         f"{bullets}\n"
         "SBML (L3V2 §3.4.6, validation rule 10224) defines no rate of change for "
-        "an assignmentRule variable, so the model has no value there; libsbml and "
-        "RoadRunner refuse it too (earlier bngsim releases took it for 0 in an "
-        "initial value). Make the variable a rateRule target, or write its rate "
-        "from the rule's own inputs."
+        "an assignmentRule variable, so the model has no value there. libsbml's "
+        "consistency check reports it and RoadRunner refuses it (earlier bngsim "
+        "releases took the rate for 0 in an initial value, and for a species in "
+        "a rule). Make the variable a rateRule target, or write its rate from "
+        "the rule's own inputs."
     )
 
 
@@ -1965,8 +1971,10 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         sp = species_by_id.get(name)
         if sp is None:
             # A parameter / compartment with no rate rule is constant ⇒ 0. One
-            # an assignmentRule sets is not, and never gets here: the load
-            # refuses its rateOf first (_check_rateof_targets, issue #1046).
+            # an assignmentRule sets is not; the load refuses a rateOf of it
+            # first (_check_rateof_targets, issue #1046). A rateOf inside a
+            # functionDefinition body still reaches here with the body's
+            # argument name, and folds to 0 (invalid SBML, rule 20304).
             return 0.0
         # 2) species — boundary or constant species is held by reactions ⇒ 0.
         if sp.getBoundaryCondition() or sp.getConstant():
@@ -8817,8 +8825,9 @@ def _build_model_from_sbml_doc(doc):
     # it was (0.172 off). And it does not read `B`'s value, so the csymbol's
     # argument is not a name read unless the expression names it elsewhere:
     # `p2 = rateOf(p1)` of a `p1` nothing changes is 0 whatever `p1` is, and
-    # used to freeze `p1` (issue #1048). A call to COPASI's rateOf idiom is
-    # left reading its argument too.
+    # used to freeze `p1` (issue #1048). A call to COPASI's rateOf idiom still
+    # counts its argument as read, as it did: that over-freezes it (a refusal,
+    # never a wrong value), and is kept deliberately for now.
     def _names_read(_m) -> set[str]:
         if not _uses_rateof:
             return _ast_name_set(_m)
@@ -8913,9 +8922,9 @@ def _build_model_from_sbml_doc(doc):
     # (#313) the residue of the lift: a parameter initialAssignment §0 folded
     # that §2 could not put back on its symbols. It is also named in a warning
     # once the model is built, from exactly what this freezes, so the warning
-    # and the refusal cannot disagree (issue #1048: the warning read the
-    # expression's names alone, and both named `p1` for `p2 = rateOf(p1)` and
-    # missed `k1` for `p2 = rateOf(B)` under `J0: A -> B; k1*A`).
+    # and the refusal cannot disagree. (Issue #1048: the warning was computed in
+    # §2 from the expression's own names, so it said nothing of `k1` for
+    # `p2 = rateOf(B)` under `J0: A -> B; k1*A`, which this refuses.)
     _frozen_upstream: set[str] = set()
     for _pid, _m in _ia_math.items():
         if _pid in _lift_expr or _pid in comp_param_idx or _pid not in _param_decl_index:

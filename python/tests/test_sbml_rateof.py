@@ -905,11 +905,14 @@ def test_rateof_of_an_assignment_rule_variable_is_refused_by_name(where, idiom):
     assert "rate_of__" not in msg
 
 
-def test_rateof_of_a_species_an_assignment_rule_sets_is_refused():
+@pytest.mark.parametrize("where", ["initialAssignment:p2", "rateRule:p2"])
+def test_rateof_of_a_species_an_assignment_rule_sets_is_refused(where):
     """A species is no different: ``Y := 3*S`` has no rate of its own in SBML,
-    though S has one. It used to fold to 0."""
-    with pytest.raises(bngsim.ModelError, match=re.escape("rateOf(Y) [initialAssignment:p2]: Y")):
-        bngsim.Model.from_sbml_string(_sbml(_rateof_q_model("initialAssignment:p2", of="Y")))
+    though S has one. Not refused, it was 0 in both places: folded so in the
+    initialAssignment, and read so by the rate rule, whose accessor the
+    builder binds for a species (p2 stayed 0 where d(3*S)/dt is -15 at t=0)."""
+    with pytest.raises(bngsim.ModelError, match=re.escape(f"rateOf(Y) [{where}]: Y")):
+        bngsim.Model.from_sbml_string(_sbml(_rateof_q_model(where, of="Y")))
 
 
 def test_rateof_of_a_kinetic_law_local_shadowing_an_assignment_rule_variable_loads():
