@@ -751,18 +751,27 @@ def test_rateof_of_a_parameter_in_a_species_initial_value():
     np.testing.assert_allclose(_series(res, "S"), 3.0)
 
 
+def _frozen_warning(caplog) -> str | None:
+    """The parameter list the #313 load warning names, or None if it was not
+    given."""
+    msgs = [r.getMessage() for r in caplog.records if "could not keep symbolic" in r.getMessage()]
+    assert len(msgs) <= 1
+    if not msgs:
+        return None
+    # The named list, not a substring of the message ("k" is in "keep").
+    named = re.search(r"parameter\(s\) (.+?)\. ", msgs[0])
+    assert named
+    return named.group(1)
+
+
 def test_a_folded_rateof_initial_assignment_still_says_what_it_froze(caplog):
     """Not lifted, the assignment keeps its folded value, and the #313 warning
-    names what a write to will no longer move it."""
+    names what a write to will no longer move it: ``k``, and not ``p1``, whose
+    rate is 0 whatever its value (issue #1048)."""
     with caplog.at_level("WARNING", logger="bngsim"):
-        bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", "true", "<ci>k</ci>")))
-    frozen = [
-        r.getMessage() for r in caplog.records if "could not keep symbolic" in r.getMessage()
-    ]
-    assert len(frozen) == 1
-    # The named list, not a substring of the message ("k" is in "keep").
-    named = re.search(r"parameter\(s\) (.+?)\. ", frozen[0])
-    assert named and named.group(1) == "k, p1"
+        model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", "true", "<ci>k</ci>")))
+    assert _frozen_warning(caplog) == "k"
+    assert model.frozen_params == ["k"]
 
 
 # ─── Issue #1046: rateOf of an assignmentRule variable ───────────────────────
@@ -913,6 +922,58 @@ def test_rateof_of_a_kinetic_law_local_shadowing_an_assignment_rule_variable_loa
     np.testing.assert_allclose(
         _series(res, "S"), 2 + 8 * np.exp(-0.5 * np.asarray(res.time)), rtol=1e-6
     )
+
+
+# ─── Issue #1048: what a folded rateOf initial value read ─────────────────────
+#
+# ``rateOf(x)`` does not read x's value. A folded initial value that reads it
+# froze x all the same (``set_param`` and the sensitivity request refused it),
+# and the #313 warning, which read the expression's names alone, named x and
+# missed what the rate is made of. Both now come from one closure: the rate's
+# kinetic laws, stoichiometries, compartment or rate rule, and whatever else the
+# expression names, x included if it is read outside the rateOf.
+
+_RATE_OF_B = "compartment d = 1; species A in d, B in d; A = 2; B = 0; k1 = 1; p2 = rateOf(B);\n"
+
+
+@pytest.mark.parametrize("p1_constant", ["true", "false"], ids=["01248", "01249"])
+def test_rateof_of_a_parameter_does_not_freeze_the_parameter(p1_constant, caplog):
+    """``p2 = rateOf(p1)`` is 0 whatever ``p1`` is: a write to ``p1`` is
+    allowed, ``p2`` stays 0, and no warning names ``p1``."""
+    with caplog.at_level("WARNING", logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", p1_constant)))
+    assert model.frozen_params == []
+    assert _frozen_warning(caplog) is None
+    model.set_param("p1", 2.0)
+    assert model.get_param("p2") == 0.0
+    assert _run(model, t_end=1.0, n_points=3).species.shape[0] == 3
+
+
+@pytest.mark.parametrize(
+    ("target", "tail", "frozen"),
+    [
+        ("p2", "<ci>k</ci>", ["k"]),
+        ("p2", "<ci>p1</ci>", ["p1"]),  # read outside the rateOf too
+        ("S", "<ci>k</ci>", ["k"]),
+    ],
+    ids=["p2=rateOf(p1)+k", "p2=rateOf(p1)+p1", "S=rateOf(p1)+k"],
+)
+def test_rateof_freezes_what_else_the_initial_value_reads(target, tail, frozen):
+    model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model(target, "false", tail)))
+    assert model.frozen_params == frozen
+
+
+def test_the_warning_names_what_a_folded_rate_is_made_of(caplog):
+    """``p2 = rateOf(B)`` under ``J0: A -> B; k1*A`` is 2. ``k1`` and B's
+    compartment ``d`` were refused already, with no warning at load; the
+    warning names them now, the same list ``set_param`` refuses."""
+    with caplog.at_level("WARNING", logger="bngsim"):
+        model = bngsim.Model.from_antimony_string(_RATE_OF_B + "J0: A -> B; k1*A\n")
+    assert model.get_param("p2") == pytest.approx(2.0)
+    assert _frozen_warning(caplog) == "d, k1"
+    assert sorted(model.frozen_params) == ["d", "k1"]
+    with pytest.raises(bngsim.ParameterError, match="initial value of 'p2'"):
+        model.set_param("k1", 2.0)
 
 
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
