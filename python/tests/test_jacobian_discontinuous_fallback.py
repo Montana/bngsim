@@ -299,6 +299,34 @@ def test_the_retry_is_for_a_cvode_failure_only(
         assert core.jacobians == ["auto"]
 
 
+class _Records(_FailsFirst):
+    """Stands in for the core simulator and fails nothing: it only records."""
+
+    def __init__(self, inner) -> None:
+        super().__init__(inner, "")
+
+    def run(self, times, opts, *args):
+        self.jacobians.append(opts.jacobian)
+        return self._inner.run(times, opts, *args)
+
+
+def test_a_timeout_is_not_retried(data_dir: Path) -> None:
+    # Issue #691: SimulationTimeout is a RuntimeError, and the retry once caught
+    # it and ran again on a fresh budget, so run(timeout=T) raised after about 2T
+    # or, from the state the first attempt left, returned a Result whose t=0 row
+    # was not the initial condition. The budget is the user's, not the Jacobian's.
+    m = bngsim.Model.from_net(_net(data_dir))
+    sim = bngsim.Simulator(m, method="ode")
+    assert m._core.analytical_jacobian_complete  # the retry is open to this run
+    start = m.get_state().copy()
+    core = sim._sim = _Records(sim._sim)
+    with pytest.raises(bngsim.SimulationTimeout):
+        sim.run(t_span=(0.0, 150.0), n_points=3, timeout=1e-9)
+    assert core.jacobians == ["auto"]
+    assert sim._ode_jacobian_fell_back is False
+    assert np.array_equal(m.get_state(), start)
+
+
 class _FailsAfterAdvancing(_FailsFirst):
     """The first run integrates for real and only then raises ``message``.
 
