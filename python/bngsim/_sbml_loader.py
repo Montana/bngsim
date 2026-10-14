@@ -429,8 +429,8 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         "an assignmentRule variable, so the model has no value there. libsbml's "
         "consistency check reports it and RoadRunner refuses it (earlier bngsim "
         "releases took the rate for 0 in an initial value, and for a species in "
-        "a rule). Make the variable a rateRule target, or write its rate from "
-        "the rule's own inputs."
+        "a rule, kinetic law or event). Make the variable a rateRule target, or "
+        "write its rate from the rule's own inputs."
     )
 
 
