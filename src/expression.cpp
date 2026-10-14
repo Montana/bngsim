@@ -1252,11 +1252,23 @@ void ExprTkEvaluator::define_constant(const std::string &name, double value) {
     impl_->add_remapped_constant(name, value);
 }
 
+// symbol_table.add_function() refuses a name that is already registered, or
+// that is not a valid ExprTk symbol, and the expression that later reads the
+// name binds whatever is there. define_variable throws on the same refusal; a
+// function has to as well, or a second table under one name (issue #772) is
+// dropped while the model goes on as if it had been registered.
+static void throw_function_not_registered(const std::string &name) {
+    throw std::runtime_error("ExprTk: failed to register function '" + name +
+                             "': the name is already registered or is not a valid "
+                             "identifier.");
+}
+
 void ExprTkEvaluator::define_function(const std::string &name, Func0 fn) {
     auto adapter = std::make_unique<StdFunc0Adapter<double>>(std::move(fn));
     adapter->warner = &impl_->nonfinite_warner;
     adapter->fname = name;
-    impl_->symbol_table.add_function(name, *adapter);
+    if (!impl_->symbol_table.add_function(name, *adapter))
+        throw_function_not_registered(name);
     impl_->user_functions.push_back(std::move(adapter));
 }
 
@@ -1264,7 +1276,8 @@ void ExprTkEvaluator::define_function(const std::string &name, Func1 fn) {
     auto adapter = std::make_unique<StdFunc1Adapter<double>>(std::move(fn));
     adapter->warner = &impl_->nonfinite_warner;
     adapter->fname = name;
-    impl_->symbol_table.add_function(name, *adapter);
+    if (!impl_->symbol_table.add_function(name, *adapter))
+        throw_function_not_registered(name);
     impl_->user_functions.push_back(std::move(adapter));
 }
 
@@ -1272,7 +1285,8 @@ void ExprTkEvaluator::define_function(const std::string &name, Func2 fn) {
     auto adapter = std::make_unique<StdFunc2Adapter<double>>(std::move(fn));
     adapter->warner = &impl_->nonfinite_warner;
     adapter->fname = name;
-    impl_->symbol_table.add_function(name, *adapter);
+    if (!impl_->symbol_table.add_function(name, *adapter))
+        throw_function_not_registered(name);
     impl_->user_functions.push_back(std::move(adapter));
 }
 
@@ -1280,7 +1294,8 @@ void ExprTkEvaluator::define_function(const std::string &name, Func3 fn) {
     auto adapter = std::make_unique<StdFunc3Adapter<double>>(std::move(fn));
     adapter->warner = &impl_->nonfinite_warner;
     adapter->fname = name;
-    impl_->symbol_table.add_function(name, *adapter);
+    if (!impl_->symbol_table.add_function(name, *adapter))
+        throw_function_not_registered(name);
     impl_->user_functions.push_back(std::move(adapter));
 }
 

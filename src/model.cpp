@@ -4986,9 +4986,24 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
     impl_->has_functions = true;
 }
 
+// A second table under a name the model already has was appended beside the
+// first (issue #772): the evaluator kept the first `tfun_<name>`, so the rate
+// laws read the old data, while table_function_names listed the name twice and
+// codegen, resolving names last-wins, reported the new one. There is no
+// replacing a table in place, so the name is refused before anything changes.
+void NetworkModel::require_new_table_name_(const std::string &name) const {
+    for (const auto &tf : impl_->table_functions) {
+        if (tf->name() == name)
+            throw std::invalid_argument("table function '" + name +
+                                        "' already exists; a model holds one table per "
+                                        "name, and an existing table cannot be replaced");
+    }
+}
+
 void NetworkModel::add_table_function(const std::string &name, const std::string &filepath,
                                       const std::string &index_name, const std::string &method,
                                       const std::string &header_name) {
+    require_new_table_name_(name);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
     auto tf = std::make_unique<TableFunction>(
         TableFunction::from_file(name, filepath, index_name, interpolation, header_name));
@@ -4999,6 +5014,7 @@ void NetworkModel::add_table_function(const std::string &name, const std::string
 void NetworkModel::add_table_function(const std::string &name, const std::vector<double> &xs,
                                       const std::vector<double> &ys, const std::string &index_name,
                                       const std::string &method) {
+    require_new_table_name_(name);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
     auto tf = std::make_unique<TableFunction>(name, xs, ys, index_name, interpolation);
     register_table_function_(*tf);

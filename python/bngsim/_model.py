@@ -2559,7 +2559,10 @@ class Model:
         Raises
         ------
         ModelError
-            If the file cannot be read or data is invalid.
+            If the file cannot be read or data is invalid, or if ``name`` is
+            already the name of one of the model's table functions or functions
+            (issue #772). A table cannot replace one the model has, or stand in
+            for a function's body.
         ValueError
             If arguments are inconsistent (e.g., both ``file`` and ``times``).
 
@@ -2577,6 +2580,19 @@ class Model:
         if normalized_method not in {"linear", "step"}:
             raise ValueError(
                 "Invalid table function interpolation method. Expected 'linear' or 'step'."
+            )
+        # Issue #772. Under a name a function already has, the interpreter kept
+        # the function's body while compiled code read the table, so the same
+        # model ran two ways by codegen; under a table's name, the evaluator kept
+        # the first table and codegen reported the second. The C++ refuses a
+        # second table; a function's name is refused here, where the builder's own
+        # calls (which register a .net tfun under its function's name) cannot
+        # reach.
+        if name in self._core.function_names:
+            raise ModelError(
+                f"Failed to add table function '{name}': the model already has a "
+                f"function named '{name}', and a table cannot replace a function's "
+                "body. Add the table under a new name."
             )
         if file is not None:
             filepath = str(Path(file))

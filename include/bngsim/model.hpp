@@ -943,6 +943,9 @@ class NetworkModel {
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);
 
+    /// Throw if a table function named `name` is already registered (issue #772).
+    void require_new_table_name_(const std::string &name) const;
+
     /// Re-resolve every species IC that a parameter names, from the current
     /// parameter values (issue #79). Called at the end of set_param(), after
     /// the derived-parameter re-evaluation. See model.cpp for the rules.

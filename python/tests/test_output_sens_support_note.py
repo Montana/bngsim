@@ -222,56 +222,54 @@ RUN = dict(method="ode", sensitivity_params=["k1", "scale"])
 TABLE = dict(times=[0.0, 10.0], values=[1.0, 3.0])
 
 
-def _given_a_table_after_a_run(model, name="ratio"):
-    """*model* is run, given a table function named for one of its functions,
-    and run again: both results and both artifacts. (At the default
-    ``codegen``, where a model that has run keeps its artifact. With
-    ``codegen=True`` the code is generated again, with the table in it.)"""
+def _refused_a_table_after_a_run(model, name="ratio"):
+    """*model* is run, refused a table function named for one of its
+    functions (issue #772), and run again: both results and both artifacts.
+    (At the default ``codegen``, where a model that has run keeps its
+    artifact.)"""
     first_sim = bngsim.Simulator(model, **RUN)
     first = first_sim.run(t_span=(0.0, 8.0), n_points=5)
     model.reset()
-    model.add_table_function(name, **TABLE)
+    with pytest.raises(bngsim.ModelError, match=f"already has a function named '{name}'"):
+        model.add_table_function(name, **TABLE)
     second_sim = bngsim.Simulator(model, **RUN)
     second = second_sim.run(t_span=(0.0, 8.0), n_points=5)
     return first, second, first_sim._codegen_so_path, second_sim._codegen_so_path
 
 
 @needs_cc
-def test_a_model_given_a_table_function_is_not_told_by_the_note(isolated_cache):
-    """A table function with a function's name takes that function's place,
-    and it then has no derivative (issue #979). A model that has run
-    keeps its artifact when it is given one, so the note beside the artifact
-    is of a model with no table and lists ``ratio`` as supported. The model
-    here was handed the artifact from the cache and told its map by the
-    note; given the table, it is analyzed for itself, and the selector
-    raises as it did before there was a note. ``scaled`` is still
-    returned."""
+def test_a_model_refused_a_table_function_keeps_what_the_note_says(isolated_cache):
+    """A table function with a function's name took that function's place in
+    the compiled code, where it has no derivative (issue #979), while the
+    interpreter kept the function's body. It is refused now (issue #772). The
+    model here was handed the artifact from the cache and told its map by the
+    note; refused the table, it is the model the note is of, and ``ratio``
+    and ``scaled`` are both returned as before."""
     _sim, built = _run()
-    want = np.asarray(built.output_sensitivities(["scaled"]))
     (artifact,) = _artifacts(isolated_cache)
     assert cg.read_output_sens_support_note(artifact, FUNCTIONS)["ratio"] is None
 
-    first, second, so_first, so_second = _given_a_table_after_a_run(
+    first, second, so_first, so_second = _refused_a_table_after_a_run(
         bngsim.Model.from_net(CHAIN_NET)
     )
     assert Path(so_first) == Path(so_second) == artifact
-    assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
-    with pytest.raises(Exception, match="'ratio' has no output sensitivity"):
-        second.output_sensitivities(["ratio"])
-    np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["scaled"])), want)
+    for name in ("ratio", "scaled"):
+        want = np.asarray(built.output_sensitivities([name]))
+        np.testing.assert_array_equal(np.asarray(first.output_sensitivities([name])), want)
+        np.testing.assert_array_equal(np.asarray(second.output_sensitivities([name])), want)
 
 
 @needs_cc
-def test_the_builder_given_a_table_function_does_not_answer_from_what_it_built(isolated_cache):
+def test_the_builder_refused_a_table_function_answers_from_what_it_built(isolated_cache):
     """Control. The same for the model that built the artifact: the analysis
-    its code was emitted from is not this model's any more."""
-    first, second, so_first, so_second = _given_a_table_after_a_run(
+    its code was emitted from is still this model's."""
+    first, second, so_first, so_second = _refused_a_table_after_a_run(
         bngsim.Model.from_net(CHAIN_NET)
     )
     assert Path(so_first) == Path(so_second)
-    assert np.all(np.isfinite(np.asarray(first.output_sensitivities(["ratio"]))))
-    with pytest.raises(Exception, match="'ratio' has no output sensitivity"):
-        second.output_sensitivities(["ratio"])
+    want = np.asarray(first.output_sensitivities(["ratio"]))
+    assert np.all(np.isfinite(want))
+    np.testing.assert_array_equal(np.asarray(second.output_sensitivities(["ratio"])), want)
 
 
 @needs_cc
@@ -316,18 +314,19 @@ def _handed_a_cut_artifact_then_given_a_table_over(name):
 
 
 @needs_cc
-@pytest.mark.parametrize("over, cut", [("scaled", "ratio"), ("ratio", "tdep")])
-def test_the_models_own_reason_and_the_builds_are_put_together(isolated_cache, over, cut):
+@pytest.mark.parametrize("over", ["scaled", "ratio"])
+def test_a_table_over_a_function_of_a_cut_build_is_refused(isolated_cache, over):
     """The table is over ``scaled``, which the build has a derivative for, or
-    over ``ratio``, which it was cut before: the function is refused for the
-    table, the model's own reason coming first, and one the model has no
-    reason of its own for is refused for the budget."""
-    model = _handed_a_cut_artifact_then_given_a_table_over(over)
+    over ``ratio``, which it was cut before. It is refused (issue #772), and
+    the build's reasons stand: ``scaled`` is returned, and ``ratio`` is
+    refused for the budget."""
+    with pytest.raises(bngsim.ModelError, match=f"already has a function named '{over}'"):
+        _handed_a_cut_artifact_then_given_a_table_over(over)
+    model = bngsim.Model.from_net(CHAIN_NET)
     result = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
-    with pytest.raises(Exception, match=f"'{over}' has no output sensitivity.*table-function"):
-        result.output_sensitivities([over])
-    with pytest.raises(Exception, match=f"'{cut}' has no output sensitivity.*budget"):
-        result.output_sensitivities([cut])
+    assert np.all(np.isfinite(np.asarray(result.output_sensitivities(["scaled"]))))
+    with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):
+        result.output_sensitivities(["ratio"])
 
 
 @needs_cc
@@ -357,7 +356,7 @@ def test_a_note_is_read_by_its_builders_key(isolated_cache):
     assert cg.read_output_sens_support_note(artifact, FUNCTIONS, key) is not None
     assert cg.read_output_sens_support_note(artifact, FUNCTIONS, "another") is None
     tabled = bngsim.Model.from_net(CHAIN_NET)
-    tabled.add_table_function("ratio", **TABLE)
+    tabled.add_table_function("a_table_of_its_own", **TABLE)
     assert cg._output_sens_note_key(tabled) != key
     assert cg._output_sens_note_key(bngsim.Model.from_net(CHAIN_NET)) == key
 
