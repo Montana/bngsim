@@ -4516,37 +4516,47 @@ def _build_model_from_sbml_doc(doc):
     # (MODEL1606100000 / issue #73: a stale ``ModelValue_19`` = +322026 instead
     # of ``cin0`` = -4807974 flips the boundary species ``Osmin`` to the wrong
     # sign — bngsim disagreed with both RoadRunner and COPASI until this fix).
-    if sbml_model.getNumInitialAssignments() > 0:
-        for _pass in range(10):
-            changed = False
-            for j in range(sbml_model.getNumInitialAssignments()):
-                ia = sbml_model.getInitialAssignment(j)
-                sym = ia.getSymbol()
-                math = ia.getMath()
-                if math is None:
-                    continue
-                val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
-                if val is not None and _ia_value_changed(val, ia_values.get(sym)):
-                    eval_ctx[sym] = val
-                    ia_values[sym] = val
-                    changed = True
-            for j in range(sbml_model.getNumRules()):
-                rule = sbml_model.getRule(j)
-                if not rule.isAssignment():
-                    continue
-                var = rule.getVariable()
-                math = rule.getMath()
-                if math is None:
-                    continue
-                val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
-                if val is not None and _ia_value_changed(val, ia_values.get(var)):
-                    eval_ctx[var] = val
-                    ia_values[var] = val
-                    changed = True
-            if _refresh_reaction_ids():
+    #
+    # Run it with no initialAssignment too: the override above is one pass in
+    # document order, so a rule that reads a later rule's target (``c2 := v``
+    # before ``v := 2*p``) reads it unset or stale, and only this loop settles
+    # it. A compartment sized that way loaded with volume factor 1 and divided
+    # every reaction across compartments by 1 instead of its size (issue #994).
+    # Each pass settles at least one more link of a chain written against
+    # document order, and an acyclic chain has at most one link per rule or
+    # initialAssignment, so that many passes (plus one to see nothing move)
+    # always reach the fixed point; a model that needs fewer breaks early.
+    _settle_passes = max(10, sbml_model.getNumRules() + sbml_model.getNumInitialAssignments() + 1)
+    for _pass in range(_settle_passes):
+        changed = False
+        for j in range(sbml_model.getNumInitialAssignments()):
+            ia = sbml_model.getInitialAssignment(j)
+            sym = ia.getSymbol()
+            math = ia.getMath()
+            if math is None:
+                continue
+            val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
+            if val is not None and _ia_value_changed(val, ia_values.get(sym)):
+                eval_ctx[sym] = val
+                ia_values[sym] = val
                 changed = True
-            if not changed:
-                break
+        for j in range(sbml_model.getNumRules()):
+            rule = sbml_model.getRule(j)
+            if not rule.isAssignment():
+                continue
+            var = rule.getVariable()
+            math = rule.getMath()
+            if math is None:
+                continue
+            val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
+            if val is not None and _ia_value_changed(val, ia_values.get(var)):
+                eval_ctx[var] = val
+                ia_values[var] = val
+                changed = True
+        if _refresh_reaction_ids():
+            changed = True
+        if not changed:
+            break
 
     # ── C2: reject missing-value parameters that are actually consumed (internal#94) ──
     # SBML allows <parameter id="X"/> with no `value=` attribute. Defaulting it
