@@ -356,6 +356,78 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     return False
 
 
+def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
+    """Refuse ``rateOf(x)`` of a variable an assignmentRule sets (issue #1046).
+
+    SBML defines no rate of change for such a variable (L3V2 §3.4.6, validation
+    rule 10224). Unchecked, the initial-value fold took it for a constant and
+    gave the rate as 0, a value the model does not have, while a rule, kinetic
+    law or event emitted a ``rate_of__x`` accessor that nothing binds, which
+    ExprTk refused without naming anything in the model. One check before
+    either path runs covers both, for the csymbol and for a call to COPASI's
+    rateOf functionDefinition idiom alike.
+
+    A kinetic law's own local parameter shadows a global of its id, so
+    ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
+    and is allowed; libsbml reports 10224 for it regardless of scope.
+    """
+    ar_rules = {}
+    for i in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(i)
+        if rule.isAssignment():
+            ar_rules[rule.getVariable()] = rule
+    if not ar_rules:
+        return
+    idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
+    law_locals = {}
+    for i in range(sbml_model.getNumReactions()):
+        rxn = sbml_model.getReaction(i)
+        kl = rxn.getKineticLaw()
+        if kl is not None:
+            law_locals[f"reaction:{rxn.getId()}"] = {
+                lp.getId() for lp in _kinetic_law_local_params(kl)
+            }
+
+    offenders: dict[tuple[str, str], None] = {}  # (variable, location), in model order
+    for math, where in _iter_model_math(sbml_model):
+        shadowed = law_locals.get(where, ())
+        for n in _iter_ast_subtree(math):
+            t = n.getType()
+            if not (
+                t == libsbml.AST_FUNCTION_RATE_OF
+                or (t == libsbml.AST_FUNCTION and n.getName() in idiom_names)
+            ):
+                continue
+            arg = n.getChild(0) if n.getNumChildren() >= 1 else None
+            if arg is None or arg.getType() != libsbml.AST_NAME:
+                continue
+            name = arg.getName()
+            if name in ar_rules and name not in shadowed:
+                offenders[(name, where)] = None
+    if not offenders:
+        return
+
+    from bngsim._exceptions import ModelError
+
+    def _rule_text(name: str) -> str:
+        m = ar_rules[name].getMath()
+        return f"{name} := {libsbml.formulaToL3String(m)}" if m is not None else name
+
+    bullets = "\n".join(
+        f"  - rateOf({name}) [{where}]: {name} is set by the assignmentRule {_rule_text(name)}"
+        for name, where in offenders
+    )
+    raise ModelError(
+        "Model reads the rate of change of a variable that an assignmentRule sets:\n"
+        f"{bullets}\n"
+        "SBML (L3V2 §3.4.6, validation rule 10224) defines no rate of change for "
+        "an assignmentRule variable, so the model has no value there; libsbml and "
+        "RoadRunner refuse it too (earlier bngsim releases took it for 0 in an "
+        "initial value). Make the variable a rateRule target, or write its rate "
+        "from the rule's own inputs."
+    )
+
+
 # ── Unsupported-construct refusal (GH #113) ──────────────────────────────
 #
 # bngsim integrates ODEs; it has no DDE or DAE solver and no fast-equilibrium
@@ -1892,7 +1964,9 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             return _eval_ast_numeric(rate_rule_math[name], ctx, func_defs)
         sp = species_by_id.get(name)
         if sp is None:
-            # A parameter / compartment with no rate rule is constant ⇒ 0.
+            # A parameter / compartment with no rate rule is constant ⇒ 0. One
+            # an assignmentRule sets is not, and never gets here: the load
+            # refuses its rateOf first (_check_rateof_targets, issue #1046).
             return 0.0
         # 2) species — boundary or constant species is held by reactions ⇒ 0.
         if sp.getBoundaryCondition() or sp.getConstant():
@@ -4284,6 +4358,12 @@ def _build_model_from_sbml_doc(doc):
     # and COPASI refuse such models; bngsim fails closed too (naming each
     # offender) rather than integrate a malformed model's incomplete setup.
     _check_undefined_symbols(sbml_model)
+
+    # ── 0d. Refuse rateOf of an assignmentRule variable (issue #1046) ──
+    # SBML defines no rate for one (rule 10224). Checked once, before the fold
+    # below would take it for a constant (rate 0) and before the emitter would
+    # write a rate accessor that nothing binds.
+    _check_rateof_targets(sbml_model, func_defs)
 
     # ── 0. Evaluate initialAssignments ────────────────────────────────
     # SBML initialAssignment elements compute ICs from expressions.

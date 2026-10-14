@@ -765,6 +765,156 @@ def test_a_folded_rateof_initial_assignment_still_says_what_it_froze(caplog):
     assert named and named.group(1) == "k, p1"
 
 
+# ─── Issue #1046: rateOf of an assignmentRule variable ───────────────────────
+#
+# SBML defines no rate of change for a variable an assignmentRule sets (L3V2
+# §3.4.6, validation rule 10224); libsbml and RoadRunner refuse the model. bngsim
+# folded ``p2 = rateOf(q)`` in an initialAssignment to 0, a value the model does
+# not have, and failed in ExprTk on an unbound ``rate_of__q`` everywhere else.
+# No SBML Test Suite case uses the construct.
+
+_TIME_CSYMBOL = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+_COPASI_RATEOF_FUNCDEF = """
+    <listOfFunctionDefinitions>
+      <functionDefinition id="rateOf"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>a</ci></bvar><notanumber/></lambda></math></functionDefinition>
+    </listOfFunctionDefinitions>"""
+
+
+def _rateof_q_model(where: str, *, idiom: bool = False, of: str = "q", local_q: bool = False):
+    """``q := 2*time`` and ``Y := 3*S`` (assignmentRules) beside ``S -> ∅`` at
+    ``k*S``, with ``rateOf(<of>)`` read at ``where``: an initialAssignment,
+    assignment or rate rule of p2, the kinetic law of a reaction J1 (``local_q``
+    gives J1 its own local q), or an event's trigger or assignment. ``idiom``
+    writes the call as COPASI's rateOf functionDefinition."""
+    rate = (
+        f"<apply><ci>rateOf</ci><ci>{of}</ci></apply>"
+        if idiom
+        else f"<apply>{_RATEOF_CSYMBOL}<ci>{of}</ci></apply>"
+    )
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    ia = rules = reactions = events = ""
+    if where == "initialAssignment:p2":
+        ia = (
+            f'<listOfInitialAssignments><initialAssignment symbol="p2">{m}{rate}</math>'
+            "</initialAssignment></listOfInitialAssignments>"
+        )
+    elif where == "assignmentRule:p2":
+        rules = f'<assignmentRule variable="p2">{m}{rate}</math></assignmentRule>'
+    elif where == "rateRule:p2":
+        rules = f'<rateRule variable="p2">{m}{rate}</math></rateRule>'
+    elif where == "reaction:J1":
+        local = (
+            '<listOfLocalParameters><localParameter id="q" value="3"/></listOfLocalParameters>'
+            if local_q
+            else ""
+        )
+        reactions = (
+            '<reaction id="J1" reversible="false"><listOfProducts>'
+            '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfProducts>'
+            f"<kineticLaw>{m}<apply><plus/>{rate}<cn>1</cn></apply></math>{local}</kineticLaw>"
+            "</reaction>"
+        )
+    elif where in ("event:e:trigger", "event:e:assignment:p2"):
+        trigger = f"<apply><gt/>{rate}<cn>1</cn></apply>"
+        value = "<cn>1</cn>"
+        if where == "event:e:assignment:p2":
+            trigger, value = f"<apply><gt/>{_TIME_CSYMBOL}<cn>1</cn></apply>", rate
+        events = f"""
+    <listOfEvents>
+      <event id="e" useValuesFromTriggerTime="true">
+        <trigger initialValue="false" persistent="true">{m}{trigger}</math></trigger>
+        <listOfEventAssignments>
+          <eventAssignment variable="p2">{m}{value}</math></eventAssignment>
+        </listOfEventAssignments>
+      </event>
+    </listOfEvents>"""
+    else:
+        raise ValueError(where)
+    return f"""
+  <model id="m">
+    {_COPASI_RATEOF_FUNCDEF if idiom else ""}
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="10" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+      <species id="Y" compartment="c" initialAmount="0" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="q" value="0" constant="false"/>
+      <parameter id="p2" value="7" constant="false"/>
+      <parameter id="k" value="0.5" constant="true"/>
+    </listOfParameters>
+    {ia}
+    <listOfRules>
+      <assignmentRule variable="q">{m}<apply><times/><cn>2</cn>{_TIME_CSYMBOL}</apply></math>
+      </assignmentRule>
+      <assignmentRule variable="Y">{m}<apply><times/><cn>3</cn><ci>S</ci></apply></math>
+      </assignmentRule>
+      {rules}
+    </listOfRules>
+    <listOfReactions>
+      <reaction id="deg" reversible="false">
+        <listOfReactants>
+          <speciesReference species="S" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <kineticLaw>{m}<apply><times/><ci>k</ci><ci>S</ci></apply></math></kineticLaw>
+      </reaction>
+      {reactions}
+    </listOfReactions>
+    {events}
+  </model>"""
+
+
+_Q_RULE = "q is set by the assignmentRule q := 2 * time"
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "initialAssignment:p2",
+        "assignmentRule:p2",
+        "rateRule:p2",
+        "reaction:J1",
+        "event:e:trigger",
+        "event:e:assignment:p2",
+    ],
+)
+@pytest.mark.parametrize("idiom", [False, True], ids=["csymbol", "copasi_idiom"])
+def test_rateof_of_an_assignment_rule_variable_is_refused_by_name(where, idiom):
+    """Each place rateOf can be read is refused with the symbol, the place and
+    the rule that sets the symbol. The initialAssignment used to load with
+    p2 = 0; the rest failed on an undefined ``rate_of__q``."""
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(_sbml(_rateof_q_model(where, idiom=idiom)))
+    msg = str(exc.value)
+    assert f"rateOf(q) [{where}]: {_Q_RULE}" in msg
+    assert "validation rule 10224" in msg
+    assert "rate_of__" not in msg
+
+
+def test_rateof_of_a_species_an_assignment_rule_sets_is_refused():
+    """A species is no different: ``Y := 3*S`` has no rate of its own in SBML,
+    though S has one. It used to fold to 0."""
+    with pytest.raises(bngsim.ModelError, match=re.escape("rateOf(Y) [initialAssignment:p2]: Y")):
+        bngsim.Model.from_sbml_string(_sbml(_rateof_q_model("initialAssignment:p2", of="Y")))
+
+
+def test_rateof_of_a_kinetic_law_local_shadowing_an_assignment_rule_variable_loads():
+    """Inside J1, ``q`` is J1's own constant local parameter, not the global the
+    rule sets, so ``rateOf(q)`` there is 0 and J1 produces S at rate 1. (libsbml
+    reports rule 10224 here anyway; it does not scope the name.)"""
+    model = bngsim.Model.from_sbml_string(_sbml(_rateof_q_model("reaction:J1", local_q=True)))
+    res = _run(model, t_end=1.0, n_points=3)
+    # dS/dt = 1 - 0.5*S, S(0) = 10  ⇒  S(t) = 2 + 8·exp(-t/2).
+    np.testing.assert_allclose(
+        _series(res, "S"), 2 + 8 * np.exp(-0.5 * np.asarray(res.time)), rtol=1e-6
+    )
+
+
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
 #
 # A trigger gated on rateOf fires when the CVODE root finder brackets the crossing.
