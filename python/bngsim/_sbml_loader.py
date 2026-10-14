@@ -5332,7 +5332,14 @@ def _build_model_from_sbml_doc(doc):
         if not _expanded <= (_param_pool | _species_ic_expr.keys()):
             continue
         _sp_subs = {_n: _species_ic_expr[_n] for _n in _expanded & _species_ic_expr.keys()}
-        if (_sp_subs or _ar_subs) and _ast_has_rateof(_m, _ic_rateof_names):
+        # rateOf is never lifted, whatever else the assignment reads: a derived
+        # parameter is evaluated only when a parameter is written, and the
+        # builder refuses one that reads a rate accessor (13c9a0e). The fold
+        # above has its value at the start, which is what an initialAssignment
+        # means (issue #1045: `p2 = rateOf(p1)` of a parameter no rule changes
+        # is 0, and used to be refused); one the fold cannot evaluate is refused
+        # by name below (#871), never kept at its declared value.
+        if _ast_has_rateof(_m, _ic_rateof_names):
             continue
         try:
             _lift_expr[_pid] = _ast_to_exprtk_with_funcdefs(
@@ -5612,7 +5619,9 @@ def _build_model_from_sbml_doc(doc):
             math = _ast_at_time_zero(math)
         if not names <= (_ic_expr_symbols | _ic_seed_symbols | _ic_const_ar.keys()):
             continue
-        if (names & _ic_seed_symbols) and _ast_has_rateof(math, _ic_rateof_names):
+        # As the parameter lift above: an initial value that reads rateOf keeps
+        # the fold's value at the start, whatever else it reads (issue #1045).
+        if _ast_has_rateof(math, _ic_rateof_names):
             continue
         _ic_cand[sym] = math
         _ic_cand_deps[sym] = names & _ic_seed_symbols

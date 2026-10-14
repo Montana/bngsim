@@ -22,6 +22,7 @@ roadrunner and the corpus are present locally.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import bngsim
@@ -694,6 +695,74 @@ def test_rateof_in_initial_assignment_reaction_species():
     reac = bngsim.Model.from_sbml_string(_sbml(_model(False)))
     assert prod.get_param("p2") == pytest.approx(1.0)  # product ⇒ +rate
     assert reac.get_param("p2") == pytest.approx(-1.0)  # reactant ⇒ -rate
+
+
+# ─── Issue #1045: rateOf of a parameter no rule changes, in an initial value ───
+#
+# ``p2 = rateOf(p1)`` with p1 a parameter that no rate rule changes is 0 (SBML
+# suite 01248: both constant; 01249: both non-constant, but nothing changes p1).
+# The §0 fold had that value, but the parameter lift (#732) then lifted p2 into a
+# derived parameter reading ``rate_of__p1`` — its rateOf guard fired only when a
+# species or assignment-rule substitution was present — and the builder refuses a
+# derived parameter that reads a rate accessor (13c9a0e), so the model was
+# refused. The species initial-value lift skipped rateOf only when the initial
+# value read a state, and had the same defect.
+
+
+def _rateof_p1_model(target: str, p1_constant: str, expr_tail: str = "") -> str:
+    """p1 = 1 with no rule; ``target`` (p2 or species S) assigned
+    ``rateOf(p1)`` plus ``expr_tail``."""
+    math = f"<apply>{_RATEOF_CSYMBOL}<ci>p1</ci></apply>"
+    if expr_tail:
+        math = f"<apply><plus/>{math}{expr_tail}</apply>"
+    return f"""
+  <model id="m">
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="5" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="p1" value="1" constant="{p1_constant}"/>
+      <parameter id="p2" value="7" constant="{p1_constant}"/>
+      <parameter id="k" value="3" constant="true"/>
+    </listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="{target}"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        {math}</math></initialAssignment>
+    </listOfInitialAssignments>
+  </model>"""
+
+
+@pytest.mark.parametrize("p1_constant", ["true", "false"], ids=["01248", "01249"])
+def test_rateof_of_a_parameter_no_rule_changes_is_zero_in_an_initial_assignment(p1_constant):
+    model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", p1_constant)))
+    assert model.get_param("p2") == 0.0
+    res = _run(model, t_end=1.0, n_points=3)
+    assert res.species.shape[0] == 3  # it runs, not just loads
+
+
+def test_rateof_of_a_parameter_in_a_species_initial_value():
+    """The species initial-value lift skipped rateOf only when the initial value
+    read a state: ``S = rateOf(p1) + k`` was refused for reading the rate
+    accessor; S starts at 0 + 3."""
+    model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("S", "true", "<ci>k</ci>")))
+    res = _run(model, t_end=1.0, n_points=3)
+    np.testing.assert_allclose(_series(res, "S"), 3.0)
+
+
+def test_a_folded_rateof_initial_assignment_still_says_what_it_froze(caplog):
+    """Not lifted, the assignment keeps its folded value, and the #313 warning
+    names what a write to will no longer move it."""
+    with caplog.at_level("WARNING", logger="bngsim"):
+        bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", "true", "<ci>k</ci>")))
+    frozen = [
+        r.getMessage() for r in caplog.records if "could not keep symbolic" in r.getMessage()
+    ]
+    assert len(frozen) == 1
+    # The named list, not a substring of the message ("k" is in "keep").
+    named = re.search(r"parameter\(s\) (.+?)\. ", frozen[0])
+    assert named and named.group(1) == "k, p1"
 
 
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
