@@ -104,3 +104,38 @@ def test_a_table_over_a_plain_parameter_still_reads_its_slot(tmp_path):
     data = bngsim.Model.from_net(str(path))._core.codegen_data()
     x = [p["name"] for p in data["parameters"]].index("x")
     assert cg._tfun_call_map(data) == {"g": (0, f"p[{x}]")}
+
+
+# ── Forward sensitivities: the table has no analytic sensitivity RHS ─────────
+# A run takes its columns from CVODES' difference quotient, over the compiled
+# right-hand side, so it reads the index live as the run does.
+
+
+def test_a_smooth_index_gives_the_closed_form_sensitivity(tmp_path):
+    # h() = c*Atot: A = 10/(1 + 10ct), so dA/dc = -100t/(1 + 10ct)^2.
+    net = NET.replace(
+        "begin parameters\nend parameters", "begin parameters\n    1 c 2\nend parameters"
+    ).format(functions="    1 g() tfun([0,100],[0,100], h)\n    2 h() c*Atot")
+    path = tmp_path / "tfun_smooth_index.net"
+    path.write_text(net)
+    run = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["c"]
+    ).run(t_span=(0.0, 1.0), n_points=3, rtol=1e-10, atol=1e-12)
+    got = np.asarray(run.sensitivities)[-1, 0, 0]
+    assert got == pytest.approx(-100.0 / (1.0 + 20.0) ** 2, rel=1e-6)
+
+
+def test_an_index_that_holds_a_state_crossing_is_refused(tmp_path):
+    # g jumps where h's condition crosses, and the quotient reads across it
+    # (issue #938). Read at its load-time value, h never crossed, and the run
+    # returned columns that ignored the jump.
+    net = NET.replace(
+        "begin parameters\nend parameters", "begin parameters\n    1 thr 2\nend parameters"
+    ).format(functions="    1 h() if(Atot<thr,1,0)\n    2 g() tfun([0,1],[0,3], h)")
+    path = tmp_path / "tfun_crossing_index.net"
+    path.write_text(net)
+    sim = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["thr"]
+    )
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match=r"Atot<thr"):
+        sim.run(t_span=(0.0, 1.0), n_points=3)

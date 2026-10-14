@@ -1533,8 +1533,12 @@ end groups
         reader). Where the mapped reactions do not account for what the pre-#763
         test reads as a jump, that test stands.
 
-        Y's own value is not asserted. In a sensitivity run it stays 0: the
-        compiled table reads its index as it was built (issue #965)."""
+        The table itself has no analytic sensitivity right-hand side, so the run
+        would be on CVODES' difference quotient, across a crossing whose time
+        moves, and is refused before it starts (issues #938, #932). Until issue
+        #965 the compiled table read its index as it was built: Y stayed 0, the
+        quotient never met the jump, and the closed-form columns came back by
+        accident. Read live, the step size collapsed at t* instead."""
         text = """begin parameters
     1 A0 10
     2 a 0.5
@@ -1560,12 +1564,10 @@ end groups
         conditions = sw.state_switch_conditions(model._core)
         assert conditions == ["Aobs<thr"]
         assert sw.state_switch_reactions(model._core, conditions) == [[]]
-        run = bngsim.Simulator(model, method="ode", sensitivity_params=["thr", "a"]).run(
-            t_span=(0.0, 6.0), n_points=3, rtol=1e-10, atol=1e-12
-        )
-        got = np.asarray(run.sensitivities)[-1, list(run.species_names).index("Y()")]
-        # The rate past the switch is 3, and t* = ln(A0/thr)/a.
-        np.testing.assert_allclose(got, [3.0 / (0.5 * 2.0), 3.0 * np.log(5.0) / 0.25], rtol=1e-5)
+        with pytest.raises(bngsim.SensitivityUnsupportedError, match=r"Aobs<thr.*#938"):
+            bngsim.Simulator(model, method="ode", sensitivity_params=["thr", "a"]).run(
+                t_span=(0.0, 6.0), n_points=3, rtol=1e-10, atol=1e-12
+            )
 
     def test_a_threshold_only_an_output_reads_does_not_take_the_wider_probe(self, tmp_path):
         """A jump at thr0, a continuous clamp on a 2e8 pool at thr1 inside the

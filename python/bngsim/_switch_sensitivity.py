@@ -6426,6 +6426,24 @@ def fallback_crossing(
         ):
             return f'tfun {table.get("name")} (method=>"step")'
     texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    # A table a rate law reads is indexed by what its index reads, which the
+    # law's text, ``tfun_g()``, does not show. Where a function owns the index
+    # slot, ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
+    # function is read as a law of its own: the table of what it holds jumps
+    # where it jumps and bends where it bends. Compiled code reads the index
+    # live since issue #965, so the quotient reads across that crossing.
+    table_indices = {
+        str(table.get("name")): param_names[table.get("index_param_idx", -1)]
+        for table in data.get("table_functions", ())
+        if table.get("index_kind") == "parameter"
+        and 0 <= table.get("index_param_idx", -1) < len(param_names)
+        and param_names[table.get("index_param_idx", -1)] in func_map
+    }
+    if table_indices:
+        read = " ".join(_inline_functions(text, func_map) or text for text in texts)
+        texts += sorted(
+            {index for name, index in table_indices.items() if f"tfun_{name}(" in read}
+        )
     moved_clocks: list[frozenset[int]] = []
 
     def scan(held: frozenset[str]) -> str | None:
@@ -7433,7 +7451,9 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     that a function writes was another such reader; that model is refused where
     it is built, issue #931.) The solver covers that: a jump the pre-#763 test
     reads, and that the listed reactions do not account for, is judged as
-    before.
+    before. A table has no analytic sensitivity right-hand side, so a run whose
+    rate reads one through a function that holds a crossing is refused by
+    :func:`fallback_crossing` before it gets there (issues #938, #965).
     """
     from bngsim._jacobian import _inline_functions
 
