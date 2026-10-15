@@ -14669,7 +14669,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             // counter clock, whose box at rtol 1e-3 is a quarter
                             // of a time unit wide, hid a crossing main restarts
                             // at, and a window came out 0 where it is 0.0149
-                            // (third review of this fix).
+                            // (third review of this fix). The box is sampled, not
+                            // covered: a dip in dg/dx between those points, or
+                            // along a mixed-sign corner they do not reach, goes
+                            // unseen. Nine shapes built to hide one there (dips,
+                            // plateaus, dips at the sampling's own period) gave
+                            // main's answer in the fourth review: the step that
+                            // crosses ends outside such a dip, so the band runs
+                            // out in it and the crossing is tested.
                             std::vector<double> xw(y_data, y_data + ns);
                             auto grad_holds = [&]() {
                                 for (const StateSwitchHold::Term &term : terms) {
