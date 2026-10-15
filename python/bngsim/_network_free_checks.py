@@ -1,21 +1,23 @@
 """Checks a BNG XML must pass before a network-free backend is handed it.
 
-Issue #862: a rate law that reads ``time()`` is wrong or refused on both
-network-free backends. RuleMonkey treats a total propensity of 0 as absorbing,
-so ``if(time()>=6, k, 0)`` never fires and the run returns the initial state at
-every row with no warning (richardposner/RuleMonkey#86). NFsim cannot prepare
-such a function and fails at setup with ``Error preparing function f in class
-GlobalFunction``, which names neither the cause nor an alternative. Both are
-refused here, before the backend is built, naming the functions. The clock is
-read under either spelling, ``time()`` or a bare ``time``, and both are refused.
+Issue #862: NFsim cannot prepare a function that reads ``time()`` and fails at
+setup with ``Error preparing function f in class GlobalFunction``, which names
+neither the cause nor an alternative. It is refused here, before the backend is
+built, naming the functions. The clock is read under either spelling,
+``time()`` or a bare ``time``, and both are refused.
 
-A table function indexed by time (``type="TFUN"`` with ``ctrName="time"``)
-keeps its clock in an attribute, and its ``<Expression>`` reads a placeholder.
-RuleMonkey reads it through the same zero-propensity trap, so RuleMonkey refuses
-it too. NFsim runs it, but refreshes its value only when a reaction fires, so a
-rate that is 0 at the start is not seen either (issue #892). That is left to
-the fix there, since refusing it would take away a table function NFsim reads
-correctly whenever reactions fire often.
+RuleMonkey runs such a function since 3.11.0, which integrates a rate that reads
+the clock between events (richardposner/RuleMonkey#86), and it runs on absolute
+model time (issue #1022). So does a table function indexed by time
+(``type="TFUN"`` with a clock ``ctrName``), which keeps its clock in an
+attribute while its ``<Expression>`` reads a placeholder. NFsim runs one, but
+refreshes its value only when a reaction fires, so a rate that is 0 at the
+start is not seen (issue #892), and it reads elapsed time, BNG2.pl's
+simulate_nf semantics. That is left to the fix there, since refusing it would
+take away a table function NFsim reads correctly whenever reactions fire often.
+
+A RuleMonkey session uses :func:`clock_readers` to refuse a segment whose labels
+are not the clock the model reads.
 """
 
 from __future__ import annotations
@@ -26,8 +28,7 @@ from pathlib import Path
 
 from bngsim._exceptions import ModelError
 
-# `time()` or a bare `time`: the engine binds the clock under both spellings, and
-# RuleMonkey returned the same flat run for `if(time>=6,k,0)` as for `time()`.
+# `time()` or a bare `time`: the engine binds the clock under both spellings.
 _TIME_REF = re.compile(r"(?<![A-Za-z0-9_])time(?![A-Za-z0-9_])")
 
 # The counter names RuleMonkey reads as the clock for a table function, checked
@@ -36,12 +37,6 @@ _TIME_REF = re.compile(r"(?<![A-Za-z0-9_])time(?![A-Za-z0-9_])")
 _RULEMONKEY_CLOCK_COUNTERS = frozenset({"time", "t", "time()", "t()"})
 
 _BACKENDS = {
-    "rulemonkey": (
-        "RuleMonkey (method='rm' / 'nf_exact')",
-        "RuleMonkey treats a total propensity of 0 as absorbing, so a rate that is 0 at "
-        "the start and turns on later never fires, and the run returns the initial "
-        "state with no warning (richardposner/RuleMonkey#86)",
-    ),
     "nfsim": (
         "NFsim (method='nf' / 'nf_reject')",
         "NFsim cannot prepare a function that reads time() and fails at setup",
@@ -88,27 +83,30 @@ def time_indexed_table_functions(xml_path: str | Path) -> list[str]:
     return [f.get("id", "?") for f in _functions(xml_path) or () if _indexed_by_time(f)]
 
 
-def refuse_time_dependent_rate_laws(xml_path: str | Path, backend: str) -> None:
-    """Raise :class:`ModelError` if *xml_path* has a function reading the clock,
-    or, for RuleMonkey, a table function indexed by it.
+def clock_readers(xml_path: str | Path) -> list[str]:
+    """The ids of the functions in *xml_path* that read the clock, through
+    ``time()``, a bare ``time``, or a table indexed by time. Empty when the file
+    cannot be parsed."""
+    return [
+        f.get("id", "?")
+        for f in _functions(xml_path) or ()
+        if _reads_time(f) or _indexed_by_time(f)
+    ]
 
-    *backend* is ``"rulemonkey"`` or ``"nfsim"``.
+
+def refuse_time_dependent_rate_laws(xml_path: str | Path, backend: str) -> None:
+    """Raise :class:`ModelError` if *xml_path* has a function reading the clock.
+
+    *backend* is ``"nfsim"``, the one network-free backend that cannot run one.
     """
-    funcs = _functions(xml_path) or []
-    reads = [f.get("id", "?") for f in funcs if _reads_time(f)]
-    tables = []
-    if backend == "rulemonkey":
-        tables = [f.get("id", "?") for f in funcs if _indexed_by_time(f) and not _reads_time(f)]
-    if not reads and not tables:
+    reads = time_reading_functions(xml_path)
+    if not reads:
         return
     label, why = _BACKENDS[backend]
-    parts = []
-    if reads:
-        parts.append("functions read time(): " + ", ".join(f"'{n}'" for n in reads))
-    if tables:
-        parts.append("table functions are indexed by time: " + ", ".join(f"'{n}'" for n in tables))
     raise ModelError(
-        f"{label} cannot run a model whose {' and whose '.join(parts)}. {why}. "
-        "Simulate it with method='ode' or method='ssa' on the generated network, which "
-        "read time() as the model time (issue #862)."
+        f"{label} cannot run a model whose functions read time(): "
+        + ", ".join(f"'{n}'" for n in reads)
+        + f". {why}. Simulate it with method='rm', or with method='ode' or "
+        "method='ssa' on the generated network, which read time() as the model "
+        "time (issue #862)."
     )

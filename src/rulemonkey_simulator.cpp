@@ -7,6 +7,7 @@
 #include <rulemonkey/simulator.hpp>
 #include <rulemonkey/types.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -125,23 +126,25 @@ Result convert_rulemonkey_result(const rulemonkey::Result &rm_result,
         result.record_expressions(i, func_buf.data());
     }
 
+    // Events since the run or the session began, so a session segment reports
+    // the session's running total (richardposner/RuleMonkey#93), as an NFsim
+    // session's global event counter does.
     result.solver_stats().n_steps = static_cast<int>(rm_result.event_count);
     result.solver_stats().n_rhs_evals = static_cast<int>(rm_result.event_count);
     return result;
 }
 
-// Upstream's stateless run() starts its SSA clock at 0 and records from
-// t_start onward, so a nonzero t_start used to simulate the pre-history [0,
-// t_start] before the first row (issue #703). A bngsim run starts from the
-// initial state at t_start and never sees [0, t_start], so the request is
-// shifted to elapsed time here (t_start -> 0) and run() labels the rows back
-// with absolute times. That is also BNG2.pl's simulate_nf semantics, which runs
-// NFsim for t_end - t_start from the initial state.
+// RuleMonkey 3.11.0 puts the seed state at ts.t_start on the model's clock
+// (richardposner/RuleMonkey#98), so a bngsim run is handed through as is: it
+// starts from the initial state at t_start and never sees [0, t_start] (issue
+// #703), and a rate law that reads time() reads absolute model time, as ode and
+// ssa do (issue #1022). Up to 3.10.1 run() simulated [0, t_start] first, so
+// every run used to be shifted to elapsed time here. NFsim stays on elapsed
+// time, BNG2.pl's simulate_nf semantics.
 rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
     rulemonkey::TimeSpec rm_times;
-    const double t0 = times.t_start;
-    rm_times.t_start = 0.0;
-    rm_times.t_end = times.t_end - t0;
+    rm_times.t_start = times.t_start;
+    rm_times.t_end = times.t_end;
     if (!times.sample_times.empty()) {
         // Explicit, possibly non-uniform output instants (GH #169). Upstream
         // RuleMonkey #16 records at exactly these times in a single run_ssa pass
@@ -149,13 +152,19 @@ rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
         // through and leave n_points at its default. The Python layer guarantees
         // sample_times[0] == t_start and t_end == the largest sample time, which
         // satisfies upstream's "t_end bounds the SSA loop" contract.
-        rm_times.sample_times.reserve(times.sample_times.size());
-        for (double t : times.sample_times)
-            rm_times.sample_times.push_back(t - t0);
+        rm_times.sample_times = times.sample_times;
     } else {
         rm_times.n_points = rulemonkey_interval_count(times.n_points);
     }
     return rm_times;
+}
+
+// The tolerance upstream's session simulate() allows between a segment's start
+// and the session clock (RuleMonkeySimulator::simulate in
+// third_party/rulemonkey/cpp/rulemonkey/simulator.cpp). RuleMonkeySession uses
+// the same one to decide whether a segment starts on the session clock.
+bool on_session_clock(double t, double session_t) {
+    return std::fabs(t - session_t) <= 1e-9 * std::max(1.0, std::fabs(session_t));
 }
 
 } // namespace
@@ -220,15 +229,12 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
         // time labels and solver_stats().n_steps now reports for both paths.
         auto rm_result =
             impl_->sim->run(to_rulemonkey_times(times), seed, make_cancel_callback(budget));
-        // Back from elapsed time to the absolute labels the caller asked for.
-        std::vector<double> labels(rm_result.time.begin(), rm_result.time.end());
-        for (double &t : labels)
-            t += times.t_start;
         // The requested instants themselves, as every other backend reports
-        // them: elapsed + t_start can miss the last by an ulp (issue #693).
-        const auto requested = times.output_times();
-        if (requested.size() == labels.size())
-            labels = requested;
+        // them: upstream's uniform grid, t_start + i*dt, can miss the last by
+        // an ulp (issue #693).
+        std::vector<double> labels = times.output_times();
+        if (labels.size() != rm_result.time.size())
+            labels.assign(rm_result.time.begin(), rm_result.time.end());
         return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
         // Upstream raises Cancelled iff our callback returned false, which it
@@ -238,7 +244,9 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
     }
 }
 
-void RuleMonkeySimulator::initialize(uint64_t seed) { impl_->sim->initialize(seed); }
+void RuleMonkeySimulator::initialize(uint64_t seed, double t_start) {
+    impl_->sim->initialize(seed, t_start);
+}
 
 void RuleMonkeySimulator::step_to(double time, double timeout_seconds) {
     WallClockBudget budget(timeout_seconds);
@@ -254,36 +262,40 @@ Result RuleMonkeySimulator::simulate(double t_start, double t_end, int n_points,
                                      const std::vector<double> &sample_times) {
     WallClockBudget budget(timeout_seconds);
     const double internal_start = impl_->sim->current_time();
+    const double origin = sample_times.empty() ? t_start : sample_times.front();
+    // A segment that starts on the session clock runs on it as given, so a rate
+    // law that reads time() reads the times the rows are labelled with (issue
+    // #1022). One that starts elsewhere continues from the session clock by the
+    // same span and is labelled with the caller's times, as it always has been:
+    // the session clock is then not the labels' clock, which only a model that
+    // reads the clock can tell, and RuleMonkeySession refuses such a segment
+    // for one.
+    const bool on_clock = on_session_clock(origin, internal_start);
+    auto to_session = [&](double t) { return on_clock ? t : internal_start + (t - origin); };
 
     try {
         if (!sample_times.empty()) {
-            // Explicit output instants (GH #184) on a stateful session. Map the
-            // caller's absolute sample times onto the session's internal clock by
-            // their offset from the segment start (sample_times[0]); the live
-            // session continues from internal_start, so the i-th sample lands at
-            // internal_start + (sample_times[i] - sample_times[0]). Hand the
-            // engine a TimeSpec carrying those instants: upstream's session
-            // simulate(TimeSpec) records at exactly them in a single run_ssa pass
-            // (RuleMonkey #16), continuing from the current session state —
-            // bit-identical to the uniform grid where the two schedules share a
-            // time, with event_count preserved. The Result is relabelled back to
-            // the caller's absolute sample_times.
-            const double origin = sample_times.front();
+            // Explicit output instants (GH #184) on a stateful session. Hand the
+            // engine a TimeSpec carrying them, on the session clock: upstream's
+            // session simulate(TimeSpec) records at exactly them in a single
+            // run_ssa pass (RuleMonkey #16), continuing from the current session
+            // state, bit-identical to the uniform grid where the two schedules
+            // share a time. The Result is labelled with the caller's
+            // sample_times.
             rulemonkey::TimeSpec rm_ts;
             rm_ts.sample_times.reserve(sample_times.size());
             for (double t : sample_times) {
-                rm_ts.sample_times.push_back(internal_start + (t - origin));
+                rm_ts.sample_times.push_back(to_session(t));
             }
-            rm_ts.t_start = internal_start;
+            rm_ts.t_start = rm_ts.sample_times.front();
             rm_ts.t_end = rm_ts.sample_times.back();
             auto rm_result = impl_->sim->simulate(rm_ts, make_cancel_callback(budget));
             return convert_rulemonkey_result(rm_result, &sample_times);
         }
 
-        const double internal_end = internal_start + (t_end - t_start);
         auto rm_result =
-            impl_->sim->simulate(internal_start, internal_end, rulemonkey_interval_count(n_points),
-                                 make_cancel_callback(budget));
+            impl_->sim->simulate(to_session(t_start), to_session(t_end),
+                                 rulemonkey_interval_count(n_points), make_cancel_callback(budget));
         auto labels = uniform_time_labels(t_start, t_end, n_points);
         return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
@@ -371,6 +383,16 @@ void RuleMonkeySimulator::set_molecule_limit(int limit) { impl_->sim->set_molecu
 
 void RuleMonkeySimulator::set_block_same_complex_binding(bool enabled) {
     impl_->sim->set_block_same_complex_binding(enabled);
+}
+
+std::vector<std::string> RuleMonkeySimulator::unsupported_warnings() const {
+    std::vector<std::string> warnings;
+    for (const auto &feature : impl_->sim->unsupported_features()) {
+        if (feature.severity == rulemonkey::Severity::Warn) {
+            warnings.push_back(feature.element + ": " + feature.feature);
+        }
+    }
+    return warnings;
 }
 
 const std::string &RuleMonkeySimulator::xml_path() const { return impl_->xml_path; }

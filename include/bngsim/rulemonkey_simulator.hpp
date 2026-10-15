@@ -38,7 +38,15 @@ class RuleMonkeySimulator {
     // left at the last completed SSA event; subsequent state is undefined
     // for bngsim purposes, so callers should `destroy_session()` before
     // reusing the simulator.
-    void initialize(uint64_t seed = 42);
+    //
+    // `initialize` puts the seed state at `t_start` on the model's clock, so a
+    // rate law that reads time() starts from its value there. A `simulate`
+    // segment that starts on the session clock runs on it as given; one that
+    // starts elsewhere continues from the session clock by the same span and
+    // is labelled with the caller's times. Every Result's `n_steps` counts the
+    // events since `initialize` (or since the snapshot's session began, after
+    // `load_state`), not the call's alone, as an NFsim session's does.
+    void initialize(uint64_t seed = 42, double t_start = 0.0);
     void step_to(double time, double timeout_seconds = 0.0);
     // `sample_times`, when non-empty, overrides the uniform t_start..t_end /
     // n_points grid: the returned Result is labelled with exactly these times
@@ -87,6 +95,11 @@ class RuleMonkeySimulator {
     void clear_param_overrides();
     void set_molecule_limit(int limit);
     void set_block_same_complex_binding(bool enabled);
+
+    // RuleMonkey's Severity::Warn load diagnostics, each "element: feature".
+    // The model runs; these name how RuleMonkey reads part of it. Errors are
+    // refused at construction.
+    std::vector<std::string> unsupported_warnings() const;
 
     const std::string &xml_path() const;
 

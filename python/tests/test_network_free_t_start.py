@@ -6,6 +6,11 @@ labelled the t = 0 state as t_start, and RuleMonkey's stateless run simulated
 t_start and never sees [0, t_start], as ode and ssa do and as BNG2.pl's
 simulate_nf does (it runs NFsim for t_end - t_start).
 
+The clocks differ (issue #1022): rm runs on absolute model time, as ode and ssa
+do, and nf on time elapsed since t_start, as simulate_nf does. Only a model that
+reads the clock can tell; NFsim refuses time() and RuleMonkey's values are in
+test_rulemonkey_model_time.py.
+
 A(s~0) -> A(s~1) at k = 0.5 from 20000 copies, so A0 = 20000*exp(-0.5 (t - t0)).
 """
 
@@ -68,9 +73,16 @@ def test_a_late_start_begins_at_the_initial_state(method, times):
 
 @pytest.mark.parametrize("method", METHODS)
 def test_a_late_start_is_the_same_run_shifted(method):
-    """Same seed, same elapsed schedule: the counts are identical to a run
-    from t = 0, only the labels move."""
+    """Same seed, same elapsed schedule: the counts are those of a run from
+    t = 0, only the labels move. NFsim runs on elapsed time, so they are
+    identical. RuleMonkey spends the same draws on absolute time, where an
+    event lands at 5 + S instead of S, and rounding at a sample boundary can
+    put one count on the other side of it (RuleMonkey's clock_origin_test
+    allows 1)."""
     _, a0 = _run(method, t_span=(0.0, 2.0), n_points=3)
     t5, a5 = _run(method, t_span=(5.0, 7.0), n_points=3)
     np.testing.assert_array_equal(t5, [5.0, 6.0, 7.0])
-    np.testing.assert_array_equal(a5, a0)
+    if method == "nf":
+        np.testing.assert_array_equal(a5, a0)
+    else:
+        assert np.max(np.abs(a5 - a0)) <= 1

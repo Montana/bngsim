@@ -1,0 +1,28 @@
+# Issue #1022: a rate law that reads time() throughout, so a run from t_start > 0
+# on absolute model time and one on elapsed time differ at every row. A(s~0)
+# leaves at k*time(), so from t0 a molecule is still there at t with
+# probability exp(-k*(t^2 - t0^2)/2).
+begin model
+begin parameters
+  k  0.02
+end parameters
+begin molecule types
+  A(s~0~1)
+end molecule types
+begin seed species
+  A(s~0)  1000
+end seed species
+begin observables
+  Molecules A0  A(s~0)
+  Molecules A1  A(s~1)
+end observables
+begin functions
+  f() = k*time()
+end functions
+begin reaction rules
+  A(s~0) -> A(s~1)  f()
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()
