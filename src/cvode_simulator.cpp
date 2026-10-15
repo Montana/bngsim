@@ -488,12 +488,6 @@ struct CvodeUserData {
     // run().
     const std::vector<double> *state_switch_zero_hold = nullptr;
 
-    // Issue #908: per state-switch residual chatter flag. When nonzero, the
-    // corresponding root is reported as a constant so CVODE neither locates
-    // nor interrupts on it (the slide's crossing is not a real discontinuity).
-    std::vector<char> *state_switch_chatter = nullptr;
-    std::vector<long> *state_switch_chatter_count = nullptr;
-
     // Earliest state at which a callback produced a non-finite value with no
     // clamp left to try (GH #336). Written by the RHS / Jacobian /
     // sensitivity-RHS callbacks, read only if the integration fails — see
@@ -1811,43 +1805,6 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
     const double *y_ptr = N_VGetArrayPointer(y);
     const int nsp = mdl->n_species();
 
-    // Issue #908: when every state-switch residual is chattering and there
-    // are no events or discontinuity triggers to report, skip the model sync
-    // entirely. CVODE never locates a root for this step without a sign.
-    const auto &disc = mdl->discontinuity_triggers();
-    const auto &events = mdl->events();
-    if (events.empty() && disc.empty() && data->state_switch_roots != nullptr &&
-        data->state_switch_chatter != nullptr) {
-        const auto &ss = *data->state_switch_roots;
-        // Periodic re-verification: every 64th suppressed root, clear
-        // chatter for all of them and fall through to real residual eval.
-        bool all_chatter = true;
-        for (int j = 0; j < static_cast<int>(ss.size()); ++j) {
-            if (!(*data->state_switch_chatter)[static_cast<size_t>(j)]) {
-                all_chatter = false;
-                break;
-            }
-            if (data->state_switch_chatter_count != nullptr &&
-                (*data->state_switch_chatter_count)[static_cast<size_t>(j)] >= 64) {
-                all_chatter = false;
-                break;
-            }
-        }
-        if (all_chatter) {
-            for (int j = 0; j < static_cast<int>(ss.size()); ++j) {
-                gout[j] = 1.0;
-            }
-            return 0;
-        }
-        // Re-enable: clear flags and fall through.
-        for (int j = 0; j < static_cast<int>(ss.size()); ++j) {
-            (*data->state_switch_chatter)[static_cast<size_t>(j)] = 0;
-            if (data->state_switch_chatter_count != nullptr) {
-                (*data->state_switch_chatter_count)[static_cast<size_t>(j)] = 0;
-            }
-        }
-    }
-
     // Sync species concentrations so ExprTk trigger expressions see current y
     auto &sp_vec = const_cast<std::vector<Species> &>(mdl->species());
     for (int i = 0; i < nsp; ++i) {
@@ -1866,6 +1823,7 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
     }
 
     auto &eval = mdl->evaluator();
+    const auto &events = mdl->events();
     const int ne = static_cast<int>(events.size());
     for (int i = 0; i < ne; ++i) {
         if (data->event_dormant != nullptr && data->event_dormant[i]) {
@@ -1879,6 +1837,7 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
         double trigger_val = eval.evaluate(events[i].trigger_expr_idx);
         gout[i] = trigger_val - 0.5;
     }
+    const auto &disc = mdl->discontinuity_triggers();
     for (int j = 0; j < static_cast<int>(disc.size()); ++j) {
         gout[ne + j] = eval.evaluate(disc[j]) - 0.5;
     }
@@ -1887,24 +1846,8 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
     // sign change IS the crossing and whose gradient is what dt*/dθ needs.
     if (data->state_switch_roots != nullptr) {
         const auto &ss = *data->state_switch_roots;
-        const char *chatter_ptr =
-            data->state_switch_chatter != nullptr ? data->state_switch_chatter->data() : nullptr;
         const int base = ne + static_cast<int>(disc.size());
         for (int j = 0; j < static_cast<int>(ss.size()); ++j) {
-            // Issue #908: a chattering residual is reported as a constant so
-            // CVODE skips its root localization entirely; re-enabled roots pay
-            // the cost only while their chatter flag is clear.
-            if (chatter_ptr != nullptr && chatter_ptr[j]) {
-                // Periodic re-verification is governed by the run-level
-                // chatter count; suppress until it reaches the threshold.
-                if (data->state_switch_chatter_count == nullptr ||
-                    (*data->state_switch_chatter_count)[static_cast<size_t>(j)] < 64) {
-                    gout[base + j] = 1.0;
-                    continue;
-                }
-                (*data->state_switch_chatter)[static_cast<size_t>(j)] = 0;
-                (*data->state_switch_chatter_count)[static_cast<size_t>(j)] = 0;
-            }
             double g = eval.evaluate(ss[j]);
             if (g == 0.0 && data->state_switch_zero_hold != nullptr) {
                 const double hold = (*data->state_switch_zero_hold)[static_cast<size_t>(j)];
@@ -11757,20 +11700,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     }
     const int n_state_switch = static_cast<int>(state_switch_roots.size());
     state_switch_zero_hold.assign(static_cast<size_t>(n_state_switch), 0.0);
-    // Issue #908: chatter tracking per state-switch residual. A slide roots the
-    // same residual in alternating directions and the restart test
-    // (flow_carries_state_switch) declines every time; once that pattern is
-    // seen the test is skipped and the root stepped on, as cheaply as before
-    // the restart test existed.
-    std::vector<char> state_switch_chattering(static_cast<size_t>(n_state_switch), 0);
-    std::vector<int> state_switch_last_dir(static_cast<size_t>(n_state_switch), 0);
-    std::vector<char> state_switch_last_declined(static_cast<size_t>(n_state_switch), 0);
-    std::vector<long> state_switch_chatter_count(static_cast<size_t>(n_state_switch), 0);
     if (n_state_switch > 0) {
         user_data.state_switch_roots = &state_switch_roots;
         user_data.state_switch_zero_hold = &state_switch_zero_hold;
-        user_data.state_switch_chatter = &state_switch_chattering;
-        user_data.state_switch_chatter_count = &state_switch_chatter_count;
     }
     const int n_roots = n_events + n_disc + n_state_switch;
 
@@ -13588,79 +13520,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         NVectorGuard scratch(N_VClone(y));
                         restart = false;
                         for (int j : switched) {
-                            const std::size_t jx = static_cast<std::size_t>(j);
-                            // Issue #908: chatter skip. A residual that has been
-                            // seen declining in alternating directions is assumed
-                            // to keep stepping on; re-verify periodically or
-                            // when the alternation breaks.
-                            if (state_switch_chattering[jx]) {
-                                if (++state_switch_chatter_count[jx] < 64) {
-                                    continue; // stepped-on root, skip the test
-                                }
-                                state_switch_chattering[jx] = 0;
-                                state_switch_chatter_count[jx] = 0;
-                            }
                             if (impl_->flow_carries_state_switch(
-                                    cvode_mem, t_root, y_data, ns, *state_switches[jx],
+                                    cvode_mem, t_root, y_data, ns,
+                                    *state_switches[static_cast<size_t>(j)],
                                     root_info[n_events + n_disc + j], static_cast<double>(t_end),
                                     scratch, rtol, atol, atol_v)) {
                                 restart = true;
                                 break;
                             }
-                        }
-                    } else {
-                        // A forced restart ends any chatter state for these.
-                        for (int j : switched) {
-                            const std::size_t jx = static_cast<std::size_t>(j);
-                            state_switch_chattering[jx] = 0;
-                            state_switch_last_declined[jx] = 0;
-                            state_switch_last_dir[jx] = root_info[n_events + n_disc + j];
-                            state_switch_chatter_count[jx] = 0;
-                        }
-                    }
-                    // Update chatter tracking based on whether the test declined
-                    // (stepped on) or carried (would restart).
-                    if (!other_root && !at_stop) {
-                        if (!restart) {
-                            for (int j : switched) {
-                                const std::size_t jx = static_cast<std::size_t>(j);
-                                const int dir = root_info[n_events + n_disc + j];
-                                // If the residual stops alternating, stop treating
-                                // it as chatter even if the test still declines.
-                                if (state_switch_chattering[jx] && state_switch_last_dir[jx] != 0 &&
-                                    state_switch_last_dir[jx] == dir) {
-                                    state_switch_chattering[jx] = 0;
-                                    state_switch_chatter_count[jx] = 0;
-                                }
-                                if (state_switch_last_declined[jx] &&
-                                    state_switch_last_dir[jx] != 0 &&
-                                    state_switch_last_dir[jx] != dir) {
-                                    state_switch_chattering[jx] = 1;
-                                    state_switch_chatter_count[jx] = 0;
-                                }
-                                state_switch_last_declined[jx] = 1;
-                                state_switch_last_dir[jx] = dir;
-                            }
-                        } else {
-                            for (int j : switched) {
-                                const std::size_t jx = static_cast<std::size_t>(j);
-                                state_switch_chattering[jx] = 0;
-                                state_switch_last_declined[jx] = 0;
-                                state_switch_chatter_count[jx] = 0;
-                                state_switch_last_dir[jx] = root_info[n_events + n_disc + j];
-                            }
-                        }
-                    }
-                } else {
-                    // Events/sens: reset chatter for any switched residuals.
-                    if (!switched.empty()) {
-                        for (int j : switched) {
-                            const std::size_t jx = static_cast<std::size_t>(j);
-                            state_switch_chattering[jx] = 0;
-                            state_switch_last_declined[jx] = 0;
-                            state_switch_chatter_count[jx] = 0;
-                            state_switch_last_dir[jx] =
-                                (n_state_switch > 0) ? root_info[n_events + n_disc + j] : 0;
                         }
                     }
                 }
