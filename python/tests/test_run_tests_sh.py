@@ -315,6 +315,11 @@ WALK_UP_PROBE = (
 #: because the tree is right there and the script was run from inside it.
 SOURCE_TREE_ABSENT = ("not in this checkout", "no committed stub")
 
+#: test_version_consistency's skip reasons for a checkout with no build tree,
+#: verbatim; TestProbeSkipAccounting pins them against that module's source.
+_NO_BUILD_DIR = "No CMake build dir; skipping CMakeCache cross-check."
+_NO_CMAKE_CACHE = "No CMakeCache.txt under build/; skipping."
+
 
 def _no_build_tree_skips() -> tuple[str, ...]:
     """Skip reasons this checkout earns in place too, so the stand-in is not to blame.
@@ -328,9 +333,9 @@ def _no_build_tree_skips() -> tuple[str, ...]:
     """
     build = _ROOT / "build"
     if not build.is_dir():
-        return ("No CMake build dir; skipping CMakeCache cross-check.",)
+        return (_NO_BUILD_DIR,)
     if not any(build.rglob("CMakeCache.txt")):
-        return ("No CMakeCache.txt under build/; skipping.",)
+        return (_NO_CMAKE_CACHE,)
     return ()
 
 
@@ -366,8 +371,21 @@ def test_the_script_itself_runs_walk_up_dependent_tests_green():
     """
     env = dict(os.environ)
     env["PYTHON"] = sys.executable
+    # -rfEs: -r replaces pytest's default "fE" rather than adding to it, so keep
+    # those and add the skip reasons _unexcused_skips reads. --color=no: FORCE_COLOR
+    # or PY_COLORS=1 in the environment would wrap SKIPPED in ANSI codes it cannot read.
     proc = subprocess.run(
-        ["bash", str(_SCRIPT), "-q", "-rs", "-p", "no:cacheprovider", "-k", WALK_UP_PROBE],
+        [
+            "bash",
+            str(_SCRIPT),
+            "-q",
+            "-rfEs",
+            "--color=no",
+            "-p",
+            "no:cacheprovider",
+            "-k",
+            WALK_UP_PROBE,
+        ],
         cwd=str(_ROOT),
         env=env,
         capture_output=True,
@@ -400,10 +418,6 @@ def test_the_script_itself_runs_walk_up_dependent_tests_green():
         )
 
 
-_NO_BUILD_DIR = "No CMake build dir; skipping CMakeCache cross-check."
-_NO_CMAKE_CACHE = "No CMakeCache.txt under build/; skipping."
-
-
 def _probe_output(*skips: tuple[int, str]) -> tuple[str, str]:
     lines = [f"SKIPPED [{n}] python/tests/test_version_consistency.py:189: {r}" for n, r in skips]
     n_skipped = sum(n for n, _ in skips)
@@ -412,7 +426,10 @@ def _probe_output(*skips: tuple[int, str]) -> tuple[str, str]:
 
 
 class TestProbeSkipAccounting:
-    """The walk-up probe excuses a no-build-tree skip only where it is true in place (#900)."""
+    """The walk-up probe excuses a no-build-tree skip only where it is true in place (#900).
+
+    No name here may contain one of WALK_UP_PROBE's -k words, or the probe runs it too.
+    """
 
     def test_no_build_dir_is_excused_in_a_checkout_without_one(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
@@ -423,13 +440,19 @@ class TestProbeSkipAccounting:
         monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
         assert _unexcused_skips(*_probe_output((1, _NO_CMAKE_CACHE))) == []
 
-    def test_no_build_dir_is_the_stand_ins_fault_where_the_checkout_has_one(
-        self, monkeypatch, tmp_path
+    @pytest.mark.parametrize(
+        ("with_cache", "reason"),
+        [(True, _NO_BUILD_DIR), (True, _NO_CMAKE_CACHE), (False, _NO_BUILD_DIR)],
+        ids=["no-build-dir-vs-a-cache", "no-cache-vs-a-cache", "no-build-dir-vs-an-empty-build"],
+    )
+    def test_a_reason_the_checkout_contradicts_is_the_stand_ins_fault(
+        self, monkeypatch, tmp_path, with_cache, reason
     ):
         (tmp_path / "build" / "cp312").mkdir(parents=True)
-        (tmp_path / "build" / "cp312" / "CMakeCache.txt").write_text("")
+        if with_cache:
+            (tmp_path / "build" / "cp312" / "CMakeCache.txt").write_text("")
         monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
-        assert _unexcused_skips(*_probe_output((1, _NO_BUILD_DIR))) == [f"[1] {_NO_BUILD_DIR}"]
+        assert _unexcused_skips(*_probe_output((1, reason))) == [f"[1] {reason}"]
 
     def test_a_source_tree_skip_is_never_excused(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
@@ -443,7 +466,7 @@ class TestProbeSkipAccounting:
         summary = "===== 77 passed, 2 skipped, 8061 deselected in 7.35s ====="
         assert _unexcused_skips(out, summary) == ["2 skipped, but 1 reported with a reason"]
 
-    def test_the_excused_reasons_are_the_ones_version_consistency_gives(self):
+    def test_the_excused_reasons_are_the_cmake_cross_checks_own_literals(self):
         source = (Path(__file__).parent / "test_version_consistency.py").read_text(
             encoding="utf-8"
         )
