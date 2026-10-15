@@ -160,7 +160,11 @@ two clocks apart, and runs on elapsed time on both backends, which keeps event
 times small at a large `t_start`. RuleMonkey integrates a rate that reads the
 clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
 whose span is too short for the doubles near its times to place them (a span of
-2 at t = 1e13), rather than return a run that never fires.
+2 at t = 1e13), rather than return a run that never fires. A model that reads
+the clock still places its events on absolute time, so once the total
+propensity times |t| nears 1e15 its waiting times are rounded and the run is
+biased with no error, as `method="ssa"` is on any model there (issue #1059).
+Keep such a run's times moderate.
 
 ### Arrhenius (energy) rules
 
