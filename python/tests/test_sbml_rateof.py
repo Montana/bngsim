@@ -1105,6 +1105,187 @@ def test_rateof_of_something_nothing_changes_is_zero_wherever_it_is_read(where, 
         np.testing.assert_allclose(p3, np.where(t > 1.0 + 1e-9, 5.0, 10.0))
 
 
+# ─── rateOf the model has no value for, beyond rule 10224 ────────────────────
+#
+# Each of these loaded with a wrong rate, mostly without a word: a concentration
+# in a compartment an assignmentRule sizes (rule 10225), rateOf of anything but a
+# symbol (10223), and a call to a functionDefinition whose body reads rateOf.
+# None occurs in the semantic suite, the rr_parity BioModels or the events set;
+# all are now refused by name, in the same up-front check as #1046.
+
+_SILENT_FUNCS = {
+    # f(x) := rateOf(x), the csymbol (libsbml rejects it in a lambda, 20304, and
+    # then reports nothing else: only the cases that need f declare it).
+    "f": f"<lambda><bvar><ci>x</ci></bvar><apply>{_RATEOF_CSYMBOL}<ci>x</ci></apply></lambda>",
+    # h(y) := rateOf(y), a call to COPASI's idiom (valid SBML).
+    "h": "<lambda><bvar><ci>y</ci></bvar><apply><ci>rateOf</ci><ci>y</ci></apply></lambda>",
+    # g(z) := 2*f(z), rateOf through another function.
+    "g": "<lambda><bvar><ci>z</ci></bvar><apply><times/><cn>2</cn><apply><ci>f</ci><ci>z</ci>"
+    "</apply></apply></lambda>",
+}
+
+
+def _silent_rateof_model(read: str, where: str, funcs: tuple[str, ...] = ()) -> str:
+    """S -> ∅ at 0.5*S (S0 = 10, so rateOf(S) is -5). In compartment
+    cv := 1 + time: Sc, a concentration; Sa, an amount; Sr, a concentration
+    with rate rule 3; Sk, a constant concentration. ``read`` (MathML) is read
+    at ``where``, an initialAssignment or an assignment rule of p2. ``funcs``
+    names the functionDefinitions to declare besides COPASI's rateOf idiom."""
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    defs = "".join(
+        f'<functionDefinition id="{fid}">{m}{_SILENT_FUNCS[fid]}</math></functionDefinition>'
+        for fid in funcs
+    )
+    defs += f'<functionDefinition id="rateOf">{m}<lambda><bvar><ci>a</ci></bvar><notanumber/>'
+    defs += "</lambda></math></functionDefinition>"
+    ia = rule = ""
+    if where == "initialAssignment:p2":
+        ia = (
+            f'<listOfInitialAssignments><initialAssignment symbol="p2">{m}{read}</math>'
+            "</initialAssignment></listOfInitialAssignments>"
+        )
+    else:
+        rule = f'<assignmentRule variable="p2">{m}{read}</math></assignmentRule>'
+    return f"""
+  <model id="m">
+    <listOfFunctionDefinitions>{defs}</listOfFunctionDefinitions>
+    <listOfCompartments>
+      <compartment id="c" size="1" constant="true"/>
+      <compartment id="cv" size="1" constant="false"/>
+    </listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="10" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+      <species id="Sc" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+      <species id="Sa" compartment="cv" initialAmount="5" hasOnlySubstanceUnits="true"
+               boundaryCondition="false" constant="false"/>
+      <species id="Sr" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+               boundaryCondition="true" constant="false"/>
+      <species id="Sk" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+               boundaryCondition="true" constant="true"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="p2" value="7" constant="false"/>
+      <parameter id="k" value="0.5" constant="true"/>
+    </listOfParameters>
+    {ia}
+    <listOfRules>
+      <assignmentRule variable="cv">{m}<apply><plus/><cn>1</cn>{_TIME_CSYMBOL}</apply></math>
+      </assignmentRule>
+      <rateRule variable="Sr">{m}<cn>3</cn></math></rateRule>
+      {rule}
+    </listOfRules>
+    <listOfReactions>
+      <reaction id="deg" reversible="false">
+        <listOfReactants><speciesReference species="S" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <kineticLaw>{m}<apply><times/><ci>k</ci><ci>S</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>"""
+
+
+_RATE_2S = "<apply><times/><cn>2</cn><ci>S</ci></apply>"
+_FUNC_WHY = "reads rateOf of a parameter of its own"
+
+
+@pytest.mark.parametrize("where", ["initialAssignment:p2", "assignmentRule:p2"])
+@pytest.mark.parametrize(
+    ("read", "funcs", "shown", "why"),
+    [
+        (
+            "<apply><ci>f</ci><ci>S</ci></apply>",
+            ("f",),
+            "f(S)",
+            f"functionDefinition f {_FUNC_WHY}",
+        ),
+        (
+            "<apply><ci>h</ci><ci>S</ci></apply>",
+            ("h",),
+            "h(S)",
+            f"functionDefinition h {_FUNC_WHY}",
+        ),
+        (
+            "<apply><ci>g</ci><ci>S</ci></apply>",
+            ("f", "g"),
+            "g(S)",
+            f"functionDefinition g {_FUNC_WHY} (or calls one that does)",
+        ),
+        (
+            f"<apply>{_RATEOF_CSYMBOL}{_RATE_2S}</apply>",
+            (),
+            "rateOf(2 * S)",
+            "not a single symbol (validation rule 10223)",
+        ),
+        (
+            f"<apply><ci>rateOf</ci>{_RATE_2S}</apply>",
+            (),
+            "rateOf(2 * S)",
+            "not a single symbol (validation rule 10223)",
+        ),
+        (
+            f"<apply>{_RATEOF_CSYMBOL}<ci>Sc</ci></apply>",
+            (),
+            "rateOf(Sc)",
+            "Sc is a concentration in compartment cv, which the assignmentRule "
+            "cv := 1 + time sizes (validation rule 10225)",
+        ),
+        # Constant, so SBML holds its amount: its concentration still moves with
+        # the size (suite 01117). The fold read 0, a rule -5/(1+t)^2.
+        (
+            f"<apply>{_RATEOF_CSYMBOL}<ci>Sk</ci></apply>",
+            (),
+            "rateOf(Sk)",
+            "Sk is a concentration in compartment cv, which the assignmentRule "
+            "cv := 1 + time sizes (validation rule 10225)",
+        ),
+    ],
+    ids=[
+        "csymbol-in-function",
+        "idiom-in-function",
+        "through-a-function",
+        "csymbol-of-2S",
+        "idiom-of-2S",
+        "10225",
+        "10225-constant-species",
+    ],
+)
+def test_a_rateof_with_no_value_is_refused_by_name(read, funcs, shown, why, where):
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(_sbml(_silent_rateof_model(read, where, funcs)))
+    msg = str(exc.value)
+    assert f"{shown} [{where}]: " in msg
+    assert why in msg
+    assert "rate_of__" not in msg
+
+
+@pytest.mark.parametrize(
+    ("read", "funcs", "value"),
+    [
+        # rateOf(S) read directly, beside a function that reads rateOf and that
+        # nothing calls: it is left alone.
+        (f"<apply>{_RATEOF_CSYMBOL}<ci>S</ci></apply>", ("h",), -5.0),
+        # An amount in the rule-sized compartment has a rate of its own: no
+        # reaction changes Sa, so 0 (the size's change is #736's business).
+        (f"<apply>{_RATEOF_CSYMBOL}<ci>Sa</ci></apply>", (), 0.0),
+        # A concentration there whose rate its own rate rule states, whatever
+        # the compartment does.
+        (f"<apply>{_RATEOF_CSYMBOL}<ci>Sr</ci></apply>", (), 3.0),
+    ],
+    ids=[
+        "uncalled-function",
+        "amount-in-a-sized-compartment",
+        "rate-ruled-concentration",
+    ],
+)
+def test_a_rateof_with_a_value_still_loads(read, funcs, value):
+    model = bngsim.Model.from_sbml_string(
+        _sbml(_silent_rateof_model(read, "initialAssignment:p2", funcs))
+    )
+    assert model.get_param("p2") == pytest.approx(value)
+
+
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
 #
 # A trigger gated on rateOf fires when the CVODE root finder brackets the crossing.
