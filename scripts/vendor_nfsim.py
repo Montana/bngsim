@@ -381,8 +381,7 @@ CARRY_QUEUE = (
             {
                 "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
                 "summary": (
-                    "bngsim: throw instead of exit(1) where a BNG-written function cannot "
-                    "be built"
+                    "bngsim: throw instead of exit(1) where a BNG-written function cannot be built"
                 ),
             },
         ],
