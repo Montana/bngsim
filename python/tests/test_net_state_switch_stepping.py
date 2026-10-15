@@ -984,18 +984,18 @@ def test_a_held_residual_leaving_its_band_is_no_root(tmp_path):
 
 # S slides on S = 1 while a() decays; dn() then takes S down and out of its
 # band, and much later v() carries it back up across S = 1 in large steps, a
-# crossing the restart test carries. Written with {dlt} for the drift and
-# {cond} for the condition.
+# crossing the restart test carries. Written with {dlt} for the drift, {lam}
+# for how fast a() decays, {kd} for K's decay, and {cond} for the condition.
 _SLIDE_LEAVE_NET = """\
 begin parameters
     1 V    0.2
     2 tp   3.0
     3 sig  0.3
     4 dlt  {dlt}
-    5 kd   2.0
+    5 kd   {kd}
 end parameters
 begin functions
-    1 a() exp(-10*time())
+    1 a() exp(-{lam}*time())
     2 f() if({cond},a(),-a())
     3 v() V*exp(-((time()-tp)/sig)^2)
     4 dn() -dlt
@@ -1019,13 +1019,13 @@ end groups
 _HOLD_CASES = {
     # Held until the next restart instead, the crossing back went unseen in a
     # step nothing else ended, and the run kept a step main restarts in.
-    "leaves its band, then crosses": dict(dlt=0.001, cond="Sobs<1"),
+    "leaves its band, then crosses": dict(dlt=0.001, lam=10, kd=2, cond="Sobs<1"),
     # S leaves fast. Taken for a root of the residual, the band's end is given
     # the restart test off the surface, which carries it.
-    "leaves its band fast": dict(dlt=0.1, cond="Sobs<1"),
-    # dg/dS = K falls 400-fold while S slides. Measured once, the band stays
-    # as wide as it was, and the crossing back lies inside it.
-    "dg/dx shrinks while held": dict(dlt=0.001, cond="Sobs*Kobs<Kobs"),
+    "leaves its band fast": dict(dlt=0.1, lam=10, kd=2, cond="Sobs<1"),
+    # dg/dS = K falls by e^-12 while S slides and parks. Measured once, the
+    # band stays as wide as it was, and the crossing back lies inside it.
+    "dg/dx shrinks while held": dict(dlt=0.001, lam=6, kd=4, cond="Sobs*Kobs<Kobs"),
 }
 
 
