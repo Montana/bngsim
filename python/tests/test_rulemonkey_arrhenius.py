@@ -176,6 +176,8 @@ MISREADS = {
     "rule_context": "rules '_R1'",
     # Unbinding inside a ring: the product stays one complex.
     "ringopen": "rules '_R1'",
+    # A one-way rule named like a reverse half, which RuleMonkey gives 1-phi.
+    "revname": "rules '_reverse_u'",
     "plain_two_a": "energy patterns 'A(b!1).B(a1!1,a2!2).A(b!2)'",
     "samename_explicit": "energy patterns 'L(r!1,r!2).R(l!1).R(l!2)'",
 }

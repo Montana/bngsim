@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -169,25 +170,28 @@ rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times, bool model_time)
 void require_finite_span(const char *where, double t_from, double t_to) {
     if (!std::isfinite(t_from) || !std::isfinite(t_to)) {
         std::ostringstream os;
-        os << where << ": t_start and t_end must be finite, got " << t_from << " and " << t_to;
+        os << std::setprecision(17) << where << ": t_start and t_end must be finite, got " << t_from
+           << " and " << t_to;
         throw std::runtime_error(os.str());
     }
 }
 
 // RuleMonkey integrates a rate that reads the clock on panels of at most a
 // thousandth of a call's span, placed at t + k*h (engine.cpp, issue #86).
-// Where the doubles near t cannot place them to one part in a million, the
+// Where the doubles near t cannot place them to one part in a thousand, the
 // integral comes out wrong or never advances, with no error: a span of 2 at
-// t = 1e13 fired nothing (issue #1022). Refuse such a call.
+// t = 1e13, panels of one spacing each, fired nothing (issue #1022). Refuse such
+// a call.
 void require_resolvable_clock(double t_from, double t_to) {
     const double h = (t_to - t_from) / 1000.0;
     const double t = std::max(std::fabs(t_from), std::fabs(t_to));
     const double spacing = std::nextafter(t, std::numeric_limits<double>::infinity()) - t;
-    if (h > 0.0 && spacing > h * 0x1p-20) {
+    if (h > 0.0 && spacing > h * 0x1p-10) {
         std::ostringstream os;
-        os << "RuleMonkey cannot integrate a rate that reads the clock from t = " << t_from
-           << " to " << t_to << ": the doubles near t = " << t << " are " << spacing
-           << " apart, too coarse for its integration panels of " << h
+        os << std::setprecision(17)
+           << "RuleMonkey cannot integrate a rate that reads the clock from t = " << t_from
+           << " to " << t_to << ": the doubles near t = " << t << " are " << std::setprecision(3)
+           << spacing << " apart, too coarse for its integration panels of " << h
            << ". Run a longer span, or one nearer t = 0 (issue #1022).";
         throw std::runtime_error(os.str());
     }

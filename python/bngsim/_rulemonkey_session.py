@@ -147,15 +147,18 @@ class RuleMonkeySession:
             exposed via the :attr:`seed` property and stamped onto every
             ``Result`` returned by :meth:`simulate`.
         t_start : float, optional
-            Where the seed state sits on the model's clock: :attr:`current_time`
-            reads it, and a rate law that reads ``time()`` starts from its
-            value there. ``None`` (default) starts the clock at 0, and lets the
-            first :meth:`simulate` move the seed state to its own start if
-            nothing has moved the session first (:meth:`step_to`, or a change
-            to its molecules) and the model reads the clock, so that
-            ``initialize(seed)`` then ``simulate(5, 7, ...)`` runs the model
-            from its initial state at t = 5, as ``Simulator.run(t_span=(5, 7))``
-            does (issue #1022).
+            For a model that reads the clock (``time()``, or a table function
+            indexed by time), where the seed state sits on the model's clock:
+            :attr:`current_time` reads it, and a rate law that reads ``time()``
+            starts from its value there. ``None`` (default) starts the clock at
+            0, and lets the first :meth:`simulate` move the seed state to its
+            own start if nothing has moved the session first (:meth:`step_to`,
+            or a change to its molecules), so that ``initialize(seed)`` then
+            ``simulate(5, 7, ...)`` runs the model from its initial state at
+            t = 5, as ``Simulator.run(t_span=(5, 7))`` does (issue #1022). A
+            model that reads no clock cannot tell, and its session always
+            starts at 0, which keeps event times small; a segment from
+            ``t_start`` is labelled with its own times.
         """
         from bngsim._seed import _resolve_seed
 
@@ -165,7 +168,7 @@ class RuleMonkeySession:
         if not math.isfinite(t0):
             raise ValueError(f"t_start must be finite, got {t_start!r}")
         try:
-            self._core.initialize(used_seed, t0)
+            self._core.initialize(used_seed, t0 if self._clock_readers else 0.0)
         except RuntimeError as e:
             raise SimulationError(f"RuleMonkey initialization failed: {e}") from e
         self._initialized = True

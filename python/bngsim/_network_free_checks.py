@@ -192,6 +192,7 @@ def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[
     names it better than this check could."""
     centers: list[tuple[Site, Site]] = []
     with_context: list[str] = []
+    rule_names = {r.get("name") for r in root.iter() if _local(r.tag) == "ReactionRule"}
     for rule in root.iter():
         if _local(rule.tag) != "ReactionRule" or not any(
             (rl.get("type") or "").lower() == "arrhenius" for rl in _children(rule, "RateLaw")
@@ -235,8 +236,13 @@ def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[
                 or (comps[0].get("id") or "") not in (a, b)
             ):
                 bare = False
+        # It takes a rule named _reverse_X for the reverse half of rule X and
+        # gives it 1-phi, which a one-way rule of that name is not.
+        name = rule.get("name") or ""
+        if name.startswith("_reverse_") and name[len("_reverse_") :] not in rule_names:
+            bare = False
         if not bare:
-            with_context.append(rule.get("name") or rule.get("id") or "?")
+            with_context.append(name or rule.get("id") or "?")
     return centers, with_context, False
 
 

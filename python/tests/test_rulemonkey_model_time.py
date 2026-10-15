@@ -339,8 +339,9 @@ def test_a_clock_too_coarse_to_integrate_over_is_refused():
     panels of 0.002: RuleMonkey fired nothing where a constant rate written
     through time() should have left 135 of 1000. A longer span, or one nearer
     0, runs."""
-    with pytest.raises(bngsim.SimulationError, match="too coarse"):
+    with pytest.raises(bngsim.SimulationError, match="too coarse") as err:
         _rm(f"{RAMP}.xml", 1, t_span=(1e13, 1e13 + 2.0), n_points=3)
+    assert "to 10000000000002" in str(err.value)
     with bngsim.RuleMonkeySession(f"{RAMP}.xml") as s:
         s.initialize(seed=1, t_start=1e13)
         with pytest.raises(bngsim.SimulationError, match="too coarse"):
@@ -352,3 +353,35 @@ def test_a_clock_too_coarse_to_integrate_over_is_refused():
         _rm(str(NF / "first_order_switch.xml"), 1, t_span=(1e13, 1e13 + 2.0), n_points=3).n_times
         == 3
     )
+
+
+def test_a_session_steps_finely_on_a_clock_far_from_zero():
+    """1000 segments of 0.01 from t = 86400, a day in seconds: panels of 1e-5
+    against doubles 1.5e-11 apart, which RuleMonkey integrates over correctly
+    and the resolution check lets through. f() is 0.5 from t = 6 on."""
+    a0 = []
+    for seed in (1, 2):
+        with bngsim.RuleMonkeySession(str(SWITCH)) as s:
+            s.initialize(seed=seed, t_start=86400.0)
+            t = 86400.0
+            for _ in range(1000):
+                r = s.simulate(t, t + 0.01, n_points=2)
+                t += 0.01
+            a0.append(r.observables["A0"][-1])
+    q = math.exp(-0.5 * 10.0)
+    _assert_mean(np.asarray(a0)[:, None], np.array([20000 * q]), np.array([20000 * q * (1 - q)]))
+
+
+def test_a_session_of_a_clock_free_model_starts_at_zero_whatever_its_start():
+    """A model that reads no clock cannot tell model time from elapsed time, so
+    its session runs from 0, as it always has, and keeps event times small: on
+    a clock at 1e12 every waiting time of 1e-4 would round away. A segment from
+    t_start is the one-shot run, labelled with its own times."""
+    xml = str(NF / "first_order_switch.xml")
+    one_shot = _rm(xml, 3, t_span=(0.0, 2.0), n_points=3)
+    with bngsim.RuleMonkeySession(xml) as s:
+        s.initialize(seed=3, t_start=1e12)
+        assert s.current_time == 0.0
+        r = s.simulate(1e12, 1e12 + 2.0, n_points=3)
+    np.testing.assert_array_equal(r.time, [1e12, 1e12 + 1.0, 1e12 + 2.0])
+    np.testing.assert_array_equal(np.asarray(r.observables), np.asarray(one_shot.observables))
