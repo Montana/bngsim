@@ -10,6 +10,7 @@ initialAssignment evaluation, MathML→ExprTk expression translation.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import io
 import logging
@@ -236,6 +237,39 @@ _RATEOF_PREFIX = "rate_of__"
 # instead of inlining the funcDef's NaN body.
 _RATEOF_FUNCDEF = object()
 
+# The parameters, compartments and speciesReference ids of the model being
+# built that no rule sets.
+# Their rate of change is 0 at every time, and the builder binds a
+# ``rate_of__`` accessor only for a state, so :func:`_rateof_call` emits the 0
+# for them. Set by the build, which runs in a context of its own, so a load
+# never sees another load's names.
+_RATEOF_CONSTANT_SYMBOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "_RATEOF_CONSTANT_SYMBOLS", default=frozenset()
+)
+
+
+def _rateof_constant_symbols(sbml_model) -> frozenset[str]:
+    """Parameters, compartments and speciesReference ids (stoichiometries)
+    that no rate or assignment rule sets.
+
+    One an event assigns is among them: an event's assignment is a jump, not a
+    rate, so between events it holds and its rate is 0. (bngsim makes it a
+    state, whose accessor reads that same 0.)
+    """
+    ruled = set()
+    for i in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(i)
+        if rule.isRate() or rule.isAssignment():
+            ruled.add(rule.getVariable())
+    names = {sbml_model.getParameter(i).getId() for i in range(sbml_model.getNumParameters())}
+    names |= {sbml_model.getCompartment(i).getId() for i in range(sbml_model.getNumCompartments())}
+    names |= {
+        sr.getId()
+        for sr in _iter_species_references(sbml_model)
+        if hasattr(sr, "getId") and sr.getId()
+    }
+    return frozenset(names - ruled)
+
 
 def _rateof_token(species_name: str) -> str:
     """Accessor token for ``rateOf(<species_name>)``. Must match the C++
@@ -258,11 +292,18 @@ def _rateof_call(node: libsbml.ASTNode, local_params: dict | None = None) -> str
     It also has no species index — emitting the accessor would either fail to
     compile (no global of that name) or silently bind to a same-named global,
     so the local-scope check both fixes the value and avoids the mis-bind.
+
+    So is a parameter, compartment or speciesReference id that no rule sets
+    (``_RATEOF_CONSTANT_SYMBOLS``): its rate is ``0``, and for one no event
+    assigns either, its accessor, bound to nothing, failed to compile (#1045's
+    case, outside an initial value).
     """
     if node.getNumChildren() >= 1:
         arg = node.getChild(0)
         if arg.getType() == libsbml.AST_NAME and arg.getName():
             if local_params and arg.getName() in local_params:
+                return "0"
+            if arg.getName() in _RATEOF_CONSTANT_SYMBOLS.get():
                 return "0"
             return _rateof_token(arg.getName())
     logger.warning("rateOf() with a non-symbol argument is unsupported; emitting 0")
@@ -4295,6 +4336,12 @@ class _FastSbmlModel:
 
 def _build_model_from_sbml_doc(doc):
     """Build a BNGsim Model from a parsed libsbml Document."""
+    # In a context of its own: what the build sets for the emitter
+    # (_RATEOF_CONSTANT_SYMBOLS) ends with it, however it ends.
+    return contextvars.copy_context().run(_build_model_from_sbml_doc_in_context, doc)
+
+
+def _build_model_from_sbml_doc_in_context(doc):
     from bngsim._bngsim_core import ModelBuilder
     from bngsim._model import Model
     from bngsim._ssa_validation import SsaIssue
@@ -4372,6 +4419,8 @@ def _build_model_from_sbml_doc(doc):
     # below would take it for a constant (rate 0) and before the emitter would
     # write a rate accessor that nothing binds.
     _check_rateof_targets(sbml_model, func_defs)
+    # What no rule sets has rate 0 wherever it is read (see _rateof_call).
+    _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
 
     # ── 0. Evaluate initialAssignments ────────────────────────────────
     # SBML initialAssignment elements compute ICs from expressions.
