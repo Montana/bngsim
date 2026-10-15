@@ -237,7 +237,8 @@ _RATEOF_PREFIX = "rate_of__"
 # instead of inlining the funcDef's NaN body.
 _RATEOF_FUNCDEF = object()
 
-# The parameters and compartments of the model being built that no rule sets.
+# The parameters, compartments and speciesReference ids of the model being
+# built that no rule sets.
 # Their rate of change is 0 at every time, and the builder binds a
 # ``rate_of__`` accessor only for a state, so :func:`_rateof_call` emits the 0
 # for them. Set by the build, which runs in a context of its own, so a load
@@ -248,7 +249,8 @@ _RATEOF_CONSTANT_SYMBOLS: contextvars.ContextVar[frozenset[str]] = contextvars.C
 
 
 def _rateof_constant_symbols(sbml_model) -> frozenset[str]:
-    """Parameters and compartments that no rate or assignment rule sets.
+    """Parameters, compartments and speciesReference ids (stoichiometries)
+    that no rate or assignment rule sets.
 
     One an event assigns is among them: an event's assignment is a jump, not a
     rate, so between events it holds and its rate is 0. (bngsim makes it a
@@ -261,6 +263,11 @@ def _rateof_constant_symbols(sbml_model) -> frozenset[str]:
             ruled.add(rule.getVariable())
     names = {sbml_model.getParameter(i).getId() for i in range(sbml_model.getNumParameters())}
     names |= {sbml_model.getCompartment(i).getId() for i in range(sbml_model.getNumCompartments())}
+    names |= {
+        sr.getId()
+        for sr in _iter_species_references(sbml_model)
+        if hasattr(sr, "getId") and sr.getId()
+    }
     return frozenset(names - ruled)
 
 
@@ -286,7 +293,7 @@ def _rateof_call(node: libsbml.ASTNode, local_params: dict | None = None) -> str
     compile (no global of that name) or silently bind to a same-named global,
     so the local-scope check both fixes the value and avoids the mis-bind.
 
-    So is a parameter or compartment that no rule sets
+    So is a parameter, compartment or speciesReference id that no rule sets
     (``_RATEOF_CONSTANT_SYMBOLS``): its rate is ``0``, and for one no event
     assigns either, its accessor, bound to nothing, failed to compile (#1045's
     case, outside an initial value).
