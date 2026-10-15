@@ -4719,37 +4719,118 @@ def _build_model_from_sbml_doc_in_context(doc):
     # (MODEL1606100000 / issue #73: a stale ``ModelValue_19`` = +322026 instead
     # of ``cin0`` = -4807974 flips the boundary species ``Osmin`` to the wrong
     # sign — bngsim disagreed with both RoadRunner and COPASI until this fix).
-    if sbml_model.getNumInitialAssignments() > 0:
-        for _pass in range(10):
-            changed = False
-            for j in range(sbml_model.getNumInitialAssignments()):
-                ia = sbml_model.getInitialAssignment(j)
-                sym = ia.getSymbol()
-                math = ia.getMath()
-                if math is None:
-                    continue
-                val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
-                if val is not None and _ia_value_changed(val, ia_values.get(sym)):
-                    eval_ctx[sym] = val
-                    ia_values[sym] = val
-                    changed = True
-            for j in range(sbml_model.getNumRules()):
-                rule = sbml_model.getRule(j)
-                if not rule.isAssignment():
-                    continue
-                var = rule.getVariable()
-                math = rule.getMath()
-                if math is None:
-                    continue
-                val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
-                if val is not None and _ia_value_changed(val, ia_values.get(var)):
-                    eval_ctx[var] = val
-                    ia_values[var] = val
-                    changed = True
-            if _refresh_reaction_ids():
+    #
+    # Run it with no initialAssignment too: the override above is one pass in
+    # document order, so a rule that reads a later rule's target (``c2 := v``
+    # before ``v := 2*p``) reads it unset or stale, and only this loop settles
+    # it. A compartment sized that way loaded with volume factor 1 and divided
+    # every reaction across compartments by 1 instead of its size (issue #994).
+    #
+    # A species whose symbol the seed above bound through a conversion by its
+    # compartment's size (an amount declared for a concentration symbol, or a
+    # concentration declared for an amount symbol) was converted with the
+    # DECLARED size. Where an initialAssignment or a rule gives the size, the
+    # size at the start is that one, so the loop converts again as the size
+    # settles: `q = B`, with B declared as amount 0.8 in `c2 := 2*p` (declared
+    # 1), folded 0.8 where the concentration at the start is 0.2. A species with
+    # its own initialAssignment or rule takes that value instead.
+    _set_by_math = {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+    } | {
+        sbml_model.getRule(j).getVariable()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isAssignment()
+    }
+    _size_converted: list[tuple[str, str, float, bool]] = []  # sid, cid, declared, divide
+    for _j in range(sbml_model.getNumSpecies()):
+        _sp = sbml_model.getSpecies(_j)
+        _spid, _spc = _sp.getId(), _sp.getCompartment()
+        if _spc not in _set_by_math or _spid in _set_by_math:
+            continue
+        if _sp.getHasOnlySubstanceUnits():
+            if _sp.isSetInitialConcentration():
+                _size_converted.append((_spid, _spc, _sp.getInitialConcentration(), False))
+        elif _sp.isSetInitialAmount() and not _sp.isSetInitialConcentration():
+            _size_converted.append((_spid, _spc, _sp.getInitialAmount(), True))
+
+    def _reconvert_species() -> bool:
+        """Convert each size-converted species with its compartment's current
+        size, as the seed did with the declared one; True if one moved."""
+        moved = False
+        for _sid, _cid, _declared, _divide in _size_converted:
+            _vol = eval_ctx.get(_cid, 1.0)
+            if not _math.isfinite(_vol):
+                _vol = 1.0  # what the seed and the compartment loop use (#353)
+            _v = (_declared / _vol if _vol else 0.0) if _divide else _declared * _vol
+            if _ia_value_changed(_v, eval_ctx.get(_sid)):
+                eval_ctx[_sid] = _v
+                moved = True
+        return moved
+
+    # Each pass settles every symbol whose inputs had settled when it began. A
+    # chain needs another pass only where a symbol reads one the pass moves after
+    # it. Within a pass the initialAssignments go first, then the rules, then the
+    # converted species, then the reaction ids, so that reader is an
+    # initialAssignment or rule that reads something the loop moves (directly,
+    # or through rateOf, which reads the kinetic laws), or a reaction id whose
+    # law reads another reaction's id; a converted species reads only sizes,
+    # which move before it. One pass per such reader, plus one, reaches the
+    # fixed point of any acyclic model, and a model that needs fewer breaks
+    # early. Counting every symbol instead would let a circular definition
+    # (illegal SBML, which never settles) cost a pass per rule or reaction,
+    # each pass re-evaluating all of them.
+    _moved = (
+        _set_by_math | {_rid for _rid, _law, _lps in _rid_laws} | {s[0] for s in _size_converted}
+    )
+    _rid_names = {_rid for _rid, _law, _lps in _rid_laws}
+    _rateof_fds = {name for name, (_p, _b) in func_defs.items() if _b is _RATEOF_FUNCDEF}
+    _fold_maths = [
+        sbml_model.getInitialAssignment(j).getMath()
+        for j in range(sbml_model.getNumInitialAssignments())
+    ] + [
+        sbml_model.getRule(j).getMath()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isAssignment()
+    ]
+    _readers = sum(
+        1
+        for _m in _fold_maths
+        if _m is not None and (_ast_name_set(_m) & _moved or _ast_has_rateof(_m, _rateof_fds))
+    ) + sum(1 for _rid, _law, _lps in _rid_laws if _ast_name_set(_law) & _rid_names)
+    _settle_passes = max(10, _readers + 1)
+    for _pass in range(_settle_passes):
+        changed = False
+        for j in range(sbml_model.getNumInitialAssignments()):
+            ia = sbml_model.getInitialAssignment(j)
+            sym = ia.getSymbol()
+            math = ia.getMath()
+            if math is None:
+                continue
+            val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
+            if val is not None and _ia_value_changed(val, ia_values.get(sym)):
+                eval_ctx[sym] = val
+                ia_values[sym] = val
                 changed = True
-            if not changed:
-                break
+        for j in range(sbml_model.getNumRules()):
+            rule = sbml_model.getRule(j)
+            if not rule.isAssignment():
+                continue
+            var = rule.getVariable()
+            math = rule.getMath()
+            if math is None:
+                continue
+            val = _eval_ast_numeric(math, eval_ctx, func_defs, rateof_resolver=rateof_resolver)
+            if val is not None and _ia_value_changed(val, ia_values.get(var)):
+                eval_ctx[var] = val
+                ia_values[var] = val
+                changed = True
+        if _reconvert_species():
+            changed = True
+        if _refresh_reaction_ids():
+            changed = True
+        if not changed:
+            break
 
     # ── C2: reject missing-value parameters that are actually consumed (internal#94) ──
     # SBML allows <parameter id="X"/> with no `value=` attribute. Defaulting it
