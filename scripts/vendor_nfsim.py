@@ -364,23 +364,25 @@ CARRY_QUEUE = (
         ],
     },
     {
-        "topic": "bngsim/carry-dor-exit-to-exception",
+        "topic": "bngsim/carry-function-build-exit-to-exception",
         "kind": "local",
         "status": (
-            "Throw std::runtime_error instead of calling exit(1) in DORRxnClass, "
-            "DOR2RxnClass, Observable and SpeciesObservable. A rule NFsim cannot build -- a "
-            "BNG-written local-function rate law that reads both reactants, or a local "
-            "function that reads a Species observable -- killed the host process with no "
-            "message; NFinput now fails the load and the host reports it. Same conversion "
-            "as bngsim/carry-exit-to-exception, for files it left out. See bngsim GH #854's "
-            "review."
+            "Throw std::runtime_error instead of calling exit(1) where NFsim cannot build a "
+            "BNG-written function or a rule that reads one: DORRxnClass/DOR2RxnClass, "
+            "Observable/SpeciesObservable, LocalFunction's constructor and "
+            "prepareForSimulation(), and createCompositeFunction. A local-function rate law "
+            "reading both reactants, a local function reading a Species observable, a "
+            "two-argument local function, or a composite function reading an observable "
+            "killed the host process with no message; NFinput now fails the load and the "
+            "host reports it. Same conversion as bngsim/carry-exit-to-exception, for files it "
+            "left out. See bngsim GH #854's review."
         ),
         "commits": [
             {
-                "commit": "037f8d0febec6a5a4f2426e0fed5db0eed7a31b1",
+                "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
                 "summary": (
-                    "bngsim: throw instead of exit(1) in the DOR reaction classes and "
-                    "observables"
+                    "bngsim: throw instead of exit(1) where a BNG-written function cannot "
+                    "be built"
                 ),
             },
         ],

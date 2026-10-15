@@ -1,33 +1,44 @@
-From 037f8d0febec6a5a4f2426e0fed5db0eed7a31b1 Mon Sep 17 00:00:00 2001
+From 7a8a2da7a51c2beed0fa431f03a40d317508e830 Mon Sep 17 00:00:00 2001
 From: Bill Hlavacek <bill.hlavacek@gmail.com>
 Date: Thu, 15 Oct 2026 13:18:27 -0600
-Subject: [PATCH] bngsim: throw instead of exit(1) in the DOR reaction classes
- and observables
+Subject: [PATCH] bngsim: throw instead of exit(1) where a BNG-written function
+ cannot be built
 
-DORRxnClass, DOR2RxnClass, Observable and SpeciesObservable called
-exit(1) on an error, so a model NFsim cannot run killed the host process
-with no message. BNG-written models reach two of them at load:
+NFsim called exit(1) when it could not build a function or a rule that
+reads one, so a model NFsim cannot run killed the host process with no
+message. BNG-written models reach these at load:
 
 - A(b)%x + B(a)%y -> A(b!1).B(a!1) fA(x)*fB(y), with fA and fB reading
-  Molecules observables: the local-function rate law reads both
-  reactants, which DORRxnClass does not support.
+  Molecules observables: the rate law reads both reactants, which
+  DORRxnClass does not support.
 - The same rule with Species observables: a local function cannot read a
   Species observable, because SpeciesObservable::clone() was never written
   ("not yet updated ... fix me").
+- fAB(x,y) = k*(1+SA(x))*(1+SB(y)) on that rule: a local function takes
+  one argument (LocalFunction's constructor).
+- g() = f() + k*SB: a function that calls another function cannot also
+  read an observable (createCompositeFunction, whose return value
+  createFunction ignores, so only a throw stops the load).
 
-bngsim's Python process exited with code 1 during initialize() on both.
-Throw std::runtime_error naming the rule or observable and the reason, as
-carry 0005 did for six other files. Load-time throws are caught by
-NFinput::initReactionRules and NFinput::initFunctions, which fail the load,
-so the host reports them; the internal-error paths at run time
+bngsim's Python process exited with code 1 during initialize() on each.
+Throw std::runtime_error naming the function, rule or observable and the
+reason, as carry 0005 did for six other files: every live exit(1) in
+DORreaction.cpp and observable.cpp, LocalFunction's constructor checks
+and its muParser failure in prepareForSimulation(), and the composite
+check in parseFuncXML.cpp. NFinput::initReactionRules and
+NFinput::initFunctions catch the load-time throws and fail the load, and
+bngsim's prepare_system turns a prepareForSimulation() throw into an
+error, so the host reports each. The internal-error paths at run time
 (Observable::subtract, rate-factor changes on a non-DOR reactant) now
 raise rather than exit. The ReactionClass destructor that runs when a
-derived constructor throws frees only arrays the base constructor has
+DOR constructor throws frees only arrays the base constructor has
 already allocated. (bngsim issue #854 review)
 ---
  src/NFcore/observable.cpp                 |  9 ++++---
+ src/NFfunction/localFunction.cpp          |  7 ++---
+ src/NFinput/parseFuncXML.cpp              |  3 ++-
  src/NFreactions/reactions/DORreaction.cpp | 33 ++++++++++++-----------
- 2 files changed, 22 insertions(+), 20 deletions(-)
+ 4 files changed, 28 insertions(+), 24 deletions(-)
 
 diff --git a/src/NFcore/observable.cpp b/src/NFcore/observable.cpp
 index fe6f1d0..7725596 100644
@@ -75,6 +86,63 @@ index fe6f1d0..7725596 100644
 +	throw std::runtime_error("SpeciesObservable " + obsName + ": compared to a molecule; a Species observable matches complexes only");
  
  }
+ 
+diff --git a/src/NFfunction/localFunction.cpp b/src/NFfunction/localFunction.cpp
+index ec65dab..ba517f6 100644
+--- a/src/NFfunction/localFunction.cpp
++++ b/src/NFfunction/localFunction.cpp
+@@ -7,6 +7,7 @@
+ 
+ 
+ #include "NFfunction.hh"
++#include <stdexcept>
+ 
+ 
+ 
+@@ -57,12 +58,12 @@ LocalFunction::LocalFunction(System *s,
+ 	if(args.size()>1) {
+ 		cerr<<"For efficiency, local functions currently support a maximum of 1 argument."<<endl;
+ 		cerr<<"Quitting now."<<endl;
+-		exit(1);
++		throw std::runtime_error("LocalFunction " + name + ": a local function can take only one argument, so it can read only one reactant");
+ 	}
+ 	if(args.size()<1) {
+ 		cerr<<"When creating a local Function, ERROR!! there were no args, so it is a global function."<<endl;
+ 		cerr<<"Quitting now."<<endl;
+-		exit(1);
++		throw std::runtime_error("LocalFunction " + name + ": a local function needs an argument");
+ 	}
+ 
+ 	//Do the basics first...
+@@ -213,7 +214,7 @@ void LocalFunction::prepareForSimulation(System *s) {
+ 		cout<<"Error creating local function "<<name<<" in class LocalFunction!!  This is what happened:"<<endl;
+ 		cout<< "  "<<e.GetMsg() << endl;
+ 		cout<<"Quitting."<<endl;
+-		exit(1);
++		throw std::runtime_error("LocalFunction " + name + ": cannot parse its expression: " + e.GetMsg());
+ 	}
+ }
+ 
+diff --git a/src/NFinput/parseFuncXML.cpp b/src/NFinput/parseFuncXML.cpp
+index 733ba53..a52d495 100644
+--- a/src/NFinput/parseFuncXML.cpp
++++ b/src/NFinput/parseFuncXML.cpp
+@@ -4,6 +4,7 @@
+ #include <cctype>
+ #include <cstdlib>
+ #include <sstream>
++#include <stdexcept>
+ 
+ 
+ 
+@@ -193,7 +194,7 @@ bool createCompositeFunction(string name,
+ 		} else if(refType=="Observable" || refType=="MoleculeObservable" || refType=="SpeciesObservable") {
+ 			cerr<<"Composite Functions (functions that call other functions) cannot have"<<endl;
+ 			cerr<<"references to observables.  You must put those in base level functions."<<endl;
+-			exit(1);
++			throw std::runtime_error("Function " + name + ": a function that calls another function cannot also read an observable");
+ 		}
+ 	}
  
 diff --git a/src/NFreactions/reactions/DORreaction.cpp b/src/NFreactions/reactions/DORreaction.cpp
 index 238e9ff..c115ab5 100644

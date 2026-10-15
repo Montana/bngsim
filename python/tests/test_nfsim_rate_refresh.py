@@ -15,9 +15,11 @@ its parameters no longer gave, with no warning:
   BioNetGen does not apply and gets one-way rules wrong (RuleWorld/nfsim#102).
   They are refused by name until the vendored NFsim carries the upstream fix,
   and so is a rate-law type NFsim does not implement: it dropped a Hill rule.
-* A local-function rate law reading both reactants, or a local function reading
-  a Species observable, made NFsim call exit(1) and kill the Python process
-  (carry 0019); the load now fails with an error.
+* A function NFsim cannot build -- a local-function rate law reading both
+  reactants, a local function reading a Species observable or taking two
+  arguments, a function calling a function and reading an observable -- made
+  NFsim call exit(1) and kill the Python process (carry 0019). The load now
+  fails with an error.
 
 The oracle for a post-init write is the same model with the new value written
 into the XML and no override at all. That load path never runs the refresh, so
@@ -280,7 +282,11 @@ def test_rate_laws_nfsim_implements_are_not_refused(data_dir: Path, fixture):
         # fA(x)*fB(y): a local-function rate law reading both reactants.
         ("local_function_two_reactants.xml", "only support one DOR reactant"),
         # The same rule with fA and fB reading Species observables.
-        ("local_function_species_observable.xml", "Failed to load XML file"),
+        ("local_function_species_observable.xml", "clone species observable"),
+        # fAB(x,y): one local function with an argument for each reactant.
+        ("local_function_two_arguments.xml", "maximum of 1 argument"),
+        # g() = f() + k*SB: a function calling a function and reading an observable.
+        ("composite_function_reads_observable.xml", "Composite Functions"),
     ],
 )
 def test_a_rule_nfsim_cannot_build_fails_the_load_not_the_process(data_dir: Path, fixture, says):
