@@ -39,6 +39,8 @@ What this locks:
 """
 
 import math
+import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -1035,7 +1037,10 @@ def test_holding_takes_the_steps_main_takes(tmp_path, monkeypatch, case):
     the run does at one: every crossing main restarts at is still restarted
     at. Each run here takes every step it takes with holding off
     (BNGSIM_STATE_SWITCH_HOLD=0), which roots and tests every crossing as main
-    does, and ends on the same bits."""
+    does, and ends on the same bits. Each hold here ends where the state leaves
+    its band. One that ends inside a slide, or a held crossing the run
+    restarts at, lands within CVODE's root tolerance of main's restart instead,
+    and the answers agree to the tolerance rather than to the bit."""
     text = _SLIDE_LEAVE_NET.format(**_HOLD_CASES[case])
     run = dict(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8, max_step=0.05)
     result = bngsim.Simulator(_write(tmp_path, text)).run(**run)
@@ -1064,3 +1069,32 @@ def test_a_held_slide_prints_nothing(tmp_path):
     )
     assert "S 0.99999" in done.stdout
     assert "mxstep" not in done.stdout + done.stderr
+
+
+def _batch_ends_after(path, hold, after):
+    """The times CVODE logs a batch ending at, past ``after``, in a run of
+    ``path`` with holding on or off; in a subprocess, as above."""
+    script = textwrap.dedent(f"""
+        import bngsim
+        m = bngsim.Model.from_net({str(path)!r})
+        bngsim.Simulator(m).run(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8,
+                                max_step=0.05, max_steps=20)
+    """)
+    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold)
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
+    )
+    times = re.findall(r"At t = ([0-9.eE+-]+), mxstep", done.stdout + done.stderr)
+    return [t for t in times if float(t) > after]
+
+
+def test_a_released_hold_logs_what_main_logs(tmp_path):
+    """While a run holds a residual, CVODE's error log is in the null sink; once
+    nothing is held it goes back. Kept in the sink for the rest of the run, the
+    batch ends after S has left its band (t > 1, in 20-step batches) went
+    unlogged, where the run with holding off logs 4 of them."""
+    path = tmp_path / "leave.net"
+    path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
+    off = _batch_ends_after(path, "0", 1.0)
+    assert off
+    assert _batch_ends_after(path, "1", 1.0) == off

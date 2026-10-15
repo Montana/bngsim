@@ -261,27 +261,33 @@ struct NonFiniteWitness {
 // the residual reads may move from where it was by that share of its own
 // tolerance band, which keeps g within B of where it was to first order with
 // dg/dx as it is, not as it was measured; and a residual that reads the time
-// may move a hundredth of it, over which its dg/dx is taken to stand. Both
-// are continuous, so CVODE locates where either runs out. Inside, no root is
+// may be held over a hundredth of it, or less where dg/dx moves with the time
+// faster than that: the hold ends before dg/dx has moved by a quarter, at the
+// rate it was moving where the hold began. Both are continuous, so CVODE
+// locates where either runs out. Inside, no root is
 // located. The residual is not switched off; only its crossings inside the
 // band are not stopped at.
 //
 // Those crossings are still tested. At every return while a residual is held
 // (the band left, an output, a stop, another root), the step just taken is
 // searched for a crossing of it on the interpolant, and one found is given
-// the restart test there, as the root it would have been. If the test carries
-// it, the run restarts at that crossing before anything at the return is
-// taken, as at an unheld root. Any restart, and leaving the band, releases the
-// hold. What this cannot see is a crossing in an earlier step of the same
-// stretch whose excursion leaves the band and comes back inside that one step:
-// both ends of the step are inside the band, so the root search never sees
-// the excursion. That is the shape #904 records for a single comparison.
+// the restart test there, as the root it would have been. An exact 0.0 is read
+// as the root function reads one, through the issue #897 zero hold. If the
+// test carries it, the run restarts at that crossing before anything at the
+// return is taken, as at an unheld root. The crossing is bracketed by
+// bisection, not by CVODE's own root search, so the restart lands within
+// CVODE's root tolerance of where an unheld root restarts, not on its bits. Any restart, and
+// leaving the band, releases the hold. What this cannot see is a crossing in an earlier step of the
+// same stretch whose excursion leaves the band and comes back inside that one step: both ends of
+// the step are inside the band, so the root search never sees the excursion. That is the shape #904
+// records for a single comparison.
 //
 // A held slide no longer returns at every step, so its CVODE calls end on
 // the batch limit as a run without these roots did, and CVODE logs each such
-// end as an error. A run that holds a residual sends its error log to the null
-// sink, as the sensitivity watch does: a failure still throws, through the
-// flag < 0 checks, with bngsim's own account of it.
+// end as an error. While a run holds a residual its error log goes to the null
+// sink, as the sensitivity watch's does, and back where it was once nothing is
+// held: a failure still throws, through the flag < 0 checks, with bngsim's own
+// account of it.
 struct StateSwitchHold {
     struct Term {
         int species = -1;
@@ -298,7 +304,8 @@ struct StateSwitchHold {
     std::vector<double> tested_to;
     double rtol = 0.0;
     int n_held = 0;
-    bool quiet = false; // the run's CVODE error log is in the null sink
+    // The run's logger, while a hold has its error log in the null sink.
+    SUNLogger muted = nullptr;
     // Set while the root function is asked for the residuals themselves (the
     // sign probe of land_clock_on_threshold) rather than by CVODE.
     bool probe = false;
@@ -307,10 +314,26 @@ struct StateSwitchHold {
     std::vector<int> run;
     std::vector<long> last_step;
 
+    void mute(SUNLogger logger) {
+        if (muted == nullptr && logger != nullptr) {
+            SUNLogger_SetErrorFilename(logger, bngsim::null_device);
+            muted = logger;
+        }
+    }
+    // Back where SUNDIALS sends errors by default.
+    void unmute() {
+        if (muted != nullptr) {
+            const char *own = std::getenv("SUNLOGGER_ERROR_FILENAME");
+            SUNLogger_SetErrorFilename(muted, own != nullptr && *own != '\0' ? own : "stderr");
+            muted = nullptr;
+        }
+    }
+
     void release_all() {
         std::fill(held.begin(), held.end(), 0);
         std::fill(run.begin(), run.end(), 0);
         n_held = 0;
+        unmute();
     }
 
     // What CVODE is shown for held residual j, of value g at (t, x).
@@ -8471,8 +8494,10 @@ static constexpr long kStateSwitchHoldStepGap = 2;
 // box a species may move in is the same share of its tolerance band.
 static constexpr double kStateSwitchHoldShare = 0.5;
 // How far, relative to the time, a residual that reads the time may be held
-// over without dg/dx being measured again.
+// over without dg/dx being measured again, and by what share of itself dg/dx
+// may move with the time over that, at the rate it moved where it was measured.
 static constexpr double kStateSwitchHoldTimeDrift = 1e-2;
+static constexpr double kStateSwitchHoldGradDrift = 0.25;
 
 bool CvodeSimulator::Impl::flow_carries_state_switch(
     void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
@@ -14060,11 +14085,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         impl_->sync_model_at(tt, x_at, ns);
                         return eval.evaluate(g_idx);
                     };
+                    // The side an exact 0.0 is on is the zero hold's, as in
+                    // the root function: what a run that stepped on every
+                    // crossing holds, kept below at each return.
+                    double &zero_hold = state_switch_zero_hold[jx];
+                    auto side = [&zero_hold](double g) {
+                        const double v = g != 0.0 ? g : zero_hold;
+                        return v > 0.0 ? 1 : (v < 0.0 ? -1 : 0);
+                    };
                     const double g_from = residual_at(from);
                     impl_->sync_model_at(t_here, y_data, ns);
                     const double g_here = eval.evaluate(g_idx);
-                    if (!std::isfinite(g_from) || !std::isfinite(g_here) || g_from == 0.0 ||
-                        g_here == 0.0 || (g_from < 0.0) == (g_here < 0.0)) {
+                    const int side_from = side(g_from);
+                    const int side_here = side(g_here);
+                    if (std::isfinite(g_here) && g_here != 0.0) {
+                        zero_hold =
+                            (g_here > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
+                    }
+                    if (!std::isfinite(g_from) || !std::isfinite(g_here) || side_from == 0 ||
+                        side_here == 0 || side_from == side_here) {
                         continue;
                     }
                     // Bracketed as CVODE brackets a root, and taken on the far
@@ -14077,7 +14116,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         if (!std::isfinite(g_mid)) {
                             break;
                         }
-                        if (g_mid == 0.0 || (g_mid < 0.0) != (g_from < 0.0)) {
+                        if (side(g_mid) != side_from) {
                             hi = mid;
                         } else {
                             lo = mid;
@@ -14088,10 +14127,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         continue;
                     }
                     const std::vector<double> x_root(x_at, x_at + ns);
-                    if (impl_->flow_carries_state_switch(cvode_mem, hi, x_root.data(), ns,
-                                                         *state_switches[jx], g_here > 0.0 ? 1 : -1,
-                                                         static_cast<double>(t_step_end), samples,
-                                                         rtol, atol, atol_v)) {
+                    if (impl_->flow_carries_state_switch(
+                            cvode_mem, hi, x_root.data(), ns, *state_switches[jx], side_here,
+                            static_cast<double>(t_step_end), samples, rtol, atol, atol_v)) {
                         t_restart = hi;
                         x_restart = x_root;
                     }
@@ -14128,6 +14166,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         state_switch_zero_hold[jx] =
                             (g_left > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
                     }
+                }
+                if (state_switch_hold.n_held == 0) {
+                    state_switch_hold.unmute();
                 }
             }
             // A root return that was only held residuals leaving their bands.
@@ -14615,9 +14656,39 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             const double g_early = model.evaluator().evaluate(sw.residual_expr_idx);
                             impl_->sync_model_at(t_root, y_data, ns);
                             const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
-                            const double t_drift =
-                                g_late == g_early ? std::numeric_limits<double>::infinity()
-                                                  : kStateSwitchHoldTimeDrift * std::fabs(t_root);
+                            double t_drift = g_late == g_early
+                                                 ? std::numeric_limits<double>::infinity()
+                                                 : kStateSwitchHoldTimeDrift * std::fabs(t_root);
+                            // dg/dx a little later, the same difference as the
+                            // restart test took: the hold ends before dg/dx has
+                            // moved by kStateSwitchHoldGradDrift of itself.
+                            if (std::isfinite(t_drift)) {
+                                std::vector<double> xw(y_data, y_data + ns);
+                                double rate = 0.0;
+                                for (const StateSwitchHold::Term &term : terms) {
+                                    const auto sx = static_cast<size_t>(term.species);
+                                    const double xj = xw[sx];
+                                    const double h = 1e-7 * std::max(std::fabs(xj), 1.0);
+                                    xw[sx] = xj + h;
+                                    impl_->sync_model_at(t_root + h_t, xw.data(), ns);
+                                    const double g_hi =
+                                        model.evaluator().evaluate(sw.residual_expr_idx);
+                                    xw[sx] = xj - h;
+                                    impl_->sync_model_at(t_root + h_t, xw.data(), ns);
+                                    const double g_lo =
+                                        model.evaluator().evaluate(sw.residual_expr_idx);
+                                    xw[sx] = xj;
+                                    const double later = (g_hi - g_lo) / (2.0 * h);
+                                    rate = std::max(rate, std::fabs(later - grad[sx]) /
+                                                              (h_t * std::fabs(grad[sx])));
+                                }
+                                impl_->sync_model_at(t_root, y_data, ns);
+                                if (!std::isfinite(rate)) {
+                                    t_drift = 0.0;
+                                } else if (rate > 0.0) {
+                                    t_drift = std::min(t_drift, kStateSwitchHoldGradDrift / rate);
+                                }
+                            }
                             if (terms.empty() || !measurable || !(band > 0.0) || !(t_drift > 0.0) ||
                                 !(std::fabs(g_root) < band)) {
                                 continue;
@@ -14628,13 +14699,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             state_switch_hold.tested_to[jx] = t_root;
                             state_switch_hold.held[jx] = 1;
                             ++state_switch_hold.n_held;
-                            if (!state_switch_hold.quiet) {
-                                SUNLogger logger = nullptr;
-                                if (SUNContext_GetLogger(ctx, &logger) == SUN_SUCCESS &&
-                                    logger != nullptr) {
-                                    SUNLogger_SetErrorFilename(logger, bngsim::null_device);
-                                }
-                                state_switch_hold.quiet = true;
+                            SUNLogger logger = nullptr;
+                            if (SUNContext_GetLogger(ctx, &logger) == SUN_SUCCESS) {
+                                state_switch_hold.mute(logger);
                             }
                         }
                     }
