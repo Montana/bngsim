@@ -133,12 +133,12 @@ class NfsimSession:
         self._destroyed = False
 
         from bngsim._network_free_checks import (
-            refuse_arrhenius_rate_laws,
+            refuse_nfsim_rate_laws,
             refuse_time_dependent_rate_laws,
         )
 
         refuse_time_dependent_rate_laws(self._xml_path, "nfsim")
-        refuse_arrhenius_rate_laws(self._xml_path)
+        refuse_nfsim_rate_laws(self._xml_path)
         self._core = NfsimSimulator(self._xml_path)
         if molecule_limit is not None:
             self._core.set_molecule_limit(int(molecule_limit))

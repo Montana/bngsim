@@ -13,7 +13,8 @@ its parameters no longer gave, with no warning:
   only XML written some other way reaches this.
 * Arrhenius (energy) rules: NFsim's expansion divides every energy by an RT that
   BioNetGen does not apply and gets one-way rules wrong (RuleWorld/nfsim#102).
-  They are refused by name until the vendored NFsim carries the upstream fix.
+  They are refused by name until the vendored NFsim carries the upstream fix,
+  and so is a rate-law type NFsim does not implement: it dropped a Hill rule.
 
 The oracle for a post-init write is the same model with the new value written
 into the XML and no override at all. That load path never runs the refresh, so
@@ -30,7 +31,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim import ModelError
-from bngsim._network_free_checks import arrhenius_rules
+from bngsim._network_free_checks import arrhenius_rules, nfsim_unimplemented_rate_laws
 
 pytestmark = pytest.mark.skipif(
     not getattr(bngsim, "HAS_NFSIM", False),
@@ -205,6 +206,32 @@ def test_the_simulator_refuses_an_arrhenius_model(arrhenius_xml, simple_decay_ne
     m = bngsim.Model.from_net(str(simple_decay_net))
     with pytest.raises(ModelError, match=_REFUSAL):
         bngsim.Simulator(m, method="nf", xml_path=str(arrhenius_xml))
+
+
+def test_a_rate_law_nfsim_does_not_implement_is_refused(data_dir: Path, simple_decay_net):
+    # BNG2.pl writes Hill into the XML; NFsim dropped the rule and P stayed at 0.
+    xml = data_dir / "nfsim" / "hill_rate_law.xml"
+    match = r"rate laws NFsim does not implement: rule '_R1' \(Hill\)"
+    with pytest.raises(ModelError, match=match):
+        bngsim.NfsimSession(str(xml))
+    m = bngsim.Model.from_net(str(simple_decay_net))
+    with pytest.raises(ModelError, match=match):
+        bngsim.Simulator(m, method="nf", xml_path=str(xml))
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "mm_switchable_rate.xml",  # MM
+        "zero_order_switchable_rate.xml",  # Ele
+        "energy_patterns_only.xml",  # Ele, beside an energy pattern
+    ],
+)
+def test_rate_laws_nfsim_implements_are_not_refused(data_dir: Path, fixture):
+    xml = data_dir / "nfsim" / fixture
+    assert arrhenius_rules(xml) == []
+    assert nfsim_unimplemented_rate_laws(xml) == []
+    bngsim.NfsimSession(str(xml)).destroy()
 
 
 def test_energy_patterns_without_an_arrhenius_rule_still_run(data_dir: Path):
