@@ -4291,21 +4291,28 @@ class Simulator:
             restore()
             raise
 
-    def _ode_attempts(self, times, opts, restore):
+    def _ode_attempts(self, times, opts, restore, sim=None, core=None):
         """The attempts :meth:`_run_ode_with_jacobian_fallback` makes, with
-        ``restore`` putting the model back between them."""
+        ``restore`` putting the model back between them.
+
+        ``sim`` and ``core`` default to this Simulator's own; a :meth:`run_batch`
+        row passes its clone's, so a row places the same bet a loop of
+        :meth:`run` would (GH #203).
+        """
+        sim = self._sim if sim is None else sim
+        core = self._model._core if core is None else core
         eligible = self._jacobian == "auto" and bool(
-            getattr(self._model._core, "analytical_jacobian_complete", False)
+            getattr(core, "analytical_jacobian_complete", False)
         )
         if not eligible:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         if self._ode_jacobian_fell_back:
             # A prior run on this Simulator already proved the analytical attempt
             # is doomed for this model — go straight to FD, no wasted attempt.
             opts.jacobian = "fd"
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         try:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         except RuntimeError as e:
             # Only a CVODE failure is the Jacobian's to rescue. Anything else is
             # bngsim refusing the model or the run, such as an invalid event delay
@@ -4320,14 +4327,15 @@ class Simulator:
                 "GH#176 analytical Jacobian: CVODE integration failed (%s); "
                 "retrying with the finite-difference Jacobian. The rate law is "
                 "likely discontinuous in a state variable (e.g. an if() whose "
-                "condition crosses a threshold), which the exact Jacobian cannot "
-                "represent. Pass jacobian='fd' to skip this attempt, or "
-                "jacobian='analytical' to surface the failure.",
+                "condition crosses a threshold), or its derivative is infinite "
+                "where the state sits (e.g. sqrt(S) at S = 0, issue #867), which "
+                "the exact Jacobian cannot represent. Pass jacobian='fd' to skip "
+                "this attempt, or jacobian='analytical' to surface the failure.",
                 e,
             )
             restore()
             opts.jacobian = "fd"
-            result = self._sim.run(times, opts)
+            result = sim.run(times, opts)
             # Only memoize once FD has actually succeeded — a model that fails on
             # both (genuinely unintegrable) keeps surfacing its error every run.
             self._ode_jacobian_fell_back = True
@@ -5661,10 +5669,14 @@ class Simulator:
         plus, minus = out
         return (plus - minus) / (2.0 * h), np.maximum(np.abs(plus), np.abs(minus))
 
-    def _capture_carryover_state(self) -> tuple[np.ndarray | None, list[str], bool, Any]:
+    def _capture_carryover_state(
+        self, core: Any = None
+    ) -> tuple[np.ndarray | None, list[str], bool, Any]:
         """Snapshot the model's carry-over state: the sensitivity seed (issue #81)
-        and the event state a continuing run starts from (issue #693)."""
-        core = self._model._core
+        and the event state a continuing run starts from (issue #693). ``core``
+        defaults to this Simulator's model; a :meth:`run_batch` row passes its
+        clone's."""
+        core = self._model._core if core is None else core
         seed = (
             np.array(core.pending_sensitivity_seed(), dtype=np.float64)
             if core.has_pending_sensitivity_seed
@@ -5678,11 +5690,11 @@ class Simulator:
         )
 
     def _restore_carryover_state(
-        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any]
+        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any], core: Any = None
     ) -> None:
         """Put back what :meth:`_capture_carryover_state` captured."""
         seed, names, dirty, events = snapshot
-        core = self._model._core
+        core = self._model._core if core is None else core
         if seed is None:
             core.set_pending_sensitivity_seed(np.zeros((0, 0), dtype=np.float64), [])
         else:
@@ -6140,7 +6152,19 @@ class Simulator:
                     self._apply_state_switch_sens(opts, clone._core)
                 else:
                     self._apply_state_switch_roots(opts, clone)
-                core_result = sim.run(times, opts)
+                # The GH #176 retry, as run() places it. Without it a row raised
+                # where the same run() fell back to FD and returned, which breaks
+                # the GH #203 contract above; issue #867 made a closed form still
+                # non-finite after the clamp one more way to need it.
+                row_core = clone._core
+                start_state = row_core.get_state()
+                start_carry = self._capture_carryover_state(row_core)
+
+                def restore() -> None:
+                    row_core.set_state(start_state)
+                    self._restore_carryover_state(start_carry, row_core)
+
+                core_result = self._ode_attempts(times, opts, restore, sim=sim, core=row_core)
 
             elif self._method in ("ssa", "psa"):
                 from bngsim._bngsim_core import SsaSimulator

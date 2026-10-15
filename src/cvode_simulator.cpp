@@ -886,6 +886,18 @@ static std::string describe_nonfinite_witness(NetworkModel &model, const NonFini
                   " finite and positive).";
         } else if (w.sens_column >= 0 && n_laws == 0 && n_negative == 0) {
             os << describe_sensitivity_witness(model, w);
+        } else if (w.source != nullptr && (std::strcmp(w.source, "The Jacobian") == 0 ||
+                                           std::strcmp(w.source, "The compiled Jacobian") == 0)) {
+            // A closed-form Jacobian is refused only after its GH #135 clamp
+            // retry, so the domain advice below misdirects for the commonest
+            // cause: a slope that is infinite at 0 itself (issue #867).
+            os << " The Jacobian is refused only after a second evaluation with every"
+                  " concentration below zero set to 0, so either a law is read outside"
+                  " its domain at a value that retry leaves alone (a rate-rule"
+                  " variable, or a species declared negative), or a derivative is"
+                  " infinite at 0 itself — the slope of sqrt(S), or of S^p with"
+                  " p < 1 — which no constraint on S removes. jacobian=\"fd\""
+                  " differences the right-hand side instead (issue #867).";
         } else {
             os << " bngsim evaluates a rate law literally, so a state outside its"
                   " domain — a logarithm, a sqrt or a fractional power of a negative"
