@@ -283,9 +283,9 @@ def _rateof_call(node: libsbml.ASTNode, local_params: dict | None = None) -> str
 
     Only rateOf of a bare symbol — a species, or a rate-rule-promoted
     parameter/compartment that becomes a species — is representable as an
-    accessor. A non-name argument has no species index to bind to, so warn and
-    emit ``0`` rather than a silently-wrong derivative (no corpus model hits
-    this; every rateOf argument across the BioModels SBML corpus is a species).
+    accessor. A non-name argument has no species index to bind to; the load
+    refuses one first (``_check_rateof_targets``, rule 10223), so the warning
+    and ``0`` below are only a backstop.
 
     A kinetic-law ``<localParameter>`` is constant by SBML definition, so the
     rate of change of a local-parameter argument is ``0`` (suite 01459/01460).
@@ -361,8 +361,9 @@ def _ast_has_rateof(node: libsbml.ASTNode, rateof_funcdef_names: set[str]) -> bo
 def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[str]) -> bool:
     """True iff any math container references rateOf (csymbol or a *called*
     COPASI idiom). Walks rules, reactions, every event math, and initial
-    assignments — plus non-idiom funcDef bodies, since a rateOf csymbol nested
-    in a funcDef body is emitted as an accessor when that funcDef is inlined."""
+    assignments — plus non-idiom funcDef bodies, which still count here,
+    although the load refuses a call to one that reads rateOf
+    (``_check_rateof_targets``)."""
 
     def _scan(n):
         return _ast_has_rateof(n, rateof_funcdef_names)
@@ -412,28 +413,35 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
       builder binds it, and the model ran with the rate as 0.
     * ``rateOf(S)`` of a species held as a concentration in a compartment an
       assignmentRule sizes (rule 10225): its rate would need the rule's own
-      rate, which SBML does not define either. Unchecked, it was taken as the
-      amount's rate over the size, with no term for the size's change.
+      rate, which SBML does not define either. Unchecked, the initial-value
+      fold took the amount's rate over the size, with no term for the size's
+      change; a rule had the term where the size reads only the time, and read
+      0 where it reads a species. A species with a rate rule of its own, or a
+      constant one, has its rate whatever its compartment does, and is left
+      alone (libsbml reports 10225 for it all the same).
     * ``rateOf`` of anything but a single symbol (rule 10223 for the
-      csymbol). Unchecked, a rule read it as 0 with a warning, and the fold
-      took the idiom's for NaN.
+      csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
+      for NaN, and a rule read either as 0 with a warning.
     * a call to a functionDefinition whose body reads ``rateOf``, directly or
       through another it calls. The argument there is the function's own
-      parameter, and both paths took the rate of that, 0, rather than of what
-      the caller passed. libsbml rejects the csymbol in a function body (rule
-      20304); a call to the idiom there is valid SBML, but bngsim does not
-      follow the caller's argument into it. A function nothing calls is left
-      alone.
+      parameter: both paths took the rate of that name, 0 unless a model
+      symbol shares it, rather than of what the caller passed. libsbml rejects
+      the csymbol in a function body (rule 20304); a call to the idiom there is
+      valid SBML, but bngsim does not follow the caller's argument into it. A
+      function nothing calls is left alone.
 
     A kinetic law's own local parameter shadows a global of its id, so
     ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
     and is allowed; libsbml reports 10224 for it regardless of scope.
     """
     ar_rules = {}
+    rate_ruled = set()
     for i in range(sbml_model.getNumRules()):
         rule = sbml_model.getRule(i)
         if rule.isAssignment():
             ar_rules[rule.getVariable()] = rule
+        elif rule.isRate():
+            rate_ruled.add(rule.getVariable())
     idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
 
     def _reads_rateof(n, called) -> bool:
@@ -453,11 +461,14 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
             if any(_reads_rateof(n, rated_funcs) for n in _iter_ast_subtree(body)):
                 rated_funcs.add(fid)
                 grew = True
-    # A species held as a concentration, by its compartment (rule 10225).
+    # A species held as a concentration, by its compartment (rule 10225), but
+    # not one whose rate is stated (a rate rule) or nil (constant).
     conc_compartment = {
-        sbml_model.getSpecies(i).getId(): sbml_model.getSpecies(i).getCompartment()
-        for i in range(sbml_model.getNumSpecies())
-        if not sbml_model.getSpecies(i).getHasOnlySubstanceUnits()
+        sp.getId(): sp.getCompartment()
+        for sp in (sbml_model.getSpecies(i) for i in range(sbml_model.getNumSpecies()))
+        if not sp.getHasOnlySubstanceUnits()
+        and not sp.getConstant()
+        and sp.getId() not in rate_ruled
     }
     law_locals = {}
     for i in range(sbml_model.getNumReactions()):
@@ -480,8 +491,9 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
             t = n.getType()
             if t == libsbml.AST_FUNCTION and n.getName() in rated_funcs:
                 offenders[(libsbml.formulaToL3String(n), where)] = (
-                    f"the functionDefinition {n.getName()} takes rateOf of its own "
-                    "argument, which bngsim reads as 0, not as the rate of what is passed"
+                    f"the functionDefinition {n.getName()} reads rateOf of a parameter "
+                    "of its own (or calls one that does), and bngsim does not take the "
+                    "rate of what is passed for it"
                 )
                 continue
             if not _reads_rateof(n, ()):
@@ -521,7 +533,7 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         "variable, nor for a concentration in a compartment an assignmentRule "
         "sizes, and rateOf takes a single symbol; libsbml's consistency check "
         "reports each, and RoadRunner refuses them. Earlier bngsim releases loaded "
-        "these with a wrong rate, mostly 0, or failed with an ExprTk error that "
+        "most of these with a wrong rate, or failed with an ExprTk error that "
         "named none of it. Make such a variable a rateRule target, or write its "
         "rate from the rule's own inputs; call rateOf directly rather than "
         "inside a functionDefinition."
@@ -4467,10 +4479,11 @@ def _build_model_from_sbml_doc_in_context(doc):
     # offender) rather than integrate a malformed model's incomplete setup.
     _check_undefined_symbols(sbml_model)
 
-    # ── 0d. Refuse rateOf of an assignmentRule variable (issue #1046) ──
-    # SBML defines no rate for one (rule 10224). Checked once, before the fold
-    # below would take it for a constant (rate 0) and before the emitter would
-    # write a rate accessor that nothing binds.
+    # ── 0d. Refuse a rateOf the model has no value for ─────────────────
+    # rateOf of an assignmentRule variable (issue #1046, rule 10224), of a
+    # concentration in a rule-sized compartment (10225), of anything but a
+    # symbol (10223), and through a functionDefinition. Checked once, before
+    # the fold below or the emitter would give any of them a wrong rate.
     _check_rateof_targets(sbml_model, func_defs)
     # What no rule sets has rate 0 wherever it is read (see _rateof_call).
     _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
