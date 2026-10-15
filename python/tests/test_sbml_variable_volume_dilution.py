@@ -722,3 +722,293 @@ def test_constant_species_dilution_matches_roadrunner():
     _, res = _run(CONST_SPECIES, t_end=t_end, n=n)
     S = _conc(res, "S")
     np.testing.assert_allclose(S, ref[:, 1], rtol=1e-6, atol=1e-8)
+
+
+# ── GH #1052: an AR compartment whose size rule reads a species ──────────────
+#
+# Section 8c's chain rule had no rate for a species leaf, so V̇ was unknown and no
+# dilution term was emitted: every concentration in ``cv := 1 + 0.1*S`` kept its
+# concentration where SBML keeps its amount. A species leaf now reads its live
+# rate (the engine's ``rate_of__S`` accessor, SBML's rateOf of the symbol's
+# value). Closed form below: S decays at k in compartment c (size 1), so
+# V(t) = 1 + e^(-k t), V(0) = 2, and a held amount A gives [.] = A/V(t).
+
+_K = 0.5
+_MATHML = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+
+
+def _species_sized_sbml(size, extra_species="", extra_rules="", extra_params=""):
+    """cv sized by ``size`` (MathML) over S (decaying in c); in cv: Sk
+    (constant), Sb (boundary), Sn (no reaction), X (decaying in cv), each
+    a concentration."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+ <model id="species_sized">
+  <listOfCompartments>
+   <compartment id="c" size="1" constant="true"/>
+   <compartment id="cv" size="1" constant="false"/>
+  </listOfCompartments>
+  <listOfSpecies>
+   <species id="S" compartment="c" initialAmount="10" hasOnlySubstanceUnits="false"
+            boundaryCondition="false" constant="false"/>
+   <species id="Sk" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+            boundaryCondition="true" constant="true"/>
+   <species id="Sb" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+            boundaryCondition="true" constant="false"/>
+   <species id="Sn" compartment="cv" initialConcentration="5" hasOnlySubstanceUnits="false"
+            boundaryCondition="false" constant="false"/>
+   <species id="X" compartment="cv" initialConcentration="10" hasOnlySubstanceUnits="false"
+            boundaryCondition="false" constant="false"/>
+   {extra_species}
+  </listOfSpecies>
+  <listOfParameters><parameter id="k" value="{_K}" constant="true"/>{extra_params}</listOfParameters>
+  <listOfRules>
+   <assignmentRule variable="cv"><math {_MATHML}>{size}</math></assignmentRule>
+   {extra_rules}
+  </listOfRules>
+  <listOfReactions>
+   <reaction id="degS" reversible="false">
+    <listOfReactants><speciesReference species="S" stoichiometry="1" constant="true"/></listOfReactants>
+    <kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>S</ci><ci>c</ci></apply></math></kineticLaw>
+   </reaction>
+   <reaction id="degX" reversible="false">
+    <listOfReactants><speciesReference species="X" stoichiometry="1" constant="true"/></listOfReactants>
+    <kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>X</ci><ci>cv</ci></apply></math></kineticLaw>
+   </reaction>
+  </listOfReactions>
+ </model>
+</sbml>"""
+
+
+def _one_plus_tenth_of(ci):
+    return f"<apply><plus/><cn>1</cn><apply><times/><cn>0.1</cn>{ci}</apply></apply>"
+
+
+_SIZED_BY_S = _species_sized_sbml(_one_plus_tenth_of("<ci>S</ci>"))
+
+
+def _expected(t):
+    """[Sk] = [Sb] = [Sn] (amount 10 held) and [X] (amount 20·e^(-k t))."""
+    v = 1 + np.exp(-_K * t)
+    return 10 / v, 20 * np.exp(-_K * t) / v
+
+
+def _assert_species_sized(res):
+    t = np.asarray(res.time)
+    held, x = _expected(t)
+    for sid in ("Sk", "Sb", "Sn"):
+        np.testing.assert_allclose(_conc(res, sid), held, rtol=1e-7, atol=1e-9, err_msg=sid)
+    np.testing.assert_allclose(_conc(res, "X"), x, rtol=1e-7, atol=1e-9, err_msg="X")
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+def test_ar_compartment_sized_by_a_species_dilutes(codegen):
+    """Constant, boundary, flux-free and reacting concentrations all follow
+    amount/V(t). They used to keep [Sk] at 5 (7.31 at t = 2) and [X] at
+    10·e^(-k t)."""
+    model = bngsim.Model.from_sbml_string(_SIZED_BY_S)
+    res = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0, 4), n_points=9, rtol=1e-11, atol=1e-13
+    )
+    _assert_species_sized(res)
+
+
+def test_ar_compartment_sized_by_a_species_reports_its_amount():
+    """The bare-id amount selector reads the live size: Sk's amount stays 10.
+    (A guard for the diluted species' amount remap, which a species left out of
+    ``ar_dilution_species`` would break. Main passed the whole test by
+    coincidence: it held [Sk] at 5 and [X] at 10·e^(-k t), and reported each
+    times the load-time size 2, which happens to be the true amount.)"""
+    _, res = _run(_SIZED_BY_S, t_end=4.0, n=9)
+    arr = res.as_roadrunner(selections=["time", "Sk", "X"])
+    cols = {c: i for i, c in enumerate(arr.colnames)}
+    t = np.asarray(res.time)
+    np.testing.assert_allclose(arr[:, cols["Sk"]], 10.0, rtol=1e-7)
+    np.testing.assert_allclose(arr[:, cols["X"]], 20 * np.exp(-_K * t), rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    ("size", "species", "rules", "params"),
+    [
+        # Through an intermediate assignment-rule parameter q := 0.1*S.
+        (
+            "<apply><plus/><cn>1</cn><ci>q</ci></apply>",
+            "",
+            f'<assignmentRule variable="q"><math {_MATHML}><apply><times/><cn>0.1</cn>'
+            "<ci>S</ci></apply></math></assignmentRule>",
+            '<parameter id="q" value="0" constant="false"/>',
+        ),
+        # Through a species an assignment rule sets, Y := 2*S.
+        (
+            _one_plus_tenth_of("<apply><times/><cn>0.5</cn><ci>Y</ci></apply>"),
+            '<species id="Y" compartment="c" initialConcentration="0" hasOnlySubstanceUnits="false"'
+            ' boundaryCondition="false" constant="false"/>',
+            f'<assignmentRule variable="Y"><math {_MATHML}><apply><times/><cn>2</cn>'
+            "<ci>S</ci></apply></math></assignmentRule>",
+            "",
+        ),
+        # An amount (hasOnlySubstanceUnits=true) in the constant compartment.
+        (
+            _one_plus_tenth_of("<ci>Sa</ci>"),
+            '<species id="Sa" compartment="c" initialAmount="10" hasOnlySubstanceUnits="true"'
+            ' boundaryCondition="false" constant="false"/>',
+            "",
+            "",
+        ),
+    ],
+    ids=["through-a-parameter-rule", "through-a-species-rule", "amount-leaf"],
+)
+def test_ar_compartment_sized_through_a_species_dilutes(size, species, rules, params):
+    sbml = _species_sized_sbml(size, species, rules, params)
+    if "Sa" in species:
+        # Sa decays like S; the size reads it in its place.
+        sbml = sbml.replace(
+            "</listOfReactions>",
+            '<reaction id="degSa" reversible="false"><listOfReactants>'
+            '<speciesReference species="Sa" stoichiometry="1" constant="true"/></listOfReactants>'
+            f"<kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>Sa</ci></apply></math>"
+            "</kineticLaw></reaction></listOfReactions>",
+        )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    _assert_species_sized(res)
+
+
+def test_ar_compartment_sized_by_a_species_matches_roadrunner():
+    t_end, n = 4.0, 9
+    ref = _rr_sim(_SIZED_BY_S, ["time", "[Sk]", "[Sn]", "[X]"], t_end, n)
+    _, res = _run(_SIZED_BY_S, t_end=t_end, n=n)
+    for i, sid in enumerate(("Sk", "Sn", "X"), start=1):
+        np.testing.assert_allclose(_conc(res, sid), ref[:, i], rtol=1e-6, atol=1e-8, err_msg=sid)
+
+
+def test_ar_compartment_sized_by_a_species_sensitivity():
+    """d[Sk]/dk = 10·t·e^(-k t)/(1 + e^(-k t))^2, through the size's rate."""
+    model = bngsim.Model.from_sbml_string(_SIZED_BY_S)
+    res = bngsim.Simulator(model, method="ode", sensitivity_params=["k"]).run(
+        t_span=(0, 4), n_points=9, rtol=1e-10, atol=1e-12
+    )
+    t = np.asarray(res.time)
+    sens = np.asarray(res.sensitivities)[:, list(res.species_names).index("Sk"), 0]
+    expected = 10 * t * np.exp(-_K * t) / (1 + np.exp(-_K * t)) ** 2
+    np.testing.assert_allclose(sens, expected, rtol=1e-5, atol=1e-7)
+
+
+def test_ar_compartment_sized_by_time_takes_no_rate():
+    """A size that reads no species needs no rate: the rateOf machinery stays
+    off, as before."""
+    time_size = (
+        "<apply><plus/><cn>1</cn>"
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        "</csymbol></apply>"
+    )
+    model = bngsim.Model.from_sbml_string(_species_sized_sbml(time_size))
+    assert model._core.uses_rateof is False
+    assert bngsim.Model.from_sbml_string(_SIZED_BY_S)._core.uses_rateof is True
+
+
+def test_ar_compartment_reading_its_own_concentration_is_refused():
+    """cv := 1 + 0.1*X with X in cv: [X] is the amount over cv, so the two
+    define each other (libRoadRunner refuses it as a recursive rule)."""
+    with pytest.raises(
+        bngsim.ModelError, match=r"compartment cv \(cv := 1 \+ 0\.1 \* X\) reads X"
+    ):
+        bngsim.Model.from_sbml_string(_species_sized_sbml(_one_plus_tenth_of("<ci>X</ci>")))
+
+
+def test_ar_compartments_reading_each_others_concentrations_are_refused():
+    """cv reads W in cw, and cw reads X in cv: a ring of sizes."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>W</ci>"),
+        '<species id="W" compartment="cw" initialConcentration="1" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="false" constant="false"/>',
+        f'<assignmentRule variable="cw"><math {_MATHML}>{_one_plus_tenth_of("<ci>X</ci>")}</math>'
+        "</assignmentRule>",
+    ).replace(
+        '<compartment id="cv" size="1" constant="false"/>',
+        '<compartment id="cv" size="1" constant="false"/>'
+        '<compartment id="cw" size="1" constant="false"/>',
+    )
+    with pytest.raises(bngsim.ModelError, match="each read a concentration in the next") as exc:
+        bngsim.Model.from_sbml_string(sbml)
+    assert "cv reads W in cw" in str(exc.value) and "cw reads X in cv" in str(exc.value)
+
+
+def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refused():
+    """An amount in a compartment an assignment rule sizes has no right rate
+    accessor yet (#736), so a size that reads one is refused, not read."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Wa</ci>"),
+        '<species id="Wa" compartment="cw" initialAmount="1" hasOnlySubstanceUnits="true"'
+        ' boundaryCondition="false" constant="false"/>',
+        f'<assignmentRule variable="cw"><math {_MATHML}><apply><plus/><cn>1</cn>'
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        "</csymbol></apply></math></assignmentRule>",
+    ).replace(
+        '<compartment id="cv" size="1" constant="false"/>',
+        '<compartment id="cv" size="1" constant="false"/>'
+        '<compartment id="cw" size="1" constant="false"/>',
+    )
+    with pytest.raises(bngsim.ModelError, match=r"reads Wa, an amount in compartment cw.*#736"):
+        bngsim.Model.from_sbml_string(sbml)
+
+
+def test_ar_compartment_sized_by_an_event_parameter_and_a_species_dilutes():
+    """``cv := p + 0.1*S`` with an event setting p := 2 at t > 1: between events
+    p holds, so the size's rate is S's; the event's jump is rescaled. An event
+    parameter used to make the size's rate unknown and drop the term."""
+    sbml = _species_sized_sbml(
+        "<apply><plus/><ci>p</ci><apply><times/><cn>0.1</cn><ci>S</ci></apply></apply>",
+        extra_params='<parameter id="p" value="1" constant="false"/>',
+    ).replace(
+        " </model>",
+        f""" <listOfEvents><event id="bump" useValuesFromTriggerTime="true">
+   <trigger initialValue="false" persistent="true"><math {_MATHML}><apply><gt/>
+    <csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>
+    <cn>1</cn></apply></math></trigger>
+   <listOfEventAssignments><eventAssignment variable="p"><math {_MATHML}><cn>2</cn></math>
+   </eventAssignment></listOfEventAssignments>
+  </event></listOfEvents>
+ </model>""",
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    v = np.where(t > 1 + 1e-9, 2.0, 1.0) + np.exp(-_K * t)
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 / v, rtol=1e-6, atol=1e-8)
+
+
+def test_ar_compartment_sized_by_a_constant_species_takes_no_rate():
+    """A constant species never changes, so a size that reads it has rate 0 and
+    needs no rate accessor: the rateOf machinery stays off."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kc</ci>"),
+        '<species id="Kc" compartment="c" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="true" constant="true"/>',
+    )
+    model, res = _run(sbml, t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)
+
+
+def test_ar_compartment_sized_by_a_constant_species_in_a_moving_compartment():
+    """A constant concentration still moves when its own compartment does:
+    Kw (constant, 10 in ``cw := 1 + time``) is 10/(1 + t), so ``cv := 1 +
+    0.1*Kw`` has a rate, and [Sn] = 10/cv = 10(1 + t)/(2 + t)."""
+    time_ci = (
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        "</csymbol>"
+    )
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kw</ci>"),
+        '<species id="Kw" compartment="cw" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="true" constant="true"/>',
+        f'<assignmentRule variable="cw"><math {_MATHML}><apply><plus/><cn>1</cn>{time_ci}</apply>'
+        "</math></assignmentRule>",
+    ).replace(
+        '<compartment id="cv" size="1" constant="false"/>',
+        '<compartment id="cv" size="1" constant="false"/>'
+        '<compartment id="cw" size="1" constant="false"/>',
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    np.testing.assert_allclose(_conc(res, "Kw"), 10 / (1 + t), rtol=1e-7)
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 * (1 + t) / (2 + t), rtol=1e-6, atol=1e-8)

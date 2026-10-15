@@ -6426,6 +6426,40 @@ def fallback_crossing(
         ):
             return f'tfun {table.get("name")} (method=>"step")'
     texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    # A table a rate law reads is indexed by what its index reads, which the
+    # law's text, ``tfun_g()``, does not show. Where a function owns the index
+    # slot, ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
+    # function is read as a law of its own: the table of what it holds jumps
+    # where it jumps and bends where it bends. Compiled code reads the index
+    # live since issue #965, so the quotient reads across that crossing. An
+    # index function may read a table of its own, ``h() = tfun(..., h0)``, so
+    # what the indices read is asked in turn until nothing new is found. Kept
+    # beside the laws, and only for a model that has such a table.
+    table_indices = {
+        str(table.get("name")): param_names[table.get("index_param_idx", -1)]
+        for table in data.get("table_functions", ())
+        if table.get("index_kind") == "parameter"
+        and 0 <= table.get("index_param_idx", -1) < len(param_names)
+        and param_names[table.get("index_param_idx", -1)] in func_map
+    }
+    if table_indices:
+        found_indices: tuple[str, ...] | None = kept_all.get(_TABLE_INDICES)
+        if found_indices is None:
+            table_call = re.compile(
+                r"(?<![A-Za-z0-9_])tfun_(" + "|".join(map(re.escape, table_indices)) + r")\("
+            )
+            memo: dict[str, str] = {}
+            reached: set[str] = set()
+            frontier = list(texts)
+            while frontier:
+                read = " ".join(
+                    _inline_functions(text, func_map, memo=memo) or text for text in frontier
+                )
+                new = {table_indices[name] for name in table_call.findall(read)} - reached
+                reached |= new
+                frontier = sorted(new)
+            found_indices = kept_all[_TABLE_INDICES] = tuple(sorted(reached))
+        texts += found_indices
     moved_clocks: list[frozenset[int]] = []
 
     def scan(held: frozenset[str]) -> str | None:
@@ -6654,6 +6688,7 @@ _STORES_KEPT = 8
 # Keys of what a scan keeps that are not a rate law's text.
 _MARKED = ("derived parameters that hold what is asked about",)
 _IN_A_RATE = ("derived parameters a rate constant is, or is written in",)
+_TABLE_INDICES = ("functions a table a rate law reads is indexed by",)
 _VIEW = "held"
 _NESTED = "held, one written in another"
 _DERIVED_LAW = "derived"
@@ -7433,7 +7468,9 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     that a function writes was another such reader; that model is refused where
     it is built, issue #931.) The solver covers that: a jump the pre-#763 test
     reads, and that the listed reactions do not account for, is judged as
-    before.
+    before. A table has no analytic sensitivity right-hand side, so a run whose
+    rate reads one through a function that holds a crossing is refused by
+    :func:`fallback_crossing` before it gets there (issues #938, #965).
     """
     from bngsim._jacobian import _inline_functions
 

@@ -680,9 +680,16 @@ static inline bool rhs_has_nonfinite(const CvodeUserData *data, const double *yd
 // to 0 the term k·p·0^{p-1} = 0 (p>1) is the correct one-sided boundary value.
 // Byte-identical for every finite-Jacobian model — mass-action / polynomial laws
 // never go non-finite — so the all-Elementary parity solves an always-on clamp
-// would have perturbed are untouched. A still-non-finite Jacobian after the clamp
-// (e.g. a p<1 power, whose derivative is inf at 0) is left as-is: no worse than
-// before, and no clamp can finitize a genuinely singular boundary Jacobian.
+// would have perturbed are untouched. A Jacobian still non-finite after the clamp
+// (a p<1 power, whose derivative is inf at 0: C*k*sqrt(S) with S pinned at 0) is
+// not handed to the linear solver: an infinite pivot in a species' row zeroes
+// its Newton correction on every step, so CVODE's error test, which reads the
+// correction, passes while the species follows the predictor off without bound
+// (S(40) = -2.27, and -2.1e6 beside an unrelated species, for 0; issue #867).
+// The callback returns CVODE's recoverable code instead, as cvode_rhs does for a
+// non-finite RHS, so the run fails as a CVODE failure: jacobian="auto" retries
+// on the difference-quotient Jacobian (GH #176), and jacobian="analytical" says
+// so, with the state as the witness (GH #336).
 static inline bool jac_has_nonfinite(const double *jac_data, std::size_t count) {
     for (std::size_t i = 0; i < count; ++i)
         if (!std::isfinite(jac_data[i]))
@@ -879,6 +886,18 @@ static std::string describe_nonfinite_witness(NetworkModel &model, const NonFini
                   " finite and positive).";
         } else if (w.sens_column >= 0 && n_laws == 0 && n_negative == 0) {
             os << describe_sensitivity_witness(model, w);
+        } else if (w.source != nullptr && (std::strcmp(w.source, "The Jacobian") == 0 ||
+                                           std::strcmp(w.source, "The compiled Jacobian") == 0)) {
+            // A closed-form Jacobian is refused only after its GH #135 clamp
+            // retry, so the domain advice below misdirects for the commonest
+            // cause: a slope that is infinite at 0 itself (issue #867).
+            os << " The Jacobian is refused only after a second evaluation with every"
+                  " concentration below zero set to 0, so either a law is read outside"
+                  " its domain at a value that retry leaves alone (a rate-rule"
+                  " variable, or a species declared negative), or a derivative is"
+                  " infinite at 0 itself — the slope of sqrt(S), or of S^p with"
+                  " p < 1 — which no constraint on S removes. jacobian=\"fd\""
+                  " differences the right-hand side instead (issue #867).";
         } else {
             os << " bngsim evaluates a rate law literally, so a state outside its"
                   " domain — a logarithm, a sqrt or a fractional power of a negative"
@@ -1509,9 +1528,11 @@ static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /
     if (jac_has_nonfinite(jac, n * n)) {
         model->fill_dense_analytical_jacobian(static_cast<double>(t),
                                               clamp_state_nonneg(data, y_ptr), jac);
-        if (jac_has_nonfinite(jac, n * n))
+        if (jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            return 1; // still non-finite: recoverable, not a silent success (issue #867)
+        }
     }
     return 0;
 }
@@ -1556,9 +1577,11 @@ static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy
     if (jac_has_nonfinite(jac, n * n)) {
         rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y_ptr), jac,
                                   &data->codegen_so_data);
-        if (rc == 0 && jac_has_nonfinite(jac, n * n))
+        if (rc == 0 && jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             data->model->n_species()); // GH #336
+            return 1; // still non-finite: recoverable, not a silent success (issue #867)
+        }
     }
     return rc;
 }
@@ -1651,9 +1674,11 @@ static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/,
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
         model->fill_sparse_analytical_jacobian(static_cast<double>(t),
                                                clamp_state_nonneg(data, conc), jac_data);
-        if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz)))
+        if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), conc,
                                             model->n_species()); // GH #336
+            return 1; // still non-finite: recoverable, not a silent success (issue #867)
+        }
     }
 
     return 0; // success
@@ -1702,9 +1727,11 @@ static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*f
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
         rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y_ptr),
                                          jac_data, &data->codegen_so_data);
-        if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz)))
+        if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            return 1; // still non-finite: recoverable, not a silent success (issue #867)
+        }
     }
     return rc;
 }
