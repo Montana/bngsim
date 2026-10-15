@@ -1071,9 +1071,9 @@ def test_a_held_slide_prints_nothing(tmp_path):
     assert "mxstep" not in done.stdout + done.stderr
 
 
-def _batch_ends_after(path, hold, after):
-    """The times CVODE logs a batch ending at, past ``after``, in a run of
-    ``path`` with holding on or off; in a subprocess, as above."""
+def _batch_ends_between(path, hold, start, stop):
+    """The times CVODE logs a batch ending at, between ``start`` and ``stop``,
+    in a run of ``path`` with holding on or off; in a subprocess, as above."""
     script = textwrap.dedent(f"""
         import bngsim
         m = bngsim.Model.from_net({str(path)!r})
@@ -1085,16 +1085,17 @@ def _batch_ends_after(path, hold, after):
         [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
     )
     times = re.findall(r"At t = ([0-9.eE+-]+), mxstep", done.stdout + done.stderr)
-    return [t for t in times if float(t) > after]
+    return [t for t in times if start < float(t) < stop]
 
 
 def test_a_released_hold_logs_what_main_logs(tmp_path):
     """While a run holds a residual, CVODE's error log is in the null sink; once
     nothing is held it goes back. Kept in the sink for the rest of the run, the
-    batch ends after S has left its band (t > 1, in 20-step batches) went
-    unlogged, where the run with holding off logs 4 of them."""
+    batch ends after S has left its band (in 20-step batches, between t = 1 and
+    the restart at S's crossing back near t = 2.55) went unlogged, where the
+    run with holding off logs them. Where each batch ends depends on where the
+    run last returned, so the times are not compared."""
     path = tmp_path / "leave.net"
     path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
-    off = _batch_ends_after(path, "0", 1.0)
-    assert off
-    assert _batch_ends_after(path, "1", 1.0) == off
+    assert _batch_ends_between(path, "0", 1.0, 2.4)
+    assert _batch_ends_between(path, "1", 1.0, 2.4)
