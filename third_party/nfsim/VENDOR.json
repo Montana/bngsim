@@ -7,11 +7,11 @@
     "local_origin_remote": "https://github.com/RuleWorld/nfsim.git",
     "fork_remote": null,
     "branch_or_ref": "bngsim/vendor",
-    "commit": "9cbe556f9e72c398383424cca480a7d8303f1ece",
+    "commit": "037f8d0febec6a5a4f2426e0fed5db0eed7a31b1",
     "base_ref": "origin/master",
     "base_commit": "1a54f38701ab2213de831f9ba272cbb14f7c371f"
   },
-  "imported_at_utc": "2026-10-15T18:56:10+00:00",
+  "imported_at_utc": "2026-10-15T19:40:57+00:00",
   "pruning": {
     "included_paths": [
       "CMakeLists.txt",
@@ -215,6 +215,17 @@
         {
           "commit": "9cbe556f9e72c398383424cca480a7d8303f1ece",
           "summary": "bngsim: refresh a Michaelis-Menten rule's kcat and Km on setParameter"
+        }
+      ]
+    },
+    {
+      "topic": "bngsim/carry-dor-exit-to-exception",
+      "kind": "local",
+      "status": "Throw std::runtime_error instead of calling exit(1) in DORRxnClass, DOR2RxnClass, Observable and SpeciesObservable. A rule NFsim cannot build -- a BNG-written local-function rate law that reads both reactants, or a local function that reads a Species observable -- killed the host process with no message; NFinput now fails the load and the host reports it. Same conversion as bngsim/carry-exit-to-exception, for files it left out. See bngsim GH #854's review.",
+      "commits": [
+        {
+          "commit": "037f8d0febec6a5a4f2426e0fed5db0eed7a31b1",
+          "summary": "bngsim: throw instead of exit(1) in the DOR reaction classes and observables"
         }
       ]
     }

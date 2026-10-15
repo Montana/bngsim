@@ -363,6 +363,28 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-dor-exit-to-exception",
+        "kind": "local",
+        "status": (
+            "Throw std::runtime_error instead of calling exit(1) in DORRxnClass, "
+            "DOR2RxnClass, Observable and SpeciesObservable. A rule NFsim cannot build -- a "
+            "BNG-written local-function rate law that reads both reactants, or a local "
+            "function that reads a Species observable -- killed the host process with no "
+            "message; NFinput now fails the load and the host reports it. Same conversion "
+            "as bngsim/carry-exit-to-exception, for files it left out. See bngsim GH #854's "
+            "review."
+        ),
+        "commits": [
+            {
+                "commit": "037f8d0febec6a5a4f2426e0fed5db0eed7a31b1",
+                "summary": (
+                    "bngsim: throw instead of exit(1) in the DOR reaction classes and "
+                    "observables"
+                ),
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12

@@ -1,4 +1,4 @@
-"""A post-init parameter write reaches every NFsim rate law, and NFsim refuses Arrhenius.
+"""A post-init parameter write reaches every NFsim rate law; NFsim refuses what it cannot run.
 
 Issue #854's review found three more ways the vendored NFsim ran a rule at a rate
 its parameters no longer gave, with no warning:
@@ -15,6 +15,9 @@ its parameters no longer gave, with no warning:
   BioNetGen does not apply and gets one-way rules wrong (RuleWorld/nfsim#102).
   They are refused by name until the vendored NFsim carries the upstream fix,
   and so is a rate-law type NFsim does not implement: it dropped a Hill rule.
+* A local-function rate law reading both reactants, or a local function reading
+  a Species observable, made NFsim call exit(1) and kill the Python process
+  (carry 0019); the load now fails with an error.
 
 The oracle for a post-init write is the same model with the new value written
 into the XML and no override at all. That load path never runs the refresh, so
@@ -25,6 +28,8 @@ draws: the trajectories must be identical. Each case also checks a closed form.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import bngsim
@@ -115,6 +120,38 @@ def test_a_post_init_km_runs_as_km_written_into_the_xml(mm_xml, tmp_path):
     (tmp_path / "km").mkdir()
     written = _run(_write(mm_xml, tmp_path / "km", {"kcat": 1.0, "Km": 10.0}))
     np.testing.assert_array_equal(post, written)
+
+
+def test_a_post_init_kcat_keeps_the_rule_symmetry_factor(mm_xml, tmp_path):
+    # baseRate carries an MM rule's symmetry factor; the refresh must leave it be.
+    sym = _write(mm_xml, tmp_path, {}, swap=[('symmetry_factor="1"', 'symmetry_factor="0.5"')])
+    post = _run(sym, post={"kcat": 1.0})
+    (tmp_path / "w").mkdir()
+    written = _run(_write(sym, tmp_path / "w", {"kcat": 1.0}))
+    np.testing.assert_array_equal(post, written)
+    assert post[-1] > 0
+
+
+def test_a_post_init_write_reaches_a_derived_kcat(mm_xml, tmp_path):
+    # kcat2 = 2*kcat, as BNG writes a derived parameter; the rule reads kcat2.
+    derived = _write(
+        mm_xml,
+        tmp_path,
+        {},
+        swap=[
+            (
+                '<Parameter id="Km" type="Constant" value="100" expr="100"/>',
+                '<Parameter id="Km" type="Constant" value="100" expr="100"/>\n'
+                '      <Parameter id="kcat2" type="Constant" value="0" expr="2*kcat"/>',
+            ),
+            ('<RateConstant value="kcat"/>', '<RateConstant value="kcat2"/>'),
+        ],
+    )
+    post = _run(derived, post={"kcat": 0.5})
+    (tmp_path / "w").mkdir()
+    written = _run(_write(derived, tmp_path / "w", {"kcat": 0.5, "kcat2": 1.0}))
+    np.testing.assert_array_equal(post, written)
+    assert post[-1] > 0
 
 
 def test_a_post_init_kcat_of_zero_stops_the_rule(mm_xml, tmp_path):
@@ -232,6 +269,40 @@ def test_rate_laws_nfsim_implements_are_not_refused(data_dir: Path, fixture):
     assert arrhenius_rules(xml) == []
     assert nfsim_unimplemented_rate_laws(xml) == []
     bngsim.NfsimSession(str(xml)).destroy()
+
+
+# ─── A rule NFsim cannot build fails the load instead of the process ─────────
+
+
+@pytest.mark.parametrize(
+    "fixture, says",
+    [
+        # fA(x)*fB(y): a local-function rate law reading both reactants.
+        ("local_function_two_reactants.xml", "only support one DOR reactant"),
+        # The same rule with fA and fB reading Species observables.
+        ("local_function_species_observable.xml", "Failed to load XML file"),
+    ],
+)
+def test_a_rule_nfsim_cannot_build_fails_the_load_not_the_process(data_dir: Path, fixture, says):
+    # In a child process: before carry 0019, NFsim called exit(1) and took the
+    # interpreter with it, which would end this test run, not fail one test.
+    xml = data_dir / "nfsim" / fixture
+    script = (
+        "import sys, bngsim\n"
+        "s = bngsim.NfsimSession(sys.argv[1])\n"
+        "try:\n"
+        "    s.initialize(seed=1)\n"
+        "except bngsim.BngsimError as e:\n"
+        "    print('RAISED', type(e).__name__, e)\n"
+        "else:\n"
+        "    print('RAN')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(xml)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.startswith("RAISED SimulationError"), proc.stdout
+    assert says in proc.stdout, proc.stdout
 
 
 def test_energy_patterns_without_an_arrhenius_rule_still_run(data_dir: Path):
