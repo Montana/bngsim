@@ -317,9 +317,15 @@ def test_clones_of_a_model_with_tables_that_was_never_asked_do_not_each_ask(tmp_
 
 def test_models_that_are_not_clones_share_nothing(tmp_path, monkeypatch):
     """Control. Two models of one shape, loaded apart, with different
-    functions: the memo is a family's, and each is analyzed for itself."""
+    functions: the memo is a family's, and each is analyzed for itself. (In a
+    cache directory of their own, so that each is built here: a model that is
+    handed a cached artifact is told its map by the note beside it and is
+    not analyzed at all, issue #1004.)"""
     from bngsim import _codegen
 
+    cache = tmp_path / "codegen-cache"
+    cache.mkdir()
+    monkeypatch.setattr(_codegen, "CACHE_DIR", cache)
     made = _analyses_made(monkeypatch)
     one = _model(tmp_path, READS_A_FUNCTION, name="one.net")
     other = _model(

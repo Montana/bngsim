@@ -47,6 +47,7 @@ from bngsim._codegen import (
     _codegen_jit_backend,
     last_codegen_decline,
     last_codegen_error,
+    output_sens_support_of_artifact,
     read_sens_decline_note,
 )
 from bngsim._exceptions import (
@@ -67,6 +68,10 @@ from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
 from bngsim._ssa_validation import validate_for_ssa
 
 logger = logging.getLogger("bngsim")
+
+# The most steps a step bound taken automatically may ask of a run (issue #890):
+# past this the bound is not a way to finish, and the run is refused instead.
+_STEP_BOUND_CEILING = 1.0e8
 
 # An identifier in a parameter's expression.
 _NAME = re.compile(r"[A-Za-z_]\w*")
@@ -893,6 +898,15 @@ class Simulator:
                     "BNGSIM_ALLOW_UNSUPPORTED_CONSTRUCTS=1."
                 )
 
+            # A ring of rates written in terms of each other (`X' =
+            # rateOf(Y); Y' = rateOf(X)`) is an algebraic loop, and has no
+            # right-hand side to integrate (lanl/bngsim#991).
+            # (Asked of a core that can say. The C++ simulator refuses the
+            # model too, for a caller that comes by another way.)
+            ring = getattr(model._core, "rateof_ring_refusal", None)
+            if ring is not None and ring():
+                raise ModelError(ring())
+
             self._sim = CvodeSimulator(model._core)
         elif dispatch in ("ssa", "psa"):
             # SBML-loaded models carry a list of SsaIssue records (populated
@@ -1623,9 +1637,12 @@ class Simulator:
         # A compartment an assignment rule sizes. The right-hand side divides a
         # species' share of a reaction across compartments by the size the
         # model loaded at, not the one the rule gives (issue #745), so a law
-        # across sizes there is a law of that right-hand side: `c2 := 1 + A`
-        # ends at A = 0.354 where the amounts give 0.467. Such a model was
-        # refused while its law was found without the sizes, and stays so.
+        # across sizes there is a law of that right-hand side, not of the
+        # amounts. Such a model was refused while its law was found without
+        # the sizes, and stays so. (`c2 := 1 + A`, the example this was
+        # written for, dilutes B since #1052, which leaves no such law: its
+        # steady states form a line, and the isolated-root check refuses its
+        # columns.)
         ruled = sorted(set(model.compartment_size_params) & set(model.function_names))
         if ruled:
             names = model.species_names
@@ -2070,7 +2087,9 @@ class Simulator:
             opts.set_ic_param_sens([t for t in triples if t[2] != 0.0] or [(-1, 0, 0.0)])
         return model.effective_ic_sensitivity(names)
 
-    def _apply_crossing_stops(self, opts, t_start, t_end, model=None) -> None:
+    def _apply_crossing_stops(
+        self, opts, t_start, t_end, model=None, sensitivities: bool | None = None
+    ) -> None:
         """Stop the integration step on every fixed time discontinuity (#305).
 
         A GH #72 discontinuity root is registered so the integrator cannot step
@@ -2109,13 +2128,33 @@ class Simulator:
         sensitivity paths run on a *clone* carrying that row's parameter point,
         and resolving against the parent's values would put the stop at the
         wrong time for exactly the rows a scan exists to explore.
+
+        ``sensitivities`` says whether the run carries sensitivity columns,
+        for a caller whose columns are not the Simulator's own (the chunked
+        path). Such a run reads every condition itself, so of the conditions
+        that only evaluating them places (issue #904) it is handed the stops
+        of those on literal time that read none of the Simulator's sensitivity
+        parameters: fixed times of the run, with no jump to make. Every chunk
+        is asked about the whole set, so every chunk stops at the same times.
         """
         model = model if model is not None else self._model
+        if sensitivities is None:
+            sensitivities = bool(self._sensitivity_params or self._sensitivity_ic)
         conditions = model.time_discontinuity_conditions()
-        if not conditions:
+        # A table function read on the clock breaks at its breakpoints whether
+        # or not any condition names it (issue #709).
+        table_breaks = model.table_function_breaks()
+        if not conditions and not table_breaks:
             return
-        from bngsim._switch_sensitivity import crossings_with_periodic, merge_crossing_stops
+        from bngsim._switch_sensitivity import (
+            _PLAIN_INSTANT_FLOOR,
+            TriggerEqualityNeverHolds,
+            crossings_with_periodic,
+            merge_crossing_stops,
+            table_function_stops,
+        )
 
+        over_budget: list = []
         try:
             crossings, periodic, periodic_at = crossings_with_periodic(
                 model._core,
@@ -2123,16 +2162,28 @@ class Simulator:
                 float(t_end),
                 conditions,
                 touches=getattr(model, "_event_disc_conditions", frozenset()),
+                over_budget=over_budget,
+                sensitivity_params=tuple(self._sensitivity_params) if sensitivities else None,
+            )
+            knots = (
+                table_function_stops(model._core, float(t_start), float(t_end), table_breaks)
+                if table_breaks
+                else []
             )
             # A crossing of a sinusoid or a polynomial in time is a stop too
             # (issue #714): a window narrower than a step lay wholly inside one,
             # unseen. The stop lands a little past the crossing; to the event
             # sensitivity jump the crossing is one more fixed one on its instant.
             stops = merge_crossing_stops(
-                sorted([*crossings, *periodic], key=lambda stop: stop.time)
+                sorted([*crossings, *periodic, *knots], key=lambda stop: stop.time),
+                floor=1.0 if sensitivities else _PLAIN_INSTANT_FLOOR,
             )
             if periodic_at:
                 crossings = sorted([*crossings, *periodic_at], key=lambda stop: stop.time)
+        except TriggerEqualityNeverHolds as e:
+            raise SimulationError(str(e)) from None
+        except SensitivityUnsupportedError:
+            raise
         except Exception as e:  # pragma: no cover - defensive
             # Resolution is best-effort: failing it leaves the pre-#305 stepping,
             # which is correct wherever it completes at all. Warn rather than
@@ -2149,7 +2200,8 @@ class Simulator:
                 ", ".join(f"{stop.time:.6g}" for stop in stops),
             )
             opts.set_crossing_stops(
-                [(stop.time, stop.clock_species_idx, stop.threshold) for stop in stops]
+                [(stop.time, stop.clock_species_idx, stop.threshold) for stop in stops],
+                [stop.restart for stop in stops],
             )
             # Where some instant has more than one crossing, the loop stops
             # there once and the event sensitivity jump asks each for its own
@@ -2160,6 +2212,217 @@ class Simulator:
             opts.set_crossing_probes(
                 list(probes) if len(probes) > len(stops) or periodic_at else []
             )
+        over_budget = self._switches_the_run(model, over_budget)
+        if over_budget:
+            # Whether the one condition past the budget is all that switches in
+            # this run: no other condition, no table, no rate law gated on the
+            # state, no event.
+            alone = (
+                len(conditions) == 1
+                and len(over_budget) == 1
+                and not table_breaks
+                and not model.state_switch_root_conditions()
+                and model._core.n_events == 0
+            )
+            self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+
+    @staticmethod
+    def _switches_the_run(model, over_budget: list) -> list:
+        """Those of the conditions past the budget that the run switches on: one
+        an SBML loader registered, one an event's trigger reads, or one that
+        stands in a rate law or a function a rate law reaches. A condition in a
+        function that only reports (an output of ``mod(time(), 0.0001)``) is
+        none of these, and no reason to refuse the run."""
+        if not over_budget:
+            return over_budget
+        from bngsim._switch_sensitivity import conditions_a_rate_law_reads
+
+        registered = {
+            *(getattr(model, "_time_disc_conditions", None) or ()),
+            *(getattr(model, "_event_disc_conditions", None) or ()),
+        }
+        asked = [item.condition for item in over_budget if item.condition not in registered]
+        try:
+            read = conditions_a_rate_law_reads(model._core, asked)
+        except Exception as exc:  # pragma: no cover - defensive: then all of them count
+            logger.debug("which conditions a rate law reads: not read (%s)", exc)
+            read = frozenset(asked)
+        return [
+            item for item in over_budget if item.condition in registered or item.condition in read
+        ]
+
+    @staticmethod
+    def _flickers(item, t_start, t_end, stop: str) -> str:
+        """The rest of the refusal of a condition a step call of which flickers
+        (:class:`bngsim._clock_scan.Flickers`), from "switches on" on."""
+        call, begins, ends, unread = item.flicker
+        if unread == "coarse":
+            # A sawtooth with nothing left of its argument to be one.
+            return (
+                f"switches on {item.condition!r}, and where it does cannot be placed: the "
+                f"whole number {call!r} takes off its argument is beyond 2^48 (2.8e14) in "
+                "this run, where the doubles of that argument are a sixteenth of one wrap "
+                "apart or more. What the call returns is then the rounding of its "
+                "argument, a few steps up to each wrap, and a stop on each wrap would not "
+                f"be a stop on each step (issue #904). Left without {stop} the run would "
+                "step over them. A sawtooth needs an argument that is small against 2^48 "
+                "of its wraps: an offset inside it (`mod(1e12 + time(), P)`), or a clock "
+                "that far along, leaves it nothing to resolve."
+            )
+        lo, hi = sorted((float(t_start), float(t_end)))
+        begins, ends = min(max(begins, lo), hi), min(max(ends, lo), hi)
+        which = "longest" if unread else "first"
+        more = (
+            f" (the {which} of {item.changes} such stretches in the run)"
+            if item.changes > 1
+            else ""
+        )
+        # Either it changes side of the level time and again there, or it is
+        # a staircase of its own last places for longer than the call can be
+        # read over to find every step it takes across the level.
+        how = (
+            "which is more of the run than the call can be read over for every change "
+            "it makes there"
+            if unread
+            else "and reads on either side of that level by turns there"
+        )
+        advice = (
+            "it is not a small difference of large terms, and does not creep up on the "
+            "level as a saturating `exp` or `tanh` does"
+            if unread
+            else "it is not a small difference of large terms (a polynomial in its factored "
+            "form, for one)"
+        )
+        return (
+            f"switches on {item.condition!r}, and where it does cannot be placed: the "
+            f"argument of {call!r} is within its own rounding of a level it crosses "
+            f"between t={begins!r} and t={ends!r}{more}, {how}. Left without {stop} the "
+            "run would step over a window that opens or closes in that stretch (issue "
+            f"#904). Write the argument so that {advice}."
+        )
+
+    @staticmethod
+    def _bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone=False) -> None:
+        """Keep the step off a condition that changes more often than a run has
+        stops for (issue #890).
+
+        Such a condition gets none of its stops, and before this the run went
+        on with a warning in the log and stepped over its windows: X = 0.1
+        where the answer is 6000.
+
+        A step no longer than half the shortest stretch between two switches
+        of the rate law cannot span one, since an end of some step then falls
+        inside every stretch. That is a property of every switch in the run
+        taken together: a rate law that goes off on this condition and comes
+        back on at another condition's stop is the same at both ends of a step
+        across the two (a schedule of 0.2-wide pulses bounded at 0.1, beside a
+        second schedule that was stopped at, gained 0.05 at each instant they
+        met within 0.05: 81 for 78).
+
+        * *alone*, a repeating schedule is all that switches in the run, its
+          shortest stretch is known, and the step is bounded at half of it.
+          (``max_steps`` is a batch the core retries while the run advances,
+          so the bound needs no more of it.)
+        * Otherwise a ``max_step`` the caller passed stands for the stops. It
+          is tightened to half the shortest stretch that is known: between two
+          changes of the condition past the budget, and between any two
+          changes where its own were listed. A bound the caller chose wider
+          than a window would step over it as surely as no bound. Where no
+          stretch is known, a bound wider than half the mean stretch between
+          the changes that were counted is wider than half the shortest, and
+          is refused.
+        * With neither, the run is refused.
+
+        A condition a step call of which flickers
+        (:class:`bngsim._clock_scan.Flickers`) is refused whatever bound is
+        passed: what else the rate law switches on is not known there.
+
+        A bound bngsim sets is refused past :data:`_STEP_BOUND_CEILING` steps:
+        4e9 windows asked for nine minutes of one core and counting, with
+        nothing said.
+        """
+        span = abs(float(t_end) - float(t_start))
+
+        def refuse(item, why: str):
+            if item.unresolved:
+                return SimulationError(
+                    f"The rate law switches on {item.condition!r}, and bngsim could not "
+                    f"count its changes between t={t_start!r} and t={t_end!r}: evaluated "
+                    "on grids of up to two million cells, each finer grid found more of "
+                    "them. Left without a stop on each, the integrator would step over "
+                    f"its windows (issue #904). {why}"
+                )
+            return SimulationError(
+                f"The rate law switches on {item.condition!r}, which changes about "
+                f"{item.changes} times between t={t_start!r} and t={t_end!r}. With the "
+                "run's other switches that is more than the 1,000,000 stops bngsim "
+                "places in one run, and left without them the integrator would step "
+                f"over its windows (issue #890). {why}"
+            )
+
+        for item in over_budget:
+            if item.flicker is not None:
+                # Whatever step bound is passed. One no wider than half the
+                # shortest stretch between two switches would stand for the
+                # stop, and what the rate law's other switches are is not
+                # known where a call of it flickers: `max_step=1` was taken
+                # for `sign(p) > 0 && time() < 5.3`, p the cube of time() - 5
+                # written out, and the run returned 0 for 0.3.
+                raise SimulationError(
+                    "The rate law " + Simulator._flickers(item, t_start, t_end, "a stop")
+                )
+            gaps = [g for g in (item.min_gap, item.union_gap) if g is not None and g > 0.0]
+            need = 0.5 * float(min(gaps)) if gaps else None
+            passed = opts.max_step_size > 0.0
+            if need is not None and (alone or passed):
+                if not (passed and opts.max_step_size <= need):
+                    if span / need > _STEP_BOUND_CEILING:
+                        raise refuse(
+                            item,
+                            f"A step bound of {need:g}, half the shortest stretch between "
+                            f"two switches, would stand for the stops, at {span / need:.3g} "
+                            "steps or more. Run it in shorter legs (run_until), or pass "
+                            "max_step that small yourself if that is the run you want.",
+                        )
+                    opts.max_step_size = need
+                logger.info(
+                    "%r changes about %d times between t=%r and t=%r, more than the "
+                    "stops placed in one run; the step is bounded at %g instead "
+                    "(issue #890).",
+                    item.condition,
+                    item.changes,
+                    t_start,
+                    t_end,
+                    opts.max_step_size,
+                )
+            elif passed:
+                mean = span / max(int(item.changes), 1)
+                if opts.max_step_size > 0.5 * mean:
+                    raise refuse(
+                        item,
+                        f"max_step={opts.max_step_size:g} is more than half the mean "
+                        f"stretch between those changes ({mean:g}), so a step under it "
+                        "can still span a window. Pass max_step no larger than half the "
+                        "shortest stretch between two switches of the rate law, or run "
+                        "in shorter legs (run_until).",
+                    )
+                logger.info(
+                    "%r changes about %d times between t=%r and t=%r, more than the "
+                    "stops placed in one run; the step bound in force (%g) is what "
+                    "keeps the integrator off its windows (issue #890).",
+                    item.condition,
+                    item.changes,
+                    t_start,
+                    t_end,
+                    opts.max_step_size,
+                )
+            else:
+                raise refuse(
+                    item,
+                    "Run it in shorter legs (run_until), or pass max_step no larger than "
+                    "half the shortest stretch between two switches of the rate law, "
+                    "which then stands for the stops.",
+                )
 
     @staticmethod
     def _apply_ssa_breakpoints(sims, model, t_start, t_end) -> None:
@@ -2193,10 +2456,12 @@ class Simulator:
             conditions = model.time_discontinuity_conditions()
             if conditions:
                 from bngsim._switch_sensitivity import (
+                    TriggerEqualityNeverHolds,
                     crossings_with_periodic,
                     merge_crossing_stops,
                 )
 
+                over_budget: list = []
                 try:
                     crossings, periodic, _ = crossings_with_periodic(
                         model._core,
@@ -2204,17 +2469,48 @@ class Simulator:
                         float(t_end),
                         conditions,
                         touches=getattr(model, "_event_disc_conditions", frozenset()),
+                        over_budget=over_budget,
                     )
                     times = [float(stop.time) for stop in merge_crossing_stops(crossings)]
                     # ...and the crossings of a sinusoid or a polynomial in time,
                     # whose window a step can otherwise lie across unseen.
                     if periodic:
                         times = sorted(set(times) | {float(stop.time) for stop in periodic})
+                except TriggerEqualityNeverHolds as e:
+                    raise SimulationError(str(e)) from None
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning(
                         "Discontinuity crossing resolution failed (%s); the SSA "
                         "continuous loop will step without breakpoints (issue #719).",
                         e,
+                    )
+                over_budget = Simulator._switches_the_run(model, over_budget)
+                if over_budget:
+                    # The loop has no step bound to fall back on: a window
+                    # between two of its looks is not seen (issue #890).
+                    item = next(
+                        (item for item in over_budget if item.flicker is not None), over_budget[0]
+                    )
+                    if item.flicker is not None:
+                        raise SimulationError(
+                            "A rate or a trigger "
+                            + Simulator._flickers(item, t_start, t_end, "a breakpoint")
+                        )
+                    if item.unresolved:
+                        raise SimulationError(
+                            f"A rate or a trigger switches on {item.condition!r}, and bngsim "
+                            f"could not count its changes between t={t_start!r} and "
+                            f"t={t_end!r}: evaluated on grids of up to two million cells, "
+                            "each finer grid found more of them. Left without a breakpoint "
+                            "on each, the run would step over its windows (issue #904). "
+                            "Run it in shorter legs (run_until)."
+                        )
+                    raise SimulationError(
+                        f"A rate or a trigger switches on {item.condition!r}, which changes "
+                        f"about {item.changes} times between t={t_start!r} and t={t_end!r}: "
+                        "more than the 1,000,000 breakpoints bngsim hands a stochastic "
+                        "run. Left alone the run would step over its windows (issue "
+                        "#890). Run it in shorter legs (run_until)."
                     )
                 if times:
                     pc_names = Simulator._ssa_piecewise_constant(model, t_start, t_end, conditions)
@@ -3014,16 +3310,43 @@ class Simulator:
         # unsupported while it is attached and not while it is pinned, and the
         # artifact can be replaced on that account by more than one route
         # (issue #708).
-        attached = _attachment(self._model)
+        #
+        # And with the artifact (issue #1004): the map is the compiled code's
+        # own, written beside it when it was built. The analysis behind it runs
+        # under a wall-clock budget, so one made again here need not be cut
+        # where the build's was, and would call a function supported that the
+        # artifact holds NaN for. Read, a warm process does not pay for the
+        # analysis either. The model whose own analysis the artifact was
+        # emitted from answers from that, and an artifact with no note is
+        # analysed as before.
+        attached = (_attachment(self._model), self._codegen_so_path)
         kept = self._expr_sens_support_memo
         if kept is not None and kept[0] == attached:
             return kept[1]
-        try:
-            from bngsim._codegen import output_sens_support
+        memo = None
+        if self._codegen_so_path:
+            try:
+                names = list(self._model._core.function_names)
+            except Exception:  # noqa: BLE001 - no names to hold the note to
+                names = None
+            memo = output_sens_support_of_artifact(self._model, self._codegen_so_path, names)
+            unavailable = [name for name, reason in (memo or {}).items() if reason is not None]
+            if memo is not None and unavailable:
+                logger.info(
+                    "The compiled code has no output sensitivity for %d of %d function(s) "
+                    "(%s): %s",
+                    len(unavailable),
+                    len(memo),
+                    ", ".join(unavailable[:5]),
+                    memo[unavailable[0]],
+                )
+        if memo is None:
+            try:
+                from bngsim._codegen import output_sens_support
 
-            memo = output_sens_support(self._model)
-        except Exception:  # pragma: no cover - defensive; analysis is best-effort
-            memo = {}
+                memo = output_sens_support(self._model)
+            except Exception:  # pragma: no cover - defensive; analysis is best-effort
+                memo = {}
         self._expr_sens_support_memo = (attached, memo)
         return memo
 
@@ -3971,21 +4294,28 @@ class Simulator:
             restore()
             raise
 
-    def _ode_attempts(self, times, opts, restore):
+    def _ode_attempts(self, times, opts, restore, sim=None, core=None):
         """The attempts :meth:`_run_ode_with_jacobian_fallback` makes, with
-        ``restore`` putting the model back between them."""
+        ``restore`` putting the model back between them.
+
+        ``sim`` and ``core`` default to this Simulator's own; a :meth:`run_batch`
+        row passes its clone's, so a row places the same bet a loop of
+        :meth:`run` would (GH #203).
+        """
+        sim = self._sim if sim is None else sim
+        core = self._model._core if core is None else core
         eligible = self._jacobian == "auto" and bool(
-            getattr(self._model._core, "analytical_jacobian_complete", False)
+            getattr(core, "analytical_jacobian_complete", False)
         )
         if not eligible:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         if self._ode_jacobian_fell_back:
             # A prior run on this Simulator already proved the analytical attempt
             # is doomed for this model — go straight to FD, no wasted attempt.
             opts.jacobian = "fd"
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         try:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         except RuntimeError as e:
             # Only a CVODE failure is the Jacobian's to rescue. Anything else is
             # bngsim refusing the model or the run, such as an invalid event delay
@@ -4000,14 +4330,15 @@ class Simulator:
                 "GH#176 analytical Jacobian: CVODE integration failed (%s); "
                 "retrying with the finite-difference Jacobian. The rate law is "
                 "likely discontinuous in a state variable (e.g. an if() whose "
-                "condition crosses a threshold), which the exact Jacobian cannot "
-                "represent. Pass jacobian='fd' to skip this attempt, or "
-                "jacobian='analytical' to surface the failure.",
+                "condition crosses a threshold), or its derivative is infinite "
+                "where the state sits (e.g. sqrt(S) at S = 0, issue #867), which "
+                "the exact Jacobian cannot represent. Pass jacobian='fd' to skip "
+                "this attempt, or jacobian='analytical' to surface the failure.",
                 e,
             )
             restore()
             opts.jacobian = "fd"
-            result = self._sim.run(times, opts)
+            result = sim.run(times, opts)
             # Only memoize once FD has actually succeeded — a model that fails on
             # both (genuinely unintegrable) keeps surfacing its error every run.
             self._ode_jacobian_fell_back = True
@@ -5341,10 +5672,14 @@ class Simulator:
         plus, minus = out
         return (plus - minus) / (2.0 * h), np.maximum(np.abs(plus), np.abs(minus))
 
-    def _capture_carryover_state(self) -> tuple[np.ndarray | None, list[str], bool, Any]:
+    def _capture_carryover_state(
+        self, core: Any = None
+    ) -> tuple[np.ndarray | None, list[str], bool, Any]:
         """Snapshot the model's carry-over state: the sensitivity seed (issue #81)
-        and the event state a continuing run starts from (issue #693)."""
-        core = self._model._core
+        and the event state a continuing run starts from (issue #693). ``core``
+        defaults to this Simulator's model; a :meth:`run_batch` row passes its
+        clone's."""
+        core = self._model._core if core is None else core
         seed = (
             np.array(core.pending_sensitivity_seed(), dtype=np.float64)
             if core.has_pending_sensitivity_seed
@@ -5358,11 +5693,11 @@ class Simulator:
         )
 
     def _restore_carryover_state(
-        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any]
+        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any], core: Any = None
     ) -> None:
         """Put back what :meth:`_capture_carryover_state` captured."""
         seed, names, dirty, events = snapshot
-        core = self._model._core
+        core = self._model._core if core is None else core
         if seed is None:
             core.set_pending_sensitivity_seed(np.zeros((0, 0), dtype=np.float64), [])
         else:
@@ -5820,7 +6155,19 @@ class Simulator:
                     self._apply_state_switch_sens(opts, clone._core)
                 else:
                     self._apply_state_switch_roots(opts, clone)
-                core_result = sim.run(times, opts)
+                # The GH #176 retry, as run() places it. Without it a row raised
+                # where the same run() fell back to FD and returned, which breaks
+                # the GH #203 contract above; issue #867 made a closed form still
+                # non-finite after the clamp one more way to need it.
+                row_core = clone._core
+                start_state = row_core.get_state()
+                start_carry = self._capture_carryover_state(row_core)
+
+                def restore() -> None:
+                    row_core.set_state(start_state)
+                    self._restore_carryover_state(start_carry, row_core)
+
+                core_result = self._ode_attempts(times, opts, restore, sim=sim, core=row_core)
 
             elif self._method in ("ssa", "psa"):
                 from bngsim._bngsim_core import SsaSimulator
@@ -6511,7 +6858,7 @@ class Simulator:
         # same crossing stops — a chunk that lost them would wedge where the
         # others did not, and issue #243 is the standing reminder that "which
         # chunk you are in" must not decide whether the solve succeeds.
-        self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone)
+        self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone, sensitivities=True)
         # Report this chunk's OWN subset of ∂x(0)/∂θ; the stitch takes the union
         # over chunks, which is the full requested set (issue #155).
         chunk_ic_seed = self._apply_ic_param_sens_seed(opts, clone, sens_params)

@@ -283,6 +283,13 @@ KNOWN_ARTIFACT: dict[str, dict] = {
     # no longer in the SSA-admitted set (ssa_candidates.json), so it builds no SSA
     # job and the override keyed nothing (stale_keys flagged it). Its exclusion
     # rationale now lives in the validation pipeline; see git history for the text.
+    #
+    # NOTE: BIOMD0000000570, 814, 816, 817, 829, 928, 994, 995, 996 and 1059 (ode)
+    # were known artifacts for a while after #1015 (#1021): RoadRunner skipped
+    # their `time == c` and open-window events between output samples, which
+    # bngsim fires. rr_run now runs RoadRunner through those instants
+    # (_rr_common.event_instants), so it fires them too and the comparison is
+    # real again; all 10 pass on their own. See git history for the entries.
 }
 
 # --------------------------------------------------------------------------- #
