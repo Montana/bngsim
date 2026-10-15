@@ -7273,10 +7273,13 @@ def _build_model_from_sbml_doc_in_context(doc):
     # reads in its own compartment, directly or through another such compartment:
     # the concentration is the amount over the size, so the two define each other
     # (libRoadRunner refuses it as a recursive assignment rule). And an amount
-    # (hOSU=true) in another assignment-rule compartment, whose rate accessor is
-    # still wrong there (#736). An event-promoted parameter (discontinuous; the #74
-    # rescale owns those) or an unparseable RHS still makes V̇ unknown, and we emit
-    # nothing, so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
+    # (hOSU=true) in an assignment-rule compartment, its own included, whose rate
+    # accessor is still wrong there (#736). An event-promoted parameter holds
+    # between its events (rate 0; the #74 rescale owns the jump), and so does a
+    # species that is constant or a boundary with no rate rule, where its value
+    # is an amount or its compartment's size holds; such a leaf needs no rate
+    # accessor. An unparseable RHS still makes V̇ unknown, and we emit nothing,
+    # so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
     # byte-identical. hOSU=true species and rule-target species are excluded exactly
     # as in 8b. The emitted term is additive to §9's reaction term and also covers a
     # flux-free species (pure dilution ``[S] = A/V(t)``); ODE-only for the same #81
@@ -7329,7 +7332,24 @@ def _build_model_from_sbml_doc_in_context(doc):
         # Classification in aliased-safe-name space (matches str(free_symbol)).
         _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
         _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
-        _event_alias = {_alias(_safe_name(p)) for p in event_promoted_params}
+        # A species whose value never moves continuously, so its rate is 0 and
+        # reading it needs no rate accessor: nothing changes its amount (constant,
+        # or boundary with no rate rule), and the value is that amount or a
+        # concentration in a compartment whose size holds between events.
+        _still_species = {
+            s
+            for s in _sbml_species_ids
+            if s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                sbml_model.getSpecies(s).getConstant()
+                or sbml_model.getSpecies(s).getBoundaryCondition()
+            )
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _rr_alias = {_alias(s): s for s in _rr_rhs_ex}  # alias -> safe name
         _ar_alias = {_alias(s): s for s in _ar_rhs_ex}  # alias -> safe name
         _rr_sym_cache: dict[str, object] = {}
@@ -7343,14 +7363,18 @@ def _build_model_from_sbml_doc_in_context(doc):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
             if nm == _TIME_SYM:
                 return _sp.Integer(1)
-            if nm in _event_alias:
-                return None
             if nm in _ar_alias:  # an assignment target, a species among them
                 return _vdot_sym(_ar_alias[nm], seen)
             if nm in _species_alias:  # its live rate, rateOf(S) (#1052)
-                return _sp.Symbol(_rateof_token(_species_alias[nm]))
+                sid = _species_alias[nm]
+                if sid in _still_species:
+                    return _sp.Integer(0)
+                return _sp.Symbol(_rateof_token(sid))
             if nm in _rr_alias:
                 return _rr_deriv(_rr_alias[nm])
+            # An event-promoted parameter jumps at its events, which rescale the
+            # concentrations there (#74), and holds between them (#1052: this
+            # used to make V̇ unknown and drop the whole term).
             return _sp.Integer(0)
 
         def _vdot_sym(safe_var: str, seen: frozenset):
@@ -7432,7 +7456,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) reads {leaf}, an amount in "
-                        f"compartment {species_comp[leaf]}, which an assignment rule also sizes; "
+                        f"compartment {species_comp[leaf]}, which an assignment rule sizes; "
                         "bngsim's rate of such a species is not yet right there (#736)"
                     )
 

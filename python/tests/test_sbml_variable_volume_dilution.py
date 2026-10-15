@@ -816,8 +816,9 @@ def test_ar_compartment_sized_by_a_species_dilutes(codegen):
 def test_ar_compartment_sized_by_a_species_reports_its_amount():
     """The bare-id amount selector reads the live size: Sk's amount stays 10.
     (A guard for the diluted species' amount remap, which a species left out of
-    ``ar_dilution_species`` would break. Main, which held [Sk] at 5, passed it
-    by coincidence: 5 times the load-time size 2.)"""
+    ``ar_dilution_species`` would break. Main passed the whole test by
+    coincidence: it held [Sk] at 5 and [X] at 10·e^(-k t), and reported each
+    times the load-time size 2, which happens to be the true amount.)"""
     _, res = _run(_SIZED_BY_S, t_end=4.0, n=9)
     arr = res.as_roadrunner(selections=["time", "Sk", "X"])
     cols = {c: i for i, c in enumerate(arr.colnames)}
@@ -949,3 +950,65 @@ def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refuse
     )
     with pytest.raises(bngsim.ModelError, match=r"reads Wa, an amount in compartment cw.*#736"):
         bngsim.Model.from_sbml_string(sbml)
+
+
+def test_ar_compartment_sized_by_an_event_parameter_and_a_species_dilutes():
+    """``cv := p + 0.1*S`` with an event setting p := 2 at t > 1: between events
+    p holds, so the size's rate is S's; the event's jump is rescaled. An event
+    parameter used to make the size's rate unknown and drop the term."""
+    sbml = _species_sized_sbml(
+        "<apply><plus/><ci>p</ci><apply><times/><cn>0.1</cn><ci>S</ci></apply></apply>",
+        extra_params='<parameter id="p" value="1" constant="false"/>',
+    ).replace(
+        " </model>",
+        f""" <listOfEvents><event id="bump" useValuesFromTriggerTime="true">
+   <trigger initialValue="false" persistent="true"><math {_MATHML}><apply><gt/>
+    <csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>
+    <cn>1</cn></apply></math></trigger>
+   <listOfEventAssignments><eventAssignment variable="p"><math {_MATHML}><cn>2</cn></math>
+   </eventAssignment></listOfEventAssignments>
+  </event></listOfEvents>
+ </model>""",
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    v = np.where(t > 1 + 1e-9, 2.0, 1.0) + np.exp(-_K * t)
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 / v, rtol=1e-6, atol=1e-8)
+
+
+def test_ar_compartment_sized_by_a_constant_species_takes_no_rate():
+    """A constant species never changes, so a size that reads it has rate 0 and
+    needs no rate accessor: the rateOf machinery stays off."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kc</ci>"),
+        '<species id="Kc" compartment="c" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="true" constant="true"/>',
+    )
+    model, res = _run(sbml, t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)
+
+
+def test_ar_compartment_sized_by_a_constant_species_in_a_moving_compartment():
+    """A constant concentration still moves when its own compartment does:
+    Kw (constant, 10 in ``cw := 1 + time``) is 10/(1 + t), so ``cv := 1 +
+    0.1*Kw`` has a rate, and [Sn] = 10/cv = 10(1 + t)/(2 + t)."""
+    time_ci = (
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        "</csymbol>"
+    )
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kw</ci>"),
+        '<species id="Kw" compartment="cw" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="true" constant="true"/>',
+        f'<assignmentRule variable="cw"><math {_MATHML}><apply><plus/><cn>1</cn>{time_ci}</apply>'
+        "</math></assignmentRule>",
+    ).replace(
+        '<compartment id="cv" size="1" constant="false"/>',
+        '<compartment id="cv" size="1" constant="false"/>'
+        '<compartment id="cw" size="1" constant="false"/>',
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    np.testing.assert_allclose(_conc(res, "Kw"), 10 / (1 + t), rtol=1e-7)
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 * (1 + t) / (2 + t), rtol=1e-6, atol=1e-8)
