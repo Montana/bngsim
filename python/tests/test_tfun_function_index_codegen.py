@@ -1,12 +1,13 @@
 """A table function indexed by a function is read at the function's value under codegen (#965).
 
-``g() tfun([0,100],[0,100], h)`` with ``h() 2*Atot``: the table spec names the
+``g() tfun([0,100],[0,100], h)`` with ``h() 2*Atot``: the table spec named the
 index by the slot the function ``h`` owns, ``index_kind == "parameter"``, and the
 compiled RHS read that slot, ``p[idx]``. Only the interpreter's
 ``evaluate_functions`` writes it, so compiled code saw ``h``'s load-time value and
 the trajectory froze at its initial state, with nothing raised. That hit
 ``codegen=True`` and the default path at or above ``BNGSIM_CODEGEN_THRESHOLD``.
-The compiled RHS now reads ``func[h]``, computed before the table call.
+The core now reports such a table as ``index_kind == "function"``, and the
+compiled RHS reads ``func[h]``, computed before the table call.
 
 The table is the identity, so g = h = 2A, dA/dt = -2A^2 and A(t) = 10/(1 + 20t).
 """
@@ -86,6 +87,20 @@ def test_compiled_and_interpreted_agree(tmp_path, functions):
     np.testing.assert_allclose(compiled, interpreted, rtol=1e-7)
 
 
+def test_the_core_reports_a_function_index_as_its_own_kind(tmp_path):
+    # Reported as the slot h's value is written to, every reader had to tell
+    # for itself that a function owns it, and one that did not read the
+    # load-time value. Both listings, and the analytic Jacobian, which must
+    # not take the table for a constant: it moves with h, and h with A.
+    core = _model(tmp_path, SPELLINGS["whole body"])._core
+    h = list(core.function_names).index("h")
+    expected = {"index_kind": "function", "index_func_idx": h}
+    expected |= {"index_param_idx": -1, "index_obs_idx": -1}
+    for (spec,) in (core.codegen_data()["table_functions"], core.table_function_tables):
+        assert {key: spec[key] for key in expected} == expected
+    assert "tfun_g" not in core.functional_jacobian_context()["constant_names"]
+
+
 def test_the_index_reads_the_functions_value_and_orders_it_first(tmp_path):
     data = _model(tmp_path, SPELLINGS["whole body"])._core.codegen_data()
     calls = cg._tfun_call_map(data)
@@ -101,9 +116,17 @@ def test_a_table_over_a_plain_parameter_still_reads_its_slot(tmp_path):
     ).format(functions="    1 g() tfun([0,100],[0,100], x)")
     path = tmp_path / "tfun_parameter_index.net"
     path.write_text(net)
-    data = bngsim.Model.from_net(str(path))._core.codegen_data()
+    core = bngsim.Model.from_net(str(path))._core
+    data = core.codegen_data()
     x = [p["name"] for p in data["parameters"]].index("x")
     assert cg._tfun_call_map(data) == {"g": (0, f"p[{x}]")}
+    (spec,) = data["table_functions"]
+    assert (spec["index_kind"], spec["index_param_idx"], spec["index_func_idx"]) == (
+        "parameter",
+        x,
+        -1,
+    )
+    assert "tfun_g" in core.functional_jacobian_context()["constant_names"]
 
 
 def test_the_recorded_function_values_read_the_index_live(tmp_path):

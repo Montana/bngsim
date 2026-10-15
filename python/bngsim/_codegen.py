@@ -6144,8 +6144,8 @@ def generate_rhs_from_model(model) -> str:
     fixed_sp = {i for i, s in enumerate(species) if s["fixed"]}
 
     # Map each tfun-backed BNGL function name to its (tf_id, C index expr):
-    # bare ``t``, ``obs[idx]``, ``p[idx]``, or ``func[k]`` for a parameter slot a
-    # function owns (issue #965). See ``_tfun_call_map``.
+    # bare ``t``, ``p[idx]``, ``obs[idx]``, or ``func[k]`` for a function index
+    # (issue #965). See ``_tfun_call_map``.
     tfun_call_by_name = _tfun_call_map(data)
 
     # ── Build per-reaction rate + scatter lines (one group per reaction) ────
@@ -6625,26 +6625,24 @@ class CodegenDeclined(RuntimeError):
 def _tfun_call_map(data: dict) -> dict[str, tuple[int, str]]:
     """Each tfun-backed function's ``(tf_id, C index expression)`` for ``data->tfun_eval``.
 
-    The index reads bare ``t`` for time, ``obs[idx]`` for an observable, and
-    ``p[idx]`` for a parameter, unless a function owns that parameter slot
-    (``tfun([...], [...], h)`` with ``h() = 2*Atot``). Only the interpreter's
-    ``evaluate_functions`` writes such a slot; compiled code never does, so
-    ``p[idx]`` held the function's load-time value and the trajectory froze
-    (issue #965). It reads ``func[k]``, the function's value this call, instead,
-    and ``_topological_function_order`` orders the function before the table.
-    An index kind this does not know is left out, so ``_expr_to_c`` surfaces it.
+    The index reads bare ``t`` for time, ``p[idx]`` for a parameter,
+    ``obs[idx]`` for an observable, and ``func[k]`` for a function
+    (``tfun([...], [...], h)`` with ``h() = 2*Atot``): the function's value this
+    call, which ``_topological_function_order`` computes before the table. The
+    function's parameter slot is written only by the interpreter's
+    ``evaluate_functions``, so read as ``p[idx]`` it held the load-time value and
+    the trajectory froze (issue #965). An index kind this does not know is left
+    out, so ``_expr_to_c`` surfaces it.
     """
-    param_names = [p["name"] for p in data["parameters"]]
-    func_idx = {f["name"]: i for i, f in enumerate(data["functions"])}
     calls: dict[str, tuple[int, str]] = {}
     for tf_id, spec in enumerate(data.get("table_functions", [])):
         kind = spec["index_kind"]
         if kind == "time":
             idx_c = "t"
         elif kind == "parameter":
-            idx = spec["index_param_idx"]
-            owner = func_idx.get(param_names[idx]) if 0 <= idx < len(param_names) else None
-            idx_c = f"func[{owner}]" if owner is not None else f"p[{idx}]"
+            idx_c = f"p[{spec['index_param_idx']}]"
+        elif kind == "function":
+            idx_c = f"func[{spec['index_func_idx']}]"
         elif kind == "observable":
             idx_c = f"obs[{spec['index_obs_idx']}]"
         else:
@@ -7593,8 +7591,8 @@ def generate_jacobian_from_model(model) -> str | None:
     # evaluated into that function's func[] slot by the recomputation below, so a
     # derivative that keeps the table as a factor reads the slot — no table call in
     # a shard block, which has no ``t`` or user data. Only tables that do not read
-    # the state (time- or parameter-indexed, the parameter not a slot a function
-    # owns: issue #965) can appear in a derivative at all.
+    # the state (time- or parameter-indexed; one over a function reads it, issue
+    # #965) can appear in a derivative at all.
     table_c = {
         f"tfun_{f['name']}": f"func[{i}]"
         for i, f in enumerate(functions)
@@ -10997,8 +10995,7 @@ def generate_outputs_from_model(model) -> str | None:
     _func_map = {name: f"func[{i}]" for i, name in enumerate(func_names)}
 
     # tfun-backed functions dispatch through the runtime callback, exactly as in
-    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]``, or ``func[k]``
-    # for a parameter slot a function owns, issue #965).
+    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]`` / ``func[k]``).
     tfun_call_by_name = _tfun_call_map(data)
 
     # Embedded (wrapper-form) tfun — a tfun call nested inside arithmetic, e.g.
@@ -11173,6 +11170,7 @@ def _table_function_bindings(core, model=None) -> tuple:
             spec.get("index_kind"),
             spec.get("index_param_idx"),
             spec.get("index_obs_idx"),
+            spec.get("index_func_idx"),
         )
         for spec in core.codegen_data().get("table_functions", ())
     )

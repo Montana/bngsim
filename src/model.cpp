@@ -2715,6 +2715,43 @@ NetworkModel::ConservationLawDrift NetworkModel::conservation_law_drift() {
     return found;
 }
 
+// ─── Table function index kinds ──────────────────────────────────────────────
+
+namespace {
+// What a table function's index reads, written into `spec`'s index fields:
+// "time"; "parameter", a slot no function owns (index_param_idx); "function",
+// the slot a function owns (index_func_idx); "observable" (index_obs_idx); or
+// "unknown". A function's slot holds its value only where the interpreter's
+// evaluate_functions has just written it, so a reader that takes it for a
+// parameter reads the value it had at load: compiled code did, and froze the
+// trajectory (issue #965). This is the one place that tells the two apart.
+void resolve_table_index(const TableFunction &tf, const SharedModelData &sd,
+                         TableFunctionSpec &spec) {
+    const auto &idx_name = tf.index_name();
+    const std::string lookup = strip_paren_suffix(idx_name);
+    if (is_time_index(idx_name)) {
+        spec.index_kind = "time";
+    } else if (sd.param_name_to_idx.count(lookup) != 0) {
+        if (auto fit = sd.function_name_to_idx.find(lookup); fit != sd.function_name_to_idx.end()) {
+            spec.index_kind = "function";
+            spec.index_func_idx = fit->second;
+        } else {
+            spec.index_kind = "parameter";
+            spec.index_param_idx = sd.param_name_to_idx.at(lookup);
+        }
+    } else if (auto oit = sd.observable_name_to_idx.find(lookup);
+               oit != sd.observable_name_to_idx.end()) {
+        spec.index_kind = "observable";
+        spec.index_obs_idx = oit->second;
+    } else {
+        // Should be unreachable: register_table_function_ rejects an
+        // unresolved index_name, so by the time a spec can be asked for the
+        // binding has already passed that gate.
+        spec.index_kind = "unknown";
+    }
+}
+} // namespace
+
 // ─── Functional analytical Jacobian (GH #76) ─────────────────────────────────
 
 FunctionalJacobianContext NetworkModel::functional_jacobian_context() const {
@@ -2777,15 +2814,12 @@ FunctionalJacobianContext NetworkModel::functional_jacobian_context() const {
     // current time is what the derivative needs; no derivative of the table
     // itself is ever taken, because nothing it depends on is a species. A table
     // indexed by an observable depends on the state and stays out, so a rate
-    // law that reads one keeps declining to finite differences.
+    // law that reads one keeps declining to finite differences, and so does
+    // one indexed by a function (issue #965).
     for (const auto &tf : impl_->table_functions) {
-        bool constant_index = is_time_index(tf->index_name());
-        if (!constant_index) {
-            const std::string idx = strip_paren_suffix(tf->index_name());
-            constant_index = sd.param_name_to_idx.count(idx) > 0 &&
-                             sd.function_name_to_idx.find(idx) == sd.function_name_to_idx.end();
-        }
-        if (constant_index)
+        TableFunctionSpec index;
+        resolve_table_index(*tf, sd, index);
+        if (index.index_kind == "time" || index.index_kind == "parameter")
             ctx.constant_names.push_back("tfun_" + tf->name());
     }
 
@@ -5076,28 +5110,11 @@ std::vector<double> NetworkModel::evaluate_over_times(const std::string &express
 std::vector<TableFunctionSpec> NetworkModel::table_function_specs() const {
     std::vector<TableFunctionSpec> specs;
     specs.reserve(impl_->table_functions.size());
-    const auto &param_map = impl_->shared->param_name_to_idx;
-    const auto &obs_map = impl_->shared->observable_name_to_idx;
     for (const auto &tf : impl_->table_functions) {
         TableFunctionSpec spec;
         spec.name = tf->name();
         spec.step = tf->method() == InterpolationMethod::Step;
-        const auto &idx_name = tf->index_name();
-        const std::string lookup = strip_paren_suffix(idx_name);
-        if (is_time_index(idx_name)) {
-            spec.index_kind = "time";
-        } else if (auto pit = param_map.find(lookup); pit != param_map.end()) {
-            spec.index_kind = "parameter";
-            spec.index_param_idx = pit->second;
-        } else if (auto oit = obs_map.find(lookup); oit != obs_map.end()) {
-            spec.index_kind = "observable";
-            spec.index_obs_idx = oit->second;
-        } else {
-            // Should be unreachable: register_table_function_ rejects an
-            // unresolved index_name, so by the time table_function_specs()
-            // can be called the binding has already passed that gate.
-            spec.index_kind = "unknown";
-        }
+        resolve_table_index(*tf, *impl_->shared, spec);
         spec.method = tf->method() == InterpolationMethod::Step ? "step" : "linear";
         spec.xs = tf->xs();
         spec.ys = tf->ys();
