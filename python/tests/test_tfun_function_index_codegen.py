@@ -106,6 +106,48 @@ def test_a_table_over_a_plain_parameter_still_reads_its_slot(tmp_path):
     assert cg._tfun_call_map(data) == {"g": (0, f"p[{x}]")}
 
 
+def test_the_recorded_function_values_read_the_index_live(tmp_path):
+    # The compiled output evaluator records g and h at each row: both are 2A.
+    sim = bngsim.Simulator(_model(tmp_path, SPELLINGS["whole body"]), method="ode", codegen=True)
+    result = sim.run(t_span=(0.0, 1.0), n_points=len(TIMES), rtol=1e-10, atol=1e-12)
+    for name in ("g", "h"):
+        np.testing.assert_allclose(result.expressions[name], 2.0 * CLOSED_FORM, rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "functions",
+    [
+        "    1 g() tfun([0,100],[0,100], g)",
+        "    1 g() tfun([0,100],[0,100], h)\n    2 h() 2*Atot + 0*g()",
+    ],
+    ids=["indexed by itself", "index reads the table"],
+)
+def test_a_table_its_index_reads_declines_codegen(tmp_path, monkeypatch, functions):
+    # No order computes g's index before g: kept as a self-edge, the compiled C
+    # read func[g] uninitialised and returned whatever the stack held.
+    data = _model(tmp_path, functions)._core.codegen_data()
+    with pytest.raises(cg.CodegenDeclined, match=r"reference each other.*#621"):
+        cg._topological_function_order(data["functions"], cg._tfun_call_map(data))
+    with pytest.raises(RuntimeError, match="codegen declined"):
+        bngsim.Simulator(_model(tmp_path, functions), method="ode", codegen=True)
+    # Above the threshold the default path declines to the interpreter.
+    monkeypatch.setenv("BNGSIM_CODEGEN_THRESHOLD", "1")
+    default = bngsim.Simulator(_model(tmp_path, functions), method="ode")
+    assert default.codegen_backend not in ("cc", "mir")
+
+
+def test_a_table_whose_name_ends_in_another_tables_call_takes_no_edge_from_it():
+    # ``tfun_a_tfun_g()`` holds ``tfun_g(`` as a substring; g's index is h, and h
+    # reads a_tfun_g, so a substring match ordered a_tfun_g after h: a cycle.
+    functions = [
+        {"name": "a_tfun_g", "expression": "tfun_a_tfun_g()"},
+        {"name": "h", "expression": "a_tfun_g()+1"},
+        {"name": "g", "expression": "tfun_g()"},
+    ]
+    calls = {"a_tfun_g": (0, "t"), "g": (1, "func[1]")}
+    assert cg._topological_function_order(functions, calls) == [0, 1, 2]
+
+
 # ── Forward sensitivities: the table has no analytic sensitivity RHS ─────────
 # A run takes its columns from CVODES' difference quotient, over the compiled
 # right-hand side, so it reads the index live as the run does.
@@ -125,17 +167,46 @@ def test_a_smooth_index_gives_the_closed_form_sensitivity(tmp_path):
     assert got == pytest.approx(-100.0 / (1.0 + 20.0) ** 2, rel=1e-6)
 
 
-def test_an_index_that_holds_a_state_crossing_is_refused(tmp_path):
-    # g jumps where h's condition crosses, and the quotient reads across it
-    # (issue #938). Read at its load-time value, h never crossed, and the run
-    # returned columns that ignored the jump.
-    net = NET.replace(
-        "begin parameters\nend parameters", "begin parameters\n    1 thr 2\nend parameters"
-    ).format(functions="    1 h() if(Atot<thr,1,0)\n    2 g() tfun([0,1],[0,3], h)")
+CROSSING_NET = """begin parameters
+    1 A0 10
+    2 a 0.5
+    3 thr 2
+end parameters
+begin species
+    1 A() A0
+    2 Y() 0
+end species
+begin reactions
+    1 1 0 a
+    2 0 2 g
+end reactions
+begin groups
+    1 Aobs 1
+end groups
+begin functions
+{functions}
+end functions
+"""
+
+
+@pytest.mark.parametrize(
+    "functions",
+    [
+        "    1 h() if(Aobs<thr,1,0)\n    2 g() tfun([0,1],[0,3], h)",
+        "    1 h0() if(Aobs<thr,1,0)\n    2 h() tfun([0,1],[0,1], h0)\n"
+        "    3 g() tfun([0,1],[0,3], h)",
+    ],
+    ids=["index holds the condition", "index reads a table whose index holds it"],
+)
+def test_an_index_that_holds_a_state_crossing_is_refused(tmp_path, functions):
+    # A decays at rate a past thr at t* = ln(A0/thr)/a = 3.2, where g jumps from
+    # 0 to 3 and the quotient reads across it (issue #938). Run anyway, CVODE
+    # made no progress at t*. Before #965 the compiled table read h as it was
+    # built, never jumped, and the run returned columns that ignored the jump.
     path = tmp_path / "tfun_crossing_index.net"
-    path.write_text(net)
+    path.write_text(CROSSING_NET.format(functions=functions))
     sim = bngsim.Simulator(
-        bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["thr"]
+        bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["thr", "a"]
     )
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match=r"Atot<thr"):
-        sim.run(t_span=(0.0, 1.0), n_points=3)
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match=r"Aobs<thr"):
+        sim.run(t_span=(0.0, 6.0), n_points=3, rtol=1e-10, atol=1e-12)

@@ -6684,25 +6684,38 @@ def _topological_function_order(
     ``tfun_call_by_name`` (``_tfun_call_map``) adds the edge a table function's
     body does not spell: ``g() = tfun(..., h)`` reads ``func[h]`` as its index
     (issue #965), though its expression is the bare ``tfun_g()``, or
-    ``tfun_g__tfun0() + 0`` where the table is wrapped in arithmetic.
+    ``tfun_g__tfun0() + 0`` where the table is wrapped in arithmetic. A table
+    over its own function, ``g() = tfun(..., g)``, is a cycle of one and declines:
+    kept as a self-edge, ``func[g] = tfun_eval(..., func[g])`` read an
+    uninitialised slot.
     """
     nf = len(functions)
     name_to_idx = {f["name"]: i for i, f in enumerate(functions)}
     successors: list[list[int]] = [[] for _ in range(nf)]
     in_degree = [0] * nf
+    # The tables whose index is a function's slot, by table name, and the
+    # ``tfun_<table>()`` calls to them; ``None`` for a model with none.
+    owner_by_table = {
+        table: int(idx_c[len("func[") : -1])
+        for table, (_, idx_c) in (tfun_call_by_name or {}).items()
+        if idx_c.startswith("func[")
+    }
+    table_call = (
+        re.compile(r"(?<![A-Za-z0-9_])tfun_(" + "|".join(map(re.escape, owner_by_table)) + r")\(")
+        if owner_by_table
+        else None
+    )
     for i, f in enumerate(functions):
         deps: set[int] = set()
         for tok in re.findall(r"[A-Za-z_]\w*", f["expression"]):
             j = name_to_idx.get(tok)
             if j is not None and j != i:
                 deps.add(j)
-        for table, (_, idx_c) in (tfun_call_by_name or {}).items():
-            if not idx_c.startswith("func["):
-                continue
-            if table == f["name"] or f"tfun_{table}(" in f["expression"]:
-                j = int(idx_c[len("func[") : -1])
-                if j != i:
-                    deps.add(j)
+        if table_call is not None:
+            tables = set(table_call.findall(f["expression"]))
+            if f["name"] in owner_by_table:
+                tables.add(f["name"])
+            deps.update(owner_by_table[table] for table in tables)
         for j in deps:
             successors[j].append(i)
             in_degree[i] += 1
@@ -10984,7 +10997,8 @@ def generate_outputs_from_model(model) -> str | None:
     _func_map = {name: f"func[{i}]" for i, name in enumerate(func_names)}
 
     # tfun-backed functions dispatch through the runtime callback, exactly as in
-    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]``).
+    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]``, or ``func[k]``
+    # for a parameter slot a function owns, issue #965).
     tfun_call_by_name = _tfun_call_map(data)
 
     # Embedded (wrapper-form) tfun — a tfun call nested inside arithmetic, e.g.

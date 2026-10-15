@@ -6431,7 +6431,10 @@ def fallback_crossing(
     # slot, ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
     # function is read as a law of its own: the table of what it holds jumps
     # where it jumps and bends where it bends. Compiled code reads the index
-    # live since issue #965, so the quotient reads across that crossing.
+    # live since issue #965, so the quotient reads across that crossing. An
+    # index function may read a table of its own, ``h() = tfun(..., h0)``, so
+    # what the indices read is asked in turn until nothing new is found. Kept
+    # beside the laws, and only for a model that has such a table.
     table_indices = {
         str(table.get("name")): param_names[table.get("index_param_idx", -1)]
         for table in data.get("table_functions", ())
@@ -6440,10 +6443,23 @@ def fallback_crossing(
         and param_names[table.get("index_param_idx", -1)] in func_map
     }
     if table_indices:
-        read = " ".join(_inline_functions(text, func_map) or text for text in texts)
-        texts += sorted(
-            {index for name, index in table_indices.items() if f"tfun_{name}(" in read}
-        )
+        found_indices: tuple[str, ...] | None = kept_all.get(_TABLE_INDICES)
+        if found_indices is None:
+            table_call = re.compile(
+                r"(?<![A-Za-z0-9_])tfun_(" + "|".join(map(re.escape, table_indices)) + r")\("
+            )
+            memo: dict[str, str] = {}
+            reached: set[str] = set()
+            frontier = list(texts)
+            while frontier:
+                read = " ".join(
+                    _inline_functions(text, func_map, memo=memo) or text for text in frontier
+                )
+                new = {table_indices[name] for name in table_call.findall(read)} - reached
+                reached |= new
+                frontier = sorted(new)
+            found_indices = kept_all[_TABLE_INDICES] = tuple(sorted(reached))
+        texts += found_indices
     moved_clocks: list[frozenset[int]] = []
 
     def scan(held: frozenset[str]) -> str | None:
@@ -6672,6 +6688,7 @@ _STORES_KEPT = 8
 # Keys of what a scan keeps that are not a rate law's text.
 _MARKED = ("derived parameters that hold what is asked about",)
 _IN_A_RATE = ("derived parameters a rate constant is, or is written in",)
+_TABLE_INDICES = ("functions a table a rate law reads is indexed by",)
 _VIEW = "held"
 _NESTED = "held, one written in another"
 _DERIVED_LAW = "derived"
