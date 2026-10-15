@@ -26,14 +26,20 @@ struct ModelImplData;
 
 /// Resolved metadata for one registered TableFunction, used by the
 /// model-based codegen path to emit the C call for a tfun-backed BNGL
-/// function. The index kind is "time", "parameter", or "observable";
-/// the corresponding index field carries the 0-based array index for
-/// parameter/observable indexing (and is -1 for time-indexed tfuns).
+/// function. The index kind is "time", "parameter", "function", or
+/// "observable"; the corresponding index field carries the 0-based array
+/// index (parameter, function or observable), and the others are -1. A
+/// "parameter" is a slot no function owns. A table over a model function,
+/// `tfun([...], [...], h)`, is "function", indexed by `h`'s position in the
+/// model's functions: `h`'s parameter slot holds its value only where the
+/// interpreter has written it, so compiled code reads the function (issue
+/// #965).
 struct TableFunctionSpec {
     std::string name;
     std::string index_kind;
     int index_param_idx = -1;
     int index_obs_idx = -1;
+    int index_func_idx = -1;
     /// The table is read as a step (method=>"step"), not interpolated: its
     /// value jumps at each breakpoint of its index.
     bool step = false;
