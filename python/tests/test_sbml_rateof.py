@@ -1005,7 +1005,8 @@ def test_the_warning_names_what_a_folded_rate_is_made_of(caplog):
 
 
 def _rateof_constant_model(where: str, p1: str) -> str:
-    """``rateOf(p1)`` (or of the compartment c) read at ``where``. ``p1`` is
+    """``rateOf(p1)`` read at ``where`` (the kinetic law also reads the rate of
+    the compartment c and of its own speciesReference id). ``p1`` is
     "constant", "variable" (constant="false", nothing changes it), "ia" (set
     only by an initialAssignment) or "event" (an event sets it to 4 at t = 0.5:
     a jump, so its rate is still 0)."""
@@ -1023,10 +1024,12 @@ def _rateof_constant_model(where: str, p1: str) -> str:
             "</rateRule>"
         )
     elif where == "reaction":
+        # p1, the compartment and the reaction's own stoichiometry `sr`.
+        law = f"<apply><plus/>{rate('p1')}{rate('c')}{rate('sr')}<cn>1</cn></apply>"
         reactions = (
             '<listOfReactions><reaction id="J1" reversible="false"><listOfProducts>'
-            '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfProducts>'
-            f"<kineticLaw>{m}<apply><plus/>{rate('c')}<cn>1</cn></apply></math></kineticLaw>"
+            '<speciesReference id="sr" species="S" stoichiometry="1" constant="true"/>'
+            f"</listOfProducts><kineticLaw>{m}{law}</math></kineticLaw>"
             "</reaction></listOfReactions>"
         )
     elif where == "event":
