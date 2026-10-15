@@ -4768,20 +4768,37 @@ def _build_model_from_sbml_doc_in_context(doc):
                 moved = True
         return moved
 
-    # Each pass settles every symbol whose inputs had settled when it began, so
-    # it settles at least one more link of any acyclic chain. A link is an
-    # initialAssignment, a rule, a reaction id (refolded at the end of a pass,
-    # and a kinetic law may read another reaction's id) or a converted species,
-    # so one pass per symbol the loop can move, plus one to see nothing move,
-    # always reaches the fixed point; a model that needs fewer breaks early.
-    _settle_passes = max(
-        10,
-        sbml_model.getNumInitialAssignments()
-        + sbml_model.getNumRules()
-        + len(_rid_laws)
-        + len(_size_converted)
-        + 1,
+    # Each pass settles every symbol whose inputs had settled when it began. A
+    # chain needs another pass only where a symbol reads one the pass moves after
+    # it. Within a pass the initialAssignments go first, then the rules, then the
+    # converted species, then the reaction ids, so that reader is an
+    # initialAssignment or rule that reads something the loop moves (directly,
+    # or through rateOf, which reads the kinetic laws), or a reaction id whose
+    # law reads another reaction's id; a converted species reads only sizes,
+    # which move before it. One pass per such reader, plus one, reaches the
+    # fixed point of any acyclic model, and a model that needs fewer breaks
+    # early. Counting every symbol instead would let a circular definition
+    # (illegal SBML, which never settles) cost a pass per rule or reaction,
+    # each pass re-evaluating all of them.
+    _moved = (
+        _set_by_math | {_rid for _rid, _law, _lps in _rid_laws} | {s[0] for s in _size_converted}
     )
+    _rid_names = {_rid for _rid, _law, _lps in _rid_laws}
+    _rateof_fds = {name for name, (_p, _b) in func_defs.items() if _b is _RATEOF_FUNCDEF}
+    _fold_maths = [
+        sbml_model.getInitialAssignment(j).getMath()
+        for j in range(sbml_model.getNumInitialAssignments())
+    ] + [
+        sbml_model.getRule(j).getMath()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isAssignment()
+    ]
+    _readers = sum(
+        1
+        for _m in _fold_maths
+        if _m is not None and (_ast_name_set(_m) & _moved or _ast_has_rateof(_m, _rateof_fds))
+    ) + sum(1 for _rid, _law, _lps in _rid_laws if _ast_name_set(_law) & _rid_names)
+    _settle_passes = max(10, _readers + 1)
     for _pass in range(_settle_passes):
         changed = False
         for j in range(sbml_model.getNumInitialAssignments()):

@@ -184,4 +184,130 @@ def test_a_parameter_initial_assignment_reads_the_size_at_the_start(
     model = bngsim.Model.from_sbml_string(
         _species_sbml(sized, "A = 1; q = B", amount_only=amount_only)
     )
-    assert model.get_param("q") == pytest.approx(0.2 if amount_only else 0.8)
+    q = 0.2 if amount_only else 0.8
+    assert model.get_param("q") == pytest.approx(q)
+    out = bngsim.Simulator(model, "ode").run(t_span=(0, 1.0), n_points=2)
+    assert np.asarray(out.species)[-1, 2] == pytest.approx(q)  # C(1) = q*1
+
+
+def test_a_size_rule_reads_a_species_in_a_rule_sized_compartment() -> None:
+    # The volume-factor path of #994 through a converted species: c2 := 1 + B,
+    # with B declared as amount 0.8 in c1 := 2*p (declared 1), is 1 + 0.8/4.
+    import antimony
+
+    antimony.clearPreviousLoads()
+    text = (
+        "compartment c1 = 1, c2 = 1, c0 = 1; p = 2; c1 := 2*p; c2 := 1 + B;\n"
+        "species B in c1, Z in c2, Y in c0; B = 0.8; Z = 1; Y = 0;\n"
+        "R1: Z -> Y; Z*c2\n"
+    )
+    assert antimony.loadAntimonyString(text) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    b = doc.getModel().getSpecies("B")
+    b.unsetInitialConcentration()
+    b.setInitialAmount(0.8)
+    model = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    assert model.get_param("c2") == pytest.approx(1.2)
+    names = [s["name"] for s in model._core.codegen_data()["species"]]
+    assert dict(zip(names, _volume_factors(model), strict=True))["Z"] == pytest.approx(1.2)
+
+
+def test_a_stoichiometry_reads_a_species_in_a_rule_sized_compartment() -> None:
+    # The speciesReference id of Y in X -> Y takes 10*B at the start, with B
+    # declared as amount 0.8 in c2 := 2*p: 10*0.2 = 2, so Y(1) = 2*(1 - e^-0.5).
+    import antimony
+
+    antimony.clearPreviousLoads()
+    text = (
+        "compartment c1 = 1, c2 = 1; p = 2; c2 := 2*p;\n"
+        "species B in c2, X in c1, Y in c1; B = 0.8; X = 1; Y = 0;\n"
+        "R1: X -> Y; 0.5*X\n"
+    )
+    assert antimony.loadAntimonyString(text) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    sbml_model = doc.getModel()
+    b = sbml_model.getSpecies("B")
+    b.unsetInitialConcentration()
+    b.setInitialAmount(0.8)
+    product = sbml_model.getReaction("R1").getProduct(0)
+    product.setId("sY")
+    product.setConstant(True)
+    ia = sbml_model.createInitialAssignment()
+    ia.setSymbol("sY")
+    ia.setMath(libsbml.parseL3Formula("10*B"))
+    model = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    out = bngsim.Simulator(model, "ode").run(t_span=(0, 1.0), n_points=2, rtol=1e-10, atol=1e-12)
+    names = [s["name"] for s in model._core.codegen_data()["species"]]
+    y = dict(zip(names, out.species[-1], strict=True))
+    assert y["Y"] == pytest.approx(2.0 * (1.0 - np.exp(-0.5)), rel=1e-6)
+
+
+def test_a_rate_of_reads_a_chain_of_reaction_ids() -> None:
+    # `q = rateOf(Y)`, where Y's only reaction runs at J1, J1 reads J2, ..., and
+    # J20 reads `r := 2*p` (declared 1). No initialAssignment or rule names a
+    # reaction id, but the rateOf reads them through Y's law, so the loop must
+    # still allow a pass per reaction; q loaded at its declared 7 for 4.
+    n = 20
+    lines = [
+        "compartment c1 = 1; p = 2; r = 1; r := 2*p; q = 0; q = rateOf(Y);",
+        "species X in c1, Y in c1; X = 1; Y = 0;",
+        *(f"J{i}: X -> X; J{i + 1}" for i in range(1, n)),
+        f"J{n}: X -> X; r",
+        "R0: -> Y; J1",
+    ]
+    import antimony
+
+    antimony.clearPreviousLoads()
+    assert antimony.loadAntimonyString("\n".join(lines)) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    doc.getModel().getParameter("q").setValue(7.0)
+    model = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    assert model.get_param("q") == pytest.approx(4.0)
+
+
+def test_a_stoichiometry_math_reads_a_chain_of_reaction_ids() -> None:
+    # SBML Level 2: the stoichiometryMath of Y in R0 reads J1, J1's law reads
+    # J2, ..., and J11's reads `r := 2*p` (declared 1), so Y' = 4. Nothing in the
+    # loop reads a reaction id, but the stoichiometry does after it, so each law
+    # that reads another reaction's id still needs its pass; with a pass per
+    # reader only, J1 came out of the loop stale and Y(1) was 1, with nothing
+    # raised.
+    n = 11
+    doc = libsbml.SBMLDocument(2, 4)
+    sbml_model = doc.createModel()
+    sbml_model.setId("m")
+    c = sbml_model.createCompartment()
+    c.setId("c")
+    c.setSize(1.0)
+    for sid, amount, boundary in (("X", 1.0, True), ("Y", 0.0, False)):
+        s = sbml_model.createSpecies()
+        s.setId(sid)
+        s.setCompartment("c")
+        s.setInitialAmount(amount)
+        s.setBoundaryCondition(boundary)
+    for pid, value, constant in (("p", 2.0, True), ("r", 1.0, False)):
+        p = sbml_model.createParameter()
+        p.setId(pid)
+        p.setValue(value)
+        p.setConstant(constant)
+    rule = sbml_model.createAssignmentRule()
+    rule.setVariable("r")
+    rule.setMath(libsbml.parseL3Formula("2*p"))
+    for i in range(1, n + 1):
+        rxn = sbml_model.createReaction()
+        rxn.setId(f"J{i}")
+        rxn.setReversible(False)
+        rxn.createReactant().setSpecies("X")
+        rxn.createProduct().setSpecies("X")
+        rxn.createKineticLaw().setMath(libsbml.parseL3Formula(f"J{i + 1}" if i < n else "r"))
+    rxn = sbml_model.createReaction()
+    rxn.setId("R0")
+    rxn.setReversible(False)
+    product = rxn.createProduct()
+    product.setSpecies("Y")
+    product.createStoichiometryMath().setMath(libsbml.parseL3Formula("J1"))
+    rxn.createKineticLaw().setMath(libsbml.parseL3Formula("1"))
+    model = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    out = bngsim.Simulator(model, "ode").run(t_span=(0, 1.0), n_points=2, rtol=1e-10, atol=1e-12)
+    names = [s["name"] for s in model._core.codegen_data()["species"]]
+    assert dict(zip(names, out.species[-1], strict=True))["Y"] == pytest.approx(4.0)
