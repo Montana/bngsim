@@ -10,6 +10,7 @@ initialAssignment evaluation, MathML→ExprTk expression translation.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import io
 import logging
@@ -236,6 +237,39 @@ _RATEOF_PREFIX = "rate_of__"
 # instead of inlining the funcDef's NaN body.
 _RATEOF_FUNCDEF = object()
 
+# The parameters, compartments and speciesReference ids of the model being
+# built that no rule sets.
+# Their rate of change is 0 at every time, and the builder binds a
+# ``rate_of__`` accessor only for a state, so :func:`_rateof_call` emits the 0
+# for them. Set by the build, which runs in a context of its own, so a load
+# never sees another load's names.
+_RATEOF_CONSTANT_SYMBOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "_RATEOF_CONSTANT_SYMBOLS", default=frozenset()
+)
+
+
+def _rateof_constant_symbols(sbml_model) -> frozenset[str]:
+    """Parameters, compartments and speciesReference ids (stoichiometries)
+    that no rate or assignment rule sets.
+
+    One an event assigns is among them: an event's assignment is a jump, not a
+    rate, so between events it holds and its rate is 0. (bngsim makes it a
+    state, whose accessor reads that same 0.)
+    """
+    ruled = set()
+    for i in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(i)
+        if rule.isRate() or rule.isAssignment():
+            ruled.add(rule.getVariable())
+    names = {sbml_model.getParameter(i).getId() for i in range(sbml_model.getNumParameters())}
+    names |= {sbml_model.getCompartment(i).getId() for i in range(sbml_model.getNumCompartments())}
+    names |= {
+        sr.getId()
+        for sr in _iter_species_references(sbml_model)
+        if hasattr(sr, "getId") and sr.getId()
+    }
+    return frozenset(names - ruled)
+
 
 def _rateof_token(species_name: str) -> str:
     """Accessor token for ``rateOf(<species_name>)``. Must match the C++
@@ -249,20 +283,27 @@ def _rateof_call(node: libsbml.ASTNode, local_params: dict | None = None) -> str
 
     Only rateOf of a bare symbol — a species, or a rate-rule-promoted
     parameter/compartment that becomes a species — is representable as an
-    accessor. A non-name argument has no species index to bind to, so warn and
-    emit ``0`` rather than a silently-wrong derivative (no corpus model hits
-    this; every rateOf argument across the BioModels SBML corpus is a species).
+    accessor. A non-name argument has no species index to bind to; the load
+    refuses one first (``_check_rateof_targets``, rule 10223), so the warning
+    and ``0`` below are only a backstop.
 
     A kinetic-law ``<localParameter>`` is constant by SBML definition, so the
     rate of change of a local-parameter argument is ``0`` (suite 01459/01460).
     It also has no species index — emitting the accessor would either fail to
     compile (no global of that name) or silently bind to a same-named global,
     so the local-scope check both fixes the value and avoids the mis-bind.
+
+    So is a parameter, compartment or speciesReference id that no rule sets
+    (``_RATEOF_CONSTANT_SYMBOLS``): its rate is ``0``, and for one no event
+    assigns either, its accessor, bound to nothing, failed to compile (#1045's
+    case, outside an initial value).
     """
     if node.getNumChildren() >= 1:
         arg = node.getChild(0)
         if arg.getType() == libsbml.AST_NAME and arg.getName():
             if local_params and arg.getName() in local_params:
+                return "0"
+            if arg.getName() in _RATEOF_CONSTANT_SYMBOLS.get():
                 return "0"
             return _rateof_token(arg.getName())
     logger.warning("rateOf() with a non-symbol argument is unsupported; emitting 0")
@@ -320,8 +361,9 @@ def _ast_has_rateof(node: libsbml.ASTNode, rateof_funcdef_names: set[str]) -> bo
 def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[str]) -> bool:
     """True iff any math container references rateOf (csymbol or a *called*
     COPASI idiom). Walks rules, reactions, every event math, and initial
-    assignments — plus non-idiom funcDef bodies, since a rateOf csymbol nested
-    in a funcDef body is emitted as an accessor when that funcDef is inlined."""
+    assignments — plus non-idiom funcDef bodies, which still count here,
+    although the load refuses a call to one that reads rateOf
+    (``_check_rateof_targets``)."""
 
     def _scan(n):
         return _ast_has_rateof(n, rateof_funcdef_names)
@@ -354,6 +396,148 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
         if body is not _RATEOF_FUNCDEF and _scan(body):
             return True
     return False
+
+
+def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
+    """Refuse, by name, a ``rateOf`` that the model has no value for.
+
+    One check before either the initial-value fold or the emitter runs, for the
+    csymbol and for a call to COPASI's rateOf functionDefinition idiom alike:
+
+    * ``rateOf(x)`` of a variable an assignmentRule sets (issue #1046). SBML
+      defines no rate of change for one (L3V2 §3.4.6, validation rule 10224).
+      Unchecked, the initial-value fold took it for a constant and gave 0, a
+      value the model does not have. A rule, kinetic law or event emitted a
+      ``rate_of__x`` accessor: for a parameter nothing binds it, and ExprTk
+      refused it without naming anything in the model; for a species the
+      builder binds it, and the model ran with the rate as 0.
+    * ``rateOf(S)`` of a species held as a concentration in a compartment an
+      assignmentRule sizes (rule 10225): its rate would need the rule's own
+      rate, which SBML does not define either. Unchecked, the initial-value
+      fold took the amount's rate over the size, with no term for the size's
+      change; a rule had the term where the size reads only the time, and left
+      it out (the amount's rate alone) where the size reads a species. A
+      species with a rate rule of its own has its rate stated, whatever its
+      compartment does, and is left alone (libsbml reports 10225 for it all
+      the same). A constant or boundary one is not: SBML holds its amount, so
+      its concentration moves with the size (suite 01117/01118).
+    * ``rateOf`` of anything but a single symbol (rule 10223 for the
+      csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
+      for NaN, and a rule read either as 0 with a warning.
+    * a call to a functionDefinition whose body reads ``rateOf``, directly or
+      through another it calls. The argument there is the function's own
+      parameter: both paths took the rate of that name, 0 unless a model
+      symbol shares it, rather than of what the caller passed. libsbml rejects
+      the csymbol in a function body (rule 20304); a call to the idiom there is
+      valid SBML, but bngsim does not follow the caller's argument into it. A
+      function nothing calls is left alone.
+
+    A kinetic law's own local parameter shadows a global of its id, so
+    ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
+    and is allowed; libsbml reports 10224 for it regardless of scope.
+    """
+    ar_rules = {}
+    rate_ruled = set()
+    for i in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(i)
+        if rule.isAssignment():
+            ar_rules[rule.getVariable()] = rule
+        elif rule.isRate():
+            rate_ruled.add(rule.getVariable())
+    idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
+
+    def _reads_rateof(n, called) -> bool:
+        t = n.getType()
+        return t == libsbml.AST_FUNCTION_RATE_OF or (
+            t == libsbml.AST_FUNCTION and (n.getName() in idiom_names or n.getName() in called)
+        )
+
+    # functionDefinitions whose body reads rateOf, directly or through a call.
+    rated_funcs: set[str] = set()
+    grew = True
+    while grew:
+        grew = False
+        for fid, (_p, body) in func_defs.items():
+            if fid in rated_funcs or body is _RATEOF_FUNCDEF:
+                continue
+            if any(_reads_rateof(n, rated_funcs) for n in _iter_ast_subtree(body)):
+                rated_funcs.add(fid)
+                grew = True
+    # A species held as a concentration, by its compartment (rule 10225), but
+    # not one whose rate a rate rule of its own states.
+    conc_compartment = {
+        sp.getId(): sp.getCompartment()
+        for sp in (sbml_model.getSpecies(i) for i in range(sbml_model.getNumSpecies()))
+        if not sp.getHasOnlySubstanceUnits() and sp.getId() not in rate_ruled
+    }
+    law_locals = {}
+    for i in range(sbml_model.getNumReactions()):
+        rxn = sbml_model.getReaction(i)
+        kl = rxn.getKineticLaw()
+        if kl is not None:
+            law_locals[f"reaction:{rxn.getId()}"] = {
+                lp.getId() for lp in _kinetic_law_local_params(kl)
+            }
+
+    def _rule_text(name: str) -> str:
+        m = ar_rules[name].getMath()
+        return f"{name} := {libsbml.formulaToL3String(m)}" if m is not None else name
+
+    # (what is read, location) → why the model has no value for it, in model order
+    offenders: dict[tuple[str, str], str] = {}
+    for math, where in _iter_model_math(sbml_model):
+        shadowed = law_locals.get(where, ())
+        for n in _iter_ast_subtree(math):
+            t = n.getType()
+            if t == libsbml.AST_FUNCTION and n.getName() in rated_funcs:
+                offenders[(libsbml.formulaToL3String(n), where)] = (
+                    f"the functionDefinition {n.getName()} reads rateOf of a parameter "
+                    "of its own (or calls one that does), and bngsim does not take the "
+                    "rate of what is passed for it"
+                )
+                continue
+            if not _reads_rateof(n, ()):
+                continue
+            arg = n.getChild(0) if n.getNumChildren() >= 1 else None
+            if arg is None or arg.getType() != libsbml.AST_NAME:
+                offenders[(libsbml.formulaToL3String(n), where)] = (
+                    "its argument is not a single symbol (validation rule 10223)"
+                )
+                continue
+            name = arg.getName()
+            if name in shadowed:
+                continue
+            if name in ar_rules:
+                offenders[(f"rateOf({name})", where)] = (
+                    f"{name} is set by the assignmentRule {_rule_text(name)} "
+                    "(validation rule 10224)"
+                )
+            elif conc_compartment.get(name) in ar_rules:
+                cid = conc_compartment[name]
+                offenders[(f"rateOf({name})", where)] = (
+                    f"{name} is a concentration in compartment {cid}, which the "
+                    f"assignmentRule {_rule_text(cid)} sizes (validation rule 10225)"
+                )
+    if not offenders:
+        return
+
+    from bngsim._exceptions import ModelError
+
+    bullets = "\n".join(
+        f"  - {shown} [{where}]: {why}" for (shown, where), why in offenders.items()
+    )
+    raise ModelError(
+        "Model reads a rateOf that it has no value for:\n"
+        f"{bullets}\n"
+        "SBML (L3V2 §3.4.6) defines no rate of change for an assignmentRule "
+        "variable, nor for a concentration in a compartment an assignmentRule "
+        "sizes, and rateOf takes a single symbol; libsbml's consistency check "
+        "reports each, and RoadRunner refuses them. Earlier bngsim releases loaded "
+        "most of these with a wrong rate, or failed with an ExprTk error that "
+        "named none of it. Make such a variable a rateRule target, or write its "
+        "rate from the rule's own inputs; call rateOf directly rather than "
+        "inside a functionDefinition."
+    )
 
 
 # ── Unsupported-construct refusal (GH #113) ──────────────────────────────
@@ -1892,7 +2076,11 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             return _eval_ast_numeric(rate_rule_math[name], ctx, func_defs)
         sp = species_by_id.get(name)
         if sp is None:
-            # A parameter / compartment with no rate rule is constant ⇒ 0.
+            # A parameter / compartment with no rate rule is constant ⇒ 0. One
+            # an assignmentRule sets is not; the load refuses a rateOf of it
+            # first (_check_rateof_targets, issue #1046), and a call to a
+            # functionDefinition whose body reads rateOf, which would reach
+            # here with the body's own argument name.
             return 0.0
         # 2) species — boundary or constant species is held by reactions ⇒ 0.
         if sp.getBoundaryCondition() or sp.getConstant():
@@ -4213,6 +4401,12 @@ class _FastSbmlModel:
 
 def _build_model_from_sbml_doc(doc):
     """Build a BNGsim Model from a parsed libsbml Document."""
+    # In a context of its own: what the build sets for the emitter
+    # (_RATEOF_CONSTANT_SYMBOLS) ends with it, however it ends.
+    return contextvars.copy_context().run(_build_model_from_sbml_doc_in_context, doc)
+
+
+def _build_model_from_sbml_doc_in_context(doc):
     from bngsim._bngsim_core import ModelBuilder
     from bngsim._model import Model
     from bngsim._ssa_validation import SsaIssue
@@ -4284,6 +4478,15 @@ def _build_model_from_sbml_doc(doc):
     # and COPASI refuse such models; bngsim fails closed too (naming each
     # offender) rather than integrate a malformed model's incomplete setup.
     _check_undefined_symbols(sbml_model)
+
+    # ── 0d. Refuse a rateOf the model has no value for ─────────────────
+    # rateOf of an assignmentRule variable (issue #1046, rule 10224), of a
+    # concentration in a rule-sized compartment (10225), of anything but a
+    # symbol (10223), and through a functionDefinition. Checked once, before
+    # the fold below or the emitter would give any of them a wrong rate.
+    _check_rateof_targets(sbml_model, func_defs)
+    # What no rule sets has rate 0 wherever it is read (see _rateof_call).
+    _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
 
     # ── 0. Evaluate initialAssignments ────────────────────────────────
     # SBML initialAssignment elements compute ICs from expressions.
@@ -5342,7 +5545,14 @@ def _build_model_from_sbml_doc(doc):
         if not _expanded <= (_param_pool | _species_ic_expr.keys()):
             continue
         _sp_subs = {_n: _species_ic_expr[_n] for _n in _expanded & _species_ic_expr.keys()}
-        if (_sp_subs or _ar_subs) and _ast_has_rateof(_m, _ic_rateof_names):
+        # rateOf is never lifted, whatever else the assignment reads: a derived
+        # parameter is evaluated only when a parameter is written, and the
+        # builder refuses one that reads a rate accessor (13c9a0e). The fold
+        # above has its value at the start, which is what an initialAssignment
+        # means (issue #1045: `p2 = rateOf(p1)` of a parameter no rule changes
+        # is 0, and used to be refused); one the fold cannot evaluate is refused
+        # by name below (#871), never kept at its declared value.
+        if _ast_has_rateof(_m, _ic_rateof_names):
             continue
         try:
             _lift_expr[_pid] = _ast_to_exprtk_with_funcdefs(
@@ -5406,34 +5616,9 @@ def _build_model_from_sbml_doc(doc):
         )
         lifted_ia_param_expr[pid] = _expr
 
-    # The residue: a parameter initialAssignment §0 folded that the lift above
-    # could not put back on its symbols. Anything the fold read that a caller can
-    # still write is frozen behind it — `set_param` takes and moves nothing, and
-    # the sensitivity column is an identical zero — so say so once, by name,
-    # rather than let both failures stay silent (#313).
-    _frozen_upstream: set[str] = set()
-    for _pid, _m in _ia_math.items():
-        if _pid in _lift_expr or _pid in comp_param_idx or _pid not in _param_decl_index:
-            continue
-        if _pid in _ar_targets:
-            continue  # §4's rule recomputes it; the fold is not what a write faces
-        # Parameters only: a compartment size behind an unliftable fold is #170's
-        # business, and it is refused by name rather than reported here. An
-        # assignmentRule target is dropped too — the rule, not a caller, defines
-        # it, so "`set_param` on it will not move the assigned symbol" names a
-        # write nobody can make (the engine refuses one on a function-backed slot,
-        # #227). An initialAssignment that reads NOTHING else therefore stays
-        # quiet, which is the honest report: it is frozen, but no writable
-        # parameter is frozen behind it.
-        _frozen_upstream |= _ast_name_set(_m) & (_param_decl_index.keys() - _ar_targets)
-    if _frozen_upstream:
-        logger.warning(
-            "initialAssignment(s) that bngsim could not keep symbolic read the "
-            "parameter(s) %s. Their contribution through that initialAssignment is "
-            "frozen at its load-time value: set_param on them will not move the "
-            "assigned symbol, and their forward sensitivity carries no term for it.",
-            ", ".join(sorted(_frozen_upstream)),
-        )
+    # The residue, a parameter initialAssignment §0 folded that the lift above
+    # could not put back on its symbols, is named in a warning at §10.8 (#313),
+    # from the same closure that refuses a write to what it read (issue #1048).
 
     # ── 3. Species ────────────────────────────────────────────────────
     # Collect assignment rule targets for step 4. linear_assignment_rules
@@ -5622,7 +5807,9 @@ def _build_model_from_sbml_doc(doc):
             math = _ast_at_time_zero(math)
         if not names <= (_ic_expr_symbols | _ic_seed_symbols | _ic_const_ar.keys()):
             continue
-        if (names & _ic_seed_symbols) and _ast_has_rateof(math, _ic_rateof_names):
+        # As the parameter lift above: an initial value that reads rateOf keeps
+        # the fold's value at the start, whatever else it reads (issue #1045).
+        if _ast_has_rateof(math, _ic_rateof_names):
             continue
         _ic_cand[sym] = math
         _ic_cand_deps[sym] = names & _ic_seed_symbols
@@ -7083,12 +7270,26 @@ def _build_model_from_sbml_doc(doc):
     # V̇ is the *time derivative of the assignment-rule RHS*, which 8b's rate-rule
     # RHS gives directly but an AR compartment does not — it needs the chain rule
     # V̇ = Σ_k (∂g/∂x_k)·ẋ_k over the time-varying quantities g references. We build
-    # it symbolically (sympy), with ẋ_k known only for safe leaves: ``time()`` (=1),
-    # a rate-ruled non-species variable (its rate-rule RHS), and another assignment
-    # target (recursively). Any reference to a reaction/rule-driven SPECIES, an
-    # event-promoted parameter (discontinuous; the #74 rescale owns those), or an
-    # unparseable RHS makes V̇ unknown and we emit nothing — identical to today's
-    # behavior, so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
+    # it symbolically (sympy), with ẋ_k for each leaf: ``time()`` (=1), a rate-ruled
+    # non-species variable (its rate-rule RHS), another assignment target, species
+    # or not (recursively), and any other species: its ``rate_of__`` accessor, the
+    # engine's live dx/dt, which is SBML's rateOf of exactly the value the symbol
+    # denotes (issue #1052: such a leaf used to make V̇ unknown, and the species
+    # then kept its concentration where SBML keeps its amount, with nothing said).
+    # Reading a rate turns the engine's rateOf machinery on (``_dilution_reads_rate``,
+    # §10.6), which takes a probe of the derivatives before each RHS.
+    #
+    # Two leaves are refused by name rather than read. A concentration the size
+    # reads in its own compartment, directly or through another such compartment:
+    # the concentration is the amount over the size, so the two define each other
+    # (libRoadRunner refuses it as a recursive assignment rule). And an amount
+    # (hOSU=true) in an assignment-rule compartment, its own included, whose rate
+    # accessor is still wrong there (#736). An event-promoted parameter holds
+    # between its events (rate 0; the #74 rescale owns the jump), and so does a
+    # species that is constant or a boundary with no rate rule, where its value
+    # is an amount or its compartment's size holds; such a leaf needs no rate
+    # accessor. An unparseable RHS still makes V̇ unknown, and we emit nothing,
+    # so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
     # byte-identical. hOSU=true species and rule-target species are excluded exactly
     # as in 8b. The emitted term is additive to §9's reaction term and also covers a
     # flux-free species (pure dilution ``[S] = A/V(t)``); ODE-only for the same #81
@@ -7098,6 +7299,7 @@ def _build_model_from_sbml_doc(doc):
     # tracks amount/V_live, so the report-time amount selector reads V_live from the
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
+    _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
     if ar_comp_targets:
         import re as _re
 
@@ -7138,8 +7340,26 @@ def _build_model_from_sbml_doc(doc):
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
-        _species_alias = {_alias(_safe_name(s)) for s in _sbml_species_ids}
-        _event_alias = {_alias(_safe_name(p)) for p in event_promoted_params}
+        _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
+        _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
+        # A species whose value never moves continuously, so its rate is 0 and
+        # reading it needs no rate accessor: nothing changes its amount (constant,
+        # or boundary with no rate rule), and the value is that amount or a
+        # concentration in a compartment whose size holds between events.
+        _still_species = {
+            s
+            for s in _sbml_species_ids
+            if s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                sbml_model.getSpecies(s).getConstant()
+                or sbml_model.getSpecies(s).getBoundaryCondition()
+            )
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _rr_alias = {_alias(s): s for s in _rr_rhs_ex}  # alias -> safe name
         _ar_alias = {_alias(s): s for s in _ar_rhs_ex}  # alias -> safe name
         _rr_sym_cache: dict[str, object] = {}
@@ -7153,12 +7373,18 @@ def _build_model_from_sbml_doc(doc):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
             if nm == _TIME_SYM:
                 return _sp.Integer(1)
-            if nm in _event_alias or nm in _species_alias:
-                return None
+            if nm in _ar_alias:  # an assignment target, a species among them
+                return _vdot_sym(_ar_alias[nm], seen)
+            if nm in _species_alias:  # its live rate, rateOf(S) (#1052)
+                sid = _species_alias[nm]
+                if sid in _still_species:
+                    return _sp.Integer(0)
+                return _sp.Symbol(_rateof_token(sid))
             if nm in _rr_alias:
                 return _rr_deriv(_rr_alias[nm])
-            if nm in _ar_alias:
-                return _vdot_sym(_ar_alias[nm], seen)
+            # An event-promoted parameter jumps at its events, which rescale the
+            # concentrations there (#74), and holds between them (#1052: this
+            # used to make V̇ unknown and drop the whole term).
             return _sp.Integer(0)
 
         def _vdot_sym(safe_var: str, seen: frozenset):
@@ -7200,15 +7426,114 @@ def _build_model_from_sbml_doc(doc):
                     expr_str = _re.sub(rf"\b{_re.escape(a)}\b", sn, expr_str)
             return expr_str
 
-        for sid, comp in species_comp.items():
-            if (
-                comp in ar_comp_targets
+        def _diluted(sid: str) -> bool:
+            return (
+                species_comp.get(sid) in ar_comp_targets
                 and sid in species_idx
                 and not species_hosu.get(sid, False)
                 and sid not in rate_rule_targets
                 and sid not in assignment_targets
-            ):
+            )
+
+        # V̇ of each compartment that holds a species to dilute, and the species
+        # whose rates it reads.
+        _comp_vdot: dict[str, object] = {}
+        _comp_rated: dict[str, set[str]] = {}
+        for sid, comp in species_comp.items():
+            if comp not in _comp_vdot and _diluted(sid):
                 vdot = _vdot_sym(_safe_name(comp), frozenset())
+                _comp_vdot[comp] = vdot
+                _comp_rated[comp] = (
+                    {
+                        _rate_token_species[str(s)]
+                        for s in vdot.free_symbols
+                        if str(s) in _rate_token_species
+                    }
+                    if vdot is not None
+                    else set()
+                )
+
+        def _size_text(cid: str) -> str:
+            for j in range(sbml_model.getNumRules()):
+                r = sbml_model.getRule(j)
+                if r.isAssignment() and r.getVariable() == cid and r.getMath() is not None:
+                    return f"{cid} := {libsbml.formulaToL3String(r.getMath())}"
+            return cid
+
+        _refusals: list[str] = []
+        for comp, rated in _comp_rated.items():
+            for leaf in sorted(rated):
+                if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) reads {leaf}, an amount in "
+                        f"compartment {species_comp[leaf]}, which an assignment rule sizes; "
+                        "bngsim's rate of such a species is not yet right there (#736)"
+                    )
+
+        # A concentration the size reads in a compartment whose own size reads a
+        # rate: each compartment's rate needs the next one's, so a ring of them
+        # (a compartment reading its own concentration is one) has no first.
+        def _reads_in(a: str, b: str) -> list[str]:
+            return sorted(
+                leaf for leaf in _comp_rated[a] if _diluted(leaf) and species_comp[leaf] == b
+            )
+
+        _needs = {
+            comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
+            for comp, rated in _comp_rated.items()
+            if rated
+        }
+        _state: dict[str, int] = {}  # 1 on the walk, 2 finished
+        _ring: list[str] = []
+        for start in sorted(_needs):
+            if _state.get(start) or _ring:
+                continue
+            path, walk = [start], [iter(_needs[start])]
+            _state[start] = 1
+            while walk and not _ring:
+                nxt = next(walk[-1], None)
+                if nxt is None:
+                    _state[path.pop()] = 2
+                    walk.pop()
+                elif _state.get(nxt) == 1:
+                    _ring = path[path.index(nxt) :] + [nxt]
+                elif not _state.get(nxt) and nxt in _needs:
+                    _state[nxt] = 1
+                    path.append(nxt)
+                    walk.append(iter(_needs[nxt]))
+        if len(_ring) == 2:  # a compartment reading its own concentration
+            c = _ring[0]
+            _refusals.append(
+                f"compartment {c} ({_size_text(c)}) reads {', '.join(_reads_in(c, c))}, a "
+                f"concentration in {c} itself: a concentration is the amount over the size, "
+                "so the two define each other, and bngsim does not solve that"
+            )
+        elif _ring:
+            _refusals.append(
+                "the sizes of compartments "
+                + ", ".join(f"{c} ({_size_text(c)})" for c in _ring[:-1])
+                + " each read a concentration in the next ("
+                + "; ".join(
+                    f"{a} reads {', '.join(_reads_in(a, b))} in {b}"
+                    for a, b in zip(_ring, _ring[1:], strict=False)
+                )
+                + "), so the sizes define each other, and bngsim does not solve that"
+            )
+        if _refusals:
+            from bngsim._exceptions import ModelError
+
+            raise ModelError(
+                "Model sizes a compartment by an assignment rule that bngsim cannot "
+                "follow to its rate of change:\n"
+                + "\n".join(f"  - {r}" for r in dict.fromkeys(_refusals))
+                + "\nA concentration species in such a compartment changes with its "
+                "size, so bngsim needs the size's rate; libRoadRunner refuses a size "
+                "that reads its own concentration too (a recursive assignment rule)."
+            )
+
+        for sid, comp in species_comp.items():
+            if _diluted(sid):
+                vdot = _comp_vdot[comp]
                 if vdot is None or vdot == 0:
                     continue
                 vdot_ex = sympy_to_exprtk(vdot)
@@ -7235,6 +7560,8 @@ def _build_model_from_sbml_doc(doc):
                 # from the AR compartment's expression column), not the stale
                 # conc·V_static. Recorded for the report-time amount remap below.
                 ar_dilution_species.add(sid)
+                if _comp_rated[comp]:
+                    _dilution_reads_rate = True
 
     # ── 9. Reactions → BNGsim reaction emission ──────────────────────
     # Two emission strategies for non-mass-action kinetic laws:
@@ -8717,7 +9044,9 @@ def _build_model_from_sbml_doc(doc):
         name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF
     }
     _uses_rateof = _model_uses_rateof(sbml_model, func_defs, rateof_funcdef_names)
-    if _uses_rateof:
+    # A §8c dilution term that reads a species' rate needs the machinery too,
+    # though the model itself names no rateOf (#1052).
+    if _uses_rateof or _dilution_reads_rate:
         builder.enable_rateof()
 
     # ── 10.7. Unresolvable compartment sizes (#170) ───────────────────
@@ -8760,18 +9089,28 @@ def _build_model_from_sbml_doc(doc):
     # `rateOf(B)` reads more than `B`: the rate of `B` at load is every kinetic
     # law of a reaction that makes or takes it, or its rate rule. `c =
     # rateOf(B)` under `J0: A -> B; k1*A` left `k1` writable and the size where
-    # it was (0.172 off).
+    # it was (0.172 off). And it does not read `B`'s value, so its argument is
+    # not a name read unless the expression names it elsewhere: `p2 =
+    # rateOf(p1)` of a `p1` nothing changes is 0 whatever `p1` is, and used to
+    # freeze `p1` (issue #1048). The same for a call to COPASI's rateOf idiom:
+    # its body is never evaluated, the call is the same rate as the csymbol.
     def _names_read(_m) -> set[str]:
-        _out = _ast_name_set(_m)
         if not _uses_rateof:
-            return _out
-        for _node in _iter_ast_subtree(_m):
+            return _ast_name_set(_m)
+        _out: set[str] = set()
+        stack = [_m] if _m is not None else []
+        while stack:
+            _node = stack.pop()
             _t = _node.getType()
+            if _t == libsbml.AST_NAME:
+                _out.add(_node.getName())
             if _t == libsbml.AST_FUNCTION_RATE_OF or (
                 _t == libsbml.AST_FUNCTION and _node.getName() in rateof_funcdef_names
             ):
                 for _k in range(_node.getNumChildren()):
                     _out |= {f"rateOf({_n})" for _n in _ast_name_set(_node.getChild(_k))}
+                continue
+            stack.extend(_node.getChild(_k) for _k in range(_node.getNumChildren()))
         return _out
 
     _reads: dict[str, set[str]] = {}
@@ -8824,7 +9163,9 @@ def _build_model_from_sbml_doc(doc):
 
     _folded_into: dict[str, str] = {}
 
-    def _fold(names, what: str) -> None:
+    def _fold(names, what: str) -> set[str]:
+        """Freeze what ``names`` reach behind ``what``; return what it froze."""
+        frozen: set[str] = set()
         stack = list(names)
         seen: set[str] = set()
         while stack:
@@ -8841,14 +9182,24 @@ def _build_model_from_sbml_doc(doc):
                 or _n.startswith("_lp_")
             ):
                 _folded_into.setdefault(_safe_name(_n), what)
+                frozen.add(_safe_name(_n))
+        return frozen
 
-    # (#313) the residue of the lift, which was only warned about.
+    # (#313) the residue of the lift: a parameter initialAssignment §0 folded
+    # that §2 could not put back on its symbols. It is also named in a warning
+    # once the model is built, from exactly what this freezes, so the warning
+    # and the refusal cannot disagree. (Issue #1048: the warning was computed in
+    # §2 from the expression's own names, so it said nothing of `k1` for
+    # `p2 = rateOf(B)` under `J0: A -> B; k1*A`, which this refuses.)
+    _frozen_upstream: set[str] = set()
     for _pid, _m in _ia_math.items():
         if _pid in _lift_expr or _pid in comp_param_idx or _pid not in _param_decl_index:
             continue
         if _pid in _ar_targets:
-            continue
-        _fold(_names_read(_m), f"the initial value of {_pid!r}, which an initialAssignment sets")
+            continue  # §4's rule recomputes it; the fold is not what a write faces
+        _frozen_upstream |= _fold(
+            _names_read(_m), f"the initial value of {_pid!r}, which an initialAssignment sets"
+        )
     # The same for a species, and for a parameter a rate rule or an event makes
     # a state of: an initialAssignment that is not lowered to an expression of
     # parameters (it reads a reaction's rate, the time, a species under a rule)
@@ -8982,6 +9333,20 @@ def _build_model_from_sbml_doc(doc):
     # Only what the built model has as a parameter a caller could write.
     _built_params = set(core.param_names)
     model._frozen_params = {n: w for n, w in _folded_into.items() if n in _built_params}
+    # (#313) Anything the residue's fold read that a caller can still write is
+    # frozen behind it: `set_param` refuses it, and so does the sensitivity
+    # request. Say so once, at load, by the names they refuse. (An
+    # initialAssignment that reads nothing writable stays quiet: it is frozen,
+    # but no parameter is frozen behind it.)
+    _residue_frozen = sorted(n for n in model._frozen_params if n in _frozen_upstream)
+    if _residue_frozen:
+        logger.warning(
+            "initialAssignment(s) that bngsim could not keep symbolic read the "
+            "parameter(s) %s. Their contribution through that initialAssignment is "
+            "frozen at its load-time value, so set_param refuses to change them and "
+            "a forward-sensitivity column for one is refused (Model.frozen_params).",
+            ", ".join(_residue_frozen),
+        )
     model._ssa_issues = ssa_issues
     model._periodic_disc_max_step = periodic_disc_max_step
     # The registered discontinuity conditions, verbatim (issue #305). A root at
