@@ -491,9 +491,7 @@ def metadata(rulemonkey_repo: Path, ref: str, commit: str, checkout_info: dict[s
         "exprtk_sync": {
             "rulemonkey_vendor_note": str(RULEMONKEY_EXPRTK_VENDOR_NOTE),
             "pinned_bngsim_commit": checkout_info["exprtk_pin"],
-            "verified_against_bngsim_paths": [
-                str(display_path(p)) for p in EXPRTK_SYNC_FILES.values()
-            ],
+            "verified_against_bngsim_paths": [display_path(p) for p in EXPRTK_SYNC_FILES.values()],
         },
         "normalizations": [
             "Removed RuleMonkey's unconditional third_party/bngsim_expr include path from the rulemonkey target.",

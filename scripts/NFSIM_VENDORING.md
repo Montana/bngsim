@@ -12,8 +12,10 @@ it in the NFsim checkout first and then re-run `vendor_nfsim.py`.
 
 Paths written `bngsim/...` here, as in the scripts' messages and `VENDOR.json`,
 name the bngsim checkout, whatever its directory is called: a worktree such as
-`bngsim-wt/<topic>` works the same. Every `scripts/vendor_*.py` finds the
-checkout from its own location, so run it by any path to it (GH #864).
+`bngsim-wt/<topic>` works the same. (`bngsim/vendor` is the exception: it is
+the carry-queue branch in the NFsim candidate checkout, not a path.) Every
+`scripts/vendor_*.py` finds the checkout from its own location and acts on
+that checkout, so run the copy in the checkout you mean to change (GH #864).
 
 ## Current Baseline
 
@@ -213,8 +215,10 @@ afterward.
 
 ### 2. Preview Before Writing
 
-From the directory above the checkout (or drop the `bngsim/` prefix and run
-from inside it):
+From inside the checkout, drop the `bngsim/` prefix. As written, the commands
+assume a checkout named `bngsim` and run from the directory above it; from the
+directory above a checkout with another name, `bngsim/scripts/...` is some
+other checkout's script, and it would act on that checkout.
 
 ```sh
 python3 bngsim/scripts/vendor_nfsim.py \

@@ -28,12 +28,17 @@ beside one (GH #864). Every script now takes the checkout from its own location,
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _source_root import bngsim_source_root  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -184,16 +189,20 @@ class TestNoVendorScriptRunsGitOutsideTheCheckout:
 
 
 def _vendor_scripts() -> list[Path]:
-    scripts = sorted(SCRIPTS_DIR.glob("vendor_*.py"))
-    assert scripts, "no scripts/vendor_*.py in this checkout"
-    return scripts
+    # Evaluated at collection, so it must not raise: without scripts/ the module
+    # skip above has to get the chance to apply.
+    return sorted(SCRIPTS_DIR.glob("vendor_*.py"))
 
 
 @pytest.mark.parametrize("script", _vendor_scripts(), ids=lambda p: p.stem)
 def test_bngsim_root_is_this_checkout(script: Path) -> None:
+    # The checkout as found by its pyproject.toml, not this file's walk-up:
+    # run_tests.sh reaches scripts/ through a symlink, which the scripts resolve.
+    checkout = bngsim_source_root()
+    assert checkout is not None
     mod = _load(script, f"_{script.stem}_root_under_test")
-    assert mod.BNGSIM_ROOT == REPO_ROOT
-    assert mod.VENDOR_DIR.parent == REPO_ROOT / "third_party"
+    assert checkout == mod.BNGSIM_ROOT
+    assert mod.VENDOR_DIR.parent == checkout / "third_party"
     assert mod.VENDOR_DIR.is_dir()
 
 
@@ -213,6 +222,10 @@ def test_bngsim_root_does_not_depend_on_the_checkout_name(script: Path, tmp_path
     mod = _load(copy, f"_{script.stem}_renamed_under_test")
     assert checkout.resolve() == mod.BNGSIM_ROOT
     assert mod.VENDOR_DIR.is_relative_to(checkout.resolve())
+    if hasattr(mod, "display_path"):
+        # The recorded form must not pick up the checkout's name either; only a
+        # checkout not named bngsim can tell.
+        assert mod.display_path(mod.VENDOR_DIR) == f"bngsim/third_party/{mod.VENDOR_DIR.name}"
 
 
 @pytest.mark.parametrize("script", _vendor_scripts(), ids=lambda p: p.stem)
@@ -232,10 +245,12 @@ def test_display_paths_keep_the_bngsim_prefix(name: str) -> None:
 
 
 def test_vendor_dir_is_unchanged_by_the_bngsim_root_refactor() -> None:
-    # The vendored paths land exactly where they did when the checkout was
-    # reached as <parent>/bngsim, in a checkout that is named bngsim.
+    # The vendored paths land in this checkout, found by its pyproject.toml
+    # rather than by the script's own arithmetic, exactly where they always did.
+    checkout = bngsim_source_root()
+    assert checkout is not None
     mod = _vendor_nfsim()
-    assert mod.VENDOR_DIR == mod.BNGSIM_ROOT / "third_party" / "nfsim"
-    assert mod.PATCHES_DIR == mod.BNGSIM_ROOT / "scripts" / "nfsim_vendor_patches"
+    assert checkout / "third_party" / "nfsim" == mod.VENDOR_DIR
+    assert checkout / "scripts" / "nfsim_vendor_patches" == mod.PATCHES_DIR
     assert mod.VENDOR_DIR.is_dir()
     assert mod.PATCHES_DIR.is_dir()
