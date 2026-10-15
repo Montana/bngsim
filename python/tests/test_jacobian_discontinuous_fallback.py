@@ -299,6 +299,59 @@ def test_the_retry_is_for_a_cvode_failure_only(
         assert core.jacobians == ["auto"]
 
 
+class _TimesOutAfterAdvancing(_FailsFirst):
+    """The first run integrates for real and only then runs out of budget.
+
+    A timeout mid-run leaves the model where the attempt stopped, as a CVODE
+    failure does. A budget that expires before the first step leaves nothing to
+    restore, so this stand-in advances the model to the end of the window first;
+    the timeout is then the core's own, raised by a second call on a budget no
+    step fits in, so the message the retry must not mistake for a CVODE failure
+    is the real one.
+    """
+
+    def __init__(self, inner) -> None:
+        super().__init__(inner, "")
+
+    def run(self, times, opts, *args):
+        self.jacobians.append(opts.jacobian)
+        if len(self.jacobians) == 1:
+            self._inner.run(times, opts, *args)
+            opts.timeout_seconds = 1e-9
+        return self._inner.run(times, opts, *args)
+
+
+def test_a_timeout_is_not_retried(data_dir: Path) -> None:
+    # Issue #691: SimulationTimeout is a RuntimeError, and the retry once caught
+    # it and ran again on a fresh budget, so run(timeout=T) raised after about 2T
+    # or, from the state the first attempt left, returned a Result whose t=0 row
+    # was not the initial condition. The budget is the user's, not the Jacobian's.
+    m = bngsim.Model.from_net(_net(data_dir))
+    sim = bngsim.Simulator(m, method="ode")
+    assert m._core.analytical_jacobian_complete  # the retry is open to this run
+    start = m.get_state().copy()
+    core = sim._sim = _TimesOutAfterAdvancing(sim._sim)
+    with pytest.raises(bngsim.SimulationTimeout):
+        sim.run(t_span=(0.0, 1.0), n_points=3)
+    assert core.jacobians == ["auto"]
+    assert sim._ode_jacobian_fell_back is False
+    assert np.array_equal(m.get_state(), start)
+
+
+def test_a_batch_row_timeout_is_not_retried(
+    data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A run_batch row places the same bet through the same attempts (issue #867),
+    # so its budget is the user's too.
+    m = bngsim.Model.from_net(_net(data_dir))
+    sim = bngsim.Simulator(m, method="ode")
+    assert m._core.analytical_jacobian_complete
+    with caplog.at_level("WARNING", logger="bngsim"), pytest.raises(bngsim.SimulationTimeout):
+        sim.run_batch(t_span=(0.0, 150.0), n_points=3, params=[{}], timeout=1e-9)
+    assert not [r for r in caplog.records if "GH#176 analytical Jacobian" in r.getMessage()]
+    assert sim._ode_jacobian_fell_back is False
+
+
 class _FailsAfterAdvancing(_FailsFirst):
     """The first run integrates for real and only then raises ``message``.
 

@@ -6372,6 +6372,8 @@ def fallback_crossing(
             # moves the index. ``idx = tD + 1`` with ``tD = 2*n`` is moved by
             # tD, which is neither the index nor a primary it is written in.
             moved_index = bool(_written_in(param_names[index], derived) & requested)
+        # Indexed by an observable, or by a function, ``fIdx() = Aobs``: by the
+        # state, which the quotient moves.
         if table.get("index_kind") not in ("time", "parameter") or moved_index:
             return f'tfun {table.get("name")} (method=>"step")'
     # The derived parameters that hold a condition, a step call, a choice or
@@ -6415,32 +6417,21 @@ def fallback_crossing(
     if ctx is None:
         ctx = core.functional_jacobian_context()
     func_map = dict(ctx["function_map"])
-    # A table indexed by a parameter is indexed by the state where the
-    # parameter is a slot a function owns: ``fIdx() = Aobs``.
-    for table in stepping:
-        index = table.get("index_param_idx", -1)
-        if (
-            table.get("index_kind") == "parameter"
-            and 0 <= index < len(param_names)
-            and param_names[index] in func_map
-        ):
-            return f'tfun {table.get("name")} (method=>"step")'
     texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
     # A table a rate law reads is indexed by what its index reads, which the
-    # law's text, ``tfun_g()``, does not show. Where a function owns the index
-    # slot, ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
+    # law's text, ``tfun_g()``, does not show. Where the index is a function,
+    # ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
     # function is read as a law of its own: the table of what it holds jumps
     # where it jumps and bends where it bends. Compiled code reads the index
     # live since issue #965, so the quotient reads across that crossing. An
     # index function may read a table of its own, ``h() = tfun(..., h0)``, so
     # what the indices read is asked in turn until nothing new is found. Kept
     # beside the laws, and only for a model that has such a table.
+    function_names = [str(f["name"]) for f in data.get("functions", ())]
     table_indices = {
-        str(table.get("name")): param_names[table.get("index_param_idx", -1)]
+        str(table.get("name")): function_names[table["index_func_idx"]]
         for table in data.get("table_functions", ())
-        if table.get("index_kind") == "parameter"
-        and 0 <= table.get("index_param_idx", -1) < len(param_names)
-        and param_names[table.get("index_param_idx", -1)] in func_map
+        if table.get("index_kind") == "function"
     }
     if table_indices:
         found_indices: tuple[str, ...] | None = kept_all.get(_TABLE_INDICES)
