@@ -1637,9 +1637,12 @@ class Simulator:
         # A compartment an assignment rule sizes. The right-hand side divides a
         # species' share of a reaction across compartments by the size the
         # model loaded at, not the one the rule gives (issue #745), so a law
-        # across sizes there is a law of that right-hand side: `c2 := 1 + A`
-        # ends at A = 0.354 where the amounts give 0.467. Such a model was
-        # refused while its law was found without the sizes, and stays so.
+        # across sizes there is a law of that right-hand side, not of the
+        # amounts. Such a model was refused while its law was found without
+        # the sizes, and stays so. (`c2 := 1 + A`, the example this was
+        # written for, dilutes B since #1052, which leaves no such law: its
+        # steady states form a line, and the isolated-root check refuses its
+        # columns.)
         ruled = sorted(set(model.compartment_size_params) & set(model.function_names))
         if ruled:
             names = model.species_names

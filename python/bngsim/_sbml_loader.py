@@ -7260,12 +7260,26 @@ def _build_model_from_sbml_doc_in_context(doc):
     # V̇ is the *time derivative of the assignment-rule RHS*, which 8b's rate-rule
     # RHS gives directly but an AR compartment does not — it needs the chain rule
     # V̇ = Σ_k (∂g/∂x_k)·ẋ_k over the time-varying quantities g references. We build
-    # it symbolically (sympy), with ẋ_k known only for safe leaves: ``time()`` (=1),
-    # a rate-ruled non-species variable (its rate-rule RHS), and another assignment
-    # target (recursively). Any reference to a reaction/rule-driven SPECIES, an
-    # event-promoted parameter (discontinuous; the #74 rescale owns those), or an
-    # unparseable RHS makes V̇ unknown and we emit nothing — identical to today's
-    # behavior, so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
+    # it symbolically (sympy), with ẋ_k for each leaf: ``time()`` (=1), a rate-ruled
+    # non-species variable (its rate-rule RHS), another assignment target, species
+    # or not (recursively), and any other species: its ``rate_of__`` accessor, the
+    # engine's live dx/dt, which is SBML's rateOf of exactly the value the symbol
+    # denotes (issue #1052: such a leaf used to make V̇ unknown, and the species
+    # then kept its concentration where SBML keeps its amount, with nothing said).
+    # Reading a rate turns the engine's rateOf machinery on (``_dilution_reads_rate``,
+    # §10.6), which takes a probe of the derivatives before each RHS.
+    #
+    # Two leaves are refused by name rather than read. A concentration the size
+    # reads in its own compartment, directly or through another such compartment:
+    # the concentration is the amount over the size, so the two define each other
+    # (libRoadRunner refuses it as a recursive assignment rule). And an amount
+    # (hOSU=true) in an assignment-rule compartment, its own included, whose rate
+    # accessor is still wrong there (#736). An event-promoted parameter holds
+    # between its events (rate 0; the #74 rescale owns the jump), and so does a
+    # species that is constant or a boundary with no rate rule, where its value
+    # is an amount or its compartment's size holds; such a leaf needs no rate
+    # accessor. An unparseable RHS still makes V̇ unknown, and we emit nothing,
+    # so a static-RHS AR compartment (V̇ ≡ 0) and every non-AR model stay
     # byte-identical. hOSU=true species and rule-target species are excluded exactly
     # as in 8b. The emitted term is additive to §9's reaction term and also covers a
     # flux-free species (pure dilution ``[S] = A/V(t)``); ODE-only for the same #81
@@ -7275,6 +7289,7 @@ def _build_model_from_sbml_doc_in_context(doc):
     # tracks amount/V_live, so the report-time amount selector reads V_live from the
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
+    _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
     if ar_comp_targets:
         import re as _re
 
@@ -7315,8 +7330,26 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
-        _species_alias = {_alias(_safe_name(s)) for s in _sbml_species_ids}
-        _event_alias = {_alias(_safe_name(p)) for p in event_promoted_params}
+        _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
+        _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
+        # A species whose value never moves continuously, so its rate is 0 and
+        # reading it needs no rate accessor: nothing changes its amount (constant,
+        # or boundary with no rate rule), and the value is that amount or a
+        # concentration in a compartment whose size holds between events.
+        _still_species = {
+            s
+            for s in _sbml_species_ids
+            if s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                sbml_model.getSpecies(s).getConstant()
+                or sbml_model.getSpecies(s).getBoundaryCondition()
+            )
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _rr_alias = {_alias(s): s for s in _rr_rhs_ex}  # alias -> safe name
         _ar_alias = {_alias(s): s for s in _ar_rhs_ex}  # alias -> safe name
         _rr_sym_cache: dict[str, object] = {}
@@ -7330,12 +7363,18 @@ def _build_model_from_sbml_doc_in_context(doc):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
             if nm == _TIME_SYM:
                 return _sp.Integer(1)
-            if nm in _event_alias or nm in _species_alias:
-                return None
+            if nm in _ar_alias:  # an assignment target, a species among them
+                return _vdot_sym(_ar_alias[nm], seen)
+            if nm in _species_alias:  # its live rate, rateOf(S) (#1052)
+                sid = _species_alias[nm]
+                if sid in _still_species:
+                    return _sp.Integer(0)
+                return _sp.Symbol(_rateof_token(sid))
             if nm in _rr_alias:
                 return _rr_deriv(_rr_alias[nm])
-            if nm in _ar_alias:
-                return _vdot_sym(_ar_alias[nm], seen)
+            # An event-promoted parameter jumps at its events, which rescale the
+            # concentrations there (#74), and holds between them (#1052: this
+            # used to make V̇ unknown and drop the whole term).
             return _sp.Integer(0)
 
         def _vdot_sym(safe_var: str, seen: frozenset):
@@ -7377,15 +7416,114 @@ def _build_model_from_sbml_doc_in_context(doc):
                     expr_str = _re.sub(rf"\b{_re.escape(a)}\b", sn, expr_str)
             return expr_str
 
-        for sid, comp in species_comp.items():
-            if (
-                comp in ar_comp_targets
+        def _diluted(sid: str) -> bool:
+            return (
+                species_comp.get(sid) in ar_comp_targets
                 and sid in species_idx
                 and not species_hosu.get(sid, False)
                 and sid not in rate_rule_targets
                 and sid not in assignment_targets
-            ):
+            )
+
+        # V̇ of each compartment that holds a species to dilute, and the species
+        # whose rates it reads.
+        _comp_vdot: dict[str, object] = {}
+        _comp_rated: dict[str, set[str]] = {}
+        for sid, comp in species_comp.items():
+            if comp not in _comp_vdot and _diluted(sid):
                 vdot = _vdot_sym(_safe_name(comp), frozenset())
+                _comp_vdot[comp] = vdot
+                _comp_rated[comp] = (
+                    {
+                        _rate_token_species[str(s)]
+                        for s in vdot.free_symbols
+                        if str(s) in _rate_token_species
+                    }
+                    if vdot is not None
+                    else set()
+                )
+
+        def _size_text(cid: str) -> str:
+            for j in range(sbml_model.getNumRules()):
+                r = sbml_model.getRule(j)
+                if r.isAssignment() and r.getVariable() == cid and r.getMath() is not None:
+                    return f"{cid} := {libsbml.formulaToL3String(r.getMath())}"
+            return cid
+
+        _refusals: list[str] = []
+        for comp, rated in _comp_rated.items():
+            for leaf in sorted(rated):
+                if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) reads {leaf}, an amount in "
+                        f"compartment {species_comp[leaf]}, which an assignment rule sizes; "
+                        "bngsim's rate of such a species is not yet right there (#736)"
+                    )
+
+        # A concentration the size reads in a compartment whose own size reads a
+        # rate: each compartment's rate needs the next one's, so a ring of them
+        # (a compartment reading its own concentration is one) has no first.
+        def _reads_in(a: str, b: str) -> list[str]:
+            return sorted(
+                leaf for leaf in _comp_rated[a] if _diluted(leaf) and species_comp[leaf] == b
+            )
+
+        _needs = {
+            comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
+            for comp, rated in _comp_rated.items()
+            if rated
+        }
+        _state: dict[str, int] = {}  # 1 on the walk, 2 finished
+        _ring: list[str] = []
+        for start in sorted(_needs):
+            if _state.get(start) or _ring:
+                continue
+            path, walk = [start], [iter(_needs[start])]
+            _state[start] = 1
+            while walk and not _ring:
+                nxt = next(walk[-1], None)
+                if nxt is None:
+                    _state[path.pop()] = 2
+                    walk.pop()
+                elif _state.get(nxt) == 1:
+                    _ring = path[path.index(nxt) :] + [nxt]
+                elif not _state.get(nxt) and nxt in _needs:
+                    _state[nxt] = 1
+                    path.append(nxt)
+                    walk.append(iter(_needs[nxt]))
+        if len(_ring) == 2:  # a compartment reading its own concentration
+            c = _ring[0]
+            _refusals.append(
+                f"compartment {c} ({_size_text(c)}) reads {', '.join(_reads_in(c, c))}, a "
+                f"concentration in {c} itself: a concentration is the amount over the size, "
+                "so the two define each other, and bngsim does not solve that"
+            )
+        elif _ring:
+            _refusals.append(
+                "the sizes of compartments "
+                + ", ".join(f"{c} ({_size_text(c)})" for c in _ring[:-1])
+                + " each read a concentration in the next ("
+                + "; ".join(
+                    f"{a} reads {', '.join(_reads_in(a, b))} in {b}"
+                    for a, b in zip(_ring, _ring[1:], strict=False)
+                )
+                + "), so the sizes define each other, and bngsim does not solve that"
+            )
+        if _refusals:
+            from bngsim._exceptions import ModelError
+
+            raise ModelError(
+                "Model sizes a compartment by an assignment rule that bngsim cannot "
+                "follow to its rate of change:\n"
+                + "\n".join(f"  - {r}" for r in dict.fromkeys(_refusals))
+                + "\nA concentration species in such a compartment changes with its "
+                "size, so bngsim needs the size's rate; libRoadRunner refuses a size "
+                "that reads its own concentration too (a recursive assignment rule)."
+            )
+
+        for sid, comp in species_comp.items():
+            if _diluted(sid):
+                vdot = _comp_vdot[comp]
                 if vdot is None or vdot == 0:
                     continue
                 vdot_ex = sympy_to_exprtk(vdot)
@@ -7412,6 +7550,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                 # from the AR compartment's expression column), not the stale
                 # conc·V_static. Recorded for the report-time amount remap below.
                 ar_dilution_species.add(sid)
+                if _comp_rated[comp]:
+                    _dilution_reads_rate = True
 
     # ── 9. Reactions → BNGsim reaction emission ──────────────────────
     # Two emission strategies for non-mass-action kinetic laws:
@@ -8894,7 +9034,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF
     }
     _uses_rateof = _model_uses_rateof(sbml_model, func_defs, rateof_funcdef_names)
-    if _uses_rateof:
+    # A §8c dilution term that reads a species' rate needs the machinery too,
+    # though the model itself names no rateOf (#1052).
+    if _uses_rateof or _dilution_reads_rate:
         builder.enable_rateof()
 
     # ── 10.7. Unresolvable compartment sizes (#170) ───────────────────
