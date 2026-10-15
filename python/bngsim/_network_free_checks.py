@@ -23,10 +23,10 @@ The vendored NFsim expands energy rules at load with three silent defects
 not apply, 2.478 unless the model has a parameter named ``RT``; it gives a
 one-way binding rule a reverse reaction the model does not have; and it drops a
 one-way unbinding rule and every state-change rule. Drop this refusal when the
-vendored NFsim carries the upstream fix. Energy patterns alone change no rate,
-so only the rate law is refused. So is a rate-law type NFsim does not
-implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops such a rule with
-a message only its captured log holds, so the rule never fires.
+vendored NFsim carries the upstream fix (gated issue #1057). Energy patterns
+alone change no rate, so only the rate law is refused. So is a rate-law type
+NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
+such a rule with a message only its captured log holds, so the rule never fires.
 """
 
 from __future__ import annotations
@@ -156,7 +156,8 @@ def refuse_nfsim_rate_laws(xml_path: str | Path) -> None:
             + ". NFsim's expansion of energy rules divides every energy by an RT that "
             "BioNetGen does not apply (2.478 unless the model defines a parameter RT), "
             "gives a one-way binding rule a reverse reaction, and drops one-way unbinding "
-            "and state-change rules, all without an error (RuleWorld/nfsim#102)"
+            "and state-change rules, all without an error (RuleWorld/nfsim#102; this "
+            "refusal is lifted under issue #1057)"
         )
     if other:
         parts.append(

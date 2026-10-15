@@ -125,7 +125,7 @@ laws NFsim cannot run, in `python/bngsim/_network_free_checks.py`
 NFsim's energy-rule expansion divides by an `RT` BioNetGen does not apply and
 gets one-way and state-change rules wrong (RuleWorld/nfsim#102); when a refresh
 brings in the upstream fix, drop that half and test NFsim against the generated
-network instead. A rate-law type outside Ele, MM, Function and FunctionProduct
+network instead (gated issue #1057 lists the steps). A rate-law type outside Ele, MM, Function and FunctionProduct
 is refused because NFsim implements none: it drops a Hill rule silently.
 
 Dropped carries that are now upstream include connectivity determinism,

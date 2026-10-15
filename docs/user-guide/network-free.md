@@ -161,7 +161,7 @@ implement, naming each rule. NFsim's expansion of energy rules divides every
 energy by an `RT` that BioNetGen does not apply (2.478 unless the model defines
 a parameter `RT`), gives a one-way binding rule a reverse reaction, and drops
 one-way unbinding and state-change rules, all without an error
-(RuleWorld/nfsim#102). NFsim implements `Ele`, `MM` and function rate laws only:
+(RuleWorld/nfsim#102; the refusal is lifted under issue #1057). NFsim implements `Ele`, `MM` and function rate laws only:
 it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
