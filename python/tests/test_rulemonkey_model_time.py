@@ -274,6 +274,27 @@ def test_a_session_of_a_model_that_does_not_read_the_clock_still_relabels():
     np.testing.assert_array_equal(r.time, [0.0, 1.0])
 
 
+@pytest.mark.parametrize(
+    "bad_segment",
+    [
+        {"t_start": 5.0, "t_end": 4.0, "n_points": 3},
+        {"t_start": 5.0, "t_end": 7.0, "n_points": 0},
+        {"t_start": math.inf, "t_end": math.inf, "n_points": 3},
+    ],
+)
+def test_a_failed_segment_leaves_the_start_unset(bad_segment):
+    """A segment that raises does not move the seed state: the next one still
+    places it, and the session is the one-shot run."""
+    one_shot = _rm(SWITCH, 7, t_span=(5.0, 7.0), n_points=3)
+    with bngsim.RuleMonkeySession(str(SWITCH)) as s:
+        s.initialize(seed=7)
+        with pytest.raises(bngsim.SimulationError):
+            s.simulate(**bad_segment)
+        assert s.current_time == 0.0
+        r = s.simulate(5.0, 7.0, n_points=3)
+    np.testing.assert_array_equal(np.asarray(r.observables), np.asarray(one_shot.observables))
+
+
 @pytest.mark.parametrize("bad", [math.nan, math.inf])
 def test_a_session_refuses_a_start_that_is_not_finite(bad):
     with bngsim.RuleMonkeySession(str(SWITCH)) as s, pytest.raises(ValueError, match="finite"):

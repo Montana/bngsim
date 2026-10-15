@@ -88,8 +88,12 @@ class RuleMonkeySession:
         self._initialized = False
         self._destroyed = False
 
-        from bngsim._network_free_checks import clock_readers
+        from bngsim._network_free_checks import (
+            clock_readers,
+            refuse_rulemonkey_energy_misreads,
+        )
 
+        refuse_rulemonkey_energy_misreads(self._xml_path)  # until issue #1058
         self._core = RuleMonkeySimulator(self._xml_path)
         warn_rulemonkey_diagnostics(self._core, stacklevel=2)
         if molecule_limit is not None:
@@ -187,6 +191,20 @@ class RuleMonkeySession:
     ) -> Result:
         """Run a simulation segment and return a Result.
 
+        A segment that starts at :attr:`current_time` runs on the session
+        clock, the model's. One that starts elsewhere continues from
+        :attr:`current_time` by the same span and is labelled with the times
+        asked for, which a model that does not read the clock cannot tell
+        apart. For a model that reads the clock (``time()``, or a table
+        function indexed by time) the labels would not be the times it read,
+        so such a segment raises :class:`bngsim.SimulationError`, unless
+        :meth:`initialize` left the start unset and nothing has moved the
+        session since: the seed state then moves to the segment's start.
+
+        The result's ``solver_stats["n_steps"]`` counts the events since
+        :meth:`initialize`, not this segment's alone, as an
+        :class:`bngsim.NfsimSession`'s does.
+
         Parameters
         ----------
         t_start, t_end, n_points
@@ -209,20 +227,6 @@ class RuleMonkeySession:
             destroyed (or the context manager exited) before reuse — the
             live RuleMonkey session sits at the last completed event and
             subsequent state is undefined for bngsim purposes.
-
-        A segment that starts at :attr:`current_time` runs on the session
-        clock, the model's. One that starts elsewhere continues from
-        :attr:`current_time` by the same span and is labelled with the times
-        asked for, which a model that does not read the clock cannot tell
-        apart. For a model that reads the clock (``time()``, or a table
-        function indexed by time) the labels would not be the times it read,
-        so such a segment raises :class:`bngsim.SimulationError`, unless
-        :meth:`initialize` left the start unset and nothing has moved the
-        session since: the seed state then moves to the segment's start.
-
-        The result's ``solver_stats["n_steps"]`` counts the events since
-        :meth:`initialize`, not this segment's alone, as an
-        :class:`bngsim.NfsimSession`'s does.
         """
         self._require_initialized()
 
@@ -246,11 +250,17 @@ class RuleMonkeySession:
                 "t_start, t_end and n_points are required unless sample_times is given."
             )
 
-        self._place_segment(float(t_start))
+        moved = self._place_segment(float(t_start))
         try:
-            core_result = self._core.simulate(
-                float(t_start), float(t_end), int(n_points), timeout_seconds, explicit_times
-            )
+            try:
+                core_result = self._core.simulate(
+                    float(t_start), float(t_end), int(n_points), timeout_seconds, explicit_times
+                )
+            except BaseException:
+                if moved:
+                    # A segment that fails leaves the start where initialize() left it.
+                    self._restore_unset_start()
+                raise
         except SimulationTimeout:
             raise
         except RuntimeError as e:
@@ -580,22 +590,25 @@ class RuleMonkeySession:
         self._require_initialized()
         return self._core.current_time()
 
-    def _place_segment(self, start: float) -> None:
+    def _place_segment(self, start: float) -> bool:
         """Check a segment starting at *start* against the session clock, for a
-        model that reads it, and move an unset start there (see simulate)."""
+        model that reads it, and move an unset start there (see simulate).
+        Whether it moved the start."""
         start_unset, self._start_unset = self._start_unset, False
         if not self._clock_readers:
-            return
+            return False
         now = self._core.current_time()
         if _on_session_clock(start, now):
-            return
-        # Only initialize() leaves the start unset, and it sets the seed.
+            return False
+        # Only initialize() leaves the start unset (at 0), and it sets the seed.
         if start_unset and self._seed is not None:
             try:
                 self._core.initialize(self._seed, start)
             except RuntimeError as e:
+                # A failed initialize() leaves no session: put back the one there was.
+                self._restore_unset_start()
                 raise SimulationError(f"RuleMonkey initialization failed: {e}") from e
-            return
+            return True
         raise SimulationError(
             f"RuleMonkeySession cannot run a segment from t = {start:g}: the session "
             f"clock is at {now:g}, and the model reads the clock in "
@@ -603,6 +616,12 @@ class RuleMonkeySession:
             + ", so the rows would not be labelled with the times it read. Start the "
             "segment at current_time, or pass t_start to initialize() (issue #1022)."
         )
+
+    def _restore_unset_start(self) -> None:
+        """Put the session back as initialize() left it, with its start unset."""
+        assert self._seed is not None
+        self._core.initialize(self._seed, 0.0)
+        self._start_unset = True
 
     def _require_alive(self) -> None:
         if self._destroyed:

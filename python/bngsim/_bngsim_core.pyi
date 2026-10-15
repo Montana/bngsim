@@ -820,6 +820,10 @@ class RuleMonkeySimulator:
         """
         Block same-complex binding. Default: true.
         """
+    def set_model_time(self, enabled: bool) -> None:
+        """
+        Run one-shot runs on the model's clock (true, the default) or on time elapsed since t_start (false), for a model that reads no clock
+        """
     def set_molecule_limit(self, limit: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
         Set global molecule limit

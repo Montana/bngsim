@@ -12,12 +12,18 @@ energy, 100 of each) rm held AB at 87 against network SSA's 74.7.
 Oracles: network SSA on the BNG-generated .net for the transient, the exact
 stationary distribution for the equilibrium (detailed balance gives it a product
 form), and the closed form of a one-way unbinding rule, which is first order.
+
+RuleMonkey 3.11.0 still expands some energy rules differently from BNG2: it
+drops or misapplies an energy pattern's context, and an Arrhenius rule's own
+reactant context (richardposner/RuleMonkey#109). rm refuses those by name until
+issue #1058 lifts the refusal; the models are in arrhenius/misread/.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+import re
 import warnings
 from pathlib import Path
 
@@ -148,3 +154,33 @@ def test_one_way_energy_rules_fire_one_way_at_bng2s_rate():
     se = np.sqrt(100 * q * (1 - q) / N_RM)
     z = (cd.mean(axis=0)[1:] - 100 * q[1:]) / se[1:]
     assert np.all(np.abs(z) < 4.5), z
+
+
+# Each .bngl in misread/ says what BNG2's rate is. RuleMonkey 3.11.0 gets the
+# first nine wrong (|z| about 50 against BNG2's closed form, 40 seeds) and the
+# last two right; those two lie outside the shapes the refusal can tell are
+# safe from the XML. Issue #1058 turns these into value tests.
+MISREADS = {
+    "state_ctx": "energy patterns 'A(b!1).B(a!1,s~1)'",
+    "freectx": "energy patterns 'A(b!1,c).B(a!1)'",
+    "wild": "energy patterns 'L(r!+,r!+)'",
+    "samename": "energy patterns 'L(r!1,r!+).R(l!1)'",
+    "samename_partner": "energy patterns 'L(r!1,r!2).R(l!1).S(l!2)'",
+    "partner": "energy patterns 'A(b!1,c!2).B(a!1).C(a!2)'",
+    "chain2ctx": "energy patterns 'A(b!1).B(a!1,c!2).C(b!2,d!3).D(c!3)'",
+    "two_leaves": "energy patterns 'A(b!1,c!2,d!3).B(a!1).C(a!2).D(a!3)'",
+    "rule_context": "the reactant context of rules '_R1'",
+    "plain_two_a": "energy patterns 'A(b!1).B(a1!1,a2!2).A(b!2)'",
+    "samename_explicit": "energy patterns 'L(r!1,r!2).R(l!1).R(l!2)'",
+}
+
+
+@pytest.mark.parametrize("name", sorted(MISREADS))
+def test_rm_refuses_an_energy_rule_it_would_misread(name):
+    xml = ARR / "misread" / f"{name}.xml"
+    match = re.escape(MISREADS[name]) + r".*RuleMonkey#109.*issue #1058"
+    m = bngsim.Model.from_net(str(ARR / "misread" / f"{name}.net"))
+    with pytest.raises(bngsim.ModelError, match=match):
+        bngsim.Simulator(m, method="rm", xml_path=str(xml))
+    with pytest.raises(bngsim.ModelError, match=match):
+        bngsim.RuleMonkeySession(str(xml))

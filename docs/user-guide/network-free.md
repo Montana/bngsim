@@ -156,7 +156,8 @@ nothing fires, is not seen until something does, and until then the run is flat
 (issue #892).
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
-two clocks apart.
+two clocks apart, and runs on elapsed time on both backends, which keeps event
+times small at a large `t_start`.
 
 ### Arrhenius (energy) rules
 
@@ -165,6 +166,16 @@ the free-energy change of the reaction the rule writes, and `1-phi` for the
 reverse half of a reversible rule. Energies are in units of RT: there is no RT
 in the formula, and a parameter named `RT` is an ordinary parameter, which a
 model in kJ/mol divides by where it uses it (issue #1022).
+
+RuleMonkey expands each energy rule at load, and reads only some energy
+patterns as BNG2 does: the bonded pair of sites a rule joins or parts, alone or
+with one more bond to a molecule of a third type whose site binds nothing else,
+on a rule that names only those two sites. That covers pair and cooperativity
+patterns. It drops or misapplies a state, a site that must be free, a wildcard
+bond, a site named twice, context further out, and context in the rule itself
+(richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
+until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
+`method="ssa"` on the generated network.
 
 ### RuleMonkey's warnings
 

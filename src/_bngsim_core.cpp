@@ -2749,6 +2749,9 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def("set_block_same_complex_binding",
              &bngsim::RuleMonkeySimulator::set_block_same_complex_binding, py::arg("enabled"),
              "Block same-complex binding. Default: true.")
+        .def("set_model_time", &bngsim::RuleMonkeySimulator::set_model_time, py::arg("enabled"),
+             "Run one-shot runs on the model's clock (true, the default) or on time elapsed "
+             "since t_start (false), for a model that reads no clock")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
         .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,

@@ -1,0 +1,30 @@
+# Plain explicit bonds, two A on one B: A(b!1).B(a1!1,a2!2).A(b!2).
+# One-way unbinding of A from B at a1. Doubly bound: dG = -(G_AB + G_pair) = 3
+#   -> exp(-(0.2 + 0.35*3)) = 0.2865; singly bound at a1: dG = 2 -> exp(-0.9).
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_AB -2
+  G_pair -1
+end parameters
+begin molecule types
+  A(b)
+  B(a1,a2)
+end molecule types
+begin seed species
+  A(b!1).B(a1!1,a2!2).A(b!2) 1000
+end seed species
+begin energy patterns
+  A(b!1).B(a1!1) G_AB
+  A(b!1).B(a1!1,a2!2).A(b!2) G_pair
+end energy patterns
+begin observables
+  Molecules Full B(a1!+,a2!+)
+end observables
+begin reaction rules
+  A(b!1).B(a1!1) -> A(b) + B(a1) Arrhenius(phi,Ea0)
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()

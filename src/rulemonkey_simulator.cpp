@@ -135,16 +135,20 @@ Result convert_rulemonkey_result(const rulemonkey::Result &rm_result,
 }
 
 // RuleMonkey 3.11.0 puts the seed state at ts.t_start on the model's clock
-// (richardposner/RuleMonkey#98), so a bngsim run is handed through as is: it
-// starts from the initial state at t_start and never sees [0, t_start] (issue
-// #703), and a rate law that reads time() reads absolute model time, as ode and
-// ssa do (issue #1022). Up to 3.10.1 run() simulated [0, t_start] first, so
-// every run used to be shifted to elapsed time here. NFsim stays on elapsed
-// time, BNG2.pl's simulate_nf semantics.
-rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
+// (richardposner/RuleMonkey#98), so a run on model time is handed through as
+// is: it starts from the initial state at t_start and never sees [0, t_start]
+// (issue #703), and a rate law that reads time() reads absolute model time, as
+// ode and ssa do (issue #1022). A model that reads no clock cannot tell model
+// time from time elapsed since t_start, and is run on the latter, shifted to
+// t_start -> 0 and labelled back: event times stay small, where on absolute time
+// a waiting time is rounded away once the total propensity times |t| nears
+// 1e15, and such a run is the one 3.10.1 gave. NFsim stays on elapsed time,
+// BNG2.pl's simulate_nf semantics.
+rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times, bool model_time) {
     rulemonkey::TimeSpec rm_times;
-    rm_times.t_start = times.t_start;
-    rm_times.t_end = times.t_end;
+    const double t0 = model_time ? 0.0 : times.t_start;
+    rm_times.t_start = times.t_start - t0;
+    rm_times.t_end = times.t_end - t0;
     if (!times.sample_times.empty()) {
         // Explicit, possibly non-uniform output instants (GH #169). Upstream
         // RuleMonkey #16 records at exactly these times in a single run_ssa pass
@@ -152,7 +156,9 @@ rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
         // through and leave n_points at its default. The Python layer guarantees
         // sample_times[0] == t_start and t_end == the largest sample time, which
         // satisfies upstream's "t_end bounds the SSA loop" contract.
-        rm_times.sample_times = times.sample_times;
+        rm_times.sample_times.reserve(times.sample_times.size());
+        for (double t : times.sample_times)
+            rm_times.sample_times.push_back(t - t0);
     } else {
         rm_times.n_points = rulemonkey_interval_count(times.n_points);
     }
@@ -210,6 +216,7 @@ struct RuleMonkeySimulator::Impl {
 
     std::string xml_path;
     std::unique_ptr<rulemonkey::RuleMonkeySimulator> sim;
+    bool model_time = true; // see set_model_time
 };
 
 RuleMonkeySimulator::RuleMonkeySimulator(const std::string &xml_path)
@@ -227,14 +234,19 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
         // share a time, and event_count preserved. The recorder labels each row
         // with the requested time, so convert_rulemonkey_result needs no explicit
         // time labels and solver_stats().n_steps now reports for both paths.
-        auto rm_result =
-            impl_->sim->run(to_rulemonkey_times(times), seed, make_cancel_callback(budget));
+        auto rm_result = impl_->sim->run(to_rulemonkey_times(times, impl_->model_time), seed,
+                                         make_cancel_callback(budget));
         // The requested instants themselves, as every other backend reports
-        // them: upstream's uniform grid, t_start + i*dt, can miss the last by
-        // an ulp (issue #693).
+        // them: upstream's grid, and elapsed time + t_start, can miss the last
+        // by an ulp (issue #693).
         std::vector<double> labels = times.output_times();
-        if (labels.size() != rm_result.time.size())
+        if (labels.size() != rm_result.time.size()) {
             labels.assign(rm_result.time.begin(), rm_result.time.end());
+            if (!impl_->model_time) {
+                for (double &t : labels)
+                    t += times.t_start;
+            }
+        }
         return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
         // Upstream raises Cancelled iff our callback returned false, which it
@@ -378,6 +390,8 @@ void RuleMonkeySimulator::clear_param_overrides() {
     impl_->sim->clear_param_overrides();
     impl_->apply_seed_rounding();
 }
+
+void RuleMonkeySimulator::set_model_time(bool enabled) { impl_->model_time = enabled; }
 
 void RuleMonkeySimulator::set_molecule_limit(int limit) { impl_->sim->set_molecule_limit(limit); }
 

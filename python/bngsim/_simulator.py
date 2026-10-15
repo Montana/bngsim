@@ -1030,10 +1030,19 @@ class Simulator:
                     f"method='{method}' requires xml_path=... pointing to a BNG XML file."
                 )
             from bngsim._bngsim_core import RuleMonkeySimulator
+            from bngsim._network_free_checks import (
+                clock_readers,
+                refuse_rulemonkey_energy_misreads,
+            )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
+            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             self._sim = RuleMonkeySimulator(xml_path)
             warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
+            # Model time where the model reads the clock (issue #1022); elsewhere
+            # elapsed time, which no such model can tell apart and which keeps
+            # event times small at a large t_start.
+            self._sim.set_model_time(bool(clock_readers(xml_path)))
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             self._sim.set_block_same_complex_binding(bool(block_same_complex_binding))
