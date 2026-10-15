@@ -2305,6 +2305,15 @@ bool NetworkModel::event_trigger_reads_time(int event_idx0) const {
     return rate_dependencies_(std::move(params), {ev.trigger_source}).time;
 }
 
+bool NetworkModel::state_switch_reads_time(const StateSwitch &sw) const {
+    std::vector<int> params;
+    if (sw.residual_expr_idx >= 0) {
+        std::vector<int> sp;
+        expression_support(sw.residual_expr_idx, &sp, &params);
+    }
+    return rate_dependencies_(std::move(params), {sw.residual_source}).time;
+}
+
 bool NetworkModel::event_trigger_is_state_dependent(int event_idx0) const {
     const auto &events = impl_->events;
     if (event_idx0 < 0 || event_idx0 >= static_cast<int>(events.size())) {

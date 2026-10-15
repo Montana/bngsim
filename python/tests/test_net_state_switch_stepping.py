@@ -874,13 +874,13 @@ def test_two_residuals_that_slide_are_both_held(tmp_path):
 
 
 # S comes down onto thr() = 1 and slides on it until a() switches off at te.
-# The drift dlt then lifts S off the surface, but not out of the band, so the
-# residual is still held when thr() sweeps up past S, fast. Only the residual
-# and Y's rate read thr(), so CVODE's steps are not held back by the sweep, and
-# one step goes from inside the band to far past the surface. Y integrates k
-# while thr() - w < S < thr(), a window that opens on the held residual's own
-# crossing. z() keeps Y off during the slide.
-_HELD_SWEEP_NET = """\
+# The drift dlt then lifts S off the surface, but not out of the band, and
+# thr() sweeps up past S, fast. Only the residual and Y's rate read thr(), so
+# CVODE's steps are not held back by the sweep, and one step goes from inside
+# the band to far past the surface. Y integrates k while thr() - w < S < thr(),
+# a window that opens on the slid residual's own crossing. z() keeps Y off
+# during the slide.
+_SWEEP_NET = """\
 begin parameters
     1 k    10.0
     2 w    0.001
@@ -914,15 +914,13 @@ end groups
 
 
 @pytest.mark.parametrize("rtol, dlt, rel", [(1e-3, 0.1, 1e-2), (1e-4, 0.01, 3e-2)])
-def test_a_held_residual_that_crosses_restarts_where_main_does(tmp_path, rtol, dlt, rel):
-    """A crossing of a held residual is not located by CVODE. At the return
-    that ends its step (here, the residual leaving its band) it is found on the
-    interpolant and given the restart test, which carries it; the run restarts
-    there and the window is integrated. Without that, the step that spans the
-    window is kept and Y gains nothing, as in a run with no state-switch roots.
-    S moves at dlt across the window and thr() is known, so the window's width
-    is exact given S before the sweep. Main gets this right too (control)."""
-    model = _write(tmp_path, _HELD_SWEEP_NET.format(dlt=dlt))
+def test_a_window_opened_by_a_moving_threshold_is_integrated(tmp_path, rtol, dlt, rel):
+    """thr() sweeps past S in one step and opens a window on the slid residual's
+    own crossing, which the run restarts at. S moves at dlt across the window
+    and thr() is known, so the window's width is exact given S before the
+    sweep. Main gets this right (control); the residual reads the time and is
+    not held (see the next test)."""
+    model = _write(tmp_path, _SWEEP_NET.format(dlt=dlt))
     t1, tp, amp, sig, w = 30.04, 30.05, 0.5, 0.001, 0.001
     result = bngsim.Simulator(model).run(
         sample_times=[0.0, t1, tp + 1.0], rtol=rtol, atol=rtol * 1e-2
@@ -943,6 +941,69 @@ def test_a_held_residual_that_crosses_restarts_where_main_does(tmp_path, rtol, d
     exact = 10.0 * (edge(w) - edge(0.0))
     gained = float(result.species[-1][1]) - float(result.species[1][1])
     assert gained == pytest.approx(exact, rel=rel)
+
+
+# The same sweep with the residual scaled by h(), which falls from 1 to 1e-3
+# just before it, and Y's rate a pulse in time rather than a window with a
+# second edge: nothing but the residual's own crossing ends the step.
+_SCALED_SWEEP_NET = """\
+begin parameters
+    1 k    10.0
+    2 A    0.5
+    3 tp   30.05
+    4 sig  0.001
+    5 dlt  0.01
+    6 te   30.0
+end parameters
+begin functions
+    1 thr() 1+A*(1+tanh((time()-tp)/sig))/2
+    2 h() 1e-3+1/(1+exp((time()-30.02)/0.002))
+    3 a() 1/(1+exp((time()-te)/0.002))
+    4 f() if(Sobs*h()<thr()*h(),a(),-a())
+    5 up() dlt
+    6 z() exp(-((time()-30.047)/0.001)^2)
+    7 r() if(Sobs*h()<thr()*h(),k,0)*z()
+end functions
+begin species
+    1 S() 27.95
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+    3 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def test_a_residual_that_reads_the_time_is_not_held(tmp_path):
+    """A residual that reads the time is never held: its g and dg/dx move with
+    the clock while the state stands still, which a band measured once cannot
+    follow. Held with the band measured where h was 1, S*h < thr*h hid its own
+    crossing once h had fallen to 1e-3, the run was not restarted there, and
+    the pulse that crossing lets through was lost: Y gained 0 where it gains
+    0.0134 (second review of the #908 fix). Main gets it right (control). The
+    pulse is a Gaussian and S moves at dlt, so the gain is exact given S before
+    the sweep."""
+    model = _write(tmp_path, _SCALED_SWEEP_NET)
+    t1, tp, amp, sig, dlt = 30.04, 30.05, 0.5, 0.001, 0.01
+    result = bngsim.Simulator(model).run(sample_times=[0.0, t1, tp + 1.0], rtol=1e-3, atol=1e-5)
+    s1 = float(result.species[1][0])
+    lo, hi = t1, tp + 0.5
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        thr = 1.0 + amp * (1.0 + math.tanh((mid - tp) / sig)) / 2.0
+        if thr - (s1 + dlt * (mid - t1)) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    t_open = 0.5 * (lo + hi)
+    exact = 10.0 * 0.001 * math.sqrt(math.pi) / 2.0 * math.erfc((t_open - 30.047) / 0.001)
+    gained = float(result.species[-1][1]) - float(result.species[1][1])
+    assert gained == pytest.approx(exact, rel=2e-2)
 
 
 # S slides on S = 1, parks just above it once a() has decayed, and is pushed
