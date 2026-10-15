@@ -237,9 +237,9 @@ _RATEOF_PREFIX = "rate_of__"
 # instead of inlining the funcDef's NaN body.
 _RATEOF_FUNCDEF = object()
 
-# The parameters and compartments of the model being built that no rule or
-# event changes. Their rate of change is 0 at every time, and the builder binds
-# a ``rate_of__`` accessor only for a state, so :func:`_rateof_call` emits the 0
+# The parameters and compartments of the model being built that no rule sets.
+# Their rate of change is 0 at every time, and the builder binds a
+# ``rate_of__`` accessor only for a state, so :func:`_rateof_call` emits the 0
 # for them. Set by the build, which runs in a context of its own, so a load
 # never sees another load's names.
 _RATEOF_CONSTANT_SYMBOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
@@ -248,19 +248,20 @@ _RATEOF_CONSTANT_SYMBOLS: contextvars.ContextVar[frozenset[str]] = contextvars.C
 
 
 def _rateof_constant_symbols(sbml_model) -> frozenset[str]:
-    """Parameters and compartments that no rule and no event assignment sets."""
-    changed = set()
+    """Parameters and compartments that no rate or assignment rule sets.
+
+    One an event assigns is among them: an event's assignment is a jump, not a
+    rate, so between events it holds and its rate is 0. (bngsim makes it a
+    state, whose accessor reads that same 0.)
+    """
+    ruled = set()
     for i in range(sbml_model.getNumRules()):
         rule = sbml_model.getRule(i)
         if rule.isRate() or rule.isAssignment():
-            changed.add(rule.getVariable())
-    for i in range(sbml_model.getNumEvents()):
-        ev = sbml_model.getEvent(i)
-        for j in range(ev.getNumEventAssignments()):
-            changed.add(ev.getEventAssignment(j).getVariable())
+            ruled.add(rule.getVariable())
     names = {sbml_model.getParameter(i).getId() for i in range(sbml_model.getNumParameters())}
     names |= {sbml_model.getCompartment(i).getId() for i in range(sbml_model.getNumCompartments())}
-    return frozenset(names - changed)
+    return frozenset(names - ruled)
 
 
 def _rateof_token(species_name: str) -> str:
@@ -285,9 +286,10 @@ def _rateof_call(node: libsbml.ASTNode, local_params: dict | None = None) -> str
     compile (no global of that name) or silently bind to a same-named global,
     so the local-scope check both fixes the value and avoids the mis-bind.
 
-    So is a parameter or compartment that no rule or event changes
-    (``_RATEOF_CONSTANT_SYMBOLS``): its rate is ``0``, and its accessor, bound
-    to nothing, failed to compile (#1045's case, outside an initial value).
+    So is a parameter or compartment that no rule sets
+    (``_RATEOF_CONSTANT_SYMBOLS``): its rate is ``0``, and for one no event
+    assigns either, its accessor, bound to nothing, failed to compile (#1045's
+    case, outside an initial value).
     """
     if node.getNumChildren() >= 1:
         arg = node.getChild(0)
@@ -4410,7 +4412,7 @@ def _build_model_from_sbml_doc_in_context(doc):
     # below would take it for a constant (rate 0) and before the emitter would
     # write a rate accessor that nothing binds.
     _check_rateof_targets(sbml_model, func_defs)
-    # What nothing changes has rate 0 wherever it is read (see _rateof_call).
+    # What no rule sets has rate 0 wherever it is read (see _rateof_call).
     _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
 
     # ── 0. Evaluate initialAssignments ────────────────────────────────

@@ -995,6 +995,113 @@ def test_the_warning_names_what_a_folded_rate_is_made_of(caplog):
         model.set_param("k1", 2.0)
 
 
+# ─── rateOf of a parameter nothing changes, outside an initial value ──────────
+#
+# #1045 gave ``p2 = rateOf(p1)`` its 0 in an initialAssignment, with p1 a
+# parameter no rule or event changes. Read anywhere else (a rule, a kinetic law,
+# an event) the emitter wrote a ``rate_of__p1`` accessor, which the builder binds
+# only for a state, so the load failed in ExprTk (ERR239). The rate is 0 at
+# every time, and so is that of a compartment nothing resizes.
+
+
+def _rateof_constant_model(where: str, p1: str) -> str:
+    """``rateOf(p1)`` (or of the compartment c) read at ``where``. ``p1`` is
+    "constant", "variable" (constant="false", nothing changes it), "ia" (set
+    only by an initialAssignment) or "event" (an event sets it to 4 at t = 0.5:
+    a jump, so its rate is still 0)."""
+
+    def rate(x: str) -> str:
+        return f"<apply>{_RATEOF_CSYMBOL}<ci>{x}</ci></apply>"
+
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    rules = reactions = events = ""
+    if where == "assignmentRule":
+        rules = f'<assignmentRule variable="p2">{m}{rate("p1")}</math></assignmentRule>'
+    elif where == "rateRule":
+        rules = (
+            f'<rateRule variable="x">{m}<apply><plus/>{rate("p1")}<cn>1</cn></apply></math>'
+            "</rateRule>"
+        )
+    elif where == "reaction":
+        reactions = (
+            '<listOfReactions><reaction id="J1" reversible="false"><listOfProducts>'
+            '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfProducts>'
+            f"<kineticLaw>{m}<apply><plus/>{rate('c')}<cn>1</cn></apply></math></kineticLaw>"
+            "</reaction></listOfReactions>"
+        )
+    elif where == "event":
+        events = f"""
+    <listOfEvents>
+      <event id="e" useValuesFromTriggerTime="true">
+        <trigger initialValue="false" persistent="true">{m}
+          <apply><gt/><apply><plus/>{rate("p1")}{_TIME_CSYMBOL}</apply><cn>1</cn></apply>
+        </math></trigger>
+        <listOfEventAssignments>
+          <eventAssignment variable="p3">{m}<apply><plus/>{rate("p1")}<cn>5</cn></apply>
+          </math></eventAssignment>
+        </listOfEventAssignments>
+      </event>
+    </listOfEvents>"""
+    else:
+        raise ValueError(where)
+    if p1 == "event":
+        events = (events or "<listOfEvents></listOfEvents>").replace(
+            "</listOfEvents>",
+            f"""<event id="e1" useValuesFromTriggerTime="true">
+        <trigger initialValue="false" persistent="true">{m}
+          <apply><gt/>{_TIME_CSYMBOL}<cn>0.5</cn></apply></math></trigger>
+        <listOfEventAssignments>
+          <eventAssignment variable="p1">{m}<cn>4</cn></math></eventAssignment>
+        </listOfEventAssignments>
+      </event></listOfEvents>""",
+        )
+    ia = (
+        '<listOfInitialAssignments><initialAssignment symbol="p1">'
+        f"{m}<apply><times/><cn>2</cn><ci>k</ci></apply></math>"
+        "</initialAssignment></listOfInitialAssignments>"
+        if p1 == "ia"
+        else ""
+    )
+    return f"""
+  <model id="m">
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="0" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="p1" value="1" constant="{"true" if p1 == "constant" else "false"}"/>
+      <parameter id="k" value="3" constant="true"/>
+      <parameter id="p2" value="7" constant="false"/>
+      <parameter id="p3" value="10" constant="false"/>
+      <parameter id="x" value="2" constant="false"/>
+    </listOfParameters>
+    {ia}
+    <listOfRules>{rules}</listOfRules>
+    {reactions}
+    {events}
+  </model>"""
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("p1", ["constant", "variable", "ia", "event"])
+@pytest.mark.parametrize("where", ["assignmentRule", "rateRule", "reaction", "event"])
+def test_rateof_of_something_nothing_changes_is_zero_wherever_it_is_read(where, p1, codegen):
+    model = bngsim.Model.from_sbml_string(_sbml(_rateof_constant_model(where, p1)))
+    res = _run(model, codegen=codegen, t_end=2.0, n_points=5)
+    t = np.asarray(res.time)
+    if where == "assignmentRule":
+        np.testing.assert_allclose(_read_value(res, "p2"), 0.0, atol=0)
+    elif where == "rateRule":
+        np.testing.assert_allclose(_read_value(res, "x"), 2.0 + t, rtol=1e-8)
+    elif where == "reaction":
+        np.testing.assert_allclose(_series(res, "S"), t, rtol=1e-8, atol=1e-10)
+    else:
+        # rateOf(p1) + time > 1 first holds at t = 1, and p3 := 0 + 5 there.
+        p3 = _read_value(res, "p3")
+        np.testing.assert_allclose(p3, np.where(t > 1.0 + 1e-9, 5.0, 10.0))
+
+
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
 #
 # A trigger gated on rateOf fires when the CVODE root finder brackets the crossing.
