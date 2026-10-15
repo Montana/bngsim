@@ -247,6 +247,94 @@ struct NonFiniteWitness {
 // symbols, and two hand-maintained copies of an ABI struct diverge silently.
 // The nested aliases below keep the historical CvodeUserData::Codegen*Fn spelling.
 
+// ─── Chattering state-switch roots held off the root search (issue #908) ─────
+//
+// A state that slides along a state-switch surface crosses it on most steps,
+// each time inside the band the tolerance leaves the residual. Every crossing
+// was located, returned and given the restart test, and every one was
+// declined: up to 12 times the wall time of a run without these roots.
+//
+// A residual whose crossings are declined as unresolved on consecutive steps
+// is HELD. CVODE is then shown min(1 - |g|/B, room) instead of g. B is a share
+// of the band the restart test asks a crossing to clear, read where the state
+// is. `room` is what is left of the box the hold was taken in: each species
+// the residual reads may move from where it was by that share of its own
+// tolerance band, which keeps g within B of where it was to first order with
+// dg/dx as it is, not as it was measured; and a residual that reads the time
+// may move a hundredth of it, over which its dg/dx is taken to stand. Both
+// are continuous, so CVODE locates where either runs out. Inside, no root is
+// located. The residual is not switched off; only its crossings inside the
+// band are not stopped at.
+//
+// Those crossings are still tested. At every return while a residual is held
+// (the band left, an output, a stop, another root), the step just taken is
+// searched for a crossing of it on the interpolant, and one found is given
+// the restart test there, as the root it would have been. If the test carries
+// it, the run restarts at that crossing before anything at the return is
+// taken, as at an unheld root. Any restart, and leaving the band, releases the
+// hold. What this cannot see is a crossing in an earlier step of the same
+// stretch whose excursion leaves the band and comes back inside that one step:
+// both ends of the step are inside the band, so the root search never sees
+// the excursion. That is the shape #904 records for a single comparison.
+//
+// A held slide no longer returns at every step, so its CVODE calls end on
+// the batch limit as a run without these roots did, and CVODE logs each such
+// end as an error. A run that holds a residual sends its error log to the null
+// sink, as the sensitivity watch does: a failure still throws, through the
+// flag < 0 checks, with bngsim's own account of it.
+struct StateSwitchHold {
+    struct Term {
+        int species = -1;
+        double weight = 0.0; // kStateSwitchHoldShare * k_resolve * |dg/dx|
+        double atol = 0.0;
+        double x0 = 0.0;    // where dg/dx was measured
+        double drift = 0.0; // how far x may move from x0: the box the hold was taken in
+    };
+    std::vector<char> held;
+    std::vector<std::vector<Term>> terms;
+    std::vector<double> t0;      // where dg/dx was measured
+    std::vector<double> t_drift; // how far t may move from t0; +inf if g does not read it
+    // How far each held residual's crossings have been searched and tested.
+    std::vector<double> tested_to;
+    double rtol = 0.0;
+    int n_held = 0;
+    bool quiet = false; // the run's CVODE error log is in the null sink
+    // Set while the root function is asked for the residuals themselves (the
+    // sign probe of land_clock_on_threshold) rather than by CVODE.
+    bool probe = false;
+    // How many steps in a row have had an unresolved, declined crossing of
+    // each residual, and CVODE's count of steps at the last one.
+    std::vector<int> run;
+    std::vector<long> last_step;
+
+    void release_all() {
+        std::fill(held.begin(), held.end(), 0);
+        std::fill(run.begin(), run.end(), 0);
+        n_held = 0;
+    }
+
+    // What CVODE is shown for held residual j, of value g at (t, x).
+    double shown(std::size_t j, double t, const double *x, double g) const {
+        if (!std::isfinite(g)) {
+            return g;
+        }
+        double band = 0.0;
+        double room = 1.0;
+        for (const Term &k : terms[j]) {
+            const double xs = x[k.species];
+            band += k.weight * (rtol * std::fabs(xs) + k.atol);
+            room = std::min(room, 1.0 - std::fabs(xs - k.x0) / k.drift);
+        }
+        if (std::isfinite(t_drift[j])) {
+            room = std::min(room, 1.0 - std::fabs(t - t0[j]) / t_drift[j]);
+        }
+        if (!(band > 0.0)) {
+            return -1.0;
+        }
+        return std::min(1.0 - std::fabs(g) / band, room);
+    }
+};
+
 struct CvodeUserData {
     NetworkModel *model;
     // Code-generated RHS function pointer.
@@ -487,6 +575,11 @@ struct CvodeUserData {
     // residual next leaves zero. Null wherever state_switch_roots is. Owned by
     // run().
     const std::vector<double> *state_switch_zero_hold = nullptr;
+
+    // Issue #908: which state-switch residuals are held off the root search,
+    // and what CVODE is shown for them (StateSwitchHold). Null wherever
+    // state_switch_roots is. Owned by run(); every restart releases it.
+    StateSwitchHold *state_switch_hold = nullptr;
 
     // Earliest state at which a callback produced a non-finite value with no
     // clamp left to try (GH #336). Written by the RHS / Jacobian /
@@ -1876,6 +1969,12 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
         const int base = ne + static_cast<int>(disc.size());
         for (int j = 0; j < static_cast<int>(ss.size()); ++j) {
             double g = eval.evaluate(ss[j]);
+            const StateSwitchHold *hold = data->state_switch_hold;
+            if (hold != nullptr && hold->held[static_cast<size_t>(j)] != 0 && !hold->probe) {
+                gout[base + j] = hold->shown(static_cast<size_t>(j), static_cast<double>(t), y_ptr,
+                                             g); // issue #908
+                continue;
+            }
             if (g == 0.0 && data->state_switch_zero_hold != nullptr) {
                 const double hold = (*data->state_switch_zero_hold)[static_cast<size_t>(j)];
                 if (hold != 0.0) {
@@ -2061,6 +2160,27 @@ static void land_clock_on_threshold(double *y_data, int ns, int clock_species_id
         y_data[clk] = landed;
         return;
     }
+    // Issue #908: a held residual is asked for itself, not for what CVODE is
+    // shown, since the restart that follows this stop releases the hold.
+    struct ShowHeldRaw {
+        StateSwitchHold *hold;
+        bool was;
+        explicit ShowHeldRaw(void *user_data)
+            : hold(user_data != nullptr ? static_cast<CvodeUserData *>(user_data)->state_switch_hold
+                                        : nullptr),
+              was(hold != nullptr && hold->probe) {
+            if (hold != nullptr) {
+                hold->probe = true;
+            }
+        }
+        ~ShowHeldRaw() {
+            if (hold != nullptr) {
+                hold->probe = was;
+            }
+        }
+        ShowHeldRaw(const ShowHeldRaw &) = delete;
+        ShowHeldRaw &operator=(const ShowHeldRaw &) = delete;
+    } const raw(watch.user_data);
     const double before_val = y_data[clk];
     cvode_event_root_fn(static_cast<sunrealtype>(t_now), y, watch.before->data(), watch.user_data);
     y_data[clk] = landed;
@@ -2832,11 +2952,14 @@ struct CvodeSimulator::Impl {
     // surface is approached and carries the residual across it in the
     // direction `dir` (+1 rising, -1 falling) the root finder reported; true
     // also when no near-side point can be built. Leaves the model synced at
-    // (t, x).
+    // (t, x). Where given, `resolved` is set to whether the crossing cleared
+    // the band, and `grad` to dg/dx at (t, x) over the residual's species
+    // (issue #908).
     bool flow_carries_state_switch(void *cvode_mem, double t, const double *x, int ns,
                                    const NetworkModel::StateSwitch &sw, int dir, double t_end,
                                    N_Vector scratch, double rtol, double atol,
-                                   const std::vector<double> &atol_v);
+                                   const std::vector<double> &atol_v, bool *resolved = nullptr,
+                                   std::vector<double> *grad_out = nullptr);
 };
 
 // ─── Shared integrator setup (used by run() and run_warm()) ──────────────────
@@ -4900,7 +5023,13 @@ int CvodeSimulator::Impl::reinit_cvode(void *cvode_mem, sunrealtype t, N_Vector 
     void *user_data = nullptr;
     if (flag == CV_SUCCESS && CVodeGetUserData(cvode_mem, &user_data) == CV_SUCCESS &&
         user_data != nullptr) {
-        static_cast<CvodeUserData *>(user_data)->last_restart_t = static_cast<double>(t);
+        auto *data = static_cast<CvodeUserData *>(user_data);
+        data->last_restart_t = static_cast<double>(t);
+        // Issue #908: CVODE reads every root afresh at a restart, so a held
+        // residual goes back to being shown as it is.
+        if (data->state_switch_hold != nullptr) {
+            data->state_switch_hold->release_all();
+        }
     }
     return flag;
 }
@@ -8327,11 +8456,28 @@ static constexpr double kStateSwitchGapRatio = 0.7;
 // which for a genuine common factor is orders of magnitude below it.
 static constexpr double kStateSwitchTauAgreeTol = 1e-4;
 
-bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, const double *x,
-                                                     int ns, const NetworkModel::StateSwitch &sw,
-                                                     int dir, double t_end, N_Vector scratch,
-                                                     double rtol, double atol,
-                                                     const std::vector<double> &atol_v) {
+// How many bands the restart test asks a crossing to clear: 10 sqrt(N), because
+// the WRMS error test lets a single component carry sqrt(N) of the tolerance.
+static double state_switch_resolve_factor(int ns) {
+    return 10.0 * std::sqrt(static_cast<double>(ns));
+}
+// Issue #908 (StateSwitchHold). A residual is held after this many steps in a
+// row, each at most kStateSwitchHoldStepGap steps after the last, have had a
+// crossing of it declined as unresolved. A slide crosses on nearly every step.
+static constexpr int kStateSwitchHoldAfter = 4;
+static constexpr long kStateSwitchHoldStepGap = 2;
+// What share of the restart test's band holds it: the band is left, and the
+// crossing tested, at half the excursion that test would call resolved. The
+// box a species may move in is the same share of its tolerance band.
+static constexpr double kStateSwitchHoldShare = 0.5;
+// How far, relative to the time, a residual that reads the time may be held
+// over without dg/dx being measured again.
+static constexpr double kStateSwitchHoldTimeDrift = 1e-2;
+
+bool CvodeSimulator::Impl::flow_carries_state_switch(
+    void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
+    int dir, double t_end, N_Vector scratch, double rtol, double atol,
+    const std::vector<double> &atol_v, bool *resolved_out, std::vector<double> *grad_out) {
     // A trajectory that CROSSES the surface arrives at it with a flow that stays
     // finite as the surface is approached. One that only approaches it, parked
     // beside it or relaxing onto it, arrives with a flow that vanishes there, so
@@ -8403,12 +8549,18 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
         }
     }
     sync_model_at(t, x, ns);
+    if (resolved_out != nullptr) {
+        *resolved_out = false;
+    }
+    if (grad_out != nullptr) {
+        *grad_out = grad;
+    }
     if (best < 0 || !std::isfinite(g_star)) {
         return true;
     }
     // The far-side excursion the solver's trajectory makes over the rest of the
     // step, against the band at the state where it is measured.
-    const double k_resolve = 10.0 * std::sqrt(static_cast<double>(ns));
+    const double k_resolve = state_switch_resolve_factor(ns);
     bool resolved = false;
     if (t_end > t) {
         constexpr int kSamples = 16;
@@ -8429,6 +8581,9 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
             resolved = std::isfinite(excursion) && excursion > k_resolve * band;
         }
         sync_model_at(t, x, ns);
+    }
+    if (resolved_out != nullptr) {
+        *resolved_out = resolved;
     }
     if (!resolved) {
         return false;
@@ -11863,9 +12018,26 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     }
     const int n_state_switch = static_cast<int>(state_switch_roots.size());
     state_switch_zero_hold.assign(static_cast<size_t>(n_state_switch), 0.0);
+    // Issue #908: residuals held off the root search while their crossings are
+    // a slide's (StateSwitchHold). Only a run without sensitivities holds one.
+    // BNGSIM_STATE_SWITCH_HOLD=0 holds none, which steps every root as before
+    // (an A/B hatch). Read per run, so a test can set it after a solve.
+    StateSwitchHold state_switch_hold;
+    const char *hold_hatch = std::getenv("BNGSIM_STATE_SWITCH_HOLD");
+    const bool hold_allowed = hold_hatch == nullptr || std::string(hold_hatch) != "0";
     if (n_state_switch > 0) {
         user_data.state_switch_roots = &state_switch_roots;
         user_data.state_switch_zero_hold = &state_switch_zero_hold;
+        const auto n_ss = static_cast<size_t>(n_state_switch);
+        state_switch_hold.held.assign(n_ss, 0);
+        state_switch_hold.terms.assign(n_ss, {});
+        state_switch_hold.t0.assign(n_ss, 0.0);
+        state_switch_hold.t_drift.assign(n_ss, 0.0);
+        state_switch_hold.tested_to.assign(n_ss, 0.0);
+        state_switch_hold.run.assign(n_ss, 0);
+        state_switch_hold.last_step.assign(n_ss, 0);
+        state_switch_hold.rtol = rtol;
+        user_data.state_switch_hold = &state_switch_hold;
     }
     const int n_roots = n_events + n_disc + n_state_switch;
 
@@ -13834,6 +14006,148 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
             t_now = t_ret;
 
+            // Issue #908: a return while a residual is held off the root search.
+            // The step just taken is searched for a crossing of each held
+            // residual since it was last searched, and one found gets the
+            // restart test it would have had as a root. One the test carries
+            // restarts the run there, before anything at this return is taken:
+            // what is past it is found again from there. A held residual's own
+            // root here is its band running out, which is no crossing, and is
+            // taken out of the batch.
+            std::vector<int> held_left;
+            if (state_switch_hold.n_held > 0) {
+                sunrealtype t_step_end = t_ret;
+                CVodeGetCurrentTime(cvode_mem, &t_step_end);
+                sunrealtype h_last = 0.0;
+                CVodeGetLastStep(cvode_mem, &h_last);
+                const double t_step_start =
+                    static_cast<double>(t_step_end) - static_cast<double>(h_last);
+                const double t_here = static_cast<double>(t_ret);
+                // CVODE's own root tolerance.
+                const double t_tol = 100.0 * std::numeric_limits<double>::epsilon() *
+                                     (std::fabs(static_cast<double>(t_step_end)) +
+                                      std::fabs(static_cast<double>(h_last)));
+                std::vector<int> info;
+                if (flag == CV_ROOT_RETURN && n_roots > 0) {
+                    info.assign(static_cast<size_t>(n_roots), 0);
+                    CVodeGetRootInfo(cvode_mem, info.data());
+                }
+                NVectorGuard at(N_VClone(y));
+                NVectorGuard samples(N_VClone(y));
+                double *x_at = N_VGetArrayPointer(at);
+                auto &eval = model.evaluator();
+                double t_restart = std::numeric_limits<double>::infinity();
+                std::vector<double> x_restart;
+                for (int j = 0; j < n_state_switch; ++j) {
+                    const auto jx = static_cast<size_t>(j);
+                    if (state_switch_hold.held[jx] == 0) {
+                        continue;
+                    }
+                    if (!info.empty() && info[static_cast<size_t>(n_events + n_disc + j)] != 0) {
+                        held_left.push_back(j);
+                    }
+                    const double from = std::max(state_switch_hold.tested_to[jx], t_step_start);
+                    state_switch_hold.tested_to[jx] = t_here;
+                    if (!(t_here > from)) {
+                        continue;
+                    }
+                    const int g_idx = state_switches[jx]->residual_expr_idx;
+                    auto residual_at = [&](double tt) {
+                        if (CVodeGetDky(cvode_mem, static_cast<sunrealtype>(tt), 0, at) !=
+                            CV_SUCCESS) {
+                            return std::numeric_limits<double>::quiet_NaN();
+                        }
+                        impl_->sync_model_at(tt, x_at, ns);
+                        return eval.evaluate(g_idx);
+                    };
+                    const double g_from = residual_at(from);
+                    impl_->sync_model_at(t_here, y_data, ns);
+                    const double g_here = eval.evaluate(g_idx);
+                    if (!std::isfinite(g_from) || !std::isfinite(g_here) || g_from == 0.0 ||
+                        g_here == 0.0 || (g_from < 0.0) == (g_here < 0.0)) {
+                        continue;
+                    }
+                    // Bracketed as CVODE brackets a root, and taken on the far
+                    // side as CVODE takes it.
+                    double lo = from;
+                    double hi = t_here;
+                    for (int it = 0; it < 200 && hi - lo > t_tol; ++it) {
+                        const double mid = lo + 0.5 * (hi - lo);
+                        const double g_mid = residual_at(mid);
+                        if (!std::isfinite(g_mid)) {
+                            break;
+                        }
+                        if (g_mid == 0.0 || (g_mid < 0.0) != (g_from < 0.0)) {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+                    if (hi >= t_restart ||
+                        CVodeGetDky(cvode_mem, static_cast<sunrealtype>(hi), 0, at) != CV_SUCCESS) {
+                        continue;
+                    }
+                    const std::vector<double> x_root(x_at, x_at + ns);
+                    if (impl_->flow_carries_state_switch(cvode_mem, hi, x_root.data(), ns,
+                                                         *state_switches[jx], g_here > 0.0 ? 1 : -1,
+                                                         static_cast<double>(t_step_end), samples,
+                                                         rtol, atol, atol_v)) {
+                        t_restart = hi;
+                        x_restart = x_root;
+                    }
+                }
+                if (!x_restart.empty()) {
+                    std::copy(x_restart.begin(), x_restart.end(), y_data);
+                    // Releases every hold.
+                    std::fill(state_switch_zero_hold.begin(), state_switch_zero_hold.end(), 0.0);
+                    const int rf =
+                        impl_->reinit_cvode(cvode_mem, static_cast<sunrealtype>(t_restart), y);
+                    if (rf != CV_SUCCESS) {
+                        throw std::runtime_error(
+                            "CVodeReInit at a held state-switch crossing failed: " +
+                            std::to_string(rf));
+                    }
+                    t_now = static_cast<sunrealtype>(t_restart);
+                    continue;
+                }
+                impl_->sync_model_at(t_here, y_data, ns);
+                // Out of its band: shown as it is again. CVODE reads every root
+                // afresh after a root return, so the change is seen whole. A
+                // run that stepped on each crossing inside the band was last
+                // carried to the side the residual is on now, and holds an
+                // exact 0.0 on the other (the issue #897 hold): a slide reads
+                // exactly zero often, and a crossing located on another hold
+                // restarts a few ulp away from where that run restarts.
+                for (int j : held_left) {
+                    const auto jx = static_cast<size_t>(j);
+                    state_switch_hold.held[jx] = 0;
+                    state_switch_hold.run[jx] = 0;
+                    --state_switch_hold.n_held;
+                    const double g_left = eval.evaluate(state_switches[jx]->residual_expr_idx);
+                    if (std::isfinite(g_left) && g_left != 0.0) {
+                        state_switch_zero_hold[jx] =
+                            (g_left > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
+                    }
+                }
+            }
+            // A root return that was only held residuals leaving their bands.
+            bool only_held_left = !held_left.empty();
+            if (only_held_left) {
+                std::vector<int> info(static_cast<size_t>(n_roots), 0);
+                CVodeGetRootInfo(cvode_mem, info.data());
+                for (int j : held_left) {
+                    info[static_cast<size_t>(n_events + n_disc + j)] = 0;
+                }
+                only_held_left =
+                    std::all_of(info.begin(), info.end(), [](int r) { return r == 0; });
+                // On a stop's instant, the return CVODE makes without that root.
+                if (only_held_left &&
+                    ((stop_at_crossing && same_instant(static_cast<double>(t_ret), t_crossing)) ||
+                     (stop_at_switch && same_instant(static_cast<double>(t_ret), t_switch)))) {
+                    flag = CV_TSTOP_RETURN;
+                }
+            }
+
             // Issue #177: a single step taken only so the sensitivity error
             // floor can be re-derived from the live state. Nothing is recorded
             // here — this is not an output point — and the loop simply goes
@@ -13896,7 +14210,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // ─── Event handling: CV_ROOT_RETURN ───────────────────────────────
             // CVODE stopped at a root (event trigger zero-crossing).
             // Identify which events fired, apply assignments, reinit integrator.
-            if (flag == CV_ROOT_RETURN && n_roots > 0) {
+            if (flag == CV_ROOT_RETURN && n_roots > 0 && !only_held_left) {
                 // root_info spans the event roots [0,n_events), the
                 // discontinuity roots [n_events,n_events+n_disc) and the
                 // state-switch roots after them. The event-firing loops below
@@ -13908,6 +14222,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 // roots that the flow does not clearly carry (issue #897, below).
                 std::vector<int> root_info(n_roots);
                 CVodeGetRootInfo(cvode_mem, root_info.data());
+                // Issue #908: a held residual's root is its band running out.
+                for (int j : held_left) {
+                    root_info[static_cast<size_t>(n_events + n_disc + j)] = 0;
+                }
 
                 // Sync species concentrations for trigger/assignment evaluation
                 for (int si = 0; si < ns; ++si) {
@@ -14235,14 +14553,88 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         CVodeGetCurrentTime(cvode_mem, &t_end);
                         NVectorGuard scratch(N_VClone(y));
                         restart = false;
+                        long steps_now = 0;
+                        CVodeGetNumSteps(cvode_mem, &steps_now);
                         for (int j : switched) {
+                            const auto jx = static_cast<size_t>(j);
+                            bool resolved = false;
+                            std::vector<double> grad;
                             if (impl_->flow_carries_state_switch(
-                                    cvode_mem, t_root, y_data, ns,
-                                    *state_switches[static_cast<size_t>(j)],
+                                    cvode_mem, t_root, y_data, ns, *state_switches[jx],
                                     root_info[n_events + n_disc + j], static_cast<double>(t_end),
-                                    scratch, rtol, atol, atol_v)) {
+                                    scratch, rtol, atol, atol_v, &resolved, &grad)) {
                                 restart = true;
                                 break;
+                            }
+                            // Issue #908: a slide's crossings, declined as
+                            // unresolved on consecutive steps, are held off the
+                            // root search (StateSwitchHold).
+                            int &run_j = state_switch_hold.run[jx];
+                            if (resolved) {
+                                run_j = 0;
+                            } else if (run_j > 0 && steps_now - state_switch_hold.last_step[jx] <=
+                                                        kStateSwitchHoldStepGap) {
+                                ++run_j;
+                            } else {
+                                run_j = 1;
+                            }
+                            state_switch_hold.last_step[jx] = steps_now;
+                            if (!hold_allowed || run_j < kStateSwitchHoldAfter ||
+                                state_switch_hold.held[jx] != 0) {
+                                continue;
+                            }
+                            const NetworkModel::StateSwitch &sw = *state_switches[jx];
+                            const double k_resolve = state_switch_resolve_factor(ns);
+                            std::vector<StateSwitchHold::Term> terms;
+                            double band = 0.0;
+                            bool measurable = true;
+                            for (int sp : sw.species) {
+                                const auto sx = static_cast<size_t>(sp);
+                                const double w = kStateSwitchHoldShare * k_resolve *
+                                                 std::fabs(sx < grad.size() ? grad[sx] : 0.0);
+                                if (!(w > 0.0) || !std::isfinite(w)) {
+                                    continue;
+                                }
+                                StateSwitchHold::Term term;
+                                term.species = sp;
+                                term.weight = w;
+                                term.atol = atol_v.empty() ? atol : atol_v[sx];
+                                term.x0 = y_data[sp];
+                                term.drift = kStateSwitchHoldShare * k_resolve *
+                                             (rtol * std::fabs(term.x0) + term.atol);
+                                measurable = measurable && term.drift > 0.0;
+                                band += w * (rtol * std::fabs(term.x0) + term.atol);
+                                terms.push_back(term);
+                            }
+                            // Whether the residual reads the time: then dg/dx
+                            // can move with it too.
+                            const double h_t = 1e-7 * std::max(std::fabs(t_root), 1.0);
+                            impl_->sync_model_at(t_root + h_t, y_data, ns);
+                            const double g_late = model.evaluator().evaluate(sw.residual_expr_idx);
+                            impl_->sync_model_at(t_root - h_t, y_data, ns);
+                            const double g_early = model.evaluator().evaluate(sw.residual_expr_idx);
+                            impl_->sync_model_at(t_root, y_data, ns);
+                            const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
+                            const double t_drift =
+                                g_late == g_early ? std::numeric_limits<double>::infinity()
+                                                  : kStateSwitchHoldTimeDrift * std::fabs(t_root);
+                            if (terms.empty() || !measurable || !(band > 0.0) || !(t_drift > 0.0) ||
+                                !(std::fabs(g_root) < band)) {
+                                continue;
+                            }
+                            state_switch_hold.terms[jx] = std::move(terms);
+                            state_switch_hold.t0[jx] = t_root;
+                            state_switch_hold.t_drift[jx] = t_drift;
+                            state_switch_hold.tested_to[jx] = t_root;
+                            state_switch_hold.held[jx] = 1;
+                            ++state_switch_hold.n_held;
+                            if (!state_switch_hold.quiet) {
+                                SUNLogger logger = nullptr;
+                                if (SUNContext_GetLogger(ctx, &logger) == SUN_SUCCESS &&
+                                    logger != nullptr) {
+                                    SUNLogger_SetErrorFilename(logger, bngsim::null_device);
+                                }
+                                state_switch_hold.quiet = true;
                             }
                         }
                     }
