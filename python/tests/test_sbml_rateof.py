@@ -709,14 +709,22 @@ def test_rateof_in_initial_assignment_reaction_species():
 # value read a state, and had the same defect.
 
 
-def _rateof_p1_model(target: str, p1_constant: str, expr_tail: str = "") -> str:
+def _rateof_p1_model(
+    target: str, p1_constant: str, expr_tail: str = "", *, idiom: bool = False
+) -> str:
     """p1 = 1 with no rule; ``target`` (p2 or species S) assigned
-    ``rateOf(p1)`` plus ``expr_tail``."""
-    math = f"<apply>{_RATEOF_CSYMBOL}<ci>p1</ci></apply>"
+    ``rateOf(p1)`` plus ``expr_tail``. ``idiom`` writes the call as COPASI's
+    rateOf functionDefinition instead of the csymbol."""
+    math = (
+        "<apply><ci>rateOf</ci><ci>p1</ci></apply>"
+        if idiom
+        else f"<apply>{_RATEOF_CSYMBOL}<ci>p1</ci></apply>"
+    )
     if expr_tail:
         math = f"<apply><plus/>{math}{expr_tail}</apply>"
     return f"""
   <model id="m">
+    {_COPASI_RATEOF_FUNCDEF if idiom else ""}
     <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
     <listOfSpecies>
       <species id="S" compartment="c" initialAmount="5" hasOnlySubstanceUnits="false"
@@ -939,12 +947,17 @@ def test_rateof_of_a_kinetic_law_local_shadowing_an_assignment_rule_variable_loa
 _RATE_OF_B = "compartment d = 1; species A in d, B in d; A = 2; B = 0; k1 = 1; p2 = rateOf(B);\n"
 
 
+@pytest.mark.parametrize("idiom", [False, True], ids=["csymbol", "copasi_idiom"])
 @pytest.mark.parametrize("p1_constant", ["true", "false"], ids=["01248", "01249"])
-def test_rateof_of_a_parameter_does_not_freeze_the_parameter(p1_constant, caplog):
+def test_rateof_of_a_parameter_does_not_freeze_the_parameter(p1_constant, idiom, caplog):
     """``p2 = rateOf(p1)`` is 0 whatever ``p1`` is: a write to ``p1`` is
-    allowed, ``p2`` stays 0, and no warning names ``p1``."""
+    allowed, ``p2`` stays 0, and no warning names ``p1``. The same written
+    with COPASI's idiom, whose body bngsim never evaluates."""
     with caplog.at_level("WARNING", logger="bngsim"):
-        model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model("p2", p1_constant)))
+        model = bngsim.Model.from_sbml_string(
+            _sbml(_rateof_p1_model("p2", p1_constant, idiom=idiom))
+        )
+    assert model.get_param("p2") == 0.0
     assert model.frozen_params == []
     assert _frozen_warning(caplog) is None
     model.set_param("p1", 2.0)
@@ -952,6 +965,7 @@ def test_rateof_of_a_parameter_does_not_freeze_the_parameter(p1_constant, caplog
     assert _run(model, t_end=1.0, n_points=3).species.shape[0] == 3
 
 
+@pytest.mark.parametrize("idiom", [False, True], ids=["csymbol", "copasi_idiom"])
 @pytest.mark.parametrize(
     ("target", "tail", "frozen"),
     [
@@ -961,8 +975,10 @@ def test_rateof_of_a_parameter_does_not_freeze_the_parameter(p1_constant, caplog
     ],
     ids=["p2=rateOf(p1)+k", "p2=rateOf(p1)+p1", "S=rateOf(p1)+k"],
 )
-def test_rateof_freezes_what_else_the_initial_value_reads(target, tail, frozen):
-    model = bngsim.Model.from_sbml_string(_sbml(_rateof_p1_model(target, "false", tail)))
+def test_rateof_freezes_what_else_the_initial_value_reads(target, tail, frozen, idiom):
+    model = bngsim.Model.from_sbml_string(
+        _sbml(_rateof_p1_model(target, "false", tail, idiom=idiom))
+    )
     assert model.frozen_params == frozen
 
 

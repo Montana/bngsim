@@ -8822,12 +8822,11 @@ def _build_model_from_sbml_doc(doc):
     # `rateOf(B)` reads more than `B`: the rate of `B` at load is every kinetic
     # law of a reaction that makes or takes it, or its rate rule. `c =
     # rateOf(B)` under `J0: A -> B; k1*A` left `k1` writable and the size where
-    # it was (0.172 off). And it does not read `B`'s value, so the csymbol's
-    # argument is not a name read unless the expression names it elsewhere:
-    # `p2 = rateOf(p1)` of a `p1` nothing changes is 0 whatever `p1` is, and
-    # used to freeze `p1` (issue #1048). A call to COPASI's rateOf idiom still
-    # counts its argument as read, as it did: that over-freezes it (a refusal,
-    # never a wrong value), and is kept deliberately for now.
+    # it was (0.172 off). And it does not read `B`'s value, so its argument is
+    # not a name read unless the expression names it elsewhere: `p2 =
+    # rateOf(p1)` of a `p1` nothing changes is 0 whatever `p1` is, and used to
+    # freeze `p1` (issue #1048). The same for a call to COPASI's rateOf idiom:
+    # its body is never evaluated, the call is the same rate as the csymbol.
     def _names_read(_m) -> set[str]:
         if not _uses_rateof:
             return _ast_name_set(_m)
@@ -8838,12 +8837,12 @@ def _build_model_from_sbml_doc(doc):
             _t = _node.getType()
             if _t == libsbml.AST_NAME:
                 _out.add(_node.getName())
-            _direct = _t == libsbml.AST_FUNCTION_RATE_OF
-            if _direct or (_t == libsbml.AST_FUNCTION and _node.getName() in rateof_funcdef_names):
+            if _t == libsbml.AST_FUNCTION_RATE_OF or (
+                _t == libsbml.AST_FUNCTION and _node.getName() in rateof_funcdef_names
+            ):
                 for _k in range(_node.getNumChildren()):
                     _out |= {f"rateOf({_n})" for _n in _ast_name_set(_node.getChild(_k))}
-                if _direct:
-                    continue
+                continue
             stack.extend(_node.getChild(_k) for _k in range(_node.getNumChildren()))
         return _out
 
