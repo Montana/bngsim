@@ -820,10 +820,6 @@ class RuleMonkeySimulator:
         """
         Block same-complex binding. Default: true.
         """
-    def set_model_time(self, enabled: bool) -> None:
-        """
-        Run one-shot runs on the model's clock (true, the default) or on time elapsed since t_start (false), for a model that reads no clock
-        """
     def set_molecule_limit(self, limit: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
         Set global molecule limit
@@ -831,6 +827,10 @@ class RuleMonkeySimulator:
     def set_param(self, name: str, value: typing.SupportsFloat | typing.SupportsIndex) -> None:
         """
         Set a parameter override
+        """
+    def set_reads_clock(self, enabled: bool) -> None:
+        """
+        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start, and a span too short for the doubles near its times to integrate a clock-driven rate is refused
         """
     def set_species_count(self, pattern: str, count: typing.SupportsInt | typing.SupportsIndex) -> None:
         """

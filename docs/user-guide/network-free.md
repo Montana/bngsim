@@ -157,7 +157,10 @@ nothing fires, is not seen until something does, and until then the run is flat
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
-times small at a large `t_start`.
+times small at a large `t_start`. RuleMonkey integrates a rate that reads the
+clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
+whose span is too short for the doubles near its times to place them (a span of
+2 at t = 1e13), rather than return a run that never fires.
 
 ### Arrhenius (energy) rules
 
@@ -176,6 +179,13 @@ bond, a site named twice, context further out, and context in the rule itself
 (richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
 until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
 `method="ssa"` on the generated network.
+
+### Compartments
+
+RuleMonkey does not scale rates by compartment volume or keep molecules in
+their compartments, so `method="rm"` refuses a model that declares
+compartments (issue #1022). Use `method="ode"` or `method="ssa"` on the
+generated network.
 
 ### RuleMonkey's warnings
 

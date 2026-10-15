@@ -96,14 +96,16 @@ class RuleMonkeySimulator {
     void set_molecule_limit(int limit);
     void set_block_same_complex_binding(bool enabled);
 
-    // Whether `run` puts the seed state at `times.t_start` on the model's clock
-    // (true, the default) or runs on time elapsed since t_start and labels the
-    // rows back (false). Only a model that reads the clock (time(), or a table
-    // function indexed by time) can tell the two apart, and elapsed time keeps
-    // event times small: on absolute time a waiting time is rounded away once
-    // the total propensity times |t| nears 1e15. Sessions always run on the
-    // model's clock.
-    void set_model_time(bool enabled);
+    // Whether the model reads the clock (time(), or a table function indexed
+    // by time); true by default. If it does, `run` puts the seed state at
+    // `times.t_start` on the model's clock, and a run, segment or step whose
+    // span the doubles near its times are too coarse to integrate a clock-
+    // driven rate over is refused. If not, `run` runs on time elapsed since
+    // t_start and labels the rows back, which no such model can tell apart and
+    // which keeps event times small: on absolute time a waiting time is rounded
+    // away once the total propensity times |t| nears 1e15. Sessions always run
+    // on the model's clock.
+    void set_reads_clock(bool enabled);
 
     // RuleMonkey's Severity::Warn load diagnostics, each "element: feature".
     // The model runs; these name how RuleMonkey reads part of it. Errors are

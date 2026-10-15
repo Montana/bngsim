@@ -313,3 +313,42 @@ def test_a_session_counts_its_events_since_initialize():
     assert first.solver_stats["n_steps"] == one_shot.solver_stats["n_steps"] > 0
     a0 = np.asarray(second.observables["A0"])
     assert second.solver_stats["n_steps"] == first.solver_stats["n_steps"] + (a0[0] - a0[-1])
+
+
+@pytest.mark.parametrize("xml", [f"{RAMP}.xml", str(NF / "first_order_switch.xml")])
+def test_a_span_that_is_not_finite_is_refused(xml):
+    # On a model that reads the clock it used to integrate for ever, past any
+    # timeout; on one that does not, it returned nan and inf for times.
+    for times in (
+        {"t_span": (0.0, math.inf), "n_points": 3},
+        {"t_span": (math.nan, 1.0), "n_points": 3},
+    ):
+        with pytest.raises(bngsim.SimulationError, match="finite"):
+            _rm(xml, 1, **times)
+    with bngsim.RuleMonkeySession(xml) as s:
+        s.initialize(seed=1)
+        with pytest.raises(bngsim.SimulationError, match="finite"):
+            s.simulate(0.0, math.inf, n_points=3)
+        with pytest.raises(bngsim.SimulationError, match="finite"):
+            s.step_to(math.inf)
+        assert s.simulate(0.0, 1.0, n_points=2).n_times == 2
+
+
+def test_a_clock_too_coarse_to_integrate_over_is_refused():
+    """At t = 1e13 the doubles are 0.002 apart, and a span of 2 has integration
+    panels of 0.002: RuleMonkey fired nothing where a constant rate written
+    through time() should have left 135 of 1000. A longer span, or one nearer
+    0, runs."""
+    with pytest.raises(bngsim.SimulationError, match="too coarse"):
+        _rm(f"{RAMP}.xml", 1, t_span=(1e13, 1e13 + 2.0), n_points=3)
+    with bngsim.RuleMonkeySession(f"{RAMP}.xml") as s:
+        s.initialize(seed=1, t_start=1e13)
+        with pytest.raises(bngsim.SimulationError, match="too coarse"):
+            s.simulate(1e13, 1e13 + 2.0, n_points=3)
+        with pytest.raises(bngsim.SimulationError, match="too coarse"):
+            s.step_to(1e13 + 2.0)
+    # A model that reads no clock runs on elapsed time there (test_network_free_t_start).
+    assert (
+        _rm(str(NF / "first_order_switch.xml"), 1, t_span=(1e13, 1e13 + 2.0), n_points=3).n_times
+        == 3
+    )

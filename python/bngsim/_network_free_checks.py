@@ -159,37 +159,37 @@ Site = tuple[str, str]  # (molecule type, component name)
 
 def _bond_partners(root: ET.Element) -> dict[Site, set[Site]]:
     """For every site, the sites a bond in the model can join it to: the bonds
-    of the seed species and every bond a rule adds."""
+    of the seed species and of every rule's patterns. A bond a rule adds, to a
+    molecule it synthesizes too, is in its product pattern."""
     partners: dict[Site, set[Site]] = {}
-
-    def add(sites: dict, a: str, b: str) -> None:
-        if a in sites and b in sites:
-            sa, sb = sites[a][1:], sites[b][1:]
-            partners.setdefault(sa, set()).add(sb)
-            partners.setdefault(sb, set()).add(sa)
-
     for el in root.iter():
-        if _local(el.tag) == "Species":
+        if _local(el.tag) in ("Species", "ReactantPattern", "ProductPattern"):
             _, sites, bonds = _graph(el)
             for a, b in bonds:
-                add(sites, a, b)
-        elif _local(el.tag) == "ReactionRule":
-            sites = {}
-            for lst in _children(el, "ListOfReactantPatterns"):
-                for rp in lst:
-                    sites.update(_graph(rp)[1])
-            for lst in _children(el, "ListOfOperations"):
-                for op in lst:
-                    if _local(op.tag) == "AddBond":
-                        add(sites, op.get("site1") or "", op.get("site2") or "")
+                if a in sites and b in sites:
+                    sa, sb = sites[a][1:], sites[b][1:]
+                    partners.setdefault(sa, set()).add(sb)
+                    partners.setdefault(sb, set()).add(sa)
     return partners
 
 
-def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[str]]:
-    """The bond each Arrhenius rule makes or breaks, as a pair of sites, and
-    the rules whose reactant patterns name anything besides those two sites.
-    A rule that is not a single AddBond or DeleteBond between two molecule
-    types is left to RuleMonkey, which refuses it itself."""
+def _component_names(root: ET.Element) -> dict[str, list[str]]:
+    """Each molecule type's component names, a name repeated as declared."""
+    names: dict[str, list[str]] = {}
+    for el in root.iter():
+        if _local(el.tag) == "MoleculeType":
+            names[el.get("id") or ""] = [
+                c.get("id") or "" for lst in _children(el, "ListOfComponentTypes") for c in lst
+            ]
+    return names
+
+
+def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[str], bool]:
+    """The bond each Arrhenius rule makes or breaks, as a pair of sites; the
+    rules RuleMonkey would run on more than those two sites, or with the wrong
+    products; and whether some Arrhenius rule has a shape RuleMonkey refuses
+    itself at load (try_expand_arrhenius in third_party/rulemonkey), which then
+    names it better than this check could."""
     centers: list[tuple[Site, Site]] = []
     with_context: list[str] = []
     for rule in root.iter():
@@ -198,20 +198,34 @@ def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[
         ):
             continue
         reactants = [rp for lst in _children(rule, "ListOfReactantPatterns") for rp in lst]
+        products = [pp for lst in _children(rule, "ListOfProductPatterns") for pp in lst]
         molecules: list[ET.Element] = []
         sites: dict[str, tuple[int, str, str]] = {}
-        for rp in reactants:
+        pattern_of: dict[str, int] = {}
+        for k, rp in enumerate(reactants):
             mols, rp_sites, _ = _graph(rp)
-            sites.update({k: (len(molecules) + v[0], v[1], v[2]) for k, v in rp_sites.items()})
+            sites.update({c: (len(molecules) + v[0], v[1], v[2]) for c, v in rp_sites.items()})
+            pattern_of.update(dict.fromkeys(rp_sites, k))
             molecules += mols
         ops = [op for lst in _children(rule, "ListOfOperations") for op in lst]
+        # RuleMonkey refuses anything but one AddBond joining two reactant
+        # patterns, or one DeleteBond inside one, between two molecule types.
         if len(ops) != 1 or _local(ops[0].tag) not in ("AddBond", "DeleteBond"):
-            continue
+            return [], [], True
         a, b = ops[0].get("site1") or "", ops[0].get("site2") or ""
         if a not in sites or b not in sites or sites[a][1] == sites[b][1]:
-            continue
+            return [], [], True
+        binding = _local(ops[0].tag) == "AddBond"
+        if binding and (len(reactants) != 2 or pattern_of[a] == pattern_of[b]):
+            return [], [], True
+        if not binding and len(reactants) != 1:
+            return [], [], True
         centers.append((sites[a][1:], sites[b][1:]))
-        bare = len(molecules) == 2 and not any(rp.get("compartment") for rp in reactants)
+        # It builds the expanded rule from the two sites alone: one complex
+        # from two when binding, two from one when unbinding (a bond inside a
+        # ring, whose products stay one complex, would part it).
+        bare = len(products) == (1 if binding else 2) and len(molecules) == 2
+        bare = bare and not any(rp.get("compartment") for rp in reactants)
         for mol in molecules:
             comps = _components(mol)
             if (
@@ -223,11 +237,14 @@ def _arrhenius_centers(root: ET.Element) -> tuple[list[tuple[Site, Site]], list[
                 bare = False
         if not bare:
             with_context.append(rule.get("name") or rule.get("id") or "?")
-    return centers, with_context
+    return centers, with_context, False
 
 
 def _expanded_exactly(
-    pattern: ET.Element, center: tuple[Site, Site], partners: dict[Site, set[Site]]
+    pattern: ET.Element,
+    center: tuple[Site, Site],
+    partners: dict[Site, set[Site]],
+    names: dict[str, list[str]],
 ) -> bool:
     """Whether RuleMonkey's expansion of an energy rule with bond *center*
     reads the plain pattern *pattern* as BNG2 does: it is the center's two
@@ -255,30 +272,41 @@ def _expanded_exactly(
         return False
     if len(_components(molecules[leaves[0]])) != 1:
         return False
-    # RuleMonkey tests the core site as bound to anything (energy_expand.cpp).
+    # RuleMonkey adds one "bound" or "free" copy of the context site to the
+    # expanded rule, so a type with two sites of its name, or of the center
+    # site's, matches both variants or counts one embedding for two.
+    core_type, context = sites[core_end][1], sites[core_end][2]
+    center_site = next(n for t, n in center if t == core_type)
+    declared = names.get(core_type, [])
+    if declared.count(context) != 1 or declared.count(center_site) != 1:
+        return False
+    # RuleMonkey tests the context site as bound to anything (energy_expand.cpp).
     return partners.get(sites[core_end][1:], set()) <= {sites[leaf_end][1:]}
 
 
 def rulemonkey_energy_misreads(xml_path: str | Path) -> tuple[list[str], list[str]]:
     """The energy patterns (as BNGL) and the Arrhenius rules (by name) of
     *xml_path* that RuleMonkey 3.11.0 expands differently from BNG2 (issue
-    #1058). Both empty for a model with no Arrhenius rule, or when the
-    file cannot be parsed."""
+    #1058). Both empty for a model with no Arrhenius rule, for one with an
+    Arrhenius rule RuleMonkey refuses itself, or when the file cannot be
+    parsed."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
         return [], []
-    centers, with_context = _arrhenius_centers(root)
-    if not centers and not with_context:
+    centers, with_context, left_to_rulemonkey = _arrhenius_centers(root)
+    if left_to_rulemonkey or (not centers and not with_context):
         return [], []
     partners = _bond_partners(root)
+    names = _component_names(root)
     patterns = []
     for ep in root.iter():
         if _local(ep.tag) != "EnergyPattern":
             continue
         graphs = _children(ep, "Pattern") or [ep]
         if not all(
-            _plain_bond_pattern(g) and all(_expanded_exactly(g, c, partners) for c in centers)
+            _plain_bond_pattern(g)
+            and all(_expanded_exactly(g, c, partners, names) for c in centers)
             for g in graphs
         ):
             patterns.append(ep.get("pattern") or ep.get("id") or "?")
@@ -302,15 +330,52 @@ def refuse_rulemonkey_energy_misreads(xml_path: str | Path) -> None:
     if patterns:
         parts.append("energy patterns " + ", ".join(f"'{n}'" for n in patterns))
     if rules:
-        parts.append("the reactant context of rules " + ", ".join(f"'{n}'" for n in rules))
+        parts.append("rules " + ", ".join(f"'{n}'" for n in rules))
     raise ModelError(
-        "RuleMonkey (method='rm' / 'nf_exact') cannot run this Arrhenius model: it would "
-        f"drop or misapply {' and '.join(parts)} when it expands the energy rules at load "
-        "(richardposner/RuleMonkey#109), so they would fire at the wrong rate. It runs an "
+        "RuleMonkey (method='rm' / 'nf_exact') cannot run this Arrhenius model: when it "
+        f"expands the energy rules at load it would misread {' and '.join(parts)} "
+        "(richardposner/RuleMonkey#109), so they would fire at the wrong rate. It reads an "
         "energy pattern that is the bonded pair of sites a rule joins or parts, alone or "
-        "with one more bond to a molecule of a third type whose site binds nothing else, "
-        "on rules that name only those two sites. Simulate it with method='ode' or "
-        "method='ssa' on the generated network (issue #1058)."
+        "with one more bond to a molecule of a third type whose site binds nothing else, on "
+        "rules that name only those two sites and join two complexes or part one in two. "
+        "Simulate it with method='ode' or method='ssa' on the generated network "
+        "(issue #1058)."
+    )
+
+
+def compartments(xml_path: str | Path) -> list[str]:
+    """The ids of the compartments *xml_path* declares. Empty when the file
+    cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    return [
+        c.get("id") or "?"
+        for lst in root.iter()
+        if _local(lst.tag) == "ListOfCompartments"
+        for c in lst
+        if _local(c.tag).lower() == "compartment"
+    ]
+
+
+def refuse_rulemonkey_compartments(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* declares compartments.
+
+    RuleMonkey does not scale rates by compartment volume or keep molecules in
+    their compartments, and means to refuse such a model at load, but its check
+    looks for ``<Compartment>`` where BNG2 writes ``<compartment>``, so it ran
+    one with the wrong rates and no error (issue #1022).
+    """
+    found = compartments(xml_path)
+    if not found:
+        return
+    raise ModelError(
+        "RuleMonkey (method='rm' / 'nf_exact') cannot run a model with compartments: "
+        + ", ".join(f"'{n}'" for n in found)
+        + ". It does not scale rates by compartment volume or keep molecules in their "
+        "compartments, so the rates would be wrong. Simulate it with method='ode' or "
+        "method='ssa' on the generated network (issue #1022)."
     )
 
 

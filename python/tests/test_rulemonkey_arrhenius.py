@@ -156,10 +156,10 @@ def test_one_way_energy_rules_fire_one_way_at_bng2s_rate():
     assert np.all(np.abs(z) < 4.5), z
 
 
-# Each .bngl in misread/ says what BNG2's rate is. RuleMonkey 3.11.0 gets the
-# first nine wrong (|z| about 50 against BNG2's closed form, 40 seeds) and the
-# last two right; those two lie outside the shapes the refusal can tell are
-# safe from the XML. Issue #1058 turns these into value tests.
+# Each .bngl in misread/ says what BNG2's rate is. RuleMonkey 3.11.0 gets all
+# but plain_two_a and samename_explicit wrong (|z| from 24 to 142 against BNG2's
+# closed form, 40 seeds); those two lie outside the shapes the refusal can tell
+# are safe from the XML. Issue #1058 turns these into value tests.
 MISREADS = {
     "state_ctx": "energy patterns 'A(b!1).B(a!1,s~1)'",
     "freectx": "energy patterns 'A(b!1,c).B(a!1)'",
@@ -169,7 +169,13 @@ MISREADS = {
     "partner": "energy patterns 'A(b!1,c!2).B(a!1).C(a!2)'",
     "chain2ctx": "energy patterns 'A(b!1).B(a!1,c!2).C(b!2,d!3).D(c!3)'",
     "two_leaves": "energy patterns 'A(b!1,c!2,d!3).B(a!1).C(a!2).D(a!3)'",
-    "rule_context": "the reactant context of rules '_R1'",
+    # A(x,c,c): one "c bound" variant matches an A with one c of each kind.
+    "samectx": "energy patterns 'A(x!1,c!2).B(y!1).C(a!2)'",
+    # Z, not C, binds A.c, through a rule that synthesizes Z bound.
+    "synth": "energy patterns 'A(x!1,c!2).B(y!1).C(a!2)'",
+    "rule_context": "rules '_R1'",
+    # Unbinding inside a ring: the product stays one complex.
+    "ringopen": "rules '_R1'",
     "plain_two_a": "energy patterns 'A(b!1).B(a1!1,a2!2).A(b!2)'",
     "samename_explicit": "energy patterns 'L(r!1,r!2).R(l!1).R(l!2)'",
 }
@@ -184,3 +190,35 @@ def test_rm_refuses_an_energy_rule_it_would_misread(name):
         bngsim.Simulator(m, method="rm", xml_path=str(xml))
     with pytest.raises(bngsim.ModelError, match=match):
         bngsim.RuleMonkeySession(str(xml))
+
+
+def test_rulemonkey_names_an_energy_rule_shape_it_refuses_itself():
+    """A state-change Arrhenius rule is refused by RuleMonkey's own load check,
+    whose message says what it is; this check stands aside."""
+    xml = str(ARR / "state_change.xml")
+    m = bngsim.Model.from_net(str(ARR / "state_change.net"))
+    for build in (
+        lambda: bngsim.Simulator(m, method="rm", xml_path=xml),
+        lambda: bngsim.RuleMonkeySession(xml),
+    ):
+        with pytest.raises(RuntimeError, match="binding/unbinding shape") as err:
+            build()
+        assert "#109" not in str(err.value)
+
+
+def test_cooperativity_on_both_reaction_centers_matches_network_ssa():
+    """Two reversible energy rules whose patterns each hold one leaf on a center,
+    patterns both rules read, and a mass-action rule binding a leaf site."""
+    obs = ("AB", "AC", "ABC", "ABD")
+    rm = _runs("rm", "coop2", N_RM, obs)
+    ssa = _runs("ssa", "coop2", N_SSA, obs)
+    for j in range(len(obs)):
+        _assert_same_mean(rm[:, j, :], ssa[:, j, :])
+
+
+def test_a_pair_pattern_on_a_bivalent_ligand_matches_its_closed_form():
+    # L(r,r) with only L(r!1).R(l!1): each bond breaks at exp(-0.9).
+    full = _runs("rm", "bivalent_pair", N_RM, ("Full",))[:, 0, :]
+    q = np.exp(-2 * math.exp(-0.9) * np.asarray(T))
+    z = (full.mean(axis=0)[1:] - 1000 * q[1:]) / np.sqrt(1000 * q[1:] * (1 - q[1:]) / N_RM)
+    assert np.all(np.abs(z) < 4.5), z

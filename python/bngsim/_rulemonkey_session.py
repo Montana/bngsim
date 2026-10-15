@@ -90,9 +90,11 @@ class RuleMonkeySession:
 
         from bngsim._network_free_checks import (
             clock_readers,
+            refuse_rulemonkey_compartments,
             refuse_rulemonkey_energy_misreads,
         )
 
+        refuse_rulemonkey_compartments(self._xml_path)
         refuse_rulemonkey_energy_misreads(self._xml_path)  # until issue #1058
         self._core = RuleMonkeySimulator(self._xml_path)
         warn_rulemonkey_diagnostics(self._core, stacklevel=2)
@@ -105,6 +107,7 @@ class RuleMonkeySession:
         # be the session clock (see simulate), and whether the session's start
         # is still the first segment's to set (see initialize).
         self._clock_readers = clock_readers(self._xml_path)
+        self._core.set_reads_clock(bool(self._clock_readers))
         self._start_unset = False
 
         logger.debug("RuleMonkeySession created: %s", self._xml_path)
