@@ -2223,6 +2223,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     td["index_kind"] = spec.index_kind;
                     td["index_param_idx"] = spec.index_param_idx;
                     td["index_obs_idx"] = spec.index_obs_idx;
+                    td["index_func_idx"] = spec.index_func_idx;
                     td["method"] = spec.method;
                     td["xs"] = spec.xs;
                     td["ys"] = spec.ys;
@@ -2230,9 +2231,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 }
                 return out;
             },
-            "Every table function with its table: [{name, index_kind ('time', 'parameter' or "
-            "'observable'), index_param_idx, index_obs_idx, method ('linear' or 'step'), xs, "
-            "ys}], in dispatch-id order. The knots of a table read on the clock are where its "
+            "Every table function with its table: [{name, index_kind ('time', 'parameter', "
+            "'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, "
+            "method ('linear' or 'step'), xs, ys}], in dispatch-id order. A 'parameter' is a "
+            "slot no function owns; a table over a model function is 'function' (issue #965). "
+            "The knots of a table read on the clock are where its "
             "value (step) or slope (linear) breaks, and Simulator.run stops the integration on "
             "each (issue #709).")
         .def(
@@ -2458,8 +2461,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 d["reactions"] = rxn_list;
 
                 // Table functions: [{name, index_kind, index_param_idx,
-                // index_obs_idx, step}, ...] in dispatch-id order. Lets the
-                // model-based codegen path emit
+                // index_obs_idx, index_func_idx, step}, ...] in dispatch-id
+                // order. Lets the model-based codegen path emit
                 //   data->tfun_eval(tf_id, idx_c, data->tfun_ctx)
                 // for any BNGL function whose name appears here. Empty
                 // for SBML/Antimony models without tfuns.
@@ -2470,6 +2473,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     td["index_kind"] = spec.index_kind;
                     td["index_param_idx"] = spec.index_param_idx;
                     td["index_obs_idx"] = spec.index_obs_idx;
+                    td["index_func_idx"] = spec.index_func_idx;
                     td["step"] = spec.step;
                     tf_list.append(td);
                 }
