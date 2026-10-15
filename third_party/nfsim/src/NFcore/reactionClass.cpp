@@ -349,6 +349,16 @@ void ReactionClass::setBaseRate(double newBaseRate,string newBaseRateName) {
 };
 
 
+// Multiply the rate already in place by factor. Unlike setBaseRate(), this
+// neither applies the symmetry (or dimer) factor again nor touches the
+// parameter name, so resetBaseRateFromSystemParamter() still recomputes the
+// same rate from the parameter. bngsim GH #854.
+void ReactionClass::scaleBaseRate(double factor) {
+	this->baseRate *= factor;
+	update_a();
+}
+
+
 void ReactionClass::resetBaseRateFromSystemParamter() {
 
 	if(!this->baseRateParameterName.empty()) {

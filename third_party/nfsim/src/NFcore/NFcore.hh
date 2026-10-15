@@ -1308,12 +1308,12 @@ namespace NFcore
 			string getName() const { return name; };
 			int getFireCounter() const { return fireCounter; };
 			double getBaseRate() const { return baseRate; };
-			string getBaseRateParameterName() const { return baseRateParameterName; };
 			int getRxnType() const { return reactionType; };
 
 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
 			void setBaseRate(double newBaseRate,string newBaseRateName);
-			void resetBaseRateFromSystemParamter();
+			void scaleBaseRate(double factor);
+			virtual void resetBaseRateFromSystemParamter();
 
 			void setTraversalLimit(int limit) { this->traversalLimit = limit; };
 

@@ -431,7 +431,9 @@ class TestPostInitZeroOrderRate:
             for name, value in (post or {}).items():
                 nf.set_param(name, value)
             result = nf.simulate(0, 4, n_points=5)
-            assert nf.get_parameter("kp") == pytest.approx((pre or post or {}).get("kp", 0.0))
+            assert nf.get_parameter("kp") == pytest.approx(
+                {**(pre or {}), **(post or {})}.get("kp", 0.0)
+            )
             return np.asarray(result.observables).ravel()
 
     @staticmethod
@@ -443,7 +445,7 @@ class TestPostInitZeroOrderRate:
         post = self._atot(xml, post={"kp": 1000.0})
         pre = self._atot(xml, pre={"kp": 1000.0})
         np.testing.assert_array_equal(post, pre)
-        # Not the kp = 0 decay it ran before the fix: 287 at t = 4 against a
+        # Not the kp = 0 decay it ran before the fix: 322 at t = 4 against a
         # mean of 1646 with synthesis on.
         t = np.linspace(0, 4, 5)
         np.testing.assert_allclose(post, self._mean(t, 1000.0), rtol=0.05)

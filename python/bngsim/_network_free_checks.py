@@ -16,6 +16,15 @@ it too. NFsim runs it, but refreshes its value only when a reaction fires, so a
 rate that is 0 at the start is not seen either (issue #892). That is left to
 the fix there, since refusing it would take away a table function NFsim reads
 correctly whenever reactions fire often.
+
+An Arrhenius (energy-based) rate law is refused on NFsim (issue #854's review).
+The vendored NFsim expands energy rules at load with three silent defects
+(RuleWorld/nfsim#102): it divides every energy by an ``RT`` that BioNetGen does
+not apply, 2.478 unless the model has a parameter named ``RT``; it gives a
+one-way binding rule a reverse reaction the model does not have; and it drops a
+one-way unbinding rule and every state-change rule. Drop this refusal when the
+vendored NFsim carries the upstream fix. Energy patterns alone change no rate,
+so only the rate law is refused.
 """
 
 from __future__ import annotations
@@ -86,6 +95,41 @@ def time_indexed_table_functions(xml_path: str | Path) -> list[str]:
     """The ids of the table functions in *xml_path* whose counter RuleMonkey
     reads as the clock. Empty when the file cannot be parsed."""
     return [f.get("id", "?") for f in _functions(xml_path) or () if _indexed_by_time(f)]
+
+
+def arrhenius_rules(xml_path: str | Path) -> list[str]:
+    """The names of the reaction rules in *xml_path* whose rate law is
+    ``Arrhenius``. Empty when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    return [
+        rule.get("name") or rule.get("id") or "?"
+        for rule in root.iter()
+        if rule.tag.endswith("ReactionRule")
+        and any(
+            law.tag.endswith("RateLaw") and (law.get("type") or "") == "Arrhenius" for law in rule
+        )
+    ]
+
+
+def refuse_arrhenius_rate_laws(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* has a rule with an Arrhenius
+    rate law. NFsim only: its energy-rule expansion is wrong (RuleWorld/nfsim#102)."""
+    rules = arrhenius_rules(xml_path)
+    if not rules:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    raise ModelError(
+        f"{label} cannot run a model with Arrhenius (energy-based) rate laws: rules "
+        + ", ".join(f"'{n}'" for n in rules)
+        + ". NFsim's expansion of energy rules divides every energy by an RT that "
+        "BioNetGen does not apply (2.478 unless the model defines a parameter RT), "
+        "gives a one-way binding rule a reverse reaction, and drops one-way unbinding "
+        "and state-change rules, all without an error (RuleWorld/nfsim#102). Simulate it "
+        "with method='ode' or method='ssa' on the network BNG2.pl generates."
+    )
 
 
 def refuse_time_dependent_rate_laws(xml_path: str | Path, backend: str) -> None:

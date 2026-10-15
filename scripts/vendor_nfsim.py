@@ -329,12 +329,37 @@ CARRY_QUEUE = (
             "volume conversion into its base rate, and reapply the conversion in "
             "resetBaseRateFromSystemParamter(). NFinput re-set the rate with an empty name, "
             "so a setParameter() after load (bngsim's post-init set_param) skipped the rule "
-            "and it kept producing at its old rate, silently. See bngsim GH #854."
+            "and it kept producing at its old rate, silently. The fold scales the rate in "
+            "place (ReactionClass::scaleBaseRate) rather than through setBaseRate(), which "
+            "applied the symmetry factor a second time. See bngsim GH #854."
         ),
         "commits": [
             {
-                "commit": "07d5fff2da2cd9a89431794f408bd8e10923f8df",
+                "commit": "e4d1a99b96d9a1eb105ec8eb818ca45e155c5e55",
                 "summary": "bngsim: keep a zero-order rule's rate parameter through its volume conversion",
+            },
+            {
+                "commit": "36092b2eaa676794bce8b2beb163c284e56694b4",
+                "summary": (
+                    "bngsim: fold a zero-order volume conversion without reapplying the "
+                    "symmetry factor"
+                ),
+            },
+        ],
+    },
+    {
+        "topic": "bngsim/carry-mm-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Refresh a Michaelis-Menten rule's kcat and Km from their parameters in "
+            "resetBaseRateFromSystemParamter() (now virtual). MMRxnClass held both as numbers "
+            "with no parameter name, so a setParameter() after load (bngsim's post-init "
+            "set_param) left the rule at its old kcat and Km, silently. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "9cbe556f9e72c398383424cca480a7d8303f1ece",
+                "summary": "bngsim: refresh a Michaelis-Menten rule's kcat and Km on setParameter",
             },
         ],
     },
