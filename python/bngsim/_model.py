@@ -2581,19 +2581,6 @@ class Model:
             raise ValueError(
                 "Invalid table function interpolation method. Expected 'linear' or 'step'."
             )
-        # Issue #772. Under a name a function already has, the interpreter kept
-        # the function's body while compiled code read the table, so the same
-        # model ran two ways by codegen; under a table's name, the evaluator kept
-        # the first table and codegen reported the second. The C++ refuses a
-        # second table; a function's name is refused here, where the builder's own
-        # calls (which register a .net tfun under its function's name) cannot
-        # reach.
-        if name in self._core.function_names:
-            raise ModelError(
-                f"Failed to add table function '{name}': the model already has a "
-                f"function named '{name}', and a table cannot replace a function's "
-                "body. Add the table under a new name."
-            )
         if file is not None:
             filepath = str(Path(file))
             try:

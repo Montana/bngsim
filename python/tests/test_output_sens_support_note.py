@@ -301,14 +301,19 @@ def test_what_a_cut_build_has_no_derivative_for_holds_under_another_key(isolated
     np.testing.assert_array_equal(np.asarray(result.output_sensitivities(["scaled"])), want)
 
 
-def _handed_a_cut_artifact_then_given_a_table_over(name):
-    """A model that is handed the artifact of a cut build, runs it, and is
-    then given a table function."""
+def _handed_a_cut_artifact():
+    """A model that is handed the artifact of a cut build and runs it."""
     with _cut_after_the_first():
         _run()
     model = bngsim.Model.from_net(CHAIN_NET)
     bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
     model.reset()
+    return model
+
+
+def _handed_a_cut_artifact_then_given_a_table_over(name):
+    """The same model, then given a table function."""
+    model = _handed_a_cut_artifact()
     model.add_table_function(name, **TABLE)
     return model
 
@@ -318,11 +323,11 @@ def _handed_a_cut_artifact_then_given_a_table_over(name):
 def test_a_table_over_a_function_of_a_cut_build_is_refused(isolated_cache, over):
     """The table is over ``scaled``, which the build has a derivative for, or
     over ``ratio``, which it was cut before. It is refused (issue #772), and
-    the build's reasons stand: ``scaled`` is returned, and ``ratio`` is
-    refused for the budget."""
+    for the model refused it the build's reasons stand: ``scaled`` is
+    returned, and ``ratio`` is refused for the budget."""
+    model = _handed_a_cut_artifact()
     with pytest.raises(bngsim.ModelError, match=f"already has a function named '{over}'"):
-        _handed_a_cut_artifact_then_given_a_table_over(over)
-    model = bngsim.Model.from_net(CHAIN_NET)
+        model.add_table_function(over, **TABLE)
     result = bngsim.Simulator(model, **RUN).run(t_span=(0.0, 8.0), n_points=5)
     assert np.all(np.isfinite(np.asarray(result.output_sensitivities(["scaled"]))))
     with pytest.raises(Exception, match="'ratio' has no output sensitivity.*budget"):

@@ -36,7 +36,7 @@ model.add_table_function(
 
 ```python
 model.add_table_function(
-    "drive", times=[0, 1, 2, 5], values=[0, 0, 1, 5], method="linear"
+    "forcing", times=[0, 1, 2, 5], values=[0, 0, 1, 5], method="linear"
 )
 ```
 
