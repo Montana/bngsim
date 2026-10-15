@@ -356,6 +356,84 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     return False
 
 
+def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
+    """Refuse ``rateOf(x)`` of a variable an assignmentRule sets (issue #1046).
+
+    SBML defines no rate of change for such a variable (L3V2 §3.4.6, validation
+    rule 10224). Unchecked, the initial-value fold took it for a constant and
+    gave the rate as 0, a value the model does not have. A rule, kinetic law or
+    event emitted a ``rate_of__x`` accessor: for a parameter nothing binds it,
+    and ExprTk refused it without naming anything in the model; for a species
+    the builder binds it, and the model ran with the rate as 0. One check
+    before either path runs covers both, for the csymbol and for a call to
+    COPASI's rateOf functionDefinition idiom alike.
+
+    Only the math the model itself holds is walked. A rateOf inside a
+    functionDefinition body takes the body's argument, which libsbml already
+    rejects there (rule 20304), and is not checked.
+
+    A kinetic law's own local parameter shadows a global of its id, so
+    ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
+    and is allowed; libsbml reports 10224 for it regardless of scope.
+    """
+    ar_rules = {}
+    for i in range(sbml_model.getNumRules()):
+        rule = sbml_model.getRule(i)
+        if rule.isAssignment():
+            ar_rules[rule.getVariable()] = rule
+    if not ar_rules:
+        return
+    idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
+    law_locals = {}
+    for i in range(sbml_model.getNumReactions()):
+        rxn = sbml_model.getReaction(i)
+        kl = rxn.getKineticLaw()
+        if kl is not None:
+            law_locals[f"reaction:{rxn.getId()}"] = {
+                lp.getId() for lp in _kinetic_law_local_params(kl)
+            }
+
+    offenders: dict[tuple[str, str], None] = {}  # (variable, location), in model order
+    for math, where in _iter_model_math(sbml_model):
+        shadowed = law_locals.get(where, ())
+        for n in _iter_ast_subtree(math):
+            t = n.getType()
+            if not (
+                t == libsbml.AST_FUNCTION_RATE_OF
+                or (t == libsbml.AST_FUNCTION and n.getName() in idiom_names)
+            ):
+                continue
+            arg = n.getChild(0) if n.getNumChildren() >= 1 else None
+            if arg is None or arg.getType() != libsbml.AST_NAME:
+                continue
+            name = arg.getName()
+            if name in ar_rules and name not in shadowed:
+                offenders[(name, where)] = None
+    if not offenders:
+        return
+
+    from bngsim._exceptions import ModelError
+
+    def _rule_text(name: str) -> str:
+        m = ar_rules[name].getMath()
+        return f"{name} := {libsbml.formulaToL3String(m)}" if m is not None else name
+
+    bullets = "\n".join(
+        f"  - rateOf({name}) [{where}]: {name} is set by the assignmentRule {_rule_text(name)}"
+        for name, where in offenders
+    )
+    raise ModelError(
+        "Model reads the rate of change of a variable that an assignmentRule sets:\n"
+        f"{bullets}\n"
+        "SBML (L3V2 §3.4.6, validation rule 10224) defines no rate of change for "
+        "an assignmentRule variable, so the model has no value there. libsbml's "
+        "consistency check reports it and RoadRunner refuses it (earlier bngsim "
+        "releases took the rate for 0 in an initial value, and for a species in "
+        "a rule, kinetic law or event). Make the variable a rateRule target, or "
+        "write its rate from the rule's own inputs."
+    )
+
+
 # ── Unsupported-construct refusal (GH #113) ──────────────────────────────
 #
 # bngsim integrates ODEs; it has no DDE or DAE solver and no fast-equilibrium
@@ -1892,7 +1970,11 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             return _eval_ast_numeric(rate_rule_math[name], ctx, func_defs)
         sp = species_by_id.get(name)
         if sp is None:
-            # A parameter / compartment with no rate rule is constant ⇒ 0.
+            # A parameter / compartment with no rate rule is constant ⇒ 0. One
+            # an assignmentRule sets is not; the load refuses a rateOf of it
+            # first (_check_rateof_targets, issue #1046). A rateOf inside a
+            # functionDefinition body still reaches here with the body's
+            # argument name, and folds to 0 (invalid SBML, rule 20304).
             return 0.0
         # 2) species — boundary or constant species is held by reactions ⇒ 0.
         if sp.getBoundaryCondition() or sp.getConstant():
@@ -4285,6 +4367,12 @@ def _build_model_from_sbml_doc(doc):
     # offender) rather than integrate a malformed model's incomplete setup.
     _check_undefined_symbols(sbml_model)
 
+    # ── 0d. Refuse rateOf of an assignmentRule variable (issue #1046) ──
+    # SBML defines no rate for one (rule 10224). Checked once, before the fold
+    # below would take it for a constant (rate 0) and before the emitter would
+    # write a rate accessor that nothing binds.
+    _check_rateof_targets(sbml_model, func_defs)
+
     # ── 0. Evaluate initialAssignments ────────────────────────────────
     # SBML initialAssignment elements compute ICs from expressions.
     # We evaluate them BEFORE adding species/parameters to the builder,
@@ -5403,34 +5491,9 @@ def _build_model_from_sbml_doc(doc):
         )
         lifted_ia_param_expr[pid] = _expr
 
-    # The residue: a parameter initialAssignment §0 folded that the lift above
-    # could not put back on its symbols. Anything the fold read that a caller can
-    # still write is frozen behind it — `set_param` takes and moves nothing, and
-    # the sensitivity column is an identical zero — so say so once, by name,
-    # rather than let both failures stay silent (#313).
-    _frozen_upstream: set[str] = set()
-    for _pid, _m in _ia_math.items():
-        if _pid in _lift_expr or _pid in comp_param_idx or _pid not in _param_decl_index:
-            continue
-        if _pid in _ar_targets:
-            continue  # §4's rule recomputes it; the fold is not what a write faces
-        # Parameters only: a compartment size behind an unliftable fold is #170's
-        # business, and it is refused by name rather than reported here. An
-        # assignmentRule target is dropped too — the rule, not a caller, defines
-        # it, so "`set_param` on it will not move the assigned symbol" names a
-        # write nobody can make (the engine refuses one on a function-backed slot,
-        # #227). An initialAssignment that reads NOTHING else therefore stays
-        # quiet, which is the honest report: it is frozen, but no writable
-        # parameter is frozen behind it.
-        _frozen_upstream |= _ast_name_set(_m) & (_param_decl_index.keys() - _ar_targets)
-    if _frozen_upstream:
-        logger.warning(
-            "initialAssignment(s) that bngsim could not keep symbolic read the "
-            "parameter(s) %s. Their contribution through that initialAssignment is "
-            "frozen at its load-time value: set_param on them will not move the "
-            "assigned symbol, and their forward sensitivity carries no term for it.",
-            ", ".join(sorted(_frozen_upstream)),
-        )
+    # The residue, a parameter initialAssignment §0 folded that the lift above
+    # could not put back on its symbols, is named in a warning at §10.8 (#313),
+    # from the same closure that refuses a write to what it read (issue #1048).
 
     # ── 3. Species ────────────────────────────────────────────────────
     # Collect assignment rule targets for step 4. linear_assignment_rules
@@ -8759,18 +8822,28 @@ def _build_model_from_sbml_doc(doc):
     # `rateOf(B)` reads more than `B`: the rate of `B` at load is every kinetic
     # law of a reaction that makes or takes it, or its rate rule. `c =
     # rateOf(B)` under `J0: A -> B; k1*A` left `k1` writable and the size where
-    # it was (0.172 off).
+    # it was (0.172 off). And it does not read `B`'s value, so its argument is
+    # not a name read unless the expression names it elsewhere: `p2 =
+    # rateOf(p1)` of a `p1` nothing changes is 0 whatever `p1` is, and used to
+    # freeze `p1` (issue #1048). The same for a call to COPASI's rateOf idiom:
+    # its body is never evaluated, the call is the same rate as the csymbol.
     def _names_read(_m) -> set[str]:
-        _out = _ast_name_set(_m)
         if not _uses_rateof:
-            return _out
-        for _node in _iter_ast_subtree(_m):
+            return _ast_name_set(_m)
+        _out: set[str] = set()
+        stack = [_m] if _m is not None else []
+        while stack:
+            _node = stack.pop()
             _t = _node.getType()
+            if _t == libsbml.AST_NAME:
+                _out.add(_node.getName())
             if _t == libsbml.AST_FUNCTION_RATE_OF or (
                 _t == libsbml.AST_FUNCTION and _node.getName() in rateof_funcdef_names
             ):
                 for _k in range(_node.getNumChildren()):
                     _out |= {f"rateOf({_n})" for _n in _ast_name_set(_node.getChild(_k))}
+                continue
+            stack.extend(_node.getChild(_k) for _k in range(_node.getNumChildren()))
         return _out
 
     _reads: dict[str, set[str]] = {}
@@ -8823,7 +8896,9 @@ def _build_model_from_sbml_doc(doc):
 
     _folded_into: dict[str, str] = {}
 
-    def _fold(names, what: str) -> None:
+    def _fold(names, what: str) -> set[str]:
+        """Freeze what ``names`` reach behind ``what``; return what it froze."""
+        frozen: set[str] = set()
         stack = list(names)
         seen: set[str] = set()
         while stack:
@@ -8840,14 +8915,24 @@ def _build_model_from_sbml_doc(doc):
                 or _n.startswith("_lp_")
             ):
                 _folded_into.setdefault(_safe_name(_n), what)
+                frozen.add(_safe_name(_n))
+        return frozen
 
-    # (#313) the residue of the lift, which was only warned about.
+    # (#313) the residue of the lift: a parameter initialAssignment §0 folded
+    # that §2 could not put back on its symbols. It is also named in a warning
+    # once the model is built, from exactly what this freezes, so the warning
+    # and the refusal cannot disagree. (Issue #1048: the warning was computed in
+    # §2 from the expression's own names, so it said nothing of `k1` for
+    # `p2 = rateOf(B)` under `J0: A -> B; k1*A`, which this refuses.)
+    _frozen_upstream: set[str] = set()
     for _pid, _m in _ia_math.items():
         if _pid in _lift_expr or _pid in comp_param_idx or _pid not in _param_decl_index:
             continue
         if _pid in _ar_targets:
-            continue
-        _fold(_names_read(_m), f"the initial value of {_pid!r}, which an initialAssignment sets")
+            continue  # §4's rule recomputes it; the fold is not what a write faces
+        _frozen_upstream |= _fold(
+            _names_read(_m), f"the initial value of {_pid!r}, which an initialAssignment sets"
+        )
     # The same for a species, and for a parameter a rate rule or an event makes
     # a state of: an initialAssignment that is not lowered to an expression of
     # parameters (it reads a reaction's rate, the time, a species under a rule)
@@ -8981,6 +9066,20 @@ def _build_model_from_sbml_doc(doc):
     # Only what the built model has as a parameter a caller could write.
     _built_params = set(core.param_names)
     model._frozen_params = {n: w for n, w in _folded_into.items() if n in _built_params}
+    # (#313) Anything the residue's fold read that a caller can still write is
+    # frozen behind it: `set_param` refuses it, and so does the sensitivity
+    # request. Say so once, at load, by the names they refuse. (An
+    # initialAssignment that reads nothing writable stays quiet: it is frozen,
+    # but no parameter is frozen behind it.)
+    _residue_frozen = sorted(n for n in model._frozen_params if n in _frozen_upstream)
+    if _residue_frozen:
+        logger.warning(
+            "initialAssignment(s) that bngsim could not keep symbolic read the "
+            "parameter(s) %s. Their contribution through that initialAssignment is "
+            "frozen at its load-time value, so set_param refuses to change them and "
+            "a forward-sensitivity column for one is refused (Model.frozen_params).",
+            ", ".join(_residue_frozen),
+        )
     model._ssa_issues = ssa_issues
     model._periodic_disc_max_step = periodic_disc_max_step
     # The registered discontinuity conditions, verbatim (issue #305). A root at
