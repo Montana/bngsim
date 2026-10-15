@@ -814,7 +814,10 @@ def test_ar_compartment_sized_by_a_species_dilutes(codegen):
 
 
 def test_ar_compartment_sized_by_a_species_reports_its_amount():
-    """The bare-id amount selector reads the live size: Sk's amount stays 10."""
+    """The bare-id amount selector reads the live size: Sk's amount stays 10.
+    (A guard for the diluted species' amount remap, which a species left out of
+    ``ar_dilution_species`` would break. Main, which held [Sk] at 5, passed it
+    by coincidence: 5 times the load-time size 2.)"""
     _, res = _run(_SIZED_BY_S, t_end=4.0, n=9)
     arr = res.as_roadrunner(selections=["time", "Sk", "X"])
     cols = {c: i for i, c in enumerate(arr.colnames)}
