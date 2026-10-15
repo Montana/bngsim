@@ -259,9 +259,10 @@ struct NonFiniteWitness {
 // of the band the restart test asks a crossing to clear, read where the state
 // is. `room` is what is left of the box the hold was taken in: each species
 // the residual reads may move from where it was by that share of its own
-// tolerance band, which keeps g within B of where it was to first order with
-// dg/dx as it is, not as it was measured. Both are continuous, so CVODE
-// locates where either runs out. Inside, no root is located. The residual is
+// tolerance band. A residual is held only where dg/dx, read across that box,
+// keeps three quarters of what it is where the hold is taken, so that B stays
+// under the restart test's band wherever the state may go. Both are
+// continuous, so CVODE locates where either runs out. Inside, no root is located. The residual is
 // not switched off; only its crossings inside the band are not stopped at.
 //
 // A residual that reads the time is never held: its g and its dg/dx move with
@@ -8491,6 +8492,13 @@ static constexpr long kStateSwitchHoldStepGap = 2;
 // crossing tested, at half the excursion that test would call resolved. The
 // box a species may move in is the same share of its tolerance band.
 static constexpr double kStateSwitchHoldShare = 0.5;
+// How much of itself each component of dg/dx has to keep across the box for
+// the residual to be held: the band, half the test's at the hold, is then
+// under two thirds of the test's anywhere in the box.
+static constexpr double kStateSwitchHoldGradKept = 0.75;
+// A residual over more species than this is not held: reading dg/dx across
+// its box costs (4n + 2) * 2n evaluations.
+static constexpr std::size_t kStateSwitchHoldMaxSpecies = 16;
 
 bool CvodeSimulator::Impl::flow_carries_state_switch(
     void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
@@ -14069,10 +14077,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     }
                     const double from = std::max(state_switch_hold.tested_to[jx], t_step_start);
                     state_switch_hold.tested_to[jx] = t_here;
+                    const int g_idx = state_switches[jx]->residual_expr_idx;
+                    impl_->sync_model_at(t_here, y_data, ns);
+                    const double g_here = eval.evaluate(g_idx);
+                    // The issue #897 hold, what an exact 0.0 is read as: a run
+                    // that stepped on each crossing inside the band was last
+                    // carried to the side the residual is on now, and holds a
+                    // zero on the other. A slide reads exactly zero often, and a
+                    // crossing located on another hold restarts a few ulp away
+                    // from where that run restarts, so it is kept at every
+                    // return, the band's end included.
+                    double &zero_hold = state_switch_zero_hold[jx];
+                    const double zero_hold_from = zero_hold;
+                    if (std::isfinite(g_here) && g_here != 0.0) {
+                        zero_hold =
+                            (g_here > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
+                    }
                     if (!(t_here > from)) {
                         continue;
                     }
-                    const int g_idx = state_switches[jx]->residual_expr_idx;
                     auto residual_at = [&](double tt) {
                         if (CVodeGetDky(cvode_mem, static_cast<sunrealtype>(tt), 0, at) !=
                             CV_SUCCESS) {
@@ -14082,22 +14105,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         return eval.evaluate(g_idx);
                     };
                     // The side an exact 0.0 is on is the zero hold's, as in
-                    // the root function: what a run that stepped on every
-                    // crossing holds, kept below at each return.
-                    double &zero_hold = state_switch_zero_hold[jx];
-                    auto side = [&zero_hold](double g) {
-                        const double v = g != 0.0 ? g : zero_hold;
+                    // the root function, as it stood at the time read.
+                    auto side = [](double g, double hold) {
+                        const double v = g != 0.0 ? g : hold;
                         return v > 0.0 ? 1 : (v < 0.0 ? -1 : 0);
                     };
                     const double g_from = residual_at(from);
-                    impl_->sync_model_at(t_here, y_data, ns);
-                    const double g_here = eval.evaluate(g_idx);
-                    const int side_from = side(g_from);
-                    const int side_here = side(g_here);
-                    if (std::isfinite(g_here) && g_here != 0.0) {
-                        zero_hold =
-                            (g_here > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
-                    }
+                    const int side_from = side(g_from, zero_hold_from);
+                    const int side_here = side(g_here, zero_hold);
                     if (!std::isfinite(g_from) || !std::isfinite(g_here) || side_from == 0 ||
                         side_here == 0 || side_from == side_here) {
                         continue;
@@ -14112,7 +14127,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         if (!std::isfinite(g_mid)) {
                             break;
                         }
-                        if (side(g_mid) != side_from) {
+                        if (side(g_mid, zero_hold_from) != side_from) {
                             hi = mid;
                         } else {
                             lo = mid;
@@ -14146,22 +14161,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 }
                 impl_->sync_model_at(t_here, y_data, ns);
                 // Out of its band: shown as it is again. CVODE reads every root
-                // afresh after a root return, so the change is seen whole. A
-                // run that stepped on each crossing inside the band was last
-                // carried to the side the residual is on now, and holds an
-                // exact 0.0 on the other (the issue #897 hold): a slide reads
-                // exactly zero often, and a crossing located on another hold
-                // restarts a few ulp away from where that run restarts.
+                // afresh after a root return, so the change is seen whole.
                 for (int j : held_left) {
                     const auto jx = static_cast<size_t>(j);
                     state_switch_hold.held[jx] = 0;
                     state_switch_hold.run[jx] = 0;
                     --state_switch_hold.n_held;
-                    const double g_left = eval.evaluate(state_switches[jx]->residual_expr_idx);
-                    if (std::isfinite(g_left) && g_left != 0.0) {
-                        state_switch_zero_hold[jx] =
-                            (g_left > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
-                    }
                 }
                 if (state_switch_hold.n_held == 0) {
                     state_switch_hold.unmute();
@@ -14630,9 +14635,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                 const auto sx = static_cast<size_t>(sp);
                                 const double w = kStateSwitchHoldShare * k_resolve *
                                                  std::fabs(sx < grad.size() ? grad[sx] : 0.0);
-                                if (!(w > 0.0) || !std::isfinite(w)) {
-                                    continue;
-                                }
+                                // Every species the residual reads is boxed, one
+                                // it does not move here as well: where it does
+                                // elsewhere, that is a dg/dx this box has to bound.
+                                measurable = measurable && std::isfinite(w);
                                 StateSwitchHold::Term term;
                                 term.species = sp;
                                 term.weight = w;
@@ -14647,7 +14653,67 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             // flow_carries_state_switch left the model at the root.
                             const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
                             if (terms.empty() || !measurable || !(band > 0.0) ||
-                                !(std::fabs(g_root) < band)) {
+                                !(std::fabs(g_root) < band) ||
+                                terms.size() > kStateSwitchHoldMaxSpecies) {
+                                continue;
+                            }
+                            // The band stands for the restart test's only while
+                            // dg/dx is what it was here, and the box is where the
+                            // state may go meanwhile. So dg/dx is read across the
+                            // box, at each species' edges and halfway to them and
+                            // at its two corners, by the restart test's own
+                            // differences. A component that falls below
+                            // kStateSwitchHoldGradKept of itself anywhere there
+                            // could leave the band wider than that test's, and
+                            // the residual is not held. A steep function of a
+                            // counter clock, whose box at rtol 1e-3 is a quarter
+                            // of a time unit wide, hid a crossing main restarts
+                            // at, and a window came out 0 where it is 0.0149
+                            // (third review of this fix).
+                            std::vector<double> xw(y_data, y_data + ns);
+                            auto grad_holds = [&]() {
+                                for (const StateSwitchHold::Term &term : terms) {
+                                    const auto sx = static_cast<size_t>(term.species);
+                                    const double xj = xw[sx];
+                                    const double h = 1e-7 * std::max(std::fabs(xj), 1.0);
+                                    xw[sx] = xj + h;
+                                    impl_->sync_model_at(t_root, xw.data(), ns);
+                                    const double g_hi =
+                                        model.evaluator().evaluate(sw.residual_expr_idx);
+                                    xw[sx] = xj - h;
+                                    impl_->sync_model_at(t_root, xw.data(), ns);
+                                    const double g_lo =
+                                        model.evaluator().evaluate(sw.residual_expr_idx);
+                                    xw[sx] = xj;
+                                    const double there = std::fabs((g_hi - g_lo) / (2.0 * h));
+                                    if (!(there >=
+                                          kStateSwitchHoldGradKept * std::fabs(grad[sx]))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
+                            bool steady = true;
+                            for (const StateSwitchHold::Term &edge : terms) {
+                                const auto ex = static_cast<size_t>(edge.species);
+                                for (const double at : {-1.0, -0.5, 0.5, 1.0}) {
+                                    xw[ex] = edge.x0 + at * edge.drift;
+                                    steady = steady && grad_holds();
+                                    xw[ex] = edge.x0;
+                                }
+                            }
+                            for (const double at : {-1.0, 1.0}) {
+                                for (const StateSwitchHold::Term &term : terms) {
+                                    xw[static_cast<size_t>(term.species)] =
+                                        term.x0 + at * term.drift;
+                                }
+                                steady = steady && grad_holds();
+                                for (const StateSwitchHold::Term &term : terms) {
+                                    xw[static_cast<size_t>(term.species)] = term.x0;
+                                }
+                            }
+                            impl_->sync_model_at(t_root, y_data, ns);
+                            if (!steady) {
                                 continue;
                             }
                             state_switch_hold.terms[jx] = std::move(terms);

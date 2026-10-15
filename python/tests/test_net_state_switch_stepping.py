@@ -1006,6 +1006,80 @@ def test_a_residual_that_reads_the_time_is_not_held(tmp_path):
     assert gained == pytest.approx(exact, rel=2e-2)
 
 
+# The scaled sweep again with the clock a species: C grows at rate 1, as a
+# BNGL "Time" species does, and thr() and h() read C, so the residual reads
+# only species and can be held. Written with {h} for h().
+_CLOCK_SWEEP_NET = """\
+begin parameters
+    1 k    10.0
+    2 A    0.5
+    3 tp   30.05
+    4 sig  0.001
+    5 dlt  0.01
+    6 te   30.0
+    7 one  1.0
+end parameters
+begin functions
+    1 thr() 1+A*(1+tanh((Cobs-tp)/sig))/2
+    2 h() {h}
+    3 a() 1/(1+exp((time()-te)/0.002))
+    4 f() if(Sobs*h()<thr()*h(),a(),-a())
+    5 up() dlt
+    6 z() exp(-((time()-30.047)/0.001)^2)
+    7 r() if(Sobs*h()<thr()*h(),k,0)*z()
+end functions
+begin species
+    1 S() 27.95
+    2 Y() 0
+    3 C() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+    3 0 2 r
+    4 0 3 one
+end reactions
+begin groups
+    1 Sobs 1
+    2 Cobs 3
+end groups
+"""
+
+
+@pytest.mark.parametrize(
+    "h",
+    ["1", "1e-3+1/(1+exp((Cobs-30.02)/0.002))"],
+    ids=["held, crossing restarted at", "dg/dx falls inside the box"],
+)
+def test_a_threshold_on_a_clock_species(tmp_path, h):
+    """With h() = 1 the residual is held through the sweep, and its crossing,
+    which CVODE does not locate, is found at the return that ends its step,
+    tested, and restarted at: without that the pulse is lost and Y gains 0.
+    With h() falling a thousandfold at C = 30.02, C's box at rtol 1e-3 (a
+    quarter of a time unit) spans the fall, and a band measured where h was 1
+    hid the crossing: Y gained 0 where it gains 0.0149 (third review of the
+    #908 fix). dg/dx is now read across the box and that residual is not held.
+    Main gets both right (control). C runs at rate 1 from 0, S moves at dlt,
+    and the pulse is a Gaussian, so the gain is exact given S before the
+    sweep."""
+    model = _write(tmp_path, _CLOCK_SWEEP_NET.format(h=h))
+    t1, tp, amp, sig, dlt = 30.04, 30.05, 0.5, 0.001, 0.01
+    result = bngsim.Simulator(model).run(sample_times=[0.0, t1, tp + 1.0], rtol=1e-3, atol=1e-5)
+    s1 = float(result.species[1][0])
+    lo, hi = t1, tp + 0.5
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        thr = 1.0 + amp * (1.0 + math.tanh((mid - tp) / sig)) / 2.0
+        if thr - (s1 + dlt * (mid - t1)) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    t_open = 0.5 * (lo + hi)
+    exact = 10.0 * 0.001 * math.sqrt(math.pi) / 2.0 * math.erfc((t_open - 30.047) / 0.001)
+    gained = float(result.species[-1][1]) - float(result.species[1][1])
+    assert gained == pytest.approx(exact, rel=2e-2)
+
+
 # S slides on S = 1, parks just above it once a() has decayed, and is pushed
 # further up by v(): the residual leaves its band without crossing.
 _SLIDE_PARK_PUSH_NET = """\
