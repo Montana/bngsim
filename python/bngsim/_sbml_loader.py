@@ -4725,11 +4725,63 @@ def _build_model_from_sbml_doc_in_context(doc):
     # before ``v := 2*p``) reads it unset or stale, and only this loop settles
     # it. A compartment sized that way loaded with volume factor 1 and divided
     # every reaction across compartments by 1 instead of its size (issue #994).
-    # Each pass settles at least one more link of a chain written against
-    # document order, and an acyclic chain has at most one link per rule or
-    # initialAssignment, so that many passes (plus one to see nothing move)
-    # always reach the fixed point; a model that needs fewer breaks early.
-    _settle_passes = max(10, sbml_model.getNumRules() + sbml_model.getNumInitialAssignments() + 1)
+    #
+    # A species whose symbol the seed above bound through a conversion by its
+    # compartment's size (an amount declared for a concentration symbol, or a
+    # concentration declared for an amount symbol) was converted with the
+    # DECLARED size. Where an initialAssignment or a rule gives the size, the
+    # size at the start is that one, so the loop converts again as the size
+    # settles: `q = B`, with B declared as amount 0.8 in `c2 := 2*p` (declared
+    # 1), folded 0.8 where the concentration at the start is 0.2. A species with
+    # its own initialAssignment or rule takes that value instead.
+    _set_by_math = {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+    } | {
+        sbml_model.getRule(j).getVariable()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isAssignment()
+    }
+    _size_converted: list[tuple[str, str, float, bool]] = []  # sid, cid, declared, divide
+    for _j in range(sbml_model.getNumSpecies()):
+        _sp = sbml_model.getSpecies(_j)
+        _spid, _spc = _sp.getId(), _sp.getCompartment()
+        if _spc not in _set_by_math or _spid in _set_by_math:
+            continue
+        if _sp.getHasOnlySubstanceUnits():
+            if _sp.isSetInitialConcentration():
+                _size_converted.append((_spid, _spc, _sp.getInitialConcentration(), False))
+        elif _sp.isSetInitialAmount() and not _sp.isSetInitialConcentration():
+            _size_converted.append((_spid, _spc, _sp.getInitialAmount(), True))
+
+    def _reconvert_species() -> bool:
+        """Convert each size-converted species with its compartment's current
+        size, as the seed did with the declared one; True if one moved."""
+        moved = False
+        for _sid, _cid, _declared, _divide in _size_converted:
+            _vol = eval_ctx.get(_cid, 1.0)
+            if not _math.isfinite(_vol):
+                _vol = 1.0  # what the seed and the compartment loop use (#353)
+            _v = (_declared / _vol if _vol else 0.0) if _divide else _declared * _vol
+            if _ia_value_changed(_v, eval_ctx.get(_sid)):
+                eval_ctx[_sid] = _v
+                moved = True
+        return moved
+
+    # Each pass settles every symbol whose inputs had settled when it began, so
+    # it settles at least one more link of any acyclic chain. A link is an
+    # initialAssignment, a rule, a reaction id (refolded at the end of a pass,
+    # and a kinetic law may read another reaction's id) or a converted species,
+    # so one pass per symbol the loop can move, plus one to see nothing move,
+    # always reaches the fixed point; a model that needs fewer breaks early.
+    _settle_passes = max(
+        10,
+        sbml_model.getNumInitialAssignments()
+        + sbml_model.getNumRules()
+        + len(_rid_laws)
+        + len(_size_converted)
+        + 1,
+    )
     for _pass in range(_settle_passes):
         changed = False
         for j in range(sbml_model.getNumInitialAssignments()):
@@ -4756,6 +4808,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                 eval_ctx[var] = val
                 ia_values[var] = val
                 changed = True
+        if _reconvert_species():
+            changed = True
         if _refresh_reaction_ids():
             changed = True
         if not changed:

@@ -102,3 +102,86 @@ def test_steady_state_sensitivities_are_refused_not_wrong() -> None:
     model = bngsim.Model.from_antimony_string(TEXT.format(c2=SPELLINGS["rule over a rule"]))
     with pytest.raises(bngsim.SensitivityUnsupportedError, match="#745"):
         bngsim.Simulator(model, "ode").steady_state(sensitivity_params=["k1"])
+
+
+def test_a_chain_through_reaction_ids_settles() -> None:
+    # `q := J1` and `c2 := q`, where J1's law reads J2, ..., and J10's reads
+    # `r := 2*p`. A reaction id refolds at the end of a pass, and J1 reads J2
+    # before J2 refolds, so each reaction is a link of its own. A cap of one
+    # pass per rule and initialAssignment ran out with J1 still moving, and c2
+    # loaded at q's declared 7, with nothing raised.
+    n = 10
+    lines = [
+        "compartment c1 = 1, c2; p = 2; r = 1; r := 2*p; q := J1; c2 := q;",
+        "species X in c1, Z in c2; X = 1; Z = 1;",
+        *(f"J{i}: X -> X; J{i + 1}" for i in range(1, n)),
+        f"J{n}: X -> X; r",
+        "R0: Z -> X; Z",
+    ]
+    import antimony
+
+    antimony.clearPreviousLoads()
+    assert antimony.loadAntimonyString("\n".join(lines)) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    doc.getModel().getParameter("q").setValue(7.0)
+    model = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    assert model.get_param("c2") == pytest.approx(4.0)
+    assert _volume_factors(model) == pytest.approx([1.0, 4.0])
+
+
+# A species declared by the quantity its symbol does not mean is converted by its
+# compartment's size: B declared as amount 0.8 in c2 is concentration 0.8/c2 to
+# every expression that reads it. With c2 declared 1 and given 4 by
+# `p = 2; c2 = 2*p` or `c2 := 2*p`, an initialAssignment that read B used to
+# read 0.8 / 1.
+SIZED = {
+    "initialAssignment": "c2 = 2*p",
+    "rule": "c2 := 2*p",
+    "rule over a rule": "v := 2*p; c2 := v",
+}
+SPECIES_TEXT = (
+    "compartment c1, c2; c1 = 1; c2 = 1; p = 2; {sized}; {reads};\n"
+    "species A in c1, B in c2, C in c1; B = 0.8; C = 0;\n"
+    "R1: -> C; q\n"
+)
+
+
+def _species_sbml(sized: str, reads: str, *, amount_only: bool) -> str:
+    import antimony
+
+    antimony.clearPreviousLoads()
+    text = SPECIES_TEXT.format(sized=sized, reads=reads)
+    assert antimony.loadAntimonyString(text) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    b = doc.getModel().getSpecies("B")
+    if amount_only:
+        b.unsetInitialConcentration()
+        b.setInitialAmount(0.8)  # concentration 0.8/4 = 0.2
+    else:
+        b.setHasOnlySubstanceUnits(True)
+        b.unsetInitialAmount()
+        b.setInitialConcentration(0.2)  # amount 0.2*4 = 0.8
+    return libsbml.writeSBMLToString(doc)
+
+
+@pytest.mark.parametrize("sized", SIZED.values(), ids=SIZED.keys())
+def test_a_species_initial_assignment_reads_the_size_at_the_start(sized: str) -> None:
+    model = bngsim.Model.from_sbml_string(_species_sbml(sized, "q = 1; A = B", amount_only=True))
+    out = bngsim.Simulator(model, "ode").run(t_span=(0, 1.0), n_points=2)
+    assert np.asarray(out.species)[0, 0] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize(
+    "amount_only", [True, False], ids=["amount for concentration", "concentration for amount"]
+)
+@pytest.mark.parametrize("sized", SIZED.values(), ids=SIZED.keys())
+def test_a_parameter_initial_assignment_reads_the_size_at_the_start(
+    sized: str, amount_only: bool
+) -> None:
+    # B's symbol means its concentration (0.2) when it is declared by amount, and
+    # its amount (0.8) when it has only substance units and is declared by
+    # concentration.
+    model = bngsim.Model.from_sbml_string(
+        _species_sbml(sized, "A = 1; q = B", amount_only=amount_only)
+    )
+    assert model.get_param("q") == pytest.approx(0.2 if amount_only else 0.8)
