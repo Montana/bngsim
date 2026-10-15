@@ -134,11 +134,13 @@ class NfsimSession:
 
         from bngsim._network_free_checks import (
             refuse_nfsim_rate_laws,
+            refuse_nfsim_stale_local_functions,
             refuse_time_dependent_rate_laws,
         )
 
         refuse_time_dependent_rate_laws(self._xml_path, "nfsim")
         refuse_nfsim_rate_laws(self._xml_path)
+        refuse_nfsim_stale_local_functions(self._xml_path)
         self._core = NfsimSimulator(self._xml_path)
         if molecule_limit is not None:
             self._core.set_molecule_limit(int(molecule_limit))
@@ -202,6 +204,11 @@ class NfsimSession:
         only update reaction rates from the new parameter namespace. To
         change live counts after ``initialize()``, use
         :meth:`add_species` / :meth:`remove_species`.
+
+        Neither kind of write reaches a compartment's size: BioNetGen writes
+        the size into the XML as a number, so a write to the parameter behind
+        it leaves the model at its old volume (issue #1061). Regenerate the XML
+        from BNGL to change a volume.
 
         Parameters
         ----------

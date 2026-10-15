@@ -1,0 +1,31 @@
+# bngsim GH #1062 fixture: as local_function_constant_outside_observable, but
+# Src has a component, so a deletion could free a bond on it. bngsim treats
+# NSrc as able to change and refuses the read (it errs toward refusing).
+begin model
+begin parameters
+  k 0.001
+  kd 0.01
+end parameters
+begin molecule types
+  A(b,c)
+  B(a)
+  Src(s)
+end molecule types
+begin seed species
+  A(b,c) 100
+  B(a) 100
+  Src(s) 5
+end seed species
+begin observables
+  Molecules AC A(c)
+  Molecules NSrc Src()
+end observables
+begin functions
+  fA(x) = k*(1+AC(x))*NSrc
+end functions
+begin reaction rules
+  %x:A(b) + B(a) -> A(b!1).B(a!1) fA(x)
+  B(a) -> 0 kd
+end reaction rules
+end model
+writeXML()

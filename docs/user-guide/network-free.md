@@ -166,6 +166,21 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
+### Local functions that read an observable outside their argument
+
+In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
+argument and follows the molecule, but `MAB` is read outside it. NFsim
+re-evaluates a local function only on the complexes a reaction produces, so on
+every other molecule that term keeps the value it had at the molecule's last
+event: on a small binding model the bound count came out about 10 % low at
+t = 10, without an error (RuleWorld/nfsim#104). NFsim therefore refuses such a read, naming the
+function and the observable, unless the observable can never change: every
+molecule type in it appears in no rule, and either has no components or the
+model deletes nothing. The check errs toward refusing (issue #1062 lifts it once
+the upstream fix is vendored). BioNetGen 2.9.3's `writeXML` cannot write a rate
+law that multiplies a local function by a global one, so simulate such a model's
+generated network with `method="ode"` or `method="ssa"`.
+
 ### Stateful network-free sessions
 
 For advanced workflows that mutate parameters or live particle counts between
@@ -184,6 +199,14 @@ with RuleMonkeySession("model.xml") as rm:
     rm.initialize(seed=42)
     result = rm.simulate(0, 100, n_points=101)
 ```
+
+On NFsim, a `set_param` reaches every rate constant, Michaelis-Menten `kcat` and
+`Km`, and function, before or after `initialize()`, but not a compartment's
+size. BioNetGen writes the size into the XML as a number, so a write to the
+parameter behind it (`Vc` in `c 3 Vc`) changes `get_parameter('Vc')` and leaves
+the model at the old volume: a zero-order synthesis into `c` keeps its old rate
+(issue #1061, waiting on RuleWorld/bionetgen#347 and RuleWorld/nfsim#105). To
+change a volume, regenerate the XML from BNGL at the new value.
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`

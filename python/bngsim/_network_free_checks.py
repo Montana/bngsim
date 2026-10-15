@@ -27,6 +27,11 @@ vendored NFsim carries the upstream fix (gated issue #1057). Energy patterns
 alone change no rate, so only the rate law is refused. So is a rate-law type
 NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
 such a rule with a message only its captured log holds, so the rule never fires.
+
+A local function that reads, outside its argument, an observable that can change
+is refused on NFsim too (issue #1062): NFsim re-evaluates a local function only
+on the complexes a reaction produces, so that term goes stale on every other
+molecule (RuleWorld/nfsim#104).
 """
 
 from __future__ import annotations
@@ -169,6 +174,96 @@ def refuse_nfsim_rate_laws(xml_path: str | Path) -> None:
     raise ModelError(
         f"{label} cannot run a model with {'; and with '.join(parts)}. Simulate it with "
         "method='ode' or method='ssa' on the network BNG2.pl generates."
+    )
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _children(el: ET.Element, name: str) -> list[ET.Element]:
+    return [c for c in el if _local(c.tag) == name]
+
+
+def _molecule_names(el: ET.Element) -> set[str]:
+    """Molecule-type names of every ``<Molecule>`` below *el*."""
+    return {m.get("name", "") for m in el.iter() if _local(m.tag) == "Molecule"}
+
+
+def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(function, observable)`` for each local function in *xml_path* that reads
+    an observable outside its argument (``MAB`` or ``MAB()``, not ``AC(x)``) whose
+    count can change. Empty when the file cannot be parsed.
+
+    NFsim re-evaluates a local function only on the complexes a reaction
+    produces, so such a term goes stale on every other molecule
+    (RuleWorld/nfsim#104). An observable counts as constant, and its read as
+    harmless, only when no rule can change it: every molecule type in its
+    patterns appears in no rule, and either has no components (so it can never
+    be bonded) or the model deletes nothing. Anything else is treated as able to
+    change, so this errs toward refusing.
+    """
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    rules = [el for el in root.iter() if _local(el.tag) == "ReactionRule"]
+    rule_types = set().union(*(_molecule_names(r) for r in rules)) if rules else set()
+    deletes = any(_local(el.tag) == "Delete" for r in rules for el in r.iter())
+    has_components = {
+        mt.get("id", ""): any(_local(c.tag) == "ComponentType" for c in mt.iter())
+        for mt in root.iter()
+        if _local(mt.tag) == "MoleculeType"
+    }
+    observable_types = {
+        obs.get("name", ""): _molecule_names(obs)
+        for obs in root.iter()
+        if _local(obs.tag) == "Observable"
+    }
+
+    def constant(observable: str) -> bool:
+        return all(
+            t not in rule_types and (not has_components.get(t, True) or not deletes)
+            for t in observable_types.get(observable, {""})
+        )
+
+    found = []
+    for func in _functions(xml_path) or []:
+        args = [a.get("id", "") for lst in _children(func, "ListOfArguments") for a in lst]
+        if not args:
+            continue  # a global function is re-evaluated whenever its observables change
+        refs = [ref for lst in _children(func, "ListOfReferences") for ref in lst]
+        if any(ref.get("type") == "Function" for ref in refs):
+            continue  # a composite function: NFsim refuses one that reads an observable
+        expr = " ".join(e.text or "" for e in _children(func, "Expression"))
+        for ref in refs:
+            if ref.get("type") == "Observable":
+                name = ref.get("name", "")
+                uses = re.finditer(
+                    rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
+                    expr,
+                )
+                outside = any(m.group(1) is None or m.group(2) not in args for m in uses)
+                if outside and not constant(name):
+                    found.append((func.get("id", "?"), name))
+    return found
+
+
+def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if a local function in *xml_path* reads, outside
+    its argument, an observable whose count can change. NFsim only."""
+    reads = stale_local_function_reads(xml_path)
+    if not reads:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    raise ModelError(
+        f"{label} cannot run a model whose local functions read an observable outside "
+        "their argument: "
+        + ", ".join(f"'{f}' reads '{o}'" for f, o in reads)
+        + ". NFsim re-evaluates a local function only on the complexes a reaction "
+        "produces, so that term goes stale on every other molecule, without an error "
+        "(RuleWorld/nfsim#104; this refusal is lifted under issue #1062). Simulate the "
+        "network BNG2.pl generates with method='ode' or method='ssa'."
     )
 
 
