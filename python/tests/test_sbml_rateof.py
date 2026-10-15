@@ -1231,6 +1231,15 @@ _FUNC_WHY = "reads rateOf of a parameter of its own"
             "Sc is a concentration in compartment cv, which the assignmentRule "
             "cv := 1 + time sizes (validation rule 10225)",
         ),
+        # Constant, so SBML holds its amount: its concentration still moves with
+        # the size (suite 01117). The fold read 0, a rule -5/(1+t)^2.
+        (
+            f"<apply>{_RATEOF_CSYMBOL}<ci>Sk</ci></apply>",
+            (),
+            "rateOf(Sk)",
+            "Sk is a concentration in compartment cv, which the assignmentRule "
+            "cv := 1 + time sizes (validation rule 10225)",
+        ),
     ],
     ids=[
         "csymbol-in-function",
@@ -1239,6 +1248,7 @@ _FUNC_WHY = "reads rateOf of a parameter of its own"
         "csymbol-of-2S",
         "idiom-of-2S",
         "10225",
+        "10225-constant-species",
     ],
 )
 def test_a_rateof_with_no_value_is_refused_by_name(read, funcs, shown, why, where):
@@ -1259,16 +1269,14 @@ def test_a_rateof_with_no_value_is_refused_by_name(read, funcs, shown, why, wher
         # An amount in the rule-sized compartment has a rate of its own: no
         # reaction changes Sa, so 0 (the size's change is #736's business).
         (f"<apply>{_RATEOF_CSYMBOL}<ci>Sa</ci></apply>", (), 0.0),
-        # A concentration there whose rate is stated by its rate rule, or nil
-        # because it is constant, whatever the compartment does.
+        # A concentration there whose rate its own rate rule states, whatever
+        # the compartment does.
         (f"<apply>{_RATEOF_CSYMBOL}<ci>Sr</ci></apply>", (), 3.0),
-        (f"<apply>{_RATEOF_CSYMBOL}<ci>Sk</ci></apply>", (), 0.0),
     ],
     ids=[
         "uncalled-function",
         "amount-in-a-sized-compartment",
         "rate-ruled-concentration",
-        "constant-concentration",
     ],
 )
 def test_a_rateof_with_a_value_still_loads(read, funcs, value):

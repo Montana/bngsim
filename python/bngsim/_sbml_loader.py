@@ -415,10 +415,12 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
       assignmentRule sizes (rule 10225): its rate would need the rule's own
       rate, which SBML does not define either. Unchecked, the initial-value
       fold took the amount's rate over the size, with no term for the size's
-      change; a rule had the term where the size reads only the time, and read
-      0 where it reads a species. A species with a rate rule of its own, or a
-      constant one, has its rate whatever its compartment does, and is left
-      alone (libsbml reports 10225 for it all the same).
+      change; a rule had the term where the size reads only the time, and left
+      it out (the amount's rate alone) where the size reads a species. A
+      species with a rate rule of its own has its rate stated, whatever its
+      compartment does, and is left alone (libsbml reports 10225 for it all
+      the same). A constant or boundary one is not: SBML holds its amount, so
+      its concentration moves with the size (suite 01117/01118).
     * ``rateOf`` of anything but a single symbol (rule 10223 for the
       csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
       for NaN, and a rule read either as 0 with a warning.
@@ -462,13 +464,11 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
                 rated_funcs.add(fid)
                 grew = True
     # A species held as a concentration, by its compartment (rule 10225), but
-    # not one whose rate is stated (a rate rule) or nil (constant).
+    # not one whose rate a rate rule of its own states.
     conc_compartment = {
         sp.getId(): sp.getCompartment()
         for sp in (sbml_model.getSpecies(i) for i in range(sbml_model.getNumSpecies()))
-        if not sp.getHasOnlySubstanceUnits()
-        and not sp.getConstant()
-        and sp.getId() not in rate_ruled
+        if not sp.getHasOnlySubstanceUnits() and sp.getId() not in rate_ruled
     }
     law_locals = {}
     for i in range(sbml_model.getNumReactions()):
