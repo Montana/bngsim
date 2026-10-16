@@ -28,10 +28,11 @@ alone change no rate, so only the rate law is refused. So is a rate-law type
 NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
 such a rule with a message only its captured log holds, so the rule never fires.
 
-A local function that reads, outside its argument, an observable that can change
-is refused on NFsim too (issue #1062): NFsim re-evaluates a local function only
-on the complexes a reaction produces, so that term goes stale on every other
-molecule (RuleWorld/nfsim#104).
+A function with an argument that reads, outside it, an observable that can
+change, directly or through a function it calls, is refused on NFsim too
+(issue #1062): NFsim re-evaluates such a function only on the complexes a
+reaction produces, so that term goes stale on every other molecule
+(RuleWorld/nfsim#104).
 """
 
 from __future__ import annotations
@@ -112,20 +113,25 @@ def time_indexed_table_functions(xml_path: str | Path) -> list[str]:
 _NFSIM_RATE_LAWS = frozenset({"Ele", "Function", "FunctionProduct", "MM"})
 
 
-def _rate_laws(xml_path: str | Path) -> list[tuple[str, str]]:
-    """``(rule name, rate-law type)`` for every reaction rule in *xml_path*.
-    Empty when the file cannot be parsed."""
+def _rate_law_functions(xml_path: str | Path) -> list[tuple[str, str, str]]:
+    """``(rule name, rate-law type, rate-law name attribute)`` for every rule."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
         return []
     return [
-        (rule.get("name") or rule.get("id") or "?", law.get("type") or "")
+        (rule.get("name") or rule.get("id") or "?", law.get("type") or "", law.get("name") or "")
         for rule in root.iter()
         if rule.tag.endswith("ReactionRule")
         for law in rule
         if law.tag.endswith("RateLaw")
     ]
+
+
+def _rate_laws(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(rule name, rate-law type)`` for every reaction rule in *xml_path*.
+    Empty when the file cannot be parsed."""
+    return [(rule, kind) for rule, kind, _ in _rate_law_functions(xml_path)]
 
 
 def arrhenius_rules(xml_path: str | Path) -> list[str]:
@@ -190,62 +196,141 @@ def _molecule_names(el: ET.Element) -> set[str]:
     return {m.get("name", "") for m in el.iter() if _local(m.tag) == "Molecule"}
 
 
-def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
-    """``(function, observable)`` for each local function in *xml_path* that reads
-    an observable outside its argument (``MAB`` or ``MAB()``, not ``AC(x)``) whose
-    count can change. Empty when the file cannot be parsed.
+def _constant_observables(root: ET.Element) -> set[str]:
+    """Names of the observables in *root* whose count no rule can change.
 
-    NFsim re-evaluates a local function only on the complexes a reaction
-    produces, so such a term goes stale on every other molecule
-    (RuleWorld/nfsim#104). An observable counts as constant, and its read as
-    harmless, only when no rule can change it: every molecule type in its
-    patterns appears in no rule, and either has no components (so it can never
-    be bonded) or the model deletes nothing. Anything else is treated as able to
-    change, so this errs toward refusing.
+    A pattern is constant when it is inert or a conserved total:
+
+    * inert: no rule names any molecule type in it, and every seed species that
+      holds one of those types holds only types no rule names. No rule can then
+      bind, free, delete, merge or split anything in those complexes. Species
+      observables and multi-molecule patterns are covered only this way, since a
+      merge elsewhere in a complex changes them without naming their types.
+    * a conserved total: a ``Molecules`` observable of one bare molecule, ``X()``,
+      where no rule adds an X, deletes an X, or deletes a whole species (which
+      can take an X with it unnamed).
+    """
+    rules = [el for el in root.iter() if _local(el.tag) == "ReactionRule"]
+    named: set[str] = set()
+    mol_type: dict[str, str] = {}
+    pattern_types: dict[str, set[str]] = {}
+    for rule in rules:
+        named |= _molecule_names(rule)
+        for el in rule.iter():
+            kind = _local(el.tag)
+            if kind == "Molecule" and el.get("id"):
+                mol_type[el.get("id", "")] = el.get("name", "")
+            elif kind in ("ReactantPattern", "ProductPattern") and el.get("id"):
+                pattern_types[el.get("id", "")] = _molecule_names(el)
+    added: set[str] = set()
+    deleted: set[str] = set()
+    whole_species_deleted = False
+    for rule in rules:
+        for el in rule.iter():
+            kind = _local(el.tag)
+            if kind == "Add":
+                added.add(mol_type.get(el.get("id", ""), ""))  # "" = unknown: any type
+            elif kind == "Delete":
+                ref = el.get("id", "")
+                if el.get("DeleteMolecules") == "1":
+                    deleted |= pattern_types.get(ref) or {mol_type.get(ref, "")}
+                else:
+                    whole_species_deleted = True
+    seeds = [
+        _molecule_names(sp)
+        for lst in root.iter()
+        if _local(lst.tag) == "ListOfSpecies"
+        for sp in lst
+        if _local(sp.tag) == "Species"
+    ]
+
+    def inert(types: set[str]) -> bool:
+        return not (types & named) and all(not (seed & named) for seed in seeds if seed & types)
+
+    def conserved_total(obs: ET.Element, pattern: ET.Element) -> bool:
+        mols = [m for m in pattern.iter() if _local(m.tag) == "Molecule"]
+        if obs.get("type") != "Molecules" or len(mols) != 1 or len(mols[0]) != 0:
+            return False
+        x = mols[0].get("name", "")
+        return not (whole_species_deleted or {x, ""} & added or {x, ""} & deleted)
+
+    constant = set()
+    for obs in root.iter():
+        if _local(obs.tag) != "Observable":
+            continue
+        patterns = [p for p in obs.iter() if _local(p.tag) == "Pattern"]
+        if patterns and all(
+            inert(_molecule_names(p)) or conserved_total(obs, p) for p in patterns
+        ):
+            constant.add(obs.get("name", ""))
+    return constant
+
+
+def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(function, observable)`` for each function with an argument in
+    *xml_path* that reads, outside that argument, an observable whose count can
+    change. Empty when the file cannot be parsed.
+
+    NFsim re-evaluates a function with an argument only on the complexes a
+    reaction produces, so such a term goes stale on every other molecule
+    (RuleWorld/nfsim#104). The read can be direct (``MAB`` or ``MAB()`` beside
+    ``AC(x)`` in a local function) or through a function the argument-taking
+    function calls (``fB(x)*g()`` with ``g() = 1+0.01*MAB``). A composite
+    function's own direct read of an observable is left to NFsim, which refuses
+    it at load. Constant observables are allowed; see
+    :func:`_constant_observables`, which errs toward calling a count changing.
     """
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
         return []
-    rules = [el for el in root.iter() if _local(el.tag) == "ReactionRule"]
-    rule_types = set().union(*(_molecule_names(r) for r in rules)) if rules else set()
-    deletes = any(_local(el.tag) == "Delete" for r in rules for el in r.iter())
-    has_components = {
-        mt.get("id", ""): any(_local(c.tag) == "ComponentType" for c in mt.iter())
-        for mt in root.iter()
-        if _local(mt.tag) == "MoleculeType"
-    }
-    observable_types = {
-        obs.get("name", ""): _molecule_names(obs)
-        for obs in root.iter()
-        if _local(obs.tag) == "Observable"
-    }
+    funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
 
-    def constant(observable: str) -> bool:
-        return all(
-            t not in rule_types and (not has_components.get(t, True) or not deletes)
-            for t in observable_types.get(observable, {""})
-        )
+    def args(f: ET.Element) -> list[str]:
+        return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
 
+    def refs(f: ET.Element, kind: str) -> list[str]:
+        return [
+            r.get("name", "")
+            for lst in _children(f, "ListOfReferences")
+            for r in lst
+            if r.get("type") == kind
+        ]
+
+    def outside(f: ET.Element) -> set[str]:
+        """Observables *f* reads directly, other than through its argument."""
+        fargs = args(f)
+        expr = " ".join(e.text or "" for e in _children(f, "Expression"))
+        found = set()
+        for name in refs(f, "Observable"):
+            uses = re.finditer(
+                rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
+                expr,
+            )
+            if any(m.group(1) is None or m.group(2) not in fargs for m in uses):
+                found.add(name)
+        return found
+
+    def through_calls(f: ET.Element, seen: frozenset[str]) -> set[str]:
+        """Observables *f* reaches outside any argument through the functions it calls."""
+        found: set[str] = set()
+        for name in refs(f, "Function"):
+            g = funcs.get(name)
+            if g is None or name in seen:
+                continue
+            if not args(g) and not refs(g, "Function"):
+                found |= outside(g)  # a global function: every read is outside
+            found |= through_calls(g, seen | {name})
+        return found
+
+    constant = _constant_observables(root)
     found = []
-    for func in _functions(xml_path) or []:
-        args = [a.get("id", "") for lst in _children(func, "ListOfArguments") for a in lst]
-        if not args:
+    for name, f in funcs.items():
+        if not args(f):
             continue  # a global function is re-evaluated whenever its observables change
-        refs = [ref for lst in _children(func, "ListOfReferences") for ref in lst]
-        if any(ref.get("type") == "Function" for ref in refs):
-            continue  # a composite function: NFsim refuses one that reads an observable
-        expr = " ".join(e.text or "" for e in _children(func, "Expression"))
-        for ref in refs:
-            if ref.get("type") == "Observable":
-                name = ref.get("name", "")
-                uses = re.finditer(
-                    rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
-                    expr,
-                )
-                outside = any(m.group(1) is None or m.group(2) not in args for m in uses)
-                if outside and not constant(name):
-                    found.append((func.get("id", "?"), name))
+        composite = bool(refs(f, "Function"))
+        reads = through_calls(f, frozenset({name})) if composite else outside(f)
+        found += [(name, o) for o in sorted(reads - constant)]
     return found
 
 
@@ -256,11 +341,25 @@ def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:
     if not reads:
         return
     label, _ = _BACKENDS["nfsim"]
+    # BNG2.pl names the function behind an inline rate law _rateLawN; say whose.
+    rule_of: dict[str, list[str]] = {}
+    for rule, kind, law_name in _rate_law_functions(xml_path):
+        if kind == "Function":
+            rule_of.setdefault(law_name, []).append(rule)
+
+    def who(f: str) -> str:
+        rules = rule_of.get(f, [])
+        return (
+            f"'{f}' (the rate law of rule {', '.join(repr(r) for r in rules)})"
+            if (f.startswith("_rateLaw") and rules)
+            else f"'{f}'"
+        )
+
     raise ModelError(
-        f"{label} cannot run a model whose local functions read an observable outside "
-        "their argument: "
-        + ", ".join(f"'{f}' reads '{o}'" for f, o in reads)
-        + ". NFsim re-evaluates a local function only on the complexes a reaction "
+        f"{label} cannot run a model whose functions with an argument read an observable "
+        "outside it, directly or through a function they call: "
+        + ", ".join(f"{who(f)} reads '{o}'" for f, o in reads)
+        + ". NFsim re-evaluates such a function only on the complexes a reaction "
         "produces, so that term goes stale on every other molecule, without an error "
         "(RuleWorld/nfsim#104; this refusal is lifted under issue #1062). Simulate the "
         "network BNG2.pl generates with method='ode' or method='ssa'."

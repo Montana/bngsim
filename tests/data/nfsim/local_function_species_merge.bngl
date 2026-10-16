@@ -1,0 +1,34 @@
+# bngsim GH #1062 fixture: fB(x) reads the Species observable SpSrc outside its
+# argument. Src is named in no rule, but its complexes merge when A(d)+A(d)
+# binds, so SpSrc falls; NFsim leaves the term stale (z = +75 against SSA),
+# so bngsim refuses it.
+begin model
+begin parameters
+  k 0.000005
+  ks 0.05
+  kr 0.02
+end parameters
+begin molecule types
+  A(b,d,s)
+  B(a,c)
+  Src(a)
+end molecule types
+begin seed species
+  A(b,d,s!1).Src(a!1) 100
+  B(a,c) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules BC B(c)
+  Species SpSrc Src()
+end observables
+begin functions
+  fB(x) = k*(1+BC(x))*(0.1*SpSrc)^2
+end functions
+begin reaction rules
+  A(b) + %x:B(a) -> A(b!1).B(a!1) fB(x)
+  A(b!1).B(a!1) -> A(b) + B(a) kr
+  A(d) + A(d) -> A(d!1).A(d!1) ks
+end reaction rules
+end model
+writeXML()

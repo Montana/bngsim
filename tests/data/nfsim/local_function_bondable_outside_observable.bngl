@@ -1,6 +1,7 @@
-# bngsim GH #1062 fixture: as local_function_constant_outside_observable, but
-# Src has a component, so a deletion could free a bond on it. bngsim treats
-# NSrc as able to change and refuses the read (it errs toward refusing).
+# bngsim GH #1062 fixture: fA(x) reads NSrc = Src() outside its argument. Src
+# has a component, but no rule names Src and its only seed complex holds Src
+# alone, so nothing can bind, free or delete it: NSrc is constant and the read
+# is allowed, though B(a) -> 0 deletes molecules.
 begin model
 begin parameters
   k 0.001

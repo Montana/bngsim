@@ -166,20 +166,24 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
-### Local functions that read an observable outside their argument
+### Functions that read an observable outside their argument
 
 In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
 argument and follows the molecule, but `MAB` is read outside it. NFsim
-re-evaluates a local function only on the complexes a reaction produces, so on
-every other molecule that term keeps the value it had at the molecule's last
-event: on a small binding model the bound count came out about 10 % low at
-t = 10, without an error (RuleWorld/nfsim#104). NFsim therefore refuses such a read, naming the
-function and the observable, unless the observable can never change: every
-molecule type in it appears in no rule, and either has no components or the
-model deletes nothing. The check errs toward refusing (issue #1062 lifts it once
-the upstream fix is vendored). BioNetGen 2.9.3's `writeXML` cannot write a rate
-law that multiplies a local function by a global one, so simulate such a model's
-generated network with `method="ode"` or `method="ssa"`.
+re-evaluates a function with an argument only on the complexes a reaction
+produces, so on every other molecule that term keeps the value it had at the
+molecule's last event: on a small binding model the bound count came out about
+10 % low at t = 10, without an error (RuleWorld/nfsim#104). A rate law such as
+`fB(x)*g()`, whose global `g()` reads `MAB`, goes stale the same way. NFsim
+therefore refuses such a read, naming the function (or the rule whose rate law
+it is) and the observable, unless the observable can never change: each of its
+patterns either names only types that no rule names, held in seed complexes of
+such types only, or is a bare `X()` counted by a `Molecules` observable that no
+rule adds to or deletes from. The check errs toward refusing (issue #1062 lifts
+it once the upstream fix is vendored). A rate law that is a global function of
+its own, such as `g()` reading `MAB`, is re-evaluated whenever `MAB` changes and
+runs. Otherwise simulate the model's generated network with `method="ode"` or
+`method="ssa"`.
 
 ### Stateful network-free sessions
 
