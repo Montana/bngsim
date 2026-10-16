@@ -213,10 +213,9 @@ class NfsimSession:
         change live counts after ``initialize()``, use
         :meth:`add_species` / :meth:`remove_species`.
 
-        Neither kind of write reaches a compartment's size: BioNetGen writes
-        the size into the XML as a number, so a write to the parameter behind
-        it leaves the model at its old volume (issue #1061). Regenerate the XML
-        from BNGL to change a volume.
+        NfsimSession refuses a compartment model (GH #1067). Once that refusal
+        is lifted, note that neither kind of write reaches a compartment's
+        size: BioNetGen writes the size into the XML as a number (issue #1061).
 
         Parameters
         ----------

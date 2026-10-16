@@ -283,12 +283,11 @@ On both, a result's `solver_stats["n_steps"]` counts the events since
 `initialize`, not the segment's alone.
 
 On NFsim, a `set_param` reaches every rate constant, Michaelis-Menten `kcat` and
-`Km`, and function, before or after `initialize()`, but not a compartment's
-size. BioNetGen writes the size into the XML as a number, so a write to the
-parameter behind it (`Vc` in `c 3 Vc`) changes `get_parameter('Vc')` and leaves
-the model at the old volume: a zero-order synthesis into `c` keeps its old rate
-(issue #1061, waiting on RuleWorld/bionetgen#347 and RuleWorld/nfsim#105). To
-change a volume, regenerate the XML from BNGL at the new value.
+`Km`, and function, before or after `initialize()`. NFsim refuses a compartment
+model (see "Compartment models" above); once that refusal is lifted, note that
+a write to a compartment-size parameter does not reach the model either, since
+BioNetGen writes the size into the XML as a number (issue #1061, waiting on
+RuleWorld/bionetgen#347 and RuleWorld/nfsim#105).
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`
