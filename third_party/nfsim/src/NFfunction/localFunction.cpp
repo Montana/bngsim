@@ -7,6 +7,7 @@
 
 
 #include "NFfunction.hh"
+#include <stdexcept>
 
 
 
@@ -57,12 +58,12 @@ LocalFunction::LocalFunction(System *s,
 	if(args.size()>1) {
 		cerr<<"For efficiency, local functions currently support a maximum of 1 argument."<<endl;
 		cerr<<"Quitting now."<<endl;
-		exit(1);
+		throw std::runtime_error("LocalFunction " + name + ": a local function can take only one argument, so it can read only one reactant");
 	}
 	if(args.size()<1) {
 		cerr<<"When creating a local Function, ERROR!! there were no args, so it is a global function."<<endl;
 		cerr<<"Quitting now."<<endl;
-		exit(1);
+		throw std::runtime_error("LocalFunction " + name + ": a local function needs an argument");
 	}
 
 	//Do the basics first...
@@ -213,7 +214,7 @@ void LocalFunction::prepareForSimulation(System *s) {
 		cout<<"Error creating local function "<<name<<" in class LocalFunction!!  This is what happened:"<<endl;
 		cout<< "  "<<e.GetMsg() << endl;
 		cout<<"Quitting."<<endl;
-		exit(1);
+		throw std::runtime_error("LocalFunction " + name + ": cannot parse its expression: " + e.GetMsg());
 	}
 }
 

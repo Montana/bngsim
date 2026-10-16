@@ -406,7 +406,7 @@ def _condition_only_params(
     return pure
 
 
-def _unit_rate_clock_indices(core) -> frozenset[int]:
+def _unit_rate_clock_indices(core, candidates: frozenset[int] | None = None) -> frozenset[int]:
     """Every species index obeying ``dc/dt = 1``, from two RHS probes.
 
     Split out of :func:`_unit_rate_clock_species` because it is the half that
@@ -415,33 +415,94 @@ def _unit_rate_clock_indices(core) -> frozenset[int]:
     question in that cheap form, so that a model with a conditional rate law but
     no counter can be dismissed without building a context that runs to tens of
     thousands of entries on a large model.
+
+    ``candidates`` is :func:`unit_rate_clock_candidates` at the model's current
+    values, for a caller that has already probed them (issue #726).
     """
-    n_species = core.n_species
-    if n_species == 0:
+    if candidates is None:
+        candidates = unit_rate_clock_candidates(core)
+    if not candidates:
         return frozenset()
-    conc = [core.get_concentration(name) for name in core.species_names]
+    return _structurally_unit_rate(core, set(candidates))
+
+
+def texts_spell_a_switch(core) -> bool:
+    """Whether any function or derived-parameter text spells a condition, a
+    step, a comparison or a bend.
+
+    The cheap first gate of :func:`time_discontinuity_conditions`, which returns
+    ``()`` from the texts alone where this is false and never probes for a
+    clock. :meth:`bngsim.Model.time_discontinuity_conditions` reads the same
+    gate to decide whether its cache key needs the probe at all (issue #726),
+    so the two cannot disagree about which models the clocks matter to. Read
+    from the texts alone: structural.
+    """
+    from bngsim._jacobian import has_condition_construct
+
+    if core.n_functions == 0:
+        return False
+    return any(
+        has_condition_construct(t)
+        or _STEP_CALL.search(t)
+        or _RELATIONAL.search(t)
+        or _BEND_CALL.search(t)
+        for t in (*core.function_expressions, *core.param_expressions)
+    )
+
+
+def unit_rate_clock_candidates(core) -> frozenset[int]:
+    """The species indices at ``dc/dt = 1`` on both of two RHS probes.
+
+    The half of :func:`_unit_rate_clock_indices` that parameter values decide:
+    what follows it reads only structure. A counter fed at ``k_t`` passes at
+    ``k_t = 1`` and not at 0 or 0.5, so whatever is derived from which species
+    are clocks is derived again when this moves (issue #726). It costs two RHS
+    evaluations, where the structural half reads the whole model.
+    """
+    import numpy as np
+
+    if core.n_species == 0:
+        return frozenset()
+    conc = core.get_state()
     try:
-        deriv = core._eval_rhs(0.0, conc)
+        deriv = np.asarray(core._eval_rhs(0.0, conc))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("switch-time: RHS probe for clock detection failed: %s", exc)
         return frozenset()
-    clock_idx = {i for i in range(n_species) if deriv[i] == _CLOCK_SLOPE}
-    if not clock_idx:
+    clock_idx = np.flatnonzero(deriv == _CLOCK_SLOPE)
+    if clock_idx.size == 0:
         return frozenset()
     # A species whose RHS merely happens to equal 1 at the initial state is not
     # a clock, so probe again at a shifted state and time. That is only a
     # filter: shift-invariant and time-gated rates pass it, and
     # _structurally_unit_rate decides (issue #733).
-    probe = [c + 1.0 for c in conc]
     try:
-        deriv2 = core._eval_rhs(1.0, probe)
+        deriv2 = np.asarray(core._eval_rhs(1.0, conc + 1.0))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("switch-time: second RHS probe failed: %s", exc)
         return frozenset()
-    clock_idx = {i for i in clock_idx if deriv2[i] == _CLOCK_SLOPE}
-    if not clock_idx:
-        return frozenset()
-    return _structurally_unit_rate(core, clock_idx)
+    return frozenset(int(i) for i in clock_idx if deriv2[i] == _CLOCK_SLOPE)
+
+
+def clock_volume_params(core) -> dict[int, str]:
+    """For each amount-valued species whose compartment size is a live
+    parameter, the name of that parameter.
+
+    The other value :func:`_unit_rate_clock_species` reads besides the RHS: what
+    a rate law reads under such a species' name is its stored value times the
+    size, so it is a unit-rate clock only while the size is 1. A ``set_param`` on
+    the size moves the verdict without moving the probes, so
+    :meth:`bngsim.Model.time_discontinuity_conditions` keys its cache on these
+    parameters' values as well (issue #726). Which species they are is
+    structural; ``.net`` models have none.
+    """
+    names = list(core.param_names)
+    out: dict[int, str] = {}
+    for i, sp in enumerate(core.codegen_data()["species"]):
+        k = int(sp.get("volume_param_idx0", -1))
+        if sp.get("amount_valued", False) and 0 <= k < len(names):
+            out[i] = names[k]
+    return out
 
 
 # The clock, read by a rate law that is therefore not constant. rateOf accessors
@@ -533,7 +594,7 @@ def _structurally_unit_rate(core, candidates: set[int]) -> frozenset[int]:
     return frozenset(keep)
 
 
-def _unit_rate_clock_species(core, ctx=None) -> dict[str, int]:
+def _unit_rate_clock_species(core, ctx=None, candidates=None) -> dict[str, int]:
     """Map every symbol that reads a unit-rate clock to its species index.
 
     A *clock* is a species obeying ``dc/dt = 1`` — the counter idiom BNGL uses to
@@ -544,9 +605,10 @@ def _unit_rate_clock_species(core, ctx=None) -> dict[str, int]:
 
     Both the observable name and the species name map to the same index: a
     condition may be written against either. Returns ``{}`` for the overwhelming
-    majority of models, which have no such species.
+    majority of models, which have no such species. ``candidates`` is passed to
+    :func:`_unit_rate_clock_indices`.
     """
-    clock_idx = _unit_rate_clock_indices(core)
+    clock_idx = _unit_rate_clock_indices(core, candidates)
     if not clock_idx:
         return {}
     # What a rate law reads under a species' name is its amount when the species
@@ -1682,17 +1744,19 @@ def _whole_word(name: str) -> re.Pattern:
     return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
 
 
-def switch_condition_scope(core, ctx=None) -> SwitchConditionScope:
+def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchConditionScope:
     """Assemble the model-level context both switch-condition callers read.
 
     One RHS probe for the clocks, one pass over the parameter table, shared by
     :func:`compute_switch_time_sens` and :func:`uncompensated_condition_reason`
     so neither can be built on a different view of the model than the other.
+    ``clock_candidates``, when given, is that probe already made at the model's
+    current values (:func:`unit_rate_clock_candidates`).
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
     exprs = list(core.param_expressions)
-    clocks = _unit_rate_clock_species(core, ctx)
+    clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
     function_names = frozenset(core.function_names)
     return SwitchConditionScope(
@@ -2259,7 +2323,9 @@ def _reads_clock_and_run_constants(flat: str, scope: SwitchConditionScope) -> bo
     return True
 
 
-def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -> tuple[str, ...]:
+def time_discontinuity_conditions(
+    core, ctx=None, *, steps_only: bool = False, clock_candidates: frozenset[int] | None = None
+) -> tuple[str, ...]:
     """Every rate-law branch condition this model switches on a *clock* alone with.
 
     The ``.net``/BNGL answer to the question the SBML loader answers at load
@@ -2299,6 +2365,10 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
     ``steps_only`` returns the step calls alone. The sensitivity detector reads
     the conditions itself, with what each threshold's crossing moves with, and
     needs only what it does not read (issue #944).
+
+    ``clock_candidates`` is :func:`unit_rate_clock_candidates` already probed at
+    the model's current values, which :meth:`bngsim.Model.time_discontinuity_conditions`
+    has in hand for its cache key (issue #726); otherwise the scan probes once.
     """
     from bngsim._jacobian import _inline_functions, has_condition_construct
 
@@ -2342,21 +2412,14 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
         # answer it instead, which is far cheaper than the context this is
         # guarding, and the answer is reused by ``switch_condition_scope``
         # below.
+        if not texts_spell_a_switch(core):
+            return ()
         texts_raw = (*core.function_expressions, *core.param_expressions)
-        if not any(
-            has_condition_construct(t)
-            or _STEP_CALL.search(t)
-            or _RELATIONAL.search(t)
-            or _BEND_CALL.search(t)
-            for t in texts_raw
-        ):
-            return ()
-        if (
-            not any(_TIME_REF.search(t) for t in texts_raw)
-            and not time_tables
-            and not _unit_rate_clock_indices(core)
-        ):
-            return ()
+        if not any(_TIME_REF.search(t) for t in texts_raw) and not time_tables:
+            if clock_candidates is None:
+                clock_candidates = unit_rate_clock_candidates(core)
+            if not _unit_rate_clock_indices(core, clock_candidates):
+                return ()
         ctx = core.functional_jacobian_context()
     func_map = dict(ctx["function_map"])
     texts = [
@@ -2372,7 +2435,7 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
     if not conditional and not stepped and not compared and not bent:
         return ()
     try:
-        scope = switch_condition_scope(core, ctx)
+        scope = switch_condition_scope(core, ctx, clock_candidates=clock_candidates)
     except Exception as exc:  # pragma: no cover - defensive
         # Same fallback as the other model-level scans: with no scope nothing
         # can be classified, and the pre-#440 stepping is what a model gets.
@@ -7540,8 +7603,11 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
       reads changes an output, not the trajectory, so a root on it would buy a
       restart and nothing else.
     * It reads no parameter value, so the answer depends on the model's
-      structure alone and :meth:`bngsim.Model.state_switch_root_conditions`
-      caches it. A fit pays for it once, not once per evaluation.
+      structure and ``covered`` alone, and
+      :meth:`bngsim.Model.state_switch_root_conditions` caches it for each
+      ``covered``. ``covered`` itself moves with a parameter value where a
+      counter is a clock at one rate and not at another (issue #726), so a fit
+      over such a rate pays once per verdict, and any other fit once.
 
     Equalities are skipped for the reason :func:`state_switch_conditions` gives.
     Deduplicated by residual, read through :func:`_surface_key`, so one crossing

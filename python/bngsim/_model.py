@@ -116,7 +116,13 @@ class Model:
         "_time_disc_conditions",
         "_event_disc_conditions",
         "_derived_time_disc_conditions",
+        "_derived_time_disc_clocks",
+        "_clock_probe_can_matter",
+        "_clock_volume_params",
+        "_time_disc_memo",
         "_state_switch_root_conditions",
+        "_state_switch_root_covered",
+        "_state_switch_root_memo",
         "_ssa_reads_clock",
         "_table_breaks",
         "_ssa_clock_functions",
@@ -292,10 +298,26 @@ class Model:
         # None means "not looked yet"; a tuple (often empty) means the scan has
         # run. See time_discontinuity_conditions().
         self._derived_time_disc_conditions: tuple[str, ...] | None = None
+        # Issue #726: the parameter-dependent inputs it was derived at (see
+        # _clock_key()). A counter is a clock by its rate's value, so the scan
+        # is done again when that moves.
+        self._derived_time_disc_clocks: object = None
+        # Whether the scan can read a clock at all, from the texts: structural.
+        self._clock_probe_can_matter: bool | None = None
+        # Amount-valued species -> the live compartment-size parameter their
+        # amount is read through; structural, read once a probe finds a clock.
+        self._clock_volume_params: dict[int, str] | None = None
+        # Every scan made, by key, shared with clones: a batch whose rows sit at
+        # another clock verdict than the parent scans that verdict once.
+        self._time_disc_memo: dict = {}
         # Issue #897: the rate-law conditions over model state that a run without
         # sensitivities roots on, derived on first ask and cached like the line
         # above. See state_switch_root_conditions().
         self._state_switch_root_conditions: tuple[str, ...] | None = None
+        # ...the time conditions it left out as covered (issue #726), and every
+        # answer by that covered set, shared with clones like the scan's.
+        self._state_switch_root_covered: object = None
+        self._state_switch_root_memo: dict = {}
         # Issue #719: whether an SSA run needs breakpoints; structural, so once.
         self._ssa_reads_clock: bool | None = None
         # Issue #709: where the model's tables break, with how many tables it
@@ -865,8 +887,21 @@ class Model:
         re-deriving one is what keeps the stops a subset of the roots. A
         ``.net``/BNGL model is built entirely in C++, so its loader has no seam
         to register a root at and there is nothing to read back; the conditions
-        are recovered from the built model's own function bodies instead, once,
-        and cached, and only when something asks.
+        are recovered from the built model's own function bodies instead, and
+        only when something asks.
+
+        The recovery is cached, keyed by what it reads from parameter values
+        (issue #726): which species pass the unit-rate clock probes at the
+        model's current values, and the size of the live compartment each such
+        amount-valued species is read through. A BNGL counter fed at ``k_t`` is
+        a clock at ``k_t = 1`` and not otherwise, so its thresholds are time
+        conditions at one value and not at another; an SBML substance-only
+        counter fed at its compartment's size is one only while that size is 1.
+        Cached once, a model first run at ``k_t = 0`` and then at 1 got no stop
+        at a clock-gated window, and one first run at 1 and then at 0.5 got
+        neither a stop nor a root. Every recovery is kept by its key and shared
+        with clones, so a batch whose rows sit at another verdict than the
+        parent's recovers that verdict once.
 
         A recovered entry is not always a condition. Since issue #869 it can
         also be a bare step call of a clock, such as ``floor((time()-t0)/P)``,
@@ -880,30 +915,83 @@ class Model:
         an SBML model had no entry at all, and was stepped over where the same
         pulse alone was not.
         """
-        if self._derived_time_disc_conditions is None:
-            try:
-                from bngsim._switch_sensitivity import (
-                    _strip_redundant_parens,
-                    time_discontinuity_conditions,
-                )
+        key = self._clock_key()
+        if self._derived_time_disc_conditions is None or self._derived_time_disc_clocks != key:
+            derived = self._time_disc_memo.get(key)
+            if derived is None:
+                try:
+                    from bngsim._switch_sensitivity import (
+                        _strip_redundant_parens,
+                        time_discontinuity_conditions,
+                    )
 
-                registered = {
-                    _strip_redundant_parens(c).replace(" ", "") for c in self._time_disc_conditions
-                }
-                self._derived_time_disc_conditions = tuple(
-                    c
-                    for c in time_discontinuity_conditions(self._core)
-                    if _strip_redundant_parens(c).replace(" ", "") not in registered
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                # Recovery is best-effort: without it a model keeps the stepping
-                # it had before this existed, which is correct wherever it does
-                # not step over a switch.
-                logger.debug("Time-discontinuity scan unavailable (%s)", e)
-                self._derived_time_disc_conditions = ()
+                    registered = {
+                        _strip_redundant_parens(c).replace(" ", "")
+                        for c in self._time_disc_conditions
+                    }
+                    derived = tuple(
+                        c
+                        for c in time_discontinuity_conditions(
+                            self._core, clock_candidates=None if key is None else key[0]
+                        )
+                        if _strip_redundant_parens(c).replace(" ", "") not in registered
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    # Recovery is best-effort: without it a model keeps the
+                    # stepping it had before this existed, which is correct
+                    # wherever it does not step over a switch.
+                    logger.debug("Time-discontinuity scan unavailable (%s)", e)
+                    derived = ()
+                _remember(self._time_disc_memo, key, derived)
+            # The answer under a key that matches nothing, then the key: cut
+            # short anywhere here, the next ask recovers again, rather than
+            # reading one verdict's answer as another's.
+            self._derived_time_disc_clocks = _UNKEYED
+            self._derived_time_disc_conditions = derived
+            self._derived_time_disc_clocks = key
         if self._time_disc_conditions:
             return (*self._time_disc_conditions, *self._derived_time_disc_conditions)
         return self._derived_time_disc_conditions
+
+    def _clock_key(self) -> tuple | None:
+        """What :meth:`time_discontinuity_conditions`' recovery reads from
+        parameter values, as its cache key (issue #726).
+
+        ``(candidates, sizes, n_tables)``: the species at ``dc/dt = 1`` on both
+        RHS probes, whether the live compartment size each amount-valued one
+        among them is read through is 1 (the recovery asks nothing else of it,
+        so a fit over the size does not rescan per value), and how many table
+        functions the model has. What the recovery does with the candidates
+        past that reads structure only.
+        Where no text spells a switch the recovery never probes, and neither
+        does this. ``None`` where the probe itself failed, which the recovery's
+        own fallback also reads as "no clock".
+        """
+        from bngsim._switch_sensitivity import (
+            clock_volume_params,
+            texts_spell_a_switch,
+            unit_rate_clock_candidates,
+        )
+
+        core = self._core
+        try:
+            if self._clock_probe_can_matter is None:
+                self._clock_probe_can_matter = texts_spell_a_switch(core)
+            if not self._clock_probe_can_matter:
+                return (frozenset(), (), core.n_table_functions)
+            candidates = unit_rate_clock_candidates(core)
+            sizes: tuple = ()
+            if candidates:
+                if self._clock_volume_params is None:
+                    self._clock_volume_params = clock_volume_params(core)
+                live = self._clock_volume_params
+                sizes = tuple(
+                    (i, core.get_param(live[i]) == 1.0) for i in sorted(candidates) if i in live
+                )
+            return (candidates, sizes, core.n_table_functions)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Clock probe for the time-condition cache unavailable (%s)", e)
+            return None
 
     def state_switch_root_conditions(self) -> tuple[str, ...]:
         """The rate-law conditions over model state a plain run roots on (issue #897).
@@ -917,27 +1005,44 @@ class Model:
 
         The crossings :meth:`time_discontinuity_conditions` already covers are
         left out, and so is every condition in a function that no rate law
-        reads. The answer depends on the model's structure alone, so it is
-        derived once and cached, and a clone inherits it.
+        reads. Past those, the answer depends on the model's structure alone,
+        so it is cached for the covered set it was derived beside, and a clone
+        inherits it. The covered set moves with a clock's rate (issue #726): a
+        threshold on a counter is covered while the counter is a clock and has
+        to be rooted once it is not.
         """
-        if self._state_switch_root_conditions is None:
-            try:
-                from bngsim._switch_sensitivity import state_switch_root_conditions
+        return self._state_switch_roots_beside(self.time_discontinuity_conditions())
 
-                self._state_switch_root_conditions = state_switch_root_conditions(
-                    self._core, covered=self.time_discontinuity_conditions()
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                # Detection is best-effort: without it a model keeps the stepping
-                # it had before issue #897, which is correct wherever no step
-                # spans a whole state-gated window.
-                logger.warning(
-                    "State-switch root detection failed (%s); a rate law switched by "
-                    "a condition over model state will be integrated without a root "
-                    "at its crossings (issue #897).",
-                    e,
-                )
-                self._state_switch_root_conditions = ()
+    def _state_switch_roots_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """:meth:`state_switch_root_conditions` beside a ``covered`` the caller
+        has just read from :meth:`time_discontinuity_conditions`. A run has it
+        in hand from placing its stops, and asking again would probe again."""
+        if (
+            self._state_switch_root_conditions is None
+            or self._state_switch_root_covered != covered
+        ):
+            roots = self._state_switch_root_memo.get(covered)
+            if roots is None:
+                try:
+                    from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                    roots = state_switch_root_conditions(self._core, covered=covered)
+                except Exception as e:  # pragma: no cover - defensive
+                    # Detection is best-effort: without it a model keeps the
+                    # stepping it had before issue #897, which is correct
+                    # wherever no step spans a whole state-gated window.
+                    logger.warning(
+                        "State-switch root detection failed (%s); a rate law switched by "
+                        "a condition over model state will be integrated without a root "
+                        "at its crossings (issue #897).",
+                        e,
+                    )
+                    roots = ()
+                _remember(self._state_switch_root_memo, covered, roots)
+            # As in time_discontinuity_conditions(): unkeyed while it is written.
+            self._state_switch_root_covered = _UNKEYED
+            self._state_switch_root_conditions = roots
+            self._state_switch_root_covered = covered
         return self._state_switch_root_conditions
 
     def table_function_breaks(self) -> list:
@@ -1139,7 +1244,15 @@ class Model:
         m._time_disc_conditions = self._time_disc_conditions
         m._event_disc_conditions = self._event_disc_conditions
         m._derived_time_disc_conditions = self._derived_time_disc_conditions
+        m._derived_time_disc_clocks = self._derived_time_disc_clocks
+        m._clock_probe_can_matter = self._clock_probe_can_matter
+        m._clock_volume_params = self._clock_volume_params
+        # Shared, not copied: an entry is a function of the structure, which a
+        # clone has too, and of its key, so a row may answer for its siblings.
+        m._time_disc_memo = self._time_disc_memo
         m._state_switch_root_conditions = self._state_switch_root_conditions
+        m._state_switch_root_covered = self._state_switch_root_covered
+        m._state_switch_root_memo = self._state_switch_root_memo
         m._ssa_reads_clock = self._ssa_reads_clock
         m._table_breaks = self._table_breaks
         m._ssa_clock_functions = self._ssa_clock_functions
@@ -2670,6 +2783,25 @@ class Model:
             f"Model(species={self.n_species}, reactions={self.n_reactions}, "
             f"observables={self.n_observables}, parameters={self.n_parameters})"
         )
+
+
+# How many recoveries a model and its clones keep in each of the issue #726
+# memos. Each is one parameter-dependent verdict and a model has few, so a full
+# memo is emptied rather than grown.
+_DERIVATION_MEMO_MAX = 16
+
+# The key of a cache slot while its answer is written: equal to no key, so an
+# interrupted write is recovered again (issue #726). Not None, which is a key.
+_UNKEYED = object()
+
+
+def _remember(memo: dict, key, value) -> None:
+    """Keep ``value`` under ``key`` in a memo a model shares with its clones.
+    Each step is one dict operation, which is atomic under the GIL, so rows of
+    a batch on worker threads can share it; two that race only scan twice."""
+    if len(memo) >= _DERIVATION_MEMO_MAX:
+        memo.clear()
+    memo[key] = value
 
 
 # To the end of the line or a second ``#``: BNG2.pl writes

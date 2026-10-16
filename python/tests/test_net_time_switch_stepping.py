@@ -482,16 +482,35 @@ def test_a_crossing_a_parameter_moves_keeps_its_sensitivity_jump(tmp_path):
     assert float(result.sensitivities[-1][0][0]) == pytest.approx(-0.1, rel=1e-6)
 
 
-def test_a_clone_carries_the_answer_rather_than_rescanning(tmp_path):
-    """The scan is the expensive half and the conditions are text, so they do
-    not depend on any parameter value. A fan-out of clones must not repeat it."""
+def test_a_clone_carries_the_answer_rather_than_rescanning(tmp_path, monkeypatch):
+    """The scan is the expensive half. What it finds depends on parameter values
+    only through which species are unit-rate clocks (issue #726), which a fit
+    over a rate constant does not move, so a fan-out of clones must not repeat
+    it. (A counter-clock model is asked the same in
+    test_time_disc_cache_follows_clock_rate.py.)"""
+    from bngsim import _switch_sensitivity
+
     path = _net(tmp_path, _WINDOWS[0][0])
     model = bngsim.Model.from_net(str(path))
     conds = model.time_discontinuity_conditions()
     assert conds
     clone = model.clone()
+    clone.set_param("k", 0.25)
     assert clone._derived_time_disc_conditions is not None
+
+    # Counted rather than raised: the model's own fallback catches whatever
+    # the scan raises and caches (), so a raise would surface only as a
+    # mismatch below, not as the reason.
+    scans = []
+    scan = _switch_sensitivity.time_discontinuity_conditions
+
+    def counting(*args, **kwargs):
+        scans.append(args)
+        return scan(*args, **kwargs)
+
+    monkeypatch.setattr(_switch_sensitivity, "time_discontinuity_conditions", counting)
     assert clone.time_discontinuity_conditions() == conds
+    assert scans == [], "the clone scanned again"
 
 
 def test_the_crossing_is_resolved_against_live_parameter_values(tmp_path):

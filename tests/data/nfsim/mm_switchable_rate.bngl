@@ -1,0 +1,24 @@
+# bngsim GH #854 fixture: S() + E() -> P() + E() with a Michaelis-Menten rate law.
+# kcat = 0 at load, so a post-init set_param('kcat', ...) must switch it on.
+begin model
+begin parameters
+  kcat 0
+  Km   100
+end parameters
+begin molecule types
+  E()
+  S()
+  P()
+end molecule types
+begin seed species
+  E() 10
+  S() 1000
+end seed species
+begin observables
+  Molecules Ptot P()
+end observables
+begin reaction rules
+  S() + E() -> P() + E() MM(kcat,Km)
+end reaction rules
+end model
+writeXML()
