@@ -1007,8 +1007,8 @@ class Simulator:
 
             refuse_time_dependent_rate_laws(xml_path, "nfsim")
             refuse_nfsim_rate_laws(xml_path)
-            refuse_nfsim_compartments(xml_path)
             refuse_nfsim_stale_local_functions(xml_path)
+            refuse_nfsim_compartments(xml_path)
             self._sim = NfsimSimulator(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))

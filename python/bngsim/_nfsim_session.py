@@ -144,8 +144,8 @@ class NfsimSession:
 
         refuse_time_dependent_rate_laws(self._xml_path, "nfsim")
         refuse_nfsim_rate_laws(self._xml_path)
-        refuse_nfsim_compartments(self._xml_path)
         refuse_nfsim_stale_local_functions(self._xml_path)
+        refuse_nfsim_compartments(self._xml_path)
         # Reads let through only because no rule can change their observable
         # (GH #1062): a count edit of one of these types would make them stale.
         self._constant_read_types = constant_read_types(self._xml_path)

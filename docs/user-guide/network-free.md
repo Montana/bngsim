@@ -168,27 +168,18 @@ model's generated network with `method="ode"` or `method="ssa"`.
 
 ### Compartment models
 
-NFsim gets a compartment model right only in a narrow envelope. It reads a
-compartment from a seed species (`@EC:A(b) 200`) and from a molecule (`A()@EC`),
-but not from a pattern, so BioNetGen's species-level prefix `@EC:A()` matched
-every compartment (RuleWorld/nfsim#106); it gave no compartment to a molecule a
-rule creates with none written, as in `A -> A + C()`, where BioNetGen uses the
-reactants' compartment (RuleWorld/nfsim#109); and it scales by volume only
-zero-order synthesis into one compartment, not a rule with two or more
-reactants or synthesis of a complex that spans compartments
-(RuleWorld/nfsim#108). Each of these ran without an error. NFsim therefore
-refuses, naming the rule or observable:
-
-- any pattern that carries a compartment (`@EC:A()`);
-- a rule that creates a molecule with no compartment written, when some pattern
-  places that type in a compartment;
-- if any compartment's size, or `NumberPerQuantityUnit`, is not 1: a rule with
-  two or more reactants, or a zero-order rule whose products do not sit in
-  exactly one compartment.
-
-Unimolecular rules and zero-order synthesis into one compartment run at any
-size. Issue #1067 lifts the refusal once the upstream fixes are vendored; until
-then simulate the generated network with `method="ode"` or `method="ssa"`.
+NFsim refuses a model that declares compartments, naming them. Its compartment
+support ran such models wrong without an error, in ways no check of the XML can
+bound: it ignored a species-level compartment on a pattern (`@EC:A()` matched
+every compartment, RuleWorld/nfsim#106); applied no volume factor to a rule with
+two or more reactants or to synthesis spanning compartments (#108); gave no
+compartment to a molecule a rule creates with none written (#109); put every
+molecule of a seed complex in the species' compartment, bound molecules in
+compartments that do not touch, and moved a whole complex on `MoveConnected`
+(#110). BNG2.pl's `writeXML` also drops `NumberPerQuantityUnit`
+(RuleWorld/bionetgen#348), so even a careful check could not see it. Issue #1067
+lifts the refusal once the fixes are vendored; until then simulate a compartment
+model's generated network with `method="ode"` or `method="ssa"`.
 
 ### Functions that read an observable outside their argument
 

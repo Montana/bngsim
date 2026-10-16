@@ -1,6 +1,6 @@
-# bngsim GH #1067 fixture: the same model with every compartment on a molecule
-# (A()@EC) or a seed species, both of which NFsim reads: allowed, and it agrees
-# with the network.
+# bngsim GH #1067 fixture: compartments only on molecules and seed species, all
+# of size 1, and one unimolecular rule. NFsim happens to run this one right,
+# but it is refused like every compartment model (see test_nfsim_compartments).
 begin model
 begin parameters
   kd 0.5
