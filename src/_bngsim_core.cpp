@@ -2753,16 +2753,24 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def("set_block_same_complex_binding",
              &bngsim::RuleMonkeySimulator::set_block_same_complex_binding, py::arg("enabled"),
              "Block same-complex binding. Default: true.")
+        .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
+             "Whether the model reads the clock (default true): one-shot runs then run on "
+             "the model's clock, else on time elapsed since t_start, and a span too short "
+             "for the doubles near its times to integrate a clock-driven rate is refused")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
+        .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
+             "RuleMonkey's warning-level load diagnostics, each 'element: feature'")
         // ── Session API (stateful, multi-action workflows) ──────────────
         .def(
             "initialize",
-            [](bngsim::RuleMonkeySimulator &self, uint64_t seed) {
+            [](bngsim::RuleMonkeySimulator &self, uint64_t seed, double t_start) {
                 py::gil_scoped_release release;
-                self.initialize(seed);
+                self.initialize(seed, t_start);
             },
-            py::arg("seed") = 42, "Initialize a simulation session")
+            py::arg("seed") = 42, py::arg("t_start") = 0.0,
+            "Initialize a simulation session with the seed state at t_start on the "
+            "model's clock")
         .def(
             "step_to",
             [](bngsim::RuleMonkeySimulator &self, double time, double timeout_seconds) {

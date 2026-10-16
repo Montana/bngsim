@@ -792,9 +792,9 @@ class RuleMonkeySimulator:
         """
         Whether a session is currently active
         """
-    def initialize(self, seed: typing.SupportsInt | typing.SupportsIndex = 42) -> None:
+    def initialize(self, seed: typing.SupportsInt | typing.SupportsIndex = 42, t_start: typing.SupportsFloat | typing.SupportsIndex = 0.0) -> None:
         """
-        Initialize a simulation session
+        Initialize a simulation session with the seed state at t_start on the model's clock
         """
     def load_state(self, path: str) -> None:
         """
@@ -828,6 +828,10 @@ class RuleMonkeySimulator:
         """
         Set a parameter override
         """
+    def set_reads_clock(self, enabled: bool) -> None:
+        """
+        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start, and a span too short for the doubles near its times to integrate a clock-driven rate is refused
+        """
     def set_species_count(self, pattern: str, count: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
         Set count for an exact BNGL species pattern (adds/removes the diff)
@@ -839,6 +843,10 @@ class RuleMonkeySimulator:
     def step_to(self, time: typing.SupportsFloat | typing.SupportsIndex, timeout_seconds: typing.SupportsFloat | typing.SupportsIndex = 0.0) -> None:
         """
         Advance simulation to target time without returning output. timeout_seconds > 0 enables a wall-clock budget; on overrun, raises bngsim.SimulationTimeout.
+        """
+    def unsupported_warnings(self) -> list[str]:
+        """
+        RuleMonkey's warning-level load diagnostics, each 'element: feature'
         """
     @property
     def xml_path(self) -> str:

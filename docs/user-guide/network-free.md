@@ -139,19 +139,66 @@ Arrhenius laws, and on local functions.
 
 ### Rate laws that read `time()`
 
-Neither backend can run a function that reads `time()` (or a bare `time`), so
-both refuse one when the simulator or session is built, naming the function
-(issue #862). RuleMonkey treats a total propensity of 0 as final: a rate such as
-`if(time()>=6, k, 0)`, which is 0 at the start, never fires, and the run would
-return the initial state on every row (richardposner/RuleMonkey#86). NFsim cannot
-prepare such a function at all. Simulate the generated network with
-`method="ode"` or `method="ssa"` instead, which read `time()` as the model time.
+`method="rm"` runs a function that reads `time()` (or a bare `time`), and a
+table function indexed by time (`tfun(..., time)`), on **absolute model time**,
+as `method="ode"` and `method="ssa"` do: `run(t_span=(5, 7))` starts from the
+initial state at t = 5, and `time()` reads 5 there. RuleMonkey integrates a rate
+that reads the clock between events, so a rate such as `if(time()>=6, k, 0)`,
+which is 0 at the start, turns on at t = 6 (issue #1022).
 
-A table function indexed by time (`tfun(..., time)`) falls into the same trap on
-RuleMonkey, which refuses it too. NFsim runs one, but refreshes its value only
-when a reaction fires. So a rate that is 0 at the start, or that changes while
+NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
+one when the simulator or session is built, naming the function (issue #862).
+Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
+NFsim runs a table function indexed by time, on **time elapsed since
+`t_start`**, as BNG2.pl's `simulate_nf` does, and refreshes its value only when
+a reaction fires. So a rate that is 0 at the start, or that changes while
 nothing fires, is not seen until something does, and until then the run is flat
 (issue #892).
+
+A model that reads neither `time()` nor a time-indexed table cannot tell the
+two clocks apart, and runs on elapsed time on both backends, which keeps event
+times small at a large `t_start`. RuleMonkey integrates a rate that reads the
+clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
+whose span is too short for the doubles near its times to place them (a span of
+2 at t = 1e13), rather than return a run that never fires. A model that reads
+the clock still places its events on absolute time, so once the total
+propensity times |t| nears 1e15 its waiting times are rounded and the run is
+biased with no error, as `method="ssa"` is on any model there (issue #1059).
+Keep such a run's times moderate.
+
+### Arrhenius (energy) rules
+
+`method="rm"` gives an energy rule BNG2's rate, `exp(-(Ea0 + phi*dG))` with `dG`
+the free-energy change of the reaction the rule writes, and `1-phi` for the
+reverse half of a reversible rule. Energies are in units of RT: there is no RT
+in the formula, and a parameter named `RT` is an ordinary parameter, which a
+model in kJ/mol divides by where it uses it (issue #1022).
+
+RuleMonkey expands each energy rule at load, and reads only some energy
+patterns as BNG2 does: the bonded pair of sites a rule joins or parts, alone or
+with one more bond to a molecule of a third type whose site binds nothing else,
+on a rule that names only those two sites. That covers pair and cooperativity
+patterns. It drops or misapplies a state, a site that must be free, a wildcard
+bond, a site named twice, context further out, and context in the rule itself
+(richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
+until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
+`method="ssa"` on the generated network.
+
+### Compartments
+
+RuleMonkey does not scale rates by compartment volume or keep molecules in
+their compartments, so `method="rm"` refuses a model that declares
+compartments (issue #1022). Use `method="ode"` or `method="ssa"` on the
+generated network.
+
+### RuleMonkey's warnings
+
+RuleMonkey refuses a model it cannot honor, naming what it cannot, and warns of
+constructs it reads in a way that is easy to miss: a rule whose products can
+never be what it writes (BioNetGen generates no reaction for it, and RuleMonkey
+never fires it), a Michaelis-Menten law over a pattern that matches several
+species, `TotalRate`, and the like. Each warning is a
+`bngsim.RuleMonkeyWarning`, emitted when the simulator or session is built.
 
 ### Rate laws NFsim cannot run
 
@@ -184,6 +231,16 @@ with RuleMonkeySession("model.xml") as rm:
     rm.initialize(seed=42)
     result = rm.simulate(0, 100, n_points=101)
 ```
+
+A RuleMonkey session's clock is model time. `initialize(seed, t_start=5)` puts
+the seed state at t = 5; left unset, the first `simulate` sets it from its own
+start for a model that reads the clock, provided nothing has moved the session
+first. A segment that starts at `current_time` runs on the clock. One that
+starts elsewhere continues from `current_time` and is labelled with the times
+asked for, which a model that reads the clock refuses, since its rows would not
+be labelled with the times it read. An NFsim session's clock is elapsed time.
+On both, a result's `solver_stats["n_steps"]` counts the events since
+`initialize`, not the segment's alone.
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`

@@ -1,0 +1,28 @@
+# Issue #1022: an Arrhenius state-change rule, which RuleMonkey 3.11.0 refuses
+# itself at load ("not a supported 2-reactant binding/unbinding shape"). bngsim
+# leaves the refusal to it, rather than blaming richardposner/RuleMonkey#109.
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_P -1
+end parameters
+begin molecule types
+  A(s~0~1)
+end molecule types
+begin seed species
+  A(s~0) 100
+end seed species
+begin energy patterns
+  A(s~1) G_P
+end energy patterns
+begin observables
+  Molecules A1 A(s~1)
+end observables
+begin reaction rules
+  A(s~0) <-> A(s~1) Arrhenius(phi,Ea0)
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

@@ -1,0 +1,34 @@
+# One-way Arrhenius unbinding of A.B with an energy pattern that requires A's c
+# site to be FREE. A.B with c bound to C must not get G_free.
+# BNG2: free-c A.B: dG = -(G_AB+G_free) = 3 -> exp(-(0.2+0.35*3)) = 0.2865
+#       C-bound A.B: dG = -G_AB = 2 -> exp(-0.9) = 0.4066
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_AB -2
+  G_free -1
+end parameters
+begin molecule types
+  A(b,c)
+  B(a)
+  C(a)
+end molecule types
+begin seed species
+  A(b!1,c).B(a!1) 1000
+  A(b!1,c!2).B(a!1).C(a!2) 1000
+end seed species
+begin energy patterns
+  A(b!1).B(a!1) G_AB
+  A(b!1,c).B(a!1) G_free
+end energy patterns
+begin observables
+  Molecules AB1 A(b!1,c).B(a!1)
+  Molecules AB0 A(b!1,c!+).B(a!1)
+end observables
+begin reaction rules
+  A(b!1).B(a!1) -> A(b) + B(a) Arrhenius(phi,Ea0)
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()
