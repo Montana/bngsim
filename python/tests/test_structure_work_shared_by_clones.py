@@ -202,34 +202,37 @@ def _output_sensitivity(model, name):
     return np.asarray(result.output_sensitivities([name])).reshape(3, -1)[:, 0]
 
 
-def test_a_table_function_added_over_an_analyzed_function_is_seen(tmp_path):
+def test_a_table_function_over_an_analyzed_function_is_refused(tmp_path):
     """A model that was analyzed and is then given a table function with the
-    name of one of its functions. The compiled code reads ``drive`` from the
-    table from then on, and it has no derivative in ``k``. The analysis was
-    kept, its key having the number of functions in it and no table, and
-    ``d drive/dk = 1`` came back with ``dg/dk = 0.5``. The selector raises
-    with the reason."""
+    name of one of its functions. The compiled code read ``drive`` from the
+    table from then on while the interpreter kept its body, and the kept
+    analysis returned ``d drive/dk = 1``. The table is refused (issue #772),
+    and the analysis is still the model's."""
     model = _model(tmp_path, READS_A_FUNCTION)
     np.testing.assert_allclose(_output_sensitivity(model, "drive"), 1.0)
     np.testing.assert_allclose(_output_sensitivity(model, "g"), 0.5)
-    model.add_table_function("drive", times=[0.0, 10.0], values=[0.0, 10.0])
-    with pytest.raises(ValueError, match=r"expression 'drive' has no output sensitivity"):
-        _output_sensitivity(model, "drive")
+    with pytest.raises(bngsim.ModelError, match="already has a function named 'drive'"):
+        model.add_table_function("drive", times=[0.0, 10.0], values=[0.0, 10.0])
+    np.testing.assert_allclose(_output_sensitivity(model, "drive"), 1.0)
+    np.testing.assert_allclose(_output_sensitivity(model, "g"), 0.5)
 
 
 def test_a_table_function_on_one_clone_is_not_its_siblings(tmp_path):
-    """Two clones of one model, one given the table over ``drive``: each has
-    what its own functions are. The memo being the family's, the key has to
-    tell them apart, by each table's name, by what it is read over (the same
-    name over the time and over a parameter are two calls in the code), and
-    by their order, which is what the code calls them by."""
+    """Two clones of one model, one given a table: each has what its own
+    functions are. The memo being the family's, the key has to tell them
+    apart, by each table's name, by what it is read over (the same name over
+    the time and over a parameter are two calls in the code), and by their
+    order, which is what the code calls them by. (A table over ``drive``
+    itself is refused, issue #772.)"""
     from bngsim._codegen import _output_sens_analysis_key
 
     base = _model(tmp_path, READS_A_FUNCTION)
     plain, tabled = base.clone(), base.clone()
-    tabled.add_table_function("drive", times=[0.0, 10.0], values=[0.0, 10.0])
-    with pytest.raises(ValueError, match=r"expression 'drive' has no output sensitivity"):
-        _output_sensitivity(tabled, "drive")
+    with pytest.raises(bngsim.ModelError, match="already has a function named 'drive'"):
+        tabled.add_table_function("drive", times=[0.0, 10.0], values=[0.0, 10.0])
+    tabled.add_table_function("drive_data", times=[0.0, 10.0], values=[0.0, 10.0])
+    assert _output_sens_analysis_key(tabled._core) != _output_sens_analysis_key(plain._core)
+    np.testing.assert_allclose(_output_sensitivity(tabled, "drive"), 1.0)
     np.testing.assert_allclose(_output_sensitivity(plain, "drive"), 1.0)
     np.testing.assert_allclose(_output_sensitivity(base.clone(), "g"), 0.5)
 
