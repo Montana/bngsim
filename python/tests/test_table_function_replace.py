@@ -335,3 +335,28 @@ def test_a_tfun_on_the_clock_still_marks_the_model_and_its_clones(tmp_path) -> N
     assert model._core.functions_use_time is True
     assert model.clone()._core.functions_use_time is True
     assert _model(tmp_path, _TFUN_OVER_K)._core.functions_use_time is False
+
+
+@ENGINES
+def test_a_condition_over_the_table_follows_its_new_data(tmp_path, codegen) -> None:
+    # rate = 1 once drive passes 2. drive = t crosses at t = 2, A(10) = 8; new
+    # data drive = 2t crosses at t = 1, A(10) = 9. The crossing is cached for
+    # the model, and a Simulator made before the call reads it as well.
+    model = _model(
+        tmp_path,
+        '    1 drive() tfun([0,10],[0,10], time, method=>"linear")\n'
+        "    2 rate() if(drive()>2, 1, 0)",
+        "    1 0 1 rate",
+    )
+    sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+
+    def a_at_10(s):
+        model.reset()
+        return float(np.asarray(s.run(t_span=(0.0, 10.0), n_points=2).species)[-1, 0])
+
+    assert a_at_10(sim) == pytest.approx(8.0, rel=1e-6)
+    _quiet_add(model, "drive", times=[0.0, 10.0], values=[0.0, 20.0])
+    assert a_at_10(sim) == pytest.approx(9.0, rel=1e-6)
+    assert a_at_10(bngsim.Simulator(model, method="ode", codegen=codegen)) == pytest.approx(
+        9.0, rel=1e-6
+    )
