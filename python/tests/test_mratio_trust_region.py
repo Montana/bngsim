@@ -16,10 +16,9 @@ work.
   settles at about 84; by then rounding has frozen the iterates.
 * So the decision has to be made from the arguments, before the fraction runs.
 
-The region it is trusted in, measured against a 40 digit reference:
-
-All of it for ``b > 0`` only (issue #768): every grid behind it had a positive
-``b``, and with ``b`` negative the fraction is wrong inside each clause.
+The region it is trusted in, measured against a 40 digit reference, is all for
+``b > 0`` only (issue #768): every grid behind it had a positive ``b``, and with
+``b`` negative the fraction is wrong inside each clause. Within that:
 
 * ``a`` a negative integer. Safe by construction rather than by
   measurement: the odd partial numerator carries ``z*(a+k)`` and reaches exactly
@@ -29,6 +28,8 @@ All of it for ``b > 0`` only (issue #768): every grid behind it had a positive
 * ``a <= 0`` with ``z <= 0``. This is where BNG models live, since a model builds
   ``a = -min(AT, BT)`` and ``z = -1/Keq``, and it stays true when a fit moves the
   counts off the integers.
+* ``|z| <= 20``, clean over 3400 hostile triples where the first wrong answer
+  anywhere is at ``|z| = 60``.
 * ``b*b >= 64*|z*a|``, which says the odd partial numerators start small,
   and for a positive ``z`` also ``2*z <= b``, which is the same statement
   about the even ones. That second half is issue #456: without it this
@@ -156,12 +157,14 @@ def test_the_regime_models_use_still_answers(tmp_path, a, b, z, expect):
 
 
 def test_a_negative_integer_terminates_the_fraction(tmp_path):
-    """z > 0 as well, which only this clause admits."""
+    """z > 20 as well, with a small b, which only this clause admits."""
     assert _value(tmp_path, -7.0, 3.0, 0.0) == pytest.approx(1.0, rel=1e-12)
-    assert _value(tmp_path, 0.0, 3.0, 0.0) == pytest.approx(1.0, rel=1e-12)
     assert _value(tmp_path, -2.0, 5.0, -0.5) == pytest.approx(26.0 / 29.0, rel=1e-12)
-    # a = -3 with z = +10: refused by the other two clauses, admitted by this one.
     assert _value(tmp_path, -3.0, 2.5, 10.0) == pytest.approx(-0.774436090226, rel=1e-9)
+    # a = -3 with z = +30: past |z| <= 20, and b*b = 6.25 is under 64*|z*a| =
+    # 5760, so every other clause refuses it and only this one admits it. The
+    # asymptotic route cannot stand in either: a is a pole of Gamma(a).
+    assert _value(tmp_path, -3.0, 2.5, 30.0) == pytest.approx(-0.0994800693240901, rel=1e-12)
 
 
 def test_a_small_partial_numerator_is_admitted(tmp_path):
@@ -227,6 +230,7 @@ def test_a_zero_or_a_negative_b_is_not_answered_wrongly(tmp_path, a, b, z, old, 
         (0.0, 1.0, 20.0, 24258259.720489514),  # (e^20 - 1)/20
         (0.0, 1.0, 1e-3, 1.0005001667083417),
         (0.0, 1.0, -100.0, 0.01),  # a <= 0 and z <= 0: (1 - e^-100)/100
+        (0.0, 3.0, 0.0, 1.0),  # the same clause at z = 0, where M(1, b+1, 0) = 1
         (-16.0, 25.44, -15.76, 0.5501014741976908),  # a negative integer, b > 0
     ],
 )
@@ -265,9 +269,10 @@ def test_the_issues_model_follows_the_closed_form(tmp_path, codegen):
     p.write_text(ISSUE_768_NET)
     with contextlib.redirect_stderr(io.StringIO()):
         model = bngsim.Model.from_net(str(p))
-        result = bngsim.Simulator(model, method="ode", codegen=codegen).run(
-            t_span=(0.0, 1.0), n_points=3
-        )
+        sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+        result = sim.run(t_span=(0.0, 1.0), n_points=3)
+    # The compiled leg has to run the generated C, or it tests the interpreter twice.
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
     assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-6)
 
 
@@ -275,10 +280,13 @@ def test_the_issues_model_follows_the_closed_form(tmp_path, codegen):
 def test_a_negative_b_in_a_rate_law_fails_rather_than_returning_a_wrong_trajectory(
     tmp_path, codegen
 ):
+    """The interpreter raises the refusal; the generated C returns NaN, and the
+    run's non-finite witness re-evaluates the model and carries the same text."""
     p = tmp_path / "m768b.net"
     p.write_text(ISSUE_768_NET.replace("mratio(0,1,50)*scale", "mratio(-22.52,-25.18,-12.0)"))
     with contextlib.redirect_stderr(io.StringIO()):
         model = bngsim.Model.from_net(str(p))
         sim = bngsim.Simulator(model, method="ode", codegen=codegen)
-        with pytest.raises(Exception):  # noqa: B017 - each engine refuses by its own route
+        with pytest.raises(bngsim.SimulationError, match=r"not reliable.*#768"):
             sim.run(t_span=(0.0, 1.0), n_points=3)
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))

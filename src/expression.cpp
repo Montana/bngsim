@@ -490,19 +490,27 @@ std::string expr_compat::exact_literals(const std::string &expr) {
 
 // a == 0 has a closed form (issue #768): M(0, b, z) = 1, so the ratio is
 // M(1, b+1, z) = sum_k z^k / (b+1)_k. For b > 0 and z > 0 every term is
-// positive, so the sum carries no cancellation and is good to rounding, where
-// the fraction runs on at a = 0 (no odd numerator vanishes) and is only
-// marginal inside |z| <= 20: mratio(0, 1, 20) came out 8.7e-9 off. Past the
-// largest term, at k = z - b - 1, the terms fall faster than geometrically, so
-// a term below eps of the sum ends it. A sum past the largest double is +inf,
-// which is the ratio rounded; the non-finite warner reports it as such.
+// positive, so the sum carries no cancellation, where the fraction runs on at
+// a = 0 (no odd numerator vanishes) and is only marginal inside |z| <= 20:
+// mratio(0, 1, 20) came out 8.7e-9 off. Not quite good to rounding, since each
+// term adds one: against mpmath over b up to 1e4 and z up to 2e4 the worst
+// was 2.6e-13. Past the largest term, at k = z - b - 1, the terms fall faster
+// than geometrically, so a term below eps of the sum ends it. A sum past the
+// largest double is +inf, which is the ratio rounded; the non-finite warner
+// reports it as such. The cap is reached only with b past about 1e10 and z
+// near b, where the terms fall too slowly; the NaN then sends the call on to
+// the rule above, which refuses a = 0 with 2*z > b.
+//
+// The inf and NaN tests are comparisons rather than isinf/isnan because the
+// generated copy has to spell them that way (see mratio_is_finite), and the two
+// copies are kept spelled alike.
 static double mratio_a_zero_series(double b, double z) {
     double term = 1.0;
     double sum = 1.0;
     for (int k = 0; k < 1000000; ++k) {
         term *= z / (b + 1.0 + k);
         sum += term;
-        if (std::isinf(sum)) {
+        if (sum > 1.7976931348623157e308) { // +inf
             return sum;
         }
         if (z < b + 1.0 + k && term <= 1.0e-17 * sum) {
@@ -515,7 +523,7 @@ static double mratio_a_zero_series(double b, double z) {
 double expr_compat::mratio(double a, double b, double z) {
     if (a == 0.0 && b > 0.0 && z > 0.0) {
         const double summed = mratio_a_zero_series(b, z);
-        if (!std::isnan(summed)) {
+        if (summed == summed) { // not NaN
             return summed;
         }
     }
