@@ -28,6 +28,10 @@ alone change no rate, so only the rate law is refused. So is a rate-law type
 NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
 such a rule with a message only its captured log holds, so the rule never fires.
 
+A species-level compartment on a pattern, ``@EC:A()``, is refused on NFsim too
+(issue #1067): NFsim reads a compartment only from seed species and molecules,
+so such a pattern matches every compartment (RuleWorld/nfsim#106).
+
 A function with an argument that reads, outside it, an observable that can
 change, directly or through a function it calls, is refused on NFsim too
 (issue #1062): NFsim re-evaluates such a function only on the complexes a
@@ -465,6 +469,68 @@ def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:
         "produces, so that term goes stale on every other molecule, without an error "
         "(RuleWorld/nfsim#104; this refusal is lifted under issue #1062). Simulate the "
         "network BNG2.pl generates with method='ode' or method='ssa'."
+    )
+
+
+def pattern_compartments(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(where, compartment)`` for each pattern in *xml_path* that carries a
+    species-level compartment (BioNetGen's ``@EC:A()`` prefix, written as
+    ``compartment="EC"`` on an observable's ``<Pattern>`` or a rule's
+    ``<ReactantPattern>`` / ``<ProductPattern>``). *where* names the observable
+    or the rule. Empty when the file cannot be parsed.
+
+    A seed species' compartment (``<Species compartment=...>``) and a molecule's
+    (``A()@EC``) are not patterns' and are not listed: NFsim reads both.
+    """
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    found: list[tuple[str, str]] = []
+    for kind, label in (("Observable", "observable"), ("ReactionRule", "rule")):
+        for el in root.iter():
+            if _local(el.tag) != kind:
+                continue
+            name = el.get("name") or el.get("id") or "?"
+            comps = sorted(
+                {
+                    p.get("compartment", "")
+                    for p in el.iter()
+                    if _local(p.tag) in ("Pattern", "ReactantPattern", "ProductPattern")
+                    and p.get("compartment")
+                }
+            )
+            found += [(f"{label} '{name}'", c) for c in comps]
+    return found
+
+
+def _grouped(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for key, value in pairs:
+        out.setdefault(key, []).append(value)
+    return out
+
+
+def refuse_nfsim_pattern_compartments(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* has a pattern with a species-level
+    compartment, which NFsim ignores (RuleWorld/nfsim#106). NFsim only."""
+    found = pattern_compartments(xml_path)
+    if not found:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    raise ModelError(
+        f"{label} cannot run a model with a species-level compartment on a pattern: "
+        + ", ".join(
+            f"{where} ({', '.join(f'@{c}:' for c in comps)})"
+            for where, comps in _grouped(found).items()
+        )
+        + ". NFsim ignores such a compartment, so the pattern matches the molecule in "
+        "every compartment: an observable counts the wrong molecules, a rule acts on the "
+        "wrong ones, and a product is made at the wrong rate, without an error "
+        "(RuleWorld/nfsim#106; this refusal is lifted under issue #1067). Write the "
+        "compartment on the molecule instead, A()@EC, which NFsim reads and which means "
+        "the same for a single molecule, or simulate the network BNG2.pl generates with "
+        "method='ode' or method='ssa'."
     )
 
 

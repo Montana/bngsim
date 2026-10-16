@@ -166,6 +166,19 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
+### Compartments on patterns
+
+NFsim reads a compartment from a seed species (`@EC:A(b) 200`) and from a
+molecule (`A()@EC`), but not from a pattern. BioNetGen's species-level prefix,
+`@EC:A()`, puts the compartment on the pattern, so NFsim ignored it and the
+pattern matched every compartment, without an error (RuleWorld/nfsim#106): an
+observable `@EC:A()` counted every A, `@EC:A() -> 0` degraded the A in other
+compartments too, and `0 -> @EC:A2()` ran without its volume factor. NFsim
+therefore refuses any observable or rule with such a pattern, naming each (issue
+#1067 lifts it once the upstream fix is vendored). For a single molecule,
+`A()@EC` means the same and runs; otherwise simulate the generated network with
+`method="ode"` or `method="ssa"`.
+
 ### Functions that read an observable outside their argument
 
 In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
