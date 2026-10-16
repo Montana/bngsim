@@ -192,12 +192,21 @@ Constructor:
   Create a RuleMonkey session from a BNGL-generated NFsim XML file
 
 Session control:
-- **`initialize(seed)`** — Initialize the live RuleMonkey system
+- **`initialize(seed, t_start=None)`** — Initialize the live RuleMonkey system
+  with the seed state at `t_start` on the model's clock (`current_time` reads
+  it). Left `None`, the clock starts at 0, and for a model that reads the clock
+  the first `simulate` moves the seed state to its own start if nothing has
+  moved the session first (issue #1022)
 - **`simulate(t_start, t_end, *, n_points, timeout)`** → `Result` —
   `timeout` is a wall-clock budget in seconds (`None` disables, the
   default). Polled by upstream every ~1024 SSA events; on overrun raises
   `bngsim.SimulationTimeout` and the session must be destroyed before
-  reuse.
+  reuse. A segment that starts at `current_time` runs on the session clock,
+  which is model time. One that starts elsewhere continues from
+  `current_time` and is labelled with the times asked for; for a model that
+  reads the clock (`time()` or a table function indexed by time) that raises
+  `SimulationError`. `solver_stats["n_steps"]` counts the events since
+  `initialize`, as an `NfsimSession`'s does.
 - **`step_to(time, *, timeout)`** — Advance without recording output;
   honors the same `timeout` semantics as `simulate(...)`.
 - **`destroy()`** — Release the live RuleMonkey session
@@ -282,6 +291,13 @@ All inherit from `bngsim.BngsimError` (which inherits `RuntimeError`):
 - **`ParameterError`** — Unknown parameter name, invalid value
 - **`SensitivityUnsupportedError`** — Forward sensitivity declined for this model: an event whose crossing time moves in a way `dt*/dp` cannot be computed for, or a rate law that does not differentiate to closed form. A declared capability gap, not a failure — catch it to fall back on a derivative-free optimizer. Also inherits `ValueError` (what both sites raised before the class existed), so `except ValueError` still catches it. A missing compiler/JIT is *not* this exception; that stays a plain `RuntimeError`.
 - **`StopConditionMet`** — Stop condition triggered; `.result` has partial data
+
+Warnings (`UserWarning` subclasses; filter or escalate them with `warnings`):
+
+- **`RuleMonkeyWarning`** — `method="rm"` or a `RuleMonkeySession` loaded a model
+  for which RuleMonkey reports a warning-level diagnostic: how it reads a rule
+  or rate law, such as a rule whose products can never be what it writes, which
+  it never fires as BioNetGen generates no reaction for it (issue #1022)
 
 ## `.net` files as a dict
 

@@ -1,0 +1,18 @@
+# Created by BioNetGen 2.9.3
+begin parameters
+    1 Ea0                 0.2  # Constant
+    2 phi                 0.35  # Constant
+    3 G_AB                -2  # Constant
+    4 __reverse_u_local1  exp((-(Ea0+(phi*(-G_AB)))))  # ConstantExpression
+end parameters
+begin species
+    1 A(x!1).B(y!1) 1000
+    2 A(x) 0
+    3 B(y) 0
+end species
+begin reactions
+    1 1 2,3 __reverse_u_local1 #_reverse_u
+end reactions
+begin groups
+    1 AB                   1
+end groups

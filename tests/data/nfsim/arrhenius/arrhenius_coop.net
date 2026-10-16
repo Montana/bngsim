@@ -1,0 +1,39 @@
+# Created by BioNetGen 2.9.3
+begin parameters
+    1 Ea0                   0.5  # Constant
+    2 phi                   0.3  # Constant
+    3 Gf_AB                 3.5  # Constant
+    4 Gf_BC                 3.5  # Constant
+    5 Gf_coop               -2  # Constant
+    6 __R1_local1           exp((-(Ea0+(phi*Gf_AB))))  # ConstantExpression
+    7 __R2_local1           exp((-(Ea0+(phi*Gf_BC))))  # ConstantExpression
+    8 __R1_local2           exp((-(Ea0+(phi*(Gf_AB+Gf_coop)))))  # ConstantExpression
+    9 __reverse__R1_local1  exp((-(Ea0+((1-phi)*(-Gf_AB)))))  # ConstantExpression
+   10 __R2_local2           exp((-(Ea0+(phi*(Gf_BC+Gf_coop)))))  # ConstantExpression
+   11 __reverse__R2_local1  exp((-(Ea0+((1-phi)*(-Gf_BC)))))  # ConstantExpression
+   12 __reverse__R1_local2  exp((-(Ea0+((1-phi)*((-Gf_AB)+(-Gf_coop))))))  # ConstantExpression
+   13 __reverse__R2_local2  exp((-(Ea0+((1-phi)*((-Gf_BC)+(-Gf_coop))))))  # ConstantExpression
+end parameters
+begin species
+    1 A(b) 100
+    2 B(a,c) 100
+    3 C(b) 100
+    4 A(b!1).B(a!1,c) 0
+    5 B(a,c!1).C(b!1) 0
+    6 A(b!1).B(a!1,c!2).C(b!2) 0
+end species
+begin reactions
+    1 1,2 4 __R1_local1 #_R1
+    2 2,3 5 __R2_local1 #_R2
+    3 1,5 6 __R1_local2 #_R1
+    4 4 1,2 __reverse__R1_local1 #_reverse__R1
+    5 3,4 6 __R2_local2 #_R2
+    6 5 2,3 __reverse__R2_local1 #_reverse__R2
+    7 6 1,5 __reverse__R1_local2 #_reverse__R1
+    8 6 3,4 __reverse__R2_local2 #_reverse__R2
+end reactions
+begin groups
+    1 AB                   4,6
+    2 BC                   5,6
+    3 ABC                  6
+end groups

@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Created by BioNetGen 2.9.3  -->
+<sbml xmlns="http://www.sbml.org/sbml/level3" level="3" version="1">
+  <model id="state_change">
+    <ListOfParameters>
+      <Parameter id="Ea0" type="Constant" value="0.2" expr="0.2"/>
+      <Parameter id="phi" type="Constant" value="0.35" expr="0.35"/>
+      <Parameter id="G_P" type="Constant" value="-1" expr="-1"/>
+      <Parameter id="__R1_local1" type="Constant" value="1.1618342" expr="exp((-(Ea0+(phi*G_P))))"/>
+      <Parameter id="__reverse__R1_local1" type="Constant" value="0.42741493" expr="exp((-(Ea0+((1-phi)*(-G_P)))))"/>
+    </ListOfParameters>
+    <ListOfMoleculeTypes>
+      <MoleculeType id="A">
+        <ListOfComponentTypes>
+          <ComponentType id="s">
+            <ListOfAllowedStates>
+              <AllowedState id="0"/>
+              <AllowedState id="1"/>
+            </ListOfAllowedStates>
+          </ComponentType>
+        </ListOfComponentTypes>
+      </MoleculeType>
+    </ListOfMoleculeTypes>
+    <ListOfCompartments>
+    </ListOfCompartments>
+    <ListOfSpecies>
+      <Species id="S1"  concentration="100" name="A(s~0)">
+        <ListOfMolecules>
+          <Molecule id="S1_M1" name="A">
+            <ListOfComponents>
+              <Component id="S1_M1_C1" name="s" state="0" numberOfBonds="0"/>
+            </ListOfComponents>
+          </Molecule>
+        </ListOfMolecules>
+      </Species>
+      <Species id="S2"  concentration="0" name="A(s~1)">
+        <ListOfMolecules>
+          <Molecule id="S2_M1" name="A">
+            <ListOfComponents>
+              <Component id="S2_M1_C1" name="s" state="1" numberOfBonds="0"/>
+            </ListOfComponents>
+          </Molecule>
+        </ListOfMolecules>
+      </Species>
+    </ListOfSpecies>
+    <ListOfReactionRules>
+      <ReactionRule id="RR1" name="_R1" symmetry_factor="1">
+        <ListOfReactantPatterns>
+          <ReactantPattern id="RR1_RP1">
+            <ListOfMolecules>
+              <Molecule id="RR1_RP1_M1" name="A">
+                <ListOfComponents>
+                  <Component id="RR1_RP1_M1_C1" name="s" state="0" numberOfBonds="0"/>
+                </ListOfComponents>
+              </Molecule>
+            </ListOfMolecules>
+          </ReactantPattern>
+        </ListOfReactantPatterns>
+        <ListOfProductPatterns>
+          <ProductPattern id="RR1_PP1">
+            <ListOfMolecules>
+              <Molecule id="RR1_PP1_M1" name="A">
+                <ListOfComponents>
+                  <Component id="RR1_PP1_M1_C1" name="s" state="1" numberOfBonds="0"/>
+                </ListOfComponents>
+              </Molecule>
+            </ListOfMolecules>
+          </ProductPattern>
+        </ListOfProductPatterns>
+        <RateLaw id="RR1_RateLaw" type="Arrhenius" totalrate="0">
+          <ListOfRateConstants>
+            <RateConstant value="phi"/>
+            <RateConstant value="Ea0"/>
+          </ListOfRateConstants>
+        </RateLaw>
+        <Map>
+          <MapItem sourceID="RR1_RP1_M1" targetID="RR1_PP1_M1"/>
+          <MapItem sourceID="RR1_RP1_M1_C1" targetID="RR1_PP1_M1_C1"/>
+        </Map>
+        <ListOfOperations>
+          <StateChange site="RR1_RP1_M1_C1" finalState="1"/>
+        </ListOfOperations>
+      </ReactionRule>
+      <ReactionRule id="RR2" name="_reverse__R1" symmetry_factor="1">
+        <ListOfReactantPatterns>
+          <ReactantPattern id="RR2_RP1">
+            <ListOfMolecules>
+              <Molecule id="RR2_RP1_M1" name="A">
+                <ListOfComponents>
+                  <Component id="RR2_RP1_M1_C1" name="s" state="1" numberOfBonds="0"/>
+                </ListOfComponents>
+              </Molecule>
+            </ListOfMolecules>
+          </ReactantPattern>
+        </ListOfReactantPatterns>
+        <ListOfProductPatterns>
+          <ProductPattern id="RR2_PP1">
+            <ListOfMolecules>
+              <Molecule id="RR2_PP1_M1" name="A">
+                <ListOfComponents>
+                  <Component id="RR2_PP1_M1_C1" name="s" state="0" numberOfBonds="0"/>
+                </ListOfComponents>
+              </Molecule>
+            </ListOfMolecules>
+          </ProductPattern>
+        </ListOfProductPatterns>
+        <RateLaw id="RR2_RateLaw" type="Arrhenius" totalrate="0">
+          <ListOfRateConstants>
+            <RateConstant value="phi"/>
+            <RateConstant value="Ea0"/>
+          </ListOfRateConstants>
+        </RateLaw>
+        <Map>
+          <MapItem sourceID="RR2_RP1_M1" targetID="RR2_PP1_M1"/>
+          <MapItem sourceID="RR2_RP1_M1_C1" targetID="RR2_PP1_M1_C1"/>
+        </Map>
+        <ListOfOperations>
+          <StateChange site="RR2_RP1_M1_C1" finalState="0"/>
+        </ListOfOperations>
+      </ReactionRule>
+    </ListOfReactionRules>
+    <ListOfObservables>
+      <Observable id="O1" name="A1" type="Molecules" output="1">
+        <ListOfPatterns>
+          <Pattern id="O1_P1" automorphisms="1">
+            <ListOfMolecules>
+              <Molecule id="O1_P1_M1" name="A">
+                <ListOfComponents>
+                  <Component id="O1_P1_M1_C1" name="s" state="1" numberOfBonds="0"/>
+                </ListOfComponents>
+              </Molecule>
+            </ListOfMolecules>
+          </Pattern>
+        </ListOfPatterns>
+      </Observable>
+    </ListOfObservables>
+    <ListOfFunctions>
+    </ListOfFunctions>
+    <ListOfEnergyPatterns>
+      <EnergyPattern id="EP1" pattern="A(s~1)" expression="G_P">
+        <Pattern id="EP1_P1" automorphisms="1">
+          <ListOfMolecules>
+            <Molecule id="EP1_P1_M1" name="A">
+              <ListOfComponents>
+                <Component id="EP1_P1_M1_C1" name="s" state="1" numberOfBonds="0"/>
+              </ListOfComponents>
+            </Molecule>
+          </ListOfMolecules>
+        </Pattern>
+      </EnergyPattern>
+    </ListOfEnergyPatterns>
+  </model>
+</sbml>
