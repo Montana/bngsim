@@ -832,6 +832,8 @@ class NetworkModel {
     // function's name it throws std::invalid_argument, as a function's body
     // cannot be replaced. A table under a new name is added, and nothing in
     // the model reads it. Bad data throws, and leaves any table as it was.
+    // New data from a file may have its value column headed with the table's
+    // name or the function that calls it; `header_name` is for a new table.
 
     /// Add a table function from a .tfun file.
     /// @param name        Function name (e.g., "cumNcases")

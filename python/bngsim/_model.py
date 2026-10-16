@@ -951,8 +951,9 @@ class Model:
         breakpoints count is :func:`bngsim._switch_sensitivity.table_function_breaks`'s
         rule: a table of many samples of a smooth signal has none.
 
-        Read from the tables alone, so it is kept until a table is added, and
-        a clone inherits it. A model with no table pays one attribute read.
+        Read from the tables alone, so it is kept until a table is added or
+        given new data (:meth:`add_table_function` drops it), and a clone
+        inherits it. A model with no table pays one attribute read.
         """
         n = self._core.n_table_functions
         if n == 0:

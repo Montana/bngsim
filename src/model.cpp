@@ -236,8 +236,8 @@ NetworkModel NetworkModel::clone() const {
     copy.refresh_derived_params();
 
     // Re-create table functions in the copy (deep copy with fresh bindings)
-    // (A copy of each table, so its header label and whether the model reads it
-    // come along; register_table_function_ binds its index to the copy's slot.)
+    // (A copy of each table, so whether the model reads it comes along;
+    // register_table_function_ binds its index to the copy's slot.)
     for (const auto &tf_ptr : impl_->table_functions) {
         auto new_tf = std::make_unique<TableFunction>(*tf_ptr);
         copy.register_table_function_(*new_tf);

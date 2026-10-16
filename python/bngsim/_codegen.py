@@ -11153,8 +11153,9 @@ def _table_function_bindings(core, model=None) -> tuple:
     ``()`` for a model with none, without asking for ``codegen_data()``, which
     is the whole model and 0.1 s on one of 58,000 reactions. For a model with
     tables it is asked for and kept on ``model`` with the list of their names:
-    a table function is added and never changed or taken away, so for one
-    model the same names in the same order are the same tables. ``clone``
+    a table function is added and never taken away, and new data for one
+    keeps its index (issue #772), so for one model the same names in the same
+    order are the same bindings. ``clone``
     hands what is kept to the clone, asking first if the model has tables and
     was never asked, so that clones of one model do not each ask.
     """
