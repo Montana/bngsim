@@ -4224,12 +4224,17 @@ def table_function_breaks(core) -> list[tuple[str, int, object, object]]:
     and go on.
 
     Read from the tables alone, so a model's is the same for every run:
-    :meth:`bngsim.Model.table_function_breaks` keeps it.
+    :meth:`bngsim.Model.table_function_breaks` keeps it. A table no expression
+    of the model calls (one added after load) is left out.
     """
     import numpy as np
 
     out: list[tuple[str, int, object, object]] = []
     for table in core.table_function_tables:
+        if not table.get("read", True):
+            # Added after load, and called by no expression (issue #772): the
+            # run never reads it, so it has nowhere to break.
+            continue
         xs = np.asarray(table["xs"], dtype=float)
         ys = np.asarray(table["ys"], dtype=float)
         if xs.size < 2:

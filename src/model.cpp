@@ -186,10 +186,9 @@ NetworkModel NetworkModel::clone() const {
     // time-pointer rebinding above and the build()-time registration.
     copy.impl_->uses_rateof = impl_->uses_rateof;
     // Issue #654 — a syntactic property of the function expressions, which the
-    // clone re-compiles verbatim, so it carries over as plain data. (The
-    // time-indexed-tfun half is re-established by the register_table_function_
-    // calls below, but only for models that have one; this copy is what covers
-    // a function that names `time` directly.)
+    // clone re-compiles verbatim, so it carries over as plain data, for a
+    // function that names `time` and one that calls a table read on the clock
+    // alike (register_table_function_ below does not set it).
     copy.impl_->functions_use_time = impl_->functions_use_time;
     if (copy.impl_->uses_rateof) {
         // What reads which rateOf is the model's structure, and a clone's is
@@ -237,9 +236,10 @@ NetworkModel NetworkModel::clone() const {
     copy.refresh_derived_params();
 
     // Re-create table functions in the copy (deep copy with fresh bindings)
+    // (A copy of each table, so its header label and whether the model reads it
+    // come along; register_table_function_ binds its index to the copy's slot.)
     for (const auto &tf_ptr : impl_->table_functions) {
-        auto new_tf = std::make_unique<TableFunction>(tf_ptr->name(), tf_ptr->xs(), tf_ptr->ys(),
-                                                      tf_ptr->index_name(), tf_ptr->method());
+        auto new_tf = std::make_unique<TableFunction>(*tf_ptr);
         copy.register_table_function_(*new_tf);
         copy.impl_->table_functions.push_back(std::move(new_tf));
     }
@@ -4977,9 +4977,8 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
     // normalized BNG-style (case-insensitive `time`/`t`; trailing "()"
     // tolerated on any index) so users can write `Time`, `myParam()`, etc.
     const auto &idx_name = tf.index_name();
-    const bool reads_the_clock = is_time_index(idx_name);
 
-    if (reads_the_clock) {
+    if (is_time_index(idx_name)) {
         // Time-indexed: point to model's current_time
         tf.set_index_ptr(&impl_->current_time);
     } else {
@@ -5010,16 +5009,6 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
         internal_name,
         ExpressionEvaluator::Func0([tf_ptr]() -> double { return tf_ptr->evaluate(); }));
 
-    // Issue #654 — this tfun reads the clock, so every function that calls
-    // it moves with time. Set unconditionally rather than checking which
-    // functions reference `tfun_<name>()`: the table is registered here
-    // before (and, post-build, possibly without) the expressions that read
-    // it, and over-reporting only costs the SSA its sub-stepping gate. Set
-    // only once the evaluator has the table: a name it refuses throws above
-    // and leaves the model as it was (issue #772).
-    if (reads_the_clock)
-        impl_->functions_use_time = true;
-
     // Mark model as having functions (table functions participate in
     // evaluate_functions → rate computation)
     impl_->has_functions = true;
@@ -5028,23 +5017,75 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
 // A second table under a name the model already has was appended beside the
 // first (issue #772): the evaluator kept the first `tfun_<name>`, so the rate
 // laws read the old data, while table_function_names listed the name twice and
-// codegen, resolving names last-wins, reported the new one. Under a function's
-// name the interpreter kept the function's body while compiled code read the
-// table. There is no replacing a table or a body in place, so the name is
-// refused before anything changes. The one table that does take a function's
-// name is a `.net` tfun, which ModelBuilder registers as the body of the
-// function it is declared in (`backs_a_function`).
-void NetworkModel::require_new_table_name_(const std::string &name, bool backs_a_function) const {
-    for (const auto &tf : impl_->table_functions) {
+// codegen, resolving names last-wins, reported the new one. A table is now one
+// per name, and new data under a table's name goes into that table, which the
+// evaluator and compiled code already call. A function's
+// body cannot be replaced, so a function's name is refused before anything
+// changes. The one table that takes a function's name is a `.net` tfun, which
+// ModelBuilder registers as the body of the function it is declared in
+// (`backs_a_function`).
+TableFunction *NetworkModel::table_named_(const std::string &name) const {
+    for (const auto &tf : impl_->table_functions)
         if (tf->name() == name)
-            throw std::invalid_argument("table function '" + name +
-                                        "' already exists; a model holds one table per "
-                                        "name, and an existing table cannot be replaced");
+            return tf.get();
+    return nullptr;
+}
+
+// The function whose body calls the table `name`: the one a `.net` tfun is
+// written in, which names a whole-body table and is the `<func>` of an
+// embedded `<func>__tfun<k>`. Empty for a table nothing calls.
+std::string NetworkModel::function_calling_table_(const std::string &name) const {
+    const std::string call = "tfun_" + name + "()";
+    for (const auto &f : impl_->functions) {
+        for (auto at = f.expression.find(call); at != std::string::npos;
+             at = f.expression.find(call, at + 1)) {
+            const char before = at == 0 ? ' ' : f.expression[at - 1];
+            if (std::isalnum(static_cast<unsigned char>(before)) == 0 && before != '_')
+                return f.name;
+        }
     }
+    return "";
+}
+
+void NetworkModel::require_new_table_name_(const std::string &name, bool backs_a_function) const {
     if (!backs_a_function && impl_->shared && impl_->shared->function_name_to_idx.count(name) != 0)
         throw std::invalid_argument("the model already has a function named '" + name +
                                     "', and a table cannot replace a function's body; add "
                                     "the table under a new name");
+}
+
+// What a table is read over is compiled into the model's code (_tfun_call_map
+// writes `t`, `p[i]`, `obs[i]` or `func[i]` into each call), so new data has to
+// be read over the same thing. Spelling may differ as it may for any index:
+// `Time` and `t` are the clock, and `k()` is `k`.
+void NetworkModel::require_same_index_(const TableFunction &held,
+                                       const std::string &index_name) const {
+    const bool clock = is_time_index(held.index_name());
+    const bool same = clock
+                          ? is_time_index(index_name)
+                          : !is_time_index(index_name) && strip_paren_suffix(index_name) ==
+                                                              strip_paren_suffix(held.index_name());
+    if (!same) {
+        const std::string over = clock ? "time" : strip_paren_suffix(held.index_name());
+        throw std::invalid_argument("table function '" + held.name() + "' is read over '" + over +
+                                    "', and what it is read over is compiled into the model's "
+                                    "code; its new data has to be read over '" +
+                                    over + "' too, not '" + index_name + "'");
+    }
+}
+
+// Register `tf` and keep it. A table the model reads (one a model source
+// declares) and that is read on the clock makes every function that calls it
+// move with time (issue #654); set only once the evaluator has the table, so a
+// name it refuses leaves the model as it was. A table added after load is read
+// by nothing, and marked it as reading the time all the same, which since #710
+// refused its steady_state().
+void NetworkModel::keep_table_function_(std::unique_ptr<TableFunction> tf, bool backs_a_function) {
+    register_table_function_(*tf);
+    tf->set_read_by_model(backs_a_function);
+    if (backs_a_function && is_time_index(tf->index_name()))
+        impl_->functions_use_time = true;
+    impl_->table_functions.push_back(std::move(tf));
 }
 
 void NetworkModel::add_table_function(const std::string &name, const std::string &filepath,
@@ -5063,22 +5104,48 @@ void NetworkModel::add_table_function(const std::string &name, const std::vector
 void NetworkModel::add_table_function_(const std::string &name, const std::string &filepath,
                                        const std::string &index_name, const std::string &method,
                                        const std::string &header_name, bool backs_a_function) {
-    require_new_table_name_(name, backs_a_function);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
-    auto tf = std::make_unique<TableFunction>(
-        TableFunction::from_file(name, filepath, index_name, interpolation, header_name));
-    register_table_function_(*tf);
-    impl_->table_functions.push_back(std::move(tf));
+    if (TableFunction *held = table_named_(name)) {
+        require_replaceable_(*held, index_name, backs_a_function);
+        // New data is built and checked (knots, values, file and header)
+        // before the table takes it, so a refusal leaves the table as it was.
+        // Only the data and the method move: the evaluator's callable, the
+        // compiled code's tf_id, the index binding and the reader stay. The
+        // file's value column may be labelled with the table's name or, as a
+        // model's own file is, with the function the table is written in.
+        held->take_data_of(TableFunction::from_file(name, filepath, held->index_name(),
+                                                    interpolation, name,
+                                                    function_calling_table_(name)));
+        return;
+    }
+    require_new_table_name_(name, backs_a_function);
+    keep_table_function_(std::make_unique<TableFunction>(TableFunction::from_file(
+                             name, filepath, index_name, interpolation, header_name)),
+                         backs_a_function);
 }
 
 void NetworkModel::add_table_function_(const std::string &name, const std::vector<double> &xs,
                                        const std::vector<double> &ys, const std::string &index_name,
                                        const std::string &method, bool backs_a_function) {
-    require_new_table_name_(name, backs_a_function);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
-    auto tf = std::make_unique<TableFunction>(name, xs, ys, index_name, interpolation);
-    register_table_function_(*tf);
-    impl_->table_functions.push_back(std::move(tf));
+    if (TableFunction *held = table_named_(name)) {
+        require_replaceable_(*held, index_name, backs_a_function);
+        held->take_data_of(TableFunction(name, xs, ys, held->index_name(), interpolation));
+        return;
+    }
+    require_new_table_name_(name, backs_a_function);
+    keep_table_function_(std::make_unique<TableFunction>(name, xs, ys, index_name, interpolation),
+                         backs_a_function);
+}
+
+// ModelBuilder registers each of a source's tables once; two under one name in
+// a source are two declarations of one name, not new data.
+void NetworkModel::require_replaceable_(const TableFunction &held, const std::string &index_name,
+                                        bool backs_a_function) const {
+    if (backs_a_function)
+        throw std::invalid_argument("table function '" + held.name() +
+                                    "' is declared twice; a model holds one table per name");
+    require_same_index_(held, index_name);
 }
 
 int NetworkModel::n_table_functions() const {
@@ -5160,6 +5227,7 @@ std::vector<TableFunctionSpec> NetworkModel::table_function_specs() const {
         spec.method = tf->method() == InterpolationMethod::Step ? "step" : "linear";
         spec.xs = tf->xs();
         spec.ys = tf->ys();
+        spec.read = tf->read_by_model();
         specs.push_back(std::move(spec));
     }
     return specs;

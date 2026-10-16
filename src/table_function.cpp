@@ -114,7 +114,8 @@ double TableFunction::evaluate() const {
 
 TableFunction TableFunction::from_file(const std::string &name, const std::string &filepath,
                                        const std::string &index_name, InterpolationMethod method,
-                                       const std::string &header_name) {
+                                       const std::string &header_name,
+                                       const std::string &also_header) {
     const std::string &expected_header = header_name.empty() ? name : header_name;
     std::ifstream file(filepath);
     if (!file.is_open()) {
@@ -174,7 +175,9 @@ TableFunction TableFunction::from_file(const std::string &name, const std::strin
                 // the same on both columns). The header_name parameter lets
                 // wrapper-form tfun (synthetic runtime ID) validate against
                 // the original BNG function name.
-                if (strip_paren_suffix(col2) != strip_paren_suffix(expected_header)) {
+                if (strip_paren_suffix(col2) != strip_paren_suffix(expected_header) &&
+                    (also_header.empty() ||
+                     strip_paren_suffix(col2) != strip_paren_suffix(also_header))) {
                     throw std::runtime_error("TableFunction '" + name + "': header column 2 '" +
                                              col2 + "' does not match expected function name '" +
                                              expected_header + "'");
@@ -208,6 +211,12 @@ TableFunction TableFunction::from_file(const std::string &name, const std::strin
     }
 
     return TableFunction(name, std::move(xs), std::move(ys), index_name, method);
+}
+
+void TableFunction::take_data_of(const TableFunction &other) {
+    xs_ = other.xs_;
+    ys_ = other.ys_;
+    method_ = other.method_;
 }
 
 } // namespace bngsim

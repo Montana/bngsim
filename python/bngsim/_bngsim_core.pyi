@@ -500,7 +500,7 @@ class NetworkModel:
     @property
     def table_function_tables(self) -> list:
         """
-        Every table function with its table: [{name, index_kind ('time', 'parameter', 'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, method ('linear' or 'step'), xs, ys}], in dispatch-id order. A 'parameter' is a slot no function owns; a table over a model function is 'function' (issue #965). The knots of a table read on the clock are where its value (step) or slope (linear) breaks, and Simulator.run stops the integration on each (issue #709).
+        Every table function with its table: [{name, index_kind ('time', 'parameter', 'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, method ('linear' or 'step'), xs, ys, read}], in dispatch-id order. A 'parameter' is a slot no function owns; a table over a model function is 'function' (issue #965). The knots of a table read on the clock are where its value (step) or slope (linear) breaks, and Simulator.run stops the integration on each (issue #709). 'read' is whether an expression of the model calls the table: true for one its source declares, false for one added after load (issue #772).
         """
     @property
     def uses_rateof(self) -> bool:

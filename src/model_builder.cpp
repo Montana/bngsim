@@ -2522,8 +2522,9 @@ NetworkModel ModelBuilder::build() {
     // no warning (issue #654). `time` is the only clock symbol in the grammar
     // (`t` is deliberately left free as an ordinary identifier, see
     // src/expression.cpp), and a time-indexed table function is the other way
-    // in — that one is flagged by register_table_function_() when the tfun is
-    // registered, above and post-build alike.
+    // in — that one is flagged by add_table_function_() when the tfun is
+    // registered above. A table added after load is read by nothing, so it
+    // does not set it (issue #772).
     //
     // No transitive closure is needed: the flag is about the function block as
     // a whole, so a function that reads a time-dependent one is already covered

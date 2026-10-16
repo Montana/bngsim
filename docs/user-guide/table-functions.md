@@ -4,9 +4,10 @@ Table functions interpolate a quantity from tabular data, which is how a model
 carries a time-varying input it cannot write down: experimental forcing, a
 measured case count, a drug dosing schedule.
 
-## Three ways to create one
+## Declaring one
 
-**1. In a `.net` file**, parsed automatically:
+A table function is declared in the model, where its expressions can call it.
+**In a `.net` file**, it is parsed automatically:
 
 ```
 begin functions
@@ -14,42 +15,62 @@ begin functions
     2 response()   tfun('dose.tfun', drug_conc)     # parameter-indexed
     3 drive()      tfun('dose.tfun', time, method=>"step")
     4 inline()     tfun([0,1,2], [0,10,20], time, method=>"linear")
+    5 scaled()     2*tfun('signal.tfun', time)      # a table inside a function
 end functions
 ```
 
-**2. From a file in Python:**
+A whole-body `tfun` is a table named for its function (`cumNcases`, `drive`).
+One written inside a function's arithmetic gets a name of its own,
+`<function>__tfun<k>` (`scaled__tfun0`), counting from 0 along the line.
+
+## Giving a table new data
+
+`add_table_function` under the name of a table the model has puts new data in
+that table, in place. Every engine reads it from then on: the interpreter, the
+compiled code, the SSA, the steady-state solvers, and a `Simulator` made before
+the call. The breakpoints a run stops on move with it. A clone keeps the data it
+was cloned with.
 
 ```python
-# Time-indexed: piecewise-linear interpolation
-model.add_table_function("cumNcases", file="case_data.tfun")
+# From a .tfun file of the same form as the model's own
+model.add_table_function("cumNcases", file="case_data_2021.tfun")
 
-# Parameter-indexed (e.g. dose-response)
-model.add_table_function("response", file="dose_response.tfun", index="drug_conc")
-
-# Step interpolation (piecewise-constant)
+# From arrays; the interpolation method may change
 model.add_table_function(
-    "dose_step", file="dose_response.tfun", index="time", method="step"
+    "drive", times=[0, 24, 25, 48, 49], values=[0, 5, 0, 5, 0], method="step"
 )
+
+# A parameter-indexed table names its index again
+model.add_table_function("response", file="dose_response_v2.tfun", index="drug_conc")
+
+# A table inside a function, by its own name
+model.add_table_function("scaled__tfun0", times=[0, 10], values=[1, 3])
 ```
 
-**3. From in-memory arrays:**
+The new data has to be read over the same index as the table's (`time`, or the
+same parameter, observable or function), because that is compiled into the
+model's code;
+`Time`, `t` and `time()` all name the clock, and `drug_conc()` names
+`drug_conc`. A file's value column may be headed with the table's name or with
+the name of the function it is written in, as the model's own file is. Bad data,
+a file that cannot be read, or another index raises `ModelError`, and leaves the
+table as it was.
 
-```python
-model.add_table_function(
-    "forcing", times=[0, 1, 2, 5], values=[0, 0, 1, 5], method="linear"
-)
-```
+A function that is not a table cannot be given a table's data: there is no
+replacing its body, and `add_table_function` raises `ModelError` for its name.
 
-A model holds one table per name, and a table cannot stand in for a function
-the model already has: `add_table_function` raises `ModelError` for a name that
-is already one of the model's table functions or functions, including a `tfun`
-the `.net` declares.
+Under a name the model does not have, `add_table_function` adds a table, but
+nothing in the model reads it. A loaded model's expressions are fixed, and none
+of them can call a table its source did not declare, so `add_table_function`
+warns, and the table changes no run: it marks no model as reading the time and
+puts no breakpoint among a run's stops. To drive a model from data, declare the
+`tfun` in the model and give it the data here.
 
 Introspect what a model carries:
 
 ```python
-print(model.n_table_functions)      # 1
-print(model.table_function_names)   # ['cumNcases']
+print(model.n_table_functions)      # 5
+print(model.table_function_names)   # ['cumNcases', 'response', 'drive', 'inline', 'scaled__tfun0']
 ```
 
 ## The `.tfun` file format

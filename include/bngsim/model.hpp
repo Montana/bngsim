@@ -47,6 +47,8 @@ struct TableFunctionSpec {
     std::string method;
     std::vector<double> xs;
     std::vector<double> ys;
+    /// An expression of the model calls the table (TableFunction::read_by_model).
+    bool read = false;
 };
 
 class NetworkModel {
@@ -823,9 +825,12 @@ class NetworkModel {
 
     // ─── Table functions ────────────────────────────────────────────────────
 
-    // Both overloads throw std::invalid_argument for a name the model already
-    // has as a table function or a function (issue #772), before anything
-    // changes: there is no replacing a table, or a function's body, in place.
+    // Under the name of a table function the model has, either overload puts
+    // the new data in that table, in place, for the interpreter and compiled
+    // code alike; it has to be read over the same index (issue #772). Under a
+    // function's name it throws std::invalid_argument, as a function's body
+    // cannot be replaced. A table under a new name is added, and nothing in
+    // the model reads it. Bad data throws, and leaves any table as it was.
 
     /// Add a table function from a .tfun file.
     /// @param name        Function name (e.g., "cumNcases")
@@ -953,9 +958,25 @@ class NetworkModel {
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);
 
-    /// Throw if a table function named `name` is already registered, or a
-    /// function is named `name` and the table does not back it (issue #772).
+    /// The table function named `name`, or nullptr.
+    TableFunction *table_named_(const std::string &name) const;
+
+    /// The function whose body calls the table `name`, or "" (issue #772).
+    std::string function_calling_table_(const std::string &name) const;
+
+    /// Throw if a function is named `name` and the table does not back it
+    /// (issue #772).
     void require_new_table_name_(const std::string &name, bool backs_a_function) const;
+
+    /// Throw unless new data for `held`, read over `index_name`, may replace
+    /// its data: the builder declaring one name twice, or a different index,
+    /// is refused (issue #772).
+    void require_replaceable_(const TableFunction &held, const std::string &index_name,
+                              bool backs_a_function) const;
+    void require_same_index_(const TableFunction &held, const std::string &index_name) const;
+
+    /// Register `tf` and keep it; `backs_a_function` says the model reads it.
+    void keep_table_function_(std::unique_ptr<TableFunction> tf, bool backs_a_function);
 
     /// add_table_function's two shapes. ModelBuilder calls them with
     /// `backs_a_function` set for a `.net` tfun, whose table takes the name of
