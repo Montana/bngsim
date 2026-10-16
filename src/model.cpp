@@ -5104,8 +5104,8 @@ void NetworkModel::add_table_function(const std::string &name, const std::vector
 void NetworkModel::add_table_function_(const std::string &name, const std::string &filepath,
                                        const std::string &index_name, const std::string &method,
                                        const std::string &header_name, bool backs_a_function) {
-    InterpolationMethod interpolation = parse_interpolation_method(method, name);
     if (TableFunction *held = table_named_(name)) {
+        const InterpolationMethod interpolation = method_for_(held, method, name);
         require_replaceable_(*held, index_name, backs_a_function);
         // New data is built and checked (knots, values, file and header)
         // before the table takes it, so a refusal leaves the table as it was.
@@ -5118,6 +5118,7 @@ void NetworkModel::add_table_function_(const std::string &name, const std::strin
                                                     function_calling_table_(name)));
         return;
     }
+    const InterpolationMethod interpolation = method_for_(nullptr, method, name);
     require_new_table_name_(name, backs_a_function);
     keep_table_function_(std::make_unique<TableFunction>(TableFunction::from_file(
                              name, filepath, index_name, interpolation, header_name)),
@@ -5127,15 +5128,28 @@ void NetworkModel::add_table_function_(const std::string &name, const std::strin
 void NetworkModel::add_table_function_(const std::string &name, const std::vector<double> &xs,
                                        const std::vector<double> &ys, const std::string &index_name,
                                        const std::string &method, bool backs_a_function) {
-    InterpolationMethod interpolation = parse_interpolation_method(method, name);
     if (TableFunction *held = table_named_(name)) {
+        const InterpolationMethod interpolation = method_for_(held, method, name);
         require_replaceable_(*held, index_name, backs_a_function);
         held->take_data_of(TableFunction(name, xs, ys, held->index_name(), interpolation));
         return;
     }
+    const InterpolationMethod interpolation = method_for_(nullptr, method, name);
     require_new_table_name_(name, backs_a_function);
     keep_table_function_(std::make_unique<TableFunction>(name, xs, ys, index_name, interpolation),
                          backs_a_function);
+}
+
+// The interpolation of new data: the one asked for, or with none ("") the
+// table's own. A `.tfun` file carries no method, so new data for a `.net`
+// table declared `method=>"step"` read from a file stayed a step only if this
+// kept it; a default of "linear" made it linear, and the run changed with no
+// word. A new table with none is linear, as a `.net` tfun is.
+InterpolationMethod NetworkModel::method_for_(const TableFunction *held, const std::string &method,
+                                              const std::string &name) const {
+    if (method.empty() && held != nullptr)
+        return held->method();
+    return parse_interpolation_method(method, name);
 }
 
 // ModelBuilder registers each of a source's tables once; two under one name in
@@ -5173,7 +5187,7 @@ double NetworkModel::evaluate_table_function_at(int tf_id, double x) const {
 std::vector<double> NetworkModel::time_table_knots() const {
     std::vector<double> out;
     for (const auto &tf : impl_->table_functions)
-        if (is_time_index(tf->index_name()))
+        if (tf->read_by_model() && is_time_index(tf->index_name()))
             out.insert(out.end(), tf->xs().begin(), tf->xs().end());
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());

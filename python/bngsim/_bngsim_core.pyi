@@ -147,11 +147,11 @@ class NetworkModel:
         """
         Evaluate dy/dt at (t, conc), leaving the model as it was. Test/diagnostic hook.
         """
-    def add_table_function_arrays(self, name: str, xs: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], ys: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], index_name: str = 'time', method: str = 'linear') -> None:
+    def add_table_function_arrays(self, name: str, xs: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], ys: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], index_name: str = 'time', method: str = '') -> None:
         """
         Add a table function from arrays
         """
-    def add_table_function_file(self, name: str, filepath: str, index_name: str = 'time', method: str = 'linear') -> None:
+    def add_table_function_file(self, name: str, filepath: str, index_name: str = 'time', method: str = '') -> None:
         """
         Add a table function from a .tfun file
         """

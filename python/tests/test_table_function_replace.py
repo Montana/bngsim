@@ -140,13 +140,38 @@ def test_a_simulator_made_before_the_new_data_runs_it(tmp_path, codegen) -> None
 @ENGINES
 def test_the_method_can_change(tmp_path, codegen) -> None:
     # 1 on [0, 0.5) and 3 after it as a step, A(1) = 2; the same knots read
-    # linearly, A(1) = 2.5.
+    # linearly, A(1) = 2.5. A method asked for is the one taken.
     model = _model(tmp_path, _TFUN)
     knots = dict(times=[0.0, 0.5, 10.0], values=[1.0, 3.0, 3.0])
     _quiet_add(model, "drive", method="step", **knots)
     assert _run(model, codegen)[0] == pytest.approx(2.0, rel=1e-6)
     _quiet_add(model, "drive", method="linear", **knots)
     assert _run(model, codegen)[0] == pytest.approx(2.5, rel=1e-6)
+
+
+_STEP_FILE = "    1 drive() tfun('step.tfun', time, method=>\"step\")"
+
+
+@ENGINES
+@pytest.mark.parametrize("given", ["file", "arrays", "core"])
+def test_new_data_keeps_the_tables_method_unless_told(tmp_path, codegen, given) -> None:
+    # A .tfun file carries no method, and the call's default made a step table
+    # linear: on 0 then 10 from t = 5, A(10) = 50 read as a step and 75 read
+    # linearly, from the same data.
+    (tmp_path / "step.tfun").write_text("# time drive\n0 0\n5 10\n10 10\n")
+    model = _model(tmp_path, _STEP_FILE)
+    assert _run(model, codegen, t_end=10.0, n_points=2)[0] == pytest.approx(50.0, rel=1e-6)
+    data = dict(times=[0.0, 5.0, 10.0], values=[0.0, 10.0, 10.0])
+    if given == "file":
+        _quiet_add(model, "drive", file=tmp_path / "step.tfun")
+    elif given == "arrays":
+        _quiet_add(model, "drive", **data)
+    else:
+        model._core.add_table_function_arrays("drive", data["times"], data["values"])
+    assert model._core.table_function_tables[0]["method"] == "step"
+    assert _run(model, codegen, t_end=10.0, n_points=2)[0] == pytest.approx(50.0, rel=1e-6)
+    _quiet_add(model, "drive", method="linear", **data)
+    assert _run(model, codegen, t_end=10.0, n_points=2)[0] == pytest.approx(75.0, rel=1e-6)
 
 
 @ENGINES

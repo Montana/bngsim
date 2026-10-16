@@ -28,14 +28,15 @@ One written inside a function's arithmetic gets a name of its own,
 `add_table_function` under the name of a table the model has puts new data in
 that table, in place. Every engine reads it from then on: the interpreter, the
 compiled code, the SSA, the steady-state solvers, and a `Simulator` made before
-the call. The breakpoints a run stops on move with it. A clone keeps the data it
-was cloned with.
+the call. The breakpoints a run stops on move with it. The table keeps its
+interpolation (a `.tfun` file carries none) unless `method` names another. A
+clone keeps the data it was cloned with.
 
 ```python
 # From a .tfun file of the same form as the model's own
 model.add_table_function("cumNcases", file="case_data_2021.tfun")
 
-# From arrays; the interpolation method may change
+# From arrays, read as a step from now on
 model.add_table_function(
     "drive", times=[0, 24, 25, 48, 49], values=[0, 5, 0, 5, 0], method="step"
 )

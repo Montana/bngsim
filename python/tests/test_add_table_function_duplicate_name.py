@@ -108,15 +108,12 @@ def test_a_table_added_after_a_run_under_a_functions_name_is_refused(tmp_path) -
 @pytest.mark.parametrize("functions", [_TFUN, _PLAIN], ids=["tfun", "plain-function"])
 def test_a_name_the_evaluator_refuses_is_reported(tmp_path, functions) -> None:
     # ExprTk's symbol table refuses `tfun_a b`; the refusal used to be dropped and
-    # the table appended under a name no expression could call. Refused, the
-    # model is as it was: a time-indexed table it never got does not mark it as
-    # reading the time, which would refuse its steady_state().
+    # the table appended under a name no expression could call.
     model = bngsim.Model.from_net(_net(tmp_path, functions))
-    tables, reads_time = model.table_function_names, model._core.functions_use_time
+    tables = model.table_function_names
     with pytest.raises(ModelError, match="failed to register function 'tfun_a b'"):
         model.add_table_function("a b", times=[0.0, 10.0], values=[7.0, 7.0])
     assert model.table_function_names == tables
-    assert model._core.functions_use_time is reads_time
 
 
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])

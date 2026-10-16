@@ -22,6 +22,7 @@ namespace bngsim {
 class ModelBuilder;
 class NetFileLoader;
 class TableFunction;
+enum class InterpolationMethod;
 struct ModelImplData;
 
 /// Resolved metadata for one registered TableFunction, used by the
@@ -836,15 +837,15 @@ class NetworkModel {
     /// @param name        Function name (e.g., "cumNcases")
     /// @param filepath    Path to .tfun file
     /// @param index_name  Index variable: "time" (default), or a parameter/observable name
-    /// @param method      Interpolation method: "linear" (default) or "step"
+    /// @param method      Interpolation method: "linear" or "step"; "" (the default)
+    ///                    keeps a table's own, and is "linear" for a new one
     /// @param header_name Optional .tfun column-2 header validation name; defaults
     ///                    to `name`. Differs from `name` only for embedded-form
     ///                    tfun where the runtime ID is synthetic but the .tfun
     ///                    file still labels its value column with the original
     ///                    BNG function name.
     void add_table_function(const std::string &name, const std::string &filepath,
-                            const std::string &index_name = "time",
-                            const std::string &method = "linear",
+                            const std::string &index_name = "time", const std::string &method = "",
                             const std::string &header_name = "");
 
     /// Add a table function from in-memory data.
@@ -852,10 +853,11 @@ class NetworkModel {
     /// @param xs         Sorted x values (monotonically increasing)
     /// @param ys         Corresponding y values
     /// @param index_name Index variable name
-    /// @param method     Interpolation method: "linear" (default) or "step"
+    /// @param method     Interpolation method: "linear" or "step"; "" (the default)
+    ///                   keeps a table's own, and is "linear" for a new one
     void add_table_function(const std::string &name, const std::vector<double> &xs,
                             const std::vector<double> &ys, const std::string &index_name = "time",
-                            const std::string &method = "linear");
+                            const std::string &method = "");
 
     /// Number of registered table functions.
     int n_table_functions() const;
@@ -977,6 +979,11 @@ class NetworkModel {
 
     /// Register `tf` and keep it; `backs_a_function` says the model reads it.
     void keep_table_function_(std::unique_ptr<TableFunction> tf, bool backs_a_function);
+
+    /// The interpolation `method` names, or with "" `held`'s own (linear for
+    /// a new table).
+    InterpolationMethod method_for_(const TableFunction *held, const std::string &method,
+                                    const std::string &name) const;
 
     /// add_table_function's two shapes. ModelBuilder calls them with
     /// `backs_a_function` set for a `.net` tfun, whose table takes the name of

@@ -2534,7 +2534,7 @@ class Model:
         times: list[float] | None = None,
         values: list[float] | None = None,
         index: str = "time",
-        method: str = "linear",
+        method: str | None = None,
     ) -> None:
         """Give a table function of the model new data, or add a table function.
 
@@ -2545,8 +2545,8 @@ class Model:
         compiled code, the SSA and the steady-state solvers, and a
         :class:`Simulator` made before the call. The new data has to be read over
         the same index as the table's, since that is compiled into the model's
-        code; it may change the interpolation ``method``. A clone keeps the data
-        it was cloned with.
+        code. It keeps the table's interpolation unless ``method`` names
+        another. A clone keeps the data it was cloned with.
 
         Under a new name the table is added, but nothing in the model reads it:
         a loaded model's expressions are fixed, and none of them can name a
@@ -2564,10 +2564,13 @@ class Model:
         values : list[float], optional
             Y (function) values. Must be used with ``times``.
         index : str
-            Index variable name. Default ``"time"``. Can also be a parameter
-            or observable name for non-time-indexed table functions.
-        method : str
-            Interpolation method: ``"linear"`` (default) or ``"step"``.
+            Index variable name. Default ``"time"``. Can also be the name of a
+            parameter, an observable or a function, for a table not read on
+            the clock. New data for a table has to name the table's own index.
+        method : str or None
+            Interpolation method, ``"linear"`` or ``"step"``. ``None`` (the
+            default) keeps the table's own for new data, as a ``.tfun`` file
+            carries none, and is ``"linear"`` for a new table.
 
         Raises
         ------
@@ -2589,8 +2592,9 @@ class Model:
             raise ValueError(
                 "Cannot specify both 'file' and 'times'/'values'. Use one or the other."
             )
-        normalized_method = method.strip().lower()
-        if normalized_method not in {"linear", "step"}:
+        # "" asks the core for the table's own method (linear for a new one).
+        normalized_method = "" if method is None else method.strip().lower()
+        if method is not None and normalized_method not in {"linear", "step"}:
             raise ValueError(
                 "Invalid table function interpolation method. Expected 'linear' or 'step'."
             )

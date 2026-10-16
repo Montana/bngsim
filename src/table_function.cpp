@@ -180,7 +180,10 @@ TableFunction TableFunction::from_file(const std::string &name, const std::strin
                      strip_paren_suffix(col2) != strip_paren_suffix(also_header))) {
                     throw std::runtime_error("TableFunction '" + name + "': header column 2 '" +
                                              col2 + "' does not match expected function name '" +
-                                             expected_header + "'");
+                                             expected_header + "'" +
+                                             (also_header.empty() || also_header == expected_header
+                                                  ? std::string()
+                                                  : " or '" + also_header + "'"));
                 }
 
                 header_found = true;

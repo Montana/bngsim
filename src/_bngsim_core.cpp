@@ -2191,11 +2191,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, filepath, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("filepath"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from a .tfun file")
+            py::arg("method") = "", "Add a table function from a .tfun file")
 
         .def(
             "add_table_function_arrays",
@@ -2205,11 +2205,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, xs, ys, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("xs"), py::arg("ys"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from arrays")
+            py::arg("method") = "", "Add a table function from arrays")
 
         .def_property_readonly("n_table_functions", &bngsim::NetworkModel::n_table_functions)
         .def_property_readonly("table_function_names", &bngsim::NetworkModel::table_function_names)
