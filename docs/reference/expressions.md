@@ -174,15 +174,19 @@ begin functions
 end functions
 ```
 
-**Add a table function from Python.** An external signal supplied as data and
-interpolated at each step — a forcing term, a dosing schedule, or a measured
-time course:
+**Give a table function new data from Python.** A `tfun` the model declares
+is an external signal supplied as data and interpolated at each step: a forcing
+term, a dosing schedule, or a measured time course. After load it can take
+other data, over the same index, without editing the model:
 
 ```python
-model = bngsim.Model.from_net("model.net")
-model.add_table_function("signal", file="signal.tfun")
+model = bngsim.Model.from_net("model.net")  # declares signal() and drive() as tfuns
+model.add_table_function("signal", file="signal_2021.tfun")
 model.add_table_function("drive", times=[0, 1, 2, 5, 10], values=[0, 0, 1, 5, 5])
 ```
+
+Nothing in a loaded model can call a table under a name its source does not
+declare: `add_table_function` adds one, warns, and the table changes no run.
 
 See the [table function guide](../user-guide/table-functions.md) for the `.tfun`
 format, non-time index variables, and the interpolation and extrapolation rules.

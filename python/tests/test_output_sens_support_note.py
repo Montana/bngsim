@@ -33,6 +33,10 @@ import pytest
 from bngsim import _jacobian
 from bngsim import cache as cache_mod
 
+# Tables added after load here are fixtures that nothing in the model reads,
+# which add_table_function warns about (issue #772).
+pytestmark = pytest.mark.filterwarnings("ignore:nothing in the model reads table function")
+
 pytest.importorskip("sympy")
 
 _CC = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")

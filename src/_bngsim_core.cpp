@@ -2191,11 +2191,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, filepath, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("filepath"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from a .tfun file")
+            py::arg("method") = "", "Add a table function from a .tfun file")
 
         .def(
             "add_table_function_arrays",
@@ -2205,11 +2205,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, xs, ys, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("xs"), py::arg("ys"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from arrays")
+            py::arg("method") = "", "Add a table function from arrays")
 
         .def_property_readonly("n_table_functions", &bngsim::NetworkModel::n_table_functions)
         .def_property_readonly("table_function_names", &bngsim::NetworkModel::table_function_names)
@@ -2227,17 +2227,19 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     td["method"] = spec.method;
                     td["xs"] = spec.xs;
                     td["ys"] = spec.ys;
+                    td["read"] = spec.read;
                     out.append(td);
                 }
                 return out;
             },
             "Every table function with its table: [{name, index_kind ('time', 'parameter', "
             "'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, "
-            "method ('linear' or 'step'), xs, ys}], in dispatch-id order. A 'parameter' is a "
-            "slot no function owns; a table over a model function is 'function' (issue #965). "
+            "method ('linear' or 'step'), xs, ys, read}], in dispatch-id order. A 'parameter' is "
+            "a slot no function owns; a table over a model function is 'function' (issue #965). "
             "The knots of a table read on the clock are where its "
             "value (step) or slope (linear) breaks, and Simulator.run stops the integration on "
-            "each (issue #709).")
+            "each (issue #709). 'read' is whether an expression of the model calls the table: "
+            "true for one its source declares, false for one added after load (issue #772).")
         .def(
             "evaluate_over_times",
             [](const bngsim::NetworkModel &m, const std::string &expression,

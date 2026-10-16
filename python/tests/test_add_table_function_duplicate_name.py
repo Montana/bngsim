@@ -6,8 +6,9 @@ and nothing checked), so the dynamics read the old data, ``table_function_names`
 listed the name twice, and codegen, resolving names last-wins, reported the new
 table beside dynamics that used the old one. Under a plain function's name the
 interpreter kept the function's body while compiled code read the table, so the
-same model ran two ways by codegen. Both are refused now, before the model
-changes, and every engine runs the model it had.
+same model ran two ways by codegen. A function's name is refused now, before
+the model changes, and every engine runs the model it had. A table's name gives
+that table new data, in place: test_table_function_replace.py.
 
 ``A' = drive`` from ``A(0) = 0`` with ``drive`` constant on ``[0, 10]``, so
 ``A(1)`` is the value of ``drive`` the dynamics used.
@@ -43,13 +44,6 @@ end groups
 _TFUN = '    1 drive() tfun([0,10],[1,1], time, method=>"linear")'
 _PLAIN = "    1 drive() k\n    2 g() drive()*a"
 
-# What each refuses `drive` as: a `.net` tfun is a table of that name, and a
-# plain function is a body a table cannot replace.
-_REFUSED = {
-    _TFUN: "table function 'drive' already exists",
-    _PLAIN: "already has a function named 'drive'",
-}
-
 
 def _net(tmp_path: Path, functions: str) -> str:
     path = tmp_path / "m.net"
@@ -63,25 +57,26 @@ def _run(model: bngsim.Model, codegen: bool) -> tuple[float, list[float]]:
     return float(np.asarray(r.species)[-1, 0]), drive.tolist()
 
 
-@pytest.mark.parametrize("functions", [_TFUN, _PLAIN], ids=["tfun", "plain-function"])
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
-def test_a_table_under_a_functions_name_is_refused(tmp_path, functions, codegen) -> None:
-    model = bngsim.Model.from_net(_net(tmp_path, functions))
-    tables = model.table_function_names
-    with pytest.raises(ModelError, match=_REFUSED[functions]):
+def test_a_table_under_a_functions_name_is_refused(tmp_path, codegen) -> None:
+    model = bngsim.Model.from_net(_net(tmp_path, _PLAIN))
+    with pytest.raises(ModelError, match="already has a function named 'drive'"):
         model.add_table_function("drive", times=[0.0, 10.0], values=[7.0, 7.0])
-    assert model.table_function_names == tables
+    assert model.table_function_names == []
     # Both engines run the model's own drive = 1: no table data reached either.
     assert _run(model, codegen) == (pytest.approx(1.0), [1.0, 1.0, 1.0])
 
 
-def test_a_second_table_under_one_name_is_refused(tmp_path) -> None:
+def test_a_second_table_under_one_name_is_one_table(tmp_path) -> None:
+    # The second call gives the table new data; it is never a second table.
     model = bngsim.Model.from_net(_net(tmp_path, _TFUN))
-    model.add_table_function("other", times=[0.0, 10.0], values=[5.0, 5.0])
-    with pytest.raises(ModelError, match="table function 'other' already exists"):
+    with pytest.warns(UserWarning, match="nothing in the model reads"):
+        model.add_table_function("other", times=[0.0, 10.0], values=[5.0, 5.0])
+    with pytest.warns(UserWarning, match="nothing in the model reads"):
         model.add_table_function("other", times=[0.0, 10.0], values=[7.0, 7.0])
     assert model.table_function_names == ["drive", "other"]
     assert model.clone().table_function_names == ["drive", "other"]
+    assert model._core.table_function_tables[1]["ys"] == [7.0, 7.0]
 
 
 def test_a_table_added_after_a_run_under_a_functions_name_is_refused(tmp_path) -> None:
@@ -113,28 +108,23 @@ def test_a_table_added_after_a_run_under_a_functions_name_is_refused(tmp_path) -
 @pytest.mark.parametrize("functions", [_TFUN, _PLAIN], ids=["tfun", "plain-function"])
 def test_a_name_the_evaluator_refuses_is_reported(tmp_path, functions) -> None:
     # ExprTk's symbol table refuses `tfun_a b`; the refusal used to be dropped and
-    # the table appended under a name no expression could call. Refused, the
-    # model is as it was: a time-indexed table it never got does not mark it as
-    # reading the time, which would refuse its steady_state().
+    # the table appended under a name no expression could call.
     model = bngsim.Model.from_net(_net(tmp_path, functions))
-    tables, reads_time = model.table_function_names, model._core.functions_use_time
+    tables = model.table_function_names
     with pytest.raises(ModelError, match="failed to register function 'tfun_a b'"):
         model.add_table_function("a b", times=[0.0, 10.0], values=[7.0, 7.0])
     assert model.table_function_names == tables
-    assert model._core.functions_use_time is reads_time
 
 
-@pytest.mark.parametrize("functions", [_TFUN, _PLAIN], ids=["tfun", "plain-function"])
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
-def test_the_core_refuses_a_functions_name_too(tmp_path, functions, codegen) -> None:
+def test_the_core_refuses_a_functions_name_too(tmp_path, codegen) -> None:
     # The refusal is the C++ NetworkModel's, not only Model's: the core's own
     # binding gave A(1) = 1 interpreted and 7 compiled under a plain function's
     # name.
-    model = bngsim.Model.from_net(_net(tmp_path, functions))
-    tables = model.table_function_names
-    with pytest.raises(ValueError, match=_REFUSED[functions]):
+    model = bngsim.Model.from_net(_net(tmp_path, _PLAIN))
+    with pytest.raises(ValueError, match="already has a function named 'drive'"):
         model._core.add_table_function_arrays("drive", [0.0, 10.0], [7.0, 7.0], "time", "linear")
-    assert model.table_function_names == tables
+    assert model.table_function_names == []
     assert _run(model, codegen) == (pytest.approx(1.0), [1.0, 1.0, 1.0])
 
 
@@ -148,6 +138,7 @@ def test_an_argument_error_is_reported_before_the_name(tmp_path) -> None:
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
 def test_a_table_under_a_new_name_is_still_added(tmp_path, codegen) -> None:
     model = bngsim.Model.from_net(_net(tmp_path, _TFUN))
-    model.add_table_function("other", times=[0.0, 10.0], values=[5.0, 5.0])
+    with pytest.warns(UserWarning, match="nothing in the model reads table function 'other'"):
+        model.add_table_function("other", times=[0.0, 10.0], values=[5.0, 5.0])
     assert model.table_function_names == ["drive", "other"]
     assert _run(model, codegen) == (pytest.approx(1.0), [1.0, 1.0, 1.0])

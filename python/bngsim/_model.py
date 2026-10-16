@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, overload
@@ -1055,8 +1056,9 @@ class Model:
         breakpoints count is :func:`bngsim._switch_sensitivity.table_function_breaks`'s
         rule: a table of many samples of a smooth signal has none.
 
-        Read from the tables alone, so it is kept until a table is added, and
-        a clone inherits it. A model with no table pays one attribute read.
+        Read from the tables alone, so it is kept until a table is added or
+        given new data (:meth:`add_table_function` drops it), and a clone
+        inherits it. A model with no table pays one attribute read.
         """
         n = self._core.n_table_functions
         if n == 0:
@@ -2646,17 +2648,29 @@ class Model:
         times: list[float] | None = None,
         values: list[float] | None = None,
         index: str = "time",
-        method: str = "linear",
+        method: str | None = None,
     ) -> None:
-        """Add a table function (piecewise-linear interpolation of data).
+        """Give a table function of the model new data, or add a table function.
 
-        The function is registered with the expression evaluator and can be
-        referenced by name in rate law expressions.
+        Under the name of a table function the model has (``table_function_names``:
+        a ``tfun`` the ``.net`` declares, or a ``tfun`` written inside a function,
+        registered as ``<function>__tfun<k>``), the table takes the new data in
+        place, and every engine reads it from then on: the interpreter, the
+        compiled code, the SSA and the steady-state solvers, and a
+        :class:`Simulator` made before the call. The new data has to be read over
+        the same index as the table's, since that is compiled into the model's
+        code. It keeps the table's interpolation unless ``method`` names
+        another. A clone keeps the data it was cloned with.
+
+        Under a new name the table is added, but nothing in the model reads it:
+        a loaded model's expressions are fixed, and none of them can name a
+        table the model's source did not declare. A :class:`UserWarning` says
+        so, and the table changes no run.
 
         Parameters
         ----------
         name : str
-            Function name (e.g., ``"cumNcases"``).
+            Table function name (e.g., ``"cumNcases"``).
         file : str or Path, optional
             Path to a ``.tfun`` file. Mutually exclusive with ``times``/``values``.
         times : list[float], optional
@@ -2664,18 +2678,21 @@ class Model:
         values : list[float], optional
             Y (function) values. Must be used with ``times``.
         index : str
-            Index variable name. Default ``"time"``. Can also be a parameter
-            or observable name for non-time-indexed table functions.
-        method : str
-            Interpolation method: ``"linear"`` (default) or ``"step"``.
+            Index variable name. Default ``"time"``. Can also be the name of a
+            parameter, an observable or a function, for a table not read on
+            the clock. New data for a table has to name the table's own index.
+        method : str or None
+            Interpolation method, ``"linear"`` or ``"step"``. ``None`` (the
+            default) keeps the table's own for new data, as a ``.tfun`` file
+            carries none, and is ``"linear"`` for a new table.
 
         Raises
         ------
         ModelError
-            If the file cannot be read or data is invalid, or if ``name`` is
-            already the name of one of the model's table functions or functions
-            (issue #772). A table cannot replace one the model has, or stand in
-            for a function's body.
+            If the file cannot be read or data is invalid; if ``name`` is the
+            name of a function of the model that is not a table, whose body a
+            table cannot replace; or if the model's table of that name is read
+            over another index (issue #772). The model is left as it was.
         ValueError
             If arguments are inconsistent (e.g., both ``file`` and ``times``).
 
@@ -2689,8 +2706,9 @@ class Model:
             raise ValueError(
                 "Cannot specify both 'file' and 'times'/'values'. Use one or the other."
             )
-        normalized_method = method.strip().lower()
-        if normalized_method not in {"linear", "step"}:
+        # "" asks the core for the table's own method (linear for a new one).
+        normalized_method = "" if method is None else method.strip().lower()
+        if method is not None and normalized_method not in {"linear", "step"}:
             raise ValueError(
                 "Invalid table function interpolation method. Expected 'linear' or 'step'."
             )
@@ -2709,6 +2727,19 @@ class Model:
                 raise ModelError(f"Failed to add table function '{name}': {e}") from e
         else:
             raise ValueError("Must specify either 'file' or both 'times' and 'values'.")
+        # The breakpoints the run stops on are read from the tables' data
+        # (issue #709), and new data under a table's name moves them.
+        self._table_breaks = None
+        read = [t["name"] for t in self._core.table_function_tables if t["read"]]
+        if name not in read:
+            warnings.warn(
+                f"nothing in the model reads table function '{name}': a loaded model's "
+                "expressions can call only the tables its source declares, so this one "
+                "changes no run. To give the model new data, use the name of a table it "
+                f"reads: {read if read else 'it has none'} (issue #772).",
+                UserWarning,
+                stacklevel=2,
+            )
 
     @property
     def n_table_functions(self) -> int:

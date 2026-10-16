@@ -22,6 +22,10 @@ import bngsim
 import numpy as np
 import pytest
 
+# Tables added after load here are fixtures that nothing in the model reads,
+# which add_table_function warns about (issue #772).
+pytestmark = pytest.mark.filterwarnings("ignore:nothing in the model reads table function")
+
 pytest.importorskip("sympy")
 
 # Two functions with a logarithm that need no guard, one that does, and a

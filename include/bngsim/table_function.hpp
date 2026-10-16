@@ -103,6 +103,18 @@ class TableFunction {
     int size() const { return static_cast<int>(xs_.size()); }
     InterpolationMethod method() const { return method_; }
 
+    /// Whether an expression of the model calls this table: true for one a
+    /// model source declares (a `.net` tfun), false for one added after load,
+    /// which no expression can name. Only a table the model reads makes it
+    /// read the time, or puts its breakpoints among a run's stops.
+    bool read_by_model() const { return read_by_model_; }
+    void set_read_by_model(bool read) { read_by_model_ = read; }
+
+    /// Take `other`'s knots, values and method, keeping this table's name,
+    /// index, binding and reader (issue #772): new data for a table the
+    /// evaluator and compiled code already call.
+    void take_data_of(const TableFunction &other);
+
     /// Load a .tfun file and create a TableFunction.
     /// File format (GDAT-style):
     ///   # index_col_header  value_col_header
@@ -122,11 +134,16 @@ class TableFunction {
     ///                    `(tfun('drive') + ...)/k`) while the .tfun file's
     ///                    column-2 header still records the original BNG function
     ///                    name.
+    /// @param also_header A second value-column header to accept in place of
+    ///                    `header_name`; empty for none. New data for a table
+    ///                    may be labelled with the table's name or with the
+    ///                    function it is written in (issue #772).
     /// @throws std::runtime_error on parse errors
     static TableFunction from_file(const std::string &name, const std::string &filepath,
                                    const std::string &index_name = "time",
                                    InterpolationMethod method = InterpolationMethod::Linear,
-                                   const std::string &header_name = "");
+                                   const std::string &header_name = "",
+                                   const std::string &also_header = "");
 
   private:
     std::string name_;
@@ -135,6 +152,7 @@ class TableFunction {
     std::vector<double> ys_;
     InterpolationMethod method_ = InterpolationMethod::Linear;
     double *index_ptr_ = nullptr;
+    bool read_by_model_ = false;
 };
 
 } // namespace bngsim
