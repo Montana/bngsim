@@ -1,4 +1,4 @@
-"""GH #1067: NFsim refuses a species-level compartment on a pattern.
+"""GH #1067: NFsim refuses a compartment model outside the envelope it runs right.
 
 BioNetGen's ``@EC:A()`` prefix puts a compartment on the pattern, written as
 ``compartment="EC"`` on an observable's ``<Pattern>`` or a rule's
@@ -12,8 +12,16 @@ pattern matched every compartment (RuleWorld/nfsim#106), with no error:
 * ``0 -> @EC:A2()`` in a volume-2 compartment ran at k1, not k1*V: A2 9.6
   against 20 at t = 10.
 
-Until a fix is vendored, NfsimSession and Simulator(method='nf') refuse such a
-model by name. The molecule-level form runs, and agrees with the network.
+NFsim also applies no volume factor to a rule with two or more reactants
+(``A(b)@EC + B(a)@EC`` in a size-2 compartment: AB 133.6 against 100,
+RuleWorld/nfsim#108), and gives no compartment to a molecule a rule creates with
+none written (``A -> A + C()``: ``C@EC()`` 0 against 86.5, RuleWorld/nfsim#109).
+
+Until fixes are vendored, NfsimSession and Simulator(method='nf') refuse such a
+model by name. Inside the envelope (no pattern compartments; created molecules
+placed; and, unless every volume factor is 1, only zero- and first-order rules,
+with zero-order products in one compartment) NFsim agrees with the network,
+#854's zero-order synthesis into a size-2 compartment included.
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim import ModelError
-from bngsim._network_free_checks import pattern_compartments
+from bngsim._network_free_checks import nfsim_compartment_problems
 
 pytestmark = pytest.mark.skipif(
     not getattr(bngsim, "HAS_NFSIM", False),
@@ -34,9 +42,11 @@ pytestmark = pytest.mark.skipif(
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data" / "nfsim"
 
 REFUSED = [
-    ("pattern_compartment_observable.xml", r"observable 'AECp' \(@EC:\)"),
-    ("pattern_compartment_rule.xml", r"rule '_R1' \(@EC:\)"),
-    ("pattern_compartment_synthesis.xml", r"rule '_R2' \(@EC:\)"),
+    ("pattern_compartment_observable.xml", r"observable 'AECp' carries .*\(@EC:\)"),
+    ("pattern_compartment_rule.xml", r"rule '_R1' carries .*\(@EC:\)"),
+    ("pattern_compartment_synthesis.xml", r"rule '_R2' carries .*\(@EC:\)"),
+    ("compartment_bimolecular_size2.xml", r"rule '_R1' has 2 reactants while EC has size 2"),
+    ("compartment_created_molecule.xml", r"rule '_R4' creates C with no compartment written"),
 ]
 
 
@@ -53,10 +63,18 @@ def test_the_simulator_refuses_a_pattern_compartment(fixture, says, simple_decay
         bngsim.Simulator(m, method="nf", xml_path=str(DATA / fixture))
 
 
-def test_a_model_with_compartments_on_molecules_and_seeds_runs():
-    # @EC:A(b) in the seed species is a species' compartment, which NFsim reads.
-    xml = DATA / "molecule_compartment_degradation.xml"
-    assert pattern_compartments(xml) == []
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        # Compartments on molecules and seed species only, all of size 1.
+        "molecule_compartment_degradation.xml",
+        # #854: zero-order synthesis into one compartment of size 2 is scaled right.
+        "zero_order_switchable_rate_compartment.xml",
+    ],
+)
+def test_a_compartment_model_inside_the_envelope_runs(fixture):
+    xml = DATA / fixture
+    assert nfsim_compartment_problems(xml) == []
     bngsim.NfsimSession(str(xml)).destroy()
 
 

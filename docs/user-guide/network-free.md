@@ -166,18 +166,29 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
-### Compartments on patterns
+### Compartment models
 
-NFsim reads a compartment from a seed species (`@EC:A(b) 200`) and from a
-molecule (`A()@EC`), but not from a pattern. BioNetGen's species-level prefix,
-`@EC:A()`, puts the compartment on the pattern, so NFsim ignored it and the
-pattern matched every compartment, without an error (RuleWorld/nfsim#106): an
-observable `@EC:A()` counted every A, `@EC:A() -> 0` degraded the A in other
-compartments too, and `0 -> @EC:A2()` ran without its volume factor. NFsim
-therefore refuses any observable or rule with such a pattern, naming each (issue
-#1067 lifts it once the upstream fix is vendored). For a single molecule,
-`A()@EC` means the same and runs; otherwise simulate the generated network with
-`method="ode"` or `method="ssa"`.
+NFsim gets a compartment model right only in a narrow envelope. It reads a
+compartment from a seed species (`@EC:A(b) 200`) and from a molecule (`A()@EC`),
+but not from a pattern, so BioNetGen's species-level prefix `@EC:A()` matched
+every compartment (RuleWorld/nfsim#106); it gave no compartment to a molecule a
+rule creates with none written, as in `A -> A + C()`, where BioNetGen uses the
+reactants' compartment (RuleWorld/nfsim#109); and it scales by volume only
+zero-order synthesis into one compartment, not a rule with two or more
+reactants or synthesis of a complex that spans compartments
+(RuleWorld/nfsim#108). Each of these ran without an error. NFsim therefore
+refuses, naming the rule or observable:
+
+- any pattern that carries a compartment (`@EC:A()`);
+- a rule that creates a molecule with no compartment written, when some pattern
+  places that type in a compartment;
+- if any compartment's size, or `NumberPerQuantityUnit`, is not 1: a rule with
+  two or more reactants, or a zero-order rule whose products do not sit in
+  exactly one compartment.
+
+Unimolecular rules and zero-order synthesis into one compartment run at any
+size. Issue #1067 lifts the refusal once the upstream fixes are vendored; until
+then simulate the generated network with `method="ode"` or `method="ssa"`.
 
 ### Functions that read an observable outside their argument
 

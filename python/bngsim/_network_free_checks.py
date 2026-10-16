@@ -28,9 +28,12 @@ alone change no rate, so only the rate law is refused. So is a rate-law type
 NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
 such a rule with a message only its captured log holds, so the rule never fires.
 
-A species-level compartment on a pattern, ``@EC:A()``, is refused on NFsim too
-(issue #1067): NFsim reads a compartment only from seed species and molecules,
-so such a pattern matches every compartment (RuleWorld/nfsim#106).
+A compartment model is refused on NFsim too (issue #1067) where NFsim runs it
+wrong: NFsim applies no volume factor to rules with two or more reactants or to
+synthesis spanning compartments (RuleWorld/nfsim#108), so those are refused
+unless every factor is 1; and it reads a compartment only from seed species and
+molecules, so a species-level ``@EC:A()`` pattern, which matches every
+compartment, is always refused (RuleWorld/nfsim#106).
 
 A function with an argument that reads, outside it, an observable that can
 change, directly or through a function it calls, is refused on NFsim too
@@ -511,26 +514,118 @@ def _grouped(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
     return out
 
 
-def refuse_nfsim_pattern_compartments(xml_path: str | Path) -> None:
-    """Raise :class:`ModelError` if *xml_path* has a pattern with a species-level
-    compartment, which NFsim ignores (RuleWorld/nfsim#106). NFsim only."""
-    found = pattern_compartments(xml_path)
-    if not found:
+def nfsim_compartment_problems(xml_path: str | Path) -> list[str]:
+    """Why NFsim would run the compartment model in *xml_path* wrong, as
+    phrases for a message; empty when it is inside the envelope NFsim gets
+    right, or has no compartments, or cannot be parsed.
+
+    BNG scales each reaction by the volumes of the compartments it touches.
+    NFsim applies that factor only to zero-order synthesis whose products sit in
+    one compartment (RuleWorld/nfsim#108), and ignores a species-level
+    compartment on a pattern (RuleWorld/nfsim#106) and a molecule a rule creates
+    with no compartment written, which BNG puts in its reactants' compartment.
+    So those are always a problem, and when some factor is not 1 (a
+    compartment of size other than 1, or ``NumberPerQuantityUnit`` other than 1),
+    so is any rule with two or more reactants and any zero-order rule whose
+    products do not sit in exactly one compartment. Unimolecular rules need no
+    factor.
+    """
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    problems = [
+        f"{where} carries a species-level compartment ({', '.join(f'@{c}:' for c in comps)})"
+        for where, comps in _grouped(pattern_compartments(xml_path)).items()
+    ]
+    compartments = [el for el in root.iter() if _local(el.tag).lower() == "compartment"]
+    if not compartments:
+        return problems
+    # A molecule a rule creates with no compartment written: BNG puts it in its
+    # reactants' compartment, NFsim in none, so a pattern that places its type in
+    # a compartment (C()@EC) never matches it. Harmless if nothing does.
+    placed = {
+        m.get("name", "")
+        for el in root.iter()
+        if _local(el.tag) in ("Observable", "ReactionRule")
+        for m in el.iter()
+        if _local(m.tag) == "Molecule" and m.get("compartment")
+    }
+    for rule in root.iter():
+        if _local(rule.tag) != "ReactionRule":
+            continue
+        made = {el.get("id", "") for el in rule.iter() if _local(el.tag) == "Add"}
+        homeless = sorted(
+            {
+                m.get("name", "?")
+                for m in rule.iter()
+                if _local(m.tag) == "Molecule"
+                and m.get("id") in made
+                and not m.get("compartment")
+                and m.get("name") in placed
+            }
+        )
+        if homeless:
+            name = rule.get("name") or rule.get("id") or "?"
+            problems.append(
+                f"rule '{name}' creates {', '.join(homeless)} with no compartment written, "
+                "though a pattern places that type in one"
+            )
+    factors = []
+    for comp in compartments:
+        size = comp.get("size", "")
+        try:
+            unit = float(size) == 1.0
+        except ValueError:
+            unit = False
+        if not unit:
+            factors.append(f"{comp.get('id', '?')} has size {size or '(none)'}")
+    for model in root.iter():
+        npqu = model.get("NumberPerQuantityUnit") if _local(model.tag) == "model" else None
+        if npqu is not None and npqu.strip() not in ("1", "1.0"):
+            factors.append(f"NumberPerQuantityUnit is {npqu}")
+    if not factors:
+        return problems
+    where = "; ".join(factors)
+    for rule in root.iter():
+        if _local(rule.tag) != "ReactionRule":
+            continue
+        name = rule.get("name") or rule.get("id") or "?"
+        reactants = [el for el in rule.iter() if _local(el.tag) == "ReactantPattern"]
+        if len(reactants) >= 2:
+            problems.append(f"rule '{name}' has {len(reactants)} reactants while {where}")
+        elif not reactants:
+            homes = {
+                m.get("compartment")
+                for pp in rule.iter()
+                if _local(pp.tag) == "ProductPattern"
+                for m in pp.iter()
+                if _local(m.tag) == "Molecule"
+            }
+            if len(homes) != 1 or None in homes:
+                spread = ", ".join(sorted(c for c in homes if c)) or "no compartment"
+                problems.append(f"rule '{name}' synthesizes products in {spread} while {where}")
+    return problems
+
+
+def refuse_nfsim_compartments(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* is a compartment model outside the
+    envelope NFsim runs right. NFsim only."""
+    problems = nfsim_compartment_problems(xml_path)
+    if not problems:
         return
     label, _ = _BACKENDS["nfsim"]
     raise ModelError(
-        f"{label} cannot run a model with a species-level compartment on a pattern: "
-        + ", ".join(
-            f"{where} ({', '.join(f'@{c}:' for c in comps)})"
-            for where, comps in _grouped(found).items()
-        )
-        + ". NFsim ignores such a compartment, so the pattern matches the molecule in "
-        "every compartment: an observable counts the wrong molecules, a rule acts on the "
-        "wrong ones, and a product is made at the wrong rate, without an error "
-        "(RuleWorld/nfsim#106; this refusal is lifted under issue #1067). Write the "
-        "compartment on the molecule instead, A()@EC, which NFsim reads and which means "
-        "the same for a single molecule, or simulate the network BNG2.pl generates with "
-        "method='ode' or method='ssa'."
+        f"{label} cannot run this compartment model: "
+        + "; ".join(problems)
+        + ". NFsim applies a compartment's volume only to zero-order synthesis into one "
+        "compartment, not to a rule with two or more reactants or to synthesis spanning "
+        "compartments, and it ignores a species-level compartment on a pattern "
+        "(@EC:A()) and leaves a molecule a rule creates with no compartment written in "
+        "none, so such a model runs at the wrong rates, acts on the wrong molecules, or "
+        "counts the wrong ones, without an error (RuleWorld/nfsim#106, RuleWorld/nfsim#108; this "
+        "refusal is lifted under issue #1067). Simulate the network BNG2.pl generates "
+        "with method='ode' or method='ssa'."
     )
 
 
