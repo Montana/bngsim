@@ -1,0 +1,28 @@
+# bngsim GH #854 review fixture: a two-argument local function reading both
+# reactants. NFsim's LocalFunction takes one argument and called exit(1),
+# killing the host process; it now fails the load with a message.
+begin model
+begin parameters
+  k 0.001
+end parameters
+begin molecule types
+  A(b)
+  B(a)
+end molecule types
+begin seed species
+  A(b) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules SA A()
+  Molecules SB B()
+end observables
+begin functions
+  fAB(x,y) = k*(1+SA(x))*(1+SB(y))
+end functions
+begin reaction rules
+  A(b)%x + B(a)%y -> A(b!1).B(a!1) fAB(x,y)
+end reaction rules
+end model
+writeXML()

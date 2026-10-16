@@ -2596,7 +2596,10 @@ class Model:
         Raises
         ------
         ModelError
-            If the file cannot be read or data is invalid.
+            If the file cannot be read or data is invalid, or if ``name`` is
+            already the name of one of the model's table functions or functions
+            (issue #772). A table cannot replace one the model has, or stand in
+            for a function's body.
         ValueError
             If arguments are inconsistent (e.g., both ``file`` and ``times``).
 

@@ -36,9 +36,14 @@ model.add_table_function(
 
 ```python
 model.add_table_function(
-    "drive", times=[0, 1, 2, 5], values=[0, 0, 1, 5], method="linear"
+    "forcing", times=[0, 1, 2, 5], values=[0, 0, 1, 5], method="linear"
 )
 ```
+
+A model holds one table per name, and a table cannot stand in for a function
+the model already has: `add_table_function` raises `ModelError` for a name that
+is already one of the model's table functions or functions, including a `tfun`
+the `.net` declares.
 
 Introspect what a model carries:
 

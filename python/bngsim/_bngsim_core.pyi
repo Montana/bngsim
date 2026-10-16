@@ -187,7 +187,7 @@ class NetworkModel:
         """
         For each conservation law, the 0-based indices of the species it holds: those whose coefficient, over the species' volume, is not rounding beside the law's largest. Issue #758.
         """
-    def evaluate_over_times(self, expression: str, times: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], shift: typing.SupportsFloat = 0.0) -> numpy.typing.NDArray[numpy.float64]:
+    def evaluate_over_times(self, expression: str, times: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], shift: typing.SupportsFloat | typing.SupportsIndex = 0.0) -> numpy.typing.NDArray[numpy.float64]:
         """
         The value of an expression at each of `times`, with the clock set to that time and everything else as it stands, in the evaluator's own arithmetic. For a text that reads the clock, parameters and builtins only (a rate law's condition on time): a function slot, an observable or a species is read at its present value, not at the time asked. The clock is put back before returning. `shift` is the value of the variable `bngsim_scan_shift_` meanwhile, for a text written over a counter as `time() + bngsim_scan_shift_`. Raises if the expression does not compile.
         """
@@ -498,9 +498,9 @@ class NetworkModel:
     def table_function_names(self) -> list[str]:
         ...
     @property
-    def table_function_tables(self) -> list[dict]:
+    def table_function_tables(self) -> list:
         """
-        Every table function with its table: [{name, index_kind ('time', 'parameter' or 'observable'), index_param_idx, index_obs_idx, method ('linear' or 'step'), xs, ys}], in dispatch-id order. The knots of a table read on the clock are where its value (step) or slope (linear) breaks, and Simulator.run stops the integration on each (issue #709).
+        Every table function with its table: [{name, index_kind ('time', 'parameter', 'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, method ('linear' or 'step'), xs, ys}], in dispatch-id order. A 'parameter' is a slot no function owns; a table over a model function is 'function' (issue #965). The knots of a table read on the clock are where its value (step) or slope (linear) breaks, and Simulator.run stops the integration on each (issue #709).
         """
     @property
     def uses_rateof(self) -> bool:

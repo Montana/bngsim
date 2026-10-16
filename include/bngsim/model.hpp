@@ -26,14 +26,20 @@ struct ModelImplData;
 
 /// Resolved metadata for one registered TableFunction, used by the
 /// model-based codegen path to emit the C call for a tfun-backed BNGL
-/// function. The index kind is "time", "parameter", or "observable";
-/// the corresponding index field carries the 0-based array index for
-/// parameter/observable indexing (and is -1 for time-indexed tfuns).
+/// function. The index kind is "time", "parameter", "function", or
+/// "observable"; the corresponding index field carries the 0-based array
+/// index (parameter, function or observable), and the others are -1. A
+/// "parameter" is a slot no function owns. A table over a model function,
+/// `tfun([...], [...], h)`, is "function", indexed by `h`'s position in the
+/// model's functions: `h`'s parameter slot holds its value only where the
+/// interpreter has written it, so compiled code reads the function (issue
+/// #965).
 struct TableFunctionSpec {
     std::string name;
     std::string index_kind;
     int index_param_idx = -1;
     int index_obs_idx = -1;
+    int index_func_idx = -1;
     /// The table is read as a step (method=>"step"), not interpolated: its
     /// value jumps at each breakpoint of its index.
     bool step = false;
@@ -383,6 +389,10 @@ class NetworkModel {
     };
     const StateSwitch *state_switch(const std::string &condition_src,
                                     std::string *why = nullptr) const;
+    // Does the switch's residual read the clock, through the walk
+    // event_trigger_reads_time takes (issue #908)? Never by probing values: a
+    // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
+    bool state_switch_reads_time(const StateSwitch &sw) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
@@ -817,6 +827,10 @@ class NetworkModel {
 
     // ─── Table functions ────────────────────────────────────────────────────
 
+    // Both overloads throw std::invalid_argument for a name the model already
+    // has as a table function or a function (issue #772), before anything
+    // changes: there is no replacing a table, or a function's body, in place.
+
     /// Add a table function from a .tfun file.
     /// @param name        Function name (e.g., "cumNcases")
     /// @param filepath    Path to .tfun file
@@ -942,6 +956,20 @@ class NetworkModel {
     /// Internal helper: register a TableFunction with the expression evaluator
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);
+
+    /// Throw if a table function named `name` is already registered, or a
+    /// function is named `name` and the table does not back it (issue #772).
+    void require_new_table_name_(const std::string &name, bool backs_a_function) const;
+
+    /// add_table_function's two shapes. ModelBuilder calls them with
+    /// `backs_a_function` set for a `.net` tfun, whose table takes the name of
+    /// the function it is the body of; the public overloads never set it.
+    void add_table_function_(const std::string &name, const std::string &filepath,
+                             const std::string &index_name, const std::string &method,
+                             const std::string &header_name, bool backs_a_function);
+    void add_table_function_(const std::string &name, const std::vector<double> &xs,
+                             const std::vector<double> &ys, const std::string &index_name,
+                             const std::string &method, bool backs_a_function);
 
     /// Re-resolve every species IC that a parameter names, from the current
     /// parameter values (issue #79). Called at the end of set_param(), after

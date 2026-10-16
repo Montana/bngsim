@@ -205,6 +205,7 @@ def test_the_core_hands_over_each_table(tmp_path):
         "index_kind": "time",
         "index_param_idx": -1,
         "index_obs_idx": -1,
+        "index_func_idx": -1,
         "method": "step",
         "xs": [0.0, 10.0, 12.0, 50.0],
         "ys": [0.0, 5.0, 0.0, 0.0],
