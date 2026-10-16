@@ -203,12 +203,15 @@ def _constant_observables(root: ET.Element) -> set[str]:
 
     * inert: no rule names any molecule type in it, and every seed species that
       holds one of those types holds only types no rule names. No rule can then
-      bind, free, delete, merge or split anything in those complexes. Species
-      observables and multi-molecule patterns are covered only this way, since a
-      merge elsewhere in a complex changes them without naming their types.
-    * a conserved total: a ``Molecules`` observable of one bare molecule, ``X()``,
-      where no rule adds an X, deletes an X, or deletes a whole species (which
-      can take an X with it unnamed).
+      bind, free, move, delete, merge or split anything in those complexes.
+      Species observables and multi-molecule patterns are covered only this way,
+      since a merge elsewhere in a complex changes them without naming their
+      types.
+    * a conserved total: a ``Molecules`` observable of one bare molecule ``X()``
+      with no compartment, where no rule adds an X, deletes an X by name, or
+      deletes a whole species that could hold an X. Two types can share a complex
+      only if they share a seed species or a rule pattern, so a whole-species
+      delete whose pattern's types never meet X's cannot take an X with it.
     """
     rules = [el for el in root.iter() if _local(el.tag) == "ReactionRule"]
     named: set[str] = set()
@@ -222,9 +225,31 @@ def _constant_observables(root: ET.Element) -> set[str]:
                 mol_type[el.get("id", "")] = el.get("name", "")
             elif kind in ("ReactantPattern", "ProductPattern") and el.get("id"):
                 pattern_types[el.get("id", "")] = _molecule_names(el)
+    seeds = [
+        _molecule_names(sp)
+        for lst in root.iter()
+        if _local(lst.tag) == "ListOfSpecies"
+        for sp in lst
+        if _local(sp.tag) == "Species"
+    ]
+    # Types that can share a complex: joined through any seed species or pattern.
+    partners: dict[str, set[str]] = {}
+    for group in [*seeds, *pattern_types.values()]:
+        for t in group:
+            partners.setdefault(t, set()).update(group)
+
+    def complex_mates(x: str) -> set[str]:
+        seen, todo = {x}, [x]
+        while todo:
+            for u in partners.get(todo.pop(), ()):
+                if u not in seen:
+                    seen.add(u)
+                    todo.append(u)
+        return seen
+
     added: set[str] = set()
     deleted: set[str] = set()
-    whole_species_deleted = False
+    species_deletes: list[set[str] | None] = []  # None = could not resolve
     for rule in rules:
         for el in rule.iter():
             kind = _local(el.tag)
@@ -235,24 +260,26 @@ def _constant_observables(root: ET.Element) -> set[str]:
                 if el.get("DeleteMolecules") == "1":
                     deleted |= pattern_types.get(ref) or {mol_type.get(ref, "")}
                 else:
-                    whole_species_deleted = True
-    seeds = [
-        _molecule_names(sp)
-        for lst in root.iter()
-        if _local(lst.tag) == "ListOfSpecies"
-        for sp in lst
-        if _local(sp.tag) == "Species"
-    ]
+                    species_deletes.append(pattern_types.get(ref))
 
     def inert(types: set[str]) -> bool:
         return not (types & named) and all(not (seed & named) for seed in seeds if seed & types)
 
     def conserved_total(obs: ET.Element, pattern: ET.Element) -> bool:
         mols = [m for m in pattern.iter() if _local(m.tag) == "Molecule"]
-        if obs.get("type") != "Molecules" or len(mols) != 1 or len(mols[0]) != 0:
+        if (
+            obs.get("type") != "Molecules"
+            or len(mols) != 1
+            or len(mols[0]) != 0
+            or pattern.get("compartment")
+            or mols[0].get("compartment")
+        ):
             return False
         x = mols[0].get("name", "")
-        return not (whole_species_deleted or {x, ""} & added or {x, ""} & deleted)
+        if {x, ""} & added or {x, ""} & deleted:
+            return False
+        mates = complex_mates(x)
+        return all(types is not None and not (types & mates) for types in species_deletes)
 
     constant = set()
     for obs in root.iter():
@@ -267,24 +294,27 @@ def _constant_observables(root: ET.Element) -> set[str]:
 
 
 def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
-    """``(function, observable)`` for each function with an argument in
-    *xml_path* that reads, outside that argument, an observable whose count can
-    change. Empty when the file cannot be parsed.
+    """``(function, observable)`` for each function with an argument that a rule's
+    rate law uses in *xml_path* and that reads, outside its argument, an
+    observable whose count can change. Empty when the file cannot be parsed.
 
     NFsim re-evaluates a function with an argument only on the complexes a
     reaction produces, so such a term goes stale on every other molecule
     (RuleWorld/nfsim#104). The read can be direct (``MAB`` or ``MAB()`` beside
-    ``AC(x)`` in a local function) or through a function the argument-taking
-    function calls (``fB(x)*g()`` with ``g() = 1+0.01*MAB``). A composite
-    function's own direct read of an observable is left to NFsim, which refuses
-    it at load. Constant observables are allowed; see
-    :func:`_constant_observables`, which errs toward calling a count changing.
+    ``AC(x)`` in a local function), through a function it calls (``fB(x)*g()``
+    with ``g() = 1+0.01*MAB``), or through a table function's counter
+    (``tfun(..., MAB)``, kept in ``ctrName``). A composite function's own direct
+    read of an observable is left to NFsim, which refuses it at load; its table
+    counter is not, since NFsim does not check that. Constant observables are
+    allowed; see :func:`_constant_observables`, which errs toward calling a
+    count changing.
     """
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
         return []
     funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
+    observables = {o.get("name", "") for o in root.iter() if _local(o.tag) == "Observable"}
 
     def args(f: ET.Element) -> list[str]:
         return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
@@ -297,11 +327,20 @@ def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
             if r.get("type") == kind
         ]
 
+    def counter_reads(f: ET.Element) -> set[str]:
+        """The observable a table function's counter reads, if it is one."""
+        ctr = f.get("ctrName", "")
+        return {ctr} if ctr in observables else set()
+
+    def calls(f: ET.Element) -> list[str]:
+        ctr = f.get("ctrName", "")
+        return refs(f, "Function") + ([ctr] if ctr in funcs else [])
+
     def outside(f: ET.Element) -> set[str]:
-        """Observables *f* reads directly, other than through its argument."""
+        """Observables *f* reads itself other than through its argument."""
         fargs = args(f)
         expr = " ".join(e.text or "" for e in _children(f, "Expression"))
-        found = set()
+        found = counter_reads(f)
         for name in refs(f, "Observable"):
             uses = re.finditer(
                 rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
@@ -314,22 +353,39 @@ def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
     def through_calls(f: ET.Element, seen: frozenset[str]) -> set[str]:
         """Observables *f* reaches outside any argument through the functions it calls."""
         found: set[str] = set()
-        for name in refs(f, "Function"):
+        for name in calls(f):
             g = funcs.get(name)
             if g is None or name in seen:
                 continue
-            if not args(g) and not refs(g, "Function"):
+            if not args(g):
                 found |= outside(g)  # a global function: every read is outside
             found |= through_calls(g, seen | {name})
         return found
 
+    # Only functions a rate law uses can run stale; follow calls from there.
+    used: set[str] = set()
+    todo = [
+        name
+        for rule in root.iter()
+        if _local(rule.tag) == "ReactionRule"
+        for law in rule
+        if _local(law.tag) == "RateLaw"
+        for key in ("name", "name1", "name2")
+        if (name := law.get(key)) in funcs
+    ]
+    while todo:
+        name = todo.pop()
+        if name not in used:
+            used.add(name)
+            todo += [c for c in calls(funcs[name]) if c in funcs]
+
     constant = _constant_observables(root)
     found = []
     for name, f in funcs.items():
-        if not args(f):
-            continue  # a global function is re-evaluated whenever its observables change
-        composite = bool(refs(f, "Function"))
-        reads = through_calls(f, frozenset({name})) if composite else outside(f)
+        if name not in used or not args(f):
+            continue  # unused, or global: re-evaluated whenever its observables change
+        # A composite's own direct reads are NFsim's to refuse; its counter is not.
+        reads = through_calls(f, frozenset({name})) | counter_reads(f) if calls(f) else outside(f)
         found += [(name, o) for o in sorted(reads - constant)]
     return found
 

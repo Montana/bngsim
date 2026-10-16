@@ -7,13 +7,16 @@ molecule off the firing complex, the value it had at that molecule's last event.
 On ``tests/data/nfsim/local_function_outside_observable.bngl``, AB at t = 10 was
 50.1 against network SSA 55.6 (100 seeds, z = -10), with no error. A rate law
 ``fB(x)*g()`` whose global ``g()`` reads the observable goes stale the same way.
-Until a fix is vendored, NfsimSession and Simulator(method='nf') refuse such a
-read by name.
+So does a read through a table function's counter, ``tfun(..., MAB)``. Until a
+fix is vendored, NfsimSession and Simulator(method='nf') refuse such a read by
+name.
 
 A read stays allowed when its observable can never change: every pattern is
 inert (no rule names its types, and their seed complexes hold only types no rule
-names) or a conserved total (``X()`` that no rule adds or deletes). The check
-errs toward refusing; the model's generated network (ode / ssa) always runs.
+names) or a conserved total (``X()`` with no compartment that no rule adds,
+deletes, or can delete with a whole species). Only functions a rate law uses are
+checked. The check errs toward refusing; the generated network (ode / ssa)
+always runs.
 """
 
 from __future__ import annotations
@@ -43,6 +46,10 @@ REFUSED = [
         "rate_law_local_times_global.xml",
         r"'_rateLaw1' \(the rate law of rule '_R1'\) reads 'MAB'",
     ),
+    # fB(x)*tfun(..., MAB): the table's counter, kept only in ctrName.
+    ("rate_law_table_function_counter.xml", r"'_rateLaw1' .*reads 'MAB'"),
+    # AEC = A()@EC: no A is made or destroyed, but transport moves A out of EC.
+    ("local_function_compartment_total.xml", r"'fA' reads 'AEC'"),
 ]
 
 ALLOWED = [
@@ -52,6 +59,10 @@ ALLOWED = [
     "local_function_bondable_outside_observable.xml",
     # Atot = A(): no rule adds or deletes an A.
     "local_function_conserved_total.xml",
+    # The same, plus C() -> 0: C never shares a complex with A.
+    "local_function_conserved_total_with_degradation.xml",
+    # fA(x) reads MAB, but no rule uses fA.
+    "unused_local_function_reads_observable.xml",
     # The rate is a global g() reading MAB: re-evaluated whenever MAB changes.
     "global_function_reads_observable.xml",
     # Both read Obs_Src = Src(), which no rule names, outside the argument.
