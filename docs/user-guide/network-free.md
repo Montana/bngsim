@@ -175,13 +175,17 @@ produces, so on every other molecule that term keeps the value it had at the
 molecule's last event: on a small binding model the bound count came out about
 10 % low at t = 10, without an error (RuleWorld/nfsim#104). A rate law such as
 `fB(x)*g()`, whose global `g()` reads `MAB`, goes stale the same way, and so does
-a table function counted by an observable, `fB(x)*tfun(..., MAB)`. NFsim
+a table function counted by an observable or the clock, `fB(x)*tfun(..., MAB)` or
+`fB(x)*tfun(..., time)`. NFsim
 therefore refuses such a read in a function a rate law uses, naming the function
 (or the rule whose rate law it is) and the observable, unless the observable can
 never change: each of its patterns either names only types that no rule names,
 held in seed complexes of such types only, or is a bare `X()` with no
 compartment, counted by a `Molecules` observable, that no rule adds, deletes, or
-can delete along with a whole species. The check errs toward refusing (issue #1062 lifts
+can delete along with a whole species, and that no fixed (`$`) seed species
+holds. Because such a count is constant only while the rules alone act on it,
+an `NfsimSession` also refuses `add_molecules`, `add_species`, `remove_species`
+or `set_species_count` on a type it counts. The check errs toward refusing (issue #1062 lifts
 it once the upstream fix is vendored). A rate law that is a global function of
 its own, such as `g()` reading `MAB`, is re-evaluated whenever `MAB` changes and
 runs. Otherwise simulate the model's generated network with `method="ode"` or

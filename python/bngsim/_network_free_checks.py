@@ -209,7 +209,8 @@ def _constant_observables(root: ET.Element) -> set[str]:
       types.
     * a conserved total: a ``Molecules`` observable of one bare molecule ``X()``
       with no compartment, where no rule adds an X, deletes an X by name, or
-      deletes a whole species that could hold an X. Two types can share a complex
+      deletes a whole species that could hold an X, and no fixed (``$``) seed
+      species holds an X. Two types can share a complex
       only if they share a seed species or a rule pattern, so a whole-species
       delete whose pattern's types never meet X's cannot take an X with it.
     """
@@ -225,13 +226,14 @@ def _constant_observables(root: ET.Element) -> set[str]:
                 mol_type[el.get("id", "")] = el.get("name", "")
             elif kind in ("ReactantPattern", "ProductPattern") and el.get("id"):
                 pattern_types[el.get("id", "")] = _molecule_names(el)
-    seeds = [
-        _molecule_names(sp)
+    seed_species = [
+        sp
         for lst in root.iter()
         if _local(lst.tag) == "ListOfSpecies"
         for sp in lst
         if _local(sp.tag) == "Species"
     ]
+    seeds = [_molecule_names(sp) for sp in seed_species]
     # Types that can share a complex: joined through any seed species or pattern.
     partners: dict[str, set[str]] = {}
     for group in [*seeds, *pattern_types.values()]:
@@ -249,6 +251,12 @@ def _constant_observables(root: ET.Element) -> set[str]:
 
     added: set[str] = set()
     deleted: set[str] = set()
+    # A fixed ($) seed species is topped back up whenever it is used, so its
+    # types are added (and, bound away, effectively removed) with no Add.
+    for sp in seed_species:
+        if sp.get("Fixed") == "1":
+            added |= _molecule_names(sp)
+            deleted |= _molecule_names(sp)
     species_deletes: list[set[str] | None] = []  # None = could not resolve
     for rule in rules:
         for el in rule.iter():
@@ -293,28 +301,20 @@ def _constant_observables(root: ET.Element) -> set[str]:
     return constant
 
 
-def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
-    """``(function, observable)`` for each function with an argument that a rule's
-    rate law uses in *xml_path* and that reads, outside its argument, an
-    observable whose count can change. Empty when the file cannot be parsed.
-
-    NFsim re-evaluates a function with an argument only on the complexes a
-    reaction produces, so such a term goes stale on every other molecule
-    (RuleWorld/nfsim#104). The read can be direct (``MAB`` or ``MAB()`` beside
-    ``AC(x)`` in a local function), through a function it calls (``fB(x)*g()``
-    with ``g() = 1+0.01*MAB``), or through a table function's counter
-    (``tfun(..., MAB)``, kept in ``ctrName``). A composite function's own direct
-    read of an observable is left to NFsim, which refuses it at load; its table
-    counter is not, since NFsim does not check that. Constant observables are
-    allowed; see :func:`_constant_observables`, which errs toward calling a
-    count changing.
-    """
+def _outside_reads(
+    xml_path: str | Path,
+) -> tuple[list[tuple[str, str]], set[str], dict[str, set[str]]] | None:
+    """``(reads, constant, observable types)``: every ``(function, observable)``
+    read outside an argument by a function with an argument that a rate law
+    uses, the observables no rule can change, and each observable's molecule
+    types. ``None`` when the file cannot be parsed."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
-        return []
+        return None
     funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
     observables = {o.get("name", "") for o in root.iter() if _local(o.tag) == "Observable"}
+    parameters = {p.get("id", "") for p in root.iter() if _local(p.tag) == "Parameter"}
 
     def args(f: ET.Element) -> list[str]:
         return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
@@ -328,9 +328,13 @@ def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
         ]
 
     def counter_reads(f: ET.Element) -> set[str]:
-        """The observable a table function's counter reads, if it is one."""
+        """What a table function's counter reads, if it changes: an observable,
+        or the clock (``time``, or ``t`` when no model symbol has that name)."""
         ctr = f.get("ctrName", "")
-        return {ctr} if ctr in observables else set()
+        clock = ctr in ("time", "time()") or (
+            ctr in _RULEMONKEY_CLOCK_COUNTERS and ctr.rstrip("()") not in parameters | set(funcs)
+        )
+        return {ctr} if ctr in observables or clock else set()
 
     def calls(f: ET.Element) -> list[str]:
         ctr = f.get("ctrName", "")
@@ -379,15 +383,57 @@ def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
             used.add(name)
             todo += [c for c in calls(funcs[name]) if c in funcs]
 
-    constant = _constant_observables(root)
     found = []
     for name, f in funcs.items():
         if name not in used or not args(f):
             continue  # unused, or global: re-evaluated whenever its observables change
         # A composite's own direct reads are NFsim's to refuse; its counter is not.
         reads = through_calls(f, frozenset({name})) | counter_reads(f) if calls(f) else outside(f)
-        found += [(name, o) for o in sorted(reads - constant)]
-    return found
+        found += [(name, o) for o in sorted(reads)]
+    obs_types = {
+        o.get("name", ""): _molecule_names(o) for o in root.iter() if _local(o.tag) == "Observable"
+    }
+    return found, _constant_observables(root), obs_types
+
+
+def stale_local_function_reads(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(function, observable)`` for each function with an argument that a rule's
+    rate law uses in *xml_path* and that reads, outside its argument, an
+    observable whose count can change. Empty when the file cannot be parsed.
+
+    NFsim re-evaluates a function with an argument only on the complexes a
+    reaction produces, so such a term goes stale on every other molecule
+    (RuleWorld/nfsim#104). The read can be direct (``MAB`` or ``MAB()`` beside
+    ``AC(x)`` in a local function), through a function it calls (``fB(x)*g()``
+    with ``g() = 1+0.01*MAB``), or through a table function's counter
+    (``tfun(..., MAB)`` or ``tfun(..., time)``, kept in ``ctrName``). A composite
+    function's own direct read of an observable is left to NFsim, which refuses
+    it at load; its table counter is not, since NFsim does not check that. Constant observables are
+    allowed; see :func:`_constant_observables`, which errs toward calling a
+    count changing.
+    """
+    out = _outside_reads(xml_path)
+    if out is None:
+        return []
+    reads, constant, _ = out
+    return [(f, o) for f, o in reads if o not in constant]
+
+
+def constant_read_types(xml_path: str | Path) -> dict[str, list[tuple[str, str]]]:
+    """Molecule type -> the ``(function, observable)`` reads that
+    :func:`stale_local_function_reads` lets run only because no rule can change
+    that observable. A session edit of such a type's count would change it and
+    leave those reads stale, so :class:`~bngsim.NfsimSession` refuses one."""
+    out = _outside_reads(xml_path)
+    if out is None:
+        return {}
+    reads, constant, obs_types = out
+    guarded: dict[str, list[tuple[str, str]]] = {}
+    for f, o in reads:
+        if o in constant:
+            for t in obs_types.get(o, ()):
+                guarded.setdefault(t, []).append((f, o))
+    return guarded
 
 
 def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:

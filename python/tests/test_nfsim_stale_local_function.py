@@ -50,6 +50,10 @@ REFUSED = [
     ("rate_law_table_function_counter.xml", r"'_rateLaw1' .*reads 'MAB'"),
     # AEC = A()@EC: no A is made or destroyed, but transport moves A out of EC.
     ("local_function_compartment_total.xml", r"'fA' reads 'AEC'"),
+    # fB(x)*tfun(..., time): a table indexed by the clock.
+    ("rate_law_time_table.xml", r"'_rateLaw1' .*reads 'time'"),
+    # Xtot = X(): no rule adds or deletes an X, but $X is topped back up.
+    ("local_function_fixed_species_total.xml", r"'fB' reads 'Xtot'"),
 ]
 
 ALLOWED = [
@@ -126,3 +130,28 @@ def test_a_read_through_the_argument_is_not_an_outside_read(tmp_path):
     xml.write_text(src.replace(old, "<Expression> k*(1+AC(x)) </Expression>"))
     assert stale_local_function_reads(xml) == []
     bngsim.NfsimSession(str(xml)).destroy()
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda nf: nf.add_molecules("A", 10),
+        lambda nf: nf.add_species("A(b,c)", 10),
+        lambda nf: nf.remove_species("A(b,c)", 10),
+        lambda nf: nf.set_species_count("A(b,c)", 50),
+    ],
+)
+def test_a_session_edit_that_would_change_an_exempt_count_is_refused(edit):
+    # Atot = A() runs only because no rule can change it; an edit could.
+    with bngsim.NfsimSession(str(DATA / "local_function_conserved_total.xml")) as nf:
+        nf.initialize(seed=1)
+        nf.simulate(0, 1, n_points=2)
+        with pytest.raises(ModelError, match=r"count of 'A': 'fA' reads 'Atot'.*#1062"):
+            edit(nf)
+
+
+def test_a_session_edit_of_another_type_runs():
+    with bngsim.NfsimSession(str(DATA / "local_function_conserved_total.xml")) as nf:
+        nf.initialize(seed=1)
+        nf.add_molecules("B", 10)
+        nf.simulate(0, 1, n_points=2)

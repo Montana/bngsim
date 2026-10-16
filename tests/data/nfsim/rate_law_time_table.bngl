@@ -1,0 +1,27 @@
+# bngsim GH #1062 fixture: the rate law fB(x)*tfun([0,10],[0.1,5],time), a
+# table indexed by the clock. NFsim leaves the table's value stale off the
+# firing complex (z = -238): refused.
+begin model
+begin parameters
+  k 0.002
+end parameters
+begin molecule types
+  A(b,c)
+  X(a)
+end molecule types
+begin seed species
+  A(b,c) 100
+  X(a) 100
+end seed species
+begin observables
+  Molecules AX A(b!1).X(a!1)
+  Molecules AC A(c)
+end observables
+begin functions
+  fB(x) = k*AC(x)
+end functions
+begin reaction rules
+  %x:A(b) + X(a) -> A(b!1).X(a!1) fB(x)*tfun([0,10],[0.1,5],time)
+end reaction rules
+end model
+writeXML()

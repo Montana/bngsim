@@ -1,0 +1,28 @@
+# bngsim GH #1062 fixture: fB(x) reads Xtot = X() outside its argument. No rule
+# adds or deletes an X, but X is a fixed ($) seed species that NFsim tops back
+# up as X binds, so Xtot grows and goes stale (z = -28): refused.
+begin model
+begin parameters
+  k 2e-5
+end parameters
+begin molecule types
+  A(b,c)
+  X(a)
+end molecule types
+begin seed species
+  A(b,c) 100
+  $X(a) 50
+end seed species
+begin observables
+  Molecules AX A(b!1).X(a!1)
+  Molecules AC A(c)
+  Molecules Xtot X()
+end observables
+begin functions
+  fB(x) = k*AC(x)*Xtot
+end functions
+begin reaction rules
+  %x:A(b) + X(a) -> A(b!1).X(a!1) fB(x)
+end reaction rules
+end model
+writeXML()
