@@ -764,20 +764,10 @@ def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:
     )
 
 
-def nfsim_compartments(xml_path: str | Path) -> list[str]:
-    """The ids of the compartments *xml_path* declares. Empty when it declares
-    none or cannot be parsed."""
-    try:
-        root = ET.parse(str(xml_path)).getroot()
-    except (ET.ParseError, OSError):
-        return []
-    return [el.get("id", "?") for el in root.iter() if _local(el.tag).lower() == "compartment"]
-
-
 def refuse_nfsim_compartments(xml_path: str | Path) -> None:
     """Raise :class:`ModelError` if *xml_path* declares compartments. NFsim only:
     its compartment support is wrong in ways no check of the XML can bound."""
-    comps = nfsim_compartments(xml_path)
+    comps = compartments(xml_path)
     if not comps:
         return
     label, _ = _BACKENDS["nfsim"]

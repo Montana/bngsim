@@ -31,7 +31,7 @@ from pathlib import Path
 import bngsim
 import pytest
 from bngsim import ModelError
-from bngsim._network_free_checks import nfsim_compartments
+from bngsim._network_free_checks import compartments
 
 pytestmark = pytest.mark.skipif(
     not getattr(bngsim, "HAS_NFSIM", False),
@@ -69,5 +69,5 @@ def test_the_simulator_refuses_a_compartment_model(fixture, names, simple_decay_
 
 def test_a_model_without_compartments_runs():
     xml = DATA / "zero_order_switchable_rate.xml"
-    assert nfsim_compartments(xml) == []
+    assert compartments(xml) == []
     bngsim.NfsimSession(str(xml)).destroy()
