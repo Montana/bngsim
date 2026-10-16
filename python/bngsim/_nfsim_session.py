@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 from pathlib import Path
 
-from bngsim._exceptions import ParameterError, SimulationError, SimulationTimeout
+from bngsim._exceptions import ModelError, ParameterError, SimulationError, SimulationTimeout
 from bngsim._result import Result
 from bngsim._rounding import round_half_up
 from bngsim._sample_times import normalize_sample_times
@@ -103,6 +104,7 @@ class NfsimSession:
         "_initialized",
         "_destroyed",
         "_seed",
+        "_constant_read_types",
     )
 
     def __init__(
@@ -133,12 +135,18 @@ class NfsimSession:
         self._destroyed = False
 
         from bngsim._network_free_checks import (
+            constant_read_types,
             refuse_nfsim_rate_laws,
+            refuse_nfsim_stale_local_functions,
             refuse_time_dependent_rate_laws,
         )
 
         refuse_time_dependent_rate_laws(self._xml_path, "nfsim")
         refuse_nfsim_rate_laws(self._xml_path)
+        refuse_nfsim_stale_local_functions(self._xml_path)
+        # Reads let through only because no rule can change their observable
+        # (GH #1062): a count edit of one of these types would make them stale.
+        self._constant_read_types = constant_read_types(self._xml_path)
         self._core = NfsimSimulator(self._xml_path)
         if molecule_limit is not None:
             self._core.set_molecule_limit(int(molecule_limit))
@@ -202,6 +210,11 @@ class NfsimSession:
         only update reaction rates from the new parameter namespace. To
         change live counts after ``initialize()``, use
         :meth:`add_species` / :meth:`remove_species`.
+
+        Neither kind of write reaches a compartment's size: BioNetGen writes
+        the size into the XML as a number, so a write to the parameter behind
+        it leaves the model at its old volume (issue #1061). Regenerate the XML
+        from BNGL to change a volume.
 
         Parameters
         ----------
@@ -473,6 +486,24 @@ class NfsimSession:
         self._require_initialized()
         return self._core.get_molecule_count(mol_type)
 
+    def _refuse_edit_of_constant_reads(self, method: str, what: str) -> None:
+        """Refuse a count edit that would change an observable a function with
+        an argument reads outside it, allowed to run only because no rule can
+        change that observable (GH #1062)."""
+        names = set(re.findall(r"([A-Za-z_]\w*)\s*\(", what)) or {what.strip()}
+        for name in sorted(names & set(self._constant_read_types)):
+            reads = self._constant_read_types[name]
+            raise ModelError(
+                f"NfsimSession.{method} cannot change the count of {name!r}: "
+                + ", ".join(f"{f!r} reads {o!r}" for f, o in reads)
+                + " outside its argument, which runs only because no rule can change "
+                "that count. NFsim re-evaluates such a function only on the complexes a "
+                "reaction produces, so after this edit the term would go stale on every "
+                "other molecule, without an error (RuleWorld/nfsim#104; this refusal is "
+                "lifted under issue #1062). Simulate the network BNG2.pl generates with "
+                "method='ode' or method='ssa' to change counts during a run."
+            )
+
     def add_molecules(self, mol_type: str, count: int) -> None:
         """Add molecules of a given type in their default (unbound) state.
 
@@ -491,6 +522,7 @@ class NfsimSession:
             If *count* is not positive.
         """
         self._require_initialized()
+        self._refuse_edit_of_constant_reads("add_molecules", mol_type)
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(
@@ -541,6 +573,7 @@ class NfsimSession:
             rounded to the nearest integer (round-half-up, GH #51).
         """
         self._require_initialized()
+        self._refuse_edit_of_constant_reads("add_species", pattern)
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -561,6 +594,7 @@ class NfsimSession:
             rounded to the nearest integer (round-half-up, GH #51).
         """
         self._require_initialized()
+        self._refuse_edit_of_constant_reads("remove_species", pattern)
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -577,6 +611,7 @@ class NfsimSession:
         rounded to the nearest integer (round-half-up, GH #51).
         """
         self._require_initialized()
+        self._refuse_edit_of_constant_reads("set_species_count", pattern)
         count = round_half_up(count)
         if count < 0:
             raise ValueError(f"count must be nonnegative, got {count}")

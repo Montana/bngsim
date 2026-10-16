@@ -213,6 +213,31 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
+### Functions that read an observable outside their argument
+
+In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
+argument and follows the molecule, but `MAB` is read outside it. NFsim
+re-evaluates a function with an argument only on the complexes a reaction
+produces, so on every other molecule that term keeps the value it had at the
+molecule's last event: on a small binding model the bound count came out about
+10 % low at t = 10, without an error (RuleWorld/nfsim#104). A rate law such as
+`fB(x)*g()`, whose global `g()` reads `MAB`, goes stale the same way, and so does
+a table function counted by an observable or the clock, `fB(x)*tfun(..., MAB)` or
+`fB(x)*tfun(..., time)`. NFsim
+therefore refuses such a read in a function a rate law uses, naming the function
+(or the rule whose rate law it is) and the observable, unless the observable can
+never change: each of its patterns either names only types that no rule names,
+held in seed complexes of such types only, or is a bare `X()` with no
+compartment, counted by a `Molecules` observable, that no rule adds, deletes, or
+can delete along with a whole species, and that no fixed (`$`) seed species
+holds. Because such a count is constant only while the rules alone act on it,
+an `NfsimSession` also refuses `add_molecules`, `add_species`, `remove_species`
+or `set_species_count` on a type it counts. The check errs toward refusing (issue #1062 lifts
+it once the upstream fix is vendored). A rate law that is a global function of
+its own, such as `g()` reading `MAB`, is re-evaluated whenever `MAB` changes and
+runs. Otherwise simulate the model's generated network with `method="ode"` or
+`method="ssa"`.
+
 ### Stateful network-free sessions
 
 For advanced workflows that mutate parameters or live particle counts between
@@ -241,6 +266,14 @@ asked for, which a model that reads the clock refuses, since its rows would not
 be labelled with the times it read. An NFsim session's clock is elapsed time.
 On both, a result's `solver_stats["n_steps"]` counts the events since
 `initialize`, not the segment's alone.
+
+On NFsim, a `set_param` reaches every rate constant, Michaelis-Menten `kcat` and
+`Km`, and function, before or after `initialize()`, but not a compartment's
+size. BioNetGen writes the size into the XML as a number, so a write to the
+parameter behind it (`Vc` in `c 3 Vc`) changes `get_parameter('Vc')` and leaves
+the model at the old volume: a zero-order synthesis into `c` keeps its old rate
+(issue #1061, waiting on RuleWorld/bionetgen#347 and RuleWorld/nfsim#105). To
+change a volume, regenerate the XML from BNGL at the new value.
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`
