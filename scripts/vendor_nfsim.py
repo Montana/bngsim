@@ -321,6 +321,71 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-zero-order-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Keep a zero-order rule's rate parameter name when NFinput folds the rule's "
+            "volume conversion into its base rate, and reapply the conversion in "
+            "resetBaseRateFromSystemParamter(). NFinput re-set the rate with an empty name, "
+            "so a setParameter() after load (bngsim's post-init set_param) skipped the rule "
+            "and it kept producing at its old rate, silently. The fold scales the rate in "
+            "place (ReactionClass::scaleBaseRate) rather than through setBaseRate(), which "
+            "applied the symmetry factor a second time. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "e4d1a99b96d9a1eb105ec8eb818ca45e155c5e55",
+                "summary": "bngsim: keep a zero-order rule's rate parameter through its volume conversion",
+            },
+            {
+                "commit": "36092b2eaa676794bce8b2beb163c284e56694b4",
+                "summary": (
+                    "bngsim: fold a zero-order volume conversion without reapplying the "
+                    "symmetry factor"
+                ),
+            },
+        ],
+    },
+    {
+        "topic": "bngsim/carry-mm-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Refresh a Michaelis-Menten rule's kcat and Km from their parameters in "
+            "resetBaseRateFromSystemParamter() (now virtual). MMRxnClass held both as numbers "
+            "with no parameter name, so a setParameter() after load (bngsim's post-init "
+            "set_param) left the rule at its old kcat and Km, silently. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "9cbe556f9e72c398383424cca480a7d8303f1ece",
+                "summary": "bngsim: refresh a Michaelis-Menten rule's kcat and Km on setParameter",
+            },
+        ],
+    },
+    {
+        "topic": "bngsim/carry-function-build-exit-to-exception",
+        "kind": "local",
+        "status": (
+            "Throw std::runtime_error instead of calling exit(1) where NFsim cannot build a "
+            "BNG-written function or a rule that reads one: DORRxnClass/DOR2RxnClass, "
+            "Observable/SpeciesObservable, LocalFunction's constructor and "
+            "prepareForSimulation(), and createCompositeFunction. A local-function rate law "
+            "reading both reactants, a local function reading a Species observable, a "
+            "two-argument local function, or a composite function reading an observable "
+            "killed the host process with no message; NFinput now fails the load and the "
+            "host reports it. Same conversion as bngsim/carry-exit-to-exception, for files it "
+            "left out. See bngsim GH #854's review."
+        ),
+        "commits": [
+            {
+                "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
+                "summary": (
+                    "bngsim: throw instead of exit(1) where a BNG-written function cannot be built"
+                ),
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12

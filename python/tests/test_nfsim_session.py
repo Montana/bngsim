@@ -408,6 +408,70 @@ class TestPostInitRateActivation:
             assert self._ab(nf, r) == 0
 
 
+# ─── Issue #854: post-init set_param refreshes a zero-order rule's rate ──────
+
+
+class TestPostInitZeroOrderRate:
+    """A post-init write to a zero-order rule's rate takes effect, as it does pre-init.
+
+    NFsim folds a zero-order rule's volume conversion into its base rate at load,
+    and did so by re-setting the rate without its parameter name, so the
+    post-init refresh (GH #44) skipped the rule: ``get_parameter('kp')`` returned
+    the new value while ``0 -> A() kp`` kept producing at the old one. With the
+    same seed the post-init and pre-init runs make the same draws, so their
+    trajectories must be identical.
+    """
+
+    @staticmethod
+    def _atot(xml, pre=None, post=None):
+        with bngsim.NfsimSession(str(xml)) as nf:
+            for name, value in (pre or {}).items():
+                nf.set_param(name, value)
+            nf.initialize(seed=1)
+            for name, value in (post or {}).items():
+                nf.set_param(name, value)
+            result = nf.simulate(0, 4, n_points=5)
+            assert nf.get_parameter("kp") == pytest.approx(
+                {**(pre or {}), **(post or {})}.get("kp", 0.0)
+            )
+            return np.asarray(result.observables).ravel()
+
+    @staticmethod
+    def _mean(t, kp, kdeg=0.7, a0=5000.0):
+        return kp / kdeg + (a0 - kp / kdeg) * np.exp(-kdeg * t)
+
+    def test_post_init_matches_pre_init(self, nfsim_zero_order_switchable_rate_xml):
+        xml = nfsim_zero_order_switchable_rate_xml
+        post = self._atot(xml, post={"kp": 1000.0})
+        pre = self._atot(xml, pre={"kp": 1000.0})
+        np.testing.assert_array_equal(post, pre)
+        # Not the kp = 0 decay it ran before the fix: 322 at t = 4 against a
+        # mean of 1646 with synthesis on.
+        t = np.linspace(0, 4, 5)
+        np.testing.assert_allclose(post, self._mean(t, 1000.0), rtol=0.05)
+
+    def test_post_init_keeps_the_volume_conversion(
+        self, nfsim_zero_order_switchable_rate_compartment_xml
+    ):
+        xml = nfsim_zero_order_switchable_rate_compartment_xml
+        post = self._atot(xml, post={"kp": 1000.0})
+        pre = self._atot(xml, pre={"kp": 1000.0})
+        np.testing.assert_array_equal(post, pre)
+        # Synthesis at kp * V = 2000, not at kp: the refresh reapplies the
+        # compartment's size (mean 2987 at t = 4, against 1646 without it).
+        t = np.linspace(0, 4, 5)
+        np.testing.assert_allclose(post, self._mean(t, 2000.0), rtol=0.05)
+
+    def test_post_init_switches_synthesis_back_off(self, nfsim_zero_order_switchable_rate_xml):
+        with bngsim.NfsimSession(str(nfsim_zero_order_switchable_rate_xml)) as nf:
+            nf.set_param("kp", 1000.0)
+            nf.initialize(seed=1)
+            nf.set_param("kp", 0.0)
+            nf.set_param("kdeg", 1e-12)  # hold degradation too: A() must stay put
+            result = nf.simulate(0, 4, n_points=5)
+            np.testing.assert_array_equal(np.asarray(result.observables).ravel(), 5000.0)
+
+
 # ─── Molecule mutations ──────────────────────────────────────────────────
 
 

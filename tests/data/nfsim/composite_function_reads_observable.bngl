@@ -1,0 +1,29 @@
+# bngsim GH #854 review fixture: a function that calls another function and
+# also reads an observable. NFsim called exit(1), killing the host process;
+# it now fails the load with a message.
+begin model
+begin parameters
+  k 0.001
+end parameters
+begin molecule types
+  A(b)
+  B(a)
+end molecule types
+begin seed species
+  A(b) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules SA A()
+  Molecules SB B()
+end observables
+begin functions
+  f() = k*SA
+  g() = f() + k*SB
+end functions
+begin reaction rules
+  A(b) + B(a) -> A(b!1).B(a!1) g()
+end reaction rules
+end model
+writeXML()

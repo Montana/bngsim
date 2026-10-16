@@ -1,0 +1,88 @@
+From 36092b2eaa676794bce8b2beb163c284e56694b4 Mon Sep 17 00:00:00 2001
+From: Bill Hlavacek <bill.hlavacek@gmail.com>
+Date: Thu, 15 Oct 2026 12:54:19 -0600
+Subject: [PATCH 17/18] bngsim: fold a zero-order volume conversion without
+ reapplying the symmetry factor
+
+NFinput folded a zero-order rule's volume conversion into its base rate
+with setBaseRate(getBaseRate() * volumeConversion, name). setBaseRate()
+multiplies by the symmetry factor (or 0.5 for an old-style dimer rule),
+and getBaseRate() already carried it, so a rule loaded at sf^2 * k * V.
+resetBaseRateFromSystemParamter() recomputes sf * k * V, so with the
+rule's parameter name kept, any setParameter() -- even a write of an
+unrelated parameter, or of the same value -- moved the rule from one rate
+to the other. Add ReactionClass::scaleBaseRate(), which multiplies the
+rate in place and leaves the name alone, and fold with it. The getter the
+previous carry added only to pass the name back is gone. BNG writes
+symmetry_factor="1" for every zero-order rule, so this reaches only XML
+written another way. (bngsim issue #854)
+---
+ src/NFcore/NFcore.hh         |  2 +-
+ src/NFcore/reactionClass.cpp | 10 ++++++++++
+ src/NFinput/NFinput.cpp      | 12 ++++++------
+ 3 files changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/src/NFcore/NFcore.hh b/src/NFcore/NFcore.hh
+index ce4c5db..95de483 100644
+--- a/src/NFcore/NFcore.hh
++++ b/src/NFcore/NFcore.hh
+@@ -1308,11 +1308,11 @@ namespace NFcore
+ 			string getName() const { return name; };
+ 			int getFireCounter() const { return fireCounter; };
+ 			double getBaseRate() const { return baseRate; };
+-			string getBaseRateParameterName() const { return baseRateParameterName; };
+ 			int getRxnType() const { return reactionType; };
+ 
+ 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
+ 			void setBaseRate(double newBaseRate,string newBaseRateName);
++			void scaleBaseRate(double factor);
+ 			void resetBaseRateFromSystemParamter();
+ 
+ 			void setTraversalLimit(int limit) { this->traversalLimit = limit; };
+diff --git a/src/NFcore/reactionClass.cpp b/src/NFcore/reactionClass.cpp
+index 7114b7a..f90e705 100755
+--- a/src/NFcore/reactionClass.cpp
++++ b/src/NFcore/reactionClass.cpp
+@@ -349,6 +349,16 @@ void ReactionClass::setBaseRate(double newBaseRate,string newBaseRateName) {
+ };
+ 
+ 
++// Multiply the rate already in place by factor. Unlike setBaseRate(), this
++// neither applies the symmetry (or dimer) factor again nor touches the
++// parameter name, so resetBaseRateFromSystemParamter() still recomputes the
++// same rate from the parameter. bngsim GH #854.
++void ReactionClass::scaleBaseRate(double factor) {
++	this->baseRate *= factor;
++	update_a();
++}
++
++
+ void ReactionClass::resetBaseRateFromSystemParamter() {
+ 
+ 	if(!this->baseRateParameterName.empty()) {
+diff --git a/src/NFinput/NFinput.cpp b/src/NFinput/NFinput.cpp
+index bc0aff4..95b78ed 100644
+--- a/src/NFinput/NFinput.cpp
++++ b/src/NFinput/NFinput.cpp
+@@ -2769,12 +2769,12 @@ bool NFinput::initReactionRulePermutation(
+ 						if (ts->getNreactants() == 0) {
+ 							r->volumeConversionFactor = volumeConversion;
+ 							if (r->getRxnType() != ReactionClass::OBS_DEPENDENT_RXN) {
+-								// Keep the rate's parameter name, so a later
+-								// setParameter() still refreshes this rule
+-								// (resetBaseRateFromSystemParamter() reapplies
+-								// the conversion). bngsim GH #854.
+-								r->setBaseRate(r->getBaseRate() * volumeConversion,
+-								               r->getBaseRateParameterName());
++								// Scale the rate in place. setBaseRate() would
++								// apply the symmetry factor a second time, and an
++								// empty name would make a later setParameter()
++								// skip this rule; the refresh reapplies the
++								// conversion itself. bngsim GH #854.
++								r->scaleBaseRate(volumeConversion);
+ 							}
+ 						}
+ 
+-- 
+2.54.0 (Apple Git-157)
+
