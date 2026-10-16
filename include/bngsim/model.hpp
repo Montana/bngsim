@@ -823,6 +823,10 @@ class NetworkModel {
 
     // ─── Table functions ────────────────────────────────────────────────────
 
+    // Both overloads throw std::invalid_argument for a name the model already
+    // has as a table function or a function (issue #772), before anything
+    // changes: there is no replacing a table, or a function's body, in place.
+
     /// Add a table function from a .tfun file.
     /// @param name        Function name (e.g., "cumNcases")
     /// @param filepath    Path to .tfun file
@@ -948,6 +952,20 @@ class NetworkModel {
     /// Internal helper: register a TableFunction with the expression evaluator
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);
+
+    /// Throw if a table function named `name` is already registered, or a
+    /// function is named `name` and the table does not back it (issue #772).
+    void require_new_table_name_(const std::string &name, bool backs_a_function) const;
+
+    /// add_table_function's two shapes. ModelBuilder calls them with
+    /// `backs_a_function` set for a `.net` tfun, whose table takes the name of
+    /// the function it is the body of; the public overloads never set it.
+    void add_table_function_(const std::string &name, const std::string &filepath,
+                             const std::string &index_name, const std::string &method,
+                             const std::string &header_name, bool backs_a_function);
+    void add_table_function_(const std::string &name, const std::vector<double> &xs,
+                             const std::vector<double> &ys, const std::string &index_name,
+                             const std::string &method, bool backs_a_function);
 
     /// Re-resolve every species IC that a parameter names, from the current
     /// parameter values (issue #79). Called at the end of set_param(), after

@@ -200,6 +200,19 @@ never fires it), a Michaelis-Menten law over a pattern that matches several
 species, `TotalRate`, and the like. Each warning is a
 `bngsim.RuleMonkeyWarning`, emitted when the simulator or session is built.
 
+### Rate laws NFsim cannot run
+
+NFsim refuses, when the simulator or session is built, a model with an
+`Arrhenius` (energy-based) rate law or with a rate-law type it does not
+implement, naming each rule. NFsim's expansion of energy rules divides every
+energy by an `RT` that BioNetGen does not apply (2.478 unless the model defines
+a parameter `RT`), gives a one-way binding rule a reverse reaction, and drops
+one-way unbinding and state-change rules, all without an error
+(RuleWorld/nfsim#102; the refusal is lifted under issue #1057). NFsim implements `Ele`, `MM` and function rate laws only:
+it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
+patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
+model's generated network with `method="ode"` or `method="ssa"`.
+
 ### Stateful network-free sessions
 
 For advanced workflows that mutate parameters or live particle counts between

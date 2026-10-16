@@ -1,0 +1,146 @@
+From 9cbe556f9e72c398383424cca480a7d8303f1ece Mon Sep 17 00:00:00 2001
+From: Bill Hlavacek <bill.hlavacek@gmail.com>
+Date: Thu, 15 Oct 2026 12:54:50 -0600
+Subject: [PATCH 18/18] bngsim: refresh a Michaelis-Menten rule's kcat and Km
+ on setParameter
+
+MMRxnClass holds kcat and Km as numbers read at load. It is built with
+a base rate of 1 and no parameter name, so resetBaseRateFromSystemParamter()
+skipped it, and a setParameter() after load (bngsim's post-init
+set_param) changed the parameter while the rule kept running at its old
+kcat and Km, silently. Keep the names NFinput read them from, make the
+refresh virtual, and have MMRxnClass read both again before recomputing
+its propensity. (bngsim issue #854)
+---
+ src/NFcore/NFcore.hh                   |  2 +-
+ src/NFinput/NFinput.cpp                |  8 +++++++-
+ src/NFreactions/reactions/reaction.cpp | 18 +++++++++++++++++-
+ src/NFreactions/reactions/reaction.hh  |  7 ++++++-
+ 4 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/src/NFcore/NFcore.hh b/src/NFcore/NFcore.hh
+index 95de483..487de97 100644
+--- a/src/NFcore/NFcore.hh
++++ b/src/NFcore/NFcore.hh
+@@ -1313,7 +1313,7 @@ namespace NFcore
+ 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
+ 			void setBaseRate(double newBaseRate,string newBaseRateName);
+ 			void scaleBaseRate(double factor);
+-			void resetBaseRateFromSystemParamter();
++			virtual void resetBaseRateFromSystemParamter();
+ 
+ 			void setTraversalLimit(int limit) { this->traversalLimit = limit; };
+ 
+diff --git a/src/NFinput/NFinput.cpp b/src/NFinput/NFinput.cpp
+index 95b78ed..9d7255a 100644
+--- a/src/NFinput/NFinput.cpp
++++ b/src/NFinput/NFinput.cpp
+@@ -2649,6 +2649,10 @@ bool NFinput::initReactionRulePermutation(
+ 						} else {
+ 							double kcat=0;
+ 							double Km=0;
++							// The parameters each was read from, so a later
++							// setParameter() refreshes them. bngsim GH #854.
++							string kcatParam="";
++							string KmParam="";
+ 
+ 							//We should always get the catalytic rate (kcat) first!
+ 							TiXmlElement *pRateConstant = pListOfRateConstants->FirstChildElement("RateConstant");
+@@ -2673,6 +2677,7 @@ bool NFinput::initReactionRulePermutation(
+ 										}
+ 										kcat = parameter.find(kcatName)->second;
+ 										usedParam = true;
++										kcatParam = kcatName;
+ 									}
+ 									if(verbose) {
+ 										cout<<"\t\t\t\t...setting kcat rate to be: "<<kcatName;
+@@ -2705,6 +2710,7 @@ bool NFinput::initReactionRulePermutation(
+ 										}
+ 										Km = parameter.find(KmName)->second;
+ 										usedParam = true;
++										KmParam = KmName;
+ 									}
+ 									if(verbose) {
+ 										cout<<"\t\t\t\t...setting Km rate to be: "<<KmName;
+@@ -2716,7 +2722,7 @@ bool NFinput::initReactionRulePermutation(
+ 
+ 							//Finally, we can make the actual reaction
+ 							ts->finalize();
+-							r = new MMRxnClass(rxnName,kcat,Km,ts,s);
++							r = new MMRxnClass(rxnName,kcat,Km,ts,s,kcatParam,KmParam);
+ 							
+ 						}
+ 					}
+diff --git a/src/NFreactions/reactions/reaction.cpp b/src/NFreactions/reactions/reaction.cpp
+index 2b4c0e6..c1af293 100644
+--- a/src/NFreactions/reactions/reaction.cpp
++++ b/src/NFreactions/reactions/reaction.cpp
+@@ -175,12 +175,15 @@ void FunctionalRxnClass::printDetails() const {
+ 
+ 
+ 
+-MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet,System *s) :
++MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet,System *s,
++                       string kcatParameterName, string KmParameterName) :
+ 	BasicRxnClass(name,1,"",transformationSet,s)
+ {
+ 	this->Km = Km;
+ 	this->kcat = kcat;
+ 	this->sFree=0;
++	this->kcatParameterName = kcatParameterName;
++	this->KmParameterName = KmParameterName;
+ 	if(n_reactants!=2) {
+ 		cerr<<"You have tried to create a reaction with a Michaelis-Menten rate law (named: '"+name+"'\n')";
+ 		cerr<<"but you don't have the correct number of reactants!  Michaelis-Menten reactions require\n";
+@@ -191,6 +194,19 @@ MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *t
+ }
+ MMRxnClass::~MMRxnClass() {};
+ 
++// kcat and Km are held as numbers, not as a base rate with a parameter name,
++// so the base refresh never reached them: a setParameter() after load changed
++// the parameter and left the rule running at its old kcat and Km. Read them
++// again from the parameters they came from. baseRate here is the symmetry
++// factor alone and has no name, so the base call leaves it as it is.
++// bngsim GH #854.
++void MMRxnClass::resetBaseRateFromSystemParamter() {
++	ReactionClass::resetBaseRateFromSystemParamter();
++	if (!kcatParameterName.empty()) kcat = system->getParameter(kcatParameterName);
++	if (!KmParameterName.empty()) Km = system->getParameter(KmParameterName);
++	update_a();
++}
++
+ double FunctionalRxnClass::exactRuleMonkey_a()
+ {
+ 	return update_a();
+diff --git a/src/NFreactions/reactions/reaction.hh b/src/NFreactions/reactions/reaction.hh
+index 9a15114..93f03d7 100644
+--- a/src/NFreactions/reactions/reaction.hh
++++ b/src/NFreactions/reactions/reaction.hh
+@@ -97,18 +97,23 @@ namespace NFcore
+ 	class MMRxnClass : public BasicRxnClass {
+ 
+ 		public:
+-			MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet, System *s);
++			MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet, System *s,
++			           string kcatParameterName = "", string KmParameterName = "");
+ 			virtual ~MMRxnClass();
+ 
+ 			virtual double update_a();
+ 				virtual double exactRuleMonkey_a();
+ 				virtual void pickRuleMonkeyMappingSets(double randNumber) const { BasicRxnClass::pickRuleMonkeyMappingSets(randNumber); }
+ 			virtual void printDetails() const;
++			virtual void resetBaseRateFromSystemParamter();
+ 
+ 		protected:
+ 			double Km;
+ 			double kcat;
+ 			double sFree;
++			// The parameters kcat and Km were read from, or "" for a number.
++			string kcatParameterName;
++			string KmParameterName;
+ 	};
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

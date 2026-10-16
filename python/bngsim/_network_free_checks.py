@@ -27,6 +27,17 @@ expands each energy rule at load, and outside that it drops or misapplies the
 context (richardposner/RuleMonkey#109), so the rule fires at the wrong rate
 with no warning. :func:`refuse_rulemonkey_energy_misreads` refuses such a model
 by name until the upstream fix is vendored.
+
+An Arrhenius (energy-based) rate law is refused on NFsim (issue #854's review).
+The vendored NFsim expands energy rules at load with three silent defects
+(RuleWorld/nfsim#102): it divides every energy by an ``RT`` that BioNetGen does
+not apply, 2.478 unless the model has a parameter named ``RT``; it gives a
+one-way binding rule a reverse reaction the model does not have; and it drops a
+one-way unbinding rule and every state-change rule. Drop this refusal when the
+vendored NFsim carries the upstream fix (gated issue #1057). Energy patterns
+alone change no rate, so only the rate law is refused. So is a rate-law type
+NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
+such a rule with a message only its captured log holds, so the rule never fires.
 """
 
 from __future__ import annotations
@@ -101,6 +112,79 @@ def clock_readers(xml_path: str | Path) -> list[str]:
         for f in _functions(xml_path) or ()
         if _reads_time(f) or _indexed_by_time(f)
     ]
+
+
+# The rate-law types the vendored NFsim implements (NFinput.cpp,
+# initReactionRulePermutation). BNG2.pl writes three more: Arrhenius, refused
+# below for its own reasons; Sat, which NFsim refuses at load; and Hill, which
+# NFsim announces only in a log bngsim captures and then drops the rule, so it
+# never fires. An unknown type takes the same path as Hill.
+_NFSIM_RATE_LAWS = frozenset({"Ele", "Function", "FunctionProduct", "MM"})
+
+
+def _rate_laws(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(rule name, rate-law type)`` for every reaction rule in *xml_path*.
+    Empty when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    return [
+        (rule.get("name") or rule.get("id") or "?", law.get("type") or "")
+        for rule in root.iter()
+        if rule.tag.endswith("ReactionRule")
+        for law in rule
+        if law.tag.endswith("RateLaw")
+    ]
+
+
+def arrhenius_rules(xml_path: str | Path) -> list[str]:
+    """The names of the reaction rules in *xml_path* whose rate law is
+    ``Arrhenius``. Empty when the file cannot be parsed."""
+    return [name for name, kind in _rate_laws(xml_path) if kind == "Arrhenius"]
+
+
+def nfsim_unimplemented_rate_laws(xml_path: str | Path) -> list[tuple[str, str]]:
+    """``(rule name, rate-law type)`` for each rule whose rate law the vendored
+    NFsim does not implement, Arrhenius aside. Empty when the file cannot be parsed."""
+    return [
+        (name, kind)
+        for name, kind in _rate_laws(xml_path)
+        if kind != "Arrhenius" and kind not in _NFSIM_RATE_LAWS
+    ]
+
+
+def refuse_nfsim_rate_laws(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* has a rule NFsim would run wrong or
+    not at all: an Arrhenius rate law (RuleWorld/nfsim#102), or a type NFsim does
+    not implement."""
+    arrhenius = arrhenius_rules(xml_path)
+    other = nfsim_unimplemented_rate_laws(xml_path)
+    if not arrhenius and not other:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    parts = []
+    if arrhenius:
+        parts.append(
+            "Arrhenius (energy-based) rate laws: rules "
+            + ", ".join(f"'{n}'" for n in arrhenius)
+            + ". NFsim's expansion of energy rules divides every energy by an RT that "
+            "BioNetGen does not apply (2.478 unless the model defines a parameter RT), "
+            "gives a one-way binding rule a reverse reaction, and drops one-way unbinding "
+            "and state-change rules, all without an error (RuleWorld/nfsim#102; this "
+            "refusal is lifted under issue #1057)"
+        )
+    if other:
+        parts.append(
+            "rate laws NFsim does not implement: "
+            + ", ".join(f"rule '{n}' ({kind or 'no type'})" for n, kind in other)
+            + ". NFsim implements Ele, MM and function rate laws, and drops a rule of "
+            "any other type without an error (Hill) or stops the load (Sat)"
+        )
+    raise ModelError(
+        f"{label} cannot run a model with {'; and with '.join(parts)}. Simulate it with "
+        "method='ode' or method='ssa' on the network BNG2.pl generates."
+    )
 
 
 def _local(tag: str) -> str:
