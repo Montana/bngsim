@@ -658,9 +658,7 @@ def test_a_residual_on_an_unstable_surface_steps_on(data_dir, tmp_path, spelling
     window = dict(t_span=(0.0, 100.0), n_points=1001, rtol=1e-11, atol=1e-11)
     result = bngsim.Simulator(model).run(**window)
     assert result.solver_stats["n_steps"] < 5_000
-    unrooted = _write(tmp_path, text, "ql_unrooted.net")
-    assert unrooted.state_switch_root_conditions()
-    unrooted._state_switch_root_conditions = ()
+    unrooted = _unrooted(tmp_path, text, "ql_unrooted.net")
     reference = bngsim.Simulator(unrooted).run(**window)
     got = np.asarray(result.species)
     want = np.asarray(reference.species)
@@ -741,8 +739,15 @@ end groups
 
 
 def _unrooted(tmp_path, text, name):
+    """The model with its state-switch roots stood down, the reference a
+    rooted run is measured against. The roots are derived before they are
+    blanked, so the blank sits under the key a run asks with (issue #726).
+    Blanked before that, it was derived again at the first run, and the
+    reference was rooted too: a comparison that could not fail."""
     model = _write(tmp_path, text, name)
+    assert model.state_switch_root_conditions()
     model._state_switch_root_conditions = ()
+    assert model.state_switch_root_conditions() == ()
     return model
 
 
