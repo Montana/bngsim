@@ -6104,9 +6104,6 @@ def generate_rhs_from_model(model) -> str:
     observables = data["observables"]
     functions = data["functions"]
     reactions = data["reactions"]
-    # tfun specs are present iff the binding exposes them; older builds
-    # without the model-based tfun support omit the key entirely.
-    tfun_specs = data.get("table_functions", [])
 
     n_sp = len(species)
     n_params = len(params)
@@ -6183,23 +6180,10 @@ def generate_rhs_from_model(model) -> str:
     # Fixed species (0-based)
     fixed_sp = {i for i, s in enumerate(species) if s["fixed"]}
 
-    # Map each tfun-backed BNGL function name to its (tf_id, C index expr).
-    # Index expr matches the locals emitted below: bare ``t`` for time,
-    # ``p[idx]`` for parameter-indexed, ``obs[idx]`` for observable-indexed.
-    tfun_call_by_name: dict[str, tuple[int, str]] = {}
-    for tf_id, spec in enumerate(tfun_specs):
-        kind = spec["index_kind"]
-        if kind == "time":
-            idx_c = "t"
-        elif kind == "parameter":
-            idx_c = f"p[{spec['index_param_idx']}]"
-        elif kind == "observable":
-            idx_c = f"obs[{spec['index_obs_idx']}]"
-        else:
-            # Unrecognised index kind — let _expr_to_c fall through and
-            # surface a compile error with the original expression text.
-            continue
-        tfun_call_by_name[spec["name"]] = (tf_id, idx_c)
+    # Map each tfun-backed BNGL function name to its (tf_id, C index expr):
+    # bare ``t``, ``p[idx]``, ``obs[idx]``, or ``func[k]`` for a function index
+    # (issue #965). See ``_tfun_call_map``.
+    tfun_call_by_name = _tfun_call_map(data)
 
     # ── Build per-reaction rate + scatter lines (one group per reaction) ────
     # Done before emission so the Tier-1 chunking decision can place the
@@ -6675,7 +6659,43 @@ class CodegenDeclined(RuntimeError):
     """
 
 
-def _topological_function_order(functions: list) -> list[int]:
+def _tfun_call_map(data: dict) -> dict[str, tuple[int, str]]:
+    """Each tfun-backed function's ``(tf_id, C index expression)`` for ``data->tfun_eval``.
+
+    The index reads bare ``t`` for time, ``p[idx]`` for a parameter,
+    ``obs[idx]`` for an observable, and ``func[k]`` for a function
+    (``tfun([...], [...], h)`` with ``h() = 2*Atot``): the function's value this
+    call, which ``_topological_function_order`` computes before the table. The
+    function's parameter slot is written only by the interpreter's
+    ``evaluate_functions``, so read as ``p[idx]`` it held the load-time value and
+    the trajectory froze (issue #965). An index kind this does not know is left
+    out, so ``_expr_to_c`` surfaces it.
+    """
+    calls: dict[str, tuple[int, str]] = {}
+    for tf_id, spec in enumerate(data.get("table_functions", [])):
+        kind = spec["index_kind"]
+        if kind == "time":
+            idx_c = "t"
+        elif kind == "parameter":
+            idx_c = f"p[{spec['index_param_idx']}]"
+        elif kind == "function":
+            idx_c = f"func[{spec['index_func_idx']}]"
+        elif kind == "observable":
+            idx_c = f"obs[{spec['index_obs_idx']}]"
+        else:
+            continue
+        calls[spec["name"]] = (tf_id, idx_c)
+    return calls
+
+
+def _tfun_reads_state(idx_c: str) -> bool:
+    """Whether a ``_tfun_call_map`` index expression moves with the state."""
+    return idx_c.startswith(("func[", "obs["))
+
+
+def _topological_function_order(
+    functions: list, tfun_call_by_name: dict | None = None
+) -> list[int]:
     """Declaration indices of ``functions`` in dependency (topological) order.
 
     A C statement ``func[i] = … func[j] …`` must come *after* ``func[j] = …`` or
@@ -6695,17 +6715,42 @@ def _topological_function_order(functions: list) -> list[int]:
     the entire real corpus, where the loader/BNG already emits rules
     topologically. A residual cycle (malformed input) appends its members in
     declaration order, matching ModelBuilder's fallback.
+
+    ``tfun_call_by_name`` (``_tfun_call_map``) adds the edge a table function's
+    body does not spell: ``g() = tfun(..., h)`` reads ``func[h]`` as its index
+    (issue #965), though its expression is the bare ``tfun_g()``, or
+    ``tfun_g__tfun0() + 0`` where the table is wrapped in arithmetic. A table
+    over its own function, ``g() = tfun(..., g)``, is a cycle of one and declines:
+    kept as a self-edge, ``func[g] = tfun_eval(..., func[g])`` read an
+    uninitialised slot.
     """
     nf = len(functions)
     name_to_idx = {f["name"]: i for i, f in enumerate(functions)}
     successors: list[list[int]] = [[] for _ in range(nf)]
     in_degree = [0] * nf
+    # The tables whose index is a function's slot, by table name, and the
+    # ``tfun_<table>()`` calls to them; ``None`` for a model with none.
+    owner_by_table = {
+        table: int(idx_c[len("func[") : -1])
+        for table, (_, idx_c) in (tfun_call_by_name or {}).items()
+        if idx_c.startswith("func[")
+    }
+    table_call = (
+        re.compile(r"(?<![A-Za-z0-9_])tfun_(" + "|".join(map(re.escape, owner_by_table)) + r")\(")
+        if owner_by_table
+        else None
+    )
     for i, f in enumerate(functions):
         deps: set[int] = set()
         for tok in re.findall(r"[A-Za-z_]\w*", f["expression"]):
             j = name_to_idx.get(tok)
             if j is not None and j != i:
                 deps.add(j)
+        if table_call is not None:
+            tables = set(table_call.findall(f["expression"]))
+            if f["name"] in owner_by_table:
+                tables.add(f["name"])
+            deps.update(owner_by_table[table] for table in tables)
         for j in deps:
             successors[j].append(i)
             in_degree[i] += 1
@@ -6777,7 +6822,7 @@ def _emit_function_lines(
     lookup = _build_ident_lookup_model(param_map, species_map, obs_map, func_map, rateof_map)
     embedded_tfun = _embedded_tfun_resolver(tfun_call_by_name)
     lines = [f"    double func[{len(functions)}];"]
-    for i in _topological_function_order(functions):
+    for i in _topological_function_order(functions, tfun_call_by_name):
         f = functions[i]
         tfun_call = tfun_call_by_name.get(f["name"])
         if tfun_call is not None:
@@ -7573,19 +7618,7 @@ def generate_jacobian_from_model(model) -> str | None:
     _species_map = {name: f"y[{i}]" for i, name in enumerate(species_names)}
     _obs_map = {name: f"obs[{i}]" for i, name in enumerate(obs_names)}
     _func_map = {name: f"func[{i}]" for i, name in enumerate(func_names)}
-    tfun_specs = data.get("table_functions", [])
-    tfun_call_by_name: dict[str, tuple[int, str]] = {}
-    for tf_id, spec in enumerate(tfun_specs):
-        kind = spec["index_kind"]
-        if kind == "time":
-            idx_c = "t"
-        elif kind == "parameter":
-            idx_c = f"p[{spec['index_param_idx']}]"
-        elif kind == "observable":
-            idx_c = f"obs[{spec['index_obs_idx']}]"
-        else:
-            continue
-        tfun_call_by_name[spec["name"]] = (tf_id, idx_c)
+    tfun_call_by_name = _tfun_call_map(data)
 
     # ── Functional contributions (GH #76/#171) ──────────────────────────────
     # Reconstructed by the shared builder the sensitivity RHS's bngsim_jac_vec
@@ -7595,15 +7628,13 @@ def generate_jacobian_from_model(model) -> str | None:
     # evaluated into that function's func[] slot by the recomputation below, so a
     # derivative that keeps the table as a factor reads the slot — no table call in
     # a shard block, which has no ``t`` or user data. Only tables that do not read
-    # the state (time- or parameter-indexed) can appear in a derivative at all.
+    # the state (time- or parameter-indexed; one over a function reads it, issue
+    # #965) can appear in a derivative at all.
     table_c = {
         f"tfun_{f['name']}": f"func[{i}]"
         for i, f in enumerate(functions)
         if f["name"] in tfun_call_by_name
-        and any(
-            spec["name"] == f["name"] and spec["index_kind"] in ("time", "parameter")
-            for spec in tfun_specs
-        )
+        and not _tfun_reads_state(tfun_call_by_name[f["name"]][1])
     }
     groups = _functional_jacobian_groups(core, data, _jac_add, table_c=table_c)
     if groups is None:
@@ -11001,19 +11032,8 @@ def generate_outputs_from_model(model) -> str | None:
     _func_map = {name: f"func[{i}]" for i, name in enumerate(func_names)}
 
     # tfun-backed functions dispatch through the runtime callback, exactly as in
-    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]``).
-    tfun_call_by_name: dict[str, tuple[int, str]] = {}
-    for tf_id, spec in enumerate(tfun_specs):
-        kind = spec["index_kind"]
-        if kind == "time":
-            idx_c = "t"
-        elif kind == "parameter":
-            idx_c = f"p[{spec['index_param_idx']}]"
-        elif kind == "observable":
-            idx_c = f"obs[{spec['index_obs_idx']}]"
-        else:
-            continue
-        tfun_call_by_name[spec["name"]] = (tf_id, idx_c)
+    # the RHS (index expr: bare ``t`` / ``p[idx]`` / ``obs[idx]`` / ``func[k]``).
+    tfun_call_by_name = _tfun_call_map(data)
 
     # Embedded (wrapper-form) tfun — a tfun call nested inside arithmetic, e.g.
     # ``(tfun('drive') + 5)/k`` — is rewritten by the model to a synthetic helper
@@ -11187,6 +11207,7 @@ def _table_function_bindings(core, model=None) -> tuple:
             spec.get("index_kind"),
             spec.get("index_param_idx"),
             spec.get("index_obs_idx"),
+            spec.get("index_func_idx"),
         )
         for spec in core.codegen_data().get("table_functions", ())
     )
@@ -11320,18 +11341,7 @@ def _compute_output_sens_analysis(model, core) -> dict:
     # callback only; table functions are intentionally not differentiated, so
     # their output sensitivity is unsupported). A model with embedded tfun
     # wrappers is declined whole, as the output evaluator declines it.
-    tfun_call_by_name: dict[str, tuple[int, str]] = {}
-    for tf_id, spec in enumerate(tfun_specs):
-        kind = spec["index_kind"]
-        if kind == "time":
-            idx_c = "t"
-        elif kind == "parameter":
-            idx_c = f"p[{spec['index_param_idx']}]"
-        elif kind == "observable":
-            idx_c = f"obs[{spec['index_obs_idx']}]"
-        else:
-            continue
-        tfun_call_by_name[spec["name"]] = (tf_id, idx_c)
+    tfun_call_by_name = _tfun_call_map(data)
     _tfun_table_names = [spec["name"] for spec in tfun_specs]
     for f in functions:
         if f["name"] in tfun_call_by_name:
@@ -12197,7 +12207,8 @@ def prepare_model_codegen(model) -> Path | None:
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
-        _topological_function_order(list(model._core.codegen_data()["functions"]))
+        _data = model._core.codegen_data()
+        _topological_function_order(list(_data["functions"]), _tfun_call_map(_data))
     except CodegenDeclined as exc:
         logger.debug("codegen declined: %s", exc)
         _record_codegen_decline(str(exc))
@@ -12342,7 +12353,8 @@ def prepare_model_codegen_source(model) -> str | None:
     # Issue #621 — a cyclic function graph has no emit order; decline so the
     # caller falls back to the interpreted engine, which solves the group.
     try:
-        _topological_function_order(list(model._core.codegen_data()["functions"]))
+        _data = model._core.codegen_data()
+        _topological_function_order(list(_data["functions"]), _tfun_call_map(_data))
     except CodegenDeclined as exc:
         logger.debug("codegen declined: %s", exc)
         _record_codegen_decline(str(exc))

@@ -1,5 +1,6 @@
 #include <iostream>
 #include "observable.hh"
+#include <stdexcept>
 
 
 using namespace std;
@@ -79,7 +80,7 @@ void Observable::subtract()
 	if(count==0){
 		cerr << "Error in observable count!! Removing from an empty observable!"
 		     << "Observable named: " << obsName << endl;
-		exit(1);
+		throw std::runtime_error("Observable " + obsName + ": removing from an empty observable");
 	}
 
 	count--;
@@ -103,7 +104,7 @@ void Observable::subtract( int n_matches )
 	{
 		cerr << "Error in observable count!! Removing " << n_matches << " matches will result in a negative match count!"
 		     << "Observable named: " << obsName << endl;
-		exit(1);
+		throw std::runtime_error("Observable " + obsName + ": removing matches would make the count negative");
 	}
 
 	// First, we subtract from our observable count
@@ -463,7 +464,7 @@ SpeciesObservable::~SpeciesObservable()
 Observable * SpeciesObservable::clone() {
 	vector <TemplateMolecule *> tmList;
 	cout<<"in clone species observable, this is not yet updated to handle stoch observables.  fix me."<<endl;
-	exit(1);
+	throw std::runtime_error("SpeciesObservable " + obsName + ": a local function cannot read a Species observable (NFsim cannot clone one)");
 	for(int t=0; t<n_templates; t++)
 		tmList.push_back(templateMolecules[t]);
 	return 0; //new SpeciesObservable(obsName+"_clone",tmList);
@@ -473,7 +474,7 @@ int SpeciesObservable::isObservable(Molecule *m) const
 {
 	cerr<<"Comparing a Species observable '"<<obsName<<"' to a molecule!"<<endl;
 	cerr<<"You can only compare Species observable to a complexes!  Quitting."<<endl;
-	exit(1);
+	throw std::runtime_error("SpeciesObservable " + obsName + ": compared to a molecule; a Species observable matches complexes only");
 
 }
 

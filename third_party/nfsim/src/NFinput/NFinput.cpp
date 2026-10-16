@@ -2649,6 +2649,10 @@ bool NFinput::initReactionRulePermutation(
 						} else {
 							double kcat=0;
 							double Km=0;
+							// The parameters each was read from, so a later
+							// setParameter() refreshes them. bngsim GH #854.
+							string kcatParam="";
+							string KmParam="";
 
 							//We should always get the catalytic rate (kcat) first!
 							TiXmlElement *pRateConstant = pListOfRateConstants->FirstChildElement("RateConstant");
@@ -2673,6 +2677,7 @@ bool NFinput::initReactionRulePermutation(
 										}
 										kcat = parameter.find(kcatName)->second;
 										usedParam = true;
+										kcatParam = kcatName;
 									}
 									if(verbose) {
 										cout<<"\t\t\t\t...setting kcat rate to be: "<<kcatName;
@@ -2705,6 +2710,7 @@ bool NFinput::initReactionRulePermutation(
 										}
 										Km = parameter.find(KmName)->second;
 										usedParam = true;
+										KmParam = KmName;
 									}
 									if(verbose) {
 										cout<<"\t\t\t\t...setting Km rate to be: "<<KmName;
@@ -2716,7 +2722,7 @@ bool NFinput::initReactionRulePermutation(
 
 							//Finally, we can make the actual reaction
 							ts->finalize();
-							r = new MMRxnClass(rxnName,kcat,Km,ts,s);
+							r = new MMRxnClass(rxnName,kcat,Km,ts,s,kcatParam,KmParam);
 							
 						}
 					}
@@ -2769,7 +2775,12 @@ bool NFinput::initReactionRulePermutation(
 						if (ts->getNreactants() == 0) {
 							r->volumeConversionFactor = volumeConversion;
 							if (r->getRxnType() != ReactionClass::OBS_DEPENDENT_RXN) {
-								r->setBaseRate(r->getBaseRate() * volumeConversion, "");
+								// Scale the rate in place. setBaseRate() would
+								// apply the symmetry factor a second time, and an
+								// empty name would make a later setParameter()
+								// skip this rule; the refresh reapplies the
+								// conversion itself. bngsim GH #854.
+								r->scaleBaseRate(volumeConversion);
 							}
 						}
 

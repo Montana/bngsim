@@ -877,6 +877,27 @@ def nfsim_switchable_rate_xml(data_dir: Path) -> Path:
 
 
 @pytest.fixture
+def nfsim_zero_order_switchable_rate_xml(data_dir: Path) -> Path:
+    """A birth-death process ``A() -> 0 kdeg``, ``0 -> A() kp`` with kp = 0 at load (GH #854).
+
+    The synthesis rule is zero-order, so NFsim folds a volume conversion into
+    its base rate at load; a post-init ``set_param('kp', ...)`` must still
+    refresh it.
+    """
+    return data_dir / "nfsim" / "zero_order_switchable_rate.xml"
+
+
+@pytest.fixture
+def nfsim_zero_order_switchable_rate_compartment_xml(data_dir: Path) -> Path:
+    """The GH #854 birth-death model with A() in a compartment of size 2.
+
+    The synthesis propensity is kp * 2, and a post-init ``set_param('kp', ...)``
+    must keep that factor.
+    """
+    return data_dir / "nfsim" / "zero_order_switchable_rate_compartment.xml"
+
+
+@pytest.fixture
 def dose_seed_precision_xml(data_dir: Path) -> Path:
     """L(b)+R(b)<->L.R in real BNG2 writeXML shape, for GH #115.
 

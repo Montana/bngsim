@@ -2,6 +2,7 @@
 
 
 #include "reaction.hh"
+#include <stdexcept>
 
 
 
@@ -38,7 +39,7 @@ DORRxnClass::DORRxnClass(
 					{   // DOR reactant is a population!
 						cout<<"Error when creating DORRxnClass: "<<name<<endl;
 						cout<<"DOR reactant cannot be a population type."<<endl;
-						exit(1);
+						throw std::runtime_error("DORRxnClass " + name + ": the DOR reactant cannot be a population type");
 					}
 
 					DORreactantIndex=r;
@@ -47,7 +48,7 @@ DORRxnClass::DORRxnClass(
 					cout<<"Error when creating DORRxnClass: "<<name<<endl;
 					cout<<"DOR reactions currently only support one DOR reactant.  This means that you can"<<endl;
 					cout<<"only have a pointer to one or the other of the two reactants, but not both."<<endl;
-					exit(1);
+					throw std::runtime_error("DORRxnClass " + name + ": a local-function rate law can read only one of the reactants, not both");
 				}
 			}
 		}
@@ -56,7 +57,7 @@ DORRxnClass::DORRxnClass(
 		cout<<"Error when creating DORRxnClass: "<<name<<endl;
 		cout<<"You don't have any pointers onto the Molecules or Species, so you can't have a local function!"<<endl;
 		cout<<"That means that this is not a DOR reaction at all!"<<endl;
-		exit(1);
+		throw std::runtime_error("DORRxnClass " + name + ": the local-function rate law reads no reactant, so this is not a DOR reaction");
 	}
 
 
@@ -72,7 +73,7 @@ DORRxnClass::DORRxnClass(
 	if((unsigned)function->getNumOfArgs()!=lfArgumentPointerNameList.size()) {
 		cout<<"Error when creating DORRxnClass: "<<name<<endl;
 		cout<<"Number of arguments and LocalFunctionArgumentPointerNameList size do not match!"<<endl;
-		exit(1);
+		throw std::runtime_error("DORRxnClass " + name + ": the function's argument count does not match its argument pointers");
 	}
 
 
@@ -109,7 +110,7 @@ DORRxnClass::DORRxnClass(
 			cout<<"Error when creating DOR reaction: "<<name<<endl;
 			cout<<"Could not find a match in the templateMolecules for the pointer reference to species/molecule: ";
 			cout<<lfArgumentPointerNameList.at(i)<<endl;
-			exit(1);
+			throw std::runtime_error("DORRxnClass " + name + ": no template molecule matches a local-function argument");
 		}
 	}
 
@@ -470,7 +471,7 @@ double DORRxnClass::pickLocalFunctionParameter(MappingSet* ms, int index, Molecu
 		}
 		// there is truly no possible mapping. User mistake prob, the error message could use somem improvement
 		cout<<"Internal error in LocalFunction::evaluateOn()! Trying to evaluate a function with unknown scope."<<endl;
-		exit(1);
+		throw std::runtime_error("DORRxnClass " + name + ": internal error evaluating a local function with an unknown argument");
 
 }
 //This function takes a given mappingset and looks up the value of its local
@@ -736,7 +737,7 @@ void DORRxnClass::notifyRateFactorChange(Molecule * m, int reactantIndex, int rx
 	} else {
 		cout<<"Internal Error in DORRxnClass::notifyRateFactorChange!!  : trying to change a rate\n";
 		cout<<"factor of a non-DOR reactant.  That means this function was called in error!\n";
-		exit(1);
+		throw std::runtime_error("DORRxnClass " + name + ": internal error, rate factor change on a non-DOR reactant");
 	}
 }
 
@@ -806,7 +807,7 @@ DOR2RxnClass::DOR2RxnClass(
 					{   // DOR reactant is a population!
 						cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 						cout<<"DOR reactant1 cannot be a population type."<<endl;
-						exit(1);
+						throw std::runtime_error("DOR2RxnClass " + name + ": DOR reactant 1 cannot be a population type");
 					}
 
 					DORreactantIndex1 = r;
@@ -819,7 +820,7 @@ DOR2RxnClass::DOR2RxnClass(
 						// DOR reactant is a population!
 						cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 						cout<<"DOR reactant2 cannot be a population type."<<endl;
-						exit(1);
+						throw std::runtime_error("DOR2RxnClass " + name + ": DOR reactant 2 cannot be a population type");
 					}
 
 					DORreactantIndex2 = r;
@@ -830,7 +831,7 @@ DOR2RxnClass::DOR2RxnClass(
 				else {
 					cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 					cout<<"DOR2 reactions only support two DOR reactants."<<endl;
-					exit(1);
+					throw std::runtime_error("DOR2RxnClass " + name + ": DOR2 reactions support only two DOR reactants");
 				}
 			}
 		}
@@ -839,7 +840,7 @@ DOR2RxnClass::DOR2RxnClass(
 	if (DORreactantIndex1==-1 || DORreactantIndex2==-1) {
 		cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 		cout<<"DOR2RxnClass requires pointers into two different reactant patterns, but fewer than 2 were found!"<<endl;
-		exit(1);
+		throw std::runtime_error("DOR2RxnClass " + name + ": the rate law must point into two different reactant patterns");
 	}
 
 
@@ -858,7 +859,7 @@ DOR2RxnClass::DOR2RxnClass(
 	if((unsigned)function1->getNumOfArgs()!=lfArgumentPointerNameList1.size()) {
 		cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 		cout<<"Number of arguments in function1 and LocalFunctionArgumentPointerList1 size do not match!"<<endl;
-		exit(1);
+		throw std::runtime_error("DOR2RxnClass " + name + ": function 1's argument count does not match its argument pointers");
 	}
 
 	n_argMolecules1=lfArgumentPointerNameList1.size();
@@ -891,7 +892,7 @@ DOR2RxnClass::DOR2RxnClass(
 			cout<<"Error when creating DOR2 reaction: "<<name<<endl;
 			cout<<"Could not find a match in the templateMolecules for a pointer reference to species/molecule: ";
 			cout<<lfArgumentPointerNameList1.at(i)<<endl;
-			exit(1);
+			throw std::runtime_error("DOR2RxnClass " + name + ": no template molecule matches a function 1 argument");
 		}
 	}
 
@@ -919,7 +920,7 @@ DOR2RxnClass::DOR2RxnClass(
 	if((unsigned)function2->getNumOfArgs()!=lfArgumentPointerNameList2.size()) {
 		cout<<"Error when creating DOR2RxnClass: "<<name<<endl;
 		cout<<"Number of arguments in function2 and LocalFunctionArgumentPointerList2 size do not match!"<<endl;
-		exit(1);
+		throw std::runtime_error("DOR2RxnClass " + name + ": function 2's argument count does not match its argument pointers");
 	}
 
 	n_argMolecules2=lfArgumentPointerNameList2.size();
@@ -952,7 +953,7 @@ DOR2RxnClass::DOR2RxnClass(
 			cout<<"Error when creating DOR2 reaction: "<<name<<endl;
 			cout<<"Could not find a match in the templateMolecules for a pointer reference to species/molecule: ";
 			cout<<lfArgumentPointerNameList2.at(i)<<endl;
-			exit(1);
+			throw std::runtime_error("DOR2RxnClass " + name + ": no template molecule matches a function 2 argument");
 		}
 	}
 
@@ -1529,7 +1530,7 @@ void DOR2RxnClass::notifyRateFactorChange(Molecule * m, int reactantIndex, int r
 	else {
 		cout<<"Internal Error in DORRxnClass::notifyRateFactorChange!!  : trying to change a rate\n";
 		cout<<"factor of a non-DOR reactant.  That means this function was called in error!\n";
-		exit(1);
+		throw std::runtime_error("DOR2RxnClass " + name + ": internal error, rate factor change on a non-DOR reactant");
 	}
 }
 

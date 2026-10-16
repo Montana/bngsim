@@ -38,7 +38,15 @@ class RuleMonkeySimulator {
     // left at the last completed SSA event; subsequent state is undefined
     // for bngsim purposes, so callers should `destroy_session()` before
     // reusing the simulator.
-    void initialize(uint64_t seed = 42);
+    //
+    // `initialize` puts the seed state at `t_start` on the model's clock, so a
+    // rate law that reads time() starts from its value there. A `simulate`
+    // segment that starts on the session clock runs on it as given; one that
+    // starts elsewhere continues from the session clock by the same span and
+    // is labelled with the caller's times. Every Result's `n_steps` counts the
+    // events since `initialize` (or since the snapshot's session began, after
+    // `load_state`), not the call's alone, as an NFsim session's does.
+    void initialize(uint64_t seed = 42, double t_start = 0.0);
     void step_to(double time, double timeout_seconds = 0.0);
     // `sample_times`, when non-empty, overrides the uniform t_start..t_end /
     // n_points grid: the returned Result is labelled with exactly these times
@@ -87,6 +95,22 @@ class RuleMonkeySimulator {
     void clear_param_overrides();
     void set_molecule_limit(int limit);
     void set_block_same_complex_binding(bool enabled);
+
+    // Whether the model reads the clock (time(), or a table function indexed
+    // by time); true by default. If it does, `run` puts the seed state at
+    // `times.t_start` on the model's clock, and a run, segment or step whose
+    // span the doubles near its times are too coarse to integrate a clock-
+    // driven rate over is refused. If not, `run` runs on time elapsed since
+    // t_start and labels the rows back, which no such model can tell apart and
+    // which keeps event times small: on absolute time a waiting time is rounded
+    // away once the total propensity times |t| nears 1e15. Sessions always run
+    // on the model's clock.
+    void set_reads_clock(bool enabled);
+
+    // RuleMonkey's Severity::Warn load diagnostics, each "element: feature".
+    // The model runs; these name how RuleMonkey reads part of it. Errors are
+    // refused at construction.
+    std::vector<std::string> unsupported_warnings() const;
 
     const std::string &xml_path() const;
 

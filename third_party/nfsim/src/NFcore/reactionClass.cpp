@@ -349,6 +349,16 @@ void ReactionClass::setBaseRate(double newBaseRate,string newBaseRateName) {
 };
 
 
+// Multiply the rate already in place by factor. Unlike setBaseRate(), this
+// neither applies the symmetry (or dimer) factor again nor touches the
+// parameter name, so resetBaseRateFromSystemParamter() still recomputes the
+// same rate from the parameter. bngsim GH #854.
+void ReactionClass::scaleBaseRate(double factor) {
+	this->baseRate *= factor;
+	update_a();
+}
+
+
 void ReactionClass::resetBaseRateFromSystemParamter() {
 
 	if(!this->baseRateParameterName.empty()) {
@@ -360,6 +370,12 @@ void ReactionClass::resetBaseRateFromSystemParamter() {
 		}
 		else {
 			this->baseRate=system->getParameter(this->baseRateParameterName);
+		}
+		// A zero-order rule carries its volume conversion in the base rate
+		// (NFinput applies it at load); reapply it here, or the refreshed
+		// rate would drop it. bngsim GH #854.
+		if (n_reactants == 0 && reactionType != ReactionClass::OBS_DEPENDENT_RXN) {
+			this->baseRate *= this->volumeConversionFactor;
 		}
 		this->update_a();
 	}

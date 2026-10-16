@@ -107,8 +107,15 @@ class TestSessionSampleTimes:
         assert np.array_equal(second.time, np.asarray([3.0, 4.0, 7.0, 10.0]))
 
     def test_mid_protocol_continues_same_trajectory(self, session_cls, nfsim_xml):
-        """A two-segment run and a single run sampled at the same instants
-        trace the same continuing trajectory (same seed, no re-seed)."""
+        """A two-segment run continues the session's trajectory (same seed, no
+        re-seed): its second segment starts from the state the single run
+        passes through at the split. NFsim keeps the waiting time that outlasts
+        the first segment, so the rest is the same trajectory too. RuleMonkey
+        spends that draw and takes a fresh one at the split, exact in
+        distribution because the waiting time has no memory, and rolling it
+        back all but froze a session advanced in short calls
+        (richardposner/RuleMonkey#89, issue #1022): after the split the draws
+        differ."""
         # One continuous run sampled at 0,2,4,6.
         with session_cls(_xml(nfsim_xml)) as s:
             s.initialize(seed=123)
@@ -119,9 +126,11 @@ class TestSessionSampleTimes:
             s.simulate(sample_times=[0.0, 2.0])
             tail = s.simulate(sample_times=[2.0, 4.0, 6.0])
         # Rows for t=2,4,6 in the whole run are indices 1,2,3; in tail 0,1,2.
-        assert np.array_equal(
-            np.asarray(whole.observables)[[1, 2, 3], :], np.asarray(tail.observables)
-        )
+        whole_rows = np.asarray(whole.observables)[[1, 2, 3], :]
+        tail_rows = np.asarray(tail.observables)
+        assert np.array_equal(whole_rows[0], tail_rows[0])
+        if session_cls is bngsim.NfsimSession:
+            assert np.array_equal(whole_rows, tail_rows)
 
     def test_rejects_fewer_than_two_points(self, session_cls, nfsim_xml):
         with session_cls(_xml(nfsim_xml)) as s:

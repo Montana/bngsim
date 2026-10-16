@@ -1,0 +1,42 @@
+# Issue #1022: arrhenius_coop.bngl with its energy patterns written in kJ/mol
+# over a model parameter RT, as BioNetGen's energy_example1.bngl does (BNG2
+# requires the activation energy not to depend on RT). The energies in units of
+# RT are arrhenius_coop.bngl's, so the two models are one. RuleMonkey 3.10.1
+# divided them by the model's RT a second time.
+begin model
+begin parameters
+  RT       2.5774863
+  Ea0      0.5
+  phi      0.3
+  Gf_AB    3.5*RT
+  Gf_BC    3.5*RT
+  Gf_coop -2*RT
+end parameters
+begin molecule types
+  A(b)
+  B(a,c)
+  C(b)
+end molecule types
+begin seed species
+  A(b)    100
+  B(a,c)  100
+  C(b)    100
+end seed species
+begin energy patterns
+  A(b!1).B(a!1)             Gf_AB/RT
+  B(c!1).C(b!1)             Gf_BC/RT
+  A(b!1).B(a!1,c!2).C(b!2)  Gf_coop/RT
+end energy patterns
+begin observables
+  Molecules AB   A(b!1).B(a!1)
+  Molecules BC   B(c!1).C(b!1)
+  Molecules ABC  A(b!1).B(a!1,c!2).C(b!2)
+end observables
+begin reaction rules
+  A(b) + B(a) <-> A(b!1).B(a!1)  Arrhenius(phi,Ea0)
+  B(c) + C(b) <-> B(c!1).C(b!1)  Arrhenius(phi,Ea0)
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

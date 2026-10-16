@@ -2305,6 +2305,15 @@ bool NetworkModel::event_trigger_reads_time(int event_idx0) const {
     return rate_dependencies_(std::move(params), {ev.trigger_source}).time;
 }
 
+bool NetworkModel::state_switch_reads_time(const StateSwitch &sw) const {
+    std::vector<int> params;
+    if (sw.residual_expr_idx >= 0) {
+        std::vector<int> sp;
+        expression_support(sw.residual_expr_idx, &sp, &params);
+    }
+    return rate_dependencies_(std::move(params), {sw.residual_source}).time;
+}
+
 bool NetworkModel::event_trigger_is_state_dependent(int event_idx0) const {
     const auto &events = impl_->events;
     if (event_idx0 < 0 || event_idx0 >= static_cast<int>(events.size())) {
@@ -2715,6 +2724,43 @@ NetworkModel::ConservationLawDrift NetworkModel::conservation_law_drift() {
     return found;
 }
 
+// ─── Table function index kinds ──────────────────────────────────────────────
+
+namespace {
+// What a table function's index reads, written into `spec`'s index fields:
+// "time"; "parameter", a slot no function owns (index_param_idx); "function",
+// the slot a function owns (index_func_idx); "observable" (index_obs_idx); or
+// "unknown". A function's slot holds its value only where the interpreter's
+// evaluate_functions has just written it, so a reader that takes it for a
+// parameter reads the value it had at load: compiled code did, and froze the
+// trajectory (issue #965). This is the one place that tells the two apart.
+void resolve_table_index(const TableFunction &tf, const SharedModelData &sd,
+                         TableFunctionSpec &spec) {
+    const auto &idx_name = tf.index_name();
+    const std::string lookup = strip_paren_suffix(idx_name);
+    if (is_time_index(idx_name)) {
+        spec.index_kind = "time";
+    } else if (sd.param_name_to_idx.count(lookup) != 0) {
+        if (auto fit = sd.function_name_to_idx.find(lookup); fit != sd.function_name_to_idx.end()) {
+            spec.index_kind = "function";
+            spec.index_func_idx = fit->second;
+        } else {
+            spec.index_kind = "parameter";
+            spec.index_param_idx = sd.param_name_to_idx.at(lookup);
+        }
+    } else if (auto oit = sd.observable_name_to_idx.find(lookup);
+               oit != sd.observable_name_to_idx.end()) {
+        spec.index_kind = "observable";
+        spec.index_obs_idx = oit->second;
+    } else {
+        // Should be unreachable: register_table_function_ rejects an
+        // unresolved index_name, so by the time a spec can be asked for the
+        // binding has already passed that gate.
+        spec.index_kind = "unknown";
+    }
+}
+} // namespace
+
 // ─── Functional analytical Jacobian (GH #76) ─────────────────────────────────
 
 FunctionalJacobianContext NetworkModel::functional_jacobian_context() const {
@@ -2777,15 +2823,12 @@ FunctionalJacobianContext NetworkModel::functional_jacobian_context() const {
     // current time is what the derivative needs; no derivative of the table
     // itself is ever taken, because nothing it depends on is a species. A table
     // indexed by an observable depends on the state and stays out, so a rate
-    // law that reads one keeps declining to finite differences.
+    // law that reads one keeps declining to finite differences, and so does
+    // one indexed by a function (issue #965).
     for (const auto &tf : impl_->table_functions) {
-        bool constant_index = is_time_index(tf->index_name());
-        if (!constant_index) {
-            const std::string idx = strip_paren_suffix(tf->index_name());
-            constant_index = sd.param_name_to_idx.count(idx) > 0 &&
-                             sd.function_name_to_idx.find(idx) == sd.function_name_to_idx.end();
-        }
-        if (constant_index)
+        TableFunctionSpec index;
+        resolve_table_index(*tf, sd, index);
+        if (index.index_kind == "time" || index.index_kind == "parameter")
             ctx.constant_names.push_back("tfun_" + tf->name());
     }
 
@@ -4943,16 +4986,11 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
     // normalized BNG-style (case-insensitive `time`/`t`; trailing "()"
     // tolerated on any index) so users can write `Time`, `myParam()`, etc.
     const auto &idx_name = tf.index_name();
+    const bool reads_the_clock = is_time_index(idx_name);
 
-    if (is_time_index(idx_name)) {
+    if (reads_the_clock) {
         // Time-indexed: point to model's current_time
         tf.set_index_ptr(&impl_->current_time);
-        // Issue #654 — this tfun reads the clock, so every function that calls
-        // it moves with time. Set unconditionally rather than checking which
-        // functions reference `tfun_<name>()`: the table is registered here
-        // before (and, post-build, possibly without) the expressions that read
-        // it, and over-reporting only costs the SSA its sub-stepping gate.
-        impl_->functions_use_time = true;
     } else {
         const std::string lookup = strip_paren_suffix(idx_name);
         // Try parameter
@@ -4981,14 +5019,60 @@ void NetworkModel::register_table_function_(TableFunction &tf) {
         internal_name,
         ExpressionEvaluator::Func0([tf_ptr]() -> double { return tf_ptr->evaluate(); }));
 
+    // Issue #654 — this tfun reads the clock, so every function that calls
+    // it moves with time. Set unconditionally rather than checking which
+    // functions reference `tfun_<name>()`: the table is registered here
+    // before (and, post-build, possibly without) the expressions that read
+    // it, and over-reporting only costs the SSA its sub-stepping gate. Set
+    // only once the evaluator has the table: a name it refuses throws above
+    // and leaves the model as it was (issue #772).
+    if (reads_the_clock)
+        impl_->functions_use_time = true;
+
     // Mark model as having functions (table functions participate in
     // evaluate_functions → rate computation)
     impl_->has_functions = true;
 }
 
+// A second table under a name the model already has was appended beside the
+// first (issue #772): the evaluator kept the first `tfun_<name>`, so the rate
+// laws read the old data, while table_function_names listed the name twice and
+// codegen, resolving names last-wins, reported the new one. Under a function's
+// name the interpreter kept the function's body while compiled code read the
+// table. There is no replacing a table or a body in place, so the name is
+// refused before anything changes. The one table that does take a function's
+// name is a `.net` tfun, which ModelBuilder registers as the body of the
+// function it is declared in (`backs_a_function`).
+void NetworkModel::require_new_table_name_(const std::string &name, bool backs_a_function) const {
+    for (const auto &tf : impl_->table_functions) {
+        if (tf->name() == name)
+            throw std::invalid_argument("table function '" + name +
+                                        "' already exists; a model holds one table per "
+                                        "name, and an existing table cannot be replaced");
+    }
+    if (!backs_a_function && impl_->shared && impl_->shared->function_name_to_idx.count(name) != 0)
+        throw std::invalid_argument("the model already has a function named '" + name +
+                                    "', and a table cannot replace a function's body; add "
+                                    "the table under a new name");
+}
+
 void NetworkModel::add_table_function(const std::string &name, const std::string &filepath,
                                       const std::string &index_name, const std::string &method,
                                       const std::string &header_name) {
+    add_table_function_(name, filepath, index_name, method, header_name,
+                        /*backs_a_function=*/false);
+}
+
+void NetworkModel::add_table_function(const std::string &name, const std::vector<double> &xs,
+                                      const std::vector<double> &ys, const std::string &index_name,
+                                      const std::string &method) {
+    add_table_function_(name, xs, ys, index_name, method, /*backs_a_function=*/false);
+}
+
+void NetworkModel::add_table_function_(const std::string &name, const std::string &filepath,
+                                       const std::string &index_name, const std::string &method,
+                                       const std::string &header_name, bool backs_a_function) {
+    require_new_table_name_(name, backs_a_function);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
     auto tf = std::make_unique<TableFunction>(
         TableFunction::from_file(name, filepath, index_name, interpolation, header_name));
@@ -4996,9 +5080,10 @@ void NetworkModel::add_table_function(const std::string &name, const std::string
     impl_->table_functions.push_back(std::move(tf));
 }
 
-void NetworkModel::add_table_function(const std::string &name, const std::vector<double> &xs,
-                                      const std::vector<double> &ys, const std::string &index_name,
-                                      const std::string &method) {
+void NetworkModel::add_table_function_(const std::string &name, const std::vector<double> &xs,
+                                       const std::vector<double> &ys, const std::string &index_name,
+                                       const std::string &method, bool backs_a_function) {
+    require_new_table_name_(name, backs_a_function);
     InterpolationMethod interpolation = parse_interpolation_method(method, name);
     auto tf = std::make_unique<TableFunction>(name, xs, ys, index_name, interpolation);
     register_table_function_(*tf);
@@ -5076,28 +5161,11 @@ std::vector<double> NetworkModel::evaluate_over_times(const std::string &express
 std::vector<TableFunctionSpec> NetworkModel::table_function_specs() const {
     std::vector<TableFunctionSpec> specs;
     specs.reserve(impl_->table_functions.size());
-    const auto &param_map = impl_->shared->param_name_to_idx;
-    const auto &obs_map = impl_->shared->observable_name_to_idx;
     for (const auto &tf : impl_->table_functions) {
         TableFunctionSpec spec;
         spec.name = tf->name();
         spec.step = tf->method() == InterpolationMethod::Step;
-        const auto &idx_name = tf->index_name();
-        const std::string lookup = strip_paren_suffix(idx_name);
-        if (is_time_index(idx_name)) {
-            spec.index_kind = "time";
-        } else if (auto pit = param_map.find(lookup); pit != param_map.end()) {
-            spec.index_kind = "parameter";
-            spec.index_param_idx = pit->second;
-        } else if (auto oit = obs_map.find(lookup); oit != obs_map.end()) {
-            spec.index_kind = "observable";
-            spec.index_obs_idx = oit->second;
-        } else {
-            // Should be unreachable: register_table_function_ rejects an
-            // unresolved index_name, so by the time table_function_specs()
-            // can be called the binding has already passed that gate.
-            spec.index_kind = "unknown";
-        }
+        resolve_table_index(*tf, *impl_->shared, spec);
         spec.method = tf->method() == InterpolationMethod::Step ? "step" : "linear";
         spec.xs = tf->xs();
         spec.ys = tf->ys();

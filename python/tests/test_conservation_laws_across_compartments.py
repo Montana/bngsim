@@ -932,18 +932,32 @@ RULED = (
 )
 
 
-@pytest.mark.parametrize("size", ["c2 := 1 + A", "p = 2; c2 := 2*p"])
-def test_a_law_across_a_rule_sized_compartment_is_still_refused(size):
+def test_a_law_across_a_rule_sized_compartment_is_still_refused():
     """An assignment rule sizes ``c2``, and the right-hand side divides B's
-    share by the size the model loaded at (issue #745): with ``c2 := 1 + A``
-    the run ends at A = 0.354 where the amounts give 0.467, and the columns
-    of that system came back -0.329 for -0.311 with nothing said. Such a
-    model was refused for its law and stays refused, also where the rule is
-    a constant and the columns would be right."""
-    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(RULED.format(size=size)), "ode")
+    share by the size the model loaded at (issue #745). Such a model was
+    refused for its law and stays refused, also where the rule is a constant
+    and the columns would be right."""
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(RULED.format(size="p = 2; c2 := 2*p")), "ode"
+    )
     with pytest.raises(
         bngsim.SensitivityUnsupportedError,
         match=r"assignment rule\s+sets the size of c2.*#745",
     ):
+        sim.steady_state(sensitivity_params=["k1"])
+    assert sim.steady_state().converged  # the state is solved for, as it was
+
+
+def test_a_rule_sized_compartment_reading_a_species_has_no_isolated_steady_state():
+    """``c2 := 1 + A``: with B diluted as c2 moves (issue #1052) the law of the
+    held right-hand side is gone, and the steady states form a line (both
+    rates vanish where k1*A*c1 = k2*B*c2), so the columns are refused as
+    those of no isolated root. The run still divides B's share by the load-time
+    size (#745): it ends at A = 0.441 where the amounts give 0.467 (0.354 when
+    B was held as well), so no column here would be right either."""
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(RULED.format(size="c2 := 1 + A")), "ode"
+    )
+    with pytest.raises(bngsim.SimulationError, match=r"not an isolated root"):
         sim.steady_state(sensitivity_params=["k1"])
     assert sim.steady_state().converged  # the state is solved for, as it was

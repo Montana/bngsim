@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 
 
 
@@ -193,7 +194,7 @@ bool createCompositeFunction(string name,
 		} else if(refType=="Observable" || refType=="MoleculeObservable" || refType=="SpeciesObservable") {
 			cerr<<"Composite Functions (functions that call other functions) cannot have"<<endl;
 			cerr<<"references to observables.  You must put those in base level functions."<<endl;
-			exit(1);
+			throw std::runtime_error("Function " + name + ": a function that calls another function cannot also read an observable");
 		}
 	}
 
