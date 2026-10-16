@@ -1,0 +1,49 @@
+# Issue #1022: two reversible Arrhenius rules whose energy patterns each hold
+# one leaf on a reaction center (A.c holding C, B.d holding D), patterns read by
+# both rules, and a mass-action rule binding the leaf site B.d. The shapes
+# RuleMonkey 3.11.0 expands as BNG2 does, so rm runs it and matches network SSA.
+begin model
+begin parameters
+  Ea1 1.5
+  Ea2 1.5
+  phi1 0.4
+  phi2 0.6
+  G1 -1.5
+  G2 -1.0
+  G3 -1.2
+  G4 0.8
+  kf 0.05
+  kr 0.5
+end parameters
+begin molecule types
+  A(x,c)
+  B(y,d)
+  C(a)
+  D(b)
+end molecule types
+begin seed species
+  A(x,c) 60
+  B(y,d) 60
+  C(a) 60
+  D(b) 60
+end seed species
+begin energy patterns
+  A(x!1).B(y!1) G1
+  C(a!1).A(c!1) G2
+  B(y!1).A(x!1,c!2).C(a!2) G3
+  A(x!1).B(y!1,d!2).D(b!2) G4
+end energy patterns
+begin observables
+  Species AB A(x!1).B(y!1)
+  Species AC A(c!1).C(a!1)
+  Species ABC A(x!1,c!+).B(y!1)
+  Species ABD A(x!1).B(y!1,d!+)
+end observables
+begin reaction rules
+  R1: A(x) + B(y) <-> A(x!1).B(y!1) Arrhenius(phi1,Ea1)
+  R2: C(a) + A(c) <-> C(a!1).A(c!1) Arrhenius(phi2,Ea2)
+  R3: B(d) + D(b) <-> B(d!1).D(b!1) kf, kr
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()

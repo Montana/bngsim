@@ -4,14 +4,40 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
+import warnings
 from pathlib import Path
+from typing import Any
 
-from bngsim._exceptions import ParameterError, SimulationError, SimulationTimeout
+from bngsim._exceptions import (
+    ParameterError,
+    RuleMonkeyWarning,
+    SimulationError,
+    SimulationTimeout,
+)
 from bngsim._result import Result
 from bngsim._rounding import round_half_up
 from bngsim._sample_times import normalize_sample_times
 
 logger = logging.getLogger("bngsim")
+
+
+def warn_rulemonkey_diagnostics(core: Any, stacklevel: int = 1) -> None:
+    """Emit a :class:`bngsim.RuleMonkeyWarning` for each warning-level
+    diagnostic RuleMonkey reported loading *core*'s XML (issue #1022).
+
+    *stacklevel* counts from the caller of this function, as for
+    :func:`warnings.warn`: 1 points at that caller, 2 at its caller.
+    """
+    for message in core.unsupported_warnings():
+        warnings.warn(f"RuleMonkey: {message}", RuleMonkeyWarning, stacklevel=stacklevel + 1)
+
+
+def _on_session_clock(t: float, session_t: float) -> bool:
+    """Whether a segment starting at *t* starts on the session clock: the
+    tolerance upstream's session ``simulate()`` allows (``on_session_clock`` in
+    ``src/rulemonkey_simulator.cpp``)."""
+    return abs(t - session_t) <= 1e-9 * max(1.0, abs(session_t))
 
 
 class RuleMonkeySession:
@@ -20,6 +46,12 @@ class RuleMonkeySession:
     RuleMonkey reads BNG XML and implements the ``nf_exact`` network-free
     backend. Use this class for multi-action workflows that need to initialize,
     simulate, add molecules, and simulate again.
+
+    The session clock is the model's clock: a rate law that reads ``time()``,
+    or a table function indexed by time, reads absolute model time, as
+    ``method="ode"`` and ``method="ssa"`` do (issue #1022). See
+    :meth:`initialize` for where it starts and :meth:`simulate` for a segment
+    that starts elsewhere.
     """
 
     __slots__ = (
@@ -28,6 +60,8 @@ class RuleMonkeySession:
         "_initialized",
         "_destroyed",
         "_seed",
+        "_clock_readers",
+        "_start_unset",
     )
 
     def __init__(
@@ -54,15 +88,27 @@ class RuleMonkeySession:
         self._initialized = False
         self._destroyed = False
 
-        from bngsim._network_free_checks import refuse_time_dependent_rate_laws
+        from bngsim._network_free_checks import (
+            clock_readers,
+            refuse_rulemonkey_compartments,
+            refuse_rulemonkey_energy_misreads,
+        )
 
-        refuse_time_dependent_rate_laws(self._xml_path, "rulemonkey")
+        refuse_rulemonkey_compartments(self._xml_path)
+        refuse_rulemonkey_energy_misreads(self._xml_path)  # until issue #1058
         self._core = RuleMonkeySimulator(self._xml_path)
+        warn_rulemonkey_diagnostics(self._core, stacklevel=2)
         if molecule_limit is not None:
             self._core.set_molecule_limit(int(molecule_limit))
         self._core.set_block_same_complex_binding(bool(block_same_complex_binding))
 
         self._seed: int | None = None
+        # The functions that read the clock, for which a segment's labels must
+        # be the session clock (see simulate), and whether the session's start
+        # is still the first segment's to set (see initialize).
+        self._clock_readers = clock_readers(self._xml_path)
+        self._core.set_reads_clock(bool(self._clock_readers))
+        self._start_unset = False
 
         logger.debug("RuleMonkeySession created: %s", self._xml_path)
 
@@ -90,7 +136,7 @@ class RuleMonkeySession:
         self._require_alive()
         self._core.clear_param_overrides()
 
-    def initialize(self, seed: int | None = None) -> None:
+    def initialize(self, seed: int | None = None, t_start: float | None = None) -> None:
         """Initialize the RuleMonkey session.
 
         Parameters
@@ -100,18 +146,35 @@ class RuleMonkeySession:
             integer for reproducibility. The actual seed used is
             exposed via the :attr:`seed` property and stamped onto every
             ``Result`` returned by :meth:`simulate`.
+        t_start : float, optional
+            For a model that reads the clock (``time()``, or a table function
+            indexed by time), where the seed state sits on the model's clock:
+            :attr:`current_time` reads it, and a rate law that reads ``time()``
+            starts from its value there. ``None`` (default) starts the clock at
+            0, and lets the first :meth:`simulate` move the seed state to its
+            own start if nothing has moved the session first (:meth:`step_to`,
+            or a change to its molecules), so that ``initialize(seed)`` then
+            ``simulate(5, 7, ...)`` runs the model from its initial state at
+            t = 5, as ``Simulator.run(t_span=(5, 7))`` does (issue #1022). A
+            model that reads no clock cannot tell, and its session always
+            starts at 0, which keeps event times small; a segment from
+            ``t_start`` is labelled with its own times.
         """
         from bngsim._seed import _resolve_seed
 
         self._require_alive()
         used_seed = _resolve_seed(seed)
+        t0 = 0.0 if t_start is None else float(t_start)
+        if not math.isfinite(t0):
+            raise ValueError(f"t_start must be finite, got {t_start!r}")
         try:
-            self._core.initialize(used_seed)
+            self._core.initialize(used_seed, t0 if self._clock_readers else 0.0)
         except RuntimeError as e:
             raise SimulationError(f"RuleMonkey initialization failed: {e}") from e
         self._initialized = True
         self._seed = used_seed
-        logger.info("RuleMonkeySession initialized (seed=%d)", used_seed)
+        self._start_unset = t_start is None
+        logger.info("RuleMonkeySession initialized (seed=%d, t_start=%g)", used_seed, t0)
 
     def destroy(self) -> None:
         """Destroy the session and release C++ resources."""
@@ -133,6 +196,20 @@ class RuleMonkeySession:
         sample_times: list[float] | None = None,
     ) -> Result:
         """Run a simulation segment and return a Result.
+
+        A segment that starts at :attr:`current_time` runs on the session
+        clock, the model's. One that starts elsewhere continues from
+        :attr:`current_time` by the same span and is labelled with the times
+        asked for, which a model that does not read the clock cannot tell
+        apart. For a model that reads the clock (``time()``, or a table
+        function indexed by time) the labels would not be the times it read,
+        so such a segment raises :class:`bngsim.SimulationError`, unless
+        :meth:`initialize` left the start unset and nothing has moved the
+        session since: the seed state then moves to the segment's start.
+
+        The result's ``solver_stats["n_steps"]`` counts the events since
+        :meth:`initialize`, not this segment's alone, as an
+        :class:`bngsim.NfsimSession`'s does.
 
         Parameters
         ----------
@@ -179,10 +256,17 @@ class RuleMonkeySession:
                 "t_start, t_end and n_points are required unless sample_times is given."
             )
 
+        moved = self._place_segment(float(t_start))
         try:
-            core_result = self._core.simulate(
-                float(t_start), float(t_end), int(n_points), timeout_seconds, explicit_times
-            )
+            try:
+                core_result = self._core.simulate(
+                    float(t_start), float(t_end), int(n_points), timeout_seconds, explicit_times
+                )
+            except BaseException:
+                if moved:
+                    # A segment that fails leaves the start where initialize() left it.
+                    self._restore_unset_start()
+                raise
         except SimulationTimeout:
             raise
         except RuntimeError as e:
@@ -209,6 +293,7 @@ class RuleMonkeySession:
             if timeout_seconds < 0.0:
                 raise ValueError(f"timeout must be non-negative or None, got {timeout!r}")
 
+        self._start_unset = False
         try:
             self._core.step_to(float(time), timeout_seconds)
         except SimulationTimeout:
@@ -231,6 +316,7 @@ class RuleMonkeySession:
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
+        self._start_unset = False
         self._core.add_molecules(mol_type, count)
 
     def get_parameter(self, name: str) -> float:
@@ -292,6 +378,7 @@ class RuleMonkeySession:
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
+        self._start_unset = False
         try:
             self._core.add_species(pattern, count)
         except RuntimeError as e:
@@ -313,6 +400,7 @@ class RuleMonkeySession:
         count = round_half_up(count)
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
+        self._start_unset = False
         try:
             self._core.remove_species(pattern, count)
         except RuntimeError as e:
@@ -332,6 +420,7 @@ class RuleMonkeySession:
         count = round_half_up(count)
         if count < 0:
             raise ValueError(f"count must be nonnegative, got {count}")
+        self._start_unset = False
         try:
             self._core.set_species_count(pattern, count)
         except RuntimeError as e:
@@ -481,6 +570,7 @@ class RuleMonkeySession:
             raise SimulationError(f"RuleMonkey load_state failed: {e}") from e
         self._initialized = True
         self._seed = None
+        self._start_unset = False
         logger.debug("RuleMonkeySession state loaded from %s", path)
 
     @property
@@ -505,6 +595,39 @@ class RuleMonkeySession:
     def current_time(self) -> float:
         self._require_initialized()
         return self._core.current_time()
+
+    def _place_segment(self, start: float) -> bool:
+        """Check a segment starting at *start* against the session clock, for a
+        model that reads it, and move an unset start there (see simulate).
+        Whether it moved the start."""
+        start_unset, self._start_unset = self._start_unset, False
+        if not self._clock_readers:
+            return False
+        now = self._core.current_time()
+        if _on_session_clock(start, now):
+            return False
+        # Only initialize() leaves the start unset (at 0), and it sets the seed.
+        if start_unset and self._seed is not None:
+            try:
+                self._core.initialize(self._seed, start)
+            except RuntimeError as e:
+                # A failed initialize() leaves no session: put back the one there was.
+                self._restore_unset_start()
+                raise SimulationError(f"RuleMonkey initialization failed: {e}") from e
+            return True
+        raise SimulationError(
+            f"RuleMonkeySession cannot run a segment from t = {start:g}: the session "
+            f"clock is at {now:g}, and the model reads the clock in "
+            + ", ".join(f"'{n}'" for n in self._clock_readers)
+            + ", so the rows would not be labelled with the times it read. Start the "
+            "segment at current_time, or pass t_start to initialize() (issue #1022)."
+        )
+
+    def _restore_unset_start(self) -> None:
+        """Put the session back as initialize() left it, with its start unset."""
+        assert self._seed is not None
+        self._core.initialize(self._seed, 0.0)
+        self._start_unset = True
 
     def _require_alive(self) -> None:
         if self._destroyed:

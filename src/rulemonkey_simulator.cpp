@@ -7,7 +7,10 @@
 #include <rulemonkey/simulator.hpp>
 #include <rulemonkey/types.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -125,22 +128,28 @@ Result convert_rulemonkey_result(const rulemonkey::Result &rm_result,
         result.record_expressions(i, func_buf.data());
     }
 
+    // Events since the run or the session began, so a session segment reports
+    // the session's running total (richardposner/RuleMonkey#93), as an NFsim
+    // session's global event counter does.
     result.solver_stats().n_steps = static_cast<int>(rm_result.event_count);
     result.solver_stats().n_rhs_evals = static_cast<int>(rm_result.event_count);
     return result;
 }
 
-// Upstream's stateless run() starts its SSA clock at 0 and records from
-// t_start onward, so a nonzero t_start used to simulate the pre-history [0,
-// t_start] before the first row (issue #703). A bngsim run starts from the
-// initial state at t_start and never sees [0, t_start], so the request is
-// shifted to elapsed time here (t_start -> 0) and run() labels the rows back
-// with absolute times. That is also BNG2.pl's simulate_nf semantics, which runs
-// NFsim for t_end - t_start from the initial state.
-rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
+// RuleMonkey 3.11.0 puts the seed state at ts.t_start on the model's clock
+// (richardposner/RuleMonkey#98), so a run on model time is handed through as
+// is: it starts from the initial state at t_start and never sees [0, t_start]
+// (issue #703), and a rate law that reads time() reads absolute model time, as
+// ode and ssa do (issue #1022). A model that reads no clock cannot tell model
+// time from time elapsed since t_start, and is run on the latter, shifted to
+// t_start -> 0 and labelled back: event times stay small, where on absolute time
+// a waiting time is rounded away once the total propensity times |t| nears
+// 1e15, and such a run is the one 3.10.1 gave. NFsim stays on elapsed time,
+// BNG2.pl's simulate_nf semantics.
+rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times, bool model_time) {
     rulemonkey::TimeSpec rm_times;
-    const double t0 = times.t_start;
-    rm_times.t_start = 0.0;
+    const double t0 = model_time ? 0.0 : times.t_start;
+    rm_times.t_start = times.t_start - t0;
     rm_times.t_end = times.t_end - t0;
     if (!times.sample_times.empty()) {
         // Explicit, possibly non-uniform output instants (GH #169). Upstream
@@ -156,6 +165,44 @@ rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times) {
         rm_times.n_points = rulemonkey_interval_count(times.n_points);
     }
     return rm_times;
+}
+
+void require_finite_span(const char *where, double t_from, double t_to) {
+    if (!std::isfinite(t_from) || !std::isfinite(t_to)) {
+        std::ostringstream os;
+        os << std::setprecision(17) << where << ": t_start and t_end must be finite, got " << t_from
+           << " and " << t_to;
+        throw std::runtime_error(os.str());
+    }
+}
+
+// RuleMonkey integrates a rate that reads the clock on panels of at most a
+// thousandth of a call's span, placed at t + k*h (engine.cpp, issue #86).
+// Where the doubles near t cannot place them to one part in a thousand, the
+// integral comes out wrong or never advances, with no error: a span of 2 at
+// t = 1e13, panels of one spacing each, fired nothing (issue #1022). Refuse such
+// a call.
+void require_resolvable_clock(double t_from, double t_to) {
+    const double h = (t_to - t_from) / 1000.0;
+    const double t = std::max(std::fabs(t_from), std::fabs(t_to));
+    const double spacing = std::nextafter(t, std::numeric_limits<double>::infinity()) - t;
+    if (h > 0.0 && spacing > h * 0x1p-10) {
+        std::ostringstream os;
+        os << std::setprecision(17)
+           << "RuleMonkey cannot integrate a rate that reads the clock from t = " << t_from
+           << " to " << t_to << ": the doubles near t = " << t << " are " << std::setprecision(3)
+           << spacing << " apart, too coarse for its integration panels of " << h
+           << ". Run a longer span, or one nearer t = 0 (issue #1022).";
+        throw std::runtime_error(os.str());
+    }
+}
+
+// The tolerance upstream's session simulate() allows between a segment's start
+// and the session clock (RuleMonkeySimulator::simulate in
+// third_party/rulemonkey/cpp/rulemonkey/simulator.cpp). RuleMonkeySession uses
+// the same one to decide whether a segment starts on the session clock.
+bool on_session_clock(double t, double session_t) {
+    return std::fabs(t - session_t) <= 1e-9 * std::max(1.0, std::fabs(session_t));
 }
 
 } // namespace
@@ -201,6 +248,7 @@ struct RuleMonkeySimulator::Impl {
 
     std::string xml_path;
     std::unique_ptr<rulemonkey::RuleMonkeySimulator> sim;
+    bool reads_clock = true; // see set_reads_clock
 };
 
 RuleMonkeySimulator::RuleMonkeySimulator(const std::string &xml_path)
@@ -218,17 +266,22 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
         // share a time, and event_count preserved. The recorder labels each row
         // with the requested time, so convert_rulemonkey_result needs no explicit
         // time labels and solver_stats().n_steps now reports for both paths.
-        auto rm_result =
-            impl_->sim->run(to_rulemonkey_times(times), seed, make_cancel_callback(budget));
-        // Back from elapsed time to the absolute labels the caller asked for.
-        std::vector<double> labels(rm_result.time.begin(), rm_result.time.end());
-        for (double &t : labels)
-            t += times.t_start;
+        require_finite_span("RuleMonkeySimulator::run", times.t_start, times.t_end);
+        if (impl_->reads_clock)
+            require_resolvable_clock(times.t_start, times.t_end);
+        auto rm_result = impl_->sim->run(to_rulemonkey_times(times, impl_->reads_clock), seed,
+                                         make_cancel_callback(budget));
         // The requested instants themselves, as every other backend reports
-        // them: elapsed + t_start can miss the last by an ulp (issue #693).
-        const auto requested = times.output_times();
-        if (requested.size() == labels.size())
-            labels = requested;
+        // them: upstream's grid, and elapsed time + t_start, can miss the last
+        // by an ulp (issue #693).
+        std::vector<double> labels = times.output_times();
+        if (labels.size() != rm_result.time.size()) {
+            labels.assign(rm_result.time.begin(), rm_result.time.end());
+            if (!impl_->reads_clock) {
+                for (double &t : labels)
+                    t += times.t_start;
+            }
+        }
         return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
         // Upstream raises Cancelled iff our callback returned false, which it
@@ -238,10 +291,16 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
     }
 }
 
-void RuleMonkeySimulator::initialize(uint64_t seed) { impl_->sim->initialize(seed); }
+void RuleMonkeySimulator::initialize(uint64_t seed, double t_start) {
+    impl_->sim->initialize(seed, t_start);
+}
 
 void RuleMonkeySimulator::step_to(double time, double timeout_seconds) {
     WallClockBudget budget(timeout_seconds);
+    const double now = impl_->sim->current_time();
+    require_finite_span("RuleMonkeySimulator::step_to", now, time);
+    if (impl_->reads_clock)
+        require_resolvable_clock(now, time);
     try {
         impl_->sim->step_to(time, make_cancel_callback(budget));
     } catch (const rulemonkey::Cancelled &) {
@@ -254,36 +313,44 @@ Result RuleMonkeySimulator::simulate(double t_start, double t_end, int n_points,
                                      const std::vector<double> &sample_times) {
     WallClockBudget budget(timeout_seconds);
     const double internal_start = impl_->sim->current_time();
+    const double origin = sample_times.empty() ? t_start : sample_times.front();
+    // A segment that starts on the session clock runs on it as given, so a rate
+    // law that reads time() reads the times the rows are labelled with (issue
+    // #1022). One that starts elsewhere continues from the session clock by the
+    // same span and is labelled with the caller's times, as it always has been:
+    // the session clock is then not the labels' clock, which only a model that
+    // reads the clock can tell, and RuleMonkeySession refuses such a segment
+    // for one.
+    const bool on_clock = on_session_clock(origin, internal_start);
+    auto to_session = [&](double t) { return on_clock ? t : internal_start + (t - origin); };
+    const double end = sample_times.empty() ? t_end : sample_times.back();
+    require_finite_span("RuleMonkeySimulator::simulate", origin, end);
+    if (impl_->reads_clock)
+        require_resolvable_clock(to_session(origin), to_session(end));
 
     try {
         if (!sample_times.empty()) {
-            // Explicit output instants (GH #184) on a stateful session. Map the
-            // caller's absolute sample times onto the session's internal clock by
-            // their offset from the segment start (sample_times[0]); the live
-            // session continues from internal_start, so the i-th sample lands at
-            // internal_start + (sample_times[i] - sample_times[0]). Hand the
-            // engine a TimeSpec carrying those instants: upstream's session
-            // simulate(TimeSpec) records at exactly them in a single run_ssa pass
-            // (RuleMonkey #16), continuing from the current session state —
-            // bit-identical to the uniform grid where the two schedules share a
-            // time, with event_count preserved. The Result is relabelled back to
-            // the caller's absolute sample_times.
-            const double origin = sample_times.front();
+            // Explicit output instants (GH #184) on a stateful session. Hand the
+            // engine a TimeSpec carrying them, on the session clock: upstream's
+            // session simulate(TimeSpec) records at exactly them in a single
+            // run_ssa pass (RuleMonkey #16), continuing from the current session
+            // state, bit-identical to the uniform grid where the two schedules
+            // share a time. The Result is labelled with the caller's
+            // sample_times.
             rulemonkey::TimeSpec rm_ts;
             rm_ts.sample_times.reserve(sample_times.size());
             for (double t : sample_times) {
-                rm_ts.sample_times.push_back(internal_start + (t - origin));
+                rm_ts.sample_times.push_back(to_session(t));
             }
-            rm_ts.t_start = internal_start;
+            rm_ts.t_start = rm_ts.sample_times.front();
             rm_ts.t_end = rm_ts.sample_times.back();
             auto rm_result = impl_->sim->simulate(rm_ts, make_cancel_callback(budget));
             return convert_rulemonkey_result(rm_result, &sample_times);
         }
 
-        const double internal_end = internal_start + (t_end - t_start);
         auto rm_result =
-            impl_->sim->simulate(internal_start, internal_end, rulemonkey_interval_count(n_points),
-                                 make_cancel_callback(budget));
+            impl_->sim->simulate(to_session(t_start), to_session(t_end),
+                                 rulemonkey_interval_count(n_points), make_cancel_callback(budget));
         auto labels = uniform_time_labels(t_start, t_end, n_points);
         return convert_rulemonkey_result(rm_result, &labels);
     } catch (const rulemonkey::Cancelled &) {
@@ -367,10 +434,22 @@ void RuleMonkeySimulator::clear_param_overrides() {
     impl_->apply_seed_rounding();
 }
 
+void RuleMonkeySimulator::set_reads_clock(bool enabled) { impl_->reads_clock = enabled; }
+
 void RuleMonkeySimulator::set_molecule_limit(int limit) { impl_->sim->set_molecule_limit(limit); }
 
 void RuleMonkeySimulator::set_block_same_complex_binding(bool enabled) {
     impl_->sim->set_block_same_complex_binding(enabled);
+}
+
+std::vector<std::string> RuleMonkeySimulator::unsupported_warnings() const {
+    std::vector<std::string> warnings;
+    for (const auto &feature : impl_->sim->unsupported_features()) {
+        if (feature.severity == rulemonkey::Severity::Warn) {
+            warnings.push_back(feature.element + ": " + feature.feature);
+        }
+    }
+    return warnings;
 }
 
 const std::string &RuleMonkeySimulator::xml_path() const { return impl_->xml_path; }

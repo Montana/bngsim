@@ -1036,10 +1036,21 @@ class Simulator:
                     f"method='{method}' requires xml_path=... pointing to a BNG XML file."
                 )
             from bngsim._bngsim_core import RuleMonkeySimulator
-            from bngsim._network_free_checks import refuse_time_dependent_rate_laws
+            from bngsim._network_free_checks import (
+                clock_readers,
+                refuse_rulemonkey_compartments,
+                refuse_rulemonkey_energy_misreads,
+            )
+            from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
-            refuse_time_dependent_rate_laws(xml_path, "rulemonkey")
+            refuse_rulemonkey_compartments(xml_path)
+            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             self._sim = RuleMonkeySimulator(xml_path)
+            warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
+            # Model time where the model reads the clock (issue #1022); elsewhere
+            # elapsed time, which no such model can tell apart and which keeps
+            # event times small at a large t_start.
+            self._sim.set_reads_clock(bool(clock_readers(xml_path)))
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             self._sim.set_block_same_complex_binding(bool(block_same_complex_binding))
@@ -2095,7 +2106,7 @@ class Simulator:
 
     def _apply_crossing_stops(
         self, opts, t_start, t_end, model=None, sensitivities: bool | None = None
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Stop the integration step on every fixed time discontinuity (#305).
 
         A GH #72 discontinuity root is registered so the integrator cannot step
@@ -2142,6 +2153,10 @@ class Simulator:
         of those on literal time that read none of the Simulator's sensitivity
         parameters: fixed times of the run, with no jump to make. Every chunk
         is asked about the whole set, so every chunk stops at the same times.
+
+        Returns the conditions it read, for :meth:`_apply_state_switch_roots`
+        to leave out as covered: asked again, the model would probe its RHS for
+        clocks again to key its cache (issue #726).
         """
         model = model if model is not None else self._model
         if sensitivities is None:
@@ -2151,7 +2166,7 @@ class Simulator:
         # or not any condition names it (issue #709).
         table_breaks = model.table_function_breaks()
         if not conditions and not table_breaks:
-            return
+            return conditions
         from bngsim._switch_sensitivity import (
             _PLAIN_INSTANT_FLOOR,
             TriggerEqualityNeverHolds,
@@ -2199,7 +2214,7 @@ class Simulator:
                 "integrator will approach each crossing unclamped (issue #305).",
                 e,
             )
-            return
+            return conditions
         if stops:
             logger.debug(
                 "Discontinuity crossing stops at t=%s (issue #305)",
@@ -2227,10 +2242,11 @@ class Simulator:
                 len(conditions) == 1
                 and len(over_budget) == 1
                 and not table_breaks
-                and not model.state_switch_root_conditions()
+                and not model._state_switch_roots_beside(conditions)
                 and model._core.n_events == 0
             )
             self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+        return conditions
 
     @staticmethod
     def _switches_the_run(model, over_budget: list) -> list:
@@ -2750,7 +2766,7 @@ class Simulator:
             else:
                 opts.set_state_switch_reactions(reactions)
 
-    def _apply_state_switch_roots(self, opts, model) -> None:
+    def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).
 
         The plain-run half of :meth:`_apply_state_switch_sens`. A rate law gated
@@ -2764,10 +2780,17 @@ class Simulator:
         and nothing else.
 
         The conditions are :meth:`Model.state_switch_root_conditions`, cached
-        on the model, so a fit pays for the scan once. A no-op for a model with
-        no such condition, which leaves its root set and stepping untouched.
+        on the model for the time conditions it leaves out as covered, so a fit
+        pays for the scan once per clock verdict (issue #726): once, unless the
+        fit moves a counter's rate across 1. ``covered`` is what
+        :meth:`_apply_crossing_stops` returned for this run. A no-op for a model
+        with no such condition, which leaves its root set and stepping untouched.
         """
-        conditions = model.state_switch_root_conditions()
+        conditions = (
+            model.state_switch_root_conditions()
+            if covered is None
+            else model._state_switch_roots_beside(covered)
+        )
         if conditions:
             logger.debug(
                 "State-switch roots for a plain run (issue #897): %s",
@@ -4678,7 +4701,7 @@ class Simulator:
                 eff_max_step = self._resolve_max_step(max_step)
                 if eff_max_step is not None:
                     opts.max_step_size = eff_max_step
-                self._apply_crossing_stops(opts, t_start, t_end)
+                covered = self._apply_crossing_stops(opts, t_start, t_end)
                 if self._codegen_so_path:
                     opts.codegen_so_path = self._codegen_so_path
                 if self._codegen_c_source:
@@ -4710,7 +4733,7 @@ class Simulator:
                     # #150 / #144), so an IC-only request needs the jump too.
                     self._apply_state_switch_sens(opts, self._model._core)
                 else:
-                    self._apply_state_switch_roots(opts, self._model)
+                    self._apply_state_switch_roots(opts, self._model, covered)
 
                 # Install the Python callback used for the JAX Jacobian path.
                 if self._jacobian == "jax" and self._jax_jac_evaluator is not None:
@@ -5017,12 +5040,14 @@ class Simulator:
         base_seed = _resolve_seed(seed) if self._method != "ode" else 0
 
         if self._method == "ode":
-            # Every row runs on a clone, and a clone inherits these structural
-            # scans only if the parent has already made them. Made here, once,
-            # before any row is cloned (and before any worker thread exists),
-            # rather than once per row and again on the next call (issue #897).
-            self._model.time_discontinuity_conditions()
-            self._model.state_switch_root_conditions()
+            # Every row runs on a clone, and a clone inherits these scans only
+            # if the parent has already made them. Made here, once, before any
+            # row is cloned (and before any worker thread exists), rather than
+            # once per row and again on the next call (issue #897). They are
+            # kept by clock verdict (issue #726): a row that moves a counter's
+            # rate across 1 scans again, and its siblings at that verdict
+            # share the answer through the memo a clone shares with its parent.
+            self._model._state_switch_roots_beside(self._model.time_discontinuity_conditions())
 
         def _run_one(i: int) -> Result:
             """Run simulation i (thread-safe, GIL released)."""
@@ -6131,7 +6156,7 @@ class Simulator:
                     opts.codegen_c_source = self._codegen_c_source
                 # This row's own discontinuity crossings, for the same reason the
                 # switch times below are detected on the clone (issue #305).
-                self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone)
+                covered = self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone)
                 if self._sensitivity_params:
                     opts.set_sensitivity_params(self._sensitivity_params)
                     # Seed ∂x_i(0)/∂p from the CLONE's params (this row's point):
@@ -6160,7 +6185,7 @@ class Simulator:
                     # sensitivity at all", not on a parameter request.
                     self._apply_state_switch_sens(opts, clone._core)
                 else:
-                    self._apply_state_switch_roots(opts, clone)
+                    self._apply_state_switch_roots(opts, clone, covered)
                 # The GH #176 retry, as run() places it. Without it a row raised
                 # where the same run() fell back to FD and returned, which breaks
                 # the GH #203 contract above; issue #867 made a closed form still
