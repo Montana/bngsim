@@ -389,6 +389,10 @@ class NetworkModel {
     };
     const StateSwitch *state_switch(const std::string &condition_src,
                                     std::string *why = nullptr) const;
+    // Does the switch's residual read the clock, through the walk
+    // event_trigger_reads_time takes (issue #908)? Never by probing values: a
+    // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
+    bool state_switch_reads_time(const StateSwitch &sw) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
