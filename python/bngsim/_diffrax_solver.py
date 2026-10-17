@@ -13,6 +13,12 @@ codegen's private parser: a synthesis reaction's rate was multiplied by the last
 species, a model without observables crashed, and an initial concentration
 written as an expression was looked up as a parameter name.
 
+A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there,
+and the run is split at each such time and restarted just past it (issue #865):
+stepped across, a jump cost several times CVODE's error, and at a tight
+tolerance the whole step budget. A switch on the model's state, whose times are
+not known before the run, is refused, as events are.
+
 Optional dependency: ``pip install diffrax``.
 """
 
@@ -97,7 +103,9 @@ def run_diffrax(
     Raises
     ------
     ValueError
-        If the model has events, which this solver does not implement, or a
+        If the model has events, or a rate law that switches on the model's
+        state, neither of which this solver implements; if its switches on the
+        clock cannot all be placed (see :func:`_switch_times`); or if it has a
         construct the JAX RHS does not implement or misdescribes (see
         :func:`bngsim._jax_rhs.check_rhs_against_engine`).
     """
@@ -126,6 +134,14 @@ def run_diffrax(
             f"run_diffrax does not implement events, and this model has {model.n_events}; "
             "use Simulator(method='ode')."
         )
+    state_switches = model.state_switch_root_conditions()
+    if state_switches:
+        raise ValueError(
+            "run_diffrax does not integrate a rate law that switches on the model's state, "
+            "whose switch times are not known before the run, and this model has "
+            f"{list(state_switches)}; use Simulator(method='ode')."
+        )
+    jump_ts = _switch_times(model, float(t_start), float(t_end))
     rhs = generate_jax_rhs(model)
     span = float(t_end) - float(t_start)
     check_rhs_against_engine(
@@ -141,38 +157,111 @@ def run_diffrax(
 
     # Output times
     ts = jnp.linspace(t_start, t_end, n_points)
+    out_ts = np.asarray(ts)
 
-    # Diffrax RHS adapter: f(t, y, args) where args = params
-    def diffrax_rhs(t, y, args):
-        return rhs(y, t, args)
-
-    # Build solver
-    term = diffrax.ODETerm(diffrax_rhs)
     solver = diffrax.Kvaerno5()
     stepsize_controller = diffrax.PIDController(rtol=rtol, atol=atol)
 
-    # JIT-compile and run
+    # Issue #865. The run is split at the times its rate laws switch at
+    # (_switch_times): each piece ends at the float just before a switch, and the
+    # next begins at the float just after it, so no step is taken across the
+    # jump. diffrax also reads the vector field at trial times past the end of
+    # the interval it solves over (to 1.43 on [0, 1.37), at rtol=1e-6), and a
+    # switch just past the end turned every step near it down until the steps
+    # ran out, both for a piece ending there and for diffrax's own jump_ts. So
+    # within a piece the right-hand side is read at the time clamped to the
+    # piece, and only ever sees the branch the piece is on. One compiled solve
+    # serves every piece: its bounds, start state and output times are
+    # arguments, the output times padded with the piece's end, the last of
+    # which is the state the next piece starts from.
     @jax.jit
-    def _solve(y0, params):
+    def _solve(a, b, y_a, seg_ts, params):
+        def piece_rhs(t, y, args):
+            return rhs(y, jnp.clip(t, a, b), args)
+
         sol = diffrax.diffeqsolve(
-            term,
+            diffrax.ODETerm(piece_rhs),
             solver,
-            t0=t_start,
-            t1=t_end,
-            dt0=min((t_end - t_start) / 100.0, 0.01),
-            y0=y0,
+            t0=a,
+            t1=b,
+            dt0=jnp.minimum((b - a) / 100.0, 0.01),
+            y0=y_a,
             args=params,
-            saveat=diffrax.SaveAt(ts=ts),
+            saveat=diffrax.SaveAt(ts=seg_ts),
             stepsize_controller=stepsize_controller,
             max_steps=max_steps,
         )
         return sol.ys, sol.stats["num_steps"]
 
-    species_out, n_steps = _solve(y0, params)
+    edges = [float(t_start), *jump_ts, float(t_end)]
+    species_out = np.empty((n_points, len(sp_names)), dtype=np.float64)
+    y_a = y0
+    n_steps = 0
+    for i in range(len(edges) - 1):
+        a = edges[0] if i == 0 else float(np.nextafter(edges[i], np.inf))
+        b = edges[-1] if i == len(edges) - 2 else float(np.nextafter(edges[i + 1], -np.inf))
+        # A piece reports the output times in (edges[i], edges[i + 1]], the first
+        # also t_start. One on a switch is the piece's before it, read at the float
+        # just before: the state does not jump there, only its derivative.
+        mine = np.flatnonzero((out_ts <= edges[i + 1]) & ((out_ts > edges[i]) | (i == 0)))
+        seg_ts = np.full(n_points + 1, b)
+        seg_ts[: mine.size] = np.clip(out_ts[mine], a, b)
+        ys, n = _solve(
+            jnp.float64(a), jnp.float64(b), y_a, jnp.asarray(seg_ts, dtype=jnp.float64), params
+        )
+        ys = np.asarray(ys)
+        species_out[mine] = ys[: mine.size]
+        y_a = jnp.asarray(ys[-1])
+        n_steps += int(n)
 
     return {
         "time": np.asarray(ts),
-        "species": np.asarray(species_out),
+        "species": species_out,
         "species_names": sp_names,
-        "n_steps": int(n_steps),
+        "n_steps": n_steps,
     }
+
+
+def _switch_times(model, t_start: float, t_end: float) -> list[float]:
+    """The instants in ``(t_start, t_end)`` at which a rate law of *model* switches
+    on the clock, for diffrax's ``jump_ts`` (issue #865).
+
+    A condition on the clock, ``if(time() > 1.37, 5, 0.1)``, is a jump in the
+    right-hand side, and the step-size controller stepped across it: several
+    times CVODE's error at ``rtol=1e-6``, and at ``rtol=1e-8`` it spent its whole
+    step budget there and failed. The crossings are constants of the run, the
+    ones CVODE stops on (:func:`bngsim._switch_sensitivity.crossings_with_periodic`).
+    These are the crossings themselves, a periodic condition's included, not the
+    stops CVODE places a little past one.
+
+    A condition that switches more often than a run's budget of stops has none
+    placed, and a failure to place them would leave the run stepping across
+    them: both raise ``ValueError`` rather than return the trajectory #865 did.
+    """
+    conditions = model.time_discontinuity_conditions()
+    if not conditions:
+        return []
+    from bngsim._switch_sensitivity import crossings_with_periodic
+
+    over_budget: list = []
+    try:
+        crossings, _stops, periodic_at = crossings_with_periodic(
+            model._core,
+            t_start,
+            t_end,
+            conditions,
+            touches=getattr(model, "_event_disc_conditions", frozenset()),
+            over_budget=over_budget,
+        )
+    except Exception as e:
+        raise ValueError(
+            f"run_diffrax could not place the times this model's rate laws switch at ({e}); "
+            "use Simulator(method='ode')."
+        ) from e
+    if over_budget:
+        raise ValueError(
+            "run_diffrax cannot stop at every switch of this model: "
+            f"{len(over_budget)} condition(s) switch more often than a run allows; "
+            "use Simulator(method='ode')."
+        )
+    return sorted({float(c.time) for c in (*crossings, *periodic_at) if t_start < c.time < t_end})
