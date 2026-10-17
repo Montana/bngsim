@@ -260,25 +260,25 @@ def _relational_split_op(atom: str) -> tuple[str, str, str] | None:
 
 def _turning_side(expr: str) -> tuple[str, str] | None:
     """``("abs", u)`` for ``abs(u)``, ``("square", u)`` for ``(u)^2`` or ``u^2``
-    with ``u`` one name or one parenthesized group; ``None`` otherwise."""
+    with ``u`` one name or one parenthesized group; ``None`` otherwise.
+
+    The group must close where the ``^`` stands. ``(A-5)^2+(B-5)^2`` and
+    ``(A-5)*(B)^2`` each balance as a whole and end in ``^2``, but only the
+    last group is squared; read as the square of everything before the ``^``,
+    the disk ``(A-c)^2+(B-5)^2 < 0.75`` was rooted at a surface it does not
+    have and lost its own crossing, and dY/dc came back 0 for -12.06.
+    """
     text = _strip_redundant_parens(expr.strip())
-    m = re.fullmatch(r"abs\s*\((.*)\)", text, re.S)
-    if m is not None and _parens_balanced(m.group(1)):
-        return "abs", m.group(1).strip()
+    m = re.match(r"abs\s*\(", text)
+    if m is not None and _find_close_paren_strict(text, m.end() - 1) == len(text) - 1:
+        return "abs", text[m.end() : -1].strip()
     m = re.fullmatch(r"(\(.*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\^\s*2(?:\.0*)?", text, re.S)
-    if m is not None and _parens_balanced(m.group(1)):
-        return "square", _strip_redundant_parens(m.group(1)).strip()
-    return None
-
-
-def _parens_balanced(text: str) -> bool:
-    depth = 0
-    for c in text:
-        depth += c == "("
-        depth -= c == ")"
-        if depth < 0:
-            return False
-    return depth == 0
+    if m is None:
+        return None
+    base = m.group(1)
+    if base.startswith("(") and _find_close_paren_strict(base, 0) != len(base) - 1:
+        return None
+    return "square", _strip_redundant_parens(base).strip()
 
 
 def _monotone_pieces(atom: str) -> list[str]:
@@ -291,8 +291,11 @@ def _monotone_pieces(atom: str) -> list[str]:
     window was stepped over (issue #904). Its edges are where ``A - 5`` crosses
     ``0.01`` and ``-0.01``, and each of those residuals is monotone along a
     flow that moves A one way. ``u^2`` against a bound is the same at
-    ``±sqrt(bound)``, taken only for a bound that is a number at least 0,
-    where the square root is one. ``[]`` for any other atom.
+    ``±sqrt(bound)``, taken only for a bound that is a number, where the square
+    root is one. A bound that is a number must be above 0: at or below it the
+    atom holds at one point or nowhere, its edges would be restarts at
+    crossings that switch nothing (two of them on one surface, at 0), and it is
+    rooted whole as before. ``[]`` for any other atom.
     """
     split = _relational_split_op(atom)
     if split is None:
@@ -306,15 +309,17 @@ def _monotone_pieces(atom: str) -> list[str]:
     if side is None or _turning_side(bound) is not None:
         return []
     kind, inner = side
+    try:
+        value: float | None = float(_strip_redundant_parens(bound.strip()))
+    except ValueError:
+        value = None
+    if value is not None and not (0.0 < value < math.inf):
+        return []
     if kind == "abs":
         return [f"({inner})<({bound})", f"({inner})>(-({bound}))"]
-    try:
-        value = float(_strip_redundant_parens(bound.strip()))
-    except ValueError:
+    if value is None:
         return []
-    if not (value >= 0.0) or value == float("inf"):
-        return []
-    root = repr(value**0.5)
+    root = repr(math.sqrt(value))
     return [f"({inner})<({root})", f"({inner})>(-{root})"]
 
 
