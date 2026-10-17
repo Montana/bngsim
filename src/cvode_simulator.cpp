@@ -8473,6 +8473,20 @@ static constexpr double kStateSwitchGapRatio = 0.7;
 // which for a genuine common factor is orders of magnitude below it.
 static constexpr double kStateSwitchTauAgreeTol = 1e-4;
 
+// Issue #897: what a state-switch residual that reads exactly 0.0 is reported
+// as while it is held to one side (state_switch_zero_hold), times that side's
+// sign. Its sign is all that matters, but CVODE's root search also divides
+// by it: cvRootfind ranks a sign change by |g(tmid) / (g(tmid) - g(tlo))|,
+// and only a ratio above 0 counts. With DBL_MIN, the smallest normal, that
+// ratio underflowed to 0 against a residual past ~9e15 at the other end. The
+// search then took the sign change for none, moved the wrong end of its
+// bracket, and asked CVodeGetDky for times outside the step: a condition over
+// counts near 1e21 stepped differently from the same condition over 1 and
+// logged "Illegal value for t" (issue #1064). Against any finite residual,
+// up to DBL_MAX (2^1024), 2^-49 keeps that ratio at 2^-1073, twice the
+// smallest subnormal.
+static const double kStateSwitchZeroHold = std::ldexp(1.0, -49);
+
 // How many bands the restart test asks a crossing to clear: 10 sqrt(N), because
 // the WRMS error test lets a single component carry sqrt(N) of the tolerance.
 static double state_switch_resolve_factor(int ns) {
@@ -14106,8 +14120,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     double &zero_hold = state_switch_zero_hold[jx];
                     const double zero_hold_from = zero_hold;
                     if (std::isfinite(g_here) && g_here != 0.0) {
-                        zero_hold =
-                            (g_here > 0.0 ? -1.0 : 1.0) * std::numeric_limits<double>::min();
+                        zero_hold = (g_here > 0.0 ? -1.0 : 1.0) * kStateSwitchZeroHold;
                     }
                     if (!(t_here > from)) {
                         continue;
@@ -14767,7 +14780,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     for (int j : switched) {
                         state_switch_zero_hold[static_cast<size_t>(j)] =
                             -static_cast<double>(root_info[n_events + n_disc + j]) *
-                            std::numeric_limits<double>::min();
+                            kStateSwitchZeroHold;
                     }
                 }
                 // Jump dx/dp across the event and re-seed CVODES sensitivity
