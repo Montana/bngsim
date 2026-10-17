@@ -20,7 +20,12 @@ from __future__ import annotations
 import bngsim
 import numpy as np
 import pytest
-from bngsim._switch_sensitivity import _monotone_pieces
+from bngsim._exceptions import SensitivityUnsupportedError
+from bngsim._switch_sensitivity import (
+    _monotone_pieces,
+    state_switch_conditions,
+    state_switch_reactions,
+)
 
 NET = """begin parameters
     1 k 10
@@ -87,6 +92,16 @@ def test_the_sensitivity_jumps_at_each_edge(tmp_path, cond):
     d_c, d_k = np.asarray(run.sensitivities)[-1, 1, :]
     assert d_c == pytest.approx(0.1, rel=1e-5)
     assert d_k == pytest.approx(0.05, rel=1e-6)
+
+
+@pytest.mark.parametrize("cond", WINDOWS[1:3], ids=IDS[1:3])
+def test_each_edge_is_read_by_the_reaction_that_reads_the_window(tmp_path, cond):
+    """The jump at an edge is judged on the flux of the reactions that read it
+    (issue #763); an edge no reaction is listed for is taken as continuous."""
+    core = _model(tmp_path, cond)._core
+    conditions = state_switch_conditions(core)
+    assert len(conditions) == 2
+    assert state_switch_reactions(core, conditions) == [[1], [1]]
 
 
 @pytest.mark.parametrize(
@@ -224,3 +239,48 @@ def test_an_sbml_kinetic_law_spelled_so_is_not_stepped_over(tmp_path, condition,
     )
     y = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))["Y"]
     assert y == pytest.approx(0.1, rel=1e-5)
+
+
+COUNTER = """begin parameters
+    1 k 10
+    2 one 1
+    3 c 5
+end parameters
+begin functions
+    1 f() if(abs(Aobs-c)<0.01,k*Aobs,0)
+end functions
+begin species
+    1 A() 0
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 one
+    2 0 2 f
+end reactions
+begin groups
+    1 Aobs 1
+end groups
+"""
+
+
+def test_an_abs_window_on_a_counter_whose_edges_a_column_moves_is_refused(tmp_path):
+    """A is a counter: Y = k*c*0.02 = 1, dY/dc = 0.2, dY/dk = 0.1.
+
+    abs() has no analytic derivative, so the columns are CVODES' difference
+    quotient. Issue #48 holds a counter's threshold while the quotient is
+    taken, but only where it reads the condition, and it does not read this
+    one. With c requested the quotient moved the edges the run now stops at,
+    and dY/dc came back 7.03. A column that moves neither is right.
+    """
+    path = tmp_path / "counter.net"
+    path.write_text(COUNTER)
+    with pytest.raises(SensitivityUnsupportedError, match=r"abs\(Aobs-c\)<0\.01"):
+        bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["c"]
+        ).run(t_span=(0.0, 10.0), n_points=2, rtol=1e-8, atol=1e-12)
+    sim = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", sensitivity_params=["k"]
+    )
+    run = sim.run(t_span=(0.0, 10.0), n_points=2, rtol=1e-8, atol=1e-12)
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(1.0, rel=1e-6)
+    assert float(np.asarray(run.sensitivities)[-1, 1, 0]) == pytest.approx(0.1, rel=1e-6)

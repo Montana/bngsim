@@ -6412,7 +6412,9 @@ def fallback_crossing(
     - a condition on a counter species that a requested column moves (its rate
       constant, its initial amount). A counter nothing moves is read at ``y``
       in both terms of the quotient, and its threshold's parameters are held
-      while the quotient is taken (issue #436);
+      while the quotient is taken (issue #436) where issue #48 reads the
+      condition. One it does not read, ``abs(Aobs-c) < 0.01``, is refused where
+      a requested parameter moves its threshold: the quotient moves it across;
     - an equality on the state. It holds at one state and over no interval
       of them, unless the state sits there: ``B == 0`` with B made from where
       another species passes a threshold holds until it does;
@@ -6669,8 +6671,34 @@ def fallback_crossing(
                     kept[("parameter", flat)] = last
                 return "parameter" if last[1] else ""
             if _reads_clock_and_run_constants(flat, scope):
-                read = {scope.clocks[n] for n in _IDENTIFIER.findall(flat) if n in scope.clocks}
-                return "state" if {i for i in read if i >= 0} & moved else ""
+                names = set(_IDENTIFIER.findall(flat))
+                read = {scope.clocks[n] for n in names if n in scope.clocks}
+                if {i for i in read if i >= 0} & moved:
+                    return "state"
+                # A requested parameter moves the threshold, which issue #48
+                # holds while the quotient is taken only where it reads the
+                # atom. It does not read `abs(Aobs-c) < 0.01` on a counter,
+                # whose edges are rooted as crossings of the state instead
+                # (issue #904), and the quotient moved c across them: dY/dc
+                # came back 7.03 for 0.2. A parameter the quotient moves across
+                # a surface, as `_parameter_crossing` finds: a law that only
+                # bends there is proved so of its conditions on the state, and
+                # this one reads none.
+                if not names & requested:
+                    return ""
+                held_by = (
+                    tuple(
+                        float(scope.values[scope.param_idx[n]])
+                        for n in sorted(names & set(scope.param_idx))
+                    ),
+                    requested,
+                    clocks,
+                )
+                verdict = kept.get(("held", flat))
+                if verdict is None or verdict[0] != held_by:
+                    verdict = (held_by, clock_crossing_compensated(flat, scope))
+                    kept[("held", flat)] = verdict
+                return "" if verdict[1] else "parameter"
             return "state"
 
         def moved_by_a_column(flat: str) -> bool:
