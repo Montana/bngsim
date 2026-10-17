@@ -1222,9 +1222,20 @@ ExprTkEvaluator::ExprTkEvaluator() : impl_(std::make_unique<Impl>()) {}
 
 ExprTkEvaluator::~ExprTkEvaluator() = default;
 
-void ExprTkEvaluator::define_variable(const std::string &name, double *addr) {
+bool ExprTkEvaluator::try_define_variable(const std::string &name, double *addr) {
     std::string mapped = expr_compat::compute_registration_name(name);
-    if (!impl_->symbol_table.add_variable(mapped, *addr)) {
+    if (!impl_->symbol_table.add_variable(mapped, *addr))
+        return false;
+    if (mapped != name && (name.empty() || name[0] != '_')) {
+        impl_->mangled_user_names[name] = mapped;
+    }
+    impl_->scalar_variable_names.insert(name);
+    return true;
+}
+
+void ExprTkEvaluator::define_variable(const std::string &name, double *addr) {
+    if (!try_define_variable(name, addr)) {
+        const std::string mapped = expr_compat::compute_registration_name(name);
         const bool reserved = expr_compat::is_exprtk_reserved(name);
         std::string detail;
         if (reserved) {
@@ -1242,10 +1253,6 @@ void ExprTkEvaluator::define_variable(const std::string &name, double *addr) {
         }
         throw std::runtime_error("ExprTk: failed to register variable '" + name + "'. " + detail);
     }
-    if (mapped != name && (name.empty() || name[0] != '_')) {
-        impl_->mangled_user_names[name] = mapped;
-    }
-    impl_->scalar_variable_names.insert(name);
 }
 
 void ExprTkEvaluator::define_constant(const std::string &name, double value) {
