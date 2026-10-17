@@ -87,17 +87,21 @@ python scripts/local_ci.py wheel --python 3.12
 
 ## Contributors
 
-bngsim is developed at Los Alamos National Laboratory by
-[William S. Hlavacek](https://github.com/wshlavacek), with contributions from
+bngsim is developed at Los Alamos National Laboratory by William S. Hlavacek.
+Everyone whose code has merged is named in
+[`CONTRIBUTORS.md`](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTORS.md),
+which gains a line when a first contribution merges. The
+[Credit](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTING.md#credit)
+section of `CONTRIBUTING.md` says how a name is chosen and how to have it
+changed.
 
-- [Michael Mendy](https://github.com/Montana)
-- [Arpit Jain](https://github.com/arpitjain099)
-- [@happykawayigt](https://github.com/happykawayigt)
+To contribute, open a pull request against `main`. What it needs, from tests to
+a changelog fragment, is under
+[Before opening a PR](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTING.md#before-opening-a-pr)
+in `CONTRIBUTING.md`, not on this page.
 
-This list is taken from the repository's history. GitHub's
-[contributors graph](https://github.com/lanl/bngsim/graphs/contributors) is
-always current. To contribute, open a pull request against `main`; the
-sections above cover the build, the test suite and the CI it has to pass.
-
-bngsim builds on the work behind the projects it vendors under
-`third_party/`: SUNDIALS, ExprTk, NFsim, RuleMonkey and MIR.
+The third-party software bngsim redistributes, the engines vendored under
+`third_party/` among it, is listed with its license terms in
+[`NOTICE`](https://github.com/lanl/bngsim/blob/HEAD/NOTICE). The tools it was
+developed and validated against are cited in
+[`ACKNOWLEDGMENTS.md`](https://github.com/lanl/bngsim/blob/HEAD/ACKNOWLEDGMENTS.md).
