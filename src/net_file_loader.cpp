@@ -751,6 +751,16 @@ static std::string read_tfun_index(const std::string &expr, size_t &p) {
     return expr.substr(start, p - start);
 }
 
+// Whether the argument at `pos` is the method option, `method=>"step"`. An index
+// whose name begins with "method" (`method_k`) was taken for the option by its
+// first six letters, and the table was read over the clock with nothing said.
+static bool is_method_option(const std::string &expr, size_t pos) {
+    if (expr.compare(pos, 6, "method") != 0)
+        return false;
+    const size_t next = expr.find_first_not_of(" \t", pos + 6);
+    return next != std::string::npos && expr.compare(next, 2, "=>") == 0;
+}
+
 static bool parse_tfun_expression(const std::string &expr, TfunSpec &spec) {
     auto pos = expr.find("tfun(");
     if (pos == std::string::npos)
@@ -803,7 +813,7 @@ static bool parse_tfun_expression(const std::string &expr, TfunSpec &spec) {
         auto idx_start = expr.find_first_not_of(" \t", after_filename + 1);
         if (idx_start != std::string::npos) {
             // Check if next token is method=> or an index name
-            if (expr.substr(idx_start, 6) == "method") {
+            if (is_method_option(expr, idx_start)) {
                 spec.method = parse_method_option(expr, idx_start);
             } else {
                 size_t idx_end = idx_start;

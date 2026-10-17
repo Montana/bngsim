@@ -5,4 +5,7 @@
   loaded. Both `.net` readers share the parse and both failed, for inline,
   file-based and embedded tables, and for an index over a parameter, an
   observable, a function or the clock (`time()`). The index is now read with
-  its `()` and names what the bare name does.
+  its `()` and names what the bare name does. In a file-based tfun, an index
+  whose name begins with `method` (`tfun('d.tfun', method_k)`) was taken for
+  the `method=>` option, and the table was read over the clock; it is the
+  index now.

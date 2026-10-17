@@ -124,3 +124,25 @@ def test_the_call_does_not_swallow_the_rest_of_the_line(tmp_path) -> None:
         ]
         # 4 throughout, plus a step that is 0 on [0, 1): A(1) = 4.
         assert _a_at_1(model, False) == pytest.approx(4.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("form", ["file", "inline", "inline-method"])
+@pytest.mark.parametrize("call", [False, True], ids=["bare", "call"])
+@pytest.mark.parametrize("loader", ["net_file_loader", "net_reader"])
+def test_an_index_named_method_something_is_an_index(tmp_path, loader, form, call) -> None:
+    # In a file-based tfun, an index whose name begins with "method" was taken
+    # for the `method=>` option by its first six letters, and the table was
+    # read over the clock (its .tfun header then refused it, or, headed
+    # `time`, it loaded over the wrong index).
+    index = "method_k()" if call else "method_k"
+    (tmp_path / "d.tfun").write_text("# method_k drive\n0 0\n10 10\n")
+    path = tmp_path / "m.net"
+    path.write_text(
+        _NET.replace("    1 k 4\n", "    1 k 4\n    2 method_k 4\n").format(
+            functions=FORMS[form].format(index=index)
+        )
+    )
+    model = _load(path, loader)
+    (table,) = model._core.table_function_tables
+    assert (table["index_kind"], table["method"]) == ("parameter", "linear")
+    assert _a_at_1(model, False) == pytest.approx(4.0, rel=1e-6)
