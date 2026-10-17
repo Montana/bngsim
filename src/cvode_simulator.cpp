@@ -537,13 +537,6 @@ struct CvodeUserData {
     const char *sens_param_pinned = nullptr;
     const double *sens_param_nominal = nullptr;
 
-    // Throwaway RHS output for the rateOf probe the root function runs before
-    // evaluating event triggers (GH #106). compute_derivs() publishes the live
-    // dx/dt into the model's current_derivs as a side effect; this buffer just
-    // absorbs the returned RHS. Sized to n_species in run() only when the model
-    // uses rateOf; left empty (and untouched) otherwise.
-    std::vector<double> rateof_root_scratch;
-
     // Nonnegative-clamped copy of the integrator state for RHS evaluation (GH
     // #135). Lazily sized to n_species on first RHS callback. Concentrations are
     // physically nonnegative, but CVODE's predictor can push a zero-pinned fast
@@ -1956,13 +1949,22 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
     mdl->update_observables(y_ptr);
     mdl->evaluate_functions(static_cast<double>(t));
 
-    // GH #106: refresh the live rateOf buffer (and re-evaluate functions
-    // with live dx/dt) so triggers reading rateOf(species) — directly or
-    // via a rateOf-bearing function — see the derivative at this (t, y).
-    // No-op for non-rateOf models. compute_derivs publishes current_derivs
-    // as a side effect; rateof_root_scratch absorbs the returned RHS.
+    // GH #106: refresh the live rateOf buffer, and re-evaluate the functions
+    // against it, so triggers reading rateOf(species) — directly or via a
+    // rateOf-bearing function — see the derivative at this (t, y). No-op for
+    // non-rateOf models.
+    //
+    // As deep as anything reads rateOf (rateof_nesting), as every other read
+    // of a trigger is. This took the buffer from compute_derivs, which probes
+    // only as deep as the derivatives read rateOf (rateof_flow_nesting), and a
+    // trigger can read deeper: at (rateOf(X0) > 0.3) with X0' = rateOf(X3)
+    // reads a rateOf whose own rate is a rateOf, which no derivative does. One
+    // probe short, it read X0's rate off whatever the buffer held before, and
+    // a smooth crossing was missed or found late (issue #991). Where the two
+    // depths agree, it is as many probes as before.
     if (mdl->uses_rateof()) {
-        mdl->compute_derivs(static_cast<double>(t), y_ptr, data->rateof_root_scratch.data());
+        mdl->refresh_rateof_derivs(static_cast<double>(t), y_ptr);
+        mdl->evaluate_functions(static_cast<double>(t));
     }
 
     auto &eval = mdl->evaluator();
@@ -3842,13 +3844,6 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     cvode_mem = CvodeMemGuard(CVodeCreate(CV_BDF, ctx));
     if (!cvode_mem) {
         throw std::runtime_error("CVodeCreate failed");
-    }
-
-    // GH #106: size the rateOf probe scratch the event root function writes into
-    // (only models that reference rateOf run that probe). Sized here, on the
-    // cold/events path that owns the root function; the warm path has no roots.
-    if (model.uses_rateof()) {
-        user_data.rateof_root_scratch.assign(model.n_species(), 0.0);
     }
 
     // ─── Codegen RHS loading ────────────────────────────────────────────────
@@ -13045,8 +13040,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // reading rateOf(species) sees the zero-initialized current_derivs
             // and can spuriously fire at t=0 (e.g. `rateOf(A) > -1` would be
             // 0 > -1 = true before the first derivative is ever computed).
+            // As deep as a trigger reads rateOf, as in the root function (issue
+            // #991): one probe short, `at (rateOf(S) > 0.5)` with S' = rateOf(A)
+            // and A' = 0 read A's rate where the search for a unit-rate clock
+            // had last evaluated the right-hand side, every species 1 higher,
+            // and fired at t = 0.
             if (model.uses_rateof()) {
-                model.compute_derivs(times.t_start, y_data, user_data.rateof_root_scratch.data());
+                model.refresh_rateof_derivs(times.t_start, y_data);
+                model.evaluate_functions(times.t_start);
             }
             // A carried execution of a non-persistent event whose trigger is
             // false here (an intervention between the legs made it so) is
@@ -13097,8 +13098,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 model.update_observables(y_data);
                 model.evaluate_functions(times.t_start);
                 if (model.uses_rateof()) {
-                    model.compute_derivs(times.t_start, y_data,
-                                         user_data.rateof_root_scratch.data());
+                    model.refresh_rateof_derivs(times.t_start, y_data);
+                    model.evaluate_functions(times.t_start);
                 }
                 // Re-evaluate trigger_was_true against post-fire state so
                 // any event that falsified its own trigger can re-arm.
