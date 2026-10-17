@@ -11,8 +11,9 @@ has no such times, and is refused, as events are.
 ``A' = -f*A`` from ``A(0) = 100``. Its closed form is
 ``A = 100 exp(-0.1 t)`` up to ``t* = 1.37``, and ``A(t*) exp(-5 (t - t*))``
 after. Other shapes are checked against ``Simulator(method="ode")`` at
-``rtol=1e-12``. The error allowed is the size of diffrax's own on the same model
-with no switch (``f() = 0.1``): 5.6e-5 at ``rtol=1e-8``.
+``rtol=1e-12``. The error allowed, 1e-4 at ``rtol=1e-8``, is about twice
+diffrax's own on the model with no switch (``f() = 0.1``, 4.3e-5). Stepped
+across, the counter clock's switch gave 1.6e-4.
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ SHAPES = {
 @pytest.mark.parametrize("f", list(SHAPES.values()), ids=list(SHAPES))
 def test_each_shape_of_switch_matches_the_ode_path(tmp_path, f) -> None:
     a, _ = _diffrax(_model(tmp_path, f))
-    assert np.abs(a - _ode(_model(tmp_path, f))).max() < 2e-4
+    assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
 
 
 def test_a_switch_time_moved_by_param_dict(tmp_path) -> None:
@@ -116,7 +117,7 @@ def test_a_switch_time_moved_by_param_dict(tmp_path) -> None:
     # the caller's model keeps its own.
     model = _model(tmp_path, "if(time()>tsw,5,0.1)")
     a, _ = _diffrax(model, param_dict={"tsw": 2.0})
-    assert np.abs(a - _closed_form(TS, t_switch=2.0)).max() < 2e-4
+    assert np.abs(a - _closed_form(TS, t_switch=2.0)).max() < 1e-4
     assert model._core.get_param("tsw") == 1.37
 
 
@@ -133,3 +134,48 @@ def test_a_condition_past_the_budget_of_stops_is_refused(tmp_path) -> None:
     omega = np.pi * (_RUN_STOP_BUDGET + 50) / 3.0
     with pytest.raises(ValueError, match="cannot stop at every switch"):
         _diffrax(_model(tmp_path, f"if(sin({omega:.6f}*time())>0,5,0.1)"))
+
+
+@pytest.mark.parametrize(
+    "f", ["if(time()>1.37,5,0.1)", "if(Cobs>1.37,5,0.1)"], ids=["time", "counter"]
+)
+def test_a_run_before_this_one_does_not_move_its_switches(tmp_path, f) -> None:
+    # run_diffrax starts from the initial state, and a counter clock's crossing
+    # was placed from the counter's present value: after an ODE run on the same
+    # model it found none and stepped across the switch.
+    model = _model(tmp_path, f)
+    bngsim.Simulator(model, method="ode").run(t_span=(0.0, 3.0), n_points=4)
+    a, _ = _diffrax(model)
+    np.testing.assert_array_equal(a, _diffrax(_model(tmp_path, f))[0])
+
+
+def test_a_run_backward_with_no_switch(tmp_path) -> None:
+    # A(3) = 100 run back to t = 0: A = 100 exp(-0.1 (t - 3)).
+    r = run_diffrax(
+        _model(tmp_path, "0.1"), t_start=3.0, t_end=0.0, n_points=7, rtol=1e-10, atol=1e-12
+    )
+    # It returned np.empty's contents at every point but t_end.
+    np.testing.assert_allclose(
+        r["species"][:, 0], 100.0 * np.exp(-0.1 * (r["time"] - 3.0)), rtol=1e-6
+    )
+
+
+def test_a_run_backward_over_a_switch_is_refused(tmp_path) -> None:
+    with pytest.raises(ValueError, match="backward"):
+        run_diffrax(_model(tmp_path, "if(time()>1.37,5,0.1)"), t_start=3.0, t_end=0.0)
+
+
+def test_a_reporting_function_past_the_budget_is_not_refused(tmp_path) -> None:
+    # A condition no rate law reads is no reason to refuse the run, as on the
+    # ODE path; the species are those of the model without it.
+    from bngsim._switch_sensitivity import _RUN_STOP_BUDGET
+
+    omega = np.pi * (_RUN_STOP_BUDGET + 50) / 3.0
+    path = tmp_path / "m.net"
+    path.write_text(
+        _NET.format(f="0.1").replace(
+            "    1 f() 0.1\n", f"    1 f() 0.1\n    2 g() if(sin({omega:.6f}*time())>0,1,0)\n"
+        )
+    )
+    a, _ = _diffrax(bngsim.Model.from_net(str(path)))
+    np.testing.assert_array_equal(a, _diffrax(_model(tmp_path, "0.1"))[0])
