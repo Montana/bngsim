@@ -155,7 +155,7 @@ def test_a_run_backward_with_no_switch(tmp_path) -> None:
     r = run_diffrax(
         _model(tmp_path, "0.1"), t_start=3.0, t_end=0.0, n_points=7, rtol=1e-10, atol=1e-12
     )
-    # It returned np.empty's contents at every point but t_end.
+    # A draft of the split returned np.empty's contents at every point but t_end.
     np.testing.assert_allclose(
         r["species"][:, 0], 100.0 * np.exp(-0.1 * (r["time"] - 3.0)), rtol=1e-6
     )
@@ -215,11 +215,14 @@ NARROW = {
 
 @pytest.mark.parametrize("f", list(NARROW.values()), ids=list(NARROW))
 def test_a_narrow_piece(tmp_path, f) -> None:
-    # The implicit solvers' Newton iteration read roundoff on so short a piece
-    # as divergence, and turned its steps down until they ran out; main and the
-    # ODE path complete. Such a piece is solved again explicitly.
-    a, _ = _diffrax(_model(tmp_path, f))
+    # Kvaerno3's Newton iteration read roundoff on so short a piece as
+    # divergence, and turned its steps down until they ran out; main and the
+    # ODE path complete. Such a piece is solved again explicitly, after a failed
+    # attempt cut short by a least step (it ran to max_steps, 100000, first).
+    # The pulse is solved by Kvaerno3, and guards the case.
+    a, n_steps = _diffrax(_model(tmp_path, f))
     assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
+    assert n_steps < 2000
 
 
 def test_a_counter_clock_restarts_past_its_threshold(tmp_path) -> None:
@@ -244,3 +247,32 @@ def test_a_condition_only_an_output_reads_does_not_split_the_run(tmp_path) -> No
     b, m_steps = _diffrax(_model(tmp_path, "0.1"))
     np.testing.assert_array_equal(a, b)
     assert n_steps == m_steps
+
+
+def test_crossings_a_float_apart_are_one_switch(tmp_path) -> None:
+    # Two crossings a float apart made a piece that ran backward, and two
+    # floats apart one of no width; within the ODE path's one instant they are
+    # one switch, the piece before ending short of the first and the one after
+    # beginning past the second.
+    from bngsim._diffrax_solver import _switch_times
+
+    f = "if(time()>1.37,5,0.1)+if(time()>1.3700000000000003,-4,0)"
+    # diffrax happened to integrate the backward piece; what it is handed is
+    # pinned here, its answer below.
+    assert _switch_times(_model(tmp_path, f), 0.0, 3.0) == [(1.37, 1.3700000000000003, ())]
+    a, _ = _diffrax(_model(tmp_path, f))
+    assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
+
+
+def test_a_condition_on_two_counters_is_refused(tmp_path) -> None:
+    # No resolver places it, and the resolvers passed it over: the run stepped
+    # across it, which is the issue again.
+    net = (
+        _NET_COUNTER.replace("    2 C() 0\n", "    2 C() 0\n    3 D() 0.5\n")
+        .replace("    2 0 2 k\n", "    2 0 2 k\n    3 0 3 k\n")
+        .replace("    2 Cobs 2\n", "    2 Cobs 2\n    3 Dobs 3\n")
+    )
+    path = tmp_path / "m.net"
+    path.write_text(net.format(f="if(Cobs+Dobs>2.0,5,0.1)"))
+    with pytest.raises(ValueError, match="cannot place the times these conditions switch at"):
+        _diffrax(bngsim.Model.from_net(str(path)))
