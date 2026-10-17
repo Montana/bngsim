@@ -84,3 +84,24 @@ python scripts/local_ci.py wheel --python 3.12
 
 `scripts/local_ci_smoke.py` is the quicker variant, and
 `scripts/local_ci_linux_docker.sh` runs the Linux leg in a container.
+
+## Contributors
+
+bngsim is developed at Los Alamos National Laboratory by William S. Hlavacek.
+Everyone whose code has merged is named in
+[`CONTRIBUTORS.md`](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTORS.md),
+which gains a line when a first contribution merges. The
+[Credit](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTING.md#credit)
+section of `CONTRIBUTING.md` says how a name is chosen and how to have it
+changed.
+
+To contribute, open a pull request against `main`. What it needs, from tests to
+a changelog fragment, is under
+[Before opening a PR](https://github.com/lanl/bngsim/blob/HEAD/CONTRIBUTING.md#before-opening-a-pr)
+in `CONTRIBUTING.md`, not on this page.
+
+The third-party software bngsim redistributes, the engines vendored under
+`third_party/` among it, is listed with its license terms in
+[`NOTICE`](https://github.com/lanl/bngsim/blob/HEAD/NOTICE). The tools it was
+developed and validated against are cited in
+[`ACKNOWLEDGMENTS.md`](https://github.com/lanl/bngsim/blob/HEAD/ACKNOWLEDGMENTS.md).
