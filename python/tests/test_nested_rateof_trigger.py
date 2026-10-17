@@ -70,8 +70,9 @@ def _run(text: str, codegen: bool, sample_times: list[float]):
     ids=["rateOf-of-a-rateOf", "through-a-rule", "one-deep", "no-rateOf"],
 )
 def test_every_spelling_fires_where_the_rate_crosses(trigger, codegen):
-    """The first two never fired; the last two are the same crossing read
-    one level up and with no rateOf at all."""
+    """The first two never fired on the interpreted right-hand side, and on
+    the compiled one fired at the next sample time, 0.46. The last two are the
+    same crossing read one level up and with no rateOf at all."""
     last, result = _run(
         CROSSING.replace("TRIGGER", trigger), codegen, [0, 0.2, 0.3, 0.44, 0.46, 0.6, 1.0]
     )
@@ -119,9 +120,9 @@ G: at (time >= 0.25): D = 1;
 )
 def test_a_chain_three_deep_fires_where_the_rate_crosses(trigger, codegen):
     """The first never fired on the interpreted right-hand side and fired at
-    0.59 on the compiled one. A crossing in mid-run is found by the root
-    function alone; where an event's write opens the trigger at a stop
-    (D = 1 with B' = D), the stop already read it at full depth."""
+    0.59 on the compiled one. The crossing is in mid-run, where only the root
+    function reads the trigger; one that an event's write opens at a stop was
+    already read at full depth there."""
     last, result = _run(CHAIN.replace("TRIGGER", trigger), codegen, [0, 0.2, 0.3, 0.5, 0.6, 1.0])
     assert last["fired"] == 1.0
     assert last["tf"] == pytest.approx(0.55, abs=1e-6)
