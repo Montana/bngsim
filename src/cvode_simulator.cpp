@@ -8961,7 +8961,8 @@ bool CvodeSimulator::Impl::carry_across_stalled_state_switch(
     struct Stalled {
         const NetworkModel::StateSwitch *sw;
         double dir;   // the sign the residual takes on the far side
-        double size;  // |g|, how far short of the surface it is
+        double size;  // how far short of the surface it is: |g|, or 0 past it
+                      // by rounding (issue #963)
         double reach; // the few ulp, in the residual's units
         // Each species' move per unit of residual, over sw->species: its own
         // ulp over the residual's, toward the side that raises the residual.
@@ -8996,10 +8997,21 @@ bool CvodeSimulator::Impl::carry_across_stalled_state_switch(
             carried += gx[uj] * f0[uj];
         }
         const double reach = kStalledSwitchUlps * ulp;
+        // "Past" by less than an ulp of the residual is rounding, not a side
+        // (issue #963). The residual and the condition are two expressions, and
+        // they need not round alike: where the compiler fuses `A*A - thr*thr`
+        // into one multiply-add (arm64), `(Aobs^2)-(thr^2)` reads +5.75e-17
+        // with A held on thr, an eighth of its ulp, while `Aobs^2 > thr^2`
+        // reads false. The state was taken as across and leaving, and stayed
+        // pinned until the run ended with the switch not taken. Put across from
+        // there, a state that is across moves the few ulp further the flow
+        // already takes it. That includes one a species ulp past, whose
+        // residual can read a hair under this ulp: unfused, A one ulp past thr
+        // reads 4.440892098500626e-16 for an ulp of 4.440892320545232e-16.
         const bool pinned = std::isfinite(g) && std::isfinite(flow) && std::isfinite(carried) &&
                             ulp > 0.0 && carried * flow > 0.0 && std::fabs(g) <= reach &&
-                            h * std::fabs(flow) <= reach      // or the steps still move it
-                            && !(g != 0.0 && g * flow > 0.0); // or it is past, and leaving
+                            h * std::fabs(flow) <= reach // or the steps still move it
+                            && !(std::fabs(g) >= ulp && g * flow > 0.0); // or past, and leaving
         if (!pinned) {
             since[k] = std::numeric_limits<double>::quiet_NaN();
             continue;
@@ -9012,10 +9024,13 @@ bool CvodeSimulator::Impl::carry_across_stalled_state_switch(
                 (*since_steps)[k] = steps_now;
             }
         }
-        if (!(std::fabs(flow) * (t - since[k]) >= std::fabs(g) + reach)) {
+        // A residual past zero by rounding is on the surface: the distances
+        // below, and where the flow is read back from, start there.
+        const double short_by = g * flow < 0.0 ? std::fabs(g) : 0.0;
+        if (!(std::fabs(flow) * (t - since[k]) >= short_by + reach)) {
             continue; // the flow would not have brought it across yet
         }
-        Stalled one{sw, flow > 0.0 ? 1.0 : -1.0, std::fabs(g), reach, {}};
+        Stalled one{sw, flow > 0.0 ? 1.0 : -1.0, short_by, reach, {}};
         for (int j : sw->species) {
             const auto uj = static_cast<std::size_t>(j);
             const double size = std::fabs(x[uj]);
