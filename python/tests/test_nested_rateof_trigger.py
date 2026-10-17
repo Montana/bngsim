@@ -3,10 +3,11 @@
 The right-hand side probes the rateOf buffer as deep as the derivatives read
 it (``rateof_flow_nesting``). A trigger can read one level deeper: at
 ``rateOf(X0) > 0.3`` with ``X0' = rateOf(X3)`` reads a rateOf whose own rate is
-a rateOf, which no derivative does. The root function took its buffer from the
-right-hand side, one probe short, so the trigger read X0's rate off the probe
-before. It never fired at a smooth crossing, and fired at t = 0 on another
-species' rate. The trajectory itself was right throughout.
+a rateOf, which no derivative does. The root function, and the trigger reads at
+the start, took the buffer from the right-hand side, one probe short, so the
+trigger read X0's rate off whatever the buffer held before. It never fired at a
+smooth crossing, and fired at t = 0 on a rate left there by a probe at another
+state. The trajectory itself was right throughout.
 
 Every expected value is a closed form.
 """
@@ -39,7 +40,11 @@ G: at (time >= aG): X5 = 1;
 """
 
 # B is 0 for good, so A, S and rateOf(S) are 0 at every time: E0 never fires.
-# Y's rate is above the threshold, and is what the trigger read at t = 0.
+# Y' = 1 makes Y a candidate clock, and the run's search for clocks evaluates
+# the right-hand side once more with every species 1 higher
+# (unit_rate_clock_candidates). That left A's rate there, B + 1 = 1, in the
+# rateOf buffer, and the read at t = 0, one probe short, took it for rateOf(S).
+# Y' = 0.3 or 2 is no candidate, and E0 did not fire.
 AT_REST = """species S = 0, A = 0, B = 0, Y = 0;
 S' = rateOf(A); A' = B; B' = 0; Y' = 1;
 fired = 0; tf = -1;
@@ -77,8 +82,8 @@ def test_every_spelling_fires_where_the_rate_crosses(trigger, codegen):
 
 
 @ENGINES
-def test_a_rate_identically_zero_does_not_fire_on_another_species_rate(codegen):
-    """It fired at t = 0 for Y' = 1, and not for Y' = 0.3."""
+def test_a_rate_identically_zero_does_not_fire_at_the_start(codegen):
+    """It fired at t = 0 on the rate the search for clocks left behind."""
     last, _ = _run(AT_REST, codegen, [0, 0.1, 0.2, 0.3, 0.5, 1.0])
     assert last["fired"] == 0.0
 
@@ -94,16 +99,31 @@ def test_the_rate_rising_later_fires_once_where_it_rises(codegen):
     assert last["tf"] == pytest.approx(0.25, abs=1e-9)
 
 
-@ENGINES
-def test_a_chain_three_deep(codegen):
-    """S' = rateOf(A), A' = rateOf(B), B' = D, and D = 1 from t = 0.25:
-    rateOf(S) = 1 from there."""
-    text = """species S = 0, A = 0, B = 0, D = 0;
-S' = rateOf(A); A' = rateOf(B); B' = D; D' = 0;
+# Three deep: S' = rateOf(A), A' = rateOf(B), B' = C, C' = D, and G sets D = 1
+# at t = 0.25. Then C = t - 0.25 and rateOf(S) = rateOf(A) = rateOf(B) = C,
+# which passes 0.3 at t = 0.55, and S(1) = 0.75^2 / 2. A derivative reads
+# rateOf(A) two deep; the trigger reads rateOf(S) three deep.
+CHAIN = """species S = 0, A = 0, B = 0, C = 0, D = 0;
+S' = rateOf(A); A' = rateOf(B); B' = C; C' = D; D' = 0;
 fired = 0; tf = -1;
-E0: at (rateOf(S) > 0.5), t0=false: fired = fired + 1, tf = time;
+E0: at (TRIGGER), t0=false: fired = fired + 1, tf = time;
 G: at (time >= 0.25): D = 1;
 """
-    last, _ = _run(text, codegen, [0, 0.1, 0.2, 0.3, 0.5, 1.0])
+
+
+@ENGINES
+@pytest.mark.parametrize(
+    "trigger",
+    ["rateOf(S) > 0.3", "rateOf(A) > 0.3", "C > 0.3"],
+    ids=["three-deep", "two-deep", "no-rateOf"],
+)
+def test_a_chain_three_deep_fires_where_the_rate_crosses(trigger, codegen):
+    """The first never fired on the interpreted right-hand side and fired at
+    0.59 on the compiled one. A crossing in mid-run is found by the root
+    function alone; where an event's write opens the trigger at a stop
+    (D = 1 with B' = D), the stop already read it at full depth."""
+    last, result = _run(CHAIN.replace("TRIGGER", trigger), codegen, [0, 0.2, 0.3, 0.5, 0.6, 1.0])
     assert last["fired"] == 1.0
-    assert last["tf"] == pytest.approx(0.25, abs=1e-9)
+    assert last["tf"] == pytest.approx(0.55, abs=1e-6)
+    s = np.asarray(result.species)[-1, list(result.species_names).index("S")]
+    assert s == pytest.approx(0.75**2 / 2, rel=1e-6)

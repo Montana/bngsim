@@ -1966,9 +1966,9 @@ static int cvode_event_root_fn_body(sunrealtype t, N_Vector y, sunrealtype *gout
     // (rateof_flow_nesting), and a trigger can read one level deeper: at
     // (rateOf(X0) > 0.3) with X0' = rateOf(X3) reads a rateOf whose own rate
     // is a rateOf, which no derivative does. One probe short, it read X0's
-    // rate off the probe before, and never fired at a smooth crossing, or
-    // fired at t = 0 on another species' rate (issue #991). The full depth
-    // first, where it is deeper; a probe from an exact buffer leaves it exact.
+    // rate off whatever the buffer held before, and never fired at a smooth
+    // crossing (issue #991). The full depth first, where it is deeper; a probe
+    // from an exact buffer leaves it exact.
     if (mdl->uses_rateof()) {
         if (mdl->rateof_nesting() > mdl->rateof_flow_nesting()) {
             mdl->refresh_rateof_derivs(static_cast<double>(t), y_ptr);
@@ -13056,7 +13056,11 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // reading rateOf(species) sees the zero-initialized current_derivs
             // and can spuriously fire at t=0 (e.g. `rateOf(A) > -1` would be
             // 0 > -1 = true before the first derivative is ever computed).
-            // (As deep as a trigger reads rateOf, as in the root function: issue #991.)
+            // As deep as a trigger reads rateOf, as in the root function (issue
+            // #991): one probe short, `at (rateOf(S) > 0.5)` with S' = rateOf(A)
+            // and A' = 0 read A's rate where the search for a unit-rate clock
+            // had last evaluated the right-hand side, every species 1 higher,
+            // and fired at t = 0.
             if (model.uses_rateof()) {
                 if (model.rateof_nesting() > model.rateof_flow_nesting()) {
                     model.refresh_rateof_derivs(times.t_start, y_data);
@@ -13111,6 +13115,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 // see the post-event values.
                 model.update_observables(y_data);
                 model.evaluate_functions(times.t_start);
+                // (The batch has refreshed at full depth after each execution,
+                // so the buffer is exact already; this keeps the read right
+                // without leaning on that.)
                 if (model.uses_rateof()) {
                     if (model.rateof_nesting() > model.rateof_flow_nesting()) {
                         model.refresh_rateof_derivs(times.t_start, y_data);
