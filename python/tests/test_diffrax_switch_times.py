@@ -84,7 +84,7 @@ def _closed_form(t, t_switch=1.37):
     )
 
 
-@pytest.mark.parametrize("rtol, allowed", [(1e-6, 2.5e-3), (1e-8, 2e-4), (1e-10, 1e-5)])
+@pytest.mark.parametrize("rtol, allowed", [(1e-6, 2.5e-3), (1e-8, 1e-4), (1e-10, 1e-7)])
 def test_the_issues_switch(tmp_path, rtol, allowed) -> None:
     # Before: 3.4e-3 in 114 steps at rtol=1e-6 (CVODE 7.5e-4), and "The
     # maximum number of solver steps was reached" at 1e-8 and 1e-10.
@@ -142,7 +142,8 @@ def test_a_condition_past_the_budget_of_stops_is_refused(tmp_path) -> None:
 def test_a_run_before_this_one_does_not_move_its_switches(tmp_path, f) -> None:
     # run_diffrax starts from the initial state, and a counter clock's crossing
     # was placed from the counter's present value: after an ODE run on the same
-    # model it found none and stepped across the switch.
+    # model it found none and stepped across the switch. (A switch on time()
+    # reads no state, and is the control.)
     model = _model(tmp_path, f)
     bngsim.Simulator(model, method="ode").run(t_span=(0.0, 3.0), n_points=4)
     a, _ = _diffrax(model)
@@ -179,3 +180,27 @@ def test_a_reporting_function_past_the_budget_is_not_refused(tmp_path) -> None:
     )
     a, _ = _diffrax(bngsim.Model.from_net(str(path)))
     np.testing.assert_array_equal(a, _diffrax(_model(tmp_path, "0.1"))[0])
+
+
+def test_a_rate_law_that_moves_with_time_and_no_switch(tmp_path) -> None:
+    # Reading the time clamped to the piece froze this rate in the run's last
+    # step, where Kvaerno5 reads a stage past the step's end: 2.8e-8 at t = 3,
+    # four times rtol, where main had 3.7e-10. A = 100 exp(-F) with
+    # F = 0.1 t + 0.01 (1 - cos(10 t)).
+    a, _ = _diffrax(_model(tmp_path, "0.1+0.1*sin(10*time())"), rtol=1e-10)
+    exact = 100.0 * np.exp(-(0.1 * TS + 0.01 * (1.0 - np.cos(10.0 * TS))))
+    assert abs(a[-1] - exact[-1]) < 1e-10 * exact[-1]
+
+
+def test_a_switch_on_a_rate_law_that_moves_with_time(tmp_path) -> None:
+    # f = r (1 + 0.5 sin(10 t)), r = 0.1 up to 1.37 and 5 after: the piece
+    # before the switch keeps the rate's time dependence to its end (2.2e-7
+    # with the time clamped, at rtol=1e-10).
+    a, _ = _diffrax(_model(tmp_path, "if(time()>1.37,5,0.1)*(1+0.5*sin(10*time()))"), rtol=1e-10)
+
+    def g(t):
+        return t - 0.05 * np.cos(10.0 * t)
+
+    s = 1.37
+    f_int = np.where(s >= TS, 0.1 * (g(TS) - g(0.0)), 0.1 * (g(s) - g(0.0)) + 5.0 * (g(TS) - g(s)))
+    assert np.abs(a - 100.0 * np.exp(-f_int)).max() < 1e-7

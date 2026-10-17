@@ -5,7 +5,8 @@ adaptive stepper are all JIT-compiled into a single fused computation.
 No Python↔C++ boundary crossings during the solve.
 
 Uses Kvaerno5 (5th-order implicit Runge-Kutta, L-stable) for stiff
-biochemical systems, with PID step size control.
+biochemical systems, with PID step size control; up to a switch on the clock,
+Kvaerno3 (see below).
 
 The RHS, the parameter values and the initial state all come from the built
 model (issue #803 step 4). They used to be re-read from the ``.net`` text by
@@ -14,7 +15,8 @@ species, a model without observables crashed, and an initial concentration
 written as an expression was looked up as a parameter name.
 
 A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there,
-and the run is split at each such time and restarted just past it (issue #865):
+and the run is split at each such time and restarted just past it (issue #865),
+each piece before one solved with Kvaerno3, whose stages stay within its step:
 stepped across, a jump cost several times CVODE's error, and at a tight
 tolerance the whole step budget. A switch on the model's state, whose times are
 not known before the run, is refused, as events are.
@@ -164,40 +166,46 @@ def run_diffrax(
     ts = jnp.linspace(t_start, t_end, n_points)
     out_ts = np.asarray(ts)
 
-    solver = diffrax.Kvaerno5()
     stepsize_controller = diffrax.PIDController(rtol=rtol, atol=atol)
+    term = diffrax.ODETerm(lambda t, y, args: rhs(y, t, args))
 
-    # Issue #865. The run is split at the times its rate laws switch at (_switch_times): each
-    # piece ends at the float just before a switch, and the next begins at the float just after
-    # it, so no step is taken across the jump (to within the few floats a crossing the engine
-    # scans is placed to). diffrax also reads the vector field at trial times past the end of
-    # the interval it solves over (to 1.43 on [0, 1.37), at rtol=1e-6), and a switch just past
-    # the end turned every step near it down until the steps ran out, both for a piece ending
-    # there and for diffrax's own jump_ts. So within a piece the right-hand side is read at the
-    # time clamped to the piece, which keeps a switch on the clock on the piece's own branch.
-    # (A counter clock's branch is read from the state, which the clamp does not hold, so near
-    # a piece's end such a step can still be turned down; it costs steps, not accuracy.) One
-    # compiled solve serves every piece: its bounds, start state and output times are
-    # arguments, the output times padded with the piece's end, the last of which is the state
-    # the next piece starts from.
-    @jax.jit
-    def _solve(a, b, y_a, seg_ts, params):
-        def piece_rhs(t, y, args):
-            return rhs(y, jnp.clip(t, jnp.minimum(a, b), jnp.maximum(a, b)), args)
+    # Issue #865. The run is split at the times its rate laws switch at
+    # (_switch_times): each piece ends at the float just before a switch, and the
+    # next begins at the float just after it, so that no step is taken across the
+    # jump (to within the few floats a crossing the engine scans is placed to).
+    # Kvaerno5 reads its second stage at 1.23 steps, past the end of the step,
+    # and in a piece's last step that is past the switch: a step that ends just
+    # before one read the other branch, and was turned down until the steps ran
+    # out. That held for diffrax's own jump_ts as well. So a piece that ends at a
+    # switch is solved with Kvaerno3, whose stages all lie within its step
+    # (c <= 1), and the last piece, and a run with no switch, with Kvaerno5 as
+    # before. Reading the time clamped to the piece instead kept the branch, but
+    # froze the rate laws' smooth dependence on the time in each last step, past
+    # the tolerance, which the error estimate does not see. One compiled solve per
+    # solver serves every piece: its bounds, start state and output times are
+    # arguments, the output times padded with the piece's end, the last of which
+    # is the state the next piece starts from.
+    def _compiled(solver):
+        @jax.jit
+        def _solve(a, b, y_a, seg_ts, params):
+            sol = diffrax.diffeqsolve(
+                term,
+                solver,
+                t0=a,
+                t1=b,
+                dt0=jnp.minimum((b - a) / 100.0, 0.01),
+                y0=y_a,
+                args=params,
+                saveat=diffrax.SaveAt(ts=seg_ts),
+                stepsize_controller=stepsize_controller,
+                max_steps=max_steps,
+            )
+            return sol.ys, sol.stats["num_steps"]
 
-        sol = diffrax.diffeqsolve(
-            diffrax.ODETerm(piece_rhs),
-            solver,
-            t0=a,
-            t1=b,
-            dt0=jnp.minimum((b - a) / 100.0, 0.01),
-            y0=y_a,
-            args=params,
-            saveat=diffrax.SaveAt(ts=seg_ts),
-            stepsize_controller=stepsize_controller,
-            max_steps=max_steps,
-        )
-        return sol.ys, sol.stats["num_steps"]
+        return _solve
+
+    solve_last = _compiled(diffrax.Kvaerno5())
+    solve_to_a_switch = _compiled(diffrax.Kvaerno3())  # compiled on first use only
 
     edges = [float(t_start), *switch_ts, float(t_end)]
     species_out = np.empty((n_points, len(sp_names)), dtype=np.float64)
@@ -216,7 +224,8 @@ def run_diffrax(
             mine = np.flatnonzero((out_ts <= edges[i + 1]) & ((out_ts > edges[i]) | (i == 0)))
         seg_ts = np.full(n_points + 1, b)
         seg_ts[: mine.size] = np.clip(out_ts[mine], min(a, b), max(a, b))
-        ys, n = _solve(
+        solve = solve_last if i == len(edges) - 2 else solve_to_a_switch
+        ys, n = solve(
             jnp.float64(a), jnp.float64(b), y_a, jnp.asarray(seg_ts, dtype=jnp.float64), params
         )
         ys = np.asarray(ys)
@@ -233,8 +242,10 @@ def run_diffrax(
 
 
 def _switch_times(model, t_start: float, t_end: float) -> list[float]:
-    """The instants in ``(t_start, t_end)`` at which a rate law of *model* switches
-    on the clock, which run_diffrax splits the run at (issue #865).
+    """The instants in ``(t_start, t_end)`` at which a condition of *model*'s
+    functions switches on the clock, which run_diffrax splits the run at (issue
+    #865). A condition only a reporting function reads costs a split, which is
+    harmless, as the ODE path stops there too.
 
     A condition on the clock, ``if(time() > 1.37, 5, 0.1)``, is a jump in the
     right-hand side, and the step-size controller stepped across it: several
@@ -282,7 +293,7 @@ def _switch_times(model, t_start: float, t_end: float) -> list[float]:
     if Simulator._switches_the_run(model, over_budget):
         raise ValueError(
             "run_diffrax cannot stop at every switch of this model: "
-            f"{len(over_budget)} condition(s) switch more often than a run allows; "
-            "use Simulator(method='ode')."
+            f"{len(over_budget)} condition(s) switch more often than a run may stop, or "
+            "too irregularly to count; use Simulator(method='ode')."
         )
     return sorted({float(c.time) for c in (*crossings, *periodic_at) if t_start < c.time < t_end})
