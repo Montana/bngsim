@@ -113,8 +113,11 @@ to `tfun()` chooses something else:
 | `tfun('file.tfun', A_tot)` | the observable `A_tot` |
 | `tfun('file.tfun', time, method=>"step")` | `time`, piecewise-constant |
 | `tfun([0,1,2], [0,10,20], time)` | `time`, with inline data and no file |
+| `tfun('file.tfun', h)` | the function `h` |
 
-The index is evaluated at each step, and the table function returns the
+The index may also be written as a call, `A_tot()` or `time()`, as BioNetGen
+writes it into the `.net` when the model does; it names the same thing. The
+index is evaluated at each step, and the table function returns the
 interpolated value there.
 
 ### Breakpoints and the integrator
