@@ -4482,6 +4482,16 @@ def _resolve_opt_flag(compiler_name: str, source_size: int, chunked: bool = Fals
     return low if source_size > _CODEGEN_BIG_SOURCE_BYTES else high
 
 
+#: GCC and Clang compile the generated C without floating-point contraction
+#: (issue #963), as bngsim compiles ExprTk (``BNGSIM_EXPRTK_COMPILE_OPTIONS`` in
+#: CMakeLists.txt). A rate law's condition evaluated here and its state switch's
+#: residual evaluated by ExprTk then round alike, on every platform: fused on
+#: arm64, ``A*k + c > thr`` here and ``((A*k)+c)-(thr)`` there need not agree on
+#: which side of the surface A is. Editing this module moves the cache key, so
+#: no fused library is reused.
+_FP_CONTRACT_OFF = "-ffp-contract=off"
+
+
 def _build_compile_cmd(c_path: Path, so_path: Path, opt_flag: str) -> list[str]:
     """Build the platform-specific compile command.
 
@@ -4516,6 +4526,7 @@ def _build_compile_cmd(c_path: Path, so_path: Path, opt_flag: str) -> list[str]:
         # GCC / Clang (Unix): cc <opt> -shared -fPIC -o <output> <input> -lm
         return compiler + [
             opt_flag,
+            _FP_CONTRACT_OFF,
             "-shared",
             "-fPIC",
             "-o",
@@ -4905,7 +4916,7 @@ def _compile_one_object(
     using relative names, then normalize the object's mtime. Relative names +
     fixed mtimes keep the linked .so reproducible (the linker would otherwise
     embed absolute input paths and per-build timestamps). Raises on failure."""
-    cmd = compiler + [opt_flag, "-fPIC", "-c", "-o", o_name, c_name]
+    cmd = compiler + [opt_flag, _FP_CONTRACT_OFF, "-fPIC", "-c", "-o", o_name, c_name]
     result = _run_compile(cmd, cwd=work, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"Codegen shard compilation failed ({c_name}):\n{result.stderr}")

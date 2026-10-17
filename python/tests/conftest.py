@@ -320,6 +320,13 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
     ),
     ("tomllib is 3.11+", _ANYWHERE, "stdlib module absent on 3.10, which is still supported"),
     ("gcc/clang only", _ANYWHERE, "the sharded compile path; MSVC takes the other branch"),
+    (
+        "no fused multiply-add",
+        _ANYWHERE,
+        "test_switch_residual_unfused.py shows codegen's C unfused against a build "
+        "that would fuse; an x86-64 core without FMA (before Haswell, or under "
+        "Rosetta) cannot fuse, so there is nothing to show. Every CI runner has one",
+    ),
     # Source-tree vs installed-wheel context.
     ("installed wheel", _ANYWHERE, "source-tree-only guard, correctly inert against a wheel"),
     ("source root", _ANYWHERE, "version-consistency check needs the source tree"),
