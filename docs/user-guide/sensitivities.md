@@ -316,10 +316,18 @@ is, its tolerance over its rate, and a pinned run spends a batch of
 threshold, with both branches pointing into it, is not moved, and neither is
 one that comes to rest just short of it.
 
-Issue #904 lists what this does not yet cover:
-- a comparison used as a number outside `if()`, such as `k*(X > 1)`;
-- a single comparison whose residual turns back within one step, such as
-  `abs(X - 5) < 0.01`;
+A comparison used as a number outside `if()`, such as `k*(X > 1)`, is rooted
+the same way in a run without sensitivities; a sensitivity run refuses it. A
+window written as one comparison, `abs(X - 5) < 0.01` or
+`(X - 5)^2 < 0.0001`, has a residual that falls to zero and comes back up as X
+passes 5, so a root on it sees one sign at both ends of the step that holds the
+window. Such a comparison is rooted at its two edges instead, `X - 5` against
+`0.01` and `-0.01`, and a sensitivity run jumps a square there (`abs()` has no
+analytic derivative, so a sensitivity run refuses it). Issue #904 lists what
+this does not yet cover:
+- a square compared with a bound that is not a number, such as
+  `(X - 5)^2 < w`, which is still rooted whole;
+- an SBML event trigger written as one such comparison;
 - `steady_state()`.
 
 ### A rate that rises from zero at the crossing
