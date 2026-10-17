@@ -14,13 +14,12 @@ codegen's private parser: a synthesis reaction's rate was multiplied by the last
 species, a model without observables crashed, and an initial concentration
 written as an expression was looked up as a parameter name.
 
-A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there,
-and the run is split at each such time and restarted just past it (issue #865),
-the last stretch before one solved with Kvaerno3, whose stages stay within its
-step:
-stepped across, a jump cost several times CVODE's error, and at a tight
-tolerance the whole step budget. A switch on the model's state, whose times are
-not known before the run, is refused, as events are.
+A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there.
+Stepped across, such a jump cost several times CVODE's error, and at a tight
+tolerance the whole step budget (issue #865). The run is split at each such time
+and restarted just past it, and the last stretch before a switch is solved with
+Kvaerno3, whose stages stay within its step. A switch on the model's state,
+whose times are not known before the run, is refused, as events are.
 
 Optional dependency: ``pip install diffrax``.
 """
@@ -224,7 +223,14 @@ def run_diffrax(
                 max_steps=max_steps,
                 throw=throw,
             )
-            return sol.ys, sol.stats["num_steps"], sol.result == diffrax.RESULTS.successful
+            # The least step is checked on the step proposed after one is
+            # accepted. A solve whose last accepted step lands on b, as short as a
+            # step clipped to b can be, comes back dt_min_reached with every
+            # point saved; one that stopped short of b leaves inf in sol.ts.
+            done = (sol.result == diffrax.RESULTS.successful) | (
+                (sol.result == diffrax.RESULTS.dt_min_reached) & (sol.ts[-1] == b)
+            )
+            return sol.ys, sol.stats["num_steps"], done
 
         return _solve
 

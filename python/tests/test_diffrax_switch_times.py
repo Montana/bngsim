@@ -219,11 +219,39 @@ NARROW = {
 def test_a_narrow_piece(tmp_path, f) -> None:
     # Kvaerno3's Newton iteration read roundoff on so short a piece as
     # divergence, and turned its steps down until they ran out; main and the
-    # ODE path complete. A stretch this short is solved with Tsit5, which has no
-    # Newton iteration; Kvaerno5 took 5642 steps over the pulse.
+    # ODE path complete. A stretch this short goes to Kvaerno3, and to Tsit5,
+    # which has no Newton iteration, where Kvaerno3 fails (1e-6 after the
+    # start); Kvaerno5 took 5642 steps over the pulse.
     a, n_steps = _diffrax(_model(tmp_path, f))
     assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
     assert n_steps < 2000
+
+
+NARROWER_THAN_THE_LEAST_STEP = {
+    "1e-12 at the start of [0, 1000]": ("if(time()>1e-12,0.001,0.1)", 1000.0),
+    "a pulse 1e-12 wide on [0, 1000]": (
+        "if(time()>1.37,0.003,0.001)+if(time()>1.370000000001,-0.002,0)",
+        1000.0,
+    ),
+    "1e-300 at the start of [0, 3]": ("if(time()>1e-300,5,0.1)", 3.0),
+}
+
+
+@pytest.mark.parametrize(
+    "f, t_end", list(NARROWER_THAN_THE_LEAST_STEP.values()), ids=list(NARROWER_THAN_THE_LEAST_STEP)
+)
+def test_a_piece_narrower_than_the_least_step(tmp_path, f, t_end) -> None:
+    # Such a piece is one step, accepted, but diffrax checks the least step on
+    # the step it proposes next, and flagged the solve as failed. Every solver
+    # failed it the same way, and the run was refused; main completes them.
+    # diffrax's own error on [0, 1000] with no switch is 3.5e-5.
+    r = run_diffrax(
+        _model(tmp_path, f), t_start=0.0, t_end=t_end, n_points=11, rtol=1e-8, atol=1e-10
+    )
+    ref = bngsim.Simulator(_model(tmp_path, f), method="ode").run(
+        t_span=(0.0, t_end), n_points=11, rtol=1e-12, atol=1e-14
+    )
+    assert np.abs(r["species"] - np.asarray(ref.species)).max() < 1e-4
 
 
 def test_a_counter_clock_restarts_past_its_threshold(tmp_path) -> None:
@@ -356,9 +384,9 @@ def _stiff(tmp_path, f, kf):
 )
 def test_a_narrow_stretch_of_a_stiff_model(tmp_path, f, kf, t_end, rtol) -> None:
     # A stretch is narrow against the run's span, so on [0, 100] one 0.05 long
-    # is, and the last 0.8% of the pulse's piece is. Solved with Tsit5, whose
-    # step stiffness binds, both ran past max_steps and were refused (main
-    # completes them, in 149 and 47740 steps); Kvaerno3 is tried first now.
+    # is, and the last 0.8% of the pulse's piece is. Solved with Tsit5 alone,
+    # whose step stiffness binds, both ran past max_steps and were refused (main
+    # completes them, in 149 and 47740 steps); Kvaerno3 is tried first.
     r = run_diffrax(
         _stiff(tmp_path, f, kf), t_start=0.0, t_end=t_end, n_points=11, rtol=rtol, atol=rtol / 100
     )
