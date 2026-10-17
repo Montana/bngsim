@@ -229,7 +229,7 @@ def test_a_narrow_piece(tmp_path, f) -> None:
 def test_a_counter_clock_restarts_past_its_threshold(tmp_path) -> None:
     # C = t reaches 2.9 three or four floats short, and the next piece read the
     # branch that had ended: 9.5e-7 of A(3) off at rtol=1e-8, where literal
-    # time is 3.4e-9 off.
+    # time is 5.8e-9 off.
     a, _ = _diffrax(_model(tmp_path, "if(Cobs>2.9,5,0.1)"))
     exact = _closed_form(TS, t_switch=2.9)
     assert abs(a[-1] / exact[-1] - 1.0) < 1e-7
@@ -331,3 +331,61 @@ def test_a_transient_too_fast_for_the_time_scale_is_refused(tmp_path) -> None:
             rtol=1e-8,
             atol=1e-10,
         )
+
+
+def _stiff(tmp_path, f, kf):
+    """The issue's model with A <-> B at *kf* each way."""
+    net = (
+        _NET.replace("    1 A() 100\n", "    1 A() 100\n    2 B() 0\n")
+        .replace("    2 tsw 1.37\n", f"    2 tsw 1.37\n    3 kf {kf}\n")
+        .replace("    1 1 0 f\n", "    1 1 0 f\n    2 1 2 kf\n    3 2 1 kf\n")
+        .format(f=f)
+    )
+    path = tmp_path / "stiff.net"
+    path.write_text(net)
+    return bngsim.Model.from_net(str(path))
+
+
+@pytest.mark.parametrize(
+    "f, kf, t_end, rtol",
+    [
+        ("if(time()>99.95,5,0.01)", 1e7, 100.0, 1e-6),
+        ("if(time()>1,5,0.1)+if(time()>1.2,-4.9,0)", 1e8, 3.0, 1e-8),
+    ],
+    ids=["near the end of [0, 100]", "a pulse 0.2 wide"],
+)
+def test_a_narrow_stretch_of_a_stiff_model(tmp_path, f, kf, t_end, rtol) -> None:
+    # A stretch is narrow against the run's span, so on [0, 100] one 0.05 long
+    # is, and the last 0.8% of the pulse's piece is. Solved with Tsit5, whose
+    # step stiffness binds, both ran past max_steps and were refused (main
+    # completes them, in 149 and 47740 steps); Kvaerno3 is tried first now.
+    r = run_diffrax(
+        _stiff(tmp_path, f, kf), t_start=0.0, t_end=t_end, n_points=11, rtol=rtol, atol=rtol / 100
+    )
+    ref = bngsim.Simulator(_stiff(tmp_path, f, kf), method="ode").run(
+        t_span=(0.0, t_end), n_points=11, rtol=1e-12, atol=1e-14
+    )
+    assert np.abs(r["species"] - np.asarray(ref.species)).max() < 1e-3
+    assert r["n_steps"] < 1000
+
+
+def test_a_run_backward_that_crosses_no_switch(tmp_path) -> None:
+    # A clock condition outside the window is no switch of this run: main ran
+    # it, and it was refused. A(1) = 100 run back to 0 at rate 0.1.
+    r = run_diffrax(
+        _model(tmp_path, "if(time()>1.37,5,0.1)"),
+        t_start=1.0,
+        t_end=0.0,
+        n_points=11,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        r["species"][:, 0], 100.0 * np.exp(-0.1 * (r["time"] - 1.0)), rtol=1e-6
+    )
+
+
+def test_a_run_backward_on_a_counter_clock_is_refused(tmp_path) -> None:
+    # A counter's crossings are placed from its value at t_start, forward.
+    with pytest.raises(ValueError, match="counter clock"):
+        run_diffrax(_model(tmp_path, "if(Cobs>1.37,5,0.1)"), t_start=3.0, t_end=0.0)

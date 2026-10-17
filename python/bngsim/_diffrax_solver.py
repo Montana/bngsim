@@ -5,8 +5,8 @@ adaptive stepper are all JIT-compiled into a single fused computation.
 No Python↔C++ boundary crossings during the solve.
 
 Uses Kvaerno5 (5th-order implicit Runge-Kutta, L-stable) for stiff
-biochemical systems, with PID step size control; just before a switch on the
-clock, Kvaerno3 (see below).
+biochemical systems, with PID step size control; next to a switch on the clock,
+Kvaerno3 (see below).
 
 The RHS, the parameter values and the initial state all come from the built
 model (issue #803 step 4). They used to be re-read from the ``.net`` text by
@@ -16,7 +16,7 @@ written as an expression was looked up as a parameter name.
 
 A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there,
 and the run is split at each such time and restarted just past it (issue #865),
-the stretch just before one solved with Kvaerno3, whose stages stay within its
+the last stretch before one solved with Kvaerno3, whose stages stay within its
 step:
 stepped across, a jump cost several times CVODE's error, and at a tight
 tolerance the whole step budget. A switch on the model's state, whose times are
@@ -48,8 +48,9 @@ _DIFFRAX_AVAILABLE: bool | None = None
 # four fifths of what is left (issue #865).
 _KVAERNO5_STRETCHES = 3
 
-# A stretch of a split run shorter than this, times the run's span, is solved
-# with Tsit5 (issue #865).
+# A stretch of a split run shorter than this, times the run's span, is narrow:
+# a piece that short is one Kvaerno3 stretch, and a narrow stretch Kvaerno3 fails
+# on is solved again with Tsit5 (issue #865).
 _NARROW = 1e-3
 
 
@@ -189,10 +190,10 @@ def run_diffrax(
     # before one read the other branch, and was turned down until the steps ran
     # out. That held for diffrax's own jump_ts as well. Kvaerno3's stages all lie
     # within its step (c <= 1), but it is of third order, and over a whole piece
-    # of fast dynamics it took ten to thirty times main's steps. So a piece that
-    # ends at a switch is solved with Kvaerno5 over its first four fifths, where
-    # no stage can reach past 1.23 * 4/5 of the piece, and with Kvaerno3 over the
-    # last fifth; the last piece, and a run with no switch, with Kvaerno5 as
+    # of fast dynamics it took ten to thirty times main's steps. So in a piece
+    # that ends at a switch, Kvaerno5 takes four fifths of what is left, where no
+    # stage can reach past 1.23 * 4/5 of it, three times over, and Kvaerno3 the
+    # last 0.8%; the last piece, and a run with no switch, are Kvaerno5's as
     # before. Reading the time clamped to the piece instead kept the branch, but
     # froze the rate laws' smooth dependence on the time in each last step, past
     # the tolerance, which the error estimate does not see. One compiled solve per
@@ -203,9 +204,10 @@ def run_diffrax(
     # The implicit solvers' Newton iteration reads roundoff as divergence on a
     # step as short as some pieces are, and a switch 1e-6 after t_start made the
     # solve turn its steps down until they ran out; Kvaerno5 also failed or took
-    # thousands of steps on pieces up to 1e-4 long. A stretch shorter than
-    # _NARROW of the run's span is solved with Tsit5 (see below). A run with no
-    # switch keeps main's controller exactly, and raises what it raised.
+    # thousands of steps on pieces up to 1e-4 long. A piece shorter than
+    # _NARROW of the run's span is one Kvaerno3 stretch, and a narrow stretch
+    # Kvaerno3 fails on goes to Tsit5 (see below). A run with no switch keeps
+    # main's controller exactly, and raises what it raised.
     def _compiled(solver, controller, throw):
         @jax.jit
         def _solve(a, b, y_a, seg_ts, params):
@@ -245,12 +247,15 @@ def run_diffrax(
         controller = diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin, force_dtmin=False)
         solve_k5 = _compiled(diffrax.Kvaerno5(), controller, throw=False)
         solve_k3 = _compiled(diffrax.Kvaerno3(), controller, throw=False)
-        # A narrow stretch is too short for the implicit solvers' Newton iteration,
-        # which reads roundoff as divergence there (a switch 1e-6 after t_start, or
-        # 1e-12 before t_end, ran their steps out). It is solved with Tsit5, which
-        # has none, and whose stages also lie within its step; a narrow stretch is
-        # short enough that stiffness costs it few steps.
-        solve_narrow = _compiled(diffrax.Tsit5(), controller, throw=False)
+        # A stretch can be too short for the implicit solvers' Newton iteration,
+        # which reads roundoff as divergence there (a switch 1e-6 after t_start,
+        # or 1e-12 before t_end, ran their steps out). A narrow one that Kvaerno3
+        # fails on is solved again with Tsit5, which has no Newton iteration and
+        # whose stages also lie within its step. Kvaerno3 is tried first: Tsit5's
+        # step is bound by stiffness, and a narrow stretch is narrow against the
+        # span, so it can be long, and a stiff model took Tsit5 tens of thousands
+        # of steps there, or more than max_steps, where main took a hundred.
+        solve_explicitly = _compiled(diffrax.Tsit5(), controller, throw=False)
     else:
         solve_k5 = _compiled(diffrax.Kvaerno5(), stepsize_controller, throw=True)
 
@@ -267,13 +272,14 @@ def run_diffrax(
         return jnp.asarray(ys[-1]), int(n), bool(ok)
 
     def stretch(a, b, y_a, out_idx, kvaerno5: bool):
-        """One stretch of a split run. A narrow one with Tsit5; any other with
-        Kvaerno5 where its stages cannot reach a switch (*kvaerno5*) and Kvaerno3
-        otherwise, and a Kvaerno5 stretch that fails with Kvaerno3 again, which
-        carries one run up to a switch (a guard on the bound above)."""
+        """One stretch of a split run: with Kvaerno5 where its stages cannot
+        reach a switch (*kvaerno5*, and not narrow) and Kvaerno3 otherwise, each
+        failure tried again with the next: a Kvaerno5 stretch with Kvaerno3,
+        which carries one run up to a switch (a guard on the bound above), and a
+        narrow stretch with Tsit5."""
         solves: tuple = ()
         if abs(b - a) < narrow:
-            solves = (solve_narrow,)
+            solves = (solve_k3, solve_explicitly)
         elif kvaerno5:
             solves = (solve_k5, solve_k3)
         else:
@@ -330,7 +336,8 @@ def run_diffrax(
             n_steps += n
         elif abs(b - a) < narrow:
             # A piece this short (a switch 1e-6 after t_start, a pulse 2e-8
-            # wide) took Kvaerno5 thousands of steps, or failed it.
+            # wide) took Kvaerno5 thousands of steps, or failed it; it is one
+            # stretch, Kvaerno3's (or Tsit5's).
             y_a, n = stretch(a, b, y_a, mine, kvaerno5=False)
             n_steps += n
         elif last:
@@ -379,20 +386,14 @@ def _switch_times(model, t_start: float, t_end: float) -> list[tuple[float, floa
     A condition a rate law reads that switches more often than a run's budget of
     stops has none placed, and one that cannot be placed, or a failure to place
     them, would leave the run stepping across them: each raises ``ValueError``
-    rather than returning the trajectory #865 did. So does a run backward in
-    time on a model with a switch on the clock, whose times are placed forward.
+    rather than returning the trajectory #865 did. So does a run backward in time
+    across a switch on the clock, or on a model with a switch on a counter clock.
     """
     conditions = model.time_discontinuity_conditions()
     if conditions:
         conditions = _conditions_the_run_switches_on(model, conditions)
     if not conditions:
         return []
-    if t_end < t_start:
-        raise ValueError(
-            "run_diffrax integrates backward in time only a model with no switch on the "
-            "clock; this one has one, and its switch times are placed forward. Use "
-            "Simulator(method='ode') or run forward."
-        )
     from bngsim._switch_sensitivity import (
         _PLAIN_INSTANT_FLOOR,
         _rewrite_counter_clock,
@@ -405,20 +406,27 @@ def _switch_times(model, t_start: float, t_end: float) -> list[tuple[float, floa
     # resolvers pass it over without a word: the run then stepped across it,
     # which is the issue again.
     scope = switch_condition_scope(model._core)
-    unplaced = [
-        c for c in conditions if _rewrite_counter_clock(model._core, c, scope, t_start) is None
-    ]
+    rewrites = {c: _rewrite_counter_clock(model._core, c, scope, t_start) for c in conditions}
+    unplaced = [c for c, rewrite in rewrites.items() if rewrite is None]
     if unplaced:
         raise ValueError(
             f"run_diffrax cannot place the times these conditions switch at: {unplaced}; "
             "use Simulator(method='ode')."
         )
+    backward = t_end < t_start
+    if backward and any(rewrite is not None and rewrite[1] >= 0 for rewrite in rewrites.values()):
+        # A counter's crossing is placed from its value at t_start, forward.
+        raise ValueError(
+            "run_diffrax cannot run backward in time on a model that switches on a "
+            "counter clock, whose crossings are placed forward; use "
+            "Simulator(method='ode') or run forward."
+        )
     over_budget: list = []
     try:
         crossings, _stops, periodic_at = crossings_with_periodic(
             model._core,
-            t_start,
-            t_end,
+            min(t_start, t_end),
+            max(t_start, t_end),
             conditions,
             touches=getattr(model, "_event_disc_conditions", frozenset()),
             over_budget=over_budget,
@@ -434,9 +442,18 @@ def _switch_times(model, t_start: float, t_end: float) -> list[tuple[float, floa
             f"{len(over_budget)} condition(s) switch more often than a run may stop, or "
             "too irregularly to count; use Simulator(method='ode')."
         )
-    found = sorted(
-        (float(c.time), c) for c in (*crossings, *periodic_at) if t_start < c.time < t_end
-    )
+    lo_t, hi_t = min(t_start, t_end), max(t_start, t_end)
+    found = sorted((float(c.time), c) for c in (*crossings, *periodic_at) if lo_t < c.time < hi_t)
+    if backward:
+        # Over literal time alone, the crossings are the same either way; a run
+        # backward over one is refused, and one with none in it is main's.
+        if found:
+            raise ValueError(
+                "run_diffrax cannot run backward in time across a switch on the clock, "
+                f"and this run crosses {[t for t, _ in found]}; use "
+                "Simulator(method='ode') or run forward."
+            )
+        return []
     groups: list[list] = []
     for t, c in found:
         if groups and _same_instant(groups[-1][1], t, _PLAIN_INSTANT_FLOOR):
