@@ -5,8 +5,8 @@ adaptive stepper are all JIT-compiled into a single fused computation.
 No Python↔C++ boundary crossings during the solve.
 
 Uses Kvaerno5 (5th-order implicit Runge-Kutta, L-stable) for stiff
-biochemical systems, with PID step size control; up to a switch on the clock,
-Kvaerno3 (see below).
+biochemical systems, with PID step size control; just before a switch on the
+clock, Kvaerno3 (see below).
 
 The RHS, the parameter values and the initial state all come from the built
 model (issue #803 step 4). They used to be re-read from the ``.net`` text by
@@ -16,7 +16,8 @@ written as an expression was looked up as a parameter name.
 
 A rate law that switches on the clock, ``if(time() > t*, ...)``, jumps there,
 and the run is split at each such time and restarted just past it (issue #865),
-each piece before one solved with Kvaerno3, whose stages stay within its step:
+the stretch just before one solved with Kvaerno3, whose stages stay within its
+step:
 stepped across, a jump cost several times CVODE's error, and at a tight
 tolerance the whole step budget. A switch on the model's state, whose times are
 not known before the run, is refused, as events are.
@@ -47,8 +48,8 @@ _DIFFRAX_AVAILABLE: bool | None = None
 # four fifths of what is left (issue #865).
 _KVAERNO5_STRETCHES = 3
 
-# A piece of a split run shorter than this, times the run's time scale, is
-# solved with Kvaerno3 alone (issue #865).
+# A stretch of a split run shorter than this, times the run's span, is solved
+# with Tsit5 (issue #865).
 _NARROW = 1e-3
 
 
@@ -202,13 +203,9 @@ def run_diffrax(
     # The implicit solvers' Newton iteration reads roundoff as divergence on a
     # step as short as some pieces are, and a switch 1e-6 after t_start made the
     # solve turn its steps down until they ran out; Kvaerno5 also failed or took
-    # thousands of steps on pieces up to 1e-4 long. A piece shorter than _NARROW
-    # of the run's time scale is solved with Kvaerno3 alone, under a least step
-    # of 128 floats of that scale, which it takes whatever its error estimate
-    # (force_dtmin): such a step is roundoff in a narrow piece, and a stiff
-    # transient the controller would want shorter is still integrated by an
-    # L-stable method. A run with no switch keeps main's controller exactly, and
-    # raises what it raised.
+    # thousands of steps on pieces up to 1e-4 long. A stretch shorter than
+    # _NARROW of the run's span is solved with Tsit5 (see below). A run with no
+    # switch keeps main's controller exactly, and raises what it raised.
     def _compiled(solver, controller, throw):
         @jax.jit
         def _solve(a, b, y_a, seg_ts, params):
@@ -230,23 +227,30 @@ def run_diffrax(
         return _solve
 
     if switch_ts:
-        time_scale = max(abs(float(t_start)), abs(float(t_end)), 1.0)
-        dtmin = 128.0 * np.finfo(np.float64).eps * time_scale
-        # Kvaerno5 is not made to take the least step: on a short stretch its
-        # Newton iteration failed at every step size, and made to take the least
-        # one it crawled to max_steps. Kvaerno3 takes a step of that size
-        # whatever its error estimate (force_dtmin), which is what carries it
-        # across a stretch too short for its Newton iteration.
-        solve_k5 = _compiled(
-            diffrax.Kvaerno5(),
-            diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin, force_dtmin=False),
-            throw=False,
+        span = abs(float(t_end) - float(t_start))
+        # A stretch shorter than this is narrow. Relative to the run's span: at
+        # t ~ 1e6 a piece 1.37 long is no narrower than at t ~ 1.
+        narrow = _NARROW * span
+        # The least step: 128 floats of the run's time, the step below which a
+        # step is roundoff.
+        dtmin = (
+            128.0 * np.finfo(np.float64).eps * max(abs(float(t_start)), abs(float(t_end)), span)
         )
-        solve_k3 = _compiled(
-            diffrax.Kvaerno3(),
-            diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin),
-            throw=False,
-        )
+
+        # A solve that would need a shorter step gives up, and the run is refused.
+        # Made to take the least step whatever its error estimate (force_dtmin),
+        # Kvaerno5 crawled to max_steps on a short stretch, and Kvaerno3 brought a
+        # stiff transient at t ~ 1e6, where the least step is 3e-8, back negative
+        # with nothing said.
+        controller = diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin, force_dtmin=False)
+        solve_k5 = _compiled(diffrax.Kvaerno5(), controller, throw=False)
+        solve_k3 = _compiled(diffrax.Kvaerno3(), controller, throw=False)
+        # A narrow stretch is too short for the implicit solvers' Newton iteration,
+        # which reads roundoff as divergence there (a switch 1e-6 after t_start, or
+        # 1e-12 before t_end, ran their steps out). It is solved with Tsit5, which
+        # has none, and whose stages also lie within its step; a narrow stretch is
+        # short enough that stiffness costs it few steps.
+        solve_narrow = _compiled(diffrax.Tsit5(), controller, throw=False)
     else:
         solve_k5 = _compiled(diffrax.Kvaerno5(), stepsize_controller, throw=True)
 
@@ -263,24 +267,28 @@ def run_diffrax(
         return jnp.asarray(ys[-1]), int(n), bool(ok)
 
     def stretch(a, b, y_a, out_idx, kvaerno5: bool):
-        """One stretch of a split run: with Kvaerno5 where its stages cannot
-        reach a switch, and with Kvaerno3 otherwise. A Kvaerno5 stretch that
-        fails is solved again with Kvaerno3: that carries a Kvaerno5 stretch run
-        up to a switch, and so is a guard on the bound above; the narrow pieces
-        Kvaerno5 was seen to fail on go to Kvaerno3 at once."""
+        """One stretch of a split run. A narrow one with Tsit5; any other with
+        Kvaerno5 where its stages cannot reach a switch (*kvaerno5*) and Kvaerno3
+        otherwise, and a Kvaerno5 stretch that fails with Kvaerno3 again, which
+        carries one run up to a switch (a guard on the bound above)."""
+        solves: tuple = ()
+        if abs(b - a) < narrow:
+            solves = (solve_narrow,)
+        elif kvaerno5:
+            solves = (solve_k5, solve_k3)
+        else:
+            solves = (solve_k3,)
         tried = 0
-        if kvaerno5:
-            y_b, n, ok = solve_span(solve_k5, a, b, y_a, out_idx)
+        for solve in solves:
+            y_b, n, ok = solve_span(solve, a, b, y_a, out_idx)
+            tried += n
             if ok:
-                return y_b, n
-            tried = n
-        y_b, n, ok = solve_span(solve_k3, a, b, y_a, out_idx)
-        if not ok:
-            raise ValueError(
-                f"run_diffrax could not integrate the run from {a!r} to {b!r}, next to a "
-                f"switch, within max_steps={max_steps}; use Simulator(method='ode')."
-            )
-        return y_b, tried + n
+                return y_b, tried
+        raise ValueError(
+            f"run_diffrax could not integrate the run from {a!r} to {b!r}, next to a "
+            f"switch, within max_steps={max_steps} and with no step shorter than {dtmin:.3g}; "
+            "use Simulator(method='ode')."
+        )
 
     # Piece i runs from just past switch i-1 to just short of switch i. A switch
     # is a group of crossings within the ODE path's one instant (_same_instant),
@@ -320,10 +328,9 @@ def run_diffrax(
         if n_pieces == 1:
             y_a, n, _ = solve_span(solve_k5, a, b, y_a, mine)
             n_steps += n
-        elif abs(b - a) < _NARROW * time_scale:
+        elif abs(b - a) < narrow:
             # A piece this short (a switch 1e-6 after t_start, a pulse 2e-8
-            # wide) took Kvaerno5 thousands of steps, or failed it, where
-            # Kvaerno3 takes a few dozen.
+            # wide) took Kvaerno5 thousands of steps, or failed it.
             y_a, n = stretch(a, b, y_a, mine, kvaerno5=False)
             n_steps += n
         elif last:
@@ -364,8 +371,10 @@ def _switch_times(model, t_start: float, t_end: float) -> list[tuple[float, floa
     These are the crossings themselves, a periodic condition's included, not the
     stops CVODE places a little past one. A condition only a reporting function
     reads changes an output, not the trajectory, which is all run_diffrax returns,
-    and is left out: a split there cost a model whose rate laws never switch
-    hundreds of steps, and changed its answer.
+    and is left out (as :func:`~bngsim._switch_sensitivity.conditions_a_rate_law_reads`
+    tells them apart, by whether a rate law's text holds the condition's): a
+    split there cost a model whose rate laws never switch hundreds of steps, and
+    changed its answer.
 
     A condition a rate law reads that switches more often than a run's budget of
     stops has none placed, and one that cannot be placed, or a failure to place

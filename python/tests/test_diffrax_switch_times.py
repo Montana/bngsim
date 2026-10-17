@@ -108,6 +108,8 @@ SHAPES = {
 
 @pytest.mark.parametrize("f", list(SHAPES.values()), ids=list(SHAPES))
 def test_each_shape_of_switch_matches_the_ode_path(tmp_path, f) -> None:
+    # (exp, periodic and the no-switch shapes main gets within 1e-4 too: they
+    # guard that the split places them right, the others that it is needed.)
     a, _ = _diffrax(_model(tmp_path, f))
     assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
 
@@ -195,7 +197,7 @@ def test_a_rate_law_that_moves_with_time_and_no_switch(tmp_path) -> None:
 def test_a_switch_on_a_rate_law_that_moves_with_time(tmp_path) -> None:
     # f = r (1 + 0.5 sin(10 t)), r = 0.1 up to 1.37 and 5 after, against the
     # closed form: the pieces keep the rate's time dependence to their ends.
-    # (Main ran out of steps at rtol=1e-10.)
+    # (Main gets this within 1e-6 as well, in 2731 steps: a guard.)
     a, _ = _diffrax(_model(tmp_path, "if(time()>1.37,5,0.1)*(1+0.5*sin(10*time()))"), rtol=1e-10)
 
     def g(t):
@@ -217,9 +219,8 @@ NARROW = {
 def test_a_narrow_piece(tmp_path, f) -> None:
     # Kvaerno3's Newton iteration read roundoff on so short a piece as
     # divergence, and turned its steps down until they ran out; main and the
-    # ODE path complete. Such a piece is solved again explicitly, after a failed
-    # attempt cut short by a least step (it ran to max_steps, 100000, first).
-    # The pulse is solved by Kvaerno3, and guards the case.
+    # ODE path complete. A stretch this short is solved with Tsit5, which has no
+    # Newton iteration; Kvaerno5 took 5642 steps over the pulse.
     a, n_steps = _diffrax(_model(tmp_path, f))
     assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
     assert n_steps < 2000
@@ -287,3 +288,46 @@ def test_fast_dynamics_before_a_switch_cost_what_they_did(tmp_path) -> None:
     a, n_steps = _diffrax(_model(tmp_path, f))
     assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
     assert n_steps < 400
+
+
+def test_a_stiff_run_far_from_t_zero(tmp_path) -> None:
+    # Narrow measured against max(|t|) made every piece of a run on [1e6, 1e6+3]
+    # narrow, and a narrow stretch is solved with an explicit method: on a stiff
+    # model, thousands of steps where the same run on [0, 3] takes a hundred.
+    # A <-> B at 1e4 each way, and A decays at f, which switches 1.37 into the
+    # run. The model is the same at every time but for the switch, so the run on
+    # [0, 3] is the reference (CVODE cannot reach rtol=1e-12 at t ~ 1e6).
+    def model(t0):
+        s = t0 + 1.37
+        net = (
+            _NET.replace("    1 A() 100\n", "    1 A() 100\n    2 B() 0\n")
+            .replace("    2 tsw 1.37\n", "    2 tsw 1.37\n    3 kf 1e4\n")
+            .replace("    1 1 0 f\n", "    1 1 0 f\n    2 1 2 kf\n    3 2 1 kf\n")
+            .format(f=f"if(time()>{s!r},5,0.1)")
+        )
+        path = tmp_path / f"stiff{t0:g}.net"
+        path.write_text(net)
+        return bngsim.Model.from_net(str(path))
+
+    r = run_diffrax(model(1e6), t_start=1e6, t_end=1e6 + 3.0, n_points=31, rtol=1e-8, atol=1e-10)
+    ref = bngsim.Simulator(model(0.0), method="ode").run(
+        t_span=(0.0, 3.0), n_points=31, rtol=1e-12, atol=1e-14
+    )
+    assert np.abs(r["species"] - np.asarray(ref.species)).max() < 1e-4
+    assert r["n_steps"] < 1000
+
+
+def test_a_transient_too_fast_for_the_time_scale_is_refused(tmp_path) -> None:
+    # At t ~ 1e6 the least step is 3e-8, and a rate of 1e8 just past a switch
+    # needs shorter. Made to take the least step anyway, the run returned
+    # A = -1.2e-6 for 4.1e-3, with nothing said; CVODE fails on it too.
+    s = 1e6 + 1.0
+    with pytest.raises(ValueError, match="no step shorter than"):
+        run_diffrax(
+            _model(tmp_path, f"if(time()>{s!r},1e8,0.1)"),
+            t_start=1e6,
+            t_end=s + 1e-7,
+            n_points=2,
+            rtol=1e-8,
+            atol=1e-10,
+        )
