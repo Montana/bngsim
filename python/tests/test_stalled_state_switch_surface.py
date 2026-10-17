@@ -470,13 +470,16 @@ def _spelled(tmp_path, text):
     ids=["plain", "squared", "multiplied"],
 )
 def test_a_residual_off_zero_by_rounding_on_its_surface_is_put_across(tmp_path, cond):
-    """A reaches thr = 1 + 5e-8 at t = 5, so Y(6) = kb. With A held on thr,
-    ``(Aobs^2)-(thr^2)`` reads +5.75e-17, an eighth of its ulp, while the
-    condition reads false: the residual's sign said across and leaving, so
-    the state was not taken as pinned. It stayed there, 17 million steps to
-    t = 5.03 with Y = 0, and the wall-clock timeout by t = 6. (At t = 10 the
-    step sequence happens to cross.) Every spelling now takes the plain one's
-    steps."""
+    """A reaches thr = 1 + 5e-8 at t = 5, so Y(6) = kb. Where the compiler
+    fuses ``A*A - thr*thr`` into one multiply-add (arm64; x86-64 with FMA
+    enabled), ``(Aobs^2)-(thr^2)`` reads +5.75e-17 with A held on thr, an
+    eighth of its ulp, while the condition reads false: the residual's sign
+    said across and leaving, so the state was not taken as pinned. It stayed
+    there, 17 million steps to t = 5.03 with Y = 0, and the wall-clock timeout
+    by t = 6. (At t = 10 the step sequence happens to cross.) Unfused, the
+    residual reads 0 there and every spelling passed on main too, so only a
+    fused build tells this fix from none. Every spelling now takes a step
+    count of the plain one's order."""
     run = _spelled(tmp_path, SPELLED.format(thr=1.0 + 5e-8, cond=cond))
     a, y = np.asarray(run.species)[-1]
     assert a == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
@@ -486,8 +489,8 @@ def test_a_residual_off_zero_by_rounding_on_its_surface_is_put_across(tmp_path, 
 
 def test_a_product_of_two_moving_species_is_put_across(tmp_path):
     """A and B each rise at 1e-8 from 1, and A*B reaches (1 + 5e-8)^2 at t = 5.
-    The product's residual is not 0 on its surface either, and the run timed
-    out the same way."""
+    Fused, the product's residual is not 0 on its surface either, and the run
+    timed out the same way."""
     text = TWO_MOVING.format(
         cond="if(Aobs*Bobs>thr,kb,0)", a0=1.0, b0=1.0, fa=1e-8, fb=1e-8, thr=(1.0 + 5e-8) ** 2
     )
@@ -496,3 +499,4 @@ def test_a_product_of_two_moving_species_is_put_across(tmp_path):
     assert a == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
     assert b == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
     assert y == pytest.approx(KB * (SPELLED_END - 5.0), abs=0.1 * KB * 1e-10 / 1e-8)
+    assert run.solver_stats["n_steps"] < 100_000
