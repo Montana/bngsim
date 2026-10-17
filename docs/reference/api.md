@@ -37,7 +37,7 @@ Methods:
 - **`is_pure_sink()`** → `ndarray (n_species,) of bool` — the array form, so `mask=~model.is_pure_sink()`
 - **`declare_ic_sensitivity({species: {param: d_ic_d_param}})`** — Declare `∂x_k(0)/∂θ` for an initial condition your own code assigns (issue #111). A declared species' row is taken as **fully specified**: parameters not named get `0.0`, so it *replaces* the model's parameter-graph row rather than adding to it
 - **`effective_ic_sensitivity(params=None)`** → `dict[str, dict[str, float]]` — the reader paired with the writer above: `{species: {param: ∂x(0)/∂θ}}`, the initial-condition seeding a run from this state would use, after the #113 retirement and the #111 overlay. Answers from model structure alone — **no integration, no simulation** — so a fitting frontend can build its gradient routing once at setup. Keys are the ids `sensitivity_params=` accepts (a #147-lowered compound `<initialAssignment>` reports the original symbols, never the synthetic `_ic_<species>` carrier). A **present** entry valued `0.0` means *seeded, coefficient zero at this state*; an **absent** entry means *no seeding path* — the two are different answers. Needed because `output_sensitivities(axis="parameter")` is a total derivative that already contains this matrix times the `ic` axis (GH #155)
-- **`add_table_function(name, *, file, times, values, index)`** — Add a piecewise-linear table function
+- **`add_table_function(name, *, file, times, values, index, method)`** — Give a table function the model declares new data, in place, over the same index and keeping its method unless `method` is given; every engine reads it from then on. A plain function's name raises `ModelError`; a new name adds a table nothing reads, with a warning (issue #772)
 - `n_table_functions`, `table_function_names` — TFUN introspection
 
 Evaluators (issue #523; see [Model evaluators](../user-guide/evaluators.md)). Each takes a state `y` of length `n_species` in `species_names` order, reads the live parameters, and leaves the stored concentrations alone:
@@ -192,12 +192,21 @@ Constructor:
   Create a RuleMonkey session from a BNGL-generated NFsim XML file
 
 Session control:
-- **`initialize(seed)`** — Initialize the live RuleMonkey system
+- **`initialize(seed, t_start=None)`** — Initialize the live RuleMonkey system
+  with the seed state at `t_start` on the model's clock (`current_time` reads
+  it). Left `None`, the clock starts at 0, and for a model that reads the clock
+  the first `simulate` moves the seed state to its own start if nothing has
+  moved the session first (issue #1022)
 - **`simulate(t_start, t_end, *, n_points, timeout)`** → `Result` —
   `timeout` is a wall-clock budget in seconds (`None` disables, the
   default). Polled by upstream every ~1024 SSA events; on overrun raises
   `bngsim.SimulationTimeout` and the session must be destroyed before
-  reuse.
+  reuse. A segment that starts at `current_time` runs on the session clock,
+  which is model time. One that starts elsewhere continues from
+  `current_time` and is labelled with the times asked for; for a model that
+  reads the clock (`time()` or a table function indexed by time) that raises
+  `SimulationError`. `solver_stats["n_steps"]` counts the events since
+  `initialize`, as an `NfsimSession`'s does.
 - **`step_to(time, *, timeout)`** — Advance without recording output;
   honors the same `timeout` semantics as `simulate(...)`.
 - **`destroy()`** — Release the live RuleMonkey session
@@ -282,6 +291,13 @@ All inherit from `bngsim.BngsimError` (which inherits `RuntimeError`):
 - **`ParameterError`** — Unknown parameter name, invalid value
 - **`SensitivityUnsupportedError`** — Forward sensitivity declined for this model: an event whose crossing time moves in a way `dt*/dp` cannot be computed for, or a rate law that does not differentiate to closed form. A declared capability gap, not a failure — catch it to fall back on a derivative-free optimizer. Also inherits `ValueError` (what both sites raised before the class existed), so `except ValueError` still catches it. A missing compiler/JIT is *not* this exception; that stays a plain `RuntimeError`.
 - **`StopConditionMet`** — Stop condition triggered; `.result` has partial data
+
+Warnings (`UserWarning` subclasses; filter or escalate them with `warnings`):
+
+- **`RuleMonkeyWarning`** — `method="rm"` or a `RuleMonkeySession` loaded a model
+  for which RuleMonkey reports a warning-level diagnostic: how it reads a rule
+  or rate law, such as a rule whose products can never be what it writes, which
+  it never fires as BioNetGen generates no reaction for it (issue #1022)
 
 ## `.net` files as a dict
 

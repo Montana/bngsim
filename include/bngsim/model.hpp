@@ -22,18 +22,25 @@ namespace bngsim {
 class ModelBuilder;
 class NetFileLoader;
 class TableFunction;
+enum class InterpolationMethod;
 struct ModelImplData;
 
 /// Resolved metadata for one registered TableFunction, used by the
 /// model-based codegen path to emit the C call for a tfun-backed BNGL
-/// function. The index kind is "time", "parameter", or "observable";
-/// the corresponding index field carries the 0-based array index for
-/// parameter/observable indexing (and is -1 for time-indexed tfuns).
+/// function. The index kind is "time", "parameter", "function", or
+/// "observable"; the corresponding index field carries the 0-based array
+/// index (parameter, function or observable), and the others are -1. A
+/// "parameter" is a slot no function owns. A table over a model function,
+/// `tfun([...], [...], h)`, is "function", indexed by `h`'s position in the
+/// model's functions: `h`'s parameter slot holds its value only where the
+/// interpreter has written it, so compiled code reads the function (issue
+/// #965).
 struct TableFunctionSpec {
     std::string name;
     std::string index_kind;
     int index_param_idx = -1;
     int index_obs_idx = -1;
+    int index_func_idx = -1;
     /// The table is read as a step (method=>"step"), not interpolated: its
     /// value jumps at each breakpoint of its index.
     bool step = false;
@@ -41,6 +48,8 @@ struct TableFunctionSpec {
     std::string method;
     std::vector<double> xs;
     std::vector<double> ys;
+    /// An expression of the model calls the table (TableFunction::read_by_model).
+    bool read = false;
 };
 
 class NetworkModel {
@@ -383,6 +392,10 @@ class NetworkModel {
     };
     const StateSwitch *state_switch(const std::string &condition_src,
                                     std::string *why = nullptr) const;
+    // Does the switch's residual read the clock, through the walk
+    // event_trigger_reads_time takes (issue #908)? Never by probing values: a
+    // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
+    bool state_switch_reads_time(const StateSwitch &sw) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
@@ -817,19 +830,28 @@ class NetworkModel {
 
     // ─── Table functions ────────────────────────────────────────────────────
 
+    // Under the name of a table function the model has, either overload puts
+    // the new data in that table, in place, for the interpreter and compiled
+    // code alike; it has to be read over the same index (issue #772). Under a
+    // function's name it throws std::invalid_argument, as a function's body
+    // cannot be replaced. A table under a new name is added, and nothing in
+    // the model reads it. Bad data throws, and leaves any table as it was.
+    // New data from a file may have its value column headed with the table's
+    // name or the function that calls it; `header_name` is for a new table.
+
     /// Add a table function from a .tfun file.
     /// @param name        Function name (e.g., "cumNcases")
     /// @param filepath    Path to .tfun file
     /// @param index_name  Index variable: "time" (default), or a parameter/observable name
-    /// @param method      Interpolation method: "linear" (default) or "step"
+    /// @param method      Interpolation method: "linear" or "step"; "" (the default)
+    ///                    keeps a table's own, and is "linear" for a new one
     /// @param header_name Optional .tfun column-2 header validation name; defaults
     ///                    to `name`. Differs from `name` only for embedded-form
     ///                    tfun where the runtime ID is synthetic but the .tfun
     ///                    file still labels its value column with the original
     ///                    BNG function name.
     void add_table_function(const std::string &name, const std::string &filepath,
-                            const std::string &index_name = "time",
-                            const std::string &method = "linear",
+                            const std::string &index_name = "time", const std::string &method = "",
                             const std::string &header_name = "");
 
     /// Add a table function from in-memory data.
@@ -837,10 +859,11 @@ class NetworkModel {
     /// @param xs         Sorted x values (monotonically increasing)
     /// @param ys         Corresponding y values
     /// @param index_name Index variable name
-    /// @param method     Interpolation method: "linear" (default) or "step"
+    /// @param method     Interpolation method: "linear" or "step"; "" (the default)
+    ///                   keeps a table's own, and is "linear" for a new one
     void add_table_function(const std::string &name, const std::vector<double> &xs,
                             const std::vector<double> &ys, const std::string &index_name = "time",
-                            const std::string &method = "linear");
+                            const std::string &method = "");
 
     /// Number of registered table functions.
     int n_table_functions() const;
@@ -942,6 +965,41 @@ class NetworkModel {
     /// Internal helper: register a TableFunction with the expression evaluator
     /// and bind its index pointer to the appropriate model variable.
     void register_table_function_(TableFunction &tf);
+
+    /// The table function named `name`, or nullptr.
+    TableFunction *table_named_(const std::string &name) const;
+
+    /// The function whose body calls the table `name`, or "" (issue #772).
+    std::string function_calling_table_(const std::string &name) const;
+
+    /// Throw if a function is named `name` and the table does not back it
+    /// (issue #772).
+    void require_new_table_name_(const std::string &name, bool backs_a_function) const;
+
+    /// Throw unless new data for `held`, read over `index_name`, may replace
+    /// its data: the builder declaring one name twice, or a different index,
+    /// is refused (issue #772).
+    void require_replaceable_(const TableFunction &held, const std::string &index_name,
+                              bool backs_a_function) const;
+    void require_same_index_(const TableFunction &held, const std::string &index_name) const;
+
+    /// Register `tf` and keep it; `backs_a_function` says the model reads it.
+    void keep_table_function_(std::unique_ptr<TableFunction> tf, bool backs_a_function);
+
+    /// The interpolation `method` names, or with "" `held`'s own (linear for
+    /// a new table).
+    InterpolationMethod method_for_(const TableFunction *held, const std::string &method,
+                                    const std::string &name) const;
+
+    /// add_table_function's two shapes. ModelBuilder calls them with
+    /// `backs_a_function` set for a `.net` tfun, whose table takes the name of
+    /// the function it is the body of; the public overloads never set it.
+    void add_table_function_(const std::string &name, const std::string &filepath,
+                             const std::string &index_name, const std::string &method,
+                             const std::string &header_name, bool backs_a_function);
+    void add_table_function_(const std::string &name, const std::vector<double> &xs,
+                             const std::vector<double> &ys, const std::string &index_name,
+                             const std::string &method, bool backs_a_function);
 
     /// Re-resolve every species IC that a parameter names, from the current
     /// parameter values (issue #79). Called at the end of set_param(), after

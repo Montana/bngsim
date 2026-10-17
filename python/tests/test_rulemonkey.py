@@ -481,3 +481,14 @@ class TestRuleMonkeySessionPatternOrder:
             rm.set_species_count("X(p~1,y)", 100)
             assert rm.get_species_count("X(y,p~1)") == 100
             assert rm.get_species_count("X(p~1,y)") == 100
+
+
+def test_rm_refuses_a_model_with_compartments(nfsim_compartment_xml, dummy_model):
+    """RuleMonkey does not scale rates by compartment volume, and its own load
+    check looks for <Compartment> where BNG2 writes <compartment>, so it ran
+    compartment models with the wrong rates (issue #1022)."""
+    match = r"RuleMonkey .* compartments: 'cell'"
+    with pytest.raises(bngsim.ModelError, match=match):
+        bngsim.Simulator(dummy_model, method="rm", xml_path=str(nfsim_compartment_xml))
+    with pytest.raises(bngsim.ModelError, match=match):
+        bngsim.RuleMonkeySession(str(nfsim_compartment_xml))

@@ -1312,7 +1312,8 @@ namespace NFcore
 
 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
 			void setBaseRate(double newBaseRate,string newBaseRateName);
-			void resetBaseRateFromSystemParamter();
+			void scaleBaseRate(double factor);
+			virtual void resetBaseRateFromSystemParamter();
 
 			void setTraversalLimit(int limit) { this->traversalLimit = limit; };
 

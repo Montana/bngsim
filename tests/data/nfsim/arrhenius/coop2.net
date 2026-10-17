@@ -1,0 +1,65 @@
+# Created by BioNetGen 2.9.3
+begin parameters
+    1 Ea1                  1.5  # Constant
+    2 Ea2                  1.5  # Constant
+    3 phi1                 0.4  # Constant
+    4 phi2                 0.6  # Constant
+    5 G1                   -1.5  # Constant
+    6 G2                   -1.0  # Constant
+    7 G3                   -1.2  # Constant
+    8 G4                   0.8  # Constant
+    9 kf                   0.05  # Constant
+   10 kr                   0.5  # Constant
+   11 _R1_local1           exp((-(Ea1+(phi1*G1))))  # ConstantExpression
+   12 _R2_local1           exp((-(Ea2+(phi2*G2))))  # ConstantExpression
+   13 _R1_local2           exp((-(Ea1+(phi1*(G1+G4)))))  # ConstantExpression
+   14 _R1_local3           exp((-(Ea1+(phi1*(G1+G3)))))  # ConstantExpression
+   15 _R1_local4           exp((-(Ea1+(phi1*(G1+G3+G4)))))  # ConstantExpression
+   16 __reverse_R1_local1  exp((-(Ea1+((1-phi1)*(-G1)))))  # ConstantExpression
+   17 _R2_local2           exp((-(Ea2+(phi2*(G2+G3)))))  # ConstantExpression
+   18 __reverse_R2_local1  exp((-(Ea2+((1-phi2)*(-G2)))))  # ConstantExpression
+   19 __reverse_R1_local2  exp((-(Ea1+((1-phi1)*((-G1)+(-G4))))))  # ConstantExpression
+   20 __reverse_R1_local3  exp((-(Ea1+((1-phi1)*((-G1)+(-G3))))))  # ConstantExpression
+   21 __reverse_R1_local4  exp((-(Ea1+((1-phi1)*((-G1)+(-G3)+(-G4))))))  # ConstantExpression
+   22 __reverse_R2_local2  exp((-(Ea2+((1-phi2)*((-G2)+(-G3))))))  # ConstantExpression
+end parameters
+begin species
+    1 A(c,x) 60
+    2 B(d,y) 60
+    3 C(a) 60
+    4 D(b) 60
+    5 A(c,x!1).B(d,y!1) 0
+    6 A(c!1,x).C(a!1) 0
+    7 B(d!1,y).D(b!1) 0
+    8 A(c,x!1).B(d!2,y!1).D(b!2) 0
+    9 A(c!1,x!2).B(d,y!2).C(a!1) 0
+   10 A(c!1,x!2).B(d!3,y!2).C(a!1).D(b!3) 0
+end species
+begin reactions
+    1 1,2 5 _R1_local1 #R1
+    2 1,3 6 _R2_local1 #R2
+    3 2,4 7 kf #R3
+    4 1,7 8 _R1_local2 #R1
+    5 2,6 9 _R1_local3 #R1
+    6 6,7 10 _R1_local4 #R1
+    7 5 1,2 __reverse_R1_local1 #_reverse_R1
+    8 3,5 9 _R2_local2 #R2
+    9 6 1,3 __reverse_R2_local1 #_reverse_R2
+   10 4,5 8 kf #R3
+   11 7 2,4 kr #_reverse_R3
+   12 8 1,7 __reverse_R1_local2 #_reverse_R1
+   13 9 2,6 __reverse_R1_local3 #_reverse_R1
+   14 10 6,7 __reverse_R1_local4 #_reverse_R1
+   15 3,8 10 _R2_local2 #R2
+   16 9 3,5 __reverse_R2_local2 #_reverse_R2
+   17 10 3,8 __reverse_R2_local2 #_reverse_R2
+   18 4,9 10 kf #R3
+   19 8 4,5 kr #_reverse_R3
+   20 10 4,9 kr #_reverse_R3
+end reactions
+begin groups
+    1 AB                   5,8,9,10
+    2 AC                   6,9,10
+    3 ABC                  9,10
+    4 ABD                  8,10
+end groups

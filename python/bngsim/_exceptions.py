@@ -317,6 +317,26 @@ class SsaRoundingWarning(UserWarning):
     """
 
 
+class RuleMonkeyWarning(UserWarning):
+    """RuleMonkey runs the model but reports how it reads part of it (issue #1022).
+
+    Emitted when ``method="rm"`` (``"nf_exact"``) or a
+    :class:`bngsim.RuleMonkeySession` loads a BNG XML for which RuleMonkey
+    reports a warning-level diagnostic: a rule whose products can never be what
+    it writes (BioNetGen generates no reaction for it, and RuleMonkey never
+    fires it), a Michaelis-Menten law over a pattern that matches several
+    species (BNG2 expands it per species pair, RuleMonkey sums the counts), an
+    observable read at local and global scope in one function, a rule priority,
+    ``TotalRate``, and the like. Each message names the rule or construct and
+    says what RuleMonkey does with it. Errors are refused instead. Filter or
+    escalate it like any ``UserWarning``::
+
+        import warnings, bngsim
+        warnings.simplefilter("error", bngsim.RuleMonkeyWarning)  # promote
+        warnings.simplefilter("ignore", bngsim.RuleMonkeyWarning)  # silence
+    """
+
+
 class DenseSolverFallbackWarning(UserWarning):
     """A large ODE model is running on the dense solver for lack of KLU (GH #209).
 

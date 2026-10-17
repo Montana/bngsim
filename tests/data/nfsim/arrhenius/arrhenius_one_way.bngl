@@ -1,0 +1,37 @@
+# Issue #1022: a one-way Arrhenius binding rule and a one-way Arrhenius
+# unbinding rule. Each fires at exp(-(Ea0 + phi*dG)) with dG the free-energy
+# change of the reaction it writes, and neither has a reverse.
+begin model
+begin parameters
+  Ea0     0.5
+  phi     0.3
+  Gf_AB   5
+  Gf_CD  -2
+end parameters
+begin molecule types
+  A(b)
+  B(a)
+  C(d)
+  D(c)
+end molecule types
+begin seed species
+  A(b)           100
+  B(a)           100
+  C(d!1).D(c!1)  100
+end seed species
+begin energy patterns
+  A(b!1).B(a!1)  Gf_AB
+  C(d!1).D(c!1)  Gf_CD
+end energy patterns
+begin observables
+  Molecules AB  A(b!1).B(a!1)
+  Molecules CD  C(d!1).D(c!1)
+end observables
+begin reaction rules
+  A(b) + B(a) -> A(b!1).B(a!1)  Arrhenius(phi,Ea0)
+  C(d!1).D(c!1) -> C(d) + D(c)  Arrhenius(phi,Ea0)
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

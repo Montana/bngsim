@@ -1,0 +1,39 @@
+# Issue #1022: an Arrhenius (eBNGL) model, two binding rules with a
+# cooperativity energy pattern, no RT parameter. RuleMonkey 3.10.1 divided every
+# energy by RT = 2.478 (richardposner/RuleMonkey#107).
+begin model
+begin parameters
+  Ea0      0.5
+  phi      0.3
+  Gf_AB    3.5
+  Gf_BC    3.5
+  Gf_coop -2
+end parameters
+begin molecule types
+  A(b)
+  B(a,c)
+  C(b)
+end molecule types
+begin seed species
+  A(b)    100
+  B(a,c)  100
+  C(b)    100
+end seed species
+begin energy patterns
+  A(b!1).B(a!1)             Gf_AB
+  B(c!1).C(b!1)             Gf_BC
+  A(b!1).B(a!1,c!2).C(b!2)  Gf_coop
+end energy patterns
+begin observables
+  Molecules AB   A(b!1).B(a!1)
+  Molecules BC   B(c!1).C(b!1)
+  Molecules ABC  A(b!1).B(a!1,c!2).C(b!2)
+end observables
+begin reaction rules
+  A(b) + B(a) <-> A(b!1).B(a!1)  Arrhenius(phi,Ea0)
+  B(c) + C(b) <-> B(c!1).C(b!1)  Arrhenius(phi,Ea0)
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

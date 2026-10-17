@@ -272,7 +272,7 @@ def test_the_refusal_prints_the_recorded_decline_reason(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cg, "CACHE_DIR", tmp_path / "cg")
 
-    def decline(functions):
+    def decline(functions, tfun_call_by_name=None):
         raise cg.CodegenDeclined("a decline nothing else has ever raised")
 
     with monkeypatch.context() as mp:

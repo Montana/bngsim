@@ -139,19 +139,104 @@ Arrhenius laws, and on local functions.
 
 ### Rate laws that read `time()`
 
-Neither backend can run a function that reads `time()` (or a bare `time`), so
-both refuse one when the simulator or session is built, naming the function
-(issue #862). RuleMonkey treats a total propensity of 0 as final: a rate such as
-`if(time()>=6, k, 0)`, which is 0 at the start, never fires, and the run would
-return the initial state on every row (richardposner/RuleMonkey#86). NFsim cannot
-prepare such a function at all. Simulate the generated network with
-`method="ode"` or `method="ssa"` instead, which read `time()` as the model time.
+`method="rm"` runs a function that reads `time()` (or a bare `time`), and a
+table function indexed by time (`tfun(..., time)`), on **absolute model time**,
+as `method="ode"` and `method="ssa"` do: `run(t_span=(5, 7))` starts from the
+initial state at t = 5, and `time()` reads 5 there. RuleMonkey integrates a rate
+that reads the clock between events, so a rate such as `if(time()>=6, k, 0)`,
+which is 0 at the start, turns on at t = 6 (issue #1022).
 
-A table function indexed by time (`tfun(..., time)`) falls into the same trap on
-RuleMonkey, which refuses it too. NFsim runs one, but refreshes its value only
-when a reaction fires. So a rate that is 0 at the start, or that changes while
+NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
+one when the simulator or session is built, naming the function (issue #862).
+Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
+NFsim runs a table function indexed by time, on **time elapsed since
+`t_start`**, as BNG2.pl's `simulate_nf` does, and refreshes its value only when
+a reaction fires. So a rate that is 0 at the start, or that changes while
 nothing fires, is not seen until something does, and until then the run is flat
 (issue #892).
+
+A model that reads neither `time()` nor a time-indexed table cannot tell the
+two clocks apart, and runs on elapsed time on both backends, which keeps event
+times small at a large `t_start`. RuleMonkey integrates a rate that reads the
+clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
+whose span is too short for the doubles near its times to place them (a span of
+2 at t = 1e13), rather than return a run that never fires. A model that reads
+the clock still places its events on absolute time, so once the total
+propensity times |t| nears 1e15 its waiting times are rounded and the run is
+biased with no error, as `method="ssa"` is on any model there (issue #1059).
+Keep such a run's times moderate.
+
+### Arrhenius (energy) rules
+
+`method="rm"` gives an energy rule BNG2's rate, `exp(-(Ea0 + phi*dG))` with `dG`
+the free-energy change of the reaction the rule writes, and `1-phi` for the
+reverse half of a reversible rule. Energies are in units of RT: there is no RT
+in the formula, and a parameter named `RT` is an ordinary parameter, which a
+model in kJ/mol divides by where it uses it (issue #1022).
+
+RuleMonkey expands each energy rule at load, and reads only some energy
+patterns as BNG2 does: the bonded pair of sites a rule joins or parts, alone or
+with one more bond to a molecule of a third type whose site binds nothing else,
+on a rule that names only those two sites. That covers pair and cooperativity
+patterns. It drops or misapplies a state, a site that must be free, a wildcard
+bond, a site named twice, context further out, and context in the rule itself
+(richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
+until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
+`method="ssa"` on the generated network.
+
+### Compartments
+
+RuleMonkey does not scale rates by compartment volume or keep molecules in
+their compartments, so `method="rm"` refuses a model that declares
+compartments (issue #1022). Use `method="ode"` or `method="ssa"` on the
+generated network.
+
+### RuleMonkey's warnings
+
+RuleMonkey refuses a model it cannot honor, naming what it cannot, and warns of
+constructs it reads in a way that is easy to miss: a rule whose products can
+never be what it writes (BioNetGen generates no reaction for it, and RuleMonkey
+never fires it), a Michaelis-Menten law over a pattern that matches several
+species, `TotalRate`, and the like. Each warning is a
+`bngsim.RuleMonkeyWarning`, emitted when the simulator or session is built.
+
+### Rate laws NFsim cannot run
+
+NFsim refuses, when the simulator or session is built, a model with an
+`Arrhenius` (energy-based) rate law or with a rate-law type it does not
+implement, naming each rule. NFsim's expansion of energy rules divides every
+energy by an `RT` that BioNetGen does not apply (2.478 unless the model defines
+a parameter `RT`), gives a one-way binding rule a reverse reaction, and drops
+one-way unbinding and state-change rules, all without an error
+(RuleWorld/nfsim#102; the refusal is lifted under issue #1057). NFsim implements `Ele`, `MM` and function rate laws only:
+it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
+patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
+model's generated network with `method="ode"` or `method="ssa"`.
+
+### Functions that read an observable outside their argument
+
+In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
+argument and follows the molecule, but `MAB` is read outside it. NFsim
+re-evaluates a function with an argument only on the complexes a reaction
+produces, so on every other molecule that term keeps the value it had at the
+molecule's last event: on a small binding model the bound count came out about
+10 % low at t = 10, without an error (RuleWorld/nfsim#104). A rate law such as
+`fB(x)*g()`, whose global `g()` reads `MAB`, goes stale the same way, and so does
+a table function counted by an observable or the clock, `fB(x)*tfun(..., MAB)` or
+`fB(x)*tfun(..., time)`. NFsim
+therefore refuses such a read in a function a rate law uses, naming the function
+(or the rule whose rate law it is) and the observable, unless the observable can
+never change: each of its patterns either names only types that no rule names,
+held in seed complexes of such types only, or is a bare `X()` with no
+compartment, counted by a `Molecules` observable, that no rule adds, deletes, or
+can delete along with a whole species, and that no fixed (`$`) seed species
+holds. Because such a count is constant only while the rules alone act on it,
+an `NfsimSession` also refuses `add_molecules`, `add_species`, `remove_species`
+or `set_species_count` on a type it counts. The check errs toward refusing (issue #1062 lifts
+it once the upstream fix is vendored). A rate law that is a global function of
+its own, such as `g()` reading `MAB`, is re-evaluated whenever `MAB` changes and
+runs. Otherwise simulate the model's generated network with `method="ode"` or
+`method="ssa"`.
 
 ### Stateful network-free sessions
 
@@ -171,6 +256,24 @@ with RuleMonkeySession("model.xml") as rm:
     rm.initialize(seed=42)
     result = rm.simulate(0, 100, n_points=101)
 ```
+
+A RuleMonkey session's clock is model time. `initialize(seed, t_start=5)` puts
+the seed state at t = 5; left unset, the first `simulate` sets it from its own
+start for a model that reads the clock, provided nothing has moved the session
+first. A segment that starts at `current_time` runs on the clock. One that
+starts elsewhere continues from `current_time` and is labelled with the times
+asked for, which a model that reads the clock refuses, since its rows would not
+be labelled with the times it read. An NFsim session's clock is elapsed time.
+On both, a result's `solver_stats["n_steps"]` counts the events since
+`initialize`, not the segment's alone.
+
+On NFsim, a `set_param` reaches every rate constant, Michaelis-Menten `kcat` and
+`Km`, and function, before or after `initialize()`, but not a compartment's
+size. BioNetGen writes the size into the XML as a number, so a write to the
+parameter behind it (`Vc` in `c 3 Vc`) changes `get_parameter('Vc')` and leaves
+the model at the old volume: a zero-order synthesis into `c` keeps its old rate
+(issue #1061, waiting on RuleWorld/bionetgen#347 and RuleWorld/nfsim#105). To
+change a volume, regenerate the XML from BNGL at the new value.
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`
