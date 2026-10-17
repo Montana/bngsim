@@ -95,7 +95,15 @@ def test_clones_of_a_model_that_was_never_analyzed_share_one_analysis(tmp_path, 
 def test_a_sensitivity_run_on_each_clone_analyzes_once(tmp_path, monkeypatch):
     """The same through ``Simulator.run``, which attaches the support map to
     every result of a sensitivity run: two clones, two Simulators, two runs
-    with the same columns, one analysis."""
+    with the same columns, one analysis. On a cache of its own: a warm one
+    holds the artifact with its note (issue #1004), which serves the map with
+    no analysis at all, so a second run of the suite on one cache (the
+    pre-push hook's, under the rootdir) counted none."""
+    from bngsim import _codegen
+
+    cache = tmp_path / "codegen-cache"
+    cache.mkdir()
+    monkeypatch.setattr(_codegen, "CACHE_DIR", cache)
     made = _analyses_made(monkeypatch)
     base = _model(tmp_path)
     columns = []
