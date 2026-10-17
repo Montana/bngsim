@@ -710,6 +710,47 @@ static std::string parse_method_option(const std::string &expr, size_t pos) {
     return expr.substr(q1 + 1, q2 - q1 - 1);
 }
 
+// Find the matching ')' for the '(' at expr[open_pos]. Returns std::string::npos
+// if the parens are unbalanced.
+static size_t find_matching_close_paren(const std::string &expr, size_t open_pos) {
+    size_t depth = 1;
+    for (size_t i = open_pos + 1; i < expr.size(); ++i) {
+        if (expr[i] == '(')
+            ++depth;
+        else if (expr[i] == ')') {
+            if (--depth == 0)
+                return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// The index argument at `p`, which is left past it: a name, with the "()" of a
+// call when the model wrote one (`Atot()`, `time()`). BioNetGen keeps a tfun's
+// index as written and puts it in the .net so, and register_table_function_
+// strips the "()" as it does for add_table_function. Read up to the first
+// parenthesis, `Atot()` was `Atot(`, and the load failed with "index variable
+// 'Atot(' not found".
+static std::string read_tfun_index(const std::string &expr, size_t &p) {
+    const size_t start = p;
+    while (p < expr.size() && expr[p] != ',' && expr[p] != ')' && expr[p] != ' ' &&
+           expr[p] != '\t') {
+        if (expr[p] == '(') {
+            const size_t close = find_matching_close_paren(expr, p);
+            if (close == std::string::npos)
+                break; // unbalanced: the name is what precedes it
+            const std::string name = expr.substr(start, p - start);
+            const bool empty_call =
+                expr.find_first_not_of(" \t", p + 1) == close; // `k()` or `k( )`
+            const std::string call = expr.substr(start, close + 1 - start);
+            p = close + 1;
+            return empty_call ? name + "()" : call;
+        }
+        ++p;
+    }
+    return expr.substr(start, p - start);
+}
+
 static bool parse_tfun_expression(const std::string &expr, TfunSpec &spec) {
     auto pos = expr.find("tfun(");
     if (pos == std::string::npos)
@@ -736,12 +777,8 @@ static bool parse_tfun_expression(const std::string &expr, TfunSpec &spec) {
         // Skip comma + whitespace to get index name
         while (p < expr.size() && (expr[p] == ',' || expr[p] == ' ' || expr[p] == '\t'))
             ++p;
-        // Read index name (until comma, paren, or whitespace)
-        size_t idx_start = p;
-        while (p < expr.size() && expr[p] != ',' && expr[p] != ')' && expr[p] != ' ' &&
-               expr[p] != '\t')
-            ++p;
-        spec.index_name = (p > idx_start) ? expr.substr(idx_start, p - idx_start) : "time";
+        const std::string index = read_tfun_index(expr, p);
+        spec.index_name = index.empty() ? "time" : index;
         spec.method = parse_method_option(expr, p);
         spec.filename = "";
         return !spec.xs.empty() && !spec.ys.empty();
@@ -769,10 +806,8 @@ static bool parse_tfun_expression(const std::string &expr, TfunSpec &spec) {
             if (expr.substr(idx_start, 6) == "method") {
                 spec.method = parse_method_option(expr, idx_start);
             } else {
-                auto idx_end = expr.find_first_of(" \t,)", idx_start);
-                if (idx_end == std::string::npos)
-                    idx_end = expr.size();
-                spec.index_name = expr.substr(idx_start, idx_end - idx_start);
+                size_t idx_end = idx_start;
+                spec.index_name = read_tfun_index(expr, idx_end);
                 // Check for method after index
                 spec.method = parse_method_option(expr, idx_end);
             }
@@ -788,21 +823,6 @@ struct TfunCallLocation {
     size_t end;   // one past the matching ')'
     TfunSpec spec;
 };
-
-// Find the matching ')' for the '(' at expr[open_pos]. Returns std::string::npos
-// if the parens are unbalanced.
-static size_t find_matching_close_paren(const std::string &expr, size_t open_pos) {
-    size_t depth = 1;
-    for (size_t i = open_pos + 1; i < expr.size(); ++i) {
-        if (expr[i] == '(')
-            ++depth;
-        else if (expr[i] == ')') {
-            if (--depth == 0)
-                return i;
-        }
-    }
-    return std::string::npos;
-}
 
 // Find the next "tfun(" token starting at or after `pos`. The token must be a
 // whole identifier (not part of a longer name like `mytfun(`).
