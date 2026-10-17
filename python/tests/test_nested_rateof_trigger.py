@@ -1,13 +1,14 @@
 """Issue #991: a trigger on the rateOf of a species whose own rate is a rateOf.
 
 The right-hand side probes the rateOf buffer as deep as the derivatives read
-it (``rateof_flow_nesting``). A trigger can read one level deeper: at
+it (``rateof_flow_nesting``). A trigger can read deeper: at
 ``rateOf(X0) > 0.3`` with ``X0' = rateOf(X3)`` reads a rateOf whose own rate is
 a rateOf, which no derivative does. The root function, and the trigger reads at
 the start, took the buffer from the right-hand side, one probe short, so the
-trigger read X0's rate off whatever the buffer held before. It never fired at a
-smooth crossing, and fired at t = 0 on a rate left there by a probe at another
-state. The trajectory itself was right throughout.
+trigger read X0's rate off whatever the buffer held before. A smooth crossing
+was never found on the interpreted right-hand side and found late on the
+compiled one, and a rate identically zero fired at t = 0 on a rate left there
+by an evaluation at another state. The trajectory itself was right throughout.
 
 Every expected value is a closed form.
 """
