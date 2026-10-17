@@ -1,0 +1,31 @@
+# bngsim GH #1062 fixture: the rate law fB(x)*tfun([0,100],[1,10],MAB). BNG2.pl
+# keeps the table counter MAB only in ctrName, and NFsim leaves the table's
+# value stale off the firing complex (z = -12): refused.
+begin model
+begin parameters
+  k 0.001
+  kr 0.1
+end parameters
+begin molecule types
+  A(b,c)
+  B(a)
+end molecule types
+begin seed species
+  A(b,c) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules AC A(c)
+  Molecules MAB A(b!1).B(a!1)
+end observables
+begin functions
+  fB(x) = k*(1+AC(x))
+  tf() = tfun([0,100],[1,10],MAB)
+end functions
+begin reaction rules
+  %x:A(b) + B(a) -> A(b!1).B(a!1) fB(x)*tfun([0,100],[1,10],MAB)
+  A(b!1).B(a!1) -> A(b) + B(a) kr
+end reaction rules
+end model
+writeXML()

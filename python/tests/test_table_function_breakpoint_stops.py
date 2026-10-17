@@ -205,9 +205,11 @@ def test_the_core_hands_over_each_table(tmp_path):
         "index_kind": "time",
         "index_param_idx": -1,
         "index_obs_idx": -1,
+        "index_func_idx": -1,
         "method": "step",
         "xs": [0.0, 10.0, 12.0, 50.0],
         "ys": [0.0, 5.0, 0.0, 0.0],
+        "read": True,
     }
 
 
@@ -377,13 +379,26 @@ def test_a_small_break_beside_a_stretch_with_none_is_a_stop(tmp_path):
     assert _stop_times(_model(tmp_path, table)) == [10.0, 12.0]
 
 
-def test_the_breaks_are_read_once_for_a_model_and_again_after_a_table_is_added(tmp_path):
+def test_the_breaks_are_read_once_for_a_model_and_again_after_a_table_is_given_data(tmp_path):
+    """New data under the table's name moves its breaks (issue #772); a table
+    added under a new name is read by nothing, and has none."""
     m = _model(tmp_path, _STEP)
     first = m.table_function_breaks()
     assert m.table_function_breaks() is first
     assert m.clone().table_function_breaks() is first
-    m.add_table_function("late", times=[0.0, 20.0, 21.0, 50.0], values=[0.0, 1.0, 0.0, 0.0])
-    assert len(m.table_function_breaks()) == 2
+    m.add_table_function(
+        "F", times=[0.0, 20.0, 21.0, 50.0], values=[0.0, 1.0, 0.0, 0.0], method="step"
+    )
+    assert _stop_times(m) == [20.0, 21.0]
+    assert [
+        s.time for s in table_function_stops(m._core, 0.0, 50.0, m.table_function_breaks())
+    ] == [
+        20.0,
+        21.0,
+    ]
+    with pytest.warns(UserWarning, match="nothing in the model reads"):
+        m.add_table_function("late", times=[0.0, 30.0, 31.0, 50.0], values=[0.0, 1.0, 0.0, 0.0])
+    assert len(m.table_function_breaks()) == 1
 
 
 # ── What the second review found ────────────────────────────────────────────

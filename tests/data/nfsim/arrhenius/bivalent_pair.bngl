@@ -1,0 +1,28 @@
+# Pair pattern on a bivalent ligand: L(r,r), pattern L(r!1).R(l!1) only. One-way
+# unbinding: each bond breaks at exp(-(0.2+0.35*2)) = 0.4066, so a doubly
+# bound L stays doubly bound with probability exp(-2*0.4066*t).
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_LR -2
+end parameters
+begin molecule types
+  L(r,r)
+  R(l)
+end molecule types
+begin seed species
+  L(r!1,r!2).R(l!1).R(l!2) 1000
+end seed species
+begin energy patterns
+  L(r!1).R(l!1) G_LR
+end energy patterns
+begin observables
+  Species Full L(r!+,r!+)
+end observables
+begin reaction rules
+  L(r!1).R(l!1) -> L(r) + R(l) Arrhenius(phi,Ea0)
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()

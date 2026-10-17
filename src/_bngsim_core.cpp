@@ -2191,11 +2191,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, filepath, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("filepath"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from a .tfun file")
+            py::arg("method") = "", "Add a table function from a .tfun file")
 
         .def(
             "add_table_function_arrays",
@@ -2205,11 +2205,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 try {
                     self.add_table_function(name, xs, ys, index_name, method);
                 } catch (const std::exception &e) {
-                    throw py::value_error(std::string("Failed to add table function: ") + e.what());
+                    throw py::value_error(e.what());
                 }
             },
             py::arg("name"), py::arg("xs"), py::arg("ys"), py::arg("index_name") = "time",
-            py::arg("method") = "linear", "Add a table function from arrays")
+            py::arg("method") = "", "Add a table function from arrays")
 
         .def_property_readonly("n_table_functions", &bngsim::NetworkModel::n_table_functions)
         .def_property_readonly("table_function_names", &bngsim::NetworkModel::table_function_names)
@@ -2223,18 +2223,23 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     td["index_kind"] = spec.index_kind;
                     td["index_param_idx"] = spec.index_param_idx;
                     td["index_obs_idx"] = spec.index_obs_idx;
+                    td["index_func_idx"] = spec.index_func_idx;
                     td["method"] = spec.method;
                     td["xs"] = spec.xs;
                     td["ys"] = spec.ys;
+                    td["read"] = spec.read;
                     out.append(td);
                 }
                 return out;
             },
-            "Every table function with its table: [{name, index_kind ('time', 'parameter' or "
-            "'observable'), index_param_idx, index_obs_idx, method ('linear' or 'step'), xs, "
-            "ys}], in dispatch-id order. The knots of a table read on the clock are where its "
+            "Every table function with its table: [{name, index_kind ('time', 'parameter', "
+            "'function' or 'observable'), index_param_idx, index_obs_idx, index_func_idx, "
+            "method ('linear' or 'step'), xs, ys, read}], in dispatch-id order. A 'parameter' is "
+            "a slot no function owns; a table over a model function is 'function' (issue #965). "
+            "The knots of a table read on the clock are where its "
             "value (step) or slope (linear) breaks, and Simulator.run stops the integration on "
-            "each (issue #709).")
+            "each (issue #709). 'read' is whether an expression of the model calls the table: "
+            "true for one its source declares, false for one added after load (issue #772).")
         .def(
             "evaluate_over_times",
             [](const bngsim::NetworkModel &m, const std::string &expression,
@@ -2458,8 +2463,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                 d["reactions"] = rxn_list;
 
                 // Table functions: [{name, index_kind, index_param_idx,
-                // index_obs_idx, step}, ...] in dispatch-id order. Lets the
-                // model-based codegen path emit
+                // index_obs_idx, index_func_idx, step}, ...] in dispatch-id
+                // order. Lets the model-based codegen path emit
                 //   data->tfun_eval(tf_id, idx_c, data->tfun_ctx)
                 // for any BNGL function whose name appears here. Empty
                 // for SBML/Antimony models without tfuns.
@@ -2470,6 +2475,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                     td["index_kind"] = spec.index_kind;
                     td["index_param_idx"] = spec.index_param_idx;
                     td["index_obs_idx"] = spec.index_obs_idx;
+                    td["index_func_idx"] = spec.index_func_idx;
                     td["step"] = spec.step;
                     tf_list.append(td);
                 }
@@ -2749,16 +2755,24 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def("set_block_same_complex_binding",
              &bngsim::RuleMonkeySimulator::set_block_same_complex_binding, py::arg("enabled"),
              "Block same-complex binding. Default: true.")
+        .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
+             "Whether the model reads the clock (default true): one-shot runs then run on "
+             "the model's clock, else on time elapsed since t_start, and a span too short "
+             "for the doubles near its times to integrate a clock-driven rate is refused")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
+        .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
+             "RuleMonkey's warning-level load diagnostics, each 'element: feature'")
         // ── Session API (stateful, multi-action workflows) ──────────────
         .def(
             "initialize",
-            [](bngsim::RuleMonkeySimulator &self, uint64_t seed) {
+            [](bngsim::RuleMonkeySimulator &self, uint64_t seed, double t_start) {
                 py::gil_scoped_release release;
-                self.initialize(seed);
+                self.initialize(seed, t_start);
             },
-            py::arg("seed") = 42, "Initialize a simulation session")
+            py::arg("seed") = 42, py::arg("t_start") = 0.0,
+            "Initialize a simulation session with the seed state at t_start on the "
+            "model's clock")
         .def(
             "step_to",
             [](bngsim::RuleMonkeySimulator &self, double time, double timeout_seconds) {

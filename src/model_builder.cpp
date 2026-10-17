@@ -2430,21 +2430,24 @@ NetworkModel ModelBuilder::build() {
     // Load/create table functions and register them with the model BEFORE
     // function compilation, since function expressions may reference tfuns.
     // Supports inline data and step interpolation compatible with BioNetGen
-    // tfun syntax.
+    // tfun syntax. A whole-body tfun's table takes the name of the function it
+    // is the body of, which the public add_table_function refuses (issue #772),
+    // so these go in through the private entry that allows it.
     for (const auto &spec : bimpl_->tfun_specs) {
         try {
             if (spec.is_inline) {
                 // Inline data: create TableFunction directly from arrays
-                model.add_table_function(spec.func_name, spec.xs, spec.ys, spec.index_name,
-                                         spec.method);
+                model.add_table_function_(spec.func_name, spec.xs, spec.ys, spec.index_name,
+                                          spec.method, /*backs_a_function=*/true);
             } else {
                 // File-based: resolve path relative to .net file directory
                 std::string tfun_path = spec.filepath;
                 if (!tfun_path.empty() && tfun_path[0] != '/' && !bimpl_->net_file_dir.empty()) {
                     tfun_path = bimpl_->net_file_dir + "/" + spec.filepath;
                 }
-                model.add_table_function(spec.func_name, tfun_path, spec.index_name, spec.method,
-                                         spec.header_name);
+                model.add_table_function_(spec.func_name, tfun_path, spec.index_name, spec.method,
+                                          spec.header_name,
+                                          /*backs_a_function=*/true);
             }
         } catch (const std::exception &e) {
             throw std::runtime_error("Failed to create table function '" + spec.func_name +
@@ -2519,8 +2522,9 @@ NetworkModel ModelBuilder::build() {
     // no warning (issue #654). `time` is the only clock symbol in the grammar
     // (`t` is deliberately left free as an ordinary identifier, see
     // src/expression.cpp), and a time-indexed table function is the other way
-    // in — that one is flagged by register_table_function_() when the tfun is
-    // registered, above and post-build alike.
+    // in — that one is flagged by add_table_function_() when the tfun is
+    // registered above. A table added after load is read by nothing, so it
+    // does not set it (issue #772).
     //
     // No transitive closure is needed: the flag is about the function block as
     // a whole, so a function that reads a time-dependent one is already covered

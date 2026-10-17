@@ -81,7 +81,10 @@ For the current pinned baseline the expected peeled commit is:
 
 ### 1. Preview Before Writing
 
-From the PyBNF repo root:
+From the PyBNF repo root. In a standalone checkout, run from inside it and drop
+the `bngsim/` prefix: from the directory above a checkout with another name,
+`bngsim/scripts/...` is some other checkout's script, and it would act on that
+checkout (GH #864).
 
 ```sh
 python3 bngsim/scripts/vendor_sundials.py \

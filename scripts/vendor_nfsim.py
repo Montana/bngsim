@@ -15,13 +15,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# The bngsim checkout itself. REPO_ROOT is its *parent*, which is a Git work
-# tree only in the monorepo layout this script was written for -- in a
-# standalone bngsim clone it is just the directory above the repo. Anything
-# that shells out to git must use BNGSIM_ROOT. Matches the other four
-# scripts/vendor_*.py.
-BNGSIM_ROOT = REPO_ROOT / "bngsim"
+# The bngsim checkout itself: scripts/ sits directly under it. Derive it from
+# this file, not as <parent>/bngsim, which names a missing directory in a
+# checkout called anything else and the other checkout in a clone beside one
+# (GH #864).
+BNGSIM_ROOT = Path(__file__).resolve().parents[1]
 VENDOR_DIR = BNGSIM_ROOT / "third_party" / "nfsim"
 PATCHES_DIR = BNGSIM_ROOT / "scripts" / "nfsim_vendor_patches"
 METADATA_NAME = "VENDOR.json"
@@ -323,9 +321,83 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-zero-order-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Keep a zero-order rule's rate parameter name when NFinput folds the rule's "
+            "volume conversion into its base rate, and reapply the conversion in "
+            "resetBaseRateFromSystemParamter(). NFinput re-set the rate with an empty name, "
+            "so a setParameter() after load (bngsim's post-init set_param) skipped the rule "
+            "and it kept producing at its old rate, silently. The fold scales the rate in "
+            "place (ReactionClass::scaleBaseRate) rather than through setBaseRate(), which "
+            "applied the symmetry factor a second time. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "e4d1a99b96d9a1eb105ec8eb818ca45e155c5e55",
+                "summary": "bngsim: keep a zero-order rule's rate parameter through its volume conversion",
+            },
+            {
+                "commit": "36092b2eaa676794bce8b2beb163c284e56694b4",
+                "summary": (
+                    "bngsim: fold a zero-order volume conversion without reapplying the "
+                    "symmetry factor"
+                ),
+            },
+        ],
+    },
+    {
+        "topic": "bngsim/carry-mm-rate-refresh",
+        "kind": "local",
+        "status": (
+            "Refresh a Michaelis-Menten rule's kcat and Km from their parameters in "
+            "resetBaseRateFromSystemParamter() (now virtual). MMRxnClass held both as numbers "
+            "with no parameter name, so a setParameter() after load (bngsim's post-init "
+            "set_param) left the rule at its old kcat and Km, silently. See bngsim GH #854."
+        ),
+        "commits": [
+            {
+                "commit": "9cbe556f9e72c398383424cca480a7d8303f1ece",
+                "summary": "bngsim: refresh a Michaelis-Menten rule's kcat and Km on setParameter",
+            },
+        ],
+    },
+    {
+        "topic": "bngsim/carry-function-build-exit-to-exception",
+        "kind": "local",
+        "status": (
+            "Throw std::runtime_error instead of calling exit(1) where NFsim cannot build a "
+            "BNG-written function or a rule that reads one: DORRxnClass/DOR2RxnClass, "
+            "Observable/SpeciesObservable, LocalFunction's constructor and "
+            "prepareForSimulation(), and createCompositeFunction. A local-function rate law "
+            "reading both reactants, a local function reading a Species observable, a "
+            "two-argument local function, or a composite function reading an observable "
+            "killed the host process with no message; NFinput now fails the load and the "
+            "host reports it. Same conversion as bngsim/carry-exit-to-exception, for files it "
+            "left out. See bngsim GH #854's review."
+        ),
+        "commits": [
+            {
+                "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
+                "summary": (
+                    "bngsim: throw instead of exit(1) where a BNG-written function cannot be built"
+                ),
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12
+
+
+def display_path(path: Path) -> str:
+    """``path`` as ``bngsim/<path under the checkout>``, whatever the checkout's name.
+
+    The form messages and VENDOR.json use, so the recorded metadata does not
+    depend on where the checkout lives (GH #864).
+    """
+    return f"bngsim/{path.relative_to(BNGSIM_ROOT).as_posix()}"
 
 
 def run(cmd: list[str], cwd: Path | None = None, text: bool = True) -> subprocess.CompletedProcess:
@@ -425,18 +497,18 @@ def export_nfsim_tree(nfsim_repo: Path, commit: str, destination: Path) -> Path:
 
 
 def ensure_clean_destination(force: bool) -> None:
-    # Query git from BNGSIM_ROOT, not REPO_ROOT: REPO_ROOT is the *parent* of
-    # the bngsim checkout, which is not itself a work tree in a standalone
-    # clone -- `git -C <parent> status` then exits 128 and this guard aborts the
-    # whole refresh instead of checking anything, pushing everyone to --force,
-    # which skips the check outright. vendor_rulemonkey.py already fixed this.
+    # Query git from BNGSIM_ROOT, the checkout itself, never its parent: the
+    # parent is not a work tree in a standalone clone -- `git -C <parent>
+    # status` then exits 128 and this guard aborts the whole refresh instead
+    # of checking anything, pushing everyone to --force, which skips the check
+    # outright.
     if force:
         return
     rel_vendor = VENDOR_DIR.relative_to(BNGSIM_ROOT)
     status = run(["git", "status", "--porcelain", "--", str(rel_vendor)], cwd=BNGSIM_ROOT).stdout
     if status.strip():
         raise RuntimeError(
-            f"{VENDOR_DIR.relative_to(REPO_ROOT)} has uncommitted changes. "
+            f"{display_path(VENDOR_DIR)} has uncommitted changes. "
             "Commit/stash them or rerun with --force."
         )
 
@@ -643,7 +715,7 @@ def print_summary(
             print(f"Current vendored base commit: {current_base_commit}")
 
     print()
-    print(f"Tree delta vs {VENDOR_DIR.relative_to(REPO_ROOT)}:")
+    print(f"Tree delta vs {display_path(VENDOR_DIR)}:")
     counts = difference_counts(differences)
     print(f"  total differences: {len(differences)}")
     print(f"  changed: {counts.get('changed', 0)}")
@@ -854,7 +926,7 @@ def run_verify_clean(args: argparse.Namespace) -> int:
         return 1
 
     resolved_ref, commit = resolve_ref(nfsim_repo, args.ref)
-    rel_vendor = VENDOR_DIR.relative_to(REPO_ROOT)
+    rel_vendor = display_path(VENDOR_DIR)
     failures: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="vendor-nfsim-verify-") as tmp:
@@ -942,7 +1014,7 @@ def main() -> int:
         if args.check:
             if differences:
                 print(
-                    f"{VENDOR_DIR.relative_to(REPO_ROOT)} differs from "
+                    f"{display_path(VENDOR_DIR)} differs from "
                     f"{resolved_ref}{resolution_note} @ {commit}:"
                 )
                 for diff in differences[:80]:
@@ -950,17 +1022,14 @@ def main() -> int:
                 if len(differences) > 80:
                     print(f"  ... {len(differences) - 80} more")
                 return 1
-            print(
-                f"{VENDOR_DIR.relative_to(REPO_ROOT)} matches {resolved_ref}{resolution_note} @ {commit}"
-            )
+            print(f"{display_path(VENDOR_DIR)} matches {resolved_ref}{resolution_note} @ {commit}")
             return 0
 
         ensure_clean_destination(args.force)
         copy_tree(source, VENDOR_DIR)
         write_metadata(nfsim_repo, resolved_ref, commit)
         print(
-            f"Refreshed {VENDOR_DIR.relative_to(REPO_ROOT)} from "
-            f"{resolved_ref}{resolution_note} @ {commit}"
+            f"Refreshed {display_path(VENDOR_DIR)} from {resolved_ref}{resolution_note} @ {commit}"
         )
     return 0
 

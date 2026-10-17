@@ -1,0 +1,38 @@
+# bngsim GH #1062 fixture: fA(x) reads AEC = A()@EC outside its argument. No
+# rule adds or deletes an A, but transport moves A out of EC, so AEC changes
+# and NFsim leaves it stale (z = +39): refused.
+begin model
+begin parameters
+  k 0.0005
+  kr 0.01
+  kt 1
+end parameters
+begin compartments
+  EC 3 1
+  PM 2 1 EC
+  CP 3 1 PM
+end compartments
+begin molecule types
+  A(b,c)
+  B(a)
+end molecule types
+begin seed species
+  A(b,c)@EC 200
+  A(b,c)@CP 100
+  B(a)@CP 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules AC A(c)
+  Molecules AEC A()@EC
+end observables
+begin functions
+  fA(x) = k*(1+AC(x))*(AEC/20)
+end functions
+begin reaction rules
+  A(b,c)@EC -> A(b,c)@CP kt
+  %x:A(b)@CP + B(a)@CP -> A(b!1)@CP.B(a!1)@CP fA(x)
+  A(b!1).B(a!1) -> A(b) + B(a) kr
+end reaction rules
+end model
+writeXML()

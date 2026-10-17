@@ -1,0 +1,71 @@
+From 07d5fff2da2cd9a89431794f408bd8e10923f8df Mon Sep 17 00:00:00 2001
+From: Montana <montana@linux.com>
+Date: Tue, 13 Oct 2026 16:49:52 -0700
+Subject: [PATCH] bngsim: keep a zero-order rule's rate parameter through its
+ volume conversion
+
+NFinput folds a zero-order rule's volume conversion into its base rate by
+calling setBaseRate(rate * volumeConversion, ""), which clears the rule's
+baseRateParameterName. resetBaseRateFromSystemParamter() skips a rule with
+no parameter name, so a setParameter() after load updated the parameter
+map but left the rule producing at its old rate, silently. Keep the name
+(new ReactionClass::getBaseRateParameterName()), and reapply the
+volumeConversionFactor in resetBaseRateFromSystemParamter() for a
+zero-order rule that carries it in its base rate (every type but
+OBS_DEPENDENT_RXN, which applies it in update_a()). (bngsim issue #854)
+---
+ src/NFcore/NFcore.hh         | 1 +
+ src/NFcore/reactionClass.cpp | 6 ++++++
+ src/NFinput/NFinput.cpp      | 7 ++++++-
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/NFcore/NFcore.hh b/src/NFcore/NFcore.hh
+index 08ab145..ce4c5db 100644
+--- a/src/NFcore/NFcore.hh
++++ b/src/NFcore/NFcore.hh
+@@ -1308,6 +1308,7 @@ namespace NFcore
+ 			string getName() const { return name; };
+ 			int getFireCounter() const { return fireCounter; };
+ 			double getBaseRate() const { return baseRate; };
++			string getBaseRateParameterName() const { return baseRateParameterName; };
+ 			int getRxnType() const { return reactionType; };
+ 
+ 			MoleculeType *getMoleculeTypeOfReactantTemplate(int pos) const;
+diff --git a/src/NFcore/reactionClass.cpp b/src/NFcore/reactionClass.cpp
+index 0b091f3..7114b7a 100755
+--- a/src/NFcore/reactionClass.cpp
++++ b/src/NFcore/reactionClass.cpp
+@@ -361,6 +361,12 @@ void ReactionClass::resetBaseRateFromSystemParamter() {
+ 		else {
+ 			this->baseRate=system->getParameter(this->baseRateParameterName);
+ 		}
++		// A zero-order rule carries its volume conversion in the base rate
++		// (NFinput applies it at load); reapply it here, or the refreshed
++		// rate would drop it. bngsim GH #854.
++		if (n_reactants == 0 && reactionType != ReactionClass::OBS_DEPENDENT_RXN) {
++			this->baseRate *= this->volumeConversionFactor;
++		}
+ 		this->update_a();
+ 	}
+ 
+diff --git a/src/NFinput/NFinput.cpp b/src/NFinput/NFinput.cpp
+index cc55c40..bc0aff4 100644
+--- a/src/NFinput/NFinput.cpp
++++ b/src/NFinput/NFinput.cpp
+@@ -2769,7 +2769,12 @@ bool NFinput::initReactionRulePermutation(
+ 						if (ts->getNreactants() == 0) {
+ 							r->volumeConversionFactor = volumeConversion;
+ 							if (r->getRxnType() != ReactionClass::OBS_DEPENDENT_RXN) {
+-								r->setBaseRate(r->getBaseRate() * volumeConversion, "");
++								// Keep the rate's parameter name, so a later
++								// setParameter() still refreshes this rule
++								// (resetBaseRateFromSystemParamter() reapplies
++								// the conversion). bngsim GH #854.
++								r->setBaseRate(r->getBaseRate() * volumeConversion,
++								               r->getBaseRateParameterName());
+ 							}
+ 						}
+ 
+-- 
+2.48.1
+

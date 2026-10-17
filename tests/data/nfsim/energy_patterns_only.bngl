@@ -1,0 +1,27 @@
+# bngsim GH #854 fixture: an energy pattern with no Arrhenius rule. The pattern
+# changes no rate, so NFsim must still run it (only Arrhenius rate laws are refused).
+begin model
+begin parameters
+  kon  0.01
+  koff 0.1
+  Gf   -1
+end parameters
+begin molecule types
+  A(b)
+  B(a)
+end molecule types
+begin seed species
+  A(b) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+end observables
+begin energy patterns
+  A(b!1).B(a!1) Gf
+end energy patterns
+begin reaction rules
+  A(b) + B(a) <-> A(b!1).B(a!1) kon, koff
+end reaction rules
+end model
+writeXML()

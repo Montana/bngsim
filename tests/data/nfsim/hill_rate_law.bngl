@@ -1,0 +1,25 @@
+# bngsim GH #854 fixture: a Hill rate law, which BNG2.pl writes into the XML
+# and the vendored NFsim does not implement (it drops the rule silently).
+begin model
+begin parameters
+  Vmax 5
+  Kh 100
+  nh 2
+end parameters
+begin molecule types
+  E()
+  S()
+  P()
+end molecule types
+begin seed species
+  E() 10
+  S() 1000
+end seed species
+begin observables
+  Molecules Ptot P()
+end observables
+begin reaction rules
+  S() + E() -> P() + E() Hill(Vmax,Kh,nh)
+end reaction rules
+end model
+writeXML()

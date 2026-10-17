@@ -33,6 +33,10 @@ import bngsim
 import numpy as np
 import pytest
 
+# Tables added after load here are fixtures that nothing in the model reads,
+# which add_table_function warns about (issue #772).
+pytestmark = pytest.mark.filterwarnings("ignore:nothing in the model reads table function")
+
 _SET = "species X; X = 2; a = 5; tau = 3\nE1: at (time {op} tau): X = a\n"
 
 

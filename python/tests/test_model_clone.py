@@ -34,6 +34,7 @@ original (covered in `test_clone_mutations_independent_*`).
 import math
 
 import numpy as np
+import pytest
 from bngsim._bngsim_core import (
     CvodeSimulator,
     ModelBuilder,
@@ -271,8 +272,9 @@ def test_clone_with_table_function():
     b.add_reaction([s_idx], [], "elementary", "k")
     core = b.build()
     model = bngsim.Model(_core=core)
-    # Constant tfun: scale(t) = 2 for all t. Use as a function body factor.
-    model.add_table_function("scale", times=[0, 100], values=[2.0, 2.0])
+    # Constant tfun: scale(t) = 2 for all t. Nothing in the model reads it.
+    with pytest.warns(UserWarning, match="nothing in the model reads"):
+        model.add_table_function("scale", times=[0, 100], values=[2.0, 2.0])
 
     clone = model.clone()
     # Both should have one table function in the cloned core
@@ -291,8 +293,9 @@ def test_clone_carries_functions_use_time():
     clones are what `run_replicates` hands each worker — a flag that did not
     carry would leave every replicate running the unsub-stepped loop while the
     original reported the gate as set. Both ways in are checked: a function that
-    names `time` (plain data on the clone) and a time-indexed table function
-    (re-established by the clone's own `register_table_function_` call).
+    names `time` and a function that calls a time-indexed table function, both
+    plain data on the clone. A table added after build is called by nothing, so
+    it sets the gate on neither (issue #772).
     """
     import bngsim
 
@@ -307,14 +310,23 @@ def test_clone_carries_functions_use_time():
     assert _decay("0.1*time()").clone().functions_use_time
     assert not _decay("0.1").clone().functions_use_time
 
-    # A tfun added post-build (index defaults to `time`) flips the flag through
-    # register_table_function_, and the clone re-runs that same registration.
+    # A tfun the builder declares as kf's body, read on the clock, sets it.
+    b = ModelBuilder()
+    s_idx = b.add_species("S", 100.0)
+    b.add_function("kf", "0.1")
+    b.add_inline_table_function_spec("kf", [0.0, 100.0], [0.1, 0.1], "time", "linear")
+    b.add_reaction([s_idx], [], "functional", "kf")
+    core = b.build()
+    assert core.functions_use_time
+    assert core.clone().functions_use_time
+
+    # One added post-build is called by no expression, and leaves it unset.
     core = _decay("0.1")
-    assert not core.functions_use_time
     model = bngsim.Model(_core=core)
-    model.add_table_function("scale", times=[0, 100], values=[2.0, 2.0])
-    assert model._core.functions_use_time
-    assert model.clone()._core.functions_use_time
+    with pytest.warns(UserWarning, match="nothing in the model reads"):
+        model.add_table_function("scale", times=[0, 100], values=[2.0, 2.0])
+    assert not model._core.functions_use_time
+    assert not model.clone()._core.functions_use_time
 
 
 # ─── Events ──────────────────────────────────────────────────────────────────
