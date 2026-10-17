@@ -185,7 +185,7 @@ def run_diffrax(
     # solver serves every piece: its bounds, start state and output times are
     # arguments, the output times padded with the piece's end, the last of which
     # is the state the next piece starts from.
-    def _compiled(solver):
+    def _compiled(solver, throw):
         @jax.jit
         def _solve(a, b, y_a, seg_ts, params):
             sol = diffrax.diffeqsolve(
@@ -199,15 +199,24 @@ def run_diffrax(
                 saveat=diffrax.SaveAt(ts=seg_ts),
                 stepsize_controller=stepsize_controller,
                 max_steps=max_steps,
+                throw=throw,
             )
-            return sol.ys, sol.stats["num_steps"]
+            return sol.ys, sol.stats["num_steps"], sol.result == diffrax.RESULTS.successful
 
         return _solve
 
-    solve_last = _compiled(diffrax.Kvaerno5())
-    solve_to_a_switch = _compiled(diffrax.Kvaerno3())  # compiled on first use only
+    solve_last = _compiled(diffrax.Kvaerno5(), throw=not switch_ts)
+    solve_to_a_switch = _compiled(diffrax.Kvaerno3(), throw=False)  # compiled on first use only
+    # diffrax's implicit solvers cannot take a step as short as some pieces are:
+    # the Newton iteration reads roundoff as divergence, the step is turned down
+    # and shrunk, and so on until the steps run out. A switch 1e-6 after t_start,
+    # 1e-12 before t_end, or two 2e-8 apart made such a piece. A piece the
+    # implicit solve fails on is solved again with Tsit5, which has no Newton
+    # iteration, and whose stages also lie within its step. A run with no switch
+    # is one piece, and keeps main's behaviour exactly, raising what it raised.
+    solve_explicitly = _compiled(diffrax.Tsit5(), throw=False)
 
-    edges = [float(t_start), *switch_ts, float(t_end)]
+    edges = [float(t_start), *(t for t, _ in switch_ts), float(t_end)]
     species_out = np.empty((n_points, len(sp_names)), dtype=np.float64)
     y_a = y0
     n_steps = 0
@@ -224,10 +233,35 @@ def run_diffrax(
             mine = np.flatnonzero((out_ts <= edges[i + 1]) & ((out_ts > edges[i]) | (i == 0)))
         seg_ts = np.full(n_points + 1, b)
         seg_ts[: mine.size] = np.clip(out_ts[mine], min(a, b), max(a, b))
+        if i > 0:
+            # A counter clock reaches its threshold at the switch only to within
+            # the integration's error, and a few floats short the next piece read
+            # the branch that had just ended: a dozen rejected steps, and an
+            # accepted one on the wrong branch. It is put just past its threshold,
+            # as the core puts it at its exact value before CVODE restarts (issue
+            # #82). (A counter that runs ahead reads the next branch before the
+            # piece ends instead, which this cannot repair.)
+            y_np = np.array(y_a, dtype=np.float64)
+            for idx, threshold in switch_ts[i - 1][1]:
+                y_np[idx] = max(y_np[idx], float(np.nextafter(threshold, np.inf)))
+            y_a = jnp.asarray(y_np)
         solve = solve_last if i == len(edges) - 2 else solve_to_a_switch
-        ys, n = solve(
-            jnp.float64(a), jnp.float64(b), y_a, jnp.asarray(seg_ts, dtype=jnp.float64), params
+        args = (
+            jnp.float64(a),
+            jnp.float64(b),
+            y_a,
+            jnp.asarray(seg_ts, dtype=jnp.float64),
+            params,
         )
+        ys, n, ok = solve(*args)
+        if switch_ts and not bool(ok):
+            ys, n, ok = solve_explicitly(*args)
+            if not bool(ok):
+                raise ValueError(
+                    f"run_diffrax could not integrate the run from {a!r} to {b!r}, between "
+                    "two of its switch times, with an implicit or an explicit solver "
+                    f"within max_steps={max_steps}; use Simulator(method='ode')."
+                )
         ys = np.asarray(ys)
         species_out[mine] = ys[: mine.size]
         y_a = jnp.asarray(ys[-1])
@@ -241,11 +275,10 @@ def run_diffrax(
     }
 
 
-def _switch_times(model, t_start: float, t_end: float) -> list[float]:
-    """The instants in ``(t_start, t_end)`` at which a condition of *model*'s
-    functions switches on the clock, which run_diffrax splits the run at (issue
-    #865). A condition only a reporting function reads costs a split, which is
-    harmless, as the ODE path stops there too.
+def _switch_times(model, t_start: float, t_end: float) -> list[tuple[float, tuple]]:
+    """The instants in ``(t_start, t_end)`` at which a rate law of *model* switches
+    on the clock, which run_diffrax splits the run at (issue #865), each with the
+    counter clocks that cross there as ``(species index, threshold)``.
 
     A condition on the clock, ``if(time() > 1.37, 5, 0.1)``, is a jump in the
     right-hand side, and the step-size controller stepped across it: several
@@ -253,7 +286,10 @@ def _switch_times(model, t_start: float, t_end: float) -> list[float]:
     step budget there and failed. The crossings are constants of the run, the
     ones CVODE stops on (:func:`bngsim._switch_sensitivity.crossings_with_periodic`).
     These are the crossings themselves, a periodic condition's included, not the
-    stops CVODE places a little past one.
+    stops CVODE places a little past one. A condition only a reporting function
+    reads changes an output, not the trajectory, which is all run_diffrax returns,
+    and is left out: a split there cost a model whose rate laws never switch
+    hundreds of steps, and changed its answer.
 
     A condition a rate law reads that switches more often than a run's budget of
     stops has none placed, and a failure to place them would leave the run
@@ -262,6 +298,8 @@ def _switch_times(model, t_start: float, t_end: float) -> list[float]:
     switch on the clock, whose times are placed forward.
     """
     conditions = model.time_discontinuity_conditions()
+    if conditions:
+        conditions = _conditions_the_run_switches_on(model, conditions)
     if not conditions:
         return []
     if t_end < t_start:
@@ -270,7 +308,6 @@ def _switch_times(model, t_start: float, t_end: float) -> list[float]:
             "clock; this one has one, and its switch times are placed forward. Use "
             "Simulator(method='ode') or run forward."
         )
-    from bngsim._simulator import Simulator
     from bngsim._switch_sensitivity import crossings_with_periodic
 
     over_budget: list = []
@@ -288,12 +325,32 @@ def _switch_times(model, t_start: float, t_end: float) -> list[float]:
             f"run_diffrax could not place the times this model's rate laws switch at ({e}); "
             "use Simulator(method='ode')."
         ) from e
-    # Only a condition the run switches on counts: one in a function that only
-    # reports is no reason to refuse, as the ODE path decides (Simulator).
-    if Simulator._switches_the_run(model, over_budget):
+    if over_budget:
         raise ValueError(
             "run_diffrax cannot stop at every switch of this model: "
             f"{len(over_budget)} condition(s) switch more often than a run may stop, or "
             "too irregularly to count; use Simulator(method='ode')."
         )
-    return sorted({float(c.time) for c in (*crossings, *periodic_at) if t_start < c.time < t_end})
+    counters: dict[float, set] = {}
+    for c in (*crossings, *periodic_at):
+        t = float(c.time)
+        if t_start < t < t_end:
+            at = counters.setdefault(t, set())
+            if c.clock_species_idx >= 0:
+                at.add((int(c.clock_species_idx), float(c.threshold)))
+    return [(t, tuple(sorted(counters[t]))) for t in sorted(counters)]
+
+
+def _conditions_the_run_switches_on(model, conditions) -> list:
+    """Those of *conditions* a rate law reads, or a loader registered as the
+    run's own, as the ODE path counts them (``Simulator._switches_the_run``)."""
+    from bngsim._switch_sensitivity import conditions_a_rate_law_reads
+
+    registered = set(getattr(model, "_time_disc_conditions", None) or ())
+    asked = [c for c in conditions if c not in registered]
+    try:
+        read = conditions_a_rate_law_reads(model._core, asked)
+    except Exception as e:  # pragma: no cover - defensive: then all of them count
+        logger.debug("which conditions a rate law reads: not read (%s)", e)
+        read = frozenset(asked)
+    return [c for c in conditions if c in registered or c in read]

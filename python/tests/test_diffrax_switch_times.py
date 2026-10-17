@@ -114,10 +114,10 @@ def test_each_shape_of_switch_matches_the_ode_path(tmp_path, f) -> None:
 
 def test_a_switch_time_moved_by_param_dict(tmp_path) -> None:
     # The switch times are the run's, on the clone param_dict is applied to, and
-    # the caller's model keeps its own.
+    # the caller's model keeps its own. (At rtol=1e-10 main ran out of steps.)
     model = _model(tmp_path, "if(time()>tsw,5,0.1)")
-    a, _ = _diffrax(model, param_dict={"tsw": 2.0})
-    assert np.abs(a - _closed_form(TS, t_switch=2.0)).max() < 1e-4
+    a, _ = _diffrax(model, rtol=1e-10, param_dict={"tsw": 2.0})
+    assert np.abs(a - _closed_form(TS, t_switch=2.0)).max() < 1e-7
     assert model._core.get_param("tsw") == 1.37
 
 
@@ -184,9 +184,9 @@ def test_a_reporting_function_past_the_budget_is_not_refused(tmp_path) -> None:
 
 def test_a_rate_law_that_moves_with_time_and_no_switch(tmp_path) -> None:
     # Reading the time clamped to the piece froze this rate in the run's last
-    # step, where Kvaerno5 reads a stage past the step's end: 2.8e-8 at t = 3,
-    # four times rtol, where main had 3.7e-10. A = 100 exp(-F) with
-    # F = 0.1 t + 0.01 (1 - cos(10 t)).
+    # step, where Kvaerno5 reads a stage past the step's end: off by 3.8e-10 of
+    # A(3) at rtol=1e-10, where main is off by 5e-12 of it. A = 100 exp(-F)
+    # with F = 0.1 t + 0.01 (1 - cos(10 t)).
     a, _ = _diffrax(_model(tmp_path, "0.1+0.1*sin(10*time())"), rtol=1e-10)
     exact = 100.0 * np.exp(-(0.1 * TS + 0.01 * (1.0 - np.cos(10.0 * TS))))
     assert abs(a[-1] - exact[-1]) < 1e-10 * exact[-1]
@@ -204,3 +204,43 @@ def test_a_switch_on_a_rate_law_that_moves_with_time(tmp_path) -> None:
     s = 1.37
     f_int = np.where(s >= TS, 0.1 * (g(TS) - g(0.0)), 0.1 * (g(s) - g(0.0)) + 5.0 * (g(TS) - g(s)))
     assert np.abs(a - 100.0 * np.exp(-f_int)).max() < 1e-7
+
+
+NARROW = {
+    "1e-6 after the start": "if(time()>1e-06,5,0.1)",
+    "1e-12 before the end": "if(time()>2.999999999999,5,0.1)",
+    "a pulse 2e-8 wide": "if(time()>1.37,5,0.1)+if(time()>1.37000002,-4.9,0)",
+}
+
+
+@pytest.mark.parametrize("f", list(NARROW.values()), ids=list(NARROW))
+def test_a_narrow_piece(tmp_path, f) -> None:
+    # The implicit solvers' Newton iteration read roundoff on so short a piece
+    # as divergence, and turned its steps down until they ran out; main and the
+    # ODE path complete. Such a piece is solved again explicitly.
+    a, _ = _diffrax(_model(tmp_path, f))
+    assert np.abs(a - _ode(_model(tmp_path, f))).max() < 1e-4
+
+
+def test_a_counter_clock_restarts_past_its_threshold(tmp_path) -> None:
+    # C = t reaches 2.9 three or four floats short, and the next piece read the
+    # branch that had ended: 9.5e-7 of A(3) off at rtol=1e-8, where literal
+    # time is 3.4e-9 off.
+    a, _ = _diffrax(_model(tmp_path, "if(Cobs>2.9,5,0.1)"))
+    exact = _closed_form(TS, t_switch=2.9)
+    assert abs(a[-1] / exact[-1] - 1.0) < 1e-7
+
+
+def test_a_condition_only_an_output_reads_does_not_split_the_run(tmp_path) -> None:
+    # Its split changed the answer of a model whose rate laws never switch, and
+    # cost a fast one hundreds of steps.
+    path = tmp_path / "m.net"
+    path.write_text(
+        _NET.format(f="0.1").replace(
+            "    1 f() 0.1\n", "    1 f() 0.1\n    2 g() if(time()>1.37,1,0)\n"
+        )
+    )
+    a, n_steps = _diffrax(bngsim.Model.from_net(str(path)))
+    b, m_steps = _diffrax(_model(tmp_path, "0.1"))
+    np.testing.assert_array_equal(a, b)
+    assert n_steps == m_steps
