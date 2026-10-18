@@ -2628,13 +2628,15 @@ def test_biomd416_a_column_of_nothing_that_never_settles_is_returned_as_that():
     1e-5 of 1/|p|, which is nothing, and is not refused for moving.
 
     The root is Newton's. A run of this model is at IAAp = 26.56 from t = 1e3
-    on, with ||f||/n wandering between 5e-8 and 9e-7 and not falling, so an
-    integration gets under tol = 1e-9 only at a step that happens to land
-    there. One did while the generated C was compiled with contraction, and
-    none has since #963 compiled it without; a tighter rtol, 1e-9 to 1e-12,
-    lands none either. The polish lands at 1e-13 either way, and the run taken
-    on from beside it needs more than its default 10,000 steps to reach
-    max_time."""
+    on, with ||f||/n wandering between 1e-8 and 6e-6 (median 4e-7) and not
+    falling, so an integration gets under tol = 1e-9 only at a step that
+    happens to land there. One did while the generated C was compiled with
+    contraction, and none has since #963 compiled it without. A tighter rtol
+    does not help: at 1e-9 and 1e-10 the march stalls before the plateau, and
+    at 1e-12 it reaches it and misses too. The polish lands at 1e-13 either
+    way. The run taken on from beside it needs 17,228 steps to reach max_time
+    compiled without contraction and 27,166 with it, past its default 10,000,
+    so it is given 100,000."""
     sim = bngsim.Simulator(bngsim.Model.from_sbml(_biomodel("BIOMD0000000416")), method="ode")
     out = sim.steady_state(sensitivity_params=["etaAuxTIR1"], method="newton", max_steps=100_000)
     assert out.sens_root_newton_steps == 10
