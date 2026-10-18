@@ -34,9 +34,10 @@ name: python-tests
 #     on, MIR off.
 #
 # It is the pre-push hook, on platforms the developer does not have. `uv sync
-# --extra dev` provisions from uv.lock and the pytest call is the hook's own
-# (.pre-commit-config.yaml), so green here means what a clean `git push` means
-# locally — on a host the developer does not have.
+# --extra dev` provisions from uv.lock and the suite is the hook's own: the hook
+# (.pre-commit-config.yaml, ci/pre_push_pytest.py) runs the same python/tests
+# directory, split across pytest-xdist workers, so green here means what a
+# clean `git push` means locally — on a host the developer does not have.
 #
 # NO leg installs SuiteSparse, and that is the point rather than an omission.
 # All of them take BNGSIM_KLU_AUTOBUILD (GH #209) — the from-source fallback
