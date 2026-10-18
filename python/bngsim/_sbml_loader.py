@@ -2159,6 +2159,95 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
 
 
+def _rule_compartments_an_event_resizes(
+    rule_math: dict,
+    ar_comp_targets,
+    resized_comps: list[tuple[str, str]],
+    assigned: dict[str, str],
+    rescaled_species: dict[str, list[str]],
+    to_exprtk,
+) -> list[tuple[str, str]]:
+    """``(compartment, new size)`` for each assignment-rule compartment an event
+    resizes that ``resized_comps`` does not already hold, in the order one
+    reaches the next (issue #1055).
+
+    A compartment is resized by an event that changes anything its size rule
+    reads: a variable the event assigns, another compartment the event resizes,
+    or a species whose concentration that resize rescales (a concentration in a
+    resized compartment keeps its amount, so it moves). And the rule is read
+    through other assignment rules, not only its own names: ``cv := 1 + q``,
+    ``q := 0.5*p`` is resized by ``p := 4``. Only the rule's own names were read
+    before, so both kinds of indirection left the compartment's species
+    unrescaled. The order matters because the engine reads each new size after
+    the rescales listed before it.
+
+    ``rule_math`` maps each assignment rule's variable to its math, in document
+    order; ``assigned`` maps each variable the event assigns to its value;
+    ``rescaled_species`` maps a compartment to the species a resize of it
+    rescales; ``to_exprtk`` writes math as ExprTk text.
+    """
+    replacements = {_safe_name(var): expr for var, expr in assigned.items()}
+    changed = set(assigned)
+    resized_ids = {comp for comp, _ in resized_comps}
+
+    def note_rescaled(comp: str, new_size: str) -> None:
+        for sid in rescaled_species.get(comp, ()):
+            changed.add(sid)
+            replacements.setdefault(
+                _safe_name(sid), f"{_safe_name(sid)} * ({_safe_name(comp)}) / ({new_size})"
+            )
+
+    for comp, new_size in resized_comps:
+        note_rescaled(comp, new_size)
+
+    def reaches_change(name: str, seen: frozenset = frozenset()) -> bool:
+        if name in changed:
+            return True
+        if name in seen or name not in rule_math:
+            return False
+        return any(reaches_change(n, seen | {name}) for n in _ast_name_set(rule_math[name]))
+
+    def inlined(expr: str, depth: int = 0) -> str:
+        """The text with each rule it reads that reaches a change written out,
+        so that the event's values can be put in."""
+        if depth > 64:
+            return expr
+        names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr))
+        inner = {
+            _safe_name(n): to_exprtk(rule_math[n])
+            for n in rule_math
+            if _safe_name(n) in names
+            and n not in changed
+            and n not in resized_ids
+            and reaches_change(n)
+        }
+        if not inner:
+            return expr
+        return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
+
+    found: list[tuple[str, str]] = []
+    progress = True
+    while progress:
+        progress = False
+        for comp_id, rmath in rule_math.items():
+            if (
+                comp_id not in ar_comp_targets
+                or comp_id in resized_ids
+                or not any(reaches_change(n) for n in _ast_name_set(rmath))
+            ):
+                continue
+            old_size_expr = inlined(to_exprtk(rmath))
+            new_size_expr = _replace_exprtk_symbols(old_size_expr, replacements)
+            if new_size_expr == old_size_expr:
+                continue
+            found.append((comp_id, new_size_expr))
+            resized_ids.add(comp_id)
+            changed.add(comp_id)
+            note_rescaled(comp_id, new_size_expr)
+            progress = True
+    return found
+
+
 def _piecewise_branches(node) -> tuple[list, list]:
     """``(condition_children, value_children)`` of a MathML ``piecewise``.
 
@@ -8803,29 +8892,31 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                     assignments.append((sp_i, value_expr))
 
-            if assignment_value_expr_by_var and ar_comp_targets:
-                event_assignment_replacements = {
-                    _safe_name(var): expr for var, expr in assignment_value_expr_by_var.items()
-                }
-                assigned_vars = set(assignment_value_expr_by_var)
+            if ar_comp_targets and (assignment_value_expr_by_var or resized_comps):
+                rule_math: dict[str, object] = {}
                 for j in range(sbml_model.getNumRules()):
                     rule = sbml_model.getRule(j)
-                    comp_id = rule.getVariable()
-                    rmath = rule.getMath()
-                    if (
-                        not rule.isAssignment()
-                        or comp_id not in ar_comp_targets
-                        or comp_id in directly_resized_comps
-                        or rmath is None
-                        or not (_ast_name_set(rmath) & assigned_vars)
-                    ):
-                        continue
-                    old_size_expr = _ast_to_exprtk_with_funcdefs(rmath, func_defs)
-                    new_size_expr = _replace_exprtk_symbols(
-                        old_size_expr, event_assignment_replacements
+                    if rule.isAssignment() and rule.getMath() is not None:
+                        rule_math[rule.getVariable()] = rule.getMath()
+                resized_comps.extend(
+                    _rule_compartments_an_event_resizes(
+                        rule_math,
+                        ar_comp_targets,
+                        resized_comps,
+                        assignment_value_expr_by_var,
+                        {
+                            cid: [
+                                sid
+                                for sid, scomp in species_comp.items()
+                                if scomp == cid
+                                and not species_hosu.get(sid, False)
+                                and sid not in assignment_targets
+                            ]
+                            for cid in _comp_id_set
+                        },
+                        lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
                     )
-                    if new_size_expr != old_size_expr:
-                        resized_comps.append((comp_id, new_size_expr))
+                )
 
             # (#74) Inject per-species concentration rescaling for any
             # compartment whose size this event changes. bngsim stores every

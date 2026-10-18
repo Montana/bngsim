@@ -12209,8 +12209,20 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             return;
         model.update_observables(y_data);
         model.evaluate_functions(t_now);
+        int size_read = -1;
         for (const auto &[a, num] : rescales) {
-            const double size = eval_ref_outer.evaluate(ev.assignment_rescale_size_expr[a]);
+            // A compartment's size rule can read a species another compartment's
+            // rescale has just moved (issue #1055: `cv := 1 + 0.1*Kw`, an event
+            // resizing Kw's compartment). The loader lists the compartments in
+            // the order one reaches the next, so each size is read after the
+            // rescales before it.
+            const int size_expr = ev.assignment_rescale_size_expr[a];
+            if (size_read >= 0 && size_expr != size_read) {
+                model.update_observables(y_data);
+                model.evaluate_functions(t_now);
+            }
+            size_read = size_expr;
+            const double size = eval_ref_outer.evaluate(size_expr);
             // An amount in no volume has no concentration: refuse it by name
             // rather than carry an inf (or 0·inf) into the integrator.
             if (num != 0.0 && !(std::isfinite(size) && size != 0.0)) {
