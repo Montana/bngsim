@@ -62,10 +62,12 @@ REGISTRY_TTL_SECONDS = 7 * 24 * 3600  # reuse the cached id-list for a week
 METADATA_DELAY = 0.05  # polite pause between per-model metadata calls
 
 # BioModels moved to biomodels.org, served through CloudFront (issue #807). The
-# old https://www.ebi.ac.uk/biomodels/ URLs still answer, by two redirects, and
-# urllib follows them silently, so nothing showed the move until GitHub's
-# runners got HTTP 403 on all 317 downloads that go through it. Asked here
-# directly, with no redirect to hide which hop refused.
+# old https://www.ebi.ac.uk/biomodels/ URLs still answer, by two redirects that
+# urllib follows silently; asked here directly, a refusal names the host that
+# refused. The move is not why GitHub's runners get HTTP 403, though: from a
+# runner CloudFront itself refuses every request, through either host and the
+# REST API alike (.github/workflows/biomodels-probe.yml, first run 38568772108):
+# the 403s that made nightly-parity's corpus job stop asking for these models.
 BIOMODELS_BASE = "https://www.biomodels.org"
 
 logger = logging.getLogger("biomodels.fetch")
@@ -197,31 +199,52 @@ def available_model_ids(*, ode_only: bool, refresh_registry: bool) -> list[str]:
 # --------------------------------------------------------------------------
 # per-model SBML download
 # --------------------------------------------------------------------------
+def _response(status: int, asked: str, final: str, headers) -> str:
+    """What answered: the status, the URL it ended at (and the one asked, if a
+    redirect moved it) and CloudFront's headers. ``server`` is ``CloudFront`` when
+    the edge answered and the origin's (``Apache``) when BioModels did, which is
+    what tells a refusal from a missing file: both are 403 (issue #807).
+    ``x-amz-cf-id`` is the request id BioModels can look up."""
+    where = final if final == asked else f"{final} (asked {asked})"
+    return (
+        f"HTTP {status} from {where}; x-cache={headers.get('x-cache')} "
+        f"x-amz-cf-id={headers.get('x-amz-cf-id')} server={headers.get('server')}"
+    )
+
+
 def _urlopen(url: str, timeout: float):
     """``urllib.request.urlopen``, with what a refusal came from logged.
 
     An ``HTTP Error 403: Forbidden`` alone does not say which host refused, or
-    whether a CDN did: logged with the URL it ended at and CloudFront's own
-    headers (``x-cache``, ``x-amz-cf-id``), a runner's refusal can be told
-    from the origin's and reported to BioModels by request id (issue #807)."""
+    whether a CDN did. It is logged here, once, by ``_response``; a caller that
+    catches the ``HTTPError`` has nothing to add to it."""
     try:
         return urllib.request.urlopen(url, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        headers = exc.headers or {}
-        logger.error(
-            "HTTP %s from %s (asked %s); x-cache=%s x-amz-cf-id=%s server=%s",
-            exc.code,
-            exc.geturl() or url,
-            url,
-            headers.get("x-cache"),
-            headers.get("x-amz-cf-id"),
-            headers.get("server"),
-        )
+        logger.error("%s", _response(exc.code, url, exc.geturl() or url, exc.headers or {}))
         raise
 
 
 def _looks_like_sbml(data: bytes) -> bool:
     return bool(data) and b"<sbml" in data[:8192].lower()
+
+
+def _get_sbml(url: str, what: str) -> bytes | None:
+    """The bytes at ``url`` if they are SBML, else ``None``. A 2xx that is not SBML
+    (an HTML page, a CDN's challenge) raises nothing, so what answered is logged
+    here; an HTTP error raises from ``_urlopen``, already logged."""
+    with _urlopen(url, timeout=60) as r:
+        data = r.read()
+        if _looks_like_sbml(data):
+            return data
+        logger.error(
+            "%s is not SBML: %s; %d bytes, starting %r",
+            what,
+            _response(r.status, url, r.geturl(), r.headers),
+            len(data),
+            data[:80],
+        )
+    return None
 
 
 def _download_via_rest(model_id: str) -> bytes | None:
@@ -230,9 +253,6 @@ def _download_via_rest(model_id: str) -> bytes | None:
     entry for some (often non-curated) models — this names the main file explicitly
     via the metadata API, which is what successfully recovered the empties. Returns
     validated SBML bytes or ``None``."""
-    import urllib.parse
-    import urllib.request
-
     try:
         with _urlopen(f"{BIOMODELS_BASE}/{model_id}?format=json", timeout=30) as r:
             main = (json.load(r).get("files", {}) or {}).get("main", [])
@@ -244,9 +264,9 @@ def _download_via_rest(model_id: str) -> bytes | None:
             + "?"
             + (urllib.parse.urlencode({"filename": main[0]["name"]}))
         )
-        with _urlopen(url, timeout=60) as r:
-            data = r.read()
-        return data if _looks_like_sbml(data) else None
+        return _get_sbml(url, f"REST download of {model_id}")
+    except urllib.error.HTTPError:
+        return None  # logged by _urlopen
     except Exception as exc:
         logger.error("REST fallback failed for %s: %s", model_id, exc)
         return None
@@ -312,9 +332,9 @@ def _download_versioned(model_id: str, version: str, fname: str) -> bytes | None
         {"filename": fname}
     )
     try:
-        with _urlopen(url, timeout=60) as r:
-            data = r.read()
-        return data if _looks_like_sbml(data) else None
+        return _get_sbml(url, f"versioned download of {model_id}.{version}")
+    except urllib.error.HTTPError:
+        return None  # logged by _urlopen
     except Exception as exc:  # noqa: BLE001
         logger.error("versioned download failed for %s.%s: %s", model_id, version, exc)
         return None
