@@ -49,6 +49,7 @@ source at all.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import bngsim
@@ -57,6 +58,8 @@ import pytest
 from bngsim._bngsim_core import ModelBuilder
 
 _REPRO = Path(__file__).resolve().parents[2] / "benchmarks" / "sbml_events" / "BIOMD0000000701.xml"
+_SIR = Path(__file__).resolve().parents[2] / "benchmarks" / "models" / "net" / "ode" / "SIR.net"
+_NAME = re.compile(r"[A-Za-z_]\w*")
 _MODELS_DIR = Path(__file__).resolve().parents[2] / "parity_checks" / "rr_parity" / "models"
 # The corpus is gitignored, so the directory itself exists in a fresh worktree
 # (and in CI) while holding nothing. Gating on `is_dir()` is how a corpus test
@@ -139,7 +142,7 @@ def test_a_value_changing_write_still_overrides_bng_style():
     assert m.get_param("k") == pytest.approx(27.0)
     # ...and the expression is still on record, which is how a caller tells an
     # overridden derived parameter from a genuine primary.
-    assert m._core.param_expressions[list(m.param_names).index("k")] == "2 * k_base"
+    assert m.param_expressions[list(m.param_names).index("k")] == "2 * k_base"
 
 
 def test_an_override_is_lifted_by_writing_back_the_expressions_value():
@@ -242,6 +245,57 @@ def test_force_override_pins_a_parameter_an_ordinary_write_already_overrode():
         assert model.get_param("k") == pytest.approx(3.0)
     r = bngsim.Simulator(m, method="ode").run(t_span=(0.0, 1.0), n_points=2, rtol=1e-10)
     assert float(np.asarray(r.species)[-1, 0]) == pytest.approx(100.0 * np.exp(-3.0), rel=1e-6)
+
+
+# ── Telling an override apart, from the public API ──────────────────────────
+#
+# `Model.param_is_expression` documents the rule: an entry that is False while
+# its `param_expressions` text names another of the model's symbols is an
+# overridden derived parameter. A `.net` primary has text too, its value as
+# written, so "non-empty text" alone is not the rule.
+
+
+def _overridden(model: bngsim.Model) -> set[str]:
+    symbols = {
+        *model.param_names,
+        *model.species_names,
+        *model.observable_names,
+        *model.function_names,
+    }
+    return {
+        name
+        for name, attached, text in zip(
+            model.param_names, model.param_is_expression, model.param_expressions, strict=True
+        )
+        if not attached and (set(_NAME.findall(text)) & symbols) - {name}
+    }
+
+
+def test_param_expressions_tells_an_overridden_derived_parameter_from_a_primary():
+    """``SIR.net`` carries every kind: primaries written as a number (``S0 2e7``)
+    and as arithmetic (``gamma 1/7``), a derived parameter (``beta 1/S0``), and
+    a function's synthesized slot (``betaI``)."""
+    m = bngsim.Model.from_net(_SIR)
+    assert dict(zip(m.param_names, m.param_expressions, strict=True)) == {
+        "S0": "2e7",
+        "I0": "1",
+        "beta": "1/S0",
+        "gamma": "1/7",
+        "betaI": "",
+    }
+    assert _overridden(m) == set()
+
+    # A primary write changes no text and overrides nothing.
+    m.set_param("S0", 5.0)
+    m.set_param("gamma", 0.3)
+    assert m.param_expressions[m.param_names.index("S0")] == "2e7"
+    assert _overridden(m) == set()
+
+    m.set_param("beta", 3.0)
+    assert _overridden(m) == {"beta"}
+
+    m.set_param("beta", 1.0 / m.get_param("S0"))  # the expression's own value
+    assert _overridden(m) == set()
 
 
 # ── The reported reproducer, inverted ───────────────────────────────────────

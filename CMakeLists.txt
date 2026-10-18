@@ -422,6 +422,27 @@ set(BNGSIM_EXPRTK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/exprtk")
 set(BNGSIM_EXPRTK_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/third_party/exprtk/exprtk.hpp")
 set(BNGSIM_EXPRTK_VENDOR_METADATA "${BNGSIM_EXPRTK_DIR}/VENDOR.json")
 
+# Every translation unit that compiles ExprTk is built without floating-point
+# contraction (issue #963). A state switch's residual `(lhs)-(rhs)` and its
+# condition `lhs > rhs` are two expressions, and the residual's sign stands for
+# the condition only if both round lhs and rhs alike. Clang contracts within an
+# expression by default, and where the target has a fused multiply-add (arm64)
+# it fused ExprTk's one-expression node for `(x*y)-(z*w)`: `(Aobs^2)-(thr^2)`
+# read +5.75e-17 with A on thr, the rounding error of thr*thr, while the
+# condition compared the two rounded squares and read false. A run sat on that
+# surface until its timeout. GCC in a GNU dialect contracts even across
+# statements. Unfused, the difference of two doubles is 0 exactly when they are
+# equal, so the residual is 0 on the surface and positive only past it, as on
+# x86-64, where nothing is fused.
+#
+# The option goes on each target that compiles exprtk.hpp, not on
+# bngsim_expression alone: ExprTk is header-only, so every such target emits
+# its own copy of the node templates, and the linker keeps one. With it on
+# bngsim_expression only, NFsim's copy (its mu::Parser shim includes
+# exprtk.hpp) was the one kept, and the residual still read 5.75e-17. The
+# option is for GCC and Clang; MSVC is left at its defaults.
+set(BNGSIM_EXPRTK_COMPILE_OPTIONS $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
+
 if(NOT EXISTS "${BNGSIM_EXPRTK_HEADER}")
     message(FATAL_ERROR
         "Missing vendored ExprTk header: ${BNGSIM_EXPRTK_HEADER}\n"
@@ -460,6 +481,7 @@ set_target_properties(bngsim_expression PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ExprTk-heavy translation units can exceed MSVC's default section limit.
 target_compile_options(bngsim_expression PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+    ${BNGSIM_EXPRTK_COMPILE_OPTIONS}
 )
 
 # ─── NFsim (vendored static library) ───────────────────────────────────────────
@@ -519,9 +541,13 @@ if(BNGSIM_BUILD_NFSIM)
             target_include_directories(NFsim_objects PRIVATE ${BNGSIM_EXPRTK_DIR})
             # ExprTk-heavy NFsim TUs (e.g. NFfunction/localFunction.cpp) exceed
             # MSVC's default COFF section limit; /bigobj raises it. GH #150.
-            # Mirrors the same flag on bngsim_expression and bngsim below.
+            # Mirrors the same flag on bngsim_expression and bngsim below. And
+            # ExprTk is compiled unfused here too, or this target's copy of its
+            # templates can be the one linked (issue #963; see
+            # BNGSIM_EXPRTK_COMPILE_OPTIONS).
             target_compile_options(NFsim_objects PRIVATE
-                $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+                $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+                ${BNGSIM_EXPRTK_COMPILE_OPTIONS})
         endif()
         if(TARGET nfsim)
             target_link_libraries(nfsim PUBLIC bngsim::expression)

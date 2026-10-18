@@ -258,6 +258,76 @@ def _relational_split_op(atom: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _turning_side(expr: str) -> tuple[str, str] | None:
+    """``("abs", u)`` for ``abs(u)``, ``("square", u)`` for ``(u)^2`` or ``u^2``
+    with ``u`` one name or one parenthesized group; ``None`` otherwise.
+
+    The group must close where the ``^`` stands. ``(A-5)^2+(B-5)^2`` and
+    ``(A-5)*(B)^2`` each balance as a whole and end in ``^2``, but only the
+    last group is squared; read as the square of everything before the ``^``,
+    the disk ``(A-c)^2+(B-5)^2 < 0.75`` was rooted at a surface it does not
+    have and lost its own crossing, and dY/dc came back 0 for -12.06.
+    """
+    text = _strip_redundant_parens(expr.strip())
+    m = re.match(r"abs\s*\(", text)
+    if m is not None and _find_close_paren_strict(text, m.end() - 1) == len(text) - 1:
+        return "abs", text[m.end() : -1].strip()
+    m = re.fullmatch(r"(\(.*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\^\s*2(?:\.0*)?", text, re.S)
+    if m is None:
+        return None
+    base = m.group(1)
+    if base.startswith("(") and _find_close_paren_strict(base, 0) != len(base) - 1:
+        return None
+    return "square", _strip_redundant_parens(base).strip()
+
+
+def _monotone_pieces(atom: str) -> list[str]:
+    """The comparisons whose crossings are this atom's, one per turn of its
+    residual, where the atom compares ``abs(u)`` or ``u^2`` with a bound.
+
+    ``abs(A - 5) < 0.01`` is a window: its residual ``abs(A-5) - 0.01`` falls
+    to zero and comes back up within one step as A passes 5, so a root on it
+    sees the same sign at both ends of the step and reports nothing, and the
+    window was stepped over (issue #904). Its edges are where ``A - 5`` crosses
+    ``0.01`` and ``-0.01``, and each of those residuals is monotone along a
+    flow that moves A one way. ``u^2`` against a bound is the same at
+    ``±sqrt(bound)``, taken only for a bound that is a number, where the square
+    root is one. A bound that is a number must be above 0: at or below it the
+    atom holds at one point or nowhere, its edges would be restarts at
+    crossings that switch nothing (two of them on one surface, at 0), and it is
+    rooted whole as before. So is ``trig > abs(-1)``, whose ``abs()`` reads no
+    name and so does not turn: its edges would put a restart at ``trig = -1``,
+    where nothing switches. ``[]`` for any other atom. Parentheses around the
+    whole atom are read through: the SBML loader writes ``(abs((A-5))<0.01)``.
+    """
+    split = _relational_split_op(_strip_redundant_parens(atom))
+    if split is None:
+        return []
+    lhs, _op, rhs = split
+    side = _turning_side(lhs)
+    bound = rhs
+    if side is None:
+        side = _turning_side(rhs)
+        bound = lhs
+    if side is None or _turning_side(bound) is not None:
+        return []
+    kind, inner = side
+    if not _IDENTIFIER.search(inner):
+        return []
+    try:
+        value: float | None = float(_strip_redundant_parens(bound.strip()))
+    except ValueError:
+        value = None
+    if value is not None and not (0.0 < value < math.inf):
+        return []
+    if kind == "abs":
+        return [f"({inner})<({bound})", f"({inner})>(-({bound}))"]
+    if value is None:
+        return []
+    root = repr(math.sqrt(value))
+    return [f"({inner})<({root})", f"({inner})>(-{root})"]
+
+
 def _relational_split(atom: str) -> tuple[str, str] | None:
     """``(lhs, rhs)`` of a relational atom, discarding the operator.
 
@@ -6347,7 +6417,9 @@ def fallback_crossing(
     - a condition on a counter species that a requested column moves (its rate
       constant, its initial amount). A counter nothing moves is read at ``y``
       in both terms of the quotient, and its threshold's parameters are held
-      while the quotient is taken (issue #436);
+      while the quotient is taken (issue #436) where issue #48 reads the
+      condition. One it does not read, ``abs(Aobs-c) < 0.01``, is refused where
+      a requested parameter moves its threshold: the quotient moves it across;
     - an equality on the state. It holds at one state and over no interval
       of them, unless the state sits there: ``B == 0`` with B made from where
       another species passes a threshold holds until it does;
@@ -6604,8 +6676,34 @@ def fallback_crossing(
                     kept[("parameter", flat)] = last
                 return "parameter" if last[1] else ""
             if _reads_clock_and_run_constants(flat, scope):
-                read = {scope.clocks[n] for n in _IDENTIFIER.findall(flat) if n in scope.clocks}
-                return "state" if {i for i in read if i >= 0} & moved else ""
+                names = set(_IDENTIFIER.findall(flat))
+                read = {scope.clocks[n] for n in names if n in scope.clocks}
+                if {i for i in read if i >= 0} & moved:
+                    return "state"
+                # A requested parameter moves the threshold, which issue #48
+                # holds while the quotient is taken only where it reads the
+                # atom. It does not read `abs(Aobs-c) < 0.01` on a counter,
+                # whose edges are rooted as crossings of the state instead
+                # (issue #904), and the quotient moved c across them: dY/dc
+                # came back 7.03 for 0.2. A parameter the quotient moves across
+                # a surface, as `_parameter_crossing` finds: a law that only
+                # bends there is proved so of its conditions on the state, and
+                # this one reads none.
+                if not names & requested:
+                    return ""
+                held_by = (
+                    tuple(
+                        float(scope.values[scope.param_idx[n]])
+                        for n in sorted(names & set(scope.param_idx))
+                    ),
+                    requested,
+                    clocks,
+                )
+                verdict = kept.get(("held", flat))
+                if verdict is None or verdict[0] != held_by:
+                    verdict = (held_by, clock_crossing_compensated(flat, scope))
+                    kept[("held", flat)] = verdict
+                return "" if verdict[1] else "parameter"
             return "state"
 
         def moved_by_a_column(flat: str) -> bool:
@@ -7492,15 +7590,23 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         # stop, reintroduced from the other side. Measured on the corpus: 3 of
         # 182 condition-carrying rr_parity models, invisible to every test.
         flat = _inline_functions(body, func_map) or body
-        for atom in _iter_condition_atoms(flat):
-            if clock_crossing_compensated(atom, scope):
+        for whole in _iter_condition_atoms(flat):
+            if clock_crossing_compensated(whole, scope):
                 continue  # issue #48's crossing; jumping it here would double it
-            if is_equality_atom(atom):
+            if is_equality_atom(whole):
                 continue  # measure-zero: rooting on it would MAKE the branch (below)
-            residual = state_switch_residual(core, atom)
-            if residual and residual not in seen_residual:
-                seen_residual.add(residual)
-                conditions.append(atom)
+            # A residual that turns within a step is rooted, and jumped, at
+            # each of its edges instead of on itself (issue #904): a root on
+            # `(A-5)^2 - 1e-4` saw one sign at both ends of the step that held
+            # the window, and the run returned Y = 0 and dY/dk = 0. The jump at
+            # each edge is read off the right-hand side either side of it, as
+            # at any crossing; with the whole atom rooted beside its edges, a
+            # step that found both at one instant would jump it twice.
+            for atom in _monotone_pieces(whole) or [whole]:
+                residual = state_switch_residual(core, atom)
+                if residual and residual not in seen_residual:
+                    seen_residual.add(residual)
+                    conditions.append(atom)
     return conditions
 
 
@@ -7565,8 +7671,11 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
             continue
         hit: set[int] = set()
         for written in _iter_condition_atoms(flat):
-            for atom in _split_logical_atoms(written):
-                hit.update(wanted.get(surface(atom) or "", ()))
+            for whole in _split_logical_atoms(written):
+                # The edges a turning residual is rooted at (issue #904) are
+                # read by the rate law that reads the whole atom.
+                for atom in (whole, *_monotone_pieces(whole)):
+                    hit.update(wanted.get(surface(atom) or "", ()))
         for i in hit:
             out[i].append(int(rxn["rxn_idx"]))
     return out
@@ -7641,11 +7750,21 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
     # registers `time() >= onset` for an assignment rule `onset := 4*S`, and
     # `onset` is a parameter slot, so that text reads no state and has no
     # residual; the rate law's own atom arrives inlined, as `time() >= 4*S`.
+    #
+    # A covered comparison that turns covers its edges (issue #904). A clock's
+    # `abs(Tobs-5) < 0.01` is stopped on at both of them, and its edges, rooted
+    # as well, put a second restart at each stop. The SBML loader registers the
+    # edges themselves, which read as they are. It is split as it is written,
+    # before it is inlined: one the loader registered whole, `(A-5)^2 < w`
+    # with `w := 0.0001`, is a root on the whole that never fires, and split
+    # after `w` was written in, it marked the rate law's edges as covered and
+    # the window was stepped over again.
     seen: set[str] = set()
     for cond in covered:
-        residual = state_switch_residual(core, inline(cond))
-        if residual:
-            seen.add(_surface_key(residual))
+        for atom in _monotone_pieces(cond) or [cond]:
+            residual = state_switch_residual(core, inline(atom))
+            if residual:
+                seen.add(_surface_key(residual))
 
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a
@@ -7669,16 +7788,19 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
         for written in (*_iter_condition_atoms(text), *_iter_comparisons_anywhere(text)):
             # Inlining can expose more logic than the text spelled — a condition
             # `flag` over `flag() = (A>1)||(B<2)` — so the atoms are split again.
-            for atom in _split_logical_atoms(inline(written)):
-                if is_equality_atom(atom):
+            for whole in _split_logical_atoms(inline(written)):
+                if is_equality_atom(whole):
                     continue
-                residual = state_switch_residual(core, atom)
-                if not residual:
-                    continue
-                key = _surface_key(residual)
-                if key not in seen:
-                    seen.add(key)
-                    conditions.append(atom)
+                # A residual that turns within a step (`abs(A-5) < 0.01`) is
+                # rooted at each of its edges instead (issue #904).
+                for atom in _monotone_pieces(whole) or [whole]:
+                    residual = state_switch_residual(core, atom)
+                    if not residual:
+                        continue
+                    key = _surface_key(residual)
+                    if key not in seen:
+                        seen.add(key)
+                        conditions.append(atom)
     return tuple(conditions)
 
 

@@ -43,8 +43,10 @@ locally:
   the exact BioModels version + OMEX member whose sha256 matches our tested
   bytes. 1323 models: 1274 pin to the latest version, 49 to the version whose
   archived member (`_url.xml` / `_urn.xml` / author-named) reproduces the
-  tested bytes. License: 1011 curated `BIOMD*` are `CC0-1.0`, 312 non-curated
-  `MODEL*` are `unknown` upstream. This manifest also covers rr_parity's 332
+  tested bytes. License: all 1323 are `CC0-1.0`, the 1011 curated `BIOMD*` and
+  the 312 non-curated `MODEL*` alike, because BioModels' terms of use
+  (https://www.biomodels.org/termsofuse) dedicate the entire dataset to the
+  public domain. This manifest also covers rr_parity's 332
   `biomodels_dir` SBML (all inside this keep-set). Regenerate with
   `generate_provenance_manifest.py` (metadata-API driven; cached in
   git-ignored `data/`).

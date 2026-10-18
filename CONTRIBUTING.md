@@ -237,6 +237,16 @@ push, run via `uv run`) with:
 uv run pre-commit install
 ```
 
+The push hook runs the whole suite in parallel through pytest-xdist, one test
+file per worker (`ci/pre_push_pytest.py`). That takes about five minutes where a
+serial run takes about 45. It uses the main checkout's test cache from a
+worktree too, because a cold cache costs a worktree's first push about 15
+minutes (see below). `BNGSIM_PREPUSH_WORKERS=4 git push` sets the worker count,
+and `BNGSIM_PREPUSH_WORKERS=0` runs the suite serially in one process, for a
+failure that might depend on what ran before it. A venv synced before
+pytest-xdist joined the `test` extra stops the push with a message;
+`uv sync --extra dev` (plus any groups you use) brings it in.
+
 ### The suite's artifact caches are its own
 
 A pytest session redirects both of bngsim's content-addressed caches — compiled
@@ -254,12 +264,21 @@ uv run python -m pytest python/tests/ --cache-clear   # force a cold-cache run
 ```
 
 - `pytest --cache-clear` wipes it, which is the supported way to test a cold
-  compile path across the whole suite;
+  compile path across the whole suite. It clears this checkout's own directory;
+  the pre-push hook in a worktree uses the main checkout's (below);
 - `BNGSIM_TEST_CACHE_DIR=/path` relocates it — node-local scratch, a cache CI
   restores between runs, or a throwaway directory. It overrides
   `BNGSIM_CODEGEN_CACHE_DIR` / `BNGSIM_BNGL_CACHE_DIR` for the session rather
   than deferring to them: exporting those points bngsim's *real* cache somewhere,
   and the suite has no more business writing there than in `~/.cache`.
+- On macOS a cold cache costs more than its compiles. The system checks each
+  newly written `.dylib` the first time anything loads it, at 0.5-2.4 s a file
+  and one file at a time across the machine, however many workers ask; a file it
+  has checked once loads instantly from any process, and a copy at another path
+  is checked again. A worktree's own `.pytest_cache` starts empty, so the
+  pre-push hook sets `BNGSIM_TEST_CACHE_DIR` to the main checkout's
+  `.pytest_cache/d/bngsim` unless you already have. A worktree's first push took
+  19m15s on a cold cache.
 
 Being persistent, it still grows — every `_CODEGEN_CACHE_KEY` change orphans what
 came before it. The difference is that it grows somewhere disposable, under a

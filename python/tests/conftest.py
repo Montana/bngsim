@@ -139,20 +139,26 @@ def pytest_configure(config: pytest.Config) -> None:
     BNGSIM_NO_BUILD_CHECK=1 (skip the check entirely).
     """
     root = _redirect_artifact_caches(config)
+    # Under pytest-xdist every worker runs this hook as well, and a dozen copies
+    # of the two lines below buried the one that describes the run. The workers
+    # still redirect and still check; only the controller says so.
+    is_xdist_worker = hasattr(config, "workerinput")
     # Named on every run, beside the binary identity line: a developer who wonders
     # why their ~/.cache stopped growing gets the answer without reading conftest.
-    print(
-        f"[bngsim] artifact caches: {root} (test-owned; ${_TEST_CACHE_ROOT_ENV} relocates)",
-        file=sys.stderr,
-        flush=True,
-    )
+    if not is_xdist_worker:
+        print(
+            f"[bngsim] artifact caches: {root} (test-owned; ${_TEST_CACHE_ROOT_ENV} relocates)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         from bngsim import _build_provenance as bp
     except Exception:
         return  # never let the guard itself break collection
     prov = bp.gather()
-    print(bp.identity_line(prov), file=sys.stderr, flush=True)
+    if not is_xdist_worker:
+        print(bp.identity_line(prov), file=sys.stderr, flush=True)
     report = bp.blocking_report(prov)
     if report:
         raise pytest.UsageError("\n" + report)
@@ -320,6 +326,13 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
     ),
     ("tomllib is 3.11+", _ANYWHERE, "stdlib module absent on 3.10, which is still supported"),
     ("gcc/clang only", _ANYWHERE, "the sharded compile path; MSVC takes the other branch"),
+    (
+        "no fused multiply-add",
+        _ANYWHERE,
+        "test_switch_residual_unfused.py shows codegen's C unfused against a build "
+        "that would fuse; an x86-64 core without FMA (before Haswell, or under "
+        "Rosetta) cannot fuse, so there is nothing to show. Every CI runner has one",
+    ),
     # Source-tree vs installed-wheel context.
     ("installed wheel", _ANYWHERE, "source-tree-only guard, correctly inert against a wheel"),
     ("source root", _ANYWHERE, "version-consistency check needs the source tree"),
