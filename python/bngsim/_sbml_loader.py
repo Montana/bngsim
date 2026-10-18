@@ -1226,7 +1226,17 @@ def _collect_relational_edge_conditions(
     way. Not a root: an equality on the clock holds (or fails) at one double,
     which no root finder brackets. The event-trigger scan asks for them so the
     run can stop on that double (``at (time == 2)``).
+
+    A relational of a lone ``abs()``, or of a lone square against a number,
+    is appended as the two edges it turns at (issue #904):
+    ``abs(A - 5) < 0.01`` as ``A - 5`` against ``0.01`` and ``-0.01``. Its own
+    truth is false at both ends of a step that passes A = 5, so a root on it
+    reported nothing, and an event on it never fired. Each edge flips once
+    there. The rate-law scan reads the same pieces
+    (:func:`bngsim._switch_sensitivity._monotone_pieces`).
     """
+    from bngsim._switch_sensitivity import _monotone_pieces
+
     global _INEQ_RELATIONAL_OPS
     if node is None:
         return
@@ -1248,7 +1258,8 @@ def _collect_relational_edge_conditions(
                     continue
                 lhs = _ast_to_exprtk_with_funcdefs(a, func_defs, local_params)
                 rhs = _ast_to_exprtk_with_funcdefs(b, func_defs, local_params)
-                out.append(f"({lhs}{op}{rhs})")
+                atom = f"{lhs}{op}{rhs}"
+                out.extend(f"({piece})" for piece in _monotone_pieces(atom) or [atom])
         elif (
             equalities is not None
             and nc == 2

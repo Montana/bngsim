@@ -295,9 +295,10 @@ def _monotone_pieces(atom: str) -> list[str]:
     root is one. A bound that is a number must be above 0: at or below it the
     atom holds at one point or nowhere, its edges would be restarts at
     crossings that switch nothing (two of them on one surface, at 0), and it is
-    rooted whole as before. ``[]`` for any other atom.
+    rooted whole as before. ``[]`` for any other atom. Parentheses around the
+    whole atom are read through: the SBML loader writes ``(abs((A-5))<0.01)``.
     """
-    split = _relational_split_op(atom)
+    split = _relational_split_op(_strip_redundant_parens(atom))
     if split is None:
         return []
     lhs, _op, rhs = split
@@ -7745,11 +7746,18 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
     # registers `time() >= onset` for an assignment rule `onset := 4*S`, and
     # `onset` is a parameter slot, so that text reads no state and has no
     # residual; the rate law's own atom arrives inlined, as `time() >= 4*S`.
+    #
+    # A covered comparison that turns covers its edges (issue #904). A clock's
+    # `abs(Tobs-5) < 0.01` is stopped on at both of them, and its edges, rooted
+    # as well, put a second restart at each stop. The SBML loader registers the
+    # edges themselves, which read as they are.
     seen: set[str] = set()
     for cond in covered:
-        residual = state_switch_residual(core, inline(cond))
-        if residual:
-            seen.add(_surface_key(residual))
+        whole = inline(cond)
+        for atom in _monotone_pieces(whole) or [whole]:
+            residual = state_switch_residual(core, atom)
+            if residual:
+                seen.add(_surface_key(residual))
 
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a

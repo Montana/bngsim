@@ -921,20 +921,25 @@ class Model:
             if derived is None:
                 try:
                     from bngsim._switch_sensitivity import (
+                        _monotone_pieces,
                         _strip_redundant_parens,
                         time_discontinuity_conditions,
                     )
 
-                    registered = {
-                        _strip_redundant_parens(c).replace(" ", "")
-                        for c in self._time_disc_conditions
-                    }
+                    def spelled(c: str) -> str:
+                        return _strip_redundant_parens(c).replace(" ", "")
+
+                    registered = {spelled(c) for c in self._time_disc_conditions}
+                    # The loader registers a turning comparison as its two
+                    # edges (issue #904), `abs(time()-5) < 0.01` as `time()-5`
+                    # against 0.01 and -0.01, so one found whole is registered
+                    # where both of its edges are.
                     derived = tuple(
                         c
                         for c in time_discontinuity_conditions(
                             self._core, clock_candidates=None if key is None else key[0]
                         )
-                        if _strip_redundant_parens(c).replace(" ", "") not in registered
+                        if not all(spelled(p) in registered for p in _monotone_pieces(c) or [c])
                     )
                 except Exception as e:  # pragma: no cover - defensive
                     # Recovery is best-effort: without it a model keeps the
