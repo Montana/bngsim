@@ -120,6 +120,13 @@ CASES = [
     # takes Kummer's transformation. The exp() cancels the ratio's e^z.
     ("tiny a, both series", -1e-12, 0.026664156824421394, "k*mratio(a,b,A)*exp(-A)", 20.0),
     ("tiny b, both series, z < 0", -1e-12, 1e-9, "k*mratio(a,b,-A)*exp(A)", 20.0),
+    # Past z = -20 with b - a < 1 the fraction is refused and the series goes on
+    # to z = -700, the asymptotic route past it (issue #1080). A decays from 1500
+    # to 334, so each of these crosses from one to the other halfway. The ratio
+    # is about b/A, which the A/b undoes. The a = 0 one runs the asymptotic
+    # route's exact M(0, b, z) = 1, which nothing else in the file reaches.
+    ("tiny b - a, past z = -20", -1e-12, 1e-9, "k*mratio(a,b,-A)*A/b", 1500.0),
+    ("a = 0, tiny b, past z = -20", 0.0, 1e-9, "k*mratio(a,b,-A)*A/b", 1500.0),
     ("a rides the species", -3.0, 9.0, "k*mratio(-A,b,-20)", 12.0),
     ("b rides the species", -4.0, 0.0, "k*mratio(a,A+2,-8)", 10.0),
 ]
@@ -184,8 +191,11 @@ def test_known_values_in_the_regime_models_use(tmp_path, a, b, z, expect):
         "k*mratio(50,2.5,-1000)",
         # A negative b, which every clause of the rule now refuses (issue #768).
         "k*mratio(-22.52,-25.18,-12)",
+        # Past z = -700 with b - a far below anything a model builds (issue
+        # #1080): the fraction returned its Lentz floor there.
+        "k*mratio(0,1e-300,-710)",
     ],
-    ids=["positive a, large negative z", "negative b"],
+    ids=["positive a, large negative z", "negative b", "tiny b - a past z = -700"],
 )
 def test_both_copies_refuse_and_both_say_why(tmp_path, body):
     """The region from issue #453, where the answer is a refusal in both copies.
@@ -215,6 +225,7 @@ def test_both_copies_refuse_and_both_say_why(tmp_path, body):
     for codegen, message in messages.items():
         assert "not reliable" in message, f"codegen={codegen} said nothing about the refusal"
         assert "#453" in message and "#456" in message and "#768" in message
+        assert "#1080" in message
         assert "mratio" in message
     # The compiled one reaches it the long way round, through the witness.
     assert "non-finite" in messages[True]
@@ -273,5 +284,37 @@ def test_the_series_route_matches_the_reference_on_both_engines(
         sim = bngsim.Simulator(model, method="ode", codegen=codegen)
         result = sim.run(t_span=(0.0, 1.0), n_points=3)
     # The compiled leg has to run the generated C, or it tests the interpreter twice.
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
+    assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-11, abs=0.0)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
+@pytest.mark.parametrize(
+    "a, b, z, true_value",
+    [
+        # mpmath at 80 digits and more. The fraction was 7.2e-7 off at the
+        # first, 1.1e-2 at the second and a factor of two at the third.
+        (-1e-12, 1e-9, -25.0, 5.562054719123343e-11),
+        (0.0, 1.1766052422876225e-12, -784.9671045705651, 1.5008374136500115e-15),
+        (
+            -2.4013304216952906e-13,
+            1.3563113178612664e-12,
+            -786022.5708171733,
+            1.7255395630598238e-18,
+        ),
+    ],
+    ids=["the series past z = -20", "a = 0 past z = -700", "a factor of two off"],
+)
+def test_past_z_minus_20_both_engines_match_the_reference(tmp_path, codegen, a, b, z, true_value):
+    """The same constant-rate check as above, for the corner of the a <= 0,
+    z <= 0 clause where b - a < 1 (issue #1080): the series to z = -700 and the
+    asymptotic route past it, which in the generated C are what the trust rule's
+    new clause hands these to."""
+    p = tmp_path / "m1080b.net"
+    p.write_text(CONSTANT_RATE_NET.format(a=a, b=b, z=z, scale=1.0 / true_value))
+    with contextlib.redirect_stderr(io.StringIO()):
+        model = bngsim.Model.from_net(str(p))
+        sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+        result = sim.run(t_span=(0.0, 1.0), n_points=3)
     assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
     assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-11, abs=0.0)
