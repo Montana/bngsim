@@ -393,6 +393,51 @@ def test_a_slower_ensemble_alerts():
     assert V.diff(base, same)["alerts"]["wall"] == 0
 
 
+def _phased(obj, seen, counted=None):
+    out = dict(obj, bngsim_phases_seen=sorted(seen))
+    out["bngsim_phases"] = list(counted if counted is not None else V.BNGSIM_PHASES)
+    return out
+
+
+def test_a_load_phase_is_not_compared_with_an_ensemble():
+    """The first night that counts the ensemble, against the night before it
+    (issue #901): bng_ssa's 0.212 s of parse and load against 533 s of SSA
+    read as x2515. The file from before says nothing of its phases, so it
+    summed the old ones, and tonight's timed one it did not count."""
+    base = _on(core({f"m{i}|stochastic": rec("PASS", sec=0.004) for i in range(50)}), "EPYC")
+    fresh = _phased(
+        _on(core({f"m{i}|stochastic": rec("PASS", sec=10.0) for i in range(50)}), "EPYC"),
+        {"load_sec", "ensemble_sec"},
+    )
+    r = V.diff(base, fresh)
+    assert r["alerts"]["wall"] == 0 and r["n_alerts"] == 0
+    assert r["wall"]["same_phases"] is False
+    assert "not compared" in V.render_md(r, "")
+
+
+def test_an_ode_leg_compares_across_the_change():
+    """Control. An ODE row records no ensemble, so its bngsim_sec is the same
+    sum before and after #901, and a blowup against a baseline from before
+    still alerts."""
+    base = _on(core({f"m{i}|ode": rec("PASS", sec=0.8) for i in range(100)}), "EPYC")
+    fresh = _phased(
+        _on(core({f"m{i}|ode": rec("PASS", sec=4.0) for i in range(100)}), "EPYC"),
+        {"parse_sec", "integrate_cold_sec"},
+    )
+    r = V.diff(base, fresh)
+    assert r["wall"]["same_phases"] is True
+    assert r["alerts"]["wall"] == 1
+
+
+def test_extract_records_the_phases_it_summed(tmp_path):
+    timing = {"bngsim": {"load_sec": 0.9, "ensemble_sec": 0.3, "rep_mean_sec": 0.03}}
+    path = tmp_path / "report.json"
+    write_report(path, [_jr("M1", "PASS", method="stochastic", timing=timing)])
+    obj = V.extract("core", path, "bng_nf")
+    assert obj["bngsim_phases"] == list(V.BNGSIM_PHASES)
+    assert obj["bngsim_phases_seen"] == ["ensemble_sec", "load_sec"]
+
+
 def test_the_stochastic_baselines_count_their_ensembles():
     """The committed bng_nf and bng_ssa baselines were extracted with the
     ensemble counted (issue #901), so tonight's extract is compared like for
@@ -401,6 +446,7 @@ def test_the_stochastic_baselines_count_their_ensembles():
         obj = json.loads((BASELINES / f"{suite}.json").read_text())
         total = sum(c.get("bngsim_sec") or 0.0 for c in obj["cases"].values())
         assert total > at_least, suite
+        assert "ensemble_sec" in obj["bngsim_phases_seen"], suite
 
 
 def test_multi_segment_backend_wins_over_the_replay_label(tmp_path):

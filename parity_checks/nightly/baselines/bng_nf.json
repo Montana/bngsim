@@ -5,6 +5,8 @@
   "source": {"config": {"bngsim_method": "nf", "n_rep": 10, "nf_block_same_complex_binding": true, "rep_timeout_sec": null, "rep_timeout_source": "derived per job", "seed_base": 1, "timeout_overridden_jobs": 0, "track": "nf"}, "cpu": "AMD EPYC 9V45 96-Core Processor", "elapsed_sec": 3971.79, "event": "schedule", "generated": "2026-10-18T13:48:00", "git_rev": "b45ff50", "regime": "nf", "run_id": "39128129181", "sha": "b45ff50433c7c8ff789a3643b98905eb0561a87e", "suite": "bng_parity", "versions": {"bng": "2.9.3", "bngsim": "0.16.0", "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39", "python": "3.12.3"}},
   "n_cases": 235,
   "tally": {"DIFF": 23, "PASS": 209, "REFERENCE_FAILED": 2, "TIMEOUT": 1},
+  "bngsim_phases": ["io_sec", "parse_sec", "interpret_sec", "load_sec", "jac_derive_sec", "codegen_sec", "integrate_cold_sec", "ensemble_sec"],
+  "bngsim_phases_seen": ["ensemble_sec", "io_sec", "load_sec"],
   "cases": {
     "glacial/curated/Creamer_2012.bngl|stochastic": {"bngsim_sec": 1.217415, "outcome": "PASS", "subclass": null},
     "glacial/rulehub/Published/Goldstein1980/blbr_heterogeneity_goldstein1980.bngl|stochastic": {"bngsim_sec": 1.246129, "note": "Disagreement does not close from 10 to 30 replicates/engine (agreement stalled or worsened as replicates grew) \u2014 a real divergence, not sampling noise. (Agreement: 90% at 10, 90% at 30.) Ensemble m...", "outcome": "DIFF", "subclass": null},

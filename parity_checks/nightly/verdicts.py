@@ -109,6 +109,10 @@ BNGSIM_PHASES = (
     "integrate_cold_sec",
     "ensemble_sec",
 )
+# What a verdict file extracted before issue #901 summed, which is what one that
+# does not say is read as: comparing its bngsim_sec with one that counts the
+# ensemble compared a load phase with a simulation (0.212 s -> 533 s, x2515).
+LEGACY_BNGSIM_PHASES = tuple(p for p in BNGSIM_PHASES if p != "ensemble_sec")
 
 NOTE_LIMIT = 200
 
@@ -135,6 +139,15 @@ def _core_bngsim_sec(row: dict) -> float | None:
     vals = [bn.get(k) for k in BNGSIM_PHASES]
     vals = [float(v) for v in vals if isinstance(v, (int, float))]
     return round(sum(vals), 6) if vals else None
+
+
+def _core_phases_seen(report: dict) -> set[str]:
+    """The BNGSIM_PHASES some row of a ``_core`` report records a time for."""
+    seen: set[str] = set()
+    for row in report.get("results", []):
+        bn = (row.get("timing") or {}).get("bngsim") or {}
+        seen.update(k for k in BNGSIM_PHASES if isinstance(bn.get(k), (int, float)))
+    return seen
 
 
 def _core_backend(row: dict) -> str | None:
@@ -248,9 +261,12 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
         report_paths = [report_paths]
     cases: dict[str, dict] = {}
     metas = []
+    phases_seen: set[str] = set()
     for path in report_paths:
         payload = json.loads(Path(path).read_text())
         part = EXTRACTORS[kind](payload)
+        if kind == "core":
+            phases_seen |= _core_phases_seen(payload)
         dup = sorted(set(part) & set(cases))
         if dup:
             raise ValueError(f"case(s) in more than one report: {dup[:5]}")
@@ -259,7 +275,7 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
     source = dict(metas[0]) if metas else {}
     if len(metas) > 1:
         source["parts"] = metas
-    return {
+    out = {
         "schema": SCHEMA,
         "suite": suite,
         "kind": kind,
@@ -268,6 +284,30 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
         "tally": tally(cases),
         "cases": dict(sorted(cases.items())),
     }
+    if kind == "core":
+        # Which phases each case's bngsim_sec sums, and which of them a case
+        # recorded, so that a diff compares two files' wall time only where each
+        # counted what the other timed (issue #901).
+        out["bngsim_phases"] = list(BNGSIM_PHASES)
+        out["bngsim_phases_seen"] = sorted(phases_seen)
+    return out
+
+
+def _wall_comparable(base: dict, fresh: dict) -> bool:
+    """Whether two verdict files' bngsim_sec measure the same thing: every phase
+    either recorded a time for is one the other summed. A file that does not say
+    summed LEGACY_BNGSIM_PHASES, and is taken to have timed all of them. So an ODE
+    leg, which records no ensemble, compares across #901, and the first night
+    that counts a stochastic ensemble does not compare it with a load phase."""
+
+    def counted(obj: dict) -> set[str]:
+        return set(obj.get("bngsim_phases") or LEGACY_BNGSIM_PHASES)
+
+    def seen(obj: dict) -> set[str]:
+        recorded = obj.get("bngsim_phases_seen")
+        return set(recorded) if recorded is not None else counted(obj)
+
+    return seen(base) <= counted(fresh) and seen(fresh) <= counted(base)
 
 
 def dump_verdicts(obj: dict, path: Path) -> None:
@@ -412,6 +452,9 @@ def diff(
     cpu_b, cpu_f = base.get("source", {}).get("cpu"), fresh.get("source", {}).get("cpu")
     same_cpu = bool(cpu_b) and cpu_b == cpu_f
     limit = wall_ratio if same_cpu else wall_ratio_any_cpu
+    # Two files whose bngsim_sec sums different phases measure different things:
+    # the first night after #901 compared bng_ssa's load phase with its ensemble.
+    same_phases = _wall_comparable(base, fresh)
     wall = {
         "n_cases": len(wall_cases),
         "before": round(wb, 3),
@@ -422,7 +465,8 @@ def diff(
         "same_cpu": same_cpu,
         "limit": limit,
         "min_delta": wall_min_delta,
-        "alert": wb > 0 and wf > wb * limit and wf - wb > wall_min_delta,
+        "same_phases": same_phases,
+        "alert": same_phases and wb > 0 and wf > wb * limit and wf - wb > wall_min_delta,
     }
 
     # A run meant to exercise a specific backend must have run it: exprtk for the
@@ -667,7 +711,14 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
             )
         lines.append("")
     w = result["wall"]
-    if w["n_cases"]:
+    if w["n_cases"] and not w.get("same_phases", True):
+        lines += [
+            f"bngsim wall over {w['n_cases']} cases: {w['before']} s -> {w['after']} s, "
+            "not compared: the two files time different phases (issue #901), and "
+            "compare again once both are extracted with the same ones.",
+            "",
+        ]
+    elif w["n_cases"]:
         flag = " — **ALERT**" if w["alert"] else ""
         where = (
             f"same CPU ({w.get('cpu_fresh')})"

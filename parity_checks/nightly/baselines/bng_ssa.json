@@ -5,6 +5,8 @@
   "source": {"config": {"bngsim_method": "ssa", "n_rep": 10, "nf_block_same_complex_binding": null, "rep_timeout_sec": null, "rep_timeout_source": "derived per job", "seed_base": 1, "timeout_overridden_jobs": 0, "track": "ssa"}, "cpu": "AMD EPYC 7763 64-Core Processor", "elapsed_sec": 2113.66, "event": "schedule", "generated": "2026-10-18T13:18:37", "git_rev": "b45ff50", "regime": "ssa", "run_id": "39128129181", "sha": "b45ff50433c7c8ff789a3643b98905eb0561a87e", "suite": "bng_parity", "versions": {"bng": "2.9.3", "bngsim": "0.16.0", "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39", "python": "3.12.3"}},
   "n_cases": 110,
   "tally": {"DIFF": 1, "PASS": 106, "REFERENCE_FAILED": 1, "TIMEOUT": 2},
+  "bngsim_phases": ["io_sec", "parse_sec", "interpret_sec", "load_sec", "jac_derive_sec", "codegen_sec", "integrate_cold_sec", "ensemble_sec"],
+  "bngsim_phases_seen": ["ensemble_sec", "interpret_sec", "io_sec", "load_sec", "parse_sec"],
   "cases": {
     "glacial/rulehub/Published/Lin2019/ERK_model.bngl|stochastic": {"note": "Exceeded the 1800.0s wall limit; stopped.", "outcome": "TIMEOUT", "subclass": null},
     "glacial/rulehub/Published/Lin2019/prion_model.bngl|stochastic": {"note": "bngsim: SimulationTimeout: Simulation exceeded wall-clock timeout: elapsed 88.5014s > limit 88.5s", "outcome": "TIMEOUT", "subclass": null},
