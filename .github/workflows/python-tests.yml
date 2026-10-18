@@ -240,14 +240,26 @@ jobs:
       # guard below: the count floor catches tests that vanish from collection,
       # strict catches tests that quietly turn into skips for a reason nobody
       # signed off on.
+      #
+      # The suite runs under pytest-xdist, one test file per worker, as the
+      # pre-push hook does (ci/pre_push_pytest.py, where the measurements are).
+      # Serially this step was 16-28 minutes of a 20-33 minute job. The workers
+      # share one artifact cache: with -p no:cacheprovider each would otherwise
+      # take a temp dir of its own (conftest's no-cacheprovider branch) and
+      # compile the same codegen libraries again, and on macOS each new library
+      # also pays a first-load check that the system runs one file at a time.
+      # The skip audit and the summary line the guard below reads come from the
+      # xdist controller, as they come from the one process serially.
       - name: Run the full Python suite
         id: pytest
         env:
           BNGSIM_SKIP_AUDIT: strict
           BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
+          BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
         run: |
           set -o pipefail
           uv run --no-sync python -m pytest -p no:cacheprovider python/tests \
+            -n auto --dist loadfile \
             -q --tb=short --durations=15 ${{ github.event.inputs.pytest_args }} \
             2>&1 | tee python-tests-${{ matrix.label }}.log
 
