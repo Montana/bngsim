@@ -896,6 +896,7 @@ def _cf_sbml(
     cf_param: str = _CF_UNSET,
     extra: str = "",
     extra_species: str = "",
+    events: str = "",
 ) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
     <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
@@ -924,6 +925,7 @@ def _cf_sbml(
             </math></kineticLaw>
           </reaction>
         </listOfReactions>
+        {events}
       </model>
     </sbml>"""
 
@@ -1007,6 +1009,11 @@ _S3_NO_VALUE = (
     '<species id="S3" compartment="C" hasOnlySubstanceUnits="false" '
     'boundaryCondition="false" constant="false"/>'
 )
+# A boundary species no rule or event changes holds its value, so a rule over it
+# does not move.
+_S3_BOUNDARY_NO_VALUE = _S3_NO_VALUE.replace(
+    'boundaryCondition="false"', 'boundaryCondition="true"'
+)
 
 
 @pytest.mark.parametrize(
@@ -1028,7 +1035,7 @@ _S3_NO_VALUE = (
                 "cf_param": '<parameter id="cf" constant="false"/>',
                 "extra": f'<listOfRules><assignmentRule variable="cf">{_CF_TWO_PLUS_S3}'
                 "</assignmentRule></listOfRules>",
-                "extra_species": _S3_NO_VALUE,
+                "extra_species": _S3_BOUNDARY_NO_VALUE,
             },
             r"could not evaluate the assignmentRule cf = 2 \+ S3 at load",
             id="a-rule-with-no-value-at-load",
@@ -1048,11 +1055,109 @@ _S3_NO_VALUE = (
 )
 def test_conversion_factor_with_no_value_to_read_refuses(kwargs, match):
     """A factor that names no parameter (invalid SBML, libsbml rules 20617 and
-    20216) was read as 1. One whose assignmentRule reads a species with no initial
-    value was read as 1 too, and one whose initialAssignment does was read as its
-    declared value: 5, while the parameter itself read 2 (RoadRunner's factor)."""
+    20216) was read as 1. One whose assignmentRule reads a boundary species with
+    no initial value was read as 1 too, and one whose initialAssignment reads a
+    species with none was read as its declared value: 5, while the parameter
+    itself read 2 (RoadRunner's factor)."""
     with pytest.raises(bngsim.ModelError, match=match):
         bngsim.Model.from_sbml_string(_cf_sbml(**kwargs))
+
+
+# ─── A conversionFactor whose parameter changes during the run ──────────
+#
+# SBML requires a conversionFactor to name a constant parameter (rule 20705).
+# bngsim folds the factor into the rates at load, so each model below ran with
+# the factor at its initial value 2, S1(1) = e^-1 = 0.36788, where RoadRunner,
+# which follows the parameter, gives 0.28651 (rate rule), 0.28650 (`2 + time`),
+# 0.43526 (`1 + S1`), 0.17377 (an event sets it to 5 at t = 0.5) and 0.13533 (a
+# rule over `k`, which an event sets to 3). A rate rule of 0 and a rule over
+# constants alone hold the value, and load (the tests above).
+
+
+def _cf_event(var: str, value: float) -> str:
+    return f"""<listOfEvents>
+      <event id="E0" useValuesFromTriggerTime="true">
+        <trigger initialValue="false" persistent="true">
+          <math xmlns="http://www.w3.org/1998/Math/MathML"><apply><gt/>
+            <csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>
+            <cn>0.5</cn></apply></math>
+        </trigger>
+        <listOfEventAssignments>
+          <eventAssignment variable="{var}">
+            <math xmlns="http://www.w3.org/1998/Math/MathML"><cn>{value}</cn></math>
+          </eventAssignment>
+        </listOfEventAssignments>
+      </event>
+    </listOfEvents>"""
+
+
+def _cf_rule(kind: str, math: str) -> str:
+    return (
+        f'<listOfRules><{kind} variable="cf"><math '
+        f'xmlns="http://www.w3.org/1998/Math/MathML">{math}</math></{kind}></listOfRules>'
+    )
+
+
+_CF_VARIABLE = '<parameter id="cf" constant="false"/>'
+_TIME = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "changer"),
+    [
+        pytest.param(
+            {
+                "cf_param": '<parameter id="cf" value="2" constant="false"/>',
+                "extra": _cf_rule("rateRule", "<cn>1</cn>"),
+            },
+            "the rate rule d(cf)/dt = 1",
+            id="rate-rule",
+        ),
+        pytest.param(
+            {
+                "cf_param": _CF_VARIABLE,
+                "extra": _cf_rule("assignmentRule", f"<apply><plus/><cn>2</cn>{_TIME}</apply>"),
+            },
+            "the assignment rule cf := 2 + time",
+            id="rule-reading-the-time",
+        ),
+        pytest.param(
+            {
+                "cf_param": _CF_VARIABLE,
+                "extra": _cf_rule("assignmentRule", "<apply><plus/><cn>1</cn><ci>S1</ci></apply>"),
+            },
+            "the assignment rule cf := 1 + S1",
+            id="rule-reading-a-species",
+        ),
+        pytest.param(
+            {
+                "cf_param": '<parameter id="cf" value="2" constant="false"/>',
+                "events": _cf_event("cf", 5),
+            },
+            "event 'E0'",
+            id="event",
+        ),
+        pytest.param(
+            {
+                "cf_param": _CF_VARIABLE + '<parameter id="k" value="1" constant="false"/>',
+                "extra": _cf_rule("assignmentRule", "<apply><times/><cn>2</cn><ci>k</ci></apply>"),
+                "events": _cf_event("k", 3),
+            },
+            "the assignment rule cf := 2 * k",
+            id="rule-over-a-parameter-an-event-changes",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("attrs", "where"), _CF_LEVELS)
+def test_conversion_factor_the_run_changes_refuses(attrs, where, kwargs, changer):
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(_cf_sbml(**attrs, **kwargs))
+    msg = str(exc.value)
+    assert f"{where} is 'cf', whose value {changer}".lower() in msg.lower()
+    assert "changes during the run" in msg
+    assert "20705" in msg
 
 
 # ─── #580: a species the model never gives an initial value ─────────────

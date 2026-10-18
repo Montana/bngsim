@@ -6457,11 +6457,64 @@ def _build_model_from_sbml_doc_in_context(doc):
     # expressed as a single rate scale and are refused loudly there (never
     # silently mis-integrated). Models with no conversionFactor leave
     # ``_has_conversion_factor`` False and this is a complete no-op.
+    #
+    # A factor whose parameter changes during the run is therefore one the rates
+    # cannot follow: they keep the value it has at load. SBML forbids it (rule
+    # 20705), but bngsim used to load it without a word: `cf = 2` with the rate
+    # rule `cf' = 1` gave S1(1) = 0.36788 for `S1 -> S2` at 0.5*S1, where
+    # RoadRunner, which follows the parameter, gives 0.28651. What changes one:
+    # a rate rule (a rate of 0 leaves it where it is), an event that assigns it
+    # (one with a trigger, as the event pre-scan counts them), or an assignment
+    # rule that moves (`_moving_assignment_rule_vars`: it reads the time, a
+    # species, or something a rate rule or an event changes). A rule over
+    # constants alone holds its value and is folded like an initialAssignment.
+    _cf_ids = {
+        _sp.getConversionFactor()
+        for _sp in (sbml_model.getSpecies(_j) for _j in range(sbml_model.getNumSpecies()))
+        if _sp.isSetConversionFactor()
+    }
+    if sbml_model.isSetConversionFactor():
+        _cf_ids.add(sbml_model.getConversionFactor())
+    _cf_changed_by: dict[str, list[str]] = {}
+    if _cf_ids:
+        _, _cf_moving_ars = _moving_assignment_rule_vars(sbml_model)
+        for _j in range(sbml_model.getNumRules()):
+            _r = sbml_model.getRule(_j)
+            _v = _r.getVariable()
+            if _v not in _cf_ids or _r.getMath() is None:
+                continue
+            _txt = libsbml.formulaToL3String(_r.getMath())
+            if _r.isRate():
+                _names, _clock = _math_names(_r.getMath())
+                if (
+                    not _names
+                    and not _clock
+                    and _eval_ast_numeric(_r.getMath(), {}, func_defs) == 0
+                ):
+                    continue
+                _cf_changed_by.setdefault(_v, []).append(f"the rate rule d({_v})/dt = {_txt}")
+            elif _r.isAssignment() and _v in _cf_moving_ars:
+                _cf_changed_by.setdefault(_v, []).append(
+                    f"the assignment rule {_v} := {_txt}, which reads the time or a value "
+                    "that changes,"
+                )
+        for _j in range(sbml_model.getNumEvents()):
+            _ev = sbml_model.getEvent(_j)
+            if _ev.getTrigger() is None or _ev.getTrigger().getMath() is None:
+                continue  # it never fires
+            for _k in range(_ev.getNumEventAssignments()):
+                _ea = _ev.getEventAssignment(_k)
+                if _ea.getVariable() in _cf_ids and _ea.getMath() is not None:
+                    _cf_changed_by.setdefault(_ea.getVariable(), []).append(
+                        f"event {_ev.getId()!r}" if _ev.getId() else "an event"
+                    )
+
     def _resolve_const_param_value(pid, what):
         # conversionFactor parameters are constant, and the factor is folded into
         # the rates as a number: the value its initialAssignment (or an
-        # assignmentRule) gives it at load, else the declared one. Nothing falls
-        # back to a number the model did not give. A factor read as 1 is a factor
+        # assignmentRule over constants) gives it at load, else the declared one.
+        # A parameter that the run changes is refused first. Nothing falls back
+        # to a number the model did not give. A factor read as 1 is a factor
         # dropped without a word, and a declared value that an assignment
         # replaces is not the factor either: `cf = 5` with the initialAssignment
         # `cf = 2 + S3`, S3 given no initial value, scaled the rates by 5 while
@@ -6477,6 +6530,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                 f"{what} is {pid!r}, which is not a parameter of the model. SBML "
                 "requires a conversionFactor to name a constant parameter, and bngsim "
                 "will not read it as 1."
+            )
+        if pid in _cf_changed_by:
+            raise ModelError(
+                f"{what} is {pid!r}, whose value {' and '.join(_cf_changed_by[pid])} "
+                "changes during the run. bngsim folds a conversion factor into the "
+                "rates as a number at load, so the run would keep the value it has at "
+                "the start. SBML requires a conversionFactor to name a constant "
+                "parameter (validation rule 20705)."
             )
         if pid in _ia_math or pid in _ar_targets:
             kind = "initialAssignment" if pid in _ia_math else "assignmentRule"
