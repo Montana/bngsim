@@ -5145,7 +5145,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # Compartments whose live symbol must divide Functional reaction laws even
     # when their load-time size is 1.0. ``variable_comps`` intentionally excludes
-    # assignment-rule compartments for state-volume/rateOf paths, but reaction
+    # assignment-rule compartments for state-volume paths, but reaction
     # storage conversion still needs ``law / V_live`` for hOSU=false species in
     # AR compartments (suite 00946/00948: ``C := fakeC``, event changes fakeC).
     live_symbol_divide_comps = variable_comps | ar_comp_targets
@@ -6293,10 +6293,16 @@ def _build_model_from_sbml_doc_in_context(doc):
         # amount-rate — for a CONSTANT-volume compartment (01455/01457) AND a
         # VARIABLE-volume compartment promoted to a state (rate-rule / event-resized,
         # 01463), with no conc·V̇ correction. Flag the species so the engine (and
-        # codegen) scale its rate_of__ accessor by volume_factor. AR-compartment
-        # volumes are not integrator states, so a hOSU species there stays on the
-        # unscaled d(conc)/dt (excluded — no rateOf case there is in the suite).
-        if hosu and (comp not in vstatic_divide_comps or comp in variable_comps):
+        # codegen) scale its rate_of__ accessor by volume_factor.
+        #
+        # An assignment-rule compartment too (issue #736). Its volume is not an
+        # integrator state, but what decides the scaling is how the species is
+        # stored, and it is stored as amount/V_static there as well: left out,
+        # its rateOf read d(amount)/dt / V_static, a third of the answer in a
+        # compartment of size 3, and a rate rule on it integrated that. Such a
+        # compartment is not in live_volume_param_comps, so codegen scales by
+        # the number V_static, which is what the storage divided by.
+        if hosu:
             builder.set_species_rateof_amount(idx)
 
         # If the species's IC was set by an initialAssignment over parameters,
@@ -9762,6 +9768,28 @@ def _build_model_from_sbml_doc_in_context(doc):
     for sid in ar_dilution_species:
         varvol_ar_amount_map[_safe_name(sid)] = _safe_name(species_comp[sid])
     model._varvol_ar_amount_map = varvol_ar_amount_map
+
+    # (#728) The amount report of a concentration species that a rule sets. The
+    # two maps above take their species from the dilution gate, which leaves
+    # out a rule target, rightly: its rule states its derivative or its value.
+    # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
+    # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
+    # under every method, so V_live(t) is all the report needs, read from the
+    # compartment's promoted-species column (a rate rule) or its expression
+    # column (an assignment rule).
+    varvol_target_amount_map: dict[str, tuple[str, str]] = {}
+    for sid, cid in species_comp.items():
+        if (
+            sid not in species_idx
+            or species_hosu.get(sid, False)
+            or (sid not in rate_rule_targets and sid not in assignment_targets)
+        ):
+            continue
+        if cid in rate_rule_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
+        elif cid in ar_comp_targets:
+            varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+    model._varvol_target_amount_map = varvol_target_amount_map
 
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
     # compartments (an event assignment writes the compartment's size). Unlike a
