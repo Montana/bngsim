@@ -2031,13 +2031,16 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
       * **rate-rule target** (parameter / species / compartment): the rate is the
         rule's RHS — ``dx/dt`` is stated directly (01250: ``rateOf(p1)`` where
         ``p1`` has rate rule ``1`` ⇒ ``1``).
-      * **reaction-driven species**: ``dAmount/dt = Σ net_stoich·kineticLaw``
-        over every reaction, in the species' reporting units — amount-rate for a
-        ``hasOnlySubstanceUnits`` species, else concentration-rate (``÷V``). This
+      * **reaction-driven species**: ``dAmount/dt = cf·Σ net_stoich·kineticLaw``
+        over every reaction, with ``cf`` the species' conversion factor or the
+        model's (1 with neither), in the species' reporting units — amount-rate
+        for a ``hasOnlySubstanceUnits`` species, else concentration-rate
+        (``÷V``, less ``[S]·V'/V`` where a rate rule sizes the compartment). This
         mirrors ``current_derivs`` (which holds d[conc]/dt) and the sub-cluster-3
         ``report_rateof_amount`` ×V convention (01251/01252/01254, all V=1).
       * **boundary / constant species** with no rate rule: not changed by
-        reactions ⇒ ``0``.
+        reactions ⇒ ``0``, or ``-[S]·V'/V`` for a concentration in a compartment
+        a rate rule sizes (its amount holds).
 
     Returns ``None`` (fold fails, target keeps its declared value) when the
     derivative can't be evaluated — an unknown symbol, an unsupported kinetic
@@ -2082,6 +2085,22 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 net += sign * sval
         return net
 
+    def _concentration_rate(name, sp, amt_rate, ctx):
+        """d[S]/dt = (d amount/dt)/V - [S]·(dV/dt)/V. dV/dt is the compartment's
+        rate rule, or 0 (issue #738: 01822 folded 1 for 0.675 without it)."""
+        vol = ctx.get(sp.getCompartment(), 1.0)
+        if not vol:
+            return None
+        dvol = resolver(sp.getCompartment(), ctx)
+        if dvol is None:
+            return None
+        if dvol == 0.0:
+            return amt_rate / vol
+        conc = ctx.get(name)
+        if conc is None:
+            return None
+        return amt_rate / vol - conc * dvol / vol
+
     def resolver(name, ctx):
         # 1) rate-rule target — dx/dt is the rule's RHS, in the target's units.
         if name in rate_rule_math:
@@ -2094,10 +2113,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             # functionDefinition whose body reads rateOf, which would reach
             # here with the body's own argument name.
             return 0.0
-        # 2) species — boundary or constant species is held by reactions ⇒ 0.
+        # 2) species — reactions do not change a boundary or constant species, so
+        # its amount holds. Held as a concentration in a compartment a rate rule
+        # sizes, it is diluted all the same (suite 01117/01118 hold the amount as
+        # the size grows), and the run's rateOf reads -[S]·V'/V; the fold gave 0
+        # (issue #738).
         if sp.getBoundaryCondition() or sp.getConstant():
-            return 0.0
-        vol = ctx.get(sp.getCompartment(), 1.0)
+            if sp.getHasOnlySubstanceUnits() or sp.getCompartment() not in rate_rule_math:
+                return 0.0
+            return _concentration_rate(name, sp, 0.0, ctx)
         amt_rate = 0.0
         for j in range(sbml_model.getNumReactions()):
             rxn = sbml_model.getReaction(j)
@@ -2115,11 +2139,24 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if v is None:
                 return None
             amt_rate += net * v
+        # A conversion factor scales what the reactions do to the species: its
+        # own, or the model's where it has none (issue #738). Left out, the fold
+        # was 1/cf of what the run reads at t = 0 (01405: -0.5 for -1).
+        cf_id = (
+            sp.getConversionFactor()
+            if sp.isSetConversionFactor()
+            else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
+        )
+        if cf_id:
+            cf = ctx.get(cf_id)
+            if cf is None:
+                return None
+            amt_rate *= cf
         # ``current_derivs`` is d[conc]/dt; rateOf reports amount-rate for a hOSU
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
-        return amt_rate / vol if vol else None
+        return _concentration_rate(name, sp, amt_rate, ctx)
 
     return resolver
 
@@ -5275,7 +5312,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # Compartments whose live symbol must divide Functional reaction laws even
     # when their load-time size is 1.0. ``variable_comps`` intentionally excludes
-    # assignment-rule compartments for state-volume/rateOf paths, but reaction
+    # assignment-rule compartments for state-volume paths, but reaction
     # storage conversion still needs ``law / V_live`` for hOSU=false species in
     # AR compartments (suite 00946/00948: ``C := fakeC``, event changes fakeC).
     live_symbol_divide_comps = variable_comps | ar_comp_targets
@@ -6423,10 +6460,16 @@ def _build_model_from_sbml_doc_in_context(doc):
         # amount-rate — for a CONSTANT-volume compartment (01455/01457) AND a
         # VARIABLE-volume compartment promoted to a state (rate-rule / event-resized,
         # 01463), with no conc·V̇ correction. Flag the species so the engine (and
-        # codegen) scale its rate_of__ accessor by volume_factor. AR-compartment
-        # volumes are not integrator states, so a hOSU species there stays on the
-        # unscaled d(conc)/dt (excluded — no rateOf case there is in the suite).
-        if hosu and (comp not in vstatic_divide_comps or comp in variable_comps):
+        # codegen) scale its rate_of__ accessor by volume_factor.
+        #
+        # An assignment-rule compartment too (issue #736). Its volume is not an
+        # integrator state, but what decides the scaling is how the species is
+        # stored, and it is stored as amount/V_static there as well: left out,
+        # its rateOf read d(amount)/dt / V_static, a third of the answer in a
+        # compartment of size 3, and a rate rule on it integrated that. Such a
+        # compartment is not in live_volume_param_comps, so codegen scales by
+        # the number V_static, which is what the storage divided by.
+        if hosu:
             builder.set_species_rateof_amount(idx)
 
         # If the species's IC was set by an initialAssignment over parameters,
@@ -9579,6 +9622,22 @@ def _build_model_from_sbml_doc_in_context(doc):
             _reads.setdefault(f"rateOf({_r.getVariable()})", set()).update(
                 _names_read(_r.getMath())
             )
+    # A concentration in a compartment a rate rule sizes is diluted as the size
+    # changes, whether reactions move it or not, so its rate also reads its own
+    # value, the size and the size's rate (issue #738): `p = rateOf(B)` under
+    # `c' = g` left `g` writable, and `p` 0.675 where a rebuild after `g = 1`
+    # gives 0.35. One with a rate rule of its own has its rate stated.
+    for _j in range(sbml_model.getNumSpecies() if _uses_rateof else 0):
+        _sp_d = sbml_model.getSpecies(_j)
+        _sid_d, _cid_d = _sp_d.getId(), _sp_d.getCompartment()
+        if (
+            _cid_d in rate_rule_comps
+            and not _sp_d.getHasOnlySubstanceUnits()
+            and _sid_d not in rate_rule_targets
+        ):
+            _reads.setdefault(f"rateOf({_sid_d})", set()).update(
+                {_sid_d, _cid_d, f"rateOf({_cid_d})"}
+            )
     for _rxn_i in range(sbml_model.getNumReactions()):
         _rxn_f = sbml_model.getReaction(_rxn_i)
         _kl_f = _rxn_f.getKineticLaw()
@@ -9955,6 +10014,28 @@ def _build_model_from_sbml_doc_in_context(doc):
     for sid in ar_dilution_species:
         varvol_ar_amount_map[_safe_name(sid)] = _safe_name(species_comp[sid])
     model._varvol_ar_amount_map = varvol_ar_amount_map
+
+    # (#728) The amount report of a concentration species that a rule sets. The
+    # two maps above take their species from the dilution gate, which leaves
+    # out a rule target, rightly: its rule states its derivative or its value.
+    # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
+    # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
+    # under every method, so V_live(t) is all the report needs, read from the
+    # compartment's promoted-species column (a rate rule) or its expression
+    # column (an assignment rule).
+    varvol_target_amount_map: dict[str, tuple[str, str]] = {}
+    for sid, cid in species_comp.items():
+        if (
+            sid not in species_idx
+            or species_hosu.get(sid, False)
+            or (sid not in rate_rule_targets and sid not in assignment_targets)
+        ):
+            continue
+        if cid in rate_rule_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
+        elif cid in ar_comp_targets:
+            varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+    model._varvol_target_amount_map = varvol_target_amount_map
 
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
     # compartments (an event assignment writes the compartment's size). Unlike a

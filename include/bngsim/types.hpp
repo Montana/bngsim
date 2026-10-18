@@ -101,9 +101,10 @@ struct Species {
     // stores amount/V_static and rescales to live volume separately, so
     // rateof_scratch is already d(amount)/dt / V_static and ×volume_factor recovers
     // the amount-rate with no conc·V̇ correction (suite 01455/01457 constant-V,
-    // 01463 rate-rule varvol). AR-compartment hOSU species stay excluded (their
-    // volume is a rule function, not verified here). Default false ⇒ byte-identical
-    // for .net, V=1, and every hOSU=false species (volume_factor=1 also a no-op).
+    // 01463 rate-rule varvol). An assignment-rule compartment is the same (#736):
+    // its species are stored as amount/V_static too, and volume_factor is that
+    // V_static. Default false ⇒ byte-identical for .net, V=1, and every hOSU=false
+    // species (volume_factor=1 also a no-op).
     bool report_rateof_amount = false;
 
     // Reported in the trajectory output? (GH #71) When false this species is a
