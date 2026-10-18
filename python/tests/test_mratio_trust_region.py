@@ -29,7 +29,10 @@ The region it is trusted in, measured against a 40 digit reference, is all for
   ``a = -min(AT, BT)`` and ``z = -1/Keq``, and it stays true when a fit moves the
   counts off the integers.
 * ``|z| <= 20``, clean over 3400 hostile triples where the first wrong answer
-  anywhere is at ``|z| = 60``.
+  anywhere is at ``|z| = 60``. Clean of false limits, that is: issue #1080
+  found it losing digits there, up to 4.4e-7, when ``a`` is tiny next to ``b``
+  or ``b`` itself is tiny, and those arguments are now summed as two series
+  before this rule is asked. That is the last section below.
 * ``b*b >= 64*|z*a|``, which says the odd partial numerators start small,
   and for a positive ``z`` also ``2*z <= b``, which is the same statement
   about the even ones. That second half is issue #456: without it this
@@ -290,3 +293,79 @@ def test_a_negative_b_in_a_rate_law_fails_rather_than_returning_a_wrong_trajecto
         with pytest.raises(bngsim.SimulationError, match=r"not reliable.*#768"):
             sim.run(t_span=(0.0, 1.0), n_points=3)
     assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
+
+
+# ── Issue #1080: digits the fraction lost inside |z| <= 20 ──────────────────
+
+# a, b, z, what the fraction returned, and the ratio (mpmath at 60 digits). No
+# false limit here: the fraction converged to the ratio, but lost about
+# 1e-14*|R| of it, and R reaches 1e9 where a is tiny next to a b below 1 and z
+# is near 20. The fourth and fifth rows are a tiny b near z = -20, the fourth
+# through the a <= 0, z <= 0 clause. The last is a b far below anything a model
+# builds, where the fraction returned its Lentz floor, 1e-32.
+WAS_OFF_1080 = [
+    (-1e-12, 0.026664156824421394, 19.310533421401022, 223548140.61039492, 223548187.99851523),
+    (
+        5.1457398429446604e-14,
+        0.002765315544365488,
+        19.907142257727095,
+        434265223.3081783,
+        434265294.9192469,
+    ),
+    (
+        -2.6999339278500113e-11,
+        0.011537625782194286,
+        19.682954101484214,
+        1648055069.4106143,
+        1648055787.7495603,
+    ),
+    (
+        -8.607573956569877e-15,
+        1.535796353807133e-08,
+        -19.72305014003269,
+        3.541811340992023e-09,
+        3.5418112969725804e-09,
+    ),
+    (
+        9.032951159523816e-08,
+        2.0956113825578895e-08,
+        -19.34191963409733,
+        -5.592377139114178e-11,
+        -5.592377814347665e-11,
+    ),
+    (0.5, 1e-300, 10.0, 9.999999999999999e-33, 2.1056310242163857e-300),
+]
+
+
+@pytest.mark.parametrize("a, b, z, old, true_value", WAS_OFF_1080)
+def test_the_digits_the_fraction_lost_are_summed_back(tmp_path, a, b, z, old, true_value):
+    """Each of these was answered by the fraction and came out more than 1e-8
+    off. For b > 0, 0 < |z| <= 20 and |alpha| < 1, with alpha = a for z > 0 and
+    b - a for z < 0, both Kummer series are summed instead, and their terms after
+    the first all share a sign, so nothing cancels at these arguments."""
+    assert abs(old - true_value) / abs(true_value) > 1e-8
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+def test_near_a_pole_the_error_is_what_an_ulp_of_a_does(tmp_path):
+    """M(a, b, z) is 6.5e-5 here, near a zero at z = 18.37, so the ratio is
+    6.9e11 and the denominator's sum cancels. That cancellation is the problem's
+    own: one ulp of a moves the ratio by 2.5e-12 (mpmath), and the sum is off
+    by about that. The fraction was off by 2.8e-4, a hundred million ulps."""
+    a, b, z = -5.016391657033421e-09, 0.2277418763764943, 18.373535269367025
+    assert _value(tmp_path, a, b, z) == pytest.approx(691719131795.04684, rel=1e-11, abs=0.0)
+
+
+@pytest.mark.parametrize(
+    "a, b, z, true_value",
+    [
+        # Just outside the box, one on each edge, where the fraction answers as
+        # before and is right to rounding. mpmath at 100 digits.
+        (1.0, 0.026664156824421394, 19.310533421401022, 0.028008147640145812),  # alpha = 1
+        (-1.0, 0.5, 10.0, -1.0 / 19.0),  # a negative integer: the fraction terminates
+        (-1e-12, 1.0, -19.5, 0.051282051107778356),  # z < 0 with b - a just above 1
+        (-1e-12, 0.5, -20.5, 0.025035151439572003),  # |z| past 20
+    ],
+)
+def test_the_fraction_still_answers_outside_the_box(tmp_path, a, b, z, true_value):
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)

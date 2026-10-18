@@ -114,10 +114,14 @@ Ported from BNG's `Util::Mratio` (W. S. Hlavacek, 2018). Evaluated by Gauss's
 continued fraction with the modified Lentz method, and by an asymptotic expansion
 for arguments the fraction cannot be trusted with. `a = 0` with `b > 0` and
 `z > 0` is summed directly instead, as M(1, b+1, z), since M(0, b, z) = 1
-(issue #768). Arguments none of these can vouch for are refused rather than
-answered, because the fraction is silently wrong there. That includes every
-`b <= 0` the asymptotic expansion cannot answer. See `expr_compat::mratio` in
-`src/expression.cpp` for the region and the reasoning behind it.
+(issue #768). Inside `|z| <= 20`, for `b > 0` and `|alpha| < 1` with
+`alpha = a` when `z > 0` and `alpha = b - a` when `z < 0`, both Kummer functions
+are summed as power series, because there the fraction loses digits when `a` or
+`b` is tiny (issue #1080). Arguments none of these can vouch for are refused
+rather than answered, because the fraction is silently wrong there. That
+includes every `b <= 0` the asymptotic expansion cannot answer. See
+`expr_compat::mratio` in `src/expression.cpp` for the region and the reasoning
+behind it.
 
 `mratio` is differentiable in its third argument, so a rate law that reaches a
 fitted rate constant through `z` (BNG writes `z = -1/Keq`) gets an analytic

@@ -111,6 +111,11 @@ namespace bngsim {
 //     with |z| up to 50, chosen with small b and a on both sides of zero. The
 //     first wrong answer anywhere appears at |z| = 60 and is marginal (2e-08);
 //     the first serious one at |z| = 75. Twenty leaves a factor of three.
+//     No false limit there, but not every digit either (issue #1080): with
+//     |a| tiny next to a b below 1 the fraction lost up to 4.4e-7 near z = 20,
+//     and with b itself tiny just over 1e-8 near z = -20, here and in the
+//     clause above. Those arguments never reach this rule now; see
+//     mratio_series below.
 //   * b^2 >= 64*|z*a|, and for a positive z also 2*z <= b: the odd partial
 //     numerators are z*(a+k)/((b+k-2)(b+k-1)), so the first half of this is the
 //     statement that they start small and the fraction is a contraction from
@@ -520,12 +525,110 @@ static double mratio_a_zero_series(double b, double z) {
     return std::numeric_limits<double>::quiet_NaN();
 }
 
+// ─── Both series summed, where the fraction loses digits (issue #1080) ───────
+//
+// Inside |z| <= 20 the fraction converges to the ratio, but not to all of it.
+// It loses digits in proportion to how large the ratio is, about 1e-14*|R| for
+// a positive z. The ratio is large there when a is tiny next to b and b < 1:
+// M(a, b, z) stays near 1 while M(a+1, b+1, z) grows like e^z/b, so R reaches
+// 1e8 to 1e9 as z approaches 20. mratio(-1e-12, 0.0266641568, 19.3105334) came
+// out 2.235481406e8 where the ratio is 2.235481880e8. A tiny b with z near -20
+// loses the same way at the other end, where R is about 1e-9. Against mpmath at
+// 60 digits, over 20000 triples with |a| in [1e-15, 1e-2], b in [1e-9, 10] and
+// z in (-20, 20], 210 were off by more than 1e-8, the worst by 4.4e-7.
+//
+// Both Kummer functions are summed directly instead, when b > 0 and |alpha| < 1:
+//
+//   z > 0:  alpha = a,      R = M(alpha+1, b+1, x) / M(alpha, b, x),  x = z
+//   z < 0:  alpha = b - a,  R = M(alpha,   b+1, x) / M(alpha, b, x),  x = -z
+//
+// The second line is Kummer's transformation M(a, b, z) = e^z M(b-a, b, -z)
+// applied to both functions, whose e^z factors cancel. In that box the
+// numerator's terms all share one sign from the second onward, and so do the
+// denominator's: (alpha)_k keeps the sign of alpha once alpha + 1 > 0, and the
+// numerator's first parameter is alpha + 1 > 0 when z > 0. So the sums cancel
+// only where a Kummer function is itself near zero. That is a pole or a zero of
+// the ratio, where the problem is ill-conditioned whatever computes it.
+//
+// The denominator is summed times b, which keeps its second term alpha*x finite
+// however small b is. The fraction has no such care: mratio(0.5, 1e-300, 10)
+// came back as 1e-32, its Lentz floor, where the ratio is 2.1e-300.
+// Nothing overflows: for |alpha| < 1 and x <= 20 the numerator is below
+// (1+x)*e^x, and the denominator's terms after b add up to less than x*e^x.
+//
+// Measured against the same reference: none of 60000 triples drawn as above is
+// off by more than 1e-8 (worst 1.0e-12, beside a pole), and none of 20000 over
+// the whole box with b from 1e-300 to 1e8 (worst 2.7e-14). Placed within 1e-15
+// to 1e-3 of a pole, where the fraction is off by factors, the value is the
+// exact ratio at an `a` 1 to 16 ulps away, 4 or fewer in 1994 of 2193 cases.
+// That error is the problem's conditioning, not the method's.
+//
+// The box keeps the fraction everywhere else, which is where it measured clean
+// (0 of 20000 off with |a| in [1e-2, 10]): a negative integer a (BNG's) never
+// enters the box, and neither does a z < 0 with b >= 1 + a. The fraction's loss
+// does go on past z = -20 in the a <= 0, z <= 0 clause when b is tiny, by up to
+// 2e-3; issue #1080 records that, and this route does not reach it.
+//
+// The sum stops once a term is below 1e-17 of its series' absolute sum and the
+// ratio of successive terms is at most 1/2 for good. Each ratio is below
+// 2*x/(k+1), so from k + 1 >= 4*x on the rest of a series is no larger than its
+// last term. That is at most about 100 terms.
+//
+// The NaN test is a comparison, not isnan, for the reason given at
+// mratio_is_finite: the generated copy has to spell it so, and the two copies
+// are kept alike. A computed denominator of exactly zero gives an infinity,
+// which is a pole rounded, and the non-finite warner reports it.
+static bool mratio_series(double a, double b, double z, double *out) {
+    if (!(b > 0.0) || !mratio_is_finite(b) || z == 0.0 || !(std::abs(z) <= 20.0)) {
+        return false;
+    }
+    const double x = z > 0.0 ? z : -z;
+    const double alpha = z > 0.0 ? a : b - a;
+    const double shift = z > 0.0 ? 1.0 : 0.0;
+    if (!(alpha > -1.0 && alpha < 1.0)) {
+        return false;
+    }
+    double tn = 1.0; // a term of M(alpha + shift, b + 1, x)
+    double sn = 1.0;
+    double an = 1.0;
+    double td = b; // a term of b * M(alpha, b, x)
+    double sd = b;
+    double ad = b;
+    for (int k = 0; k < 1000; ++k) {
+        tn = tn * ((alpha + shift + k) / (b + 1.0 + k)) * (x / (k + 1.0));
+        if (k == 0) {
+            td = alpha * x;
+        } else {
+            td = td * ((alpha + k) / (b + k)) * (x / (k + 1.0));
+        }
+        sn += tn;
+        sd += td;
+        an += std::abs(tn);
+        ad += std::abs(td);
+        if (k + 1.0 >= 4.0 * x && std::abs(tn) <= 1.0e-17 * an && std::abs(td) <= 1.0e-17 * ad) {
+            // b * sn would overflow for a b near the largest double, and sd / b
+            // for a tiny one, so the division is ordered by which side of 1 b is.
+            const double value = b < 1.0 ? b * sn / sd : sn / (sd / b);
+            if (!(value == value)) { // NaN
+                return false;
+            }
+            *out = value;
+            return true;
+        }
+    }
+    return false;
+}
+
 double expr_compat::mratio(double a, double b, double z) {
     if (a == 0.0 && b > 0.0 && z > 0.0) {
         const double summed = mratio_a_zero_series(b, z);
         if (summed == summed) { // not NaN
             return summed;
         }
+    }
+    double series = 0.0;
+    if (mratio_series(a, b, z, &series)) {
+        return series;
     }
     if (!mratio_cf_is_trustworthy(a, b, z)) {
         double asymptotic = 0.0;

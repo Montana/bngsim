@@ -113,6 +113,13 @@ CASES = [
     # series. mratio(0, 1, z) is (e^z - 1)/z, and the exp(-A) keeps the rate
     # tame while z sweeps from 60 down to near 0.
     ("a = 0, summed", 0.0, 1.0, "40*k*mratio(a,b,A)*exp(-A)", 60.0),
+    # For b > 0, 0 < |z| <= 20 and |alpha| < 1 both Kummer series are summed
+    # and the loop is never reached (issue #1080), so these two are what run the
+    # compiled copy of that routine, one per sign of z: a tiny a with z near 20,
+    # where the fraction lost up to 4e-7, and a tiny b with z near -20, which
+    # takes Kummer's transformation. The exp() cancels the ratio's e^z.
+    ("tiny a, both series", -1e-12, 0.026664156824421394, "k*mratio(a,b,A)*exp(-A)", 20.0),
+    ("tiny b, both series, z < 0", -1e-12, 1e-9, "k*mratio(a,b,-A)*exp(A)", 20.0),
     ("a rides the species", -3.0, 9.0, "k*mratio(-A,b,-20)", 12.0),
     ("b rides the species", -4.0, 0.0, "k*mratio(a,A+2,-8)", 10.0),
 ]
@@ -211,3 +218,60 @@ def test_both_copies_refuse_and_both_say_why(tmp_path, body):
         assert "mratio" in message
     # The compiled one reaches it the long way round, through the witness.
     assert "non-finite" in messages[True]
+
+
+# ── Issue #1080: the series route, pinned to the reference on both engines ──
+
+CONSTANT_RATE_NET = """begin parameters
+    1 a  {a!r}  # Constant
+    2 b  {b!r}  # Constant
+    3 zz {z!r}  # Constant
+    4 scale {scale!r}  # Constant
+end parameters
+begin functions
+    1 f() mratio(a,b,zz)*scale
+end functions
+begin species
+    1 A() 0
+end species
+begin reactions
+    1 0 1 f
+end reactions
+begin groups
+    1 Aobs 1
+end groups
+"""
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
+@pytest.mark.parametrize(
+    "a, b, z, true_value",
+    [
+        # mpmath at 60 digits. The fraction returned 2.235481406e8 at the first
+        # (2.1e-7 off) and was 1.2e-8 off at the second.
+        (-1e-12, 0.026664156824421394, 19.310533421401022, 223548187.99851523),
+        (
+            -8.607573956569877e-15,
+            1.535796353807133e-08,
+            -19.72305014003269,
+            3.5418112969725804e-09,
+        ),
+    ],
+    ids=["z > 0", "z < 0"],
+)
+def test_the_series_route_matches_the_reference_on_both_engines(
+    tmp_path, codegen, a, b, z, true_value
+):
+    """``A' = mratio(a, b, z) / true_value`` from 0, so A(1) = 1, and a constant
+    right-hand side integrates to rounding. Agreement between the two copies
+    alone would pass if both were wrong the same way; this holds the compiled
+    one to the reference itself, ten thousand times tighter than the old error."""
+    p = tmp_path / "m1080.net"
+    p.write_text(CONSTANT_RATE_NET.format(a=a, b=b, z=z, scale=1.0 / true_value))
+    with contextlib.redirect_stderr(io.StringIO()):
+        model = bngsim.Model.from_net(str(p))
+        sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+        result = sim.run(t_span=(0.0, 1.0), n_points=3)
+    # The compiled leg has to run the generated C, or it tests the interpreter twice.
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
+    assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-11, abs=0.0)
