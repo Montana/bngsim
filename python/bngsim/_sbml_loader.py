@@ -246,7 +246,9 @@ def _is_name_or_call(text: str) -> bool:
     if _ATOMIC_TOKEN.fullmatch(text):
         return True
     m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
-    return bool(m) and _fully_parenthesised(text[m.end() :])
+    if m is None:
+        return False
+    return _fully_parenthesised(text[m.end() :])
 
 
 def _ia_value_changed(new: float, old: float | None) -> bool:
