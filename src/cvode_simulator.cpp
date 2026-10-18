@@ -8584,9 +8584,23 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(
     const double k_resolve = state_switch_resolve_factor(ns);
     bool resolved = false;
     if (t_end > t) {
+        // Evenly over the step, and then halving toward the root (issue #907).
+        // CVODE grows its step about tenfold over a smooth stretch, so after a
+        // restart the step can be many times the width of a hump that opens
+        // just past the root, and sixteen even samples straddled it: a curved
+        // residual's window, caught over (0, 5), was lost over (0, 10) and on
+        // seven grids of nine. The halvings put samples at every scale down
+        // to the root; more samples can only find an excursion the solver's
+        // own trajectory makes, so a crossing inside the band stays declined.
         constexpr int kSamples = 16;
-        for (int k = 1; k <= kSamples && !resolved; ++k) {
-            const double tk = t + (t_end - t) * static_cast<double>(k) / kSamples;
+        constexpr int kHalvings = 40;
+        for (int k = 1; k <= kSamples + kHalvings && !resolved; ++k) {
+            const double share = k <= kSamples ? static_cast<double>(k) / kSamples
+                                               : std::ldexp(1.0, -(k - kSamples));
+            const double tk = t + (t_end - t) * share;
+            if (!(tk > t)) {
+                break;
+            }
             if (CVodeGetDky(cvode_mem, tk, 0, scratch) != CV_SUCCESS) {
                 break;
             }

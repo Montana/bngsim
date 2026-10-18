@@ -580,6 +580,22 @@ def test_a_crossing_on_a_curved_residual_restarts(tmp_path, rtol, max_step):
     assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1000 * rtol)
 
 
+@pytest.mark.parametrize("rtol", [1e-6, 1e-8, 1e-10])
+@pytest.mark.parametrize("t_end", [4.0, 6.0, 7.0, 8.0, 10.0, 20.0])
+def test_a_curved_residual_restarts_whatever_the_run_length(tmp_path, t_end, rtol):
+    """Issue #907, case 1: the test above passed over (0, 5) and the window was
+    lost over most other spans. CVODE grows its step about tenfold over this
+    smooth stretch, so the step after the opening root ran many times the
+    width of the cubic's hump, and the restart test's sixteen even samples of
+    it straddled the hump: the crossing read as unresolved, the run stepped
+    on, and Y came out 0. The test samples halving toward the root as well."""
+    model = _write(tmp_path, _CUBIC_NET)
+    result = bngsim.Simulator(model).run(
+        t_span=(0.0, t_end), n_points=3, rtol=rtol, atol=rtol * 1e-2
+    )
+    assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1000 * rtol)
+
+
 def test_a_residual_too_deep_to_print_keeps_every_root(tmp_path):
     """A rate law over a sum of 400 observables has a residual that nests too
     deep for ``ast.unparse``. The RecursionError escaped the dedupe key, the
