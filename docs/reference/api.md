@@ -356,5 +356,4 @@ reference below is generated directly from the package docstrings.
    :members:
    :undoc-members:
    :show-inheritance:
-   :no-index:
 ```

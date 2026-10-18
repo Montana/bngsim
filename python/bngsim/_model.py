@@ -1207,7 +1207,8 @@ class Model:
         Raises
         ------
         ParameterError
-            If the parameter name is not found.
+            If the parameter name is not found, or if ``name`` is one of
+            :attr:`frozen_params` and ``value`` differs from the value it holds.
         ValueError
             If ``name`` is an SBML compartment size this model cannot resolve to
             a live volume, or a synthesized slot, and ``value`` differs from the
@@ -1251,7 +1252,7 @@ class Model:
         The **declared** initial condition always follows, so :meth:`reset`
         rebuilds from current parameter values rather than from a snapshot taken
         at load. The **live** concentration follows only while the species is
-        still sitting on that initial condition: a species a :meth:`run` has
+        still sitting on that initial condition: a species a :meth:`Simulator.run` has
         advanced, or that :meth:`set_concentration` has assigned, keeps its
         value and picks the new initial condition up at the next :meth:`reset`.
 

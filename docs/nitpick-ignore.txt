@@ -1,0 +1,75 @@
+# References `nitpicky = True` (docs/conf.py) does not warn about, one per line:
+# a role and a target, as Sphinx prints them in "py:meth reference target not
+# found: run". Each line silences that exact target only, so a new broken
+# reference still fails the docs job.
+
+# Words of a NumPy-style type ("ndarray, shape (n,)", "str, optional"), which
+# Sphinx splits into references; none is a name.
+py:class optional
+py:class shape
+py:class sequence
+py:class array-like
+py:class ndarray
+py:class complex128
+py:class NDArray
+py:class np.float64
+py:class Path
+
+# Names sphinx-autodoc-typehints writes that no intersphinx inventory lists as a
+# class (NumPy documents NDArray as data and its scalars as attributes; xarray
+# has no inventory in conf.py).
+py:class numpy.typing.NDArray
+py:class numpy.float64
+py:class numpy.int64
+py:class xarray.Dataset
+py:class xarray.DataArray
+
+# Names the API page does not document: the compiled core (mocked in the CI
+# build), private helpers, and the submodules reference/api.md summarizes by
+# hand (bngsim.cache, bngsim.convert, bngsim.jax).
+py:class ResultCore
+py:class bngsim._bngsim_core.NetworkModel
+py:class bngsim._bngsim_core.ResultCore
+py:attr bngsim._bngsim_core.NetworkModel.analytical_jacobian_complete
+py:attr Species.volume_factor
+py:class bngsim._result._ObservableAccessor
+py:class bngsim._result._XarrayAccessor
+py:class bngsim._switch_sensitivity.UncompensatedCrossingReason
+py:func bngsim._switch_sensitivity.table_function_breaks
+py:meth _apply_switch_time_sens
+py:meth _raise_if_uncompensated_crossing_sensitivities
+py:meth _recover_failed_chunk
+py:meth __new__
+py:attr issues
+py:data RoundingPolicy
+py:func prepare_model_codegen
+py:class bngsim.cache.CacheInfo
+py:class bngsim.cache.CacheSweep
+py:attr CacheInfo.orphaned
+py:data DEFAULT_MIN_AGE
+py:data PARTIAL_KINDS
+py:func codegen_cache_dir
+py:func _stamp
+py:class ProtocolSpec
+py:class bngsim.convert.ProtocolSpec
+py:class bngsim.convert._protocol.ProtocolSpec
+py:class bngsim.convert.ConversionReport
+py:attr ConversionReport.max_ar_report_delta
+py:attr ConversionReport.max_rhs_delta
+py:attr ConversionReport.ok
+py:attr ConversionReport.rhs_faithful
+py:attr ConversionReport.validation
+py:func bngsim.convert.parse_bngl_protocol
+py:func bngsim.convert.sbml_to_net
+py:func net_to_sbml
+py:func bngsim.jax.differentiable_solve
+
+# Broken before the check existed. Fix the docstring, then delete the line.
+# Model has no param_expressions attribute (set_param, param_is_expression).
+py:attr param_expressions
+# CouplingMap.from_model means Model.species_names.
+py:attr species_names
+# get_compartment_volume means the UnitConverter method.
+py:meth from_concentrations
+# DiscreteExchange names a function that no longer exists.
+py:func round_initial_population_to_storage
