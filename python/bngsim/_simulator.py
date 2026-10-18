@@ -4802,6 +4802,7 @@ class Simulator:
             seed=used_seed if seed_is_meaningful else None,
             ic_seed=ic_seed,
         )
+        self._warn_events_held_at_start(core_result)
 
         # Issue #553 — the interactive clock moves with the state, here, rather
         # than in the caller after run() returns. The backend has written the
@@ -8507,6 +8508,40 @@ class Simulator:
             f"warnings.simplefilter('ignore', bngsim.DenseSolverFallbackWarning).)",
             DenseSolverFallbackWarning,
             stacklevel=3,
+        )
+
+    def _warn_events_held_at_start(self, core_result) -> None:
+        """Log each event whose trigger rose off its threshold at the start and was not fired.
+
+        Issue #934. A trigger false at the start with its residual exactly on
+        zero, that the flow does not carry off it at first order, rests there
+        (issue #340), and a rise read at the start is taken for the start read
+        again. ``at (B > 0)`` with B = t²/2 is that case, and so is
+        BIOMD0000000285's ``p38death > 0``. AMICI, for which SUNDIALS
+        deactivates the same root, fires neither, and bngsim agrees with it;
+        this says so rather than leaving it silent. A trigger that falls back and rises
+        again later fires as any trigger does.
+        """
+        held = getattr(core_result.solver_stats, "events_held_at_start", [])
+        if not held:
+            return
+        try:
+            sources = list(self._model._core.event_trigger_sources())
+        except Exception:  # pragma: no cover - defensive
+            sources = []
+        named = ", ".join(
+            f"event {i} ({sources[i]})" if i < len(sources) and sources[i] else f"event {i}"
+            for i in held
+        )
+        logger.warning(
+            "%s: the trigger started exactly on its threshold, with the state it reads "
+            "not moving there at first order, and became true just after the start. "
+            "bngsim, like AMICI, takes that for the initial state read again and does not "
+            "fire it; if it leaves its threshold at second order or past (B > 0 with "
+            "B = t^2/2), the event should fire at the start and did not. To fire it "
+            "there, write the trigger so it holds at the start (B >= 0) with its "
+            "initial value false (issue #934).",
+            named,
         )
 
     @staticmethod

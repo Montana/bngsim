@@ -38,6 +38,7 @@ SUNDIALS and does not fire here; bngsim now agrees with it on this model.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import bngsim
@@ -198,6 +199,42 @@ def test_a_later_genuine_crossing_still_fires():
 
     assert not fired[t < 0.99].any(), "fired before the crossing at t=1"
     assert fired[t > 1.01].all(), "the genuine crossing at t=1 did not fire"
+
+
+def _held_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "issue #934" in r.getMessage()]
+
+
+def test_a_rise_held_at_the_start_is_logged_by_name(caplog):
+    """Issue #934: the case above is not fired, as AMICI does not fire it, but
+    it was silent. ``S = t^2/2`` leaves its threshold at second order, so
+    whether the event should fire at the start is the modeller's to decide; the
+    run now says it did not, and names the trigger."""
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        _, fired, _ = _run(_sbml(_S + _A, _RATE_S_IS_A + _RATE_A_IS_ONE, _TRIGGER_S_GT_0))
+
+    assert not fired.any()
+    (message,) = _held_warnings(caplog)
+    assert "event 0 (" in message and "S" in message
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["positive flow", "later crossing"],
+)
+def test_a_trigger_that_fires_or_crosses_later_is_not_logged(caplog, case):
+    if case == "positive flow":
+        xml = _sbml(_S, _RATE_S_IS_ONE, _TRIGGER_S_GT_0)
+    else:
+        xml = _sbml(
+            _S,
+            _RATE_S_IS_A + _RATE_A_IS_TWO,
+            _TRIGGER_S_GT_0,
+            parameters='<parameter id="A" value="-1" constant="false"/>',
+        )
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        _run(xml, t_end=2.0)
+    assert _held_warnings(caplog) == []
 
 
 def _corpus_xml() -> Path | None:

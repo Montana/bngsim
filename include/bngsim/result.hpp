@@ -63,6 +63,13 @@ struct SolverStats {
     // ||f(t,y)||_2 / n_species value at the last recorded row.
     bool steady_state_reached = false;
     double steady_state_residual = 0.0;
+
+    // Issue #934: the 0-based events whose trigger started on its threshold
+    // (issue #340) and rose there, where the rise was taken for the start read
+    // again and not fired. A trigger that leaves its threshold only at second
+    // order or past is one (`at (B > 0)` with B = t²/2): AMICI does not fire it
+    // either, and the Python layer warns, naming each. Empty on any other run.
+    std::vector<int> events_held_at_start;
 };
 
 // GH #110 — SSA boundary diagnostics. The exact SSA evaluates rate laws

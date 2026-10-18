@@ -275,6 +275,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
                        &bngsim::SolverStats::n_dense_blas_factorizations)
         .def_readwrite("steady_state_reached", &bngsim::SolverStats::steady_state_reached)
         .def_readwrite("steady_state_residual", &bngsim::SolverStats::steady_state_residual)
+        .def_readwrite("events_held_at_start", &bngsim::SolverStats::events_held_at_start)
         .def("__repr__",
              [](const bngsim::SolverStats &s) {
                  std::ostringstream os;

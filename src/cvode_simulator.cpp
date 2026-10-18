@@ -11896,6 +11896,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // event's first root, so nothing later is ever suppressed. Filled by the
     // t=0 trigger initialization below.
     std::vector<char> on_threshold_at_start(n_events, 0);
+    // The events whose rise the mark refused, for SolverStats (issue #934).
+    std::vector<char> held_at_start(n_events, 0);
 
     // ─── Random tie-break among equal-priority simultaneous events (GH #242) ──
     // SBML L3v2 §4.11.6: among events firing at the same instant with the SAME
@@ -12775,8 +12777,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // the trigger.)
             const bool resting =
                 on_stop && on_threshold_at_start[ei] != 0 && t_now - times.t_start <= start_window;
-            if (now_true && !trigger_was_true[ei] && !event_dormant[ei] && !resting) {
-                risers.push_back(ei);
+            if (now_true && !trigger_was_true[ei] && !event_dormant[ei]) {
+                if (resting) {
+                    held_at_start[ei] = 1;
+                } else {
+                    risers.push_back(ei);
+                }
             }
             if (trigger_was_true[ei] != now_true) {
                 trigger_changed_at[ei] = t_now;
@@ -14367,8 +14373,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     const bool at_start =
                         flagged && on_threshold_at_start[ei] != 0 &&
                         static_cast<double>(t_ret) - times.t_start <= t0_root_window;
-                    if (trigger_now && !trigger_was_true[ei] && !at_start) {
-                        firing.push_back(ei);
+                    if (trigger_now && !trigger_was_true[ei]) {
+                        if (at_start) {
+                            held_at_start[ei] = 1;
+                        } else {
+                            firing.push_back(ei);
+                        }
                     }
                     if (!trigger_now && !events_outer[ei].persistent) {
                         drop_pending_of(ei);
@@ -15377,6 +15387,11 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // ─── Solver statistics ───────────────────────────────────────────────────
 
     impl_->record_solver_stats(cvode_mem, LS_guard, result);
+    for (int ei = 0; ei < n_events; ++ei) {
+        if (held_at_start[static_cast<std::size_t>(ei)] != 0) {
+            result.solver_stats().events_held_at_start.push_back(ei);
+        }
+    }
 
     if (check_ss) {
         result.solver_stats().steady_state_reached = ss_reached;
