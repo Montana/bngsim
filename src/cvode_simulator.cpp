@@ -12199,15 +12199,23 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             return;
         model.update_observables(y_data);
         model.evaluate_functions(t_now);
+        // Each rescale compiles its own copy of its compartment's size, so a
+        // compartment is told from the next by the size's text, not its id.
+        // Refreshed at every new id, the observables and functions were read
+        // again for every species: a run of a thousand events, each resizing
+        // one compartment of 300 species, took four to six times as long.
+        const auto *exprtk = dynamic_cast<const ExprTkEvaluator *>(&eval_ref_outer);
         int size_read = -1;
         for (const auto &[a, num] : rescales) {
             // A compartment's size rule can read a species another compartment's
             // rescale has just moved (issue #1055: `cv := 1 + 0.1*Kw`, an event
-            // resizing Kw's compartment). The loader lists the compartments in
-            // the order one reaches the next, so each size is read after the
-            // rescales before it.
+            // resizing Kw's compartment). The loader lists each compartment
+            // after those whose rescales it reads, so each size is read after
+            // the rescales before it.
             const int size_expr = ev.assignment_rescale_size_expr[a];
-            if (size_read >= 0 && size_expr != size_read) {
+            if (size_read >= 0 && size_expr != size_read &&
+                (exprtk == nullptr ||
+                 exprtk->preprocessed_expr(size_expr) != exprtk->preprocessed_expr(size_read))) {
                 model.update_observables(y_data);
                 model.evaluate_functions(t_now);
             }
