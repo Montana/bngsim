@@ -175,12 +175,15 @@ void FunctionalRxnClass::printDetails() const {
 
 
 
-MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet,System *s) :
+MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *transformationSet,System *s,
+                       string kcatParameterName, string KmParameterName) :
 	BasicRxnClass(name,1,"",transformationSet,s)
 {
 	this->Km = Km;
 	this->kcat = kcat;
 	this->sFree=0;
+	this->kcatParameterName = kcatParameterName;
+	this->KmParameterName = KmParameterName;
 	if(n_reactants!=2) {
 		cerr<<"You have tried to create a reaction with a Michaelis-Menten rate law (named: '"+name+"'\n')";
 		cerr<<"but you don't have the correct number of reactants!  Michaelis-Menten reactions require\n";
@@ -190,6 +193,19 @@ MMRxnClass::MMRxnClass(string name, double kcat, double Km, TransformationSet *t
 	}
 }
 MMRxnClass::~MMRxnClass() {};
+
+// kcat and Km are held as numbers, not as a base rate with a parameter name,
+// so the base refresh never reached them: a setParameter() after load changed
+// the parameter and left the rule running at its old kcat and Km. Read them
+// again from the parameters they came from. baseRate here is the symmetry
+// factor alone and has no name, so the base call leaves it as it is.
+// bngsim GH #854.
+void MMRxnClass::resetBaseRateFromSystemParamter() {
+	ReactionClass::resetBaseRateFromSystemParamter();
+	if (!kcatParameterName.empty()) kcat = system->getParameter(kcatParameterName);
+	if (!KmParameterName.empty()) Km = system->getParameter(KmParameterName);
+	update_a();
+}
 
 double FunctionalRxnClass::exactRuleMonkey_a()
 {

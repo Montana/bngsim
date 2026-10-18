@@ -258,6 +258,71 @@ def _relational_split_op(atom: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _turning_side(expr: str) -> tuple[str, str] | None:
+    """``("abs", u)`` for ``abs(u)``, ``("square", u)`` for ``(u)^2`` or ``u^2``
+    with ``u`` one name or one parenthesized group; ``None`` otherwise.
+
+    The group must close where the ``^`` stands. ``(A-5)^2+(B-5)^2`` and
+    ``(A-5)*(B)^2`` each balance as a whole and end in ``^2``, but only the
+    last group is squared; read as the square of everything before the ``^``,
+    the disk ``(A-c)^2+(B-5)^2 < 0.75`` was rooted at a surface it does not
+    have and lost its own crossing, and dY/dc came back 0 for -12.06.
+    """
+    text = _strip_redundant_parens(expr.strip())
+    m = re.match(r"abs\s*\(", text)
+    if m is not None and _find_close_paren_strict(text, m.end() - 1) == len(text) - 1:
+        return "abs", text[m.end() : -1].strip()
+    m = re.fullmatch(r"(\(.*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\^\s*2(?:\.0*)?", text, re.S)
+    if m is None:
+        return None
+    base = m.group(1)
+    if base.startswith("(") and _find_close_paren_strict(base, 0) != len(base) - 1:
+        return None
+    return "square", _strip_redundant_parens(base).strip()
+
+
+def _monotone_pieces(atom: str) -> list[str]:
+    """The comparisons whose crossings are this atom's, one per turn of its
+    residual, where the atom compares ``abs(u)`` or ``u^2`` with a bound.
+
+    ``abs(A - 5) < 0.01`` is a window: its residual ``abs(A-5) - 0.01`` falls
+    to zero and comes back up within one step as A passes 5, so a root on it
+    sees the same sign at both ends of the step and reports nothing, and the
+    window was stepped over (issue #904). Its edges are where ``A - 5`` crosses
+    ``0.01`` and ``-0.01``, and each of those residuals is monotone along a
+    flow that moves A one way. ``u^2`` against a bound is the same at
+    ``±sqrt(bound)``, taken only for a bound that is a number, where the square
+    root is one. A bound that is a number must be above 0: at or below it the
+    atom holds at one point or nowhere, its edges would be restarts at
+    crossings that switch nothing (two of them on one surface, at 0), and it is
+    rooted whole as before. ``[]`` for any other atom.
+    """
+    split = _relational_split_op(atom)
+    if split is None:
+        return []
+    lhs, _op, rhs = split
+    side = _turning_side(lhs)
+    bound = rhs
+    if side is None:
+        side = _turning_side(rhs)
+        bound = lhs
+    if side is None or _turning_side(bound) is not None:
+        return []
+    kind, inner = side
+    try:
+        value: float | None = float(_strip_redundant_parens(bound.strip()))
+    except ValueError:
+        value = None
+    if value is not None and not (0.0 < value < math.inf):
+        return []
+    if kind == "abs":
+        return [f"({inner})<({bound})", f"({inner})>(-({bound}))"]
+    if value is None:
+        return []
+    root = repr(math.sqrt(value))
+    return [f"({inner})<({root})", f"({inner})>(-{root})"]
+
+
 def _relational_split(atom: str) -> tuple[str, str] | None:
     """``(lhs, rhs)`` of a relational atom, discarding the operator.
 
@@ -406,7 +471,7 @@ def _condition_only_params(
     return pure
 
 
-def _unit_rate_clock_indices(core) -> frozenset[int]:
+def _unit_rate_clock_indices(core, candidates: frozenset[int] | None = None) -> frozenset[int]:
     """Every species index obeying ``dc/dt = 1``, from two RHS probes.
 
     Split out of :func:`_unit_rate_clock_species` because it is the half that
@@ -415,33 +480,94 @@ def _unit_rate_clock_indices(core) -> frozenset[int]:
     question in that cheap form, so that a model with a conditional rate law but
     no counter can be dismissed without building a context that runs to tens of
     thousands of entries on a large model.
+
+    ``candidates`` is :func:`unit_rate_clock_candidates` at the model's current
+    values, for a caller that has already probed them (issue #726).
     """
-    n_species = core.n_species
-    if n_species == 0:
+    if candidates is None:
+        candidates = unit_rate_clock_candidates(core)
+    if not candidates:
         return frozenset()
-    conc = [core.get_concentration(name) for name in core.species_names]
+    return _structurally_unit_rate(core, set(candidates))
+
+
+def texts_spell_a_switch(core) -> bool:
+    """Whether any function or derived-parameter text spells a condition, a
+    step, a comparison or a bend.
+
+    The cheap first gate of :func:`time_discontinuity_conditions`, which returns
+    ``()`` from the texts alone where this is false and never probes for a
+    clock. :meth:`bngsim.Model.time_discontinuity_conditions` reads the same
+    gate to decide whether its cache key needs the probe at all (issue #726),
+    so the two cannot disagree about which models the clocks matter to. Read
+    from the texts alone: structural.
+    """
+    from bngsim._jacobian import has_condition_construct
+
+    if core.n_functions == 0:
+        return False
+    return any(
+        has_condition_construct(t)
+        or _STEP_CALL.search(t)
+        or _RELATIONAL.search(t)
+        or _BEND_CALL.search(t)
+        for t in (*core.function_expressions, *core.param_expressions)
+    )
+
+
+def unit_rate_clock_candidates(core) -> frozenset[int]:
+    """The species indices at ``dc/dt = 1`` on both of two RHS probes.
+
+    The half of :func:`_unit_rate_clock_indices` that parameter values decide:
+    what follows it reads only structure. A counter fed at ``k_t`` passes at
+    ``k_t = 1`` and not at 0 or 0.5, so whatever is derived from which species
+    are clocks is derived again when this moves (issue #726). It costs two RHS
+    evaluations, where the structural half reads the whole model.
+    """
+    import numpy as np
+
+    if core.n_species == 0:
+        return frozenset()
+    conc = core.get_state()
     try:
-        deriv = core._eval_rhs(0.0, conc)
+        deriv = np.asarray(core._eval_rhs(0.0, conc))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("switch-time: RHS probe for clock detection failed: %s", exc)
         return frozenset()
-    clock_idx = {i for i in range(n_species) if deriv[i] == _CLOCK_SLOPE}
-    if not clock_idx:
+    clock_idx = np.flatnonzero(deriv == _CLOCK_SLOPE)
+    if clock_idx.size == 0:
         return frozenset()
     # A species whose RHS merely happens to equal 1 at the initial state is not
     # a clock, so probe again at a shifted state and time. That is only a
     # filter: shift-invariant and time-gated rates pass it, and
     # _structurally_unit_rate decides (issue #733).
-    probe = [c + 1.0 for c in conc]
     try:
-        deriv2 = core._eval_rhs(1.0, probe)
+        deriv2 = np.asarray(core._eval_rhs(1.0, conc + 1.0))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("switch-time: second RHS probe failed: %s", exc)
         return frozenset()
-    clock_idx = {i for i in clock_idx if deriv2[i] == _CLOCK_SLOPE}
-    if not clock_idx:
-        return frozenset()
-    return _structurally_unit_rate(core, clock_idx)
+    return frozenset(int(i) for i in clock_idx if deriv2[i] == _CLOCK_SLOPE)
+
+
+def clock_volume_params(core) -> dict[int, str]:
+    """For each amount-valued species whose compartment size is a live
+    parameter, the name of that parameter.
+
+    The other value :func:`_unit_rate_clock_species` reads besides the RHS: what
+    a rate law reads under such a species' name is its stored value times the
+    size, so it is a unit-rate clock only while the size is 1. A ``set_param`` on
+    the size moves the verdict without moving the probes, so
+    :meth:`bngsim.Model.time_discontinuity_conditions` keys its cache on these
+    parameters' values as well (issue #726). Which species they are is
+    structural; ``.net`` models have none.
+    """
+    names = list(core.param_names)
+    out: dict[int, str] = {}
+    for i, sp in enumerate(core.codegen_data()["species"]):
+        k = int(sp.get("volume_param_idx0", -1))
+        if sp.get("amount_valued", False) and 0 <= k < len(names):
+            out[i] = names[k]
+    return out
 
 
 # The clock, read by a rate law that is therefore not constant. rateOf accessors
@@ -533,7 +659,7 @@ def _structurally_unit_rate(core, candidates: set[int]) -> frozenset[int]:
     return frozenset(keep)
 
 
-def _unit_rate_clock_species(core, ctx=None) -> dict[str, int]:
+def _unit_rate_clock_species(core, ctx=None, candidates=None) -> dict[str, int]:
     """Map every symbol that reads a unit-rate clock to its species index.
 
     A *clock* is a species obeying ``dc/dt = 1`` — the counter idiom BNGL uses to
@@ -544,9 +670,10 @@ def _unit_rate_clock_species(core, ctx=None) -> dict[str, int]:
 
     Both the observable name and the species name map to the same index: a
     condition may be written against either. Returns ``{}`` for the overwhelming
-    majority of models, which have no such species.
+    majority of models, which have no such species. ``candidates`` is passed to
+    :func:`_unit_rate_clock_indices`.
     """
-    clock_idx = _unit_rate_clock_indices(core)
+    clock_idx = _unit_rate_clock_indices(core, candidates)
     if not clock_idx:
         return {}
     # What a rate law reads under a species' name is its amount when the species
@@ -1682,17 +1809,19 @@ def _whole_word(name: str) -> re.Pattern:
     return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
 
 
-def switch_condition_scope(core, ctx=None) -> SwitchConditionScope:
+def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchConditionScope:
     """Assemble the model-level context both switch-condition callers read.
 
     One RHS probe for the clocks, one pass over the parameter table, shared by
     :func:`compute_switch_time_sens` and :func:`uncompensated_condition_reason`
     so neither can be built on a different view of the model than the other.
+    ``clock_candidates``, when given, is that probe already made at the model's
+    current values (:func:`unit_rate_clock_candidates`).
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
     exprs = list(core.param_expressions)
-    clocks = _unit_rate_clock_species(core, ctx)
+    clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
     function_names = frozenset(core.function_names)
     return SwitchConditionScope(
@@ -2259,7 +2388,9 @@ def _reads_clock_and_run_constants(flat: str, scope: SwitchConditionScope) -> bo
     return True
 
 
-def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -> tuple[str, ...]:
+def time_discontinuity_conditions(
+    core, ctx=None, *, steps_only: bool = False, clock_candidates: frozenset[int] | None = None
+) -> tuple[str, ...]:
     """Every rate-law branch condition this model switches on a *clock* alone with.
 
     The ``.net``/BNGL answer to the question the SBML loader answers at load
@@ -2299,6 +2430,10 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
     ``steps_only`` returns the step calls alone. The sensitivity detector reads
     the conditions itself, with what each threshold's crossing moves with, and
     needs only what it does not read (issue #944).
+
+    ``clock_candidates`` is :func:`unit_rate_clock_candidates` already probed at
+    the model's current values, which :meth:`bngsim.Model.time_discontinuity_conditions`
+    has in hand for its cache key (issue #726); otherwise the scan probes once.
     """
     from bngsim._jacobian import _inline_functions, has_condition_construct
 
@@ -2342,21 +2477,14 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
         # answer it instead, which is far cheaper than the context this is
         # guarding, and the answer is reused by ``switch_condition_scope``
         # below.
+        if not texts_spell_a_switch(core):
+            return ()
         texts_raw = (*core.function_expressions, *core.param_expressions)
-        if not any(
-            has_condition_construct(t)
-            or _STEP_CALL.search(t)
-            or _RELATIONAL.search(t)
-            or _BEND_CALL.search(t)
-            for t in texts_raw
-        ):
-            return ()
-        if (
-            not any(_TIME_REF.search(t) for t in texts_raw)
-            and not time_tables
-            and not _unit_rate_clock_indices(core)
-        ):
-            return ()
+        if not any(_TIME_REF.search(t) for t in texts_raw) and not time_tables:
+            if clock_candidates is None:
+                clock_candidates = unit_rate_clock_candidates(core)
+            if not _unit_rate_clock_indices(core, clock_candidates):
+                return ()
         ctx = core.functional_jacobian_context()
     func_map = dict(ctx["function_map"])
     texts = [
@@ -2372,7 +2500,7 @@ def time_discontinuity_conditions(core, ctx=None, *, steps_only: bool = False) -
     if not conditional and not stepped and not compared and not bent:
         return ()
     try:
-        scope = switch_condition_scope(core, ctx)
+        scope = switch_condition_scope(core, ctx, clock_candidates=clock_candidates)
     except Exception as exc:  # pragma: no cover - defensive
         # Same fallback as the other model-level scans: with no scope nothing
         # can be classified, and the pre-#440 stepping is what a model gets.
@@ -4224,12 +4352,17 @@ def table_function_breaks(core) -> list[tuple[str, int, object, object]]:
     and go on.
 
     Read from the tables alone, so a model's is the same for every run:
-    :meth:`bngsim.Model.table_function_breaks` keeps it.
+    :meth:`bngsim.Model.table_function_breaks` keeps it. A table no expression
+    of the model calls (one added after load) is left out.
     """
     import numpy as np
 
     out: list[tuple[str, int, object, object]] = []
     for table in core.table_function_tables:
+        if not table.get("read", True):
+            # Added after load, and called by no expression (issue #772): the
+            # run never reads it, so it has nowhere to break.
+            continue
         xs = np.asarray(table["xs"], dtype=float)
         ys = np.asarray(table["ys"], dtype=float)
         if xs.size < 2:
@@ -6279,7 +6412,9 @@ def fallback_crossing(
     - a condition on a counter species that a requested column moves (its rate
       constant, its initial amount). A counter nothing moves is read at ``y``
       in both terms of the quotient, and its threshold's parameters are held
-      while the quotient is taken (issue #436);
+      while the quotient is taken (issue #436) where issue #48 reads the
+      condition. One it does not read, ``abs(Aobs-c) < 0.01``, is refused where
+      a requested parameter moves its threshold: the quotient moves it across;
     - an equality on the state. It holds at one state and over no interval
       of them, unless the state sits there: ``B == 0`` with B made from where
       another species passes a threshold holds until it does;
@@ -6372,6 +6507,8 @@ def fallback_crossing(
             # moves the index. ``idx = tD + 1`` with ``tD = 2*n`` is moved by
             # tD, which is neither the index nor a primary it is written in.
             moved_index = bool(_written_in(param_names[index], derived) & requested)
+        # Indexed by an observable, or by a function, ``fIdx() = Aobs``: by the
+        # state, which the quotient moves.
         if table.get("index_kind") not in ("time", "parameter") or moved_index:
             return f'tfun {table.get("name")} (method=>"step")'
     # The derived parameters that hold a condition, a step call, a choice or
@@ -6415,17 +6552,40 @@ def fallback_crossing(
     if ctx is None:
         ctx = core.functional_jacobian_context()
     func_map = dict(ctx["function_map"])
-    # A table indexed by a parameter is indexed by the state where the
-    # parameter is a slot a function owns: ``fIdx() = Aobs``.
-    for table in stepping:
-        index = table.get("index_param_idx", -1)
-        if (
-            table.get("index_kind") == "parameter"
-            and 0 <= index < len(param_names)
-            and param_names[index] in func_map
-        ):
-            return f'tfun {table.get("name")} (method=>"step")'
     texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    # A table a rate law reads is indexed by what its index reads, which the
+    # law's text, ``tfun_g()``, does not show. Where the index is a function,
+    # ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
+    # function is read as a law of its own: the table of what it holds jumps
+    # where it jumps and bends where it bends. Compiled code reads the index
+    # live since issue #965, so the quotient reads across that crossing. An
+    # index function may read a table of its own, ``h() = tfun(..., h0)``, so
+    # what the indices read is asked in turn until nothing new is found. Kept
+    # beside the laws, and only for a model that has such a table.
+    function_names = [str(f["name"]) for f in data.get("functions", ())]
+    table_indices = {
+        str(table.get("name")): function_names[table["index_func_idx"]]
+        for table in data.get("table_functions", ())
+        if table.get("index_kind") == "function"
+    }
+    if table_indices:
+        found_indices: tuple[str, ...] | None = kept_all.get(_TABLE_INDICES)
+        if found_indices is None:
+            table_call = re.compile(
+                r"(?<![A-Za-z0-9_])tfun_(" + "|".join(map(re.escape, table_indices)) + r")\("
+            )
+            memo: dict[str, str] = {}
+            reached: set[str] = set()
+            frontier = list(texts)
+            while frontier:
+                read = " ".join(
+                    _inline_functions(text, func_map, memo=memo) or text for text in frontier
+                )
+                new = {table_indices[name] for name in table_call.findall(read)} - reached
+                reached |= new
+                frontier = sorted(new)
+            found_indices = kept_all[_TABLE_INDICES] = tuple(sorted(reached))
+        texts += found_indices
     moved_clocks: list[frozenset[int]] = []
 
     def scan(held: frozenset[str]) -> str | None:
@@ -6511,8 +6671,34 @@ def fallback_crossing(
                     kept[("parameter", flat)] = last
                 return "parameter" if last[1] else ""
             if _reads_clock_and_run_constants(flat, scope):
-                read = {scope.clocks[n] for n in _IDENTIFIER.findall(flat) if n in scope.clocks}
-                return "state" if {i for i in read if i >= 0} & moved else ""
+                names = set(_IDENTIFIER.findall(flat))
+                read = {scope.clocks[n] for n in names if n in scope.clocks}
+                if {i for i in read if i >= 0} & moved:
+                    return "state"
+                # A requested parameter moves the threshold, which issue #48
+                # holds while the quotient is taken only where it reads the
+                # atom. It does not read `abs(Aobs-c) < 0.01` on a counter,
+                # whose edges are rooted as crossings of the state instead
+                # (issue #904), and the quotient moved c across them: dY/dc
+                # came back 7.03 for 0.2. A parameter the quotient moves across
+                # a surface, as `_parameter_crossing` finds: a law that only
+                # bends there is proved so of its conditions on the state, and
+                # this one reads none.
+                if not names & requested:
+                    return ""
+                held_by = (
+                    tuple(
+                        float(scope.values[scope.param_idx[n]])
+                        for n in sorted(names & set(scope.param_idx))
+                    ),
+                    requested,
+                    clocks,
+                )
+                verdict = kept.get(("held", flat))
+                if verdict is None or verdict[0] != held_by:
+                    verdict = (held_by, clock_crossing_compensated(flat, scope))
+                    kept[("held", flat)] = verdict
+                return "" if verdict[1] else "parameter"
             return "state"
 
         def moved_by_a_column(flat: str) -> bool:
@@ -6654,6 +6840,7 @@ _STORES_KEPT = 8
 # Keys of what a scan keeps that are not a rate law's text.
 _MARKED = ("derived parameters that hold what is asked about",)
 _IN_A_RATE = ("derived parameters a rate constant is, or is written in",)
+_TABLE_INDICES = ("functions a table a rate law reads is indexed by",)
 _VIEW = "held"
 _NESTED = "held, one written in another"
 _DERIVED_LAW = "derived"
@@ -7398,15 +7585,23 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         # stop, reintroduced from the other side. Measured on the corpus: 3 of
         # 182 condition-carrying rr_parity models, invisible to every test.
         flat = _inline_functions(body, func_map) or body
-        for atom in _iter_condition_atoms(flat):
-            if clock_crossing_compensated(atom, scope):
+        for whole in _iter_condition_atoms(flat):
+            if clock_crossing_compensated(whole, scope):
                 continue  # issue #48's crossing; jumping it here would double it
-            if is_equality_atom(atom):
+            if is_equality_atom(whole):
                 continue  # measure-zero: rooting on it would MAKE the branch (below)
-            residual = state_switch_residual(core, atom)
-            if residual and residual not in seen_residual:
-                seen_residual.add(residual)
-                conditions.append(atom)
+            # A residual that turns within a step is rooted, and jumped, at
+            # each of its edges instead of on itself (issue #904): a root on
+            # `(A-5)^2 - 1e-4` saw one sign at both ends of the step that held
+            # the window, and the run returned Y = 0 and dY/dk = 0. The jump at
+            # each edge is read off the right-hand side either side of it, as
+            # at any crossing; with the whole atom rooted beside its edges, a
+            # step that found both at one instant would jump it twice.
+            for atom in _monotone_pieces(whole) or [whole]:
+                residual = state_switch_residual(core, atom)
+                if residual and residual not in seen_residual:
+                    seen_residual.add(residual)
+                    conditions.append(atom)
     return conditions
 
 
@@ -7433,7 +7628,9 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     that a function writes was another such reader; that model is refused where
     it is built, issue #931.) The solver covers that: a jump the pre-#763 test
     reads, and that the listed reactions do not account for, is judged as
-    before.
+    before. A table has no analytic sensitivity right-hand side, so a run whose
+    rate reads one through a function that holds a crossing is refused by
+    :func:`fallback_crossing` before it gets there (issues #938, #965).
     """
     from bngsim._jacobian import _inline_functions
 
@@ -7469,8 +7666,11 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
             continue
         hit: set[int] = set()
         for written in _iter_condition_atoms(flat):
-            for atom in _split_logical_atoms(written):
-                hit.update(wanted.get(surface(atom) or "", ()))
+            for whole in _split_logical_atoms(written):
+                # The edges a turning residual is rooted at (issue #904) are
+                # read by the rate law that reads the whole atom.
+                for atom in (whole, *_monotone_pieces(whole)):
+                    hit.update(wanted.get(surface(atom) or "", ()))
         for i in hit:
             out[i].append(int(rxn["rxn_idx"]))
     return out
@@ -7507,8 +7707,11 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
       reads changes an output, not the trajectory, so a root on it would buy a
       restart and nothing else.
     * It reads no parameter value, so the answer depends on the model's
-      structure alone and :meth:`bngsim.Model.state_switch_root_conditions`
-      caches it. A fit pays for it once, not once per evaluation.
+      structure and ``covered`` alone, and
+      :meth:`bngsim.Model.state_switch_root_conditions` caches it for each
+      ``covered``. ``covered`` itself moves with a parameter value where a
+      counter is a clock at one rate and not at another (issue #726), so a fit
+      over such a rate pays once per verdict, and any other fit once.
 
     Equalities are skipped for the reason :func:`state_switch_conditions` gives.
     Deduplicated by residual, read through :func:`_surface_key`, so one crossing
@@ -7570,16 +7773,19 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
         for written in (*_iter_condition_atoms(text), *_iter_comparisons_anywhere(text)):
             # Inlining can expose more logic than the text spelled — a condition
             # `flag` over `flag() = (A>1)||(B<2)` — so the atoms are split again.
-            for atom in _split_logical_atoms(inline(written)):
-                if is_equality_atom(atom):
+            for whole in _split_logical_atoms(inline(written)):
+                if is_equality_atom(whole):
                     continue
-                residual = state_switch_residual(core, atom)
-                if not residual:
-                    continue
-                key = _surface_key(residual)
-                if key not in seen:
-                    seen.add(key)
-                    conditions.append(atom)
+                # A residual that turns within a step (`abs(A-5) < 0.01`) is
+                # rooted at each of its edges instead (issue #904).
+                for atom in _monotone_pieces(whole) or [whole]:
+                    residual = state_switch_residual(core, atom)
+                    if not residual:
+                        continue
+                    key = _surface_key(residual)
+                    if key not in seen:
+                        seen.add(key)
+                        conditions.append(atom)
     return tuple(conditions)
 
 

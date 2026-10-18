@@ -39,9 +39,12 @@ What this locks:
 """
 
 import math
+import os
+import re
 import subprocess
 import sys
 import textwrap
+import time
 
 import bngsim
 import numpy as np
@@ -655,8 +658,7 @@ def test_a_residual_on_an_unstable_surface_steps_on(data_dir, tmp_path, spelling
     window = dict(t_span=(0.0, 100.0), n_points=1001, rtol=1e-11, atol=1e-11)
     result = bngsim.Simulator(model).run(**window)
     assert result.solver_stats["n_steps"] < 5_000
-    unrooted = _write(tmp_path, text, "ql_unrooted.net")
-    unrooted._state_switch_root_conditions = ()
+    unrooted = _unrooted(tmp_path, text, "ql_unrooted.net")
     reference = bngsim.Simulator(unrooted).run(**window)
     got = np.asarray(result.species)
     want = np.asarray(reference.species)
@@ -708,3 +710,533 @@ def test_a_residual_that_starts_at_zero_prints_nothing(tmp_path):
     )
     assert "Y 0.0" in done.stdout
     assert "identically 0" not in done.stdout + done.stderr
+
+
+# ── 8. A slide along the surface (issue #908) ───────────────────────────────
+# The issue's reproduction. f() switches sign at S = 1, so S slides along it and
+# crosses it on most steps. Each crossing was a root, located, returned and
+# declined by the restart test.
+_SLIDE_NET = """\
+begin parameters
+    1 amp 1.0
+    2 one 1.0
+end parameters
+begin functions
+    1 f() if(Sobs<1,amp,-amp)
+end functions
+begin species
+    1 S() 0
+    2 W() 0
+end species
+begin reactions
+    1 0 1 f
+    2 1 1,2 one
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def _unrooted(tmp_path, text, name):
+    """The model with its state-switch roots stood down, the reference a
+    rooted run is measured against. The roots are derived before they are
+    blanked, so the blank sits under the key a run asks with (issue #726).
+    Blanked before that, it was derived again at the first run, and the
+    reference was rooted too: a comparison that could not fail."""
+    model = _write(tmp_path, text, name)
+    assert model.state_switch_root_conditions()
+    model._state_switch_root_conditions = ()
+    assert model.state_switch_root_conditions() == ()
+    return model
+
+
+def _within_budget(rooted, unrooted, **run):
+    """Run ``unrooted`` and then ``rooted``, the second with a timeout of three
+    times the first's wall time plus a quarter second. Measured here rather
+    than fixed, so that the budget moves with the machine."""
+    start = time.perf_counter()
+    reference = bngsim.Simulator(unrooted).run(**run)
+    budget = 3.0 * (time.perf_counter() - start) + 0.25
+    return bngsim.Simulator(rooted).run(**run, timeout=budget), reference
+
+
+@pytest.mark.parametrize("n_points", [None, 401])
+def test_a_slide_costs_what_it_cost_without_its_root(tmp_path, n_points):
+    """The issue's model ran 7.6 times as long as the same model with no
+    state-switch roots (2.8 s against 0.37 s on arm64 macOS at rtol 1e-5), and
+    12 times at rtol 1e-6, over the same 1.3 million steps. The slide's
+    crossings are now held off the root search. The run takes every step the
+    unrooted run takes, within three times its wall time, with two output
+    points and with an output point at each of 401, where each crossing since
+    the last is searched for and tested. Fails on main (timeout)."""
+    run = (
+        dict(sample_times=[0.0, 4.25])
+        if n_points is None
+        else dict(t_span=(0.0, 4.25), n_points=n_points)
+    )
+    result, reference = _within_budget(
+        _write(tmp_path, _SLIDE_NET),
+        _unrooted(tmp_path, _SLIDE_NET, "unrooted.net"),
+        rtol=1e-5,
+        atol=1e-5,
+        **run,
+    )
+    assert result.solver_stats["n_steps"] == reference.solver_stats["n_steps"]
+    np.testing.assert_array_equal(np.asarray(result.species), np.asarray(reference.species))
+
+
+# S slides on S = 1 until t1, is then driven down for half a time unit and up at
+# rate 1, and crosses S = 1 again at t_open = t2 + 1 - S(t2). Y integrates k
+# from there until tc, which a time condition closes. One state residual, so a
+# hold that outlived the slide would also hide the window's opening.
+_SLIDE_THEN_WINDOW_NET = """\
+begin parameters
+    1 k   10.0
+    2 t1  1.5
+    3 t2  2.0
+    4 tc  2.501
+end parameters
+begin functions
+    1 amp() if(time()<t1,1,0)
+    2 f() if(Sobs<1,amp(),-amp())
+    3 g() if(time()>=t2,1,if(time()>=t1,-1,0))
+    4 r() if((Sobs>1)&&(time()>t2)&&(time()<tc),k,0)
+end functions
+begin species
+    1 S() 0
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 g
+    3 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def test_a_residual_held_through_a_slide_still_opens_a_window(tmp_path):
+    """The first version of the #908 fix reported a chattering residual as a
+    constant for the rest of the run, so the window S > 1 that opens after the
+    slide was never rooted, and Y came out 0 where it is 0.00999. Now a
+    restart (here, the stop at t1) releases the hold, and the window is rooted
+    and restarted at as on main. Main gets this right too (control)."""
+    model = _write(tmp_path, _SLIDE_THEN_WINDOW_NET)
+    assert model.state_switch_root_conditions() == ("Sobs<1",)
+    result = bngsim.Simulator(model).run(sample_times=[0.0, 1.5, 2.0, 4.0], rtol=1e-5, atol=1e-7)
+    s_t2 = float(result.species[1][0]) - 0.5
+    exact = 10.0 * (2.501 - (2.0 + 1.0 - s_t2))
+    assert float(result.species[-1][1]) == pytest.approx(exact, rel=1e-3)
+
+
+# The same slide with the window gated by two residuals of S: two state
+# switches, both of which slide.
+_SLIDE_TWO_RESIDUALS_NET = """\
+begin parameters
+    1 k   10.0
+    2 w   0.001
+end parameters
+begin functions
+    1 amp() if(time()<1.5,1,0)
+    2 f() if(Sobs<1,amp(),-amp())
+    3 g() if(time()>=2,1,if(time()>=1.5,-1,0))
+    4 r() if((Sobs>1)&&(Sobs<1+w)&&(time()>2),k,0)
+end functions
+begin species
+    1 S() 0
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 g
+    3 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def test_two_residuals_that_slide_are_both_held(tmp_path):
+    """The first version of the #908 fix cleared every residual's chatter flag
+    whenever any one was not chattering, so a model with two state switches
+    paid in full: 3.6 s against 0.66 s with no state-switch roots, as on main.
+    Both are now held, within three times the unrooted run, and the window S in
+    (1, 1 + w), crossed at rate 1, still gives Y = k*w. Fails on main
+    (timeout)."""
+    model = _write(tmp_path, _SLIDE_TWO_RESIDUALS_NET)
+    assert sorted(model.state_switch_root_conditions()) == ["Sobs<1", "Sobs<1+w"]
+    result, _ = _within_budget(
+        model,
+        _unrooted(tmp_path, _SLIDE_TWO_RESIDUALS_NET, "unrooted.net"),
+        sample_times=[0.0, 1.5, 3.0],
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    assert float(result.species[-1][1]) == pytest.approx(0.01, rel=1e-3)
+
+
+# S comes down onto thr() = 1 and slides on it until a() switches off at te.
+# The drift dlt then lifts S off the surface, but not out of the band, and
+# thr() sweeps up past S, fast. Only the residual and Y's rate read thr(), so
+# CVODE's steps are not held back by the sweep, and one step goes from inside
+# the band to far past the surface. Y integrates k while thr() - w < S < thr(),
+# a window that opens on the slid residual's own crossing. z() keeps Y off
+# during the slide.
+_SWEEP_NET = """\
+begin parameters
+    1 k    10.0
+    2 w    0.001
+    3 A    0.5
+    4 tp   30.05
+    5 sig  0.001
+    6 dlt  {dlt}
+    7 te   30.0
+end parameters
+begin functions
+    1 thr() 1+A*(1+tanh((time()-tp)/sig))/2
+    2 a() 1/(1+exp((time()-te)/0.002))
+    3 f() if(Sobs<thr(),a(),-a())
+    4 up() dlt
+    5 z() 1/(1+exp(-(time()-(te+0.02))/0.002))
+    6 r() if((Sobs<thr())&&(Sobs>(thr()-w)),k,0)*z()
+end functions
+begin species
+    1 S() 27.95
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+    3 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+@pytest.mark.parametrize("rtol, dlt, rel", [(1e-3, 0.1, 1e-2), (1e-4, 0.01, 3e-2)])
+def test_a_window_opened_by_a_moving_threshold_is_integrated(tmp_path, rtol, dlt, rel):
+    """thr() sweeps past S in one step and opens a window on the slid residual's
+    own crossing, which the run restarts at. S moves at dlt across the window
+    and thr() is known, so the window's width is exact given S before the
+    sweep. Main gets this right (control); the residual reads the time and is
+    not held (see the next test)."""
+    model = _write(tmp_path, _SWEEP_NET.format(dlt=dlt))
+    t1, tp, amp, sig, w = 30.04, 30.05, 0.5, 0.001, 0.001
+    result = bngsim.Simulator(model).run(
+        sample_times=[0.0, t1, tp + 1.0], rtol=rtol, atol=rtol * 1e-2
+    )
+    s1 = float(result.species[1][0])
+
+    def edge(offset):
+        lo, hi = t1, tp + 0.5
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            thr = 1.0 + amp * (1.0 + math.tanh((mid - tp) / sig)) / 2.0
+            if thr - offset - (s1 + dlt * (mid - t1)) < 0.0:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    exact = 10.0 * (edge(w) - edge(0.0))
+    gained = float(result.species[-1][1]) - float(result.species[1][1])
+    assert gained == pytest.approx(exact, rel=rel)
+
+
+# The same sweep with the residual scaled by h(), which falls from 1 to 1e-3
+# just before it, and Y's rate a pulse in time rather than a window with a
+# second edge: nothing but the residual's own crossing ends the step.
+_SCALED_SWEEP_NET = """\
+begin parameters
+    1 k    10.0
+    2 A    0.5
+    3 tp   30.05
+    4 sig  0.001
+    5 dlt  0.01
+    6 te   30.0
+end parameters
+begin functions
+    1 thr() 1+A*(1+tanh((time()-tp)/sig))/2
+    2 h() 1e-3+1/(1+exp((time()-30.02)/0.002))
+    3 a() 1/(1+exp((time()-te)/0.002))
+    4 f() if(Sobs*h()<thr()*h(),a(),-a())
+    5 up() dlt
+    6 z() exp(-((time()-30.047)/0.001)^2)
+    7 r() if(Sobs*h()<thr()*h(),k,0)*z()
+end functions
+begin species
+    1 S() 27.95
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+    3 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def test_a_residual_that_reads_the_time_is_not_held(tmp_path):
+    """A residual that reads the time is never held: its g and dg/dx move with
+    the clock while the state stands still, which a band measured once cannot
+    follow. Held with the band measured where h was 1, S*h < thr*h hid its own
+    crossing once h had fallen to 1e-3, the run was not restarted there, and
+    the pulse that crossing lets through was lost: Y gained 0 where it gains
+    0.0134 (second review of the #908 fix). Main gets it right (control). The
+    pulse is a Gaussian and S moves at dlt, so the gain is exact given S before
+    the sweep."""
+    model = _write(tmp_path, _SCALED_SWEEP_NET)
+    t1, tp, amp, sig, dlt = 30.04, 30.05, 0.5, 0.001, 0.01
+    result = bngsim.Simulator(model).run(sample_times=[0.0, t1, tp + 1.0], rtol=1e-3, atol=1e-5)
+    s1 = float(result.species[1][0])
+    lo, hi = t1, tp + 0.5
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        thr = 1.0 + amp * (1.0 + math.tanh((mid - tp) / sig)) / 2.0
+        if thr - (s1 + dlt * (mid - t1)) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    t_open = 0.5 * (lo + hi)
+    exact = 10.0 * 0.001 * math.sqrt(math.pi) / 2.0 * math.erfc((t_open - 30.047) / 0.001)
+    gained = float(result.species[-1][1]) - float(result.species[1][1])
+    assert gained == pytest.approx(exact, rel=2e-2)
+
+
+# The scaled sweep again with the clock a species: C grows at rate 1, as a
+# BNGL "Time" species does, and thr() and h() read C, so the residual reads
+# only species and can be held. Written with {h} for h().
+_CLOCK_SWEEP_NET = """\
+begin parameters
+    1 k    10.0
+    2 A    0.5
+    3 tp   30.05
+    4 sig  0.001
+    5 dlt  0.01
+    6 te   30.0
+    7 one  1.0
+end parameters
+begin functions
+    1 thr() 1+A*(1+tanh((Cobs-tp)/sig))/2
+    2 h() {h}
+    3 a() 1/(1+exp((time()-te)/0.002))
+    4 f() if(Sobs*h()<thr()*h(),a(),-a())
+    5 up() dlt
+    6 z() exp(-((time()-30.047)/0.001)^2)
+    7 r() if(Sobs*h()<thr()*h(),k,0)*z()
+end functions
+begin species
+    1 S() 27.95
+    2 Y() 0
+    3 C() 0
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+    3 0 2 r
+    4 0 3 one
+end reactions
+begin groups
+    1 Sobs 1
+    2 Cobs 3
+end groups
+"""
+
+
+@pytest.mark.parametrize(
+    "h",
+    ["1", "1e-3+1/(1+exp((Cobs-30.02)/0.002))"],
+    ids=["held, crossing restarted at", "dg/dx falls inside the box"],
+)
+def test_a_threshold_on_a_clock_species(tmp_path, h):
+    """With h() = 1 the residual is held through the sweep, and its crossing,
+    which CVODE does not locate, is found at the return that ends its step,
+    tested, and restarted at: without that the pulse is lost and Y gains 0.
+    With h() falling a thousandfold at C = 30.02, C's box at rtol 1e-3 (a
+    quarter of a time unit) spans the fall, and a band measured where h was 1
+    hid the crossing: Y gained 0 where it gains 0.0149 (third review of the
+    #908 fix). dg/dx is now read across the box and that residual is not held.
+    Main gets both right (control). C runs at rate 1 from 0, S moves at dlt,
+    and the pulse is a Gaussian, so the gain is exact given S before the
+    sweep."""
+    model = _write(tmp_path, _CLOCK_SWEEP_NET.format(h=h))
+    t1, tp, amp, sig, dlt = 30.04, 30.05, 0.5, 0.001, 0.01
+    result = bngsim.Simulator(model).run(sample_times=[0.0, t1, tp + 1.0], rtol=1e-3, atol=1e-5)
+    s1 = float(result.species[1][0])
+    lo, hi = t1, tp + 0.5
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        thr = 1.0 + amp * (1.0 + math.tanh((mid - tp) / sig)) / 2.0
+        if thr - (s1 + dlt * (mid - t1)) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    t_open = 0.5 * (lo + hi)
+    exact = 10.0 * 0.001 * math.sqrt(math.pi) / 2.0 * math.erfc((t_open - 30.047) / 0.001)
+    gained = float(result.species[-1][1]) - float(result.species[1][1])
+    assert gained == pytest.approx(exact, rel=2e-2)
+
+
+# S slides on S = 1, parks just above it once a() has decayed, and is pushed
+# further up by v(): the residual leaves its band without crossing.
+_SLIDE_PARK_PUSH_NET = """\
+begin parameters
+    1 V    2.0
+    2 tp   3.0
+    3 sig  0.1
+end parameters
+begin functions
+    1 a() exp(-10*time())
+    2 f() if(Sobs<1,a(),-a())
+    3 v() V*exp(-((time()-tp)/sig)^2)
+end functions
+begin species
+    1 S() 0.95
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 v
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def test_a_held_residual_leaving_its_band_is_no_root(tmp_path):
+    """Where a held residual's band runs out, CVODE returns a root of what it
+    is shown, which is not a crossing and must not be handled as one: taken
+    for a root of the residual, it is given the restart test at a point off
+    the surface. The run takes every step the run with no state-switch roots
+    takes. Main does too (control)."""
+    run = dict(sample_times=[0.0, 3.5], rtol=1e-6, atol=1e-8, max_step=0.02)
+    result = bngsim.Simulator(_write(tmp_path, _SLIDE_PARK_PUSH_NET)).run(**run)
+    reference = bngsim.Simulator(_unrooted(tmp_path, _SLIDE_PARK_PUSH_NET, "u.net")).run(**run)
+    assert result.solver_stats["n_steps"] == reference.solver_stats["n_steps"]
+    np.testing.assert_array_equal(np.asarray(result.species), np.asarray(reference.species))
+
+
+# S slides on S = 1 while a() decays; dn() then takes S down and out of its
+# band, and much later v() carries it back up across S = 1 in large steps, a
+# crossing the restart test carries. Written with {dlt} for the drift, {lam}
+# for how fast a() decays, {kd} for K's decay, and {cond} for the condition.
+_SLIDE_LEAVE_NET = """\
+begin parameters
+    1 V    0.2
+    2 tp   3.0
+    3 sig  0.3
+    4 dlt  {dlt}
+    5 kd   {kd}
+end parameters
+begin functions
+    1 a() exp(-{lam}*time())
+    2 f() if({cond},a(),-a())
+    3 v() V*exp(-((time()-tp)/sig)^2)
+    4 dn() -dlt
+end functions
+begin species
+    1 S() 0.95
+    2 K() 1
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 v
+    3 0 1 dn
+    4 2 0 kd
+end reactions
+begin groups
+    1 Sobs 1
+    2 Kobs 2
+end groups
+"""
+
+_HOLD_CASES = {
+    # Held until the next restart instead, the crossing back went unseen in a
+    # step nothing else ended, and the run kept a step main restarts in.
+    "leaves its band, then crosses": dict(dlt=0.001, lam=10, kd=2, cond="Sobs<1"),
+    # S leaves fast. Taken for a root of the residual, the band's end is given
+    # the restart test off the surface, which carries it.
+    "leaves its band fast": dict(dlt=0.1, lam=10, kd=2, cond="Sobs<1"),
+    # dg/dS = K falls by e^-12 while S slides and parks. Measured once, the
+    # band stays as wide as it was, and the crossing back lies inside it.
+    "dg/dx shrinks while held": dict(dlt=0.001, lam=6, kd=4, cond="Sobs*Kobs<Kobs"),
+}
+
+
+@pytest.mark.parametrize("case", list(_HOLD_CASES))
+def test_holding_takes_the_steps_main_takes(tmp_path, monkeypatch, case):
+    """Holding a residual changes which crossings CVODE locates, never what
+    the run does at one: every crossing main restarts at is still restarted
+    at. Each run here takes every step it takes with holding off
+    (BNGSIM_STATE_SWITCH_HOLD=0), which roots and tests every crossing as main
+    does, and ends on the same bits. Each hold here ends where the state leaves
+    its band. One that ends inside a slide, or a held crossing the run
+    restarts at, lands within CVODE's root tolerance of main's restart instead,
+    and the answers agree to the tolerance rather than to the bit."""
+    text = _SLIDE_LEAVE_NET.format(**_HOLD_CASES[case])
+    run = dict(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8, max_step=0.05)
+    result = bngsim.Simulator(_write(tmp_path, text)).run(**run)
+    monkeypatch.setenv("BNGSIM_STATE_SWITCH_HOLD", "0")
+    reference = bngsim.Simulator(_write(tmp_path, text, "off.net")).run(**run)
+    assert result.solver_stats["n_steps"] == reference.solver_stats["n_steps"]
+    np.testing.assert_array_equal(np.asarray(result.species), np.asarray(reference.species))
+
+
+def test_a_held_slide_prints_nothing(tmp_path):
+    """A held slide no longer returns at every step, so CVODE's calls end on
+    their batch limit, and CVODE logs each end as an error: 132 lines of
+    "mxstep steps taken before reaching tout" on this run. A run that holds a
+    residual sends that log to the null sink. Main prints nothing (control).
+    In a subprocess, for the reason given above."""
+    path = tmp_path / "slide.net"
+    path.write_text(_SLIDE_NET)
+    script = textwrap.dedent(f"""
+        import bngsim
+        m = bngsim.Model.from_net({str(path)!r})
+        r = bngsim.Simulator(m).run(sample_times=[0.0, 4.25], rtol=1e-5, atol=1e-5)
+        print("S", float(r.species[-1][0]))
+    """)
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert "S 0.99999" in done.stdout
+    assert "mxstep" not in done.stdout + done.stderr
+
+
+def _batch_ends_between(path, hold, start, stop):
+    """The times CVODE logs a batch ending at, between ``start`` and ``stop``,
+    in a run of ``path`` with holding on or off; in a subprocess, as above."""
+    script = textwrap.dedent(f"""
+        import bngsim
+        m = bngsim.Model.from_net({str(path)!r})
+        bngsim.Simulator(m).run(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8,
+                                max_step=0.05, max_steps=20)
+    """)
+    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold)
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
+    )
+    times = re.findall(r"At t = ([0-9.eE+-]+), mxstep", done.stdout + done.stderr)
+    return [t for t in times if start < float(t) < stop]
+
+
+def test_a_released_hold_logs_what_main_logs(tmp_path):
+    """While a run holds a residual, CVODE's error log is in the null sink; once
+    nothing is held it goes back. Kept in the sink for the rest of the run, the
+    batch ends after S has left its band (in 20-step batches, between t = 1 and
+    the restart at S's crossing back near t = 2.55) went unlogged, where the
+    run with holding off logs them. Where each batch ends depends on where the
+    run last returned, so the times are not compared."""
+    path = tmp_path / "leave.net"
+    path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
+    assert _batch_ends_between(path, "0", 1.0, 2.4)
+    assert _batch_ends_between(path, "1", 1.0, 2.4)

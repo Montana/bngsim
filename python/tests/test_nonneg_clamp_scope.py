@@ -15,10 +15,10 @@ then 0. V and X do not read S: V(t) = -70 + 9 exp(-0.1 t) and
 X(t) = N (1 - exp(-t)) for the value N it relaxes to.
 
 The runs use the finite-difference Jacobian. With S pinned at 0 the analytical
-d/dS sqrt(S) is infinite even after the clamp, and that Jacobian freezes S's
-Newton correction (issue #867), so S drifts off wherever the step sequence takes
-it and the compiled-Jacobian solve can fail outright. The difference quotients
-go through the RHS and its retry, which is what this file is about.
+d/dS sqrt(S) is infinite even after the clamp, so the closed form is refused
+there (issue #867) and ``jacobian="auto"`` would only reach these same difference
+quotients after a failed first attempt. The difference quotients go through the
+RHS and its retry, which is what this file is about.
 
 What decides "negative by design" for a species is the DECLARED initial value,
 not the IC baseline: save_concentrations() can make the baseline a depleted

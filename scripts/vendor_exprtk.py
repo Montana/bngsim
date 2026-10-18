@@ -19,8 +19,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BNGSIM_ROOT = REPO_ROOT / "bngsim"
+# The bngsim checkout itself: scripts/ sits directly under it. Derive it from
+# this file, not as <parent>/bngsim, which names a missing directory in a
+# checkout called anything else and the other checkout in a clone beside one
+# (GH #864).
+BNGSIM_ROOT = Path(__file__).resolve().parents[1]
 VENDOR_DIR = BNGSIM_ROOT / "third_party" / "exprtk"
 HEADER_NAME = "exprtk.hpp"
 METADATA_NAME = "VENDOR.json"

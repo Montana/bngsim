@@ -1,0 +1,30 @@
+# bngsim GH #1062 fixture: the same model with the rate in a global function
+# g() that reads MAB. NFsim re-evaluates a global function whenever MAB changes,
+# so nothing goes stale and nothing is refused.
+begin model
+begin parameters
+  k 0.001
+  kr 0.1
+end parameters
+begin molecule types
+  A(b,c)
+  B(a)
+end molecule types
+begin seed species
+  A(b,c) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Molecules AC A(c)
+  Molecules MAB A(b!1).B(a!1)
+end observables
+begin functions
+  g() = 2*k*(1+0.01*MAB)
+end functions
+begin reaction rules
+  A(b) + B(a) -> A(b!1).B(a!1) g()
+  A(b!1).B(a!1) -> A(b) + B(a) kr
+end reaction rules
+end model
+writeXML()

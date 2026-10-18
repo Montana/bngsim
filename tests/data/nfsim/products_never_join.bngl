@@ -1,0 +1,30 @@
+# Issue #1022: a rule whose products can never be what it writes
+# (richardposner/RuleMonkey#105). Rule 1 puts a free A and a free B into one
+# product pattern that no bond joins, so BNG2 generates no reaction for it and
+# RuleMonkey 3.11.0 never fires it and says so in a Severity::Warn diagnostic.
+# RuleMonkey 3.10.1 fired it, setting s~1 on A.
+begin model
+begin parameters
+  k1  1
+  k2  0.001
+end parameters
+begin molecule types
+  A(b,s~0~1)
+  B(a)
+end molecule types
+begin seed species
+  A(b,s~0)  100
+  B(a)      100
+end seed species
+begin observables
+  Molecules A1  A(s~1)
+  Molecules AB  A(b!1).B(a!1)
+end observables
+begin reaction rules
+  A(b,s~0) + B(a) -> A(b,s~1).B(a)  k1
+  A(b) + B(a) -> A(b!1).B(a!1)      k2
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

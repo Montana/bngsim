@@ -1,0 +1,29 @@
+# bngsim GH #854 review fixture: local functions that read Species observables,
+# which NFsim cannot clone for a local function. NFsim called exit(1), killing
+# the host process; it now fails the load with a message.
+begin model
+begin parameters
+  k 0.001
+end parameters
+begin molecule types
+  A(b)
+  B(a)
+end molecule types
+begin seed species
+  A(b) 100
+  B(a) 100
+end seed species
+begin observables
+  Molecules AB A(b!1).B(a!1)
+  Species SA A()
+  Species SB B()
+end observables
+begin functions
+  fA(x) = k*(1+SA(x))
+  fB(y) = 1+SB(y)
+end functions
+begin reaction rules
+  A(b)%x + B(a)%y -> A(b!1).B(a!1) fA(x)*fB(y)
+end reaction rules
+end model
+writeXML()

@@ -1,0 +1,31 @@
+# A bivalent ligand with the cooperativity pattern written with explicit bonds,
+# L(r!1,r!2).R(l!1).R(l!2): a site named twice on one molecule. One-way
+# unbinding from doubly bound L: each bond breaks at exp(-(0.2+0.35*3)), so the
+# doubly bound count decays at 2*0.2865 = 0.573 (0.813 without the pattern).
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_LR -2
+  G_full -1
+end parameters
+begin molecule types
+  L(r,r)
+  R(l)
+end molecule types
+begin seed species
+  L(r!1,r!2).R(l!1).R(l!2) 1000
+end seed species
+begin energy patterns
+  L(r!1).R(l!1) G_LR
+  L(r!1,r!2).R(l!1).R(l!2) G_full
+end energy patterns
+begin observables
+  Species Full L(r!+,r!+)
+end observables
+begin reaction rules
+  L(r!1).R(l!1) -> L(r) + R(l) Arrhenius(phi,Ea0)
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()

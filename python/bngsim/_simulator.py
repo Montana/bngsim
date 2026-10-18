@@ -998,9 +998,15 @@ class Simulator:
                     f"method='{method}' requires xml_path=... pointing to a BNG XML file."
                 )
             from bngsim._bngsim_core import NfsimSimulator
-            from bngsim._network_free_checks import refuse_time_dependent_rate_laws
+            from bngsim._network_free_checks import (
+                refuse_nfsim_rate_laws,
+                refuse_nfsim_stale_local_functions,
+                refuse_time_dependent_rate_laws,
+            )
 
             refuse_time_dependent_rate_laws(xml_path, "nfsim")
+            refuse_nfsim_rate_laws(xml_path)
+            refuse_nfsim_stale_local_functions(xml_path)
             self._sim = NfsimSimulator(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
@@ -1030,10 +1036,21 @@ class Simulator:
                     f"method='{method}' requires xml_path=... pointing to a BNG XML file."
                 )
             from bngsim._bngsim_core import RuleMonkeySimulator
-            from bngsim._network_free_checks import refuse_time_dependent_rate_laws
+            from bngsim._network_free_checks import (
+                clock_readers,
+                refuse_rulemonkey_compartments,
+                refuse_rulemonkey_energy_misreads,
+            )
+            from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
-            refuse_time_dependent_rate_laws(xml_path, "rulemonkey")
+            refuse_rulemonkey_compartments(xml_path)
+            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             self._sim = RuleMonkeySimulator(xml_path)
+            warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
+            # Model time where the model reads the clock (issue #1022); elsewhere
+            # elapsed time, which no such model can tell apart and which keeps
+            # event times small at a large t_start.
+            self._sim.set_reads_clock(bool(clock_readers(xml_path)))
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             self._sim.set_block_same_complex_binding(bool(block_same_complex_binding))
@@ -1637,9 +1654,12 @@ class Simulator:
         # A compartment an assignment rule sizes. The right-hand side divides a
         # species' share of a reaction across compartments by the size the
         # model loaded at, not the one the rule gives (issue #745), so a law
-        # across sizes there is a law of that right-hand side: `c2 := 1 + A`
-        # ends at A = 0.354 where the amounts give 0.467. Such a model was
-        # refused while its law was found without the sizes, and stays so.
+        # across sizes there is a law of that right-hand side, not of the
+        # amounts. Such a model was refused while its law was found without
+        # the sizes, and stays so. (`c2 := 1 + A`, the example this was
+        # written for, dilutes B since #1052, which leaves no such law: its
+        # steady states form a line, and the isolated-root check refuses its
+        # columns.)
         ruled = sorted(set(model.compartment_size_params) & set(model.function_names))
         if ruled:
             names = model.species_names
@@ -2086,7 +2106,7 @@ class Simulator:
 
     def _apply_crossing_stops(
         self, opts, t_start, t_end, model=None, sensitivities: bool | None = None
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Stop the integration step on every fixed time discontinuity (#305).
 
         A GH #72 discontinuity root is registered so the integrator cannot step
@@ -2133,6 +2153,10 @@ class Simulator:
         of those on literal time that read none of the Simulator's sensitivity
         parameters: fixed times of the run, with no jump to make. Every chunk
         is asked about the whole set, so every chunk stops at the same times.
+
+        Returns the conditions it read, for :meth:`_apply_state_switch_roots`
+        to leave out as covered: asked again, the model would probe its RHS for
+        clocks again to key its cache (issue #726).
         """
         model = model if model is not None else self._model
         if sensitivities is None:
@@ -2142,7 +2166,7 @@ class Simulator:
         # or not any condition names it (issue #709).
         table_breaks = model.table_function_breaks()
         if not conditions and not table_breaks:
-            return
+            return conditions
         from bngsim._switch_sensitivity import (
             _PLAIN_INSTANT_FLOOR,
             TriggerEqualityNeverHolds,
@@ -2190,7 +2214,7 @@ class Simulator:
                 "integrator will approach each crossing unclamped (issue #305).",
                 e,
             )
-            return
+            return conditions
         if stops:
             logger.debug(
                 "Discontinuity crossing stops at t=%s (issue #305)",
@@ -2218,10 +2242,11 @@ class Simulator:
                 len(conditions) == 1
                 and len(over_budget) == 1
                 and not table_breaks
-                and not model.state_switch_root_conditions()
+                and not model._state_switch_roots_beside(conditions)
                 and model._core.n_events == 0
             )
             self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+        return conditions
 
     @staticmethod
     def _switches_the_run(model, over_budget: list) -> list:
@@ -2741,7 +2766,7 @@ class Simulator:
             else:
                 opts.set_state_switch_reactions(reactions)
 
-    def _apply_state_switch_roots(self, opts, model) -> None:
+    def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).
 
         The plain-run half of :meth:`_apply_state_switch_sens`. A rate law gated
@@ -2755,10 +2780,17 @@ class Simulator:
         and nothing else.
 
         The conditions are :meth:`Model.state_switch_root_conditions`, cached
-        on the model, so a fit pays for the scan once. A no-op for a model with
-        no such condition, which leaves its root set and stepping untouched.
+        on the model for the time conditions it leaves out as covered, so a fit
+        pays for the scan once per clock verdict (issue #726): once, unless the
+        fit moves a counter's rate across 1. ``covered`` is what
+        :meth:`_apply_crossing_stops` returned for this run. A no-op for a model
+        with no such condition, which leaves its root set and stepping untouched.
         """
-        conditions = model.state_switch_root_conditions()
+        conditions = (
+            model.state_switch_root_conditions()
+            if covered is None
+            else model._state_switch_roots_beside(covered)
+        )
         if conditions:
             logger.debug(
                 "State-switch roots for a plain run (issue #897): %s",
@@ -4291,21 +4323,28 @@ class Simulator:
             restore()
             raise
 
-    def _ode_attempts(self, times, opts, restore):
+    def _ode_attempts(self, times, opts, restore, sim=None, core=None):
         """The attempts :meth:`_run_ode_with_jacobian_fallback` makes, with
-        ``restore`` putting the model back between them."""
+        ``restore`` putting the model back between them.
+
+        ``sim`` and ``core`` default to this Simulator's own; a :meth:`run_batch`
+        row passes its clone's, so a row places the same bet a loop of
+        :meth:`run` would (GH #203).
+        """
+        sim = self._sim if sim is None else sim
+        core = self._model._core if core is None else core
         eligible = self._jacobian == "auto" and bool(
-            getattr(self._model._core, "analytical_jacobian_complete", False)
+            getattr(core, "analytical_jacobian_complete", False)
         )
         if not eligible:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         if self._ode_jacobian_fell_back:
             # A prior run on this Simulator already proved the analytical attempt
             # is doomed for this model — go straight to FD, no wasted attempt.
             opts.jacobian = "fd"
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         try:
-            return self._sim.run(times, opts)
+            return sim.run(times, opts)
         except RuntimeError as e:
             # Only a CVODE failure is the Jacobian's to rescue. Anything else is
             # bngsim refusing the model or the run, such as an invalid event delay
@@ -4320,14 +4359,15 @@ class Simulator:
                 "GH#176 analytical Jacobian: CVODE integration failed (%s); "
                 "retrying with the finite-difference Jacobian. The rate law is "
                 "likely discontinuous in a state variable (e.g. an if() whose "
-                "condition crosses a threshold), which the exact Jacobian cannot "
-                "represent. Pass jacobian='fd' to skip this attempt, or "
-                "jacobian='analytical' to surface the failure.",
+                "condition crosses a threshold), or its derivative is infinite "
+                "where the state sits (e.g. sqrt(S) at S = 0, issue #867), which "
+                "the exact Jacobian cannot represent. Pass jacobian='fd' to skip "
+                "this attempt, or jacobian='analytical' to surface the failure.",
                 e,
             )
             restore()
             opts.jacobian = "fd"
-            result = self._sim.run(times, opts)
+            result = sim.run(times, opts)
             # Only memoize once FD has actually succeeded — a model that fails on
             # both (genuinely unintegrable) keeps surfacing its error every run.
             self._ode_jacobian_fell_back = True
@@ -4661,7 +4701,7 @@ class Simulator:
                 eff_max_step = self._resolve_max_step(max_step)
                 if eff_max_step is not None:
                     opts.max_step_size = eff_max_step
-                self._apply_crossing_stops(opts, t_start, t_end)
+                covered = self._apply_crossing_stops(opts, t_start, t_end)
                 if self._codegen_so_path:
                     opts.codegen_so_path = self._codegen_so_path
                 if self._codegen_c_source:
@@ -4693,7 +4733,7 @@ class Simulator:
                     # #150 / #144), so an IC-only request needs the jump too.
                     self._apply_state_switch_sens(opts, self._model._core)
                 else:
-                    self._apply_state_switch_roots(opts, self._model)
+                    self._apply_state_switch_roots(opts, self._model, covered)
 
                 # Install the Python callback used for the JAX Jacobian path.
                 if self._jacobian == "jax" and self._jax_jac_evaluator is not None:
@@ -5000,12 +5040,14 @@ class Simulator:
         base_seed = _resolve_seed(seed) if self._method != "ode" else 0
 
         if self._method == "ode":
-            # Every row runs on a clone, and a clone inherits these structural
-            # scans only if the parent has already made them. Made here, once,
-            # before any row is cloned (and before any worker thread exists),
-            # rather than once per row and again on the next call (issue #897).
-            self._model.time_discontinuity_conditions()
-            self._model.state_switch_root_conditions()
+            # Every row runs on a clone, and a clone inherits these scans only
+            # if the parent has already made them. Made here, once, before any
+            # row is cloned (and before any worker thread exists), rather than
+            # once per row and again on the next call (issue #897). They are
+            # kept by clock verdict (issue #726): a row that moves a counter's
+            # rate across 1 scans again, and its siblings at that verdict
+            # share the answer through the memo a clone shares with its parent.
+            self._model._state_switch_roots_beside(self._model.time_discontinuity_conditions())
 
         def _run_one(i: int) -> Result:
             """Run simulation i (thread-safe, GIL released)."""
@@ -5661,10 +5703,14 @@ class Simulator:
         plus, minus = out
         return (plus - minus) / (2.0 * h), np.maximum(np.abs(plus), np.abs(minus))
 
-    def _capture_carryover_state(self) -> tuple[np.ndarray | None, list[str], bool, Any]:
+    def _capture_carryover_state(
+        self, core: Any = None
+    ) -> tuple[np.ndarray | None, list[str], bool, Any]:
         """Snapshot the model's carry-over state: the sensitivity seed (issue #81)
-        and the event state a continuing run starts from (issue #693)."""
-        core = self._model._core
+        and the event state a continuing run starts from (issue #693). ``core``
+        defaults to this Simulator's model; a :meth:`run_batch` row passes its
+        clone's."""
+        core = self._model._core if core is None else core
         seed = (
             np.array(core.pending_sensitivity_seed(), dtype=np.float64)
             if core.has_pending_sensitivity_seed
@@ -5678,11 +5724,11 @@ class Simulator:
         )
 
     def _restore_carryover_state(
-        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any]
+        self, snapshot: tuple[np.ndarray | None, list[str], bool, Any], core: Any = None
     ) -> None:
         """Put back what :meth:`_capture_carryover_state` captured."""
         seed, names, dirty, events = snapshot
-        core = self._model._core
+        core = self._model._core if core is None else core
         if seed is None:
             core.set_pending_sensitivity_seed(np.zeros((0, 0), dtype=np.float64), [])
         else:
@@ -6110,7 +6156,7 @@ class Simulator:
                     opts.codegen_c_source = self._codegen_c_source
                 # This row's own discontinuity crossings, for the same reason the
                 # switch times below are detected on the clone (issue #305).
-                self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone)
+                covered = self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone)
                 if self._sensitivity_params:
                     opts.set_sensitivity_params(self._sensitivity_params)
                     # Seed ∂x_i(0)/∂p from the CLONE's params (this row's point):
@@ -6139,8 +6185,20 @@ class Simulator:
                     # sensitivity at all", not on a parameter request.
                     self._apply_state_switch_sens(opts, clone._core)
                 else:
-                    self._apply_state_switch_roots(opts, clone)
-                core_result = sim.run(times, opts)
+                    self._apply_state_switch_roots(opts, clone, covered)
+                # The GH #176 retry, as run() places it. Without it a row raised
+                # where the same run() fell back to FD and returned, which breaks
+                # the GH #203 contract above; issue #867 made a closed form still
+                # non-finite after the clamp one more way to need it.
+                row_core = clone._core
+                start_state = row_core.get_state()
+                start_carry = self._capture_carryover_state(row_core)
+
+                def restore() -> None:
+                    row_core.set_state(start_state)
+                    self._restore_carryover_state(start_carry, row_core)
+
+                core_result = self._ode_attempts(times, opts, restore, sim=sim, core=row_core)
 
             elif self._method in ("ssa", "psa"):
                 from bngsim._bngsim_core import SsaSimulator

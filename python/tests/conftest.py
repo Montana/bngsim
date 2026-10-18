@@ -320,6 +320,13 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
     ),
     ("tomllib is 3.11+", _ANYWHERE, "stdlib module absent on 3.10, which is still supported"),
     ("gcc/clang only", _ANYWHERE, "the sharded compile path; MSVC takes the other branch"),
+    (
+        "no fused multiply-add",
+        _ANYWHERE,
+        "test_switch_residual_unfused.py shows codegen's C unfused against a build "
+        "that would fuse; an x86-64 core without FMA (before Haswell, or under "
+        "Rosetta) cannot fuse, so there is nothing to show. Every CI runner has one",
+    ),
     # Source-tree vs installed-wheel context.
     ("installed wheel", _ANYWHERE, "source-tree-only guard, correctly inert against a wheel"),
     ("source root", _ANYWHERE, "version-consistency check needs the source tree"),
@@ -874,6 +881,27 @@ def nfsim_switchable_rate_xml(data_dir: Path) -> Path:
     NFsim and RuleMonkey session tests.
     """
     return data_dir / "nfsim" / "switchable_rate.xml"
+
+
+@pytest.fixture
+def nfsim_zero_order_switchable_rate_xml(data_dir: Path) -> Path:
+    """A birth-death process ``A() -> 0 kdeg``, ``0 -> A() kp`` with kp = 0 at load (GH #854).
+
+    The synthesis rule is zero-order, so NFsim folds a volume conversion into
+    its base rate at load; a post-init ``set_param('kp', ...)`` must still
+    refresh it.
+    """
+    return data_dir / "nfsim" / "zero_order_switchable_rate.xml"
+
+
+@pytest.fixture
+def nfsim_zero_order_switchable_rate_compartment_xml(data_dir: Path) -> Path:
+    """The GH #854 birth-death model with A() in a compartment of size 2.
+
+    The synthesis propensity is kp * 2, and a post-init ``set_param('kp', ...)``
+    must keep that factor.
+    """
+    return data_dir / "nfsim" / "zero_order_switchable_rate_compartment.xml"
 
 
 @pytest.fixture

@@ -32,6 +32,10 @@ from bngsim._exceptions import (
     StopConditionMet,
 )
 
+# Tables added after load here are fixtures that nothing in the model reads,
+# which add_table_function warns about (issue #772).
+pytestmark = pytest.mark.filterwarnings("ignore:nothing in the model reads table function")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Batch with num_processors (ThreadPoolExecutor)
 # ═══════════════════════════════════════════════════════════════════════════════

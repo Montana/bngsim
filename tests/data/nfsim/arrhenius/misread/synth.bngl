@@ -1,0 +1,38 @@
+# A.c is bound only by a synthesis rule that attaches Z, never by C. The
+# pattern A(x!1,c!2).B(y!1).C(a!2) never matches, so B unbinds at
+# exp(-(0.2+0.35*2)) = exp(-0.9) whether or not Z sits on c. synth.xml is
+# written by writeXML() before generate_network, as for a network-free run, so
+# no species in it holds the A-Z bond.
+begin model
+begin parameters
+  Ea0 0.2
+  phi 0.35
+  G_AB -2
+  G_C -1
+  ks 100
+end parameters
+begin molecule types
+  A(x,c)
+  B(y)
+  C(a)
+  Z(a)
+end molecule types
+begin seed species
+  A(x!1,c).B(y!1) 1000
+  C(a) 10
+end seed species
+begin energy patterns
+  A(x!1).B(y!1) G_AB
+  A(x!1,c!2).B(y!1).C(a!2) G_C
+end energy patterns
+begin observables
+  Species AB A(x!1).B(y!1)
+  Species AZ A(c!1).Z(a!1)
+end observables
+begin reaction rules
+  A(x!1).B(y!1) -> A(x) + B(y) Arrhenius(phi,Ea0)
+  A(c) -> A(c!1).Z(a!1) ks
+end reaction rules
+end model
+generate_network({overwrite=>1})
+writeXML()
