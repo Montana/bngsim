@@ -140,6 +140,7 @@ def pytest_configure(config: pytest.Config) -> None:
     one. Escape hatches: BNGSIM_ALLOW_STALE_CORE=1 (proceed with a warning) or
     BNGSIM_NO_BUILD_CHECK=1 (skip the check entirely).
     """
+    _configure_shard(config)
     root = _redirect_artifact_caches(config)
     # Under pytest-xdist every worker runs this hook as well, and a dozen copies
     # of the two lines below buried the one that describes the run. The workers
@@ -605,22 +606,25 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 # ─── Shards: one CI leg's suite split across jobs ─────────────────────────────
 #
-# BNGSIM_TEST_SHARD=k/n (1-based) keeps the tests of the files in shard k of n
-# and deselects the rest. python-tests.yml runs each leg as two jobs this way,
-# and a job of its own sums the two summaries for the false-green guard.
+# BNGSIM_TEST_SHARD=k/n (1-based) makes the session collect only the test files
+# in shard k of n. python-tests.yml runs each leg as two jobs this way, and a
+# job of its own sums the two summaries for the false-green guard.
 #
-# The split is by FILE, and it is decided here, on what pytest itself
-# collected, rather than from a file list handed to pytest: every collected
-# test is in exactly one shard by construction, so nothing can fall between
-# them. Within a job, xdist spreads the shard's tests over the cores.
+# Another shard's files are not collected at all (pytest_ignore_collect), rather
+# than collected and then deselected. A module that skips at collection, which
+# leaves no items to deselect, then reports its skip in one shard, as it does
+# in one unsharded run, and the summed counts stay what that run would count.
+# Which shard a file is in depends on its path and ci/test_durations.json
+# alone, never on what this session collected, so every job and every xdist
+# worker agrees, and each test file is in exactly one shard.
 #
-# Files are dealt heaviest first onto the lighter shard, using the durations in
-# ci/test_durations.json (ci/test_durations.py rewrites it from junit XML). A
-# hash split instead left one shard 24% heavier. A file the table does not
-# list goes by a hash of its path, so a stale table costs balance, never
-# coverage.
+# The table's files are dealt heaviest first onto the lighter shard; a hash
+# split instead left one shard 24% heavier. A file the table does not list goes
+# by a hash of its path, so a stale table costs balance, never coverage.
+# ci/test_durations.py rewrites the table from junit XML.
 _SHARD_ENV = "BNGSIM_TEST_SHARD"
 _SHARD_DURATIONS = Path(__file__).resolve().parents[2] / "ci" / "test_durations.json"
+_SHARD_KEY = pytest.StashKey["tuple[int, int, dict[str, int]] | None"]()
 
 
 def _parse_shard(value: str) -> tuple[int, int]:
@@ -635,20 +639,17 @@ def _parse_shard(value: str) -> tuple[int, int]:
 
 
 def _assign_shards(files: list[str], durations: dict[str, float], n: int) -> dict[str, int]:
-    """Each file's 1-based shard: known files heaviest first onto the lightest
-    shard (ties to the lower index), unknown ones by CRC-32 of the path. A pure
-    function of its arguments, so every job and every xdist worker agrees."""
+    """Each of ``files``' 1-based shard. Every file in the table is dealt, heaviest
+    first onto the lightest shard (ties to the lower index), whether or not it is
+    among ``files``, so one file's answer never depends on which others were
+    asked about. A file the table lacks goes by CRC-32 of its path."""
     load = [0.0] * n
-    shard_of: dict[str, int] = {}
-    known = sorted((f for f in set(files) if f in durations), key=lambda f: (-durations[f], f))
-    for f in known:
+    dealt: dict[str, int] = {}
+    for f in sorted(durations, key=lambda f: (-durations[f], f)):
         i = min(range(n), key=lambda j: (load[j], j))
-        shard_of[f] = i + 1
+        dealt[f] = i + 1
         load[i] += durations[f]
-    for f in files:
-        if f not in shard_of:
-            shard_of[f] = zlib.crc32(f.encode("utf-8")) % n + 1
-    return shard_of
+    return {f: dealt.get(f, zlib.crc32(f.encode("utf-8")) % n + 1) for f in files}
 
 
 def _read_shard_durations() -> dict[str, float]:
@@ -659,23 +660,41 @@ def _read_shard_durations() -> dict[str, float]:
     return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    # Taken out of the environment, not just read: the shard is this session's.
-    # A test that starts a pytest of its own (test_run_tests_sh.py counts what
-    # one collects) must see the whole suite, not inherit a slice of it. Each
-    # xdist worker collects for itself and has its own copy of the environment.
-    value = os.environ.pop(_SHARD_ENV, "").strip()
+def _configure_shard(config: pytest.Config) -> None:
+    """Read the shard at configure time: in the xdist controller a bad value is a
+    usage error before any worker starts, not a worker's INTERNALERROR."""
+    value = os.environ.get(_SHARD_ENV, "").strip()
     if not value:
+        config.stash[_SHARD_KEY] = None
         return
     k, n = _parse_shard(value)
-    file_of = {id(item): item.nodeid.split("::", 1)[0] for item in items}
-    shard_of = _assign_shards(sorted(set(file_of.values())), _read_shard_durations(), n)
-    keep = [item for item in items if shard_of[file_of[id(item)]] == k]
-    drop = [item for item in items if shard_of[file_of[id(item)]] != k]
-    if drop:
-        config.hook.pytest_deselected(items=drop)
-    items[:] = keep
+    durations = _read_shard_durations()
+    config.stash[_SHARD_KEY] = (k, n, _assign_shards(list(durations), durations, n))
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    shard = config.stash.get(_SHARD_KEY, None)
+    if shard is None or not (
+        collection_path.suffix == ".py" and collection_path.name.startswith("test_")
+    ):
+        return None
+    try:
+        rel = collection_path.relative_to(config.rootpath).as_posix()
+    except ValueError:
+        return None
+    k, n, dealt = shard
+    if rel not in dealt:
+        dealt[rel] = _assign_shards([rel], {}, n)[rel]
+    return True if dealt[rel] != k else None
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    # Out of the environment once collection is done: the shard is this
+    # session's. A test that starts a pytest of its own (test_run_tests_sh.py
+    # counts what one collects) must see the whole suite, not inherit a slice of
+    # it. Not earlier: the xdist controller collects nothing, and its workers,
+    # which do, inherit the variable from it.
+    os.environ.pop(_SHARD_ENV, None)
 
 
 @pytest.fixture(scope="session")

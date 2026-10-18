@@ -129,7 +129,8 @@ concurrency:
 
 jobs:
   # Each leg is two jobs, one per shard of the suite (BNGSIM_TEST_SHARD below;
-  # conftest splits by file and balances on ci/test_durations.json). The
+  # conftest collects each test file in one shard, balanced on
+  # ci/test_durations.json). The
   # python-tests-counts job further down sums the two summaries of a leg for
   # the false-green guard, which is a statement about the whole suite.
   python-tests:
@@ -205,11 +206,14 @@ jobs:
       # CMAKE_<LANG>_COMPILER_LAUNCHER from the environment at configure, which
       # reaches every CMake configure uv's build backend runs, the KLU autobuild
       # included. One cache per leg, written by shard 1 only: both shards build
-      # the same thing, and two writers to one key would race.
+      # the same thing, and two writers to one key would race. The key ends in
+      # -build because the action restores by prefix: without it, the
+      # ubuntu-latest leg's key is a prefix of the lapack leg's, and it restored
+      # whichever of the two was saved last.
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: python-tests-${{ matrix.leg.label }}
+          key: python-tests-${{ matrix.leg.label }}-build
           save: ${{ matrix.shard == 1 }}
           max-size: 500M
 
@@ -439,13 +443,15 @@ jobs:
           if-no-files-found: warn
 
   # The false-green guard for a whole leg: the sum of its two shards' summaries.
-  # conftest puts every collected test in exactly one shard, so the sum is what
+  # conftest collects each test file in exactly one shard, so the sum is what
   # one unsharded job reported. The labels here are the legs' labels above;
-  # test_ci_shards.py holds the two lists together.
+  # test_ci_shards.py holds the two lists together. Like the per-job guard it
+  # replaces, it runs only when every shard passed: a failed test is not in the
+  # collected count, and the floor would add a misleading second error.
   python-tests-counts:
     name: Python suite counts · ${{ matrix.label }}
     needs: python-tests
-    if: ${{ !cancelled() && !github.event.inputs.pytest_args }}
+    if: ${{ !github.event.inputs.pytest_args }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -455,11 +461,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `-?` and not `-*`: ubuntu-latest-* also matches ubuntu-latest-lapack-1.
+      # Each artifact lands in a directory of its own name, so two can never
+      # overwrite one another.
       - name: Download this leg's shard logs
         uses: actions/download-artifact@v4
         with:
-          pattern: python-tests-log-${{ matrix.label }}-*
-          merge-multiple: true
+          pattern: python-tests-log-${{ matrix.label }}-?
+          path: logs
 
       - name: Guard against a false green
         run: |
@@ -497,7 +506,7 @@ jobs:
           collected=0
           skipped=0
           for shard in 1 2; do
-            LOG="python-tests-${{ matrix.label }}-$shard.log"
+            LOG="logs/python-tests-log-${{ matrix.label }}-$shard/python-tests-${{ matrix.label }}-$shard.log"
             summary="$(grep -E '[0-9]+ (passed|failed).* in [0-9.]+s' "$LOG" 2>/dev/null | tail -1 || true)"
             if [ -z "$summary" ]; then
               echo "::error::No pytest summary line for shard $shard/2 — it did not run to completion."

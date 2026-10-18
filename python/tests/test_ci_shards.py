@@ -2,7 +2,8 @@
 
 What has to hold: every test pytest collects runs in exactly one shard, so a
 green set of shard jobs says what one unsharded job said. The split is by file,
-balanced on ci/test_durations.json, and decided on pytest's own collection.
+balanced on ci/test_durations.json, and a file's shard depends on its path and
+that table alone; another shard's files are not collected at all.
 """
 
 from __future__ import annotations
@@ -66,6 +67,16 @@ def test_an_unknown_file_goes_by_a_hash_of_its_path(shards):
     assert assigned == {f: zlib.crc32(f.encode()) % 3 + 1 for f in FILES}
 
 
+def test_a_files_shard_does_not_depend_on_which_others_were_collected(shards):
+    """Two jobs of one leg could collect different files (a module skipped in one
+    of them). If the dealing ran over what was collected, one difference would
+    reshuffle every file after it, and tests would land in both shards or none."""
+    durations = dict(zip(FILES[:6], [10.0, 9.0, 8.0, 3.0, 1.0, 1.0], strict=True))
+    whole = shards.assign(FILES, durations, 2)
+    for subset in (FILES[:3], FILES[2:5], FILES[::2], FILES[6:]):
+        assert shards.assign(subset, durations, 2) == {f: whole[f] for f in subset}
+
+
 def test_the_split_does_not_depend_on_the_order_files_arrive_in(shards):
     durations = {f: float(len(f) % 4) for f in FILES[:7]}
     assert shards.assign(FILES, durations, 2) == shards.assign(FILES[::-1], durations, 2)
@@ -124,6 +135,39 @@ def test_the_shards_of_the_real_suite_are_disjoint_and_cover_it():
     assert sorted(one + two) == sorted(whole)
     # Both shards carry real weight, not one file each.
     assert min(len(one), len(two)) > len(whole) // 4
+
+
+def test_no_test_sees_the_shard_variable(shards):
+    """conftest takes it out of the environment once collection is done, so a
+    test that starts a pytest of its own sees the whole suite. In a CI shard job
+    the variable is set for the job, and this is the test that it was taken out."""
+    assert shards.env not in os.environ
+
+
+def test_a_bad_shard_is_a_usage_error_before_any_worker_starts(tmp_path):
+    """Read at configure time: under xdist, read later, it surfaced as the
+    workers' INTERNALERROR (exit 3) and the message was lost."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_XDIST")}
+    env["BNGSIM_TEST_SHARD"] = "3/2"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "python/tests/test_ci_shards.py",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 4, proc.stdout[-1500:] + proc.stderr[-1500:]
+    assert "BNGSIM_TEST_SHARD='3/2'" in proc.stderr + proc.stdout
 
 
 def test_the_workflow_runs_every_shard_the_variable_names():
