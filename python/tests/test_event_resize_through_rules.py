@@ -288,3 +288,48 @@ def test_the_sensitivity_through_the_resize(case):
     np.testing.assert_allclose(
         np.ravel(np.asarray(result.output_sensitivities(f"species:{sid}"))[-1]), grad, rtol=1e-5
     )
+
+
+# A piecewise size whose condition reads a concentration an event moves (#1054
+# beside #1055). The event's resize carries the jump; the jump's own rescale
+# (#1054) added a second one at the instant, so [Sn] read 20 for 10.
+_KW = (
+    "compartment ce = 1; species Kw in ce; Kw = 10; compartment cv = 1; species Sn in cv; Sn = 5; "
+)
+PIECEWISE_AT_AN_EVENT = {
+    "a species the event's resize rescales": (
+        _KW + "cv := piecewise(2, Kw > 7, 1); at (time > 1): ce = 2;",
+        10.0,
+    ),
+    "the same species, read through a rule": (
+        _KW + "q := 0.5*Kw; cv := piecewise(2, q > 3.5, 1); at (time > 1): ce = 2;",
+        10.0,
+    ),
+    # Kw is not constant, but no reaction or rule moves it, so only the event
+    # does: it was refused as a condition the run moves too.
+    "a species the event assigns": (
+        _KW + "cv := piecewise(1, Kw > 7, 2); at (time > 1): Kw = 2;",
+        2.5,
+    ),
+}
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("case", list(PIECEWISE_AT_AN_EVENT))
+def test_a_piecewise_size_an_event_flips_is_rescaled_once(case, codegen):
+    text, after = PIECEWISE_AT_AN_EVENT[case]
+    result = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", codegen=codegen
+    ).run(t_span=(0.0, 3.0), n_points=7, rtol=1e-10, atol=1e-12)
+    t = np.asarray(result.time)
+    sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    np.testing.assert_allclose(sn, np.where(t <= 1, 5.0, after), rtol=1e-8)
+
+
+def test_a_piecewise_size_an_event_and_a_reaction_both_flip_is_refused():
+    """A reaction moves Kw as well, so the condition can flip at the event and
+    by the run: refused by name, not rescaled twice."""
+    with pytest.raises(bngsim.ModelError, match="Kw, which an event changes"):
+        bngsim.Model.from_antimony_string(
+            _KW + "J: Kw => ; 0.01*Kw; cv := piecewise(2, Kw > 7, 1); at (time > 1): ce = 2;"
+        )

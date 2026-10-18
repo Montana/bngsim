@@ -7696,14 +7696,72 @@ def _build_model_from_sbml_doc_in_context(doc):
         # own rescale owns that jump; one that reads an event target and the
         # state or time could flip at the event and then again by the jump
         # event, so it is refused.
-        _event_targets = {
-            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+        #
+        # An event moves more than what it assigns: a concentration in a
+        # compartment it resizes, directly or through the compartment's rule,
+        # is rescaled there, and that resize's own rescale carries any jump of
+        # a size that reads it (#1055). Left out, both rescaled at the event:
+        # `cv := piecewise(2, Kw > 7, 1)` with Kw in a compartment the event
+        # doubles took [Sn] to 20 for 10. And a species no reaction or rule
+        # moves, in a compartment that holds its size between events, moves
+        # only at an event, though it is not constant: `cv := piecewise(1, Kw >
+        # 7, 2)` beside `at (t > 1): Kw = 2` was refused, where the event's
+        # resize alone is right.
+        _event_moved = {
+            sbml_model.getEvent(k).getEventAssignment(j).getVariable()
             for k in range(sbml_model.getNumEvents())
             for j in range(sbml_model.getEvent(k).getNumEventAssignments())
         }
+        _rescaled_in: dict[str, set[str]] = {}
+        for _sid, _scomp in species_comp.items():
+            if not species_hosu.get(_sid, False) and _sid not in assignment_targets:
+                _rescaled_in.setdefault(_scomp, set()).add(_sid)
+        _size_rule_math = {
+            sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
+            for j in range(sbml_model.getNumRules())
+            if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
+        }
+        _rule_reach: dict[str, frozenset] = {}
+
+        def _reaches(var: str) -> frozenset:
+            if var not in _rule_reach:
+                _rule_reach[var] = frozenset()  # a cycle of rules reads no further
+                names: set[str] = set()
+                for n in _ast_name_set(_size_rule_math[var]):
+                    names.add(n)
+                    if n in _size_rule_math:
+                        names |= _reaches(n)
+                _rule_reach[var] = frozenset(names)
+            return _rule_reach[var]
+
+        for _comp in _event_moved & _comp_id_set:
+            _event_moved |= _rescaled_in.get(_comp, set())
+        _grew = True
+        while _grew:
+            _grew = False
+            for _comp in sorted(ar_comp_targets - _event_moved):
+                if _reaches(_comp) & _event_moved:
+                    _event_moved |= {_comp, *_rescaled_in.get(_comp, ())}
+                    _grew = True
+        _event_targets = {_alias(_safe_name(n)) for n in _event_moved}
+        _flow_free = {
+            s
+            for s in _sbml_species_ids
+            if s not in reaction_species
+            and s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _moving = (
             {_TIME_SYM}
-            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | {
+                a
+                for a, s in _species_alias.items()
+                if s not in _still_species and s not in _flow_free
+            }
             | set(_rr_alias)
             | set(_rate_token_species)
         )
@@ -7744,8 +7802,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where "
                         f"{c} flips, which reads "
-                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
-                        "moves with the run as well; bngsim would rescale its "
+                        f"{', '.join(sorted(names & _event_targets))}, which an event "
+                        "changes, and moves with the run as well; bngsim would rescale its "
                         "concentrations twice when an event flips it"
                     )
                     continue
