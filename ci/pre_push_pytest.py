@@ -8,11 +8,14 @@ workers, with the same outcome test for test. Nothing is dropped to get there:
 this is still the whole directory, so the hook and python-tests.yml keep
 running one suite.
 
-``--dist loadfile`` and not xdist's default per-test ``load``: each file's tests
-run in one worker, in file order, so a module- or class-scoped fixture is built
-once per file, as it is serially. What changes is which files ran earlier in the
-same process. The price is balance, since the slowest file (about 200 s) is the
-floor.
+``--dist worksteal``: tests go to the workers one at a time, and a worker that
+runs out takes queued tests from the others. One file per worker (``loadfile``)
+made the slowest file the floor: test_expression_backend_equivalence.py, about
+five minutes on one worker. In a checkout without the gitignored corpora,
+``loadfile`` took 304 s and ``worksteal`` 184 s on 12 workers, and every one of
+the 13,573 tests had the same outcome both ways (2026-10-18). A module- or
+class-scoped fixture is then built once per worker that runs one of its tests,
+rather than once per file; 14 of the 475 files have one.
 
 **The test cache is shared with the main checkout.** macOS checks a newly
 written ``.dylib`` the first time anything loads it, at 0.5-2.4 s a file, and it
@@ -30,11 +33,11 @@ written by atomic rename, so two checkouts sharing it is safe.
 
 The worker count defaults to the number of cores that are not efficiency cores
 on Apple Silicon, and to xdist's ``auto`` (one per CPU) everywhere else. On the
-same 12+4-core Mac, ``auto``'s 16 workers took 5m27s against 12 workers' 4m42s:
-a file dealt to an efficiency core runs slower, and with ``loadfile`` the
-slowest file sets the finish. ``BNGSIM_PREPUSH_WORKERS`` overrides the count,
-and ``0`` runs the whole suite in a single pytest process with no xdist at all,
-as the hook used to, for a failure that might be about what ran before it.
+same 12+4-core Mac, ``auto``'s 16 workers took 5m27s against 12 workers' 4m42s
+(one file per worker, then): work dealt to an efficiency core runs slower.
+``BNGSIM_PREPUSH_WORKERS`` overrides the count, and ``0`` runs the whole suite
+in a single pytest process with no xdist at all, as the hook used to, for a
+failure that might be about what ran before it.
 
 Without pytest-xdist the hook stops at once and says how to get it. Running
 serially instead would turn a five-minute push into a 45-minute one that
@@ -58,7 +61,7 @@ def command(workers: str) -> list[str]:
     """The pytest invocation; ``0`` workers is the plain serial run."""
     cmd = [sys.executable, "-m", "pytest", "-q", "python/tests"]
     if workers != "0":
-        cmd += ["-n", workers, "--dist", "loadfile"]
+        cmd += ["-n", workers, "--dist", "worksteal"]
     return cmd
 
 
