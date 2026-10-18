@@ -22,11 +22,11 @@ Once a file has been checked, every later load of it, in any process, is
 instant. A copy of it at another path is checked again. So a ``.claude`` or
 ``bngsim-wt`` worktree, whose own ``.pytest_cache`` starts empty, recompiles and
 re-checks every codegen library the suite builds: the first push from one took
-19m15s on 12 workers, most of it waiting on those checks. Unless
-``BNGSIM_TEST_CACHE_DIR`` is already set, this points it at the main checkout's
-``.pytest_cache/d/bngsim``, which is the default there anyway. The cache is
-content-addressed and written by atomic rename, so two checkouts sharing it is
-safe.
+19m15s on 12 workers, most of it waiting on those checks. So from a worktree,
+unless ``BNGSIM_TEST_CACHE_DIR`` is already set, this points it at the main
+checkout's ``.pytest_cache/d/bngsim``. The main checkout itself is left on
+pytest's own route to that same directory. The cache is content-addressed and
+written by atomic rename, so two checkouts sharing it is safe.
 
 The worker count defaults to the number of cores that are not efficiency cores
 on Apple Silicon, and to xdist's ``auto`` (one per CPU) everywhere else. On the
@@ -95,7 +95,11 @@ def default_workers() -> str:
 
 
 def shared_cache_dir() -> Path | None:
-    """The main checkout's test cache, or ``None`` when it cannot be found."""
+    """The main checkout's test cache, for a run in one of its worktrees.
+
+    ``None`` in the main checkout itself, where that directory is already the
+    default, and wherever the main checkout cannot be found.
+    """
     try:
         common = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -109,8 +113,18 @@ def shared_cache_dir() -> Path | None:
         return None
     common_dir = Path(common)
     main_root = common_dir.parent
-    # Only an ordinary checkout's ``.git`` directory has the checkout beside it.
-    if common_dir.name != ".git" or not (main_root / "pyproject.toml").is_file():
+    # Only an ordinary checkout's ``.git`` directory has the checkout beside it,
+    # and it has to be bngsim's: a repository that vendors this tree has a
+    # pyproject of its own.
+    if common_dir.name != ".git":
+        return None
+    pyproject = main_root / "pyproject.toml"
+    try:
+        if 'name = "bngsim"' not in pyproject.read_text(encoding="utf-8"):
+            return None
+    except OSError:
+        return None
+    if Path.cwd().resolve() == main_root.resolve():
         return None
     return main_root / ".pytest_cache" / "d" / "bngsim"
 

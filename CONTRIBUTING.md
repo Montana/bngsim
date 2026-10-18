@@ -264,7 +264,8 @@ uv run python -m pytest python/tests/ --cache-clear   # force a cold-cache run
 ```
 
 - `pytest --cache-clear` wipes it, which is the supported way to test a cold
-  compile path across the whole suite;
+  compile path across the whole suite. It clears this checkout's own directory;
+  the pre-push hook in a worktree uses the main checkout's (below);
 - `BNGSIM_TEST_CACHE_DIR=/path` relocates it — node-local scratch, a cache CI
   restores between runs, or a throwaway directory. It overrides
   `BNGSIM_CODEGEN_CACHE_DIR` / `BNGSIM_BNGL_CACHE_DIR` for the session rather

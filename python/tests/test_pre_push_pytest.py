@@ -128,7 +128,7 @@ def _git(cwd: Path, *args: str) -> None:
 def test_a_worktree_finds_the_main_checkouts_cache(tmp_path, monkeypatch):
     main = tmp_path / "main"
     main.mkdir()
-    (main / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (main / "pyproject.toml").write_text('[project]\nname = "bngsim"\n')
     _git(main, "init", "-q")
     _git(
         main,
@@ -145,13 +145,35 @@ def test_a_worktree_finds_the_main_checkouts_cache(tmp_path, monkeypatch):
     _git(main, "worktree", "add", "-q", "--detach", str(tmp_path / "wt" / "bngsim"))
     for name in [k for k in os.environ if k.startswith("GIT_")]:
         monkeypatch.delenv(name)
-    expected = main.resolve() / ".pytest_cache" / "d" / "bngsim"
-    for cwd in (main, tmp_path / "wt" / "bngsim"):
-        monkeypatch.chdir(cwd)
-        assert pre_push.shared_cache_dir() == expected
-    # Not a checkout of anything with a pyproject: no guess.
+    monkeypatch.chdir(tmp_path / "wt" / "bngsim")
+    assert pre_push.shared_cache_dir() == main.resolve() / ".pytest_cache" / "d" / "bngsim"
+    # Another project's checkout, or none at all: no guess.
+    (main / "pyproject.toml").write_text('[project]\nname = "pybnf"\n')
+    assert pre_push.shared_cache_dir() is None
     (main / "pyproject.toml").unlink()
     assert pre_push.shared_cache_dir() is None
+
+
+def test_the_main_checkout_keeps_pytests_own_route_to_its_cache(tmp_path, monkeypatch):
+    """Set there, the variable would skip the ``config.cache`` route, the one
+    that makes pytest write the ``.gitignore`` inside ``.pytest_cache``."""
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "pyproject.toml").write_text('[project]\nname = "bngsim"\n')
+    _git(main, "init", "-q")
+    for name in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.chdir(main)
+    assert pre_push.shared_cache_dir() is None
+
+
+def test_the_repository_ignores_pytests_cache_directory():
+    """pytest's own ``.gitignore`` there is written only if pytest creates the
+    directory, and a worktree's hook run can create the main checkout's first."""
+    gitignore = REPO_ROOT / ".gitignore"
+    if not gitignore.is_file():
+        pytest.skip(".gitignore is not in this checkout")
+    assert ".pytest_cache/" in gitignore.read_text(encoding="utf-8").splitlines()
 
 
 class _Sysctl:
