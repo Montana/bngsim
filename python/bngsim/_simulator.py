@@ -3931,10 +3931,12 @@ class Simulator:
             # The column now holds amount/V_live, so the bare-id amount is it times
             # V_live; left to the volume factor it was amount·V_static/V_live, and a
             # conserved amount of 5 in c := 2 + time read 0.83 at t = 10 (issue
-            # #728), under SSA as under ODE, since this pass rescales both.
+            # #728), under SSA as under ODE, since this pass rescales both. At a
+            # sample where the size is 0 the guard above left the column at
+            # amount/V_static, so the amount there is it times V_static, not 0.
             amount_factor = result._varvol_amount_factor or {}
-            for _name, j, _factor, v_live, _kind, _k in rescaled:
-                amount_factor[j] = v_live
+            for name, j, _factor, v_live, _kind, _k in rescaled:
+                amount_factor[j] = np.where(v_live != 0.0, v_live, (amap or {})[name][1])
             result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
