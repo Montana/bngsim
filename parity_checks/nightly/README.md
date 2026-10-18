@@ -17,9 +17,9 @@ a regression. Nothing here blocks a PR.
 **The BioModels gap.** 317 of the 1,323 BioModels come only from EBI's BioModels REST
 API, which answers HTTP 403 to GitHub-hosted runners (the same URLs work from a
 workstation), so CI runs the 992 temp-biomodels models plus the committed SBML
-overrides. `present_models.py` hands each runner the models that are on disk. 300 of
-the 317 carry no recorded license (17 are CC0), so re-hosting them for CI needs a
-license review first.
+overrides. `present_models.py` hands each runner the models that are on disk. All 317
+are CC0-1.0, like the whole BioModels dataset (https://www.biomodels.org/termsofuse),
+so CI may re-host them; where to host them is still open (#807).
 
 **Giant models.** The dozen SBML files over 1 MB (up to 786 species) run in a
 separate `rr-ode` pass, two at a time on the interpreted RHS: their automatic C
