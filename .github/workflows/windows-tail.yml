@@ -144,9 +144,10 @@ jobs:
       # and -MP compiles a target's sources in parallel, one process per core.
       # Spelled -MP, not /MP: this step runs in Git Bash, which rewrites an
       # environment value that looks like a POSIX path before a Windows program
-      # sees it, and cl got CL=C:/Program Files/Git/MP and failed CMake's
-      # compiler check. The variable is this step's alone, so the cl that tests
-      # compile codegen with later runs as it did.
+      # sees it, and with CL=/MP CMake's compiler check failed on all four bash
+      # legs while cibuildwheel's (set from Python) built. The variable is this
+      # step's alone, so the cl that tests compile codegen with later runs as
+      # it did.
       - name: Build & install bngsim (NFsim on, KLU off)
         env:
           CL: -MP
