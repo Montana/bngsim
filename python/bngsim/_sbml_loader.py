@@ -9620,6 +9620,28 @@ def _build_model_from_sbml_doc_in_context(doc):
         varvol_ar_amount_map[_safe_name(sid)] = _safe_name(species_comp[sid])
     model._varvol_ar_amount_map = varvol_ar_amount_map
 
+    # (#728) The amount report of a concentration species that a rule sets. The
+    # two maps above take their species from the dilution gate, which leaves
+    # out a rule target, rightly: its rule states its derivative or its value.
+    # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
+    # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
+    # under every method, so V_live(t) is all the report needs, read from the
+    # compartment's promoted-species column (a rate rule) or its expression
+    # column (an assignment rule).
+    varvol_target_amount_map: dict[str, tuple[str, str]] = {}
+    for sid, cid in species_comp.items():
+        if (
+            sid not in species_idx
+            or species_hosu.get(sid, False)
+            or (sid not in rate_rule_targets and sid not in assignment_targets)
+        ):
+            continue
+        if cid in rate_rule_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
+        elif cid in ar_comp_targets:
+            varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+    model._varvol_target_amount_map = varvol_target_amount_map
+
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
     # compartments (an event assignment writes the compartment's size). Unlike a
     # rate-rule compartment, an event resize injects a per-species ``V_old/V_new``
