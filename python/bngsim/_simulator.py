@@ -9508,8 +9508,8 @@ class SteadyStateResult:
 
     Attributes
     ----------
-    concentrations : ndarray, shape (n_species,)
-        Species concentrations at steady state.
+    concentrations : ndarray
+        Species concentrations at steady state, shape ``(n_species,)``.
     species_names : list[str]
         Species names.
     residual : float

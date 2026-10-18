@@ -6,6 +6,8 @@ import importlib.metadata
 import os
 import sys
 
+import sphinx.util.requests
+
 # Make the package importable for autodoc even when bngsim isn't pip-installed
 # in the build environment (e.g. local `sphinx-build`, or the RTD mock path).
 sys.path.insert(0, os.path.abspath(os.path.join("..", "python")))
@@ -55,12 +57,68 @@ autodoc_member_order = "bysource"
 autodoc_typehints = "description"
 always_document_param_types = True
 
+# An "Attributes" section renders as :ivar: fields, not as `.. attribute::`
+# directives: autodoc already documents each of those attributes from the class,
+# and a second directive for the same name is a duplicate-object warning now
+# that the API page is indexed (issue #586).
+napoleon_use_ivar = True
+
+# -- cross-references --------------------------------------------------------
+# Warn on a reference that resolves to nothing, so `-W` fails on a :meth: that
+# names a renamed API (issue #586). nitpick-ignore.txt lists the references that
+# cannot resolve (words of a NumPy-style type, undocumented modules) and the
+# broken ones that predate the check.
+nitpicky = True
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nitpick-ignore.txt")) as f:
+    nitpick_ignore = [
+        tuple(line.split(None, 1))
+        for line in (raw.strip() for raw in f)
+        if line and not line.startswith("#")
+    ]
+
 # -- intersphinx -------------------------------------------------------------
+_INTERSPHINX_URLS = {
+    "python": "https://docs.python.org/3/",
+    "numpy": "https://numpy.org/doc/stable/",
+    "pandas": "https://pandas.pydata.org/docs/",
+    "scipy": "https://docs.scipy.org/doc/scipy/",
+}
+intersphinx_timeout = 30
+
+
+def _inventory(name: str, url: str) -> str | None:
+    """Where intersphinx reads ``name``'s inventory from.
+
+    With BNGSIM_INTERSPHINX_CACHE unset, ``None``: intersphinx fetches ``url``
+    itself. Set to a directory, as lint.yml's docs job sets it, a copy there,
+    refreshed from ``url`` and kept as it was if the host does not answer.
+    Under -W an unreachable inventory is a failed build, so without the copy an
+    outage at numpy.org would fail every pull request (issue #586).
+    """
+    cache = os.environ.get("BNGSIM_INTERSPHINX_CACHE")
+    if not cache:
+        return None
+    path = os.path.join(os.path.expanduser(cache), f"{name}.inv")
+    try:
+        # Sphinx's own client, as intersphinx fetches with: numpy.org refuses
+        # urllib's default User-Agent.
+        with sphinx.util.requests.get(url + "objects.inv", timeout=intersphinx_timeout) as r:
+            r.raise_for_status()
+            data = r.content
+        if not data.startswith(b"# Sphinx inventory version"):
+            raise ValueError("not a Sphinx inventory")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as out:
+            out.write(data)
+        os.replace(path + ".tmp", path)
+    except (OSError, ValueError) as exc:  # requests' errors are OSErrors
+        state = "keeping the cached copy" if os.path.exists(path) else "no cached copy"
+        print(f"intersphinx: {name}: {url} failed ({exc}); {state}")
+    return path if os.path.exists(path) else None
+
+
 intersphinx_mapping = {
-    "python": ("https://docs.python.org/3", None),
-    "numpy": ("https://numpy.org/doc/stable/", None),
-    "pandas": ("https://pandas.pydata.org/docs/", None),
-    "scipy": ("https://docs.scipy.org/doc/scipy/", None),
+    name: (url, _inventory(name, url)) for name, url in _INTERSPHINX_URLS.items()
 }
 
 # -- HTML output -------------------------------------------------------------
