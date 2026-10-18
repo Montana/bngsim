@@ -1254,6 +1254,14 @@ struct SteadyStateOptions {
     // its meaning as a per-species residual scale no matter how many species
     // were excluded. With no mask, n_included == n_species and nothing changes.
     std::vector<uint8_t> steady_state_mask;
+
+    // Rate-law conditions over model state, as source text, one relational atom
+    // each (Model.state_switch_root_conditions, the set a plain run() roots;
+    // issue #897). The march roots their residuals and restarts on each
+    // crossing, so a window the approach to the steady state passes through is
+    // not stepped over (issue #904): a rate on while 0.5 < S < 0.505 left Y at
+    // 0 for 0.199, with converged=True. Empty roots nothing, as before.
+    std::vector<std::string> state_switch_conditions;
 };
 
 // --- Steady-state result ------------------------------------------------------
@@ -1265,6 +1273,12 @@ struct SteadyStateResult {
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
     int n_rhs_evals = 0;
+    // Issue #904: the crossings of a rate-law condition over model state the
+    // march restarted on (SteadyStateOptions::state_switch_conditions), and
+    // whether it stopped rooting them, past 1000, to march over a state that
+    // slides along its threshold as it did before.
+    int n_state_switch_roots = 0;
+    bool state_switch_roots_dropped = false;
 
     // Observable totals and raw function values AT the returned state (issue
     // #247), evaluated once after the solve by the same update_observables() +
