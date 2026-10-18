@@ -22,9 +22,11 @@ Modes:
                    ``data/biomodels_sbml/`` by default), and check each one
                    against the provenance manifest.
     --build OUT    pack the archive from a local corpus (``--sbml-dir``, by
-                   default where fetch.py writes it). Deterministic: the same
-                   files give the same bytes, so a rebuild can be compared with
-                   MIRROR_SHA256.
+                   default where fetch.py writes it). The tar inside is
+                   deterministic (fixed order, times, owners, modes); the gzip
+                   around it is too for a given zlib, so a rebuild matched
+                   MIRROR_SHA256 under Python 3.10 and 3.13 here, but another
+                   zlib (zlib-ng) may compress the same tar differently.
 
 Usage:
     python fetch_biomodels_mirror.py
@@ -42,6 +44,7 @@ import json
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -57,6 +60,7 @@ PROVENANCE = BIOMODELS_SUITE / "biomodels_provenance.json"
 DEFAULT_JOBS = HERE / "ode_jobs.json"
 DEFAULT_SBML_DIR = BIOMODELS_SUITE / "data" / "sbml_downloads"
 DEFAULT_DEST = HERE / "data" / "biomodels_sbml"
+RETRY_DELAY = 10.0  # seconds, times the attempt number
 
 README = """\
 BioModels SBML for bngsim's rr_parity corpus (the "biomodels_dir" jobs of
@@ -128,17 +132,37 @@ def build(out: Path, sbml_dir: Path, ids: list[str]) -> int:
     return 0
 
 
+def _download(url: str, tmp) -> str | None:
+    """Stream ``url`` into ``tmp``; the sha256 of what arrived, or ``None``.
+
+    Three tries: the nightly rebuilds its corpus only on a cache miss, and one
+    dropped connection then would cost that night's rr-ode and amici-sens."""
+    for attempt in range(1, 4):
+        tmp.seek(0)
+        tmp.truncate()
+        digest = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                while chunk := r.read(1 << 20):
+                    digest.update(chunk)
+                    tmp.write(chunk)
+            return digest.hexdigest()
+        except OSError as exc:  # urllib's HTTPError and URLError included
+            print(f"download attempt {attempt} of 3 failed: {exc}: {url}", file=sys.stderr)
+            if attempt < 3:
+                time.sleep(RETRY_DELAY * attempt)
+    return None
+
+
 def fetch(dest: Path, ids: list[str], url: str, want: str) -> int:
     """Download the archive, check it, and write each model's SBML into ``dest``.
     Returns the number of models missing or not the pinned bytes."""
     with tempfile.TemporaryFile() as tmp:
-        digest = hashlib.sha256()
-        with urllib.request.urlopen(url, timeout=120) as r:
-            while chunk := r.read(1 << 20):
-                digest.update(chunk)
-                tmp.write(chunk)
-        if digest.hexdigest() != want:
-            print(f"archive sha256 {digest.hexdigest()}, pinned {want}: {url}", file=sys.stderr)
+        got = _download(url, tmp)
+        if got is None:
+            return len(ids)
+        if got != want:
+            print(f"archive sha256 {got}, pinned {want}: {url}", file=sys.stderr)
             return len(ids)
         tmp.seek(0)
         pins = pinned_sha256()

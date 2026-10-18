@@ -3,8 +3,8 @@
 
 The nightly's corpus job fetches the whole BioModels corpus, but a local checkout
 may hold only part of it, so rr-ode and amici-sens pass this list to their runner's
-``--models`` filter instead of failing on the first missing file. Job ``model`` paths are relative to ``parity_checks/rr_parity``
-for both manifests.
+``--models`` filter instead of failing on the first missing file. Job ``model``
+paths are relative to ``parity_checks/rr_parity`` for both manifests.
 
 ``--min-bytes`` / ``--max-bytes`` split the list by SBML file size, so the few
 giant models can run in a pass of their own (four of them at once, each compiling

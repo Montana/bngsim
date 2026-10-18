@@ -216,9 +216,9 @@ verifies the fetched bytes against it. Regenerate the manifest with
 
 The 331 `invented` protocols are **authored by us** — no upstream file, so they
 are not in this manifest; their grid/tolerances live inline in the committed
-`ode_jobs.json`. The 332 `biomodels_dir` SBML come from BioModels REST and are
+`ode_jobs.json`. The 331 `biomodels_dir` SBML come from BioModels REST and are
 pinned by the biomodels suite's version manifest
-(`../../benchmarks/suites/biomodels/biomodels_provenance.json`) — all 332 are
+(`../../benchmarks/suites/biomodels/biomodels_provenance.json`) — all 331 are
 inside that keep-set, so `materialize.py`'s `$BIOMODELS_SBML_DIR` copy is
 reproducible once that suite's pinned `fetch.py` has run. Where BioModels refuses the
 download (its CloudFront refuses GitHub-hosted runners, issue #807),

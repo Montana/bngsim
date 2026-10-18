@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: key
-        run: echo "key=rr-corpus-v3-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/fetch_biomodels_mirror.py', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=rr-corpus-v3-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/fetch_biomodels_mirror.py', 'benchmarks/suites/biomodels/biomodels_provenance.json', 'parity_checks/rr_parity/materialize.py', 'parity_checks/rr_parity/fetch_sedml.py', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
 
       - id: cache
         uses: actions/cache/restore@v4
