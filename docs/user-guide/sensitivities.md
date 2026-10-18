@@ -326,12 +326,13 @@ step that holds the window. Such a comparison is rooted at its two edges
 instead, `X - 5` against `0.01` and `-0.01`, and a sensitivity run jumps a
 square there. `abs()` has no analytic derivative, so a sensitivity run takes
 its columns by difference quotient, and refuses the model where the state or a
-requested parameter moves the run across an edge. Issue #904 lists what this
-does not yet cover:
+requested parameter moves the run across an edge. An SBML event trigger
+written as such a comparison is rooted at its edges too, so the event fires
+where the comparison turns true. Issue #904 lists what this does not yet
+cover:
 - the same window written any other way, such as `pow(X - 5, 2)` in a `.net`
   model, `2*abs(X - 5) < 0.02`, or a square compared with a bound that is not
   a number, `(X - 5)^2 < w`. Each is still rooted whole;
-- an SBML event trigger written as one such comparison;
 - `steady_state()`.
 
 ### A rate that rises from zero at the crossing
