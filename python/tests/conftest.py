@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import importlib
 import json
 import os
@@ -607,8 +608,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 # ─── Shards: one CI leg's suite split across jobs ─────────────────────────────
 #
 # BNGSIM_TEST_SHARD=k/n (1-based) makes the session collect only the test files
-# in shard k of n. python-tests.yml runs each leg as two jobs this way, and a
-# job of its own sums the two summaries for the false-green guard.
+# in shard k of n that it finds by walking a directory, as python-tests.yml's
+# `pytest python/tests` does. A file named on the command line is collected
+# whatever its shard: pytest does not ask this hook about those. python-tests.yml
+# runs each leg as two jobs this way, and a job of its own sums the two
+# summaries for the false-green guard.
 #
 # Another shard's files are not collected at all (pytest_ignore_collect), rather
 # than collected and then deselected. A module that skips at collection, which
@@ -672,20 +676,31 @@ def _configure_shard(config: pytest.Config) -> None:
     config.stash[_SHARD_KEY] = (k, n, _assign_shards(list(durations), durations, n))
 
 
-def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+def _in_another_shard(path: Path, config: pytest.Config) -> bool:
+    """Is ``path`` a test module that belongs to a shard other than this one?
+
+    A test module is whatever ``python_files`` says pytest collects (test_*.py
+    and *_test.py by default), so no module pytest would collect escapes the
+    split; conftest.py, __init__.py, helpers and directories are left to
+    pytest. A file outside the rootdir is split on its absolute path, never
+    collected in every shard."""
     shard = config.stash.get(_SHARD_KEY, None)
-    if shard is None or not (
-        collection_path.suffix == ".py" and collection_path.name.startswith("test_")
-    ):
-        return None
+    if shard is None or path.suffix != ".py":
+        return False
+    if not any(fnmatch.fnmatch(path.name, pattern) for pattern in config.getini("python_files")):
+        return False
     try:
-        rel = collection_path.relative_to(config.rootpath).as_posix()
+        rel = path.relative_to(config.rootpath).as_posix()
     except ValueError:
-        return None
+        rel = path.resolve().as_posix()
     k, n, dealt = shard
     if rel not in dealt:
         dealt[rel] = _assign_shards([rel], {}, n)[rel]
-    return True if dealt[rel] != k else None
+    return dealt[rel] != k
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    return True if _in_another_shard(collection_path, config) else None
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -707,6 +722,8 @@ def shards() -> SimpleNamespace:
         parse=_parse_shard,
         assign=_assign_shards,
         read_durations=_read_shard_durations,
+        key=_SHARD_KEY,
+        in_another_shard=_in_another_shard,
     )
 
 

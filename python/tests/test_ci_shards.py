@@ -16,6 +16,7 @@ import subprocess
 import sys
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -135,6 +136,41 @@ def test_the_shards_of_the_real_suite_are_disjoint_and_cover_it():
     assert sorted(one + two) == sorted(whole)
     # Both shards carry real weight, not one file each.
     assert min(len(one), len(two)) > len(whole) // 4
+
+
+def _config(shards, rootpath: Path, shard, python_files=("test_*.py", "*_test.py")):
+    """Just enough of a pytest.Config for the collection filter."""
+    stash = pytest.Stash()
+    stash[shards.key] = shard
+    return SimpleNamespace(stash=stash, rootpath=rootpath, getini=lambda name: list(python_files))
+
+
+def test_another_shards_test_modules_are_not_collected_and_nothing_else_is_touched(
+    shards, tmp_path
+):
+    dealt = {"python/tests/test_a.py": 1, "python/tests/b_test.py": 2}
+    one = _config(shards, tmp_path, (1, 2, dealt))
+    two = _config(shards, tmp_path, (2, 2, dealt))
+    for name, mine in (("test_a.py", one), ("b_test.py", two)):
+        path = tmp_path / "python" / "tests" / name
+        assert not shards.in_another_shard(path, mine)
+        assert shards.in_another_shard(path, two if mine is one else one)
+    for name in ("conftest.py", "__init__.py", "_helper.py", "data.json"):
+        path = tmp_path / "python" / "tests" / name
+        assert not shards.in_another_shard(path, one) and not shards.in_another_shard(path, two)
+    # No shard set: nothing is filtered.
+    assert not shards.in_another_shard(
+        tmp_path / "python/tests/test_a.py", _config(shards, tmp_path, None)
+    )
+
+
+def test_a_module_outside_the_rootdir_is_in_exactly_one_shard(shards, tmp_path):
+    outside = tmp_path / "elsewhere" / "test_far.py"
+    root = tmp_path / "root"
+    verdicts = [
+        shards.in_another_shard(outside, _config(shards, root, (k, 3, {}))) for k in (1, 2, 3)
+    ]
+    assert verdicts.count(False) == 1, verdicts
 
 
 def test_no_test_sees_the_shard_variable(shards):
