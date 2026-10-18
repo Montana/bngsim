@@ -199,10 +199,12 @@ def _sbml_window(
     *,
     trigger: str | None = None,
     rules: dict[str, str] | None = None,
+    functions: dict[str, str] | None = None,
 ) -> str:
     """A = 2t as an SBML document, with Y' = piecewise(k, condition, 0), or
     with an event on *trigger* that adds 1 to Y and writes the time to T.
-    *rules* are parameters set by assignment rules, by name."""
+    *rules* are parameters set by assignment rules, by name, and *functions*
+    are function definitions, by name."""
     import libsbml
 
     doc = libsbml.SBMLDocument(3, 1)
@@ -224,6 +226,10 @@ def _sbml_window(
     k.setId("k")
     k.setValue(10)
     k.setConstant(True)
+    for name, body in (functions or {}).items():
+        function = model.createFunctionDefinition()
+        function.setId(name)
+        function.setMath(libsbml.parseL3Formula(body))
     for name, formula in (rules or {}).items():
         param = model.createParameter()
         param.setId(name)
@@ -301,9 +307,11 @@ def test_a_square_against_a_rule_bound_keeps_the_rate_laws_edges(tmp_path, rtol)
     assert y == pytest.approx(0.1, rel=1e-5)
 
 
-def _fired(tmp_path, trigger: str, rtol: float) -> tuple[float, float]:
+def _fired(
+    tmp_path, trigger: str, rtol: float, functions: dict[str, str] | None = None
+) -> tuple[float, float]:
     """How often the event on *trigger* fired by t = 10, and when it last did."""
-    model = bngsim.Model.from_sbml(_sbml_window(tmp_path, trigger=trigger))
+    model = bngsim.Model.from_sbml(_sbml_window(tmp_path, trigger=trigger, functions=functions))
     run = bngsim.Simulator(model, method="ode").run(
         t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
     )
@@ -334,6 +342,69 @@ def test_an_sbml_event_outside_a_window_fires_again_after_it(tmp_path, rtol):
     y, fired_at = _fired(tmp_path, "abs(A - 5) > 0.01", rtol)
     assert y == 2.0
     assert fired_at == pytest.approx(2.505, rel=1e-6)
+
+
+NEAR = "lambda(x, c, w, abs(x - c) < w)"
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+@pytest.mark.parametrize(
+    ("trigger", "body", "edges"),
+    [
+        ("near(A, 5, 0.01)", NEAR, {"A-5<0.01", "A-5>-0.01"}),
+        ("near(A, 4.99, 5.01)", "lambda(x, lo, hi, (x > lo) && (x < hi))", {"A>4.99", "A<5.01"}),
+        ("near(time, 2.5, 0.005)", NEAR, {"time-2.5<0.005", "time-2.5>-0.005"}),
+        # The formal A is what the call binds, time, and not the species A.
+        (
+            "near(time, 2.5, 0.005)",
+            "lambda(A, c, w, abs(A - c) < w)",
+            {"time-2.5<0.005", "time-2.5>-0.005"},
+        ),
+    ],
+    ids=["abs", "two-comparisons", "time", "formal-named-A"],
+)
+def test_an_sbml_event_on_a_window_in_a_function_definition_fires(
+    tmp_path, trigger, body, edges, rtol
+):
+    """``near(A, 5, 0.01)`` holds its window in the function's body, and the
+    loader scanned only the trigger's own math, which has no comparison in it.
+    Rooted whole, the window was stepped over and the event never fired: Y = 0
+    at both tolerances, where the same window written in the trigger fired.
+    The body's two edges are registered now, in what the call binds."""
+    path = _sbml_window(tmp_path, trigger=trigger, functions={"near": body})
+    covered = bngsim.Model.from_sbml(path).time_discontinuity_conditions()
+    assert {c.replace("(", "").replace(")", "") for c in covered} == edges
+    y, fired_at = _fired(tmp_path, trigger, rtol, functions={"near": body})
+    assert y == 1.0
+    assert fired_at == pytest.approx(2.495, rel=1e-6)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+def test_an_sbml_event_on_an_equality_in_a_function_definition_fires(tmp_path, rtol):
+    """``hit(time, 2.5)`` with ``hit := x == c`` holds at one double, and the run
+    stops there, as it does for ``time == 2.5`` written in the trigger. The
+    body was not read, and the event never fired."""
+    y, fired_at = _fired(
+        tmp_path, "hit(time, 2.5)", rtol, functions={"hit": "lambda(x, c, x == c)"}
+    )
+    assert y == 1.0
+    assert fired_at == pytest.approx(2.5, rel=1e-12)
+
+
+def test_an_sbml_event_on_a_touch_in_a_function_definition_fires_on_any_grid(tmp_path):
+    """``peak(time)`` with ``peak := sin(s) >= 1`` is true at one instant a
+    period. A trigger's touch keeps its stop (issue #714), and the event fires
+    16 times by t = 100 on any grid, as on ``sin(time) >= 1``. The body was not
+    read, and it never fired."""
+    path = _sbml_window(
+        tmp_path, trigger="peak(time)", functions={"peak": "lambda(s, sin(s) >= 1)"}
+    )
+    for n_points in (2, 11, 1001):
+        run = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
+            t_span=(0.0, 100.0), n_points=n_points
+        )
+        y = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))["Y"]
+        assert y == 16.0
 
 
 COUNTER = """begin parameters

@@ -9045,9 +9045,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         trigger = event.getTrigger()
         if trigger is not None and trigger.getMath() is not None:
             _from_trigger: list[str] = []
-            _collect_relational_edge_conditions(
-                trigger.getMath(), func_defs, _from_trigger, equalities=trigger_equalities
-            )
+            # Into the function definitions the trigger calls as well, as the
+            # time and state scans go: `near(A, 5, 0.01)` with `near :=
+            # abs(x - c) < w` holds its window in the body, and the trigger's
+            # own math has no relational in it. Rooted whole, the window was
+            # stepped over and the event never fired (issue #904). Every
+            # trigger atom is kept, so no formal needs judging dynamic.
+            for _body, _scope, _ in _iter_funcdef_scan_frames(
+                trigger.getMath(), func_defs, lambda *_: False
+            ):
+                _collect_relational_edge_conditions(
+                    _body,
+                    func_defs,
+                    _from_trigger,
+                    local_params=_scope,
+                    equalities=trigger_equalities,
+                )
             disc_conditions.extend(_from_trigger)
             event_disc.update(_from_trigger)
 
