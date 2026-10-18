@@ -5245,7 +5245,7 @@ def _bend_branches(atom: str) -> list[str]:
     the call takes, which is a restart where nothing switches. ``[]`` with no
     bend to unfold, with one inside another, and past four branches.
     """
-    calls = []
+    calls: list[tuple[int, int, list[str]]] = []
     for m in _BEND_CALL.finditer(atom):
         close = _find_close_paren_strict(atom, m.end() - 1)
         if close < 0 or (calls and m.start() < calls[-1][1]):
