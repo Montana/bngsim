@@ -1347,9 +1347,27 @@ _TIME = (
 )
 
 
-def _hosu_in_ar_compartment(size_rule: str) -> str:
+_DECAY_BY_REACTION = f"""
+    <listOfReactions>
+      <reaction id="d" reversible="false">
+        <listOfReactants><speciesReference species="H" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <kineticLaw><math {_M}><apply><times/><ci>k</ci><ci>H</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>"""
+_DECAY_BY_RATE_RULE = (
+    f'<rateRule variable="H"><math {_M}><apply><times/><cn>-1</cn><ci>k</ci><ci>H</ci>'
+    "</apply></math></rateRule>"
+)
+
+
+def _hosu_in_ar_compartment(size_rule: str, driver: str) -> str:
     """H (hOSU, amount 6) decaying at 0.2*H in C, a compartment of size 3 an
-    assignment rule sets; R := rateOf(H), Z' = rateOf(H), P := rateOf(H) at t = 0."""
+    assignment rule sets; R := rateOf(H), Z' = rateOf(H), P := rateOf(H) at t = 0.
+    The decay is a reaction or H's own rate rule: each divides by the size its
+    own way, and both store H as amount/V_static."""
+    reactions = _DECAY_BY_REACTION if driver == "reaction" else ""
+    h_rule = _DECAY_BY_RATE_RULE if driver == "rate rule" else ""
     return _sbml(f"""
   <model id="m">
     <listOfCompartments><compartment id="C" size="3" constant="false"/></listOfCompartments>
@@ -1372,29 +1390,24 @@ def _hosu_in_ar_compartment(size_rule: str) -> str:
       <assignmentRule variable="R"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math>
       </assignmentRule>
       <rateRule variable="Z"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math></rateRule>
-    </listOfRules>
-    <listOfReactions>
-      <reaction id="d" reversible="false">
-        <listOfReactants><speciesReference species="H" stoichiometry="1" constant="true"/>
-        </listOfReactants>
-        <kineticLaw><math {_M}><apply><times/><ci>k</ci><ci>H</ci></apply></math></kineticLaw>
-      </reaction>
-    </listOfReactions>
+      {h_rule}
+    </listOfRules>{reactions}
   </model>""")
 
 
 @pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("driver", ["reaction", "rate rule"])
 @pytest.mark.parametrize(
     "size_rule",
     ["<cn>3</cn>", f"<apply><plus/><cn>3</cn><apply><times/><cn>0.5</cn>{_TIME}</apply></apply>"],
     ids=["constant", "time-varying"],
 )
-def test_rateof_hosu_in_an_ar_compartment_is_the_amount_rate(size_rule, codegen):
+def test_rateof_hosu_in_an_ar_compartment_is_the_amount_rate(size_rule, driver, codegen):
     """Issue #736: H is an amount, H = 6 exp(-0.2 t) whatever C is, so rateOf(H)
     is -0.2 H and Z = H - 6. Unscaled, R was a third of that (V_static = 3) and Z
     integrated the third. The load-time fold of the same rateOf, P, agreed with
     the closed form already and still does."""
-    model = bngsim.Model.from_sbml_string(_hosu_in_ar_compartment(size_rule))
+    model = bngsim.Model.from_sbml_string(_hosu_in_ar_compartment(size_rule, driver))
     assert model.get_param("P") == pytest.approx(-1.2, rel=1e-12)
     run = bngsim.Simulator(model, method="ode", codegen=codegen).run(
         t_span=(0.0, 5.0), n_points=6, rtol=1e-10, atol=1e-12

@@ -5145,7 +5145,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # Compartments whose live symbol must divide Functional reaction laws even
     # when their load-time size is 1.0. ``variable_comps`` intentionally excludes
-    # assignment-rule compartments for state-volume/rateOf paths, but reaction
+    # assignment-rule compartments for state-volume paths, but reaction
     # storage conversion still needs ``law / V_live`` for hOSU=false species in
     # AR compartments (suite 00946/00948: ``C := fakeC``, event changes fakeC).
     live_symbol_divide_comps = variable_comps | ar_comp_targets

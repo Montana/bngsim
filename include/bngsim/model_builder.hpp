@@ -163,7 +163,8 @@ class ModelBuilder {
     /// amount-rate (volume_factor·d(conc)/dt) instead of the stored d(conc)/dt.
     /// The same flag also serves a hOSU species in a VARIABLE-volume compartment:
     /// the integrator stores amount/V_static, so ×volume_factor recovers the
-    /// amount-rate there too (suite 01463). See Species::report_rateof_amount.
+    /// amount-rate there too (suite 01463), and in an assignment-rule compartment
+    /// (#736). See Species::report_rateof_amount.
     /// No-op if species_idx0 is out of range.
     void set_species_rateof_amount(int species_idx0);
 
