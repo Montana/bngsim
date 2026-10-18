@@ -50,7 +50,9 @@ META_CACHE = HERE / "data" / "biomodels_meta_cache.json"  # gitignored (data/)
 OMEX_CACHE = HERE / "data" / "biomodels_omex_resolve_cache.json"  # gitignored
 DEFAULT_OUT = HERE / "biomodels_provenance.json"
 
-API = "https://www.ebi.ac.uk/biomodels"
+# fetch.py's BIOMODELS_BASE: BioModels' own host, not the old ebi.ac.uk URLs that
+# reach it by two silent redirects (issue #807).
+API = "https://www.biomodels.org"
 DELAY = 0.05  # polite pause between API calls
 
 
