@@ -153,7 +153,11 @@ jobs:
       - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
+      # Compile in parallel; windows-tail.yml's build step says why.
       - name: Build & install bngsim (KLU on)
+        env:
+          CL: /MP
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         shell: bash
         run: |
           set -euxo pipefail

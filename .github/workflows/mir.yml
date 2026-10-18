@@ -140,6 +140,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          # MSVC builds serially without these; windows-tail.yml's build step
+          # says why. Exported here, for this step and the Windows leg only.
+          if [ "$RUNNER_OS" = Windows ]; then
+            export CL=/MP CMAKE_BUILD_PARALLEL_LEVEL=2
+          fi
           python -m pip install --upgrade pip
           # BNGSIM_ENABLE_MIR=ON builds the vendored MIR backend; KLU off (and
           # REQUIRE_KLU off, overriding the pyproject default) skips SuiteSparse.

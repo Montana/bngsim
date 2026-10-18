@@ -416,5 +416,8 @@ environment = { BNGSIM_ENABLE_KLU = "ON", BNGSIM_REQUIRE_KLU = "ON", SUITESPARSE
 # See ci/build_suitesparse.ps1.
 before-all = "powershell -ExecutionPolicy Bypass -File ci/build_suitesparse.ps1 -Prefix C:/suitesparse"
 before-build = "pip install delvewheel"
-environment = { BNGSIM_ENABLE_KLU = "ON", BNGSIM_REQUIRE_KLU = "ON", SUITESPARSE_ROOT = "C:/suitesparse", CMAKE_PREFIX_PATH = "C:/suitesparse" }
+# CL and CMAKE_BUILD_PARALLEL_LEVEL: MSBuild compiles one file at a time without
+# them, so each of the four wheels was a serial 10+ minute build and the job took
+# 52 minutes. See windows-tail.yml's build step.
+environment = { BNGSIM_ENABLE_KLU = "ON", BNGSIM_REQUIRE_KLU = "ON", SUITESPARSE_ROOT = "C:/suitesparse", CMAKE_PREFIX_PATH = "C:/suitesparse", CL = "/MP", CMAKE_BUILD_PARALLEL_LEVEL = "2" }
 repair-wheel-command = "delvewheel repair -w {dest_dir} {wheel} --add-path C:/suitesparse/bin"
