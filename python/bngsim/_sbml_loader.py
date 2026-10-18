@@ -7553,11 +7553,19 @@ def _build_model_from_sbml_doc_in_context(doc):
         # the jumps, but a jump is a delta no ODE term carries, so it gets what
         # an event's resize gets (#74): each concentration × V_before/V_after,
         # at the condition's root. The size is inlined through the rules it
-        # reads, and each condition is set true and false in it for the size on
-        # either side. A condition over constants and event targets alone moves
-        # only at an event, whose own rescale owns that jump; one that reads an
-        # event target and the state or time could flip at the event and then
-        # again by the jump event, so it is refused.
+        # reads, and the relations in its conditions are set as they read on
+        # either side of each root for the size there. Relations that compare
+        # one difference (or a multiple of it) with 0 change at one root, as
+        # `t < 2` and `t >= 2` do in a piecewise with no otherwise, so they are
+        # set together. Set one at a time, the event of each read the other
+        # after its flip: two rescales at the instant took [S] in
+        # `piecewise(1, t < 2, 5, t >= 2)` to 0 or left it right, as the hash
+        # seed ordered them, and with `t < 2` and `t > 2` the size between the
+        # two, which no piece gives, was read as 0 and divided by. A condition
+        # over constants and event targets alone moves only at an event, whose
+        # own rescale owns that jump; one that reads an event target and the
+        # state or time could flip at the event and then again by the jump
+        # event, so it is refused.
         _event_targets = {
             _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
             for k in range(sbml_model.getNumEvents())
@@ -7592,9 +7600,12 @@ def _build_model_from_sbml_doc_in_context(doc):
             g = _inlined_size(_safe_name(comp), frozenset())
             if g is None:
                 continue
-            conds = dict.fromkeys(
-                c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)
+            # In a fixed order, so the events do not move with the hash seed.
+            conds = sorted(
+                {c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)},
+                key=_sp.default_sort_key,
             )
+            relations: set = set()
             for c in conds:
                 names = {str(s) for s in c.free_symbols}
                 if not names & _moving:
@@ -7608,7 +7619,40 @@ def _build_model_from_sbml_doc_in_context(doc):
                         "concentrations twice when an event flips it"
                     )
                     continue
-                v_false, v_true = (g.xreplace({c: b}) for b in (_sp.false, _sp.true))
+                relations |= {
+                    r
+                    for r in c.atoms(_sp.core.relational.Relational)
+                    if {str(s) for s in r.free_symbols} & _moving
+                }
+            # (difference, [(relation, its difference over that one)])
+            roots: list[tuple[object, list]] = []
+            for r in sorted(relations, key=_sp.default_sort_key):
+                d = r.lhs - r.rhs
+                for d0, rels in roots:
+                    ratio = _sp.cancel(d / d0)
+                    if ratio.is_number and ratio != 0:
+                        rels.append((r, ratio))
+                        break
+                else:
+                    roots.append((d, [(r, _sp.Integer(1))]))
+            for _, rels in roots:
+                # A side is the sign of the difference there, and an inequality
+                # in the set, where it has one, says which side is true: an
+                # equality holds at the root alone, so it reads false on both.
+                c, q = next(
+                    ((r, q) for r, q in rels if not isinstance(r, (_sp.Eq, _sp.Ne))), rels[0]
+                )
+                if isinstance(c, _sp.Eq):
+                    side_true, side_false = 0, 1
+                elif isinstance(c, _sp.Ne):
+                    side_true, side_false = 1, 0
+                else:
+                    side_true = -1 if c.func(-q, 0) else 1
+                    side_false = -side_true
+                v_false, v_true = (
+                    g.xreplace({r: r.func(rq * side, 0) for r, rq in rels})
+                    for side in (side_false, side_true)
+                )
                 texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
                 if any(t is None for t in texts):
                     _refusals.append(
@@ -9017,6 +9061,12 @@ def _build_model_from_sbml_doc_in_context(doc):
     # condition's root, each way, rescales the compartment's concentrations so
     # their amounts hold. ODE only, as every resize rescale is (#81); it is
     # added after the model's own events so their indices stay as they were.
+    # It executes before any of the model's events at the same instant, by a
+    # priority none of theirs reaches: the jump belongs to the size at that
+    # instant, and executed after an event there that sets a concentration in
+    # the compartment, its rescale of the value from before overwrote that
+    # setting (`at (time >= 2): Sn = 10` beside `cv := piecewise(1, time < 2,
+    # 5)` left Sn at 1 or 10 as the same-priority draw went, #242).
     for k, (comp, trigger, before, after) in enumerate(_size_jumps):
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
@@ -9027,6 +9077,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             ],
             persistent=True,
             initial_value=True,
+            priority_expr="1e308",
             assignment_ode_only=[True] * len(_jump_species[comp]),
         )
         for sid in _jump_species[comp]:

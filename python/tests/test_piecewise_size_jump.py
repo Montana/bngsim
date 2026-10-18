@@ -10,7 +10,9 @@ carries, and the concentration was held there instead:
 - ``cv := piecewise(1 + t, t < 2, 5)`` jumps 3 -> 5 at t = 2, and [Sn] stayed
   at 1.667 where the amount, 5, over 5 is 1.
 
-Each case is checked against amount/V(t) in closed form.
+Conditions that change at one root, ``t < 2`` and ``t >= 2`` in a piecewise
+with no otherwise, are one jump, not one each. Each case is checked against
+amount/V(t) in closed form.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ M = 'xmlns="http://www.w3.org/1998/Math/MathML"'
 T = '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
 
 
-def _pw(*pieces, otherwise):
+def _pw(*pieces, otherwise=None):
     body = "".join(f"<piece>{v}{c}</piece>" for v, c in pieces)
-    return f"<piecewise>{body}<otherwise>{otherwise}</otherwise></piecewise>"
+    tail = "" if otherwise is None else f"<otherwise>{otherwise}</otherwise>"
+    return f"<piecewise>{body}{tail}</piecewise>"
 
 
 def _plus(a, b):
@@ -85,6 +88,14 @@ T_WINDOW = _pw(
     (_cn(2), f"<apply><and/>{_rel('gt', T, _cn(1))}{_rel('lt', T, _cn(3))}</apply>"),
     otherwise=_cn(1),
 )
+# no otherwise: `t < 2` and `t >= 2` flip at one root
+T_NO_OTHERWISE = _pw((_plus(_cn(1), T), _rel("lt", T, _cn(2))), (_cn(5), _rel("geq", T, _cn(2))))
+S_NO_OTHERWISE = _pw(
+    (_plus(_cn(1), _times(_cn(0.1), _ci("S"))), _rel("gt", _ci("S"), _cn(3))),
+    (_plus(_cn(1), _times(_cn(0.2), _ci("S"))), _rel("leq", _ci("S"), _cn(3))),
+)
+# no piece at t = 2.1 itself; the jump's rescale divided by the 0 read there
+T_GAP = _pw((_cn(1), _rel("lt", T, _cn(2.1))), (_cn(5), _rel("gt", T, _cn(2.1))))
 # continuous at its switch: 1 + t meets 3 at t = 2
 T_CONTINUOUS = _pw((_plus(_cn(1), T), _rel("lt", T, _cn(2))), otherwise=_cn(3))
 STEP_FN = (
@@ -122,6 +133,19 @@ CASES = {
         _doc([("cv", f"<apply><ci>step</ci>{T}</apply>")], functions=STEP_FN),
         lambda t: 5 / np.where(t < 2, 1 + t, 5),
     ),
+    # each pair is one jump, not two rescales at the instant
+    "with no otherwise, on time": (
+        _doc([("cv", T_NO_OTHERWISE)]),
+        lambda t: 5 / np.where(t < 2, 1 + t, 5),
+    ),
+    "with no otherwise, on a species": (
+        _doc([("cv", S_NO_OTHERWISE)]),
+        lambda t: 10 / np.where(_s(t) > 3, 1 + 0.1 * _s(t), 1 + 0.2 * _s(t)),
+    ),
+    "with no piece at the switch": (
+        _doc([("cv", T_GAP)]),
+        lambda t: 5 / np.where(t < 2.1, 1, 5),
+    ),
     # control: no jump, so nothing to rescale
     "continuous (control)": (
         _doc([("cv", T_CONTINUOUS)]),
@@ -140,6 +164,34 @@ def test_the_amount_is_kept_across_the_jump(case, codegen):
     t = np.asarray(result.time)
     sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
     np.testing.assert_allclose(sn, closed_form(t), rtol=1e-5, atol=1e-8)
+
+
+def _set_sn_at_2(priority):
+    return (
+        '<event id="e" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true"><math {M}>'
+        f"{_rel('geq', T, _cn(2))}</math></trigger>"
+        + (f"<priority><math {M}>{_cn(priority)}</math></priority>" if priority else "")
+        + f'<listOfEventAssignments><eventAssignment variable="Sn"><math {M}>{_cn(10)}'
+        "</math></eventAssignment></listOfEventAssignments></event>"
+    )
+
+
+@pytest.mark.parametrize("priority", [None, 5], ids=["no priority", "a priority"])
+def test_an_event_at_the_jump_keeps_the_concentration_it_sets(priority):
+    """``at (t >= 2): Sn = 10`` fires where ``cv := piecewise(1 + t, t < 2,
+    5)`` jumps. Sn is 10 after, the concentration the event sets in the
+    compartment as it is then; the jump's rescale of Sn from before the instant
+    overwrote it whenever it ran second, by the priority or the draw between
+    equal ones."""
+    xml = _doc([("cv", T_STEP)], events=_set_sn_at_2(priority))
+    for seed in range(4):
+        result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+            t_span=(0.0, 4.0), n_points=17, seed=seed
+        )
+        t = np.asarray(result.time)
+        sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+        np.testing.assert_allclose(sn, np.where(t < 2, 5 / (1 + t), 10), rtol=1e-5, atol=1e-8)
 
 
 def test_a_condition_an_event_also_moves_is_refused():
