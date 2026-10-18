@@ -295,7 +295,9 @@ def _monotone_pieces(atom: str) -> list[str]:
     root is one. A bound that is a number must be above 0: at or below it the
     atom holds at one point or nowhere, its edges would be restarts at
     crossings that switch nothing (two of them on one surface, at 0), and it is
-    rooted whole as before. ``[]`` for any other atom. Parentheses around the
+    rooted whole as before. So is ``trig > abs(-1)``, whose ``abs()`` reads no
+    name and so does not turn: its edges would put a restart at ``trig = -1``,
+    where nothing switches. ``[]`` for any other atom. Parentheses around the
     whole atom are read through: the SBML loader writes ``(abs((A-5))<0.01)``.
     """
     split = _relational_split_op(_strip_redundant_parens(atom))
@@ -310,6 +312,8 @@ def _monotone_pieces(atom: str) -> list[str]:
     if side is None or _turning_side(bound) is not None:
         return []
     kind, inner = side
+    if not _IDENTIFIER.search(inner):
+        return []
     try:
         value: float | None = float(_strip_redundant_parens(bound.strip()))
     except ValueError:

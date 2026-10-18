@@ -134,6 +134,8 @@ def test_the_pieces_of_a_turning_comparison(atom, pieces):
         "A^2.5<1",  # not a square
         "(A-5)^2+(B-5)^2<1",  # a sum: only its last group is squared
         "(A-5)*(B)^2<4",  # a product: likewise
+        "trig>abs(-1)",  # an abs() of a number does not turn
+        "(2-5)^2<1",  # nor does a square of one
     ],
 )
 def test_other_comparisons_are_left_as_they_are(atom):
