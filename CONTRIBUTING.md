@@ -237,6 +237,14 @@ push, run via `uv run`) with:
 uv run pre-commit install
 ```
 
+The push hook runs the whole suite on every core through pytest-xdist, one test
+file per worker (`ci/pre_push_pytest.py`). That takes about five minutes where a
+serial run takes about 45. `BNGSIM_PREPUSH_WORKERS=4 git push` caps the workers,
+and `BNGSIM_PREPUSH_WORKERS=0` runs the suite serially in one process, for a
+failure that might depend on what ran before it. A venv synced before
+pytest-xdist joined the `test` extra falls back to the serial run and says so;
+`uv sync --extra dev` (plus any groups you use) brings it in.
+
 ### The suite's artifact caches are its own
 
 A pytest session redirects both of bngsim's content-addressed caches — compiled
