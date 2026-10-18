@@ -1350,10 +1350,13 @@ _S1_TO_S2 = (
 )
 
 
-def _conc_species(sid: str, conc: float, extra: str = "") -> str:
+def _conc_species(
+    sid: str, conc: float, extra: str = "", *, boundary: str = "false", constant: str = "false"
+) -> str:
     return (
         f'<species id="{sid}" compartment="C" initialConcentration="{conc}" '
-        f'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"{extra}/>'
+        f'hasOnlySubstanceUnits="false" boundaryCondition="{boundary}" '
+        f'constant="{constant}"{extra}/>'
     )
 
 
@@ -1378,6 +1381,8 @@ def _folded(*, comp, species, rxns, params="", rules="", model_attr="", feed=Fal
 
 _UNIT_C = '<compartment id="C" size="1" constant="true"/>'
 _CF = '<parameter id="cf" value="2" constant="true"/>'
+_GROWING_C = '<compartment id="C" size="2" constant="false"/>'
+_GROWS = f'<rateRule variable="C"><math {_MATHML}><cn>0.5</cn></math></rateRule>'
 
 _FOLDS = {
     # 01405 with its rule an initialAssignment: 2 * (-0.1 * 5)
@@ -1403,9 +1408,9 @@ _FOLDS = {
     # 01822 with its rule an initialAssignment: 2/2 - 1.3 * 0.5/2
     "rate-ruled compartment": (
         dict(
-            comp='<compartment id="C" size="2" constant="false"/>',
+            comp=_GROWING_C,
             species=_conc_species("S1", 1.3),
-            rules=f'<rateRule variable="C"><math {_MATHML}><cn>0.5</cn></math></rateRule>',
+            rules=_GROWS,
             rxns=(
                 '<reaction id="J0" reversible="false"><listOfProducts>'
                 '<speciesReference species="S1" stoichiometry="1" constant="true"/>'
@@ -1415,14 +1420,37 @@ _FOLDS = {
         ),
         0.675,
     ),
+    # Reactions do not move a boundary or constant species, so its amount holds
+    # as the size grows (01117/01118) and its concentration falls: -1.3 * 0.5/2.
+    "boundary species in a rate-ruled compartment": (
+        dict(
+            comp=_GROWING_C,
+            species=_conc_species("S1", 1.3, boundary="true") + _conc_species("S2", 0),
+            rules=_GROWS,
+            rxns=_S1_TO_S2,
+        ),
+        -0.325,
+    ),
+    "constant species in a rate-ruled compartment": (
+        dict(
+            comp=_GROWING_C,
+            species=_conc_species("S1", 1.3, constant="true"),
+            rules=_GROWS,
+            rxns="",
+        ),
+        -0.325,
+    ),
 }
 
 
 @pytest.mark.parametrize("case", list(_FOLDS))
 def test_rateof_folded_into_an_initial_assignment_is_the_t0_rate(case):
     """Issue #738: the fold read neither conversion factor (-0.5 for -1) nor the
-    -[S]·V'/V dilution of a rate-ruled compartment (1 for 0.675). The values
-    are the SBML suite's t = 0 rateOf for 01405 and 01822."""
+    -[S]·V'/V dilution of a rate-ruled compartment (1 for 0.675, and 0 for
+    -0.325 where the species is boundary or constant). The values are the SBML
+    suite's t = 0 rateOf for 01405 and 01822, and for the held species the run's
+    own rateOf, the slope of its [S1] = 2.6/(2 + 0.5·t). RoadRunner reports 0
+    for those, though its own [S1] falls at that rate."""
     kw, want = _FOLDS[case]
     model = bngsim.Model.from_sbml_string(_folded(**kw))
     assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
@@ -1438,3 +1466,59 @@ def test_a_folded_rateof_feeds_a_rate_rule_with_its_conversion_factor():
     names = [*run.observable_names, *run.expression_names]
     values = np.hstack([np.asarray(run.observables), np.asarray(run.expressions)])
     assert values[-1, names.index("Y")] == pytest.approx(want, rel=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [("J0: -> S1; 2", 0.675), ("$S1 = s0", -0.325)],
+    ids=["reaction", "boundary"],
+)
+def test_a_folded_dilution_freezes_the_size_rate_and_the_value_it_read(source, want):
+    """The dilution term reads the compartment's rate rule and the species'
+    own value: under ``C' = g`` and ``S1 = s0`` a write to ``g`` or ``s0`` was
+    taken and left ``P0`` where it was (0.675, where a rebuild after ``g = 1``
+    gives 0.35), so both are refused like the kinetic laws' parameters."""
+    model = bngsim.Model.from_antimony_string(
+        "g = 0.5; s0 = 1.3; compartment C = 2; C' = g; species S1 in C; S1 = s0\n"
+        f"{source}\nP0 = rateOf(S1); const P0\n"
+    )
+    assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
+    assert sorted(model.frozen_params) == ["g", "s0"]
+    with pytest.raises(bngsim.ParameterError, match="initial value of 'P0'"):
+        model.set_param("g", 1.0)
+
+
+@pytest.mark.parametrize("global_k", ["", '<parameter id="k" value="100"/>'])
+def test_a_folded_rateof_reads_a_level_2_kinetic_law_local_parameter(global_k):
+    """Issue #738's third gap: libsbml lists an L2 law's local parameters only
+    under getParameter, and a fold that asked getNumLocalParameters alone read a
+    global k = 100 (-100) or none (NaN) for the local k = 3. Closed by #580's
+    level-aware helper; this pins the rateOf fold through it: -3 * [S] with [S] = 1."""
+    doc = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+  <model id="m">
+    <listOfFunctionDefinitions>
+      <functionDefinition id="rateOf">
+        <math {_MATHML}><lambda><bvar><ci>a</ci></bvar><notanumber/></lambda></math>
+      </functionDefinition>
+    </listOfFunctionDefinitions>
+    <listOfCompartments><compartment id="c" size="1"/></listOfCompartments>
+    <listOfSpecies><species id="S" compartment="c" initialConcentration="1"/></listOfSpecies>
+    <listOfParameters>{global_k}<parameter id="p" value="0"/></listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="p">
+        <math {_MATHML}><apply><ci>rateOf</ci><ci>S</ci></apply></math>
+      </initialAssignment>
+    </listOfInitialAssignments>
+    <listOfReactions>
+      <reaction id="R" reversible="false">
+        <listOfReactants><speciesReference species="S"/></listOfReactants>
+        <kineticLaw>
+          <math {_MATHML}><apply><times/><ci>k</ci><ci>S</ci></apply></math>
+          <listOfParameters><parameter id="k" value="3"/></listOfParameters>
+        </kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>"""
+    assert bngsim.Model.from_sbml_string(doc).get_param("p") == pytest.approx(-3.0, rel=1e-12)
