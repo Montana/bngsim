@@ -3981,14 +3981,19 @@ def _classify_mass_action_ast(
     # amount bookkeeping differs) stay refused (varvol_non_mass_action), and the §9
     # certification is guarded to IRREVERSIBLE only. Record the variable-volume
     # storage compartments so §9 can certify + correct the emitted reaction.
+    #
+    # (#745) An assignment-rule compartment moves too, and is routed the same
+    # way; it is left out of what §9 certifies for the SSA, which does not run
+    # an assignment-rule compartment.
     _storage_comps = {species_comp[s] for s in rxn_species}
     _varvol_storage = _storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+    _ar_storage = _storage_comps & set(assignment_targets)
     if (
         len(_storage_comps) > 1
-        and _varvol_storage
+        and (_varvol_storage or _ar_storage)
         and all(not species_hosu.get(s, False) for s in rxn_species)
     ):
-        if varvol_reject is not None:
+        if varvol_reject is not None and _varvol_storage:
             varvol_reject["xcomp_varvol_comps"] = sorted(_varvol_storage)
         return None
 
@@ -4055,7 +4060,14 @@ def _classify_mass_action_ast(
                 m for sid, m in species_multiset.items() if not species_hosu.get(sid, False)
             )
 
-    varvol_comp_ids = (set(rate_rule_targets) | set(event_promoted_params)) & comp_ids
+    # (#745) An assignment-rule compartment is a variable volume here as well:
+    # left out, a bare ``k*A`` in ``C := 2 + time`` stayed Elementary with
+    # V_static baked in and ran 36% off (BIOMD0000000342's TGF_beta_ex, 37%).
+    # _record_varvol_reject keeps to rate-rule and event compartments, which
+    # are the ones the SSA correction it feeds is for.
+    varvol_comp_ids = (
+        set(rate_rule_targets) | set(event_promoted_params) | set(assignment_targets)
+    ) & comp_ids
     if varvol_comp_ids:
         if all(not species_hosu.get(s, False) for s in rxn_species):
             storage_comps = {species_comp[s] for s in rxn_species}
