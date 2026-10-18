@@ -112,6 +112,8 @@ def test_each_edge_is_read_by_the_reaction_that_reads_the_window(tmp_path, cond)
         ("abs(Aobs-c)<=w", ["(Aobs-c)<(w)", "(Aobs-c)>(-(w))"]),
         ("(Aobs-5)^2<0.0001", ["(Aobs-5)<(0.01)", "(Aobs-5)>(-0.01)"]),
         ("Aobs^2>4", ["(Aobs)<(2.0)", "(Aobs)>(-2.0)"]),
+        # as the SBML loader writes a condition
+        ("(abs((A-5))<0.01)", ["((A-5))<(0.01)", "((A-5))>(-(0.01))"]),
     ],
 )
 def test_the_pieces_of_a_turning_comparison(atom, pieces):
@@ -132,6 +134,8 @@ def test_the_pieces_of_a_turning_comparison(atom, pieces):
         "A^2.5<1",  # not a square
         "(A-5)^2+(B-5)^2<1",  # a sum: only its last group is squared
         "(A-5)*(B)^2<4",  # a product: likewise
+        "trig>abs(-1)",  # an abs() of a number does not turn
+        "(2-5)^2<1",  # nor does a square of one
     ],
 )
 def test_other_comparisons_are_left_as_they_are(atom):
@@ -189,8 +193,16 @@ def test_a_sum_of_squares_keeps_its_own_root(tmp_path):
     assert d_k == pytest.approx(10 - t_star, rel=1e-6)
 
 
-def _sbml_window(tmp_path, condition: str) -> str:
-    """A = 2t and Y' = piecewise(k, condition, 0), as an SBML document."""
+def _sbml_window(
+    tmp_path,
+    condition: str | None = None,
+    *,
+    trigger: str | None = None,
+    rules: dict[str, str] | None = None,
+) -> str:
+    """A = 2t as an SBML document, with Y' = piecewise(k, condition, 0), or
+    with an event on *trigger* that adds 1 to Y and writes the time to T.
+    *rules* are parameters set by assignment rules, by name."""
     import libsbml
 
     doc = libsbml.SBMLDocument(3, 1)
@@ -200,7 +212,7 @@ def _sbml_window(tmp_path, condition: str) -> str:
     comp.setId("C")
     comp.setSize(1)
     comp.setConstant(True)
-    for sid in ("A", "Y"):
+    for sid in ("A", "Y", "T"):
         sp = model.createSpecies()
         sp.setId(sid)
         sp.setCompartment("C")
@@ -212,7 +224,17 @@ def _sbml_window(tmp_path, condition: str) -> str:
     k.setId("k")
     k.setValue(10)
     k.setConstant(True)
-    for rid, product, law in (("R1", "A", "2"), ("R2", "Y", f"piecewise(k, {condition}, 0)")):
+    for name, formula in (rules or {}).items():
+        param = model.createParameter()
+        param.setId(name)
+        param.setConstant(False)
+        rule = model.createAssignmentRule()
+        rule.setVariable(name)
+        rule.setMath(libsbml.parseL3Formula(formula))
+    laws = [("R1", "A", "2")]
+    if condition is not None:
+        laws.append(("R2", "Y", f"piecewise(k, {condition}, 0)"))
+    for rid, product, law in laws:
         rxn = model.createReaction()
         rxn.setId(rid)
         rxn.setReversible(False)
@@ -221,6 +243,18 @@ def _sbml_window(tmp_path, condition: str) -> str:
         ref.setStoichiometry(1)
         ref.setConstant(True)
         rxn.createKineticLaw().setMath(libsbml.parseL3Formula(law))
+    if trigger is not None:
+        event = model.createEvent()
+        event.setId("E")
+        event.setUseValuesFromTriggerTime(True)
+        when = event.createTrigger()
+        when.setMath(libsbml.parseL3Formula(trigger))
+        when.setInitialValue(False)
+        when.setPersistent(True)
+        for target, value in (("Y", "Y + 1"), ("T", "time")):
+            assignment = event.createEventAssignment()
+            assignment.setVariable(target)
+            assignment.setMath(libsbml.parseL3Formula(value))
     path = tmp_path / "window.xml"
     path.write_text(libsbml.writeSBMLToString(doc))
     return str(path)
@@ -228,17 +262,78 @@ def _sbml_window(tmp_path, condition: str) -> str:
 
 @pytest.mark.parametrize("rtol", [1e-6, 1e-10])
 @pytest.mark.parametrize(
-    "condition", ["abs(A - 5) < 0.01", "pow(A - 5, 2) < 0.0001"], ids=["abs", "pow"]
+    "condition",
+    ["abs(A - 5) < 0.01", "pow(A - 5, 2) < 0.0001", "abs(time - 2.5) < 0.005"],
+    ids=["abs", "pow", "abs-of-time"],
 )
 def test_an_sbml_kinetic_law_spelled_so_is_not_stepped_over(tmp_path, condition, rtol):
-    """The SBML loader roots the whole comparison, which turns within the step
-    as the ``.net`` one does; the run roots its edges as well."""
-    model = bngsim.Model.from_sbml(_sbml_window(tmp_path, condition))
-    run = bngsim.Simulator(model, method="ode").run(
+    """The SBML loader registers the comparison's two edges, so the run has a
+    root or a stop at each and roots nothing besides. It registered the whole
+    comparison, which turns within the step as the ``.net`` one does; on time,
+    the scan that recovers clock conditions then found the whole one again
+    beside its edges."""
+    path = _sbml_window(tmp_path, condition)
+    model = bngsim.Model.from_sbml(path)
+    covered = model.time_discontinuity_conditions()
+    assert len(covered) == 2
+    assert all("abs" not in c and "^" not in c for c in covered)
+    assert model.state_switch_root_conditions() == ()
+    run = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
         t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
     )
     y = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))["Y"]
     assert y == pytest.approx(0.1, rel=1e-5)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+def test_a_square_against_a_rule_bound_keeps_the_rate_laws_edges(tmp_path, rtol):
+    """The loader cannot split ``(A - 5)^2 < w``: ``w`` is no number in its
+    text, so it registers the whole comparison, whose root never fires. The
+    rate-law scan writes ``w := 0.0001`` in and roots the edges. Read as
+    covering those edges, the whole one left the window stepped over: Y = 0."""
+    path = _sbml_window(tmp_path, "(A - 5)^2 < w", rules={"w": "0.0001"})
+    roots = bngsim.Model.from_sbml(path).state_switch_root_conditions()
+    assert roots == ("(A-5)<(0.01)", "(A-5)>(-0.01)")
+    run = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
+        t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
+    )
+    y = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))["Y"]
+    assert y == pytest.approx(0.1, rel=1e-5)
+
+
+def _fired(tmp_path, trigger: str, rtol: float) -> tuple[float, float]:
+    """How often the event on *trigger* fired by t = 10, and when it last did."""
+    model = bngsim.Model.from_sbml(_sbml_window(tmp_path, trigger=trigger))
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
+    )
+    last = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))
+    return float(last["Y"]), float(last["T"])
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+@pytest.mark.parametrize(
+    "trigger",
+    ["abs(A - 5) < 0.01", "0.01 > abs(A - 5)", "(A - 5)^2 < 0.0001", "pow(A - 5, 2) < 0.0001"],
+    ids=["abs", "abs-reversed", "square", "pow"],
+)
+def test_an_sbml_event_on_a_turning_trigger_fires(tmp_path, trigger, rtol):
+    """The trigger holds while 4.99 < A < 5.01, from t = 2.495. Rooted whole,
+    it is false at both ends of the step that passes A = 5, and the event
+    never fired: Y = 0 at both tolerances, where ``(A > 4.99) && (A < 5.01)``
+    fired."""
+    y, fired_at = _fired(tmp_path, trigger, rtol)
+    assert y == 1.0
+    assert fired_at == pytest.approx(2.495, rel=1e-6)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+def test_an_sbml_event_outside_a_window_fires_again_after_it(tmp_path, rtol):
+    """``abs(A - 5) > 0.01`` holds at the start and fires there, is false only
+    while A passes 5, and fires again at t = 2.505. It fired once."""
+    y, fired_at = _fired(tmp_path, "abs(A - 5) > 0.01", rtol)
+    assert y == 2.0
+    assert fired_at == pytest.approx(2.505, rel=1e-6)
 
 
 COUNTER = """begin parameters
@@ -284,3 +379,19 @@ def test_an_abs_window_on_a_counter_whose_edges_a_column_moves_is_refused(tmp_pa
     run = sim.run(t_span=(0.0, 10.0), n_points=2, rtol=1e-8, atol=1e-12)
     assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(1.0, rel=1e-6)
     assert float(np.asarray(run.sensitivities)[-1, 1, 0]) == pytest.approx(0.1, rel=1e-6)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+def test_a_counters_window_is_stopped_on_and_not_rooted_as_well(tmp_path, rtol):
+    """A counter's ``abs(Aobs-c) < 0.01`` is a condition on time, and the run
+    stops at both of its edges. Its edges were rooted as well, a second
+    restart at each stop. Y = k*c*0.02 = 1."""
+    path = tmp_path / "counter.net"
+    path.write_text(COUNTER)
+    model = bngsim.Model.from_net(str(path))
+    assert model.time_discontinuity_conditions() == ("abs(Aobs-c)<0.01",)
+    assert model.state_switch_root_conditions() == ()
+    run = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").run(
+        t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
+    )
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(1.0, rel=1e-4)
