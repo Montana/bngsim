@@ -3013,7 +3013,9 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     """The names each assignment rule reads, by variable, and the variables whose
     value moves during a run: one that reads the clock, a species, a rate-rule or
     event target, or another moving rule's variable. A rule over constants
-    (``C := 2``, ``C := p``) holds its value."""
+    (``C := 2``, ``C := p``) holds its value. A concentration moves with its
+    compartment's size, so a constant species is a constant only in a
+    compartment whose size holds."""
     reads: dict[str, set[str]] = {}
     moving: set[str] = set()
     rate_vars = set()
@@ -3038,9 +3040,22 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
         for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
         if not sp.getConstant() and not sp.getBoundaryCondition()
     }
+    # A resize keeps a species' amount, so the concentration of a constant or
+    # boundary species moves with its compartment's size, though nothing names
+    # it. `cv := 1 + 0.1*Kw` with Kw constant in `ce` was taken for still across
+    # an event `ce = 2`, and SSA ran cv's reactions at its load-time size.
+    conc_comp = {
+        sp.getId(): sp.getCompartment()
+        for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
+        if not sp.getHasOnlySubstanceUnits()
+    }
     changed = True
     while changed:  # to the fixed point: a rule over a moving rule moves
         changed = False
+        for sid, comp in conc_comp.items():
+            if sid not in sources and (comp in sources or comp in moving):
+                sources.add(sid)
+                changed = True
         for var, names in reads.items():
             if var not in moving and (names & sources or names & moving):
                 moving.add(var)
