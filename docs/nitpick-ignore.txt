@@ -63,13 +63,3 @@ py:func bngsim.convert.parse_bngl_protocol
 py:func bngsim.convert.sbml_to_net
 py:func net_to_sbml
 py:func bngsim.jax.differentiable_solve
-
-# Broken before the check existed. Fix the docstring, then delete the line.
-# Model has no param_expressions attribute (set_param, param_is_expression).
-py:attr param_expressions
-# CouplingMap.from_model means Model.species_names.
-py:attr species_names
-# get_compartment_volume means the UnitConverter method.
-py:meth from_concentrations
-# DiscreteExchange names a function that no longer exists.
-py:func round_initial_population_to_storage
