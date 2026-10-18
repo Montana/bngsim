@@ -460,3 +460,52 @@ def test_past_z_minus_700_with_b_minus_a_near_the_smallest_double_is_refused(tmp
     only for b - a below about 1e-290."""
     with pytest.raises(Exception, match=r"not reliable.*#1080"):
         _value(tmp_path, 0.0, 1e-300, -710.0)
+
+
+# ── Issue #1080: a b below about 1e-22, wherever the fraction is trusted ─────
+
+# a, b, z, what the fraction returned, and the ratio (mpmath at 80 digits and
+# more, hyp1f1 directly and after Kummer's transformation, which agree). The
+# fraction starts from tiny = 1e-32 in place of zero, so its first C stands for
+# infinity and the next is 1 + p_2/C_1, which should be exactly 1. Taken
+# literally it is 1 + p_2*1e-32, with p_2 = z*(a-b)/(b*(b+1)), and a tiny b makes
+# that anything at all. One row per clause it reached: a <= 0 with z <= 0 (near
+# and past z = -20), a negative integer, whose fraction terminates and was still
+# 7e-7 off, and |z| <= 20 with each sign of z. The last has p_2 just under the
+# largest double, where the ratio is itself near the smallest normal one.
+WAS_OFF_1080_TINY_B = [
+    (
+        -4.119676222070549,
+        2.4225094582386945e-279,
+        -1.4540899212539904,
+        9.999999999999999e-33,
+        8.515249528874852e-280,
+    ),
+    (
+        -3.689525822973658,
+        5.126352093327822e-300,
+        -491.8281574812038,
+        1e-32,
+        1.0366673205419992e-302,
+    ),
+    (-3.0, 1e-25, 10.0, -1.347825086956521e-26, -1.3478260869565218e-26),
+    (-20.0, 1e-200, 15.0, 1e-32, -3.8469703304037625e-202),
+    (2.5, 1e-25, 10.0, 4.884009591187713e-26, 4.884008591187709e-26),
+    (12.0, 1e-100, -5.0, 9.999999999999999e-33, 7.757425751152755e-102),
+    (
+        8.48517191235676,
+        3.06959761947884e-309,
+        -0.05844426302774795,
+        9.999999999999999e-33,
+        -4.331194060173115e-309,
+    ),
+]
+
+
+@pytest.mark.parametrize("a, b, z, old, true_value", WAS_OFF_1080_TINY_B)
+def test_a_tiny_b_no_longer_leaks_through_the_fractions_start(tmp_path, a, b, z, old, true_value):
+    """The step after the first now takes C_2 = 1. For |p_2| below 5.5e15,
+    1 + p_2*1e-32 already rounded to 1, so no other argument changes by a bit;
+    BNG's never come near, since they have b >= 1."""
+    assert abs(old - true_value) / abs(true_value) > 1e-8
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)

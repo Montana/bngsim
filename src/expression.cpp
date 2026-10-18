@@ -753,7 +753,19 @@ double expr_compat::mratio(double a, double b, double z) {
         if (std::abs(D) < tiny) {
             D = tiny;
         }
-        double C = q + p / Csave;
+        // C_1 = 1 + 1/tiny stands for infinity, so the step after it is
+        // C_2 = 1 exactly. Taking p/C_1 literally added p*1e-32, with
+        // p_2 = z*(a-b)/(b*(b+1)), and a b below about 1e-22 makes that
+        // anything at all: mratio(-4.12, 2.4e-279, -1.45) returned 1e-32, the
+        // floor, where the ratio is 8.5e-280 (issue #1080). While |p_2| is
+        // below 5.5e15, 1 + p*1e-32 rounds to 1, so nothing there changes by a
+        // bit; for BNG's arguments (b >= 1) passing it takes an equilibrium
+        // constant below 1e-16 times the larger count, 1e-13 at a thousand
+        // copies, and there it moves within rounding. A p_2 that overflowed
+        // keeps the old arithmetic, which makes the NaN it always made there.
+        // (Not mratio_is_finite, which stops at 1e308: a p_2 just under the
+        // largest double is a ratio near 1e-308, which still wants this step.)
+        double C = (j == 2 && std::abs(p) <= 1.7976931348623157e308) ? q : q + p / Csave;
         if (std::abs(C) < tiny) {
             C = tiny;
         }

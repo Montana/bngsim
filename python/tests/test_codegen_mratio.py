@@ -318,3 +318,29 @@ def test_past_z_minus_20_both_engines_match_the_reference(tmp_path, codegen, a, 
         result = sim.run(t_span=(0.0, 1.0), n_points=3)
     assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
     assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-11, abs=0.0)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "compiled"])
+@pytest.mark.parametrize(
+    "a, b, z, true_value",
+    [
+        # mpmath at 80 digits and more. The fraction returned 1e-32 at the
+        # first and was 1.2e-6 and 2.1e-7 off at the other two.
+        (-4.119676222070549, 2.4225094582386945e-279, -1.4540899212539904, 8.515249528874852e-280),
+        (-3.0, 1e-25, -10.0, 8.55421686746988e-27),
+        (2.5, 1e-25, 10.0, 4.884008591187709e-26),
+    ],
+    ids=["a <= 0, z <= 0", "a negative integer", "|z| <= 20, z > 0"],
+)
+def test_a_tiny_b_both_engines_match_the_reference(tmp_path, codegen, a, b, z, true_value):
+    """The same constant-rate check, for a b far below 1e-22 with b - a >= 1,
+    where the fraction itself answers and its second step is now exactly 1
+    (issue #1080). This runs the compiled copy of that step."""
+    p = tmp_path / "m1080c.net"
+    p.write_text(CONSTANT_RATE_NET.format(a=a, b=b, z=z, scale=1.0 / true_value))
+    with contextlib.redirect_stderr(io.StringIO()):
+        model = bngsim.Model.from_net(str(p))
+        sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+        result = sim.run(t_span=(0.0, 1.0), n_points=3)
+    assert sim.codegen_backend in (("cc", "mir") if codegen else ("exprtk",))
+    assert float(result.species[-1][0]) == pytest.approx(1.0, rel=1e-11, abs=0.0)
