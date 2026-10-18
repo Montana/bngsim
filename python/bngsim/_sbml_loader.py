@@ -8873,7 +8873,11 @@ def _build_model_from_sbml_doc_in_context(doc):
             # rescale (which preserves the *amount* by changing the stored
             # *concentration*) must not run. Every real event assignment applies
             # in both modes. Empty/all-False ⇒ byte-identical for non-resize
-            # events.
+            # events. A rate-rule target is the exception among the rescales: it
+            # is no count (issue #718), and its slot holds the rule's
+            # concentration under SSA as under ODE, so its rescale applies in
+            # both. Skipped under SSA, its amount changed with the size: [S]
+            # 0.733 for 0.867 a step after `c = 3`.
             assignment_ode_only = [False] * len(assignments)
             # (#936) Each rescale's (assignment index, compartment size, index of
             # the event's own assignment to the species or -1): the engine stores
@@ -8883,6 +8887,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rescale_meta: list[tuple[int, str, int]] = []
             if resized_comps:
                 explicitly_assigned = {sp_i for sp_i, _ in assignments}
+                n_own = len(assignments)
                 for comp_id, new_size_expr in resized_comps:
                     comp_safe = _safe_name(comp_id)
                     for sid, scomp in species_comp.items():
@@ -8893,7 +8898,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                         if sid in assignment_targets:
                             continue
                         sp_i = species_idx[sid]
-                        if comp_id in ar_comp_targets:
+                        ode_only = sid not in rate_rule_targets
+                        # A rate-rule target's amount is reported through the
+                        # rule-target map (#728), which reads its column as a
+                        # concentration under every method; the dilution map
+                        # reads it as a count under SSA.
+                        if comp_id in ar_comp_targets and ode_only:
                             ar_dilution_species.add(sid)
                         if sp_i in explicit_species_assignment_expr:
                             # Simultaneous event semantics evaluate all RHS
@@ -8905,20 +8915,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                             value_expr = explicit_species_assignment_expr[sp_i]
                             rescale_expr = f"({value_expr}) * ({comp_safe}) / ({new_size_expr})"
                             base_idx = next(
-                                i
-                                for i, (j, _) in enumerate(assignments)
-                                if j == sp_i and not assignment_ode_only[i]
+                                i for i, (j, _) in enumerate(assignments[:n_own]) if j == sp_i
                             )
                             rescale_meta.append((len(assignments), comp_safe, base_idx))
                             assignments.append((sp_i, rescale_expr))
-                            assignment_ode_only.append(True)
+                            assignment_ode_only.append(ode_only)
                             continue
                         if sp_i in explicitly_assigned:
                             continue
                         rescale_expr = f"{_safe_name(sid)} * ({comp_safe}) / ({new_size_expr})"
                         rescale_meta.append((len(assignments), comp_safe, -1))
                         assignments.append((sp_i, rescale_expr))
-                        assignment_ode_only.append(True)
+                        assignment_ode_only.append(ode_only)
 
             if not assignments:
                 logger.warning(f"Event '{eid}': no valid assignments, skipping")
@@ -9626,8 +9634,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
     # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
     # under every method, so V_live(t) is all the report needs, read from the
-    # compartment's promoted-species column (a rate rule) or its expression
-    # column (an assignment rule).
+    # compartment's promoted-species column (a rate rule), its expression
+    # column (an assignment rule) or its observable column (an event resize; the
+    # event-resize map below leaves such a species to this one).
     varvol_target_amount_map: dict[str, tuple[str, str]] = {}
     for sid, cid in species_comp.items():
         if (
@@ -9640,6 +9649,8 @@ def _build_model_from_sbml_doc_in_context(doc):
             varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
         elif cid in ar_comp_targets:
             varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+        elif cid in event_resize_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("observable", _safe_name(cid))
     model._varvol_target_amount_map = varvol_target_amount_map
 
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
@@ -9665,9 +9676,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # emitted as an observable) and applies the factor method-by-method. Maps
     # species_safe → (comp_obs_name, V_static, hOSU). Empty (no-op) for every
     # model with no event-resized compartment.
+    #
+    # A concentration species that a rule sets is no count, and its column holds
+    # the rule's concentration under SSA too (its rescale is not ODE-only), so
+    # this map leaves it to the rule-target map above. Read as a count, `S := 3`
+    # reported [S] = 1 and S = 3 under SSA after `c = 3`, for 3 and 9.
     varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
     if event_resize_comps:
         for sid, cid in species_comp.items():
+            if _safe_name(sid) in varvol_target_amount_map:
+                continue
             if cid in event_resize_comps and sid in species_idx:
                 varvol_event_resize_map[_safe_name(sid)] = (
                     _safe_name(cid),
