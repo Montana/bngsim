@@ -9,15 +9,15 @@ name: nightly-parity
 #   job          reference                       corpus
 #   sbml         SBML Test Suite expected CSVs    1,824 semantic cases (pinned checkout)
 #                DSMTS analytic mean/sd           39 stochastic cases (committed)
-#   rr-ode       libRoadRunner                    1,006 of the 1,323 BioModels SBML: the
-#                                                 part a hosted runner can fetch (pinned, cached)
+#   rr-ode       libRoadRunner                    all 1,323 BioModels SBML (pinned,
+#                                                 sha256-checked, cached)
 #   bng-ode      BNG2.pl + run_network            592 committed BNGL ODE jobs, twice:
 #                                                 the ExprTk interpreter a .net runs by
 #                                                 default, and the compiled C path every
 #                                                 sensitivity run uses (#689/#699 lived
 #                                                 only there)
 #   bng-stoch    run_network SSA / NFsim          110 SSA + 235 NF committed BNGL jobs
-#   amici-sens   AMICI forward sensitivities      40 of the 50 curated BioModels x 2 methods
+#   amici-sens   AMICI forward sensitivities      48 of the 50 curated BioModels x 2 methods
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -88,12 +88,13 @@ jobs:
   # (~260 MB), so it is rebuilt from its pinned, sha256-checked sources on a cache
   # miss and restored from the cache otherwise.
   #
-  # CI covers the part of the corpus a hosted runner can fetch: the 992 models
-  # (SBML + SED-ML) from sys-bio/temp-biomodels on GitHub, plus the committed SBML
-  # overrides. The other 317 come only from EBI's BioModels REST API, which answers
-  # HTTP 403 to GitHub-hosted runners (every request, measured on this workflow's
-  # first run) while serving the same URLs elsewhere, so they are not requested
-  # here. The two consumers run whatever is present and the baseline records it.
+  # The whole corpus, 1,323 models: 992 (SBML + SED-ML) from sys-bio/temp-biomodels
+  # on GitHub, and the 331 whose SBML only BioModels serves, from bngsim's own copy
+  # (fetch_biomodels_mirror.py; one release asset, every file checked against the
+  # biomodels suite's provenance manifest), then the committed SBML overrides.
+  # BioModels itself is not asked: CloudFront refuses GitHub-hosted runners every
+  # request (issue #807, biomodels-probe.yml), and its dataset is CC0, so a copy is
+  # allowed. A missing model is a fetch failure.
   # ------------------------------------------------------------------------- #
   corpus:
     name: BioModels corpus
@@ -105,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: key
-        run: echo "key=rr-corpus-v2-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=rr-corpus-v3-${{ hashFiles('parity_checks/rr_parity/ode_jobs.json', 'parity_checks/rr_parity/temp_biomodels_manifest.json', 'parity_checks/rr_parity/fetch_biomodels_mirror.py', 'parity_checks/rr_parity/data/sbml_overrides/**') }}" >> "$GITHUB_OUTPUT"
 
       - id: cache
         uses: actions/cache/restore@v4
@@ -121,12 +122,13 @@ jobs:
           set -euo pipefail
           # SED-ML + SBML: sys-bio/temp-biomodels at the pinned commit, sha256-verified.
           python3 parity_checks/rr_parity/fetch_sedml.py --dest "$RUNNER_TEMP/sedml_source"
+          # SBML only BioModels serves: bngsim's pinned copy, sha256-verified.
+          python3 parity_checks/rr_parity/fetch_biomodels_mirror.py --dest "$RUNNER_TEMP/biomodels_sbml"
           python3 parity_checks/rr_parity/materialize.py \
             --sedml-dir "$RUNNER_TEMP/sedml_source/final" \
-            --sbml-dir "$RUNNER_TEMP/no-ebi-downloads"
+            --sbml-dir "$RUNNER_TEMP/biomodels_sbml"
 
-      # Every job whose SBML comes from temp-biomodels must be present; a shortfall
-      # there is a fetch failure, not the known EBI gap.
+      # Every job's SBML must be present; a shortfall is a fetch failure.
       - name: Check coverage
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -135,16 +137,13 @@ jobs:
           from pathlib import Path
           root = Path("parity_checks/rr_parity")
           jobs = json.loads((root / "ode_jobs.json").read_text())["jobs"]
-          present = [j for j in jobs if (root / j["model"]).is_file()]
-          tb_missing = [j["model_id"] for j in jobs
-                        if j.get("params", {}).get("sbml_origin") == "temp-biomodels"
-                        and not (root / j["model"]).is_file()]
-          msg = f"{len(present)}/{len(jobs)} manifest SBML files present ({len(jobs) - len(present)} are EBI-only)"
+          missing = [j["model_id"] for j in jobs if not (root / j["model"]).is_file()]
+          msg = f"{len(jobs) - len(missing)}/{len(jobs)} manifest SBML files present"
           print(msg)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"BioModels corpus: {msg}\n")
-          if tb_missing:
-              raise SystemExit(f"temp-biomodels models missing: {tb_missing[:10]}")
+          if missing:
+              raise SystemExit(f"models missing: {missing[:10]}")
           PY
 
       - name: Save the corpus cache
@@ -272,7 +271,7 @@ jobs:
       # --timeout 300 rather than the runner's 120 s: four models sit at 115-118 s on
       # an M1 Max (RoadRunner's JIT load dominates), and a timeout that flips with
       # runner speed would alert as a regression.
-      # Two passes. The dozen SBML files over 1 MB (up to 786 species) run on their
+      # Two passes. The 23 SBML files over 1 MB (up to 6,047 species) run on their
       # own: four of them at once, each auto-compiling ~20 MB of generated C in
       # parallel shards, killed the runner on the first run.
       - name: Select the models the corpus holds
@@ -285,7 +284,7 @@ jobs:
         run: uv run --no-sync python parity_checks/rr_parity/rr_run.py --workers 4 --timeout 300 --models "$(cat "$RUNNER_TEMP/light.txt")" --out "$RUNNER_TEMP/rr_ode.json" || true
       # The giants on the interpreted RHS: their auto-codegen compile alone runs past
       # the per-job cap on a 4-core runner, so with it they would only ever report
-      # TIMEOUT. These are the only fetchable models at or above the 256-species
+      # TIMEOUT. These are the only models at or above the 256-species
       # auto-codegen threshold (the light pass tops out at 194), so rr-ode does not
       # exercise SBML auto-codegen; compiled RHS code is covered by bng-ode's codegen
       # arm and by amici-sens, whose bngsim side always runs compiled.
