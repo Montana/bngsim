@@ -5126,6 +5126,49 @@ def _build_model_from_sbml_doc_in_context(doc):
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     } & _comp_id_set
 
+    # (#745) The assignment-rule compartments whose size can move during a run:
+    # their rule reads the time, a species, a rate-rule or event target, or a
+    # rateOf or delay, directly or through another assignment rule. One that
+    # reads constants alone holds its load-time size for the whole run, as a
+    # write to what it reads is refused.
+    _ar_rule_math = {
+        sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
+    }
+    _moving_ids = {sbml_model.getSpecies(j).getId() for j in range(sbml_model.getNumSpecies())}
+    _moving_ids |= {
+        sbml_model.getRule(j).getVariable()
+        for j in range(sbml_model.getNumRules())
+        if sbml_model.getRule(j).isRate()
+    }
+    _moving_ids |= {
+        sbml_model.getEvent(j).getEventAssignment(k).getVariable()
+        for j in range(sbml_model.getNumEvents())
+        for k in range(sbml_model.getEvent(j).getNumEventAssignments())
+    }
+    _moving_types = {
+        libsbml.AST_NAME_TIME,
+        libsbml.AST_FUNCTION_DELAY,
+        getattr(libsbml, "AST_FUNCTION_RATE_OF", -1),
+    }
+
+    def _rule_moves(var: str, seen: frozenset = frozenset()) -> bool:
+        if var in seen:
+            return True
+        for node in _iter_ast_subtree(_ar_rule_math[var]):
+            if node.getType() in _moving_types:
+                return True
+            if node.getType() == libsbml.AST_NAME:
+                name = node.getName()
+                if name in _moving_ids:
+                    return True
+                if name in _ar_rule_math and _rule_moves(name, seen | {var}):
+                    return True
+        return False
+
+    ar_comp_moving = {cid for cid in ar_comp_targets if _rule_moves(cid)}
+
     # (#86) Compartments driven by a RATE RULE — continuously variable volume
     # V(t). A concentration-valued (hOSU=false) species in such a compartment
     # needs an explicit dilution term ``-[S]·V̇/V`` in its concentration ODE
@@ -8484,6 +8527,36 @@ def _build_model_from_sbml_doc_in_context(doc):
             _ssa_ff = _ssa_falling_factorial_terms(rxn, species_idx, _ssa_ff_continuous)
             if _ssa_ff:
                 builder.set_reaction_ssa_falling_factorial(_xrxn_idx, _ssa_ff)
+            # (#745) The per-species divide above is by each species' load-time
+            # size. For a concentration in a compartment an assignment rule sizes
+            # the row is law/V_live; the engine has no state column for that size,
+            # so the difference is added as its own reaction on that species, as
+            # the §8c dilution is: net·law·(1/C - 1/V_static), with C the
+            # compartment's live symbol. The two rows sum to net·law/C, and the
+            # Jacobian and the sensitivities reach C through its rule as they do
+            # in any rate law. ODE only, as the SSA does not run such a
+            # compartment. BIOMD0000000342's re9 was 37% off without it. Only for
+            # a size that can move (ar_comp_moving): for one that cannot, the
+            # term is 0, and a reaction on one species would hide a conservation
+            # law the right-hand side keeps.
+            for _sid, _n in net.items():
+                _c = species_comp[_sid]
+                if _n == 0 or species_hosu.get(_sid, False) or _c not in ar_comp_moving:
+                    continue
+                _corr = f"_vd_{_safe_name(rid)}_{_safe_name(_sid)}_live"
+                builder.add_function(
+                    _corr,
+                    f"({float(_n) * _cf_i!r})*({base_func})"
+                    f"*(1.0/({_safe_name(_c)}) - 1.0/({float(comp_volumes.get(_c, 1.0))!r}))",
+                )
+                builder.add_reaction(
+                    [],
+                    [species_idx[_sid]],
+                    "functional",
+                    _corr,
+                    apply_species_factor=False,
+                    ode_only=True,
+                )
             # (#144 case 4) Cross-compartment variable-volume monomial certified by
             # the classifier (§7). The per-species emission above divides each
             # species's storage derivative by its *static* volume_factor, which is

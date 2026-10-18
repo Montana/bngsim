@@ -11,10 +11,11 @@ nothing said. A ``C*k*A`` law, whose power cancels, was right and still is.
 Each is checked against the SBML amount equations, amount' = law([S] = amount/V(t)),
 solved in closed form where they have one.
 
-Left open by this fix: a cross-compartment monomial with a species in the
-assignment-rule compartment (BIOMD0000000342's re9) is emitted per species, and
-the engine divides that species by its static size, as it has no state column to
-read the live one from.
+A cross-compartment law (BIOMD0000000342's re9) is emitted per species, and the
+engine divided a species in the assignment-rule compartment by its static size,
+having no state column to read the live one from. The difference to the live
+size is now added as its own reaction on that species, as the dilution is; the
+published 342 matches its rate-rule spelling where it was 37% off.
 """
 
 from __future__ import annotations
@@ -39,9 +40,9 @@ def _ci(x: str) -> str:
     return f"<ci>{x}</ci>"
 
 
-def _species(sid: str, amount: float) -> str:
+def _species(sid: str, amount: float, comp: str = "C") -> str:
     return (
-        f'<species id="{sid}" compartment="C" initialAmount="{amount}" '
+        f'<species id="{sid}" compartment="{comp}" initialAmount="{amount}" '
         'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
     )
 
@@ -59,15 +60,17 @@ def _reaction(reactants, products, law, reversible=False) -> str:
     )
 
 
-def _doc(species: str, reaction: str, params: str) -> str:
+def _doc(species: str, reaction: str, params: str, size: str | None = None) -> str:
+    size = size or _ap("plus", "<cn>2</cn>", TIME)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">
  <model id="m">
-  <listOfCompartments><compartment id="C" size="2" constant="false"/></listOfCompartments>
+  <listOfCompartments><compartment id="C" size="2" constant="false"/>
+   <compartment id="D" size="1" constant="true"/></listOfCompartments>
   <listOfSpecies>{species}</listOfSpecies>
   <listOfParameters>{params}</listOfParameters>
   <listOfRules><assignmentRule variable="C">
-   <math {MATHML}>{_ap("plus", "<cn>2</cn>", TIME)}</math></assignmentRule></listOfRules>
+   <math {MATHML}>{size}</math></assignmentRule></listOfRules>
   <listOfReactions>{reaction}</listOfReactions>
  </model>
 </sbml>"""
@@ -129,11 +132,29 @@ def _reversible():
     return xml, {"A": a[:, 0] / V, "B": a[:, 1] / V}
 
 
+def _cross_compartment():
+    # A in C (2 + t), B and P in D (size 1): the flux is k [A][B] in amount per time
+    law = _ap("times", _ci("k"), _ci("A"), _ci("B"))
+    xml = _doc(
+        _species("A", 4) + _species("B", 2, "D") + _species("P", 0, "D"),
+        _reaction(["A", "B"], ["P"], law),
+        _param("k", 0.5),
+    )
+
+    def rhs(t, y):
+        flux = 0.5 * (y[0] / (2 + t)) * y[1]
+        return [-flux, -flux, flux]
+
+    a = solve_ivp(rhs, (0, 4), [4, 2, 0], t_eval=T, rtol=1e-12, atol=1e-14).y
+    return xml, {"A": a[0] / V, "B": a[1], "P": a[2]}
+
+
 CASES = {
     "decay k*A": _decay,
     "zero-order ks": _synthesis,
     "k*A*B": _bimolecular,
     "reversible kf*A - kr*B": _reversible,
+    "cross-compartment k*A*B": _cross_compartment,
 }
 
 
@@ -152,3 +173,25 @@ def test_a_law_whose_power_cancels_is_unchanged():
     xml = _doc(_species("A", 4), _reaction(["A"], [], law), _param("k", 0.5))
     got = _run(xml, codegen=False)
     np.testing.assert_allclose(got["A"], 4.0 * np.exp(-0.5 * T) / V, rtol=1e-7)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+def test_a_cross_compartment_law_where_the_size_reads_a_species(codegen):
+    """C := 2 + P, with P made in D by the law: the size moves with the state,
+    and the live divide follows it through C's rule."""
+    law = _ap("times", _ci("k"), _ci("A"), _ci("B"))
+    xml = _doc(
+        _species("A", 4) + _species("B", 2, "D") + _species("P", 0, "D"),
+        _reaction(["A", "B"], ["P"], law),
+        _param("k", 0.5),
+        size=_ap("plus", "<cn>2</cn>", _ci("P")),
+    )
+
+    def rhs(t, y):
+        flux = 0.5 * (y[0] / (2 + y[2])) * y[1]
+        return [-flux, -flux, flux]
+
+    a = solve_ivp(rhs, (0, 4), [4, 2, 0], t_eval=T, rtol=1e-12, atol=1e-14).y
+    got = _run(xml, codegen)
+    np.testing.assert_allclose(got["A"], a[0] / (2 + a[2]), rtol=1e-7, atol=1e-12)
+    np.testing.assert_allclose(got["P"], a[2], rtol=1e-7, atol=1e-12)
