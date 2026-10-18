@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import os
 import shutil
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -599,6 +601,94 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     # own exit code, which is the more actionable one.
     if (undeclared or local_only) and exitstatus == 0:
         session.exitstatus = 1
+
+
+# ─── Shards: one CI leg's suite split across jobs ─────────────────────────────
+#
+# BNGSIM_TEST_SHARD=k/n (1-based) keeps the tests of the files in shard k of n
+# and deselects the rest. python-tests.yml runs each leg as two jobs this way,
+# and a job of its own sums the two summaries for the false-green guard.
+#
+# The split is by FILE, and it is decided here, on what pytest itself
+# collected, rather than from a file list handed to pytest: every collected
+# test is in exactly one shard by construction, so nothing can fall between
+# them. Within a job, xdist spreads the shard's tests over the cores.
+#
+# Files are dealt heaviest first onto the lighter shard, using the durations in
+# ci/test_durations.json (ci/test_durations.py rewrites it from junit XML). A
+# hash split instead left one shard 24% heavier. A file the table does not
+# list goes by a hash of its path, so a stale table costs balance, never
+# coverage.
+_SHARD_ENV = "BNGSIM_TEST_SHARD"
+_SHARD_DURATIONS = Path(__file__).resolve().parents[2] / "ci" / "test_durations.json"
+
+
+def _parse_shard(value: str) -> tuple[int, int]:
+    """``"k/n"`` to ``(k, n)``, or a usage error naming the variable."""
+    try:
+        k, n = (int(part) for part in value.split("/"))
+    except ValueError:
+        k = n = 0
+    if not (n >= 1 and 1 <= k <= n):
+        raise pytest.UsageError(f"{_SHARD_ENV}={value!r}: expected k/n with 1 <= k <= n")
+    return k, n
+
+
+def _assign_shards(files: list[str], durations: dict[str, float], n: int) -> dict[str, int]:
+    """Each file's 1-based shard: known files heaviest first onto the lightest
+    shard (ties to the lower index), unknown ones by CRC-32 of the path. A pure
+    function of its arguments, so every job and every xdist worker agrees."""
+    load = [0.0] * n
+    shard_of: dict[str, int] = {}
+    known = sorted((f for f in set(files) if f in durations), key=lambda f: (-durations[f], f))
+    for f in known:
+        i = min(range(n), key=lambda j: (load[j], j))
+        shard_of[f] = i + 1
+        load[i] += durations[f]
+    for f in files:
+        if f not in shard_of:
+            shard_of[f] = zlib.crc32(f.encode("utf-8")) % n + 1
+    return shard_of
+
+
+def _read_shard_durations() -> dict[str, float]:
+    try:
+        data = json.loads(_SHARD_DURATIONS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}  # balance falls back to the hash; coverage does not depend on it
+    return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # Taken out of the environment, not just read: the shard is this session's.
+    # A test that starts a pytest of its own (test_run_tests_sh.py counts what
+    # one collects) must see the whole suite, not inherit a slice of it. Each
+    # xdist worker collects for itself and has its own copy of the environment.
+    value = os.environ.pop(_SHARD_ENV, "").strip()
+    if not value:
+        return
+    k, n = _parse_shard(value)
+    file_of = {id(item): item.nodeid.split("::", 1)[0] for item in items}
+    shard_of = _assign_shards(sorted(set(file_of.values())), _read_shard_durations(), n)
+    keep = [item for item in items if shard_of[file_of[id(item)]] == k]
+    drop = [item for item in items if shard_of[file_of[id(item)]] != k]
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+    items[:] = keep
+
+
+@pytest.fixture(scope="session")
+def shards() -> SimpleNamespace:
+    """The shard split's internals, for ``test_ci_shards.py``; handed over as a
+    fixture for the reason ``skip_audit`` below is."""
+    return SimpleNamespace(
+        env=_SHARD_ENV,
+        durations_path=_SHARD_DURATIONS,
+        parse=_parse_shard,
+        assign=_assign_shards,
+        read_durations=_read_shard_durations,
+    )
 
 
 @pytest.fixture(scope="session")
