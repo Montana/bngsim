@@ -121,11 +121,12 @@ namespace bngsim {
 //
 // All of it for `b > 0` only (issue #768). The grids behind every clause had a
 // positive b, and with b negative and not an integer the fraction settles on a
-// false limit inside each of them: 21 of 200 triples wrong at a < 0 and z <= 0,
-// 28 of 200 at |z| <= 20, and 16 of 200 even where a is a negative integer and
-// the fraction terminates, out to the wrong sign (mratio(-22.52, -25.18, -12.00)
-// returned 2.853 where the ratio is -2.337). BNG builds b = |AT-BT| + 1, so no
-// model it writes has b <= 0.
+// false limit inside each of them: 21 of 200 triples wrong at a < 0 and z <= 0
+// (mratio(-22.52, -25.18, -12.00) came back positive where the ratio is
+// -2.337), 28 of 200 at |z| <= 20, and 16 of 200 even where a is a negative
+// integer and the fraction terminates, out to the wrong sign
+// (mratio(-20, -23.34, -10.87) returned 5.935 where the ratio is -2.073). BNG
+// builds b = |AT-BT| + 1, so no model it writes has b <= 0.
 //
 // Everything else is refused, unless the asymptotic route below can vouch for
 // an answer of its own. That still gives up cases the fraction would have got
@@ -497,9 +498,10 @@ std::string expr_compat::exact_literals(const std::string &expr) {
 // was 2.6e-13. Past the largest term, at k = z - b - 1, the terms fall faster
 // than geometrically, so a term below eps of the sum ends it. A sum past the
 // largest double is +inf, which is the ratio rounded; the non-finite warner
-// reports it as such. The cap is reached only with b past about 1e10 and z
-// near b, where the terms fall too slowly; the NaN then sends the call on to
-// the rule above, which refuses a = 0 with 2*z > b.
+// reports it as such. The cap is reached only with b past about 5e8 and z
+// near b, where the terms fall too slowly (b = 5e8 with z = b + 8.3e5 needs
+// 1.06e6 terms, and its ratio is a finite e^704); the NaN then sends the call
+// on to the rule above, which refuses a = 0 with 2*z > b.
 //
 // The inf and NaN tests are comparisons rather than isinf/isnan because the
 // generated copy has to spell them that way (see mratio_is_finite), and the two

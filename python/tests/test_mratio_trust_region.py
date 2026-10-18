@@ -243,6 +243,16 @@ def test_a_zero_past_the_largest_double_is_infinite(tmp_path):
     assert _value(tmp_path, 0.0, 1.0, 800.0) == float("inf")
 
 
+def test_a_zero_the_series_cannot_finish_is_refused(tmp_path):
+    """With b past about 5e8 and z near b the terms fall too slowly for the
+    series' million-term cap (here it would need 7.1e6). It gives up with a NaN
+    and the call goes on: the rule refuses a = 0 with 2*z > b, and the asymptotic
+    route refuses a = 0 outright. Were either to let it through, it would reach
+    the fraction at the a = 0 where it settles on a false limit."""
+    with pytest.raises(Exception, match=r"not reliable.*#768"):
+        _value(tmp_path, 0.0, 1e12, 1e12)
+
+
 ISSUE_768_NET = """begin parameters
     1 scale 9.643749239819589e-21
 end parameters
