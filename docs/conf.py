@@ -66,8 +66,7 @@ napoleon_use_ivar = True
 # -- cross-references --------------------------------------------------------
 # Warn on a reference that resolves to nothing, so `-W` fails on a :meth: that
 # names a renamed API (issue #586). nitpick-ignore.txt lists the references that
-# cannot resolve (words of a NumPy-style type, undocumented modules) and the
-# broken ones that predate the check.
+# cannot resolve (words of a NumPy-style type, undocumented modules).
 nitpicky = True
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nitpick-ignore.txt")) as f:
     nitpick_ignore = [

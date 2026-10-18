@@ -2488,13 +2488,32 @@ class Model:
         overrides the expression and flips its entry to ``False`` until the
         override is lifted (issue #188 — see :meth:`set_param`).
         :attr:`param_expressions` keeps the defining expression throughout, so
-        a non-empty expression paired with ``False`` here is exactly an
-        overridden derived parameter, as distinct from a genuine primary. That
-        pairing is also the whole of what the generated C source depends on:
-        an override moves the chain rule, and nothing else about a parameter
-        write does.
+        an entry that is ``False`` here while its expression there names
+        another of the model's symbols is exactly an overridden derived
+        parameter, as distinct from a genuine primary, whose text is a number
+        (``2e7``, ``1/7``) or empty. That pairing is also the whole of what the
+        generated C source depends on: an override moves the chain rule, and
+        nothing else about a parameter write does.
         """
         return list(self._core.param_is_expression)
+
+    @property
+    def param_expressions(self) -> list[str]:
+        """Per-parameter defining text, parallel to :attr:`param_names`.
+
+        For a derived parameter (:attr:`param_is_expression`), the expression it
+        is re-evaluated from, such as ``1/S0``. It stays on record while a
+        :meth:`set_param` override pins the parameter to a literal, which is how
+        an overridden derived parameter is told from a genuine primary.
+
+        Anything else has a number or nothing here: a primary read from a
+        ``.net`` file keeps its value as the file wrote it (``2e7``, ``1/7``),
+        and most SBML primaries and every synthesized slot
+        (:attr:`param_is_internal`) have ``""``. This is the declaration, which
+        a write does not change, so read a parameter's value with
+        :meth:`get_param`.
+        """
+        return list(self._core.param_expressions)
 
     @property
     def param_is_internal(self) -> list[bool]:
