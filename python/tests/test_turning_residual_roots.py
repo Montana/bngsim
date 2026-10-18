@@ -391,6 +391,19 @@ def test_an_sbml_event_on_an_equality_in_a_function_definition_fires(tmp_path, r
     assert fired_at == pytest.approx(2.5, rel=1e-12)
 
 
+def test_an_equality_in_a_function_definition_that_never_holds_is_refused(tmp_path):
+    """``hit(time - 1, 1.3)``: ``t - 1`` steps over 1.3 in doubles, and the run
+    refuses it, as it does ``time - 1 == 1.3`` written in the trigger. The body
+    was not read, and the run went on with an event that never fired."""
+    path = _sbml_window(
+        tmp_path, trigger="hit(time - 1, 1.3)", functions={"hit": "lambda(x, c, x == c)"}
+    )
+    with pytest.raises(bngsim.SimulationError, match="never equal in double arithmetic"):
+        bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
+            t_span=(0.0, 10.0), n_points=2
+        )
+
+
 def test_an_sbml_event_on_a_touch_in_a_function_definition_fires_on_any_grid(tmp_path):
     """``peak(time)`` with ``peak := sin(s) >= 1`` is true at one instant a
     period. A trigger's touch keeps its stop (issue #714), and the event fires

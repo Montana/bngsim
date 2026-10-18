@@ -1219,8 +1219,9 @@ def _collect_relational_edge_conditions(
 
     ``local_params`` is the lexical scope the emitted text is written in: the
     formal-parameter → call-site-expression binding when *node* is a function
-    definition's body (see :func:`_iter_funcdef_scan_frames`). ``None`` — the
-    event-trigger and top-level cases — is model scope.
+    definition's body (see :func:`_iter_funcdef_scan_frames`), which the
+    event-trigger scan walks as the time and state scans do. ``None`` is
+    model scope.
 
     ``equalities``, a list, receives each two-sided ``==`` and ``!=`` the same
     way. Not a root: an equality on the clock holds (or fails) at one double,
