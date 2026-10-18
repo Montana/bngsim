@@ -3691,8 +3691,9 @@ class Simulator:
         reading V_live(t) from the compartment's own promoted-species column
         (``volume_factor`` 1.0, so its stored value *is* the live size).
 
-        Records the live-volume column index per rescaled species in
-        ``result._varvol_live_vol`` so :meth:`Result.as_roadrunner` can recover
+        Records V_live(t) per rescaled species in ``result._varvol_amount_factor``,
+        and the live-volume column index per diluted hOSU=false species in
+        ``result._varvol_live_vol``, so :meth:`Result.as_roadrunner` can recover
         the amount (``conc * V_live``) for a bare-id selector instead of the now
         meaningless ``conc * V_static``. No-op for .net and static models (empty
         map) and for a 3-D stack, whose rows were remapped before stacking.
@@ -3718,6 +3719,7 @@ class Simulator:
         sp = np.array(result._species, dtype=np.float64, copy=True)
         live_vol: dict[int, int] = {}
         conc_factor: dict[int, np.ndarray] = {}
+        amount_factor: dict[int, np.ndarray] = {}
         changed = False
         rescaled: list[tuple[str, int, np.ndarray, np.ndarray, str, int]] = []
 
@@ -3725,8 +3727,8 @@ class Simulator:
         # amount/V_static under BOTH methods, but the V_static→V_live correction
         # is applied differently:
         #   • ODE reports in concentration space, so rescale the raw column in
-        #     place (sp[:,j] *= V_static/V_live) and record the live-volume column
-        #     so as_roadrunner recovers the amount as conc·V_live.
+        #     place (sp[:,j] *= V_static/V_live) and record V_live(t) as the
+        #     amount factor so as_roadrunner recovers the amount as conc·V_live.
         #   • SSA keeps the raw column as the conserved molecule count
         #     (amount/V_static) — every SSA test and the engine's own state read
         #     it that way — so leave sp[:,j] untouched and record the per-sample
@@ -3753,7 +3755,12 @@ class Simulator:
                 conc_factor[j] = factor
             else:
                 sp[:, j] = sp[:, j] * factor
-                live_vol[j] = k
+                # At a sample where the size is 0 the guard above left the column
+                # at amount/V_static, so the amount there is it times V_static,
+                # not 0: a conserved 5 in c' = -1 from 2 read [5, 5, 0, 5] at
+                # t = 0, 1, 2, 3, as it did in an assignment-rule compartment
+                # until #728's review.
+                amount_factor[j] = np.where(v_live != 0.0, v_live, v_static)
                 rescaled.append((s_name, j, factor, np.array(v_live, copy=True), "species", k))
             changed = True
 
@@ -3790,6 +3797,8 @@ class Simulator:
                 result._varvol_live_vol = live_vol
             if conc_factor:
                 result._varvol_conc_factor = conc_factor
+            if amount_factor:
+                result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
     def _rescale_varvol_sensitivity_rows(
