@@ -11,10 +11,13 @@ JSON: no engines, no corpus.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import verdicts as V
 from _core import JobResult, write_report
+
+BASELINES = Path(V.__file__).resolve().parent / "baselines"
 
 
 def core(cases: dict, suite="t") -> dict:
@@ -233,7 +236,7 @@ def test_wall_across_cpu_models_alerts_only_on_a_blowup():
 
 
 def test_wall_growth_under_the_absolute_floor_does_not_alert():
-    # bng_nf, 2026-09-29: its bngsim_sec is only the model load, and #885 added a
+    # bng_nf, 2026-09-29: its bngsim_sec was only the model load (before #901), and #885 added a
     # millisecond XML scan to it. 0.011 s -> 0.67 s over 231 cases is x61 and
     # 0.66 s of wall, on a leg whose runs take minutes.
     base = _on(core({f"m{i}|stochastic": rec("PASS", sec=0.00005) for i in range(200)}), "Intel")
@@ -353,6 +356,51 @@ def test_extract_core_reads_outcome_work_wall_and_backend(tmp_path):
     assert obj["cases"]["M2|sens/staggered"]["outcome"] == "PASS"
     assert obj["source"]["git_rev"] == "abc1234"
     assert obj["source"]["cpu"] == "EPYC 7763"
+
+
+def test_extract_counts_a_stochastic_ensemble(tmp_path):
+    """Issue #901: a stochastic row's simulation is its ``ensemble_sec``, which
+    the wall check did not count. bng_nf summed the session's construction
+    alone, 0.012 s beside 4004.5 s of NFsim. The per-replicate statistics are
+    views of the same time and are not summed."""
+    timing = {
+        "bngsim": {
+            "io_sec": 0.0,
+            "load_sec": 0.9,
+            "n_rep": 10,
+            "rep_mean_sec": 0.03,
+            "rep_median_sec": 0.03,
+            "rep_cold_sec": 0.03,
+            "ensemble_sec": 0.3,
+            "setup_per_rep_sec": 0.36,
+        }
+    }
+    path = tmp_path / "report.json"
+    write_report(path, [_jr("M1", "PASS", method="stochastic", timing=timing)])
+    obj = V.extract("core", path, "bng_nf")
+    assert obj["cases"]["M1|stochastic"]["bngsim_sec"] == pytest.approx(1.2)
+
+
+def test_a_slower_ensemble_alerts():
+    """With the ensemble counted, a 2x slower NFsim on the same CPU clears both
+    the ratio and the absolute floor, at bng_nf's scale (about 4000 s over
+    235 cases)."""
+    base = _on(core({f"m{i}|stochastic": rec("PASS", sec=17.0) for i in range(235)}), "EPYC 9V45")
+    fresh = _on(core({f"m{i}|stochastic": rec("PASS", sec=34.5) for i in range(235)}), "EPYC 9V45")
+    r = V.diff(base, fresh)
+    assert r["alerts"]["wall"] == 1 and r["wall"]["same_cpu"]
+    same = _on(core({f"m{i}|stochastic": rec("PASS", sec=18.0) for i in range(235)}), "EPYC 9V45")
+    assert V.diff(base, same)["alerts"]["wall"] == 0
+
+
+def test_the_stochastic_baselines_count_their_ensembles():
+    """The committed bng_nf and bng_ssa baselines were extracted with the
+    ensemble counted (issue #901), so tonight's extract is compared like for
+    like and does not read about 4000 s against 0.012 s."""
+    for suite, at_least in (("bng_nf", 1000.0), ("bng_ssa", 100.0)):
+        obj = json.loads((BASELINES / f"{suite}.json").read_text())
+        total = sum(c.get("bngsim_sec") or 0.0 for c in obj["cases"].values())
+        assert total > at_least, suite
 
 
 def test_multi_segment_backend_wins_over_the_replay_label(tmp_path):

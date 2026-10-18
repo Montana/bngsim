@@ -86,13 +86,19 @@ WORK_ALERT_KEYS = ("n_steps", "n_rhs_evals", "n_jac_evals")
 # count on a trivial model does not alert.
 WORK_MIN_DELTA = {"n_steps": 25, "n_rhs_evals": 50, "n_jac_evals": 10}
 # And the wall total must grow by this many seconds too, so a fixed cost on a
-# total that is near zero does not alert as a blowup. On the stochastic legs
-# ``bngsim_sec`` is only the load phase, 0.011 s over bng_nf's 231 cases, and the
-# millisecond XML scan #885 added to each session's construction read as x56. The ODE
-# and sensitivity legs total 79-913 s, so a real doubling clears it on every one.
+# total that is near zero does not alert as a blowup: before issue #901 the
+# stochastic legs' ``bngsim_sec`` was only the load phase, 0.011 s over bng_nf's
+# 231 cases, and the millisecond XML scan #885 added to each session's
+# construction read as x56. With the ensemble counted, bng_nf totals about 4000 s
+# and bng_ssa about 750 s, and the ODE and sensitivity legs 79-913 s, so a real
+# doubling clears it on every leg.
 WALL_MIN_DELTA_SEC = 30.0
 
 # bngsim-side phases summed into ``bngsim_sec`` (whichever the runner records).
+# ``ensemble_sec`` is a stochastic run's simulation (bng_stoch_run.py), every
+# replicate: without it bng_nf summed only the session's construction, 0.012 s
+# beside 4004.5 s of NFsim, and bng_ssa its parse and load, so a 2x slower
+# ensemble could not alert (issue #901). An ODE row records no ``ensemble_sec``.
 BNGSIM_PHASES = (
     "io_sec",
     "parse_sec",
@@ -101,6 +107,7 @@ BNGSIM_PHASES = (
     "jac_derive_sec",
     "codegen_sec",
     "integrate_cold_sec",
+    "ensemble_sec",
 )
 
 NOTE_LIMIT = 200
