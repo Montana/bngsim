@@ -2031,13 +2031,16 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
       * **rate-rule target** (parameter / species / compartment): the rate is the
         rule's RHS — ``dx/dt`` is stated directly (01250: ``rateOf(p1)`` where
         ``p1`` has rate rule ``1`` ⇒ ``1``).
-      * **reaction-driven species**: ``dAmount/dt = Σ net_stoich·kineticLaw``
-        over every reaction, in the species' reporting units — amount-rate for a
-        ``hasOnlySubstanceUnits`` species, else concentration-rate (``÷V``). This
+      * **reaction-driven species**: ``dAmount/dt = cf·Σ net_stoich·kineticLaw``
+        over every reaction, with ``cf`` the species' conversion factor or the
+        model's (1 with neither), in the species' reporting units — amount-rate
+        for a ``hasOnlySubstanceUnits`` species, else concentration-rate
+        (``÷V``, less ``[S]·V'/V`` where a rate rule sizes the compartment). This
         mirrors ``current_derivs`` (which holds d[conc]/dt) and the sub-cluster-3
         ``report_rateof_amount`` ×V convention (01251/01252/01254, all V=1).
       * **boundary / constant species** with no rate rule: not changed by
-        reactions ⇒ ``0``.
+        reactions ⇒ ``0``, or ``-[S]·V'/V`` for a concentration in a compartment
+        a rate rule sizes (its amount holds).
 
     Returns ``None`` (fold fails, target keeps its declared value) when the
     derivative can't be evaluated — an unknown symbol, an unsupported kinetic
@@ -2052,15 +2055,6 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
     species_by_id = {
         sbml_model.getSpecies(i).getId(): sbml_model.getSpecies(i)
         for i in range(sbml_model.getNumSpecies())
-    }
-    # A species' conversionFactor, its own or else the model's, scales the change
-    # every reaction makes to its amount, as the emitted rates do (§3b). Left
-    # out, `p = rateOf(S)` with S's factor 2 folded to half the rate that a rule
-    # reading rateOf(S) has at the same instant, and that RoadRunner gives.
-    model_cf = sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else None
-    cf_of = {
-        sid: sp.getConversionFactor() if sp.isSetConversionFactor() else model_cf
-        for sid, sp in species_by_id.items()
     }
 
     def _net_stoich(rxn, sid, ctx):
@@ -2091,6 +2085,22 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 net += sign * sval
         return net
 
+    def _concentration_rate(name, sp, amt_rate, ctx):
+        """d[S]/dt = (d amount/dt)/V - [S]·(dV/dt)/V. dV/dt is the compartment's
+        rate rule, or 0 (issue #738: 01822 folded 1 for 0.675 without it)."""
+        vol = ctx.get(sp.getCompartment(), 1.0)
+        if not vol:
+            return None
+        dvol = resolver(sp.getCompartment(), ctx)
+        if dvol is None:
+            return None
+        if dvol == 0.0:
+            return amt_rate / vol
+        conc = ctx.get(name)
+        if conc is None:
+            return None
+        return amt_rate / vol - conc * dvol / vol
+
     def resolver(name, ctx):
         # 1) rate-rule target — dx/dt is the rule's RHS, in the target's units.
         if name in rate_rule_math:
@@ -2103,10 +2113,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             # functionDefinition whose body reads rateOf, which would reach
             # here with the body's own argument name.
             return 0.0
-        # 2) species — boundary or constant species is held by reactions ⇒ 0.
+        # 2) species — reactions do not change a boundary or constant species, so
+        # its amount holds. Held as a concentration in a compartment a rate rule
+        # sizes, it is diluted all the same (suite 01117/01118 hold the amount as
+        # the size grows), and the run's rateOf reads -[S]·V'/V; the fold gave 0
+        # (issue #738).
         if sp.getBoundaryCondition() or sp.getConstant():
-            return 0.0
-        vol = ctx.get(sp.getCompartment(), 1.0)
+            if sp.getHasOnlySubstanceUnits() or sp.getCompartment() not in rate_rule_math:
+                return 0.0
+            return _concentration_rate(name, sp, 0.0, ctx)
         amt_rate = 0.0
         for j in range(sbml_model.getNumReactions()):
             rxn = sbml_model.getReaction(j)
@@ -2124,11 +2139,19 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if v is None:
                 return None
             amt_rate += net * v
-        if cf_of.get(name) is not None:
+        # A conversion factor scales what the reactions do to the species: its
+        # own, or the model's where it has none (issue #738). Left out, the fold
+        # was 1/cf of what the run reads at t = 0 (01405: -0.5 for -1).
+        cf_id = (
+            sp.getConversionFactor()
+            if sp.isSetConversionFactor()
+            else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
+        )
+        if cf_id:
             # A factor with no value yet fails the fold: the initialAssignment
             # or rule that gives it one refolds this on a later pass, and C2c
             # refuses one the model never gives.
-            cf = ctx.get(cf_of[name])
+            cf = ctx.get(cf_id)
             if cf is None:
                 return None
             amt_rate *= cf
@@ -2136,7 +2159,7 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
-        return amt_rate / vol if vol else None
+        return _concentration_rate(name, sp, amt_rate, ctx)
 
     return resolver
 
@@ -9363,6 +9386,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         if _r.isRate() and _r.getMath() is not None:
             _reads.setdefault(f"rateOf({_r.getVariable()})", set()).update(
                 _names_read(_r.getMath())
+            )
+    # A concentration in a compartment a rate rule sizes is diluted as the size
+    # changes, whether reactions move it or not, so its rate also reads its own
+    # value, the size and the size's rate (issue #738): `p = rateOf(B)` under
+    # `c' = g` left `g` writable, and `p` 0.675 where a rebuild after `g = 1`
+    # gives 0.35. One with a rate rule of its own has its rate stated.
+    for _j in range(sbml_model.getNumSpecies() if _uses_rateof else 0):
+        _sp_d = sbml_model.getSpecies(_j)
+        _sid_d, _cid_d = _sp_d.getId(), _sp_d.getCompartment()
+        if (
+            _cid_d in rate_rule_comps
+            and not _sp_d.getHasOnlySubstanceUnits()
+            and _sid_d not in rate_rule_targets
+        ):
+            _reads.setdefault(f"rateOf({_sid_d})", set()).update(
+                {_sid_d, _cid_d, f"rateOf({_cid_d})"}
             )
     for _rxn_i in range(sbml_model.getNumReactions()):
         _rxn_f = sbml_model.getReaction(_rxn_i)
