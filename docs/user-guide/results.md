@@ -42,6 +42,14 @@ result.custom_attrs["experiment"] = "dose_response_2026"
 result.save("results_with_meta.h5")
 ```
 
+The file keeps what `as_roadrunner` needs to report amounts and live
+concentrations: each species' compartment size and, where a size changes,
+the per-sample volume factors. A file written before bngsim saved these
+(format 2) does not say what the sizes were, so `as_roadrunner` on it
+refuses an amount selector (`"S"`) and warns on a concentration one
+(`"[S]"`). Multiply `"[S]"` by the size yourself, or run the model again and
+save the result.
+
 ## Export results to text files
 
 bngsim provides three text-export methods on `Result`; pick by audience.
