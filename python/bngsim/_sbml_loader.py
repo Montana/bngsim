@@ -195,6 +195,60 @@ def _fully_parenthesised(expr: str) -> bool:
     return False
 
 
+def _condition_key(cond: str) -> str:
+    """The text of a condition with the parentheses ``_atomic`` adds around a
+    call dropped, and those around a lone name or number, so that one crossing
+    reached two ways has one key (issue #1082).
+
+    A function-definition formal bound to ``time()`` is spliced into the body
+    as ``(time())``, so ``near(time, 2.5, 0.005)`` with ``near := abs(x - c) <
+    w`` and ``abs(time - 2.5) < 0.005`` written directly gave two spellings of
+    each edge, and two roots. A group that is a call's own argument list is
+    left alone, and so is any group with an operator in it.
+    """
+    prev = None
+    while prev != cond:
+        prev = cond
+        out: list[str] = []
+        i = 0
+        n = len(cond)
+        while i < n:
+            ch = cond[i]
+            # An opening parenthesis that is not a call's own (no name before it).
+            if ch == "(" and not (out and (out[-1][-1:].isalnum() or out[-1][-1:] == "_")):
+                close = _matching_paren(cond, i)
+                inner = cond[i + 1 : close] if close is not None else ""
+                if close is not None and _is_name_or_call(inner):
+                    out.append(inner)
+                    i = close + 1
+                    continue
+            out.append(ch)
+            i += 1
+        cond = "".join(out)
+    return cond
+
+
+def _matching_paren(text: str, start: int) -> int | None:
+    """The index of the ``)`` that closes the ``(`` at *start*."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _is_name_or_call(text: str) -> bool:
+    """A lone name or number, or a name applied to one parenthesised group."""
+    if _ATOMIC_TOKEN.fullmatch(text):
+        return True
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    return bool(m) and _fully_parenthesised(text[m.end() :])
+
+
 def _ia_value_changed(new: float, old: float | None) -> bool:
     """Whether an initialAssignment / assignment-rule fold has moved a symbol's
     value — the section-0 fixpoint loop's continue-iterating test, made
@@ -9114,10 +9168,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _kinetic_law_local_values(kl),
             )
 
+    # Every spelling met (GH #274's check below asks after the text it emits),
+    # and one root per crossing: a condition reached through a function
+    # definition is spelled `(time())` where the same one written directly is
+    # `time()`, and both were registered (issue #1082). The first spelling met
+    # is the one registered, so a model with no such pair registers what it did.
     seen_disc: set[str] = set()
+    registered_disc: dict[str, str] = {}
     for cond in disc_conditions:
-        if cond not in seen_disc:
-            seen_disc.add(cond)
+        seen_disc.add(cond)
+        key = _condition_key(cond)
+        if key not in registered_disc:
+            registered_disc[key] = cond
             builder.add_discontinuity_trigger(cond)
 
     # Periodic floor()/modulo dosing schedules (GH #88) that the monotonic roots
@@ -9455,8 +9517,14 @@ def _build_model_from_sbml_doc_in_context(doc):
     # set itself, rather than re-deriving one from the rule text, is what keeps
     # the stops a subset of the roots.
     # ...and, beside the roots, the trigger equalities, which are stops alone.
-    model._time_disc_conditions = tuple(sorted(seen_disc | set(trigger_equalities)))
-    model._event_disc_conditions = frozenset((event_disc & seen_disc) | set(trigger_equalities))
+    # Both in the spelling registered (issue #1082).
+    model._time_disc_conditions = tuple(
+        sorted(set(registered_disc.values()) | set(trigger_equalities))
+    )
+    model._event_disc_conditions = frozenset(
+        {registered_disc[k] for k in map(_condition_key, event_disc) if k in registered_disc}
+        | set(trigger_equalities)
+    )
 
     # AR-target species report map. An AssignmentRule target species is
     # emitted ``fixed`` (its ODE derivative is zeroed), so the integrator
