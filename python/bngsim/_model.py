@@ -2443,13 +2443,53 @@ class Model:
             if analytical:
                 vals = self._core.fill_sparse_analytical_jacobian(t, y_arr)
             else:
-                vals = gather_pattern(self._core, self._core.fill_dense_fd_jacobian(t, y_arr))
+                dense = self._core.fill_dense_fd_jacobian(t, y_arr)
+                self._warn_if_the_step_decides(t, y_arr, dense)
+                vals = gather_pattern(self._core, dense)
             return csc_from_pattern(self._core, vals, source)
         if analytical:
             dense = self._core.fill_dense_analytical_jacobian(t, y_arr)
         else:
             dense = self._core.fill_dense_fd_jacobian(t, y_arr)
+            self._warn_if_the_step_decides(t, y_arr, dense)
         return JacobianMatrix(dense, source)
+
+    def _warn_if_the_step_decides(self, t: float, y: np.ndarray, dense: np.ndarray) -> None:
+        """Warn where the difference quotient ``dense`` and the same matrix
+        with the columns of species far below the state's scale at their own
+        step differ by more than 1e-4 of a column's largest entry (issue
+        #1002). The first steps every species by 1.5e-8 of the state's largest
+        concentration, which reads a term of second order in a small species
+        as a secant across it; the second misses a term that reads it through a
+        sum with something much larger. ``steady_state`` refuses the columns
+        it would solve with such a matrix; here the matrix is returned, as it
+        was, and the warning names the entry."""
+        own, changed = self._core.fill_dense_fd_jacobian_own_step(t, y, np.asfortranarray(dense))
+        worst = None
+        for j in changed:
+            largest = float(np.max(np.abs(dense[:, j])))
+            apart = np.abs(own[:, j] - dense[:, j])
+            i = int(np.argmax(apart))
+            share = apart[i] / largest if largest > 0.0 else np.inf
+            if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):
+                worst = (share, i, j)
+        if worst is None:
+            return
+        _, i, j = worst
+        names = self.species_names
+        warnings.warn(
+            f"Model.jacobian(): the entry d(rate of {names[i]})/d{names[j]} of this "
+            f"difference quotient is {dense[i, j]:.6g} with {names[j]} stepped by 1.5e-8 of "
+            f"the state's largest concentration, and {own[i, j]:.6g} stepped by 1.5e-8 of "
+            "itself, more than 1e-4 of its column's largest entry apart (issue #1002). A "
+            "species far below the state's scale is stepped by many times itself at the "
+            "first, which reads a term of second order in it as a secant across it, and the "
+            "second misses a term that reads it through a sum with something much larger: "
+            "which of the two is right is not known. The first is returned. "
+            "steady_state(sensitivity_params=...) refuses columns solved with such a matrix.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     def propensities(self, y, t: float = 0.0) -> np.ndarray:
         """Every reaction's SSA propensity at state ``y`` and time ``t``.

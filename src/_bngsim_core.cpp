@@ -1816,6 +1816,31 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, "
             "stepped by the steady-state solver's own rule. Issue #523.")
         .def(
+            "fill_dense_fd_jacobian_own_step",
+            [](bngsim::NetworkModel &self, double t,
+               py::array_t<double, py::array::c_style | py::array::forcecast> conc,
+               py::array_t<double, py::array::f_style | py::array::forcecast> floored) {
+                const double *y = state_arg(self, conc, "fill_dense_fd_jacobian_own_step");
+                const int ns = self.n_species();
+                if (floored.ndim() != 2 || floored.shape(0) != ns || floored.shape(1) != ns) {
+                    throw py::value_error("fill_dense_fd_jacobian_own_step: floored must be "
+                                          "(n_species, n_species)");
+                }
+                std::vector<double> jac(static_cast<size_t>(ns) * ns, 0.0);
+                std::vector<int> changed;
+                if (ns > 0) {
+                    py::gil_scoped_release release;
+                    changed =
+                        self.fill_dense_fd_jacobian_own_step(t, y, floored.data(), jac.data());
+                }
+                return py::make_tuple(colmajor_to_ndarray_2d(jac, ns), changed);
+            },
+            py::arg("t"), py::arg("conc"), py::arg("floored"),
+            "The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the "
+            "same point) with the columns of species far below the state's scale taken "
+            "at their own step where the rules of fd_own_step_columns allow, and the "
+            "species (0-based) whose columns that changed. Issue #1002.")
+        .def(
             "fill_sparse_analytical_jacobian",
             [](bngsim::NetworkModel &self, double t,
                py::array_t<double, py::array::c_style | py::array::forcecast> conc) {
@@ -3464,6 +3489,20 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("n_state_switch_roots", &bngsim::SteadyStateResult::n_state_switch_roots)
         .def_readonly("state_switch_roots_dropped",
                       &bngsim::SteadyStateResult::state_switch_roots_dropped)
+        .def_readonly("sens_fd_own_step_species",
+                      &bngsim::SteadyStateResult::sens_fd_own_step_species)
+        .def_readonly("sens_fd_disagree_species",
+                      &bngsim::SteadyStateResult::sens_fd_disagree_species)
+        .def_readonly("sens_fd_disagree_param", &bngsim::SteadyStateResult::sens_fd_disagree_param)
+        .def_readonly("sens_fd_floored", &bngsim::SteadyStateResult::sens_fd_floored)
+        .def_readonly("sens_fd_own_step", &bngsim::SteadyStateResult::sens_fd_own_step)
+        .def_readonly("sens_fd_disagree_function",
+                      &bngsim::SteadyStateResult::sens_fd_disagree_function)
+        .def_readonly("sens_fd_function_param", &bngsim::SteadyStateResult::sens_fd_function_param)
+        .def_readonly("sens_fd_function_floored",
+                      &bngsim::SteadyStateResult::sens_fd_function_floored)
+        .def_readonly("sens_fd_function_own_step",
+                      &bngsim::SteadyStateResult::sens_fd_function_own_step)
         .def_property_readonly(
             "sensitivity_data",
             [](const bngsim::SteadyStateResult &r) {

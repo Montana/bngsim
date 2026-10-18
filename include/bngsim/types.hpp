@@ -1476,6 +1476,31 @@ struct SteadyStateResult {
     int sens_mask_held_species = -1;
     int sens_mask_reader_species = -1;
 
+    // ─── Whether a differenced Jacobian's step decides the answer (issue #1002) ───
+    // Where sens_jacobian_source is "finite-difference", the columns are solved
+    // again with the matrix that has the columns of species far below the
+    // state's scale at their own step (fd_own_step_columns, in
+    // bngsim/fd_jacobian.hpp). sens_fd_own_step_species are the species
+    // (0-based) whose columns that changed; empty where none did, and then
+    // there is nothing to compare. Where the two answers are further apart
+    // than 1e-4 of a column's largest entry, sens_fd_disagree_species and
+    // sens_fd_disagree_param are the entry furthest apart (0-based species, and
+    // column into sens_param_names; -1 where none is) and sens_fd_floored and
+    // sens_fd_own_step its two values, the first being the one in
+    // `sensitivity`. sens_fd_disagree_function is the same for the
+    // state-chain term of a function sensitivity that was differenced (an
+    // index into function_names), with the two totals in
+    // sens_fd_function_floored and sens_fd_function_own_step.
+    std::vector<int> sens_fd_own_step_species;
+    int sens_fd_disagree_species = -1;
+    int sens_fd_disagree_param = -1;
+    double sens_fd_floored = 0.0;
+    double sens_fd_own_step = 0.0;
+    int sens_fd_disagree_function = -1;
+    int sens_fd_function_param = -1;
+    double sens_fd_function_floored = 0.0;
+    double sens_fd_function_own_step = 0.0;
+
     // ─── Observable / function output sensitivities at steady state (GH #12) ───
     // The chain-rule projection of the species dY_ss/dp above onto the model's
     // observables and global functions, so a gradient consumer can read

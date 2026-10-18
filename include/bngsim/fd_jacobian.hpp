@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace bngsim {
@@ -37,6 +38,9 @@ constexpr double kFdEps = 1.4901161193847656e-8;
 // old one (511 better vs 54 worse, at 10x) and the floor-free relative step
 // (291 vs 13) — the floor is what a species far below the state's scale needs
 // to stay out of the cancellation noise.
+//
+// What the floor costs a species far below the state's scale, a step of many
+// times itself, is checked by `fd_own_step_columns` below (issue #1002).
 inline double state_fd_step(double y, double y_scale) {
     return kFdEps * std::max(std::abs(y), y_scale);
 }
@@ -76,6 +80,204 @@ inline double state_probe_scale(const double *y, int ns, const std::vector<int> 
         scale = std::max(scale, std::abs(y[i]));
     }
     return scale > 0.0 ? scale : 1.0;
+}
+
+// ─── A species far below the state's scale (issue #1002) ─────────────────────
+//
+// `state_fd_step` floors the step at the state's largest concentration, which
+// keeps a small species out of the cancellation noise of the rows it is read
+// in. It also steps that species by many times itself: beside a species at 1e8,
+// one at 0.87 is stepped by 1.5, and a term of second order in it is read as a
+// secant across twice the species. `k·X²` comes back with a slope of
+// `k·(2X + h)`: dX*/ds 7% off at a ratio of 1e7 and 44% at 1e8.
+//
+// The species' own step (√eps of itself) has the opposite failure. A term that
+// reads the species through a sum with something much larger, `C·((K + X) − K)`
+// or a total minus what is bound, answers in steps of that sum's last bit; where
+// that grain is wider than the own step and narrower than the floored one, the
+// own step does not see the term at all and the floored step sees all of it.
+// No sampling of a row tells the two apart in every case (the plan on #1002
+// records four rules that were tried), so neither matrix is returned in place of
+// the other. `fd_own_step_columns` gives the second matrix, and a caller works
+// its answer out with both: where they agree the floored one is returned as it
+// was, and where they do not the answer is refused. Curvature moves the floored
+// step's answer and grain moves the own step's, and the two steps are at least
+// kFdRefineRatio apart, so a result both give is neither failure's.
+//
+// The second matrix is the first except in the column of a species stepped by
+// more than kFdRefineRatio times its own step, and there only where all of
+// this holds of an entry, at the own step:
+//
+// - the own step moved the row, and the row's rounding over it is under
+//   kFdSettled of the quotient: it is known there;
+// - the quotient at kFdRefineRatio times the step agrees with it to
+//   kFdSettled of itself: the slope is the row's over two decades of step;
+// - a thousandth beyond the own step moves the row by a thousandth of what the
+//   step did, to a tenth: the row resolves the step, and the quotient is not a
+//   count of the row's own last bits;
+// - it is further from the first quotient than twice what it is known to.
+//
+// And a column is taken whole or not at all: where an entry of it is not taken
+// and its two quotients are more than kFdRefineRtol apart, the column stays the
+// first. A column of secants at one step keeps what the right-hand side keeps
+// (rows that add up to nothing add up to nothing in it); a column with one
+// entry at the own step and the same term's other entry at the floored one
+// does not, and a solve with the matrix answers for the difference
+// (MODEL1911130007 went from 0.4% of a column's largest off to 43%).
+//
+// A row's rounding is taken as eps of its value and of each entry times its
+// species, a small species' entry at its own step: the floored quotient, a
+// secant, times the species is no term of the row.
+
+// How many times its own step a species has to be stepped by before its column
+// is taken again, and the step the second quotient is taken at.
+constexpr double kFdRefineRatio = 64.0;
+// A row's rounding over a step is taken this many times over.
+constexpr double kFdNoise = 32.0;
+// What a one-sided quotient at the species' own step leaves out, of itself.
+constexpr double kFdRefineRtol = 1e-6;
+// A quotient is known where the row's rounding over its step is under this
+// much of it, and two quotients agree where they are no further apart.
+constexpr double kFdSettled = 1e-4;
+// How far beyond the own step the row is asked whether it resolves it, as a
+// part of the step, and how near what the quotient says its answer has to be.
+constexpr double kFdResolveStep = 0x1p-10;
+constexpr double kFdResolveRtol = 0.1;
+
+// The second matrix for `D` (column-major n_out×ns, D[j*n_out + i] =
+// ∂g_i/∂y_j, as the floored sweep took it from `eval(y, g)` with g(y) = `g0`):
+// `D_own` is D with the columns of species far below the state's scale taken
+// at their own step where the rules above allow. Returns the species whose
+// columns differ (0-based, ascending); empty where none does, and then D_own
+// is D to the bit. Three more `eval` per such species.
+template <class Eval>
+inline std::vector<int> fd_own_step_columns(Eval &&eval, const double *y, int ns, int n_out,
+                                            const std::vector<int> &excluded, const double *g0,
+                                            const double *D, double *D_own) {
+    const auto un = static_cast<std::size_t>(ns);
+    const auto um = static_cast<std::size_t>(n_out);
+    std::memcpy(D_own, D, un * um * sizeof(double));
+    std::vector<int> changed;
+    std::vector<int> small; // the species far below the state's scale
+    const double y_scale = state_probe_scale(y, ns, excluded);
+    for (int j = 0; j < ns; ++j) {
+        double unused = 0.0;
+        const double h = fd_probe(y[j], state_fd_step(y[j], y_scale), &unused);
+        // A species at 0 has no step of its own.
+        if (y[j] != 0.0 && h > kFdRefineRatio * kFdEps * std::abs(y[j])) {
+            small.push_back(j);
+        }
+    }
+    if (small.empty()) {
+        return changed;
+    }
+    std::vector<double> g1(um), g_fine(um), y_pert(un);
+    // The quotients of each such species at its own step and at
+    // kFdRefineRatio times it, whether the own step moved the row, and
+    // whether the row resolves it.
+    const std::size_t n_small = small.size();
+    std::vector<double> own(n_small * um), wide(n_small * um);
+    std::vector<double> step(n_small, 0.0);
+    std::vector<char> moved(n_small * um, 0), resolved(n_small * um, 0);
+    for (std::size_t s = 0; s < n_small; ++s) {
+        const auto uj = static_cast<std::size_t>(small[s]);
+        const double base = kFdEps * std::abs(y[uj]);
+        std::memcpy(y_pert.data(), y, un * sizeof(double));
+        y_pert[uj] = y[uj] + base;
+        const double h1 = y_pert[uj] - y[uj];
+        y_pert[uj] = y[uj] + kFdRefineRatio * base;
+        const double h_wide = y_pert[uj] - y[uj];
+        if (!(h1 > 0.0) || !(h_wide > h1)) {
+            continue; // no step of its own that a double holds
+        }
+        step[s] = h1;
+        eval(y_pert.data(), g1.data());
+        for (std::size_t i = 0; i < um; ++i) {
+            wide[s * um + i] = (g1[i] - g0[i]) / h_wide;
+        }
+        y_pert[uj] = y[uj] + base;
+        eval(y_pert.data(), g1.data());
+        for (std::size_t i = 0; i < um; ++i) {
+            own[s * um + i] = (g1[i] - g0[i]) / h1;
+            moved[s * um + i] = g1[i] != g0[i] ? 1 : 0;
+        }
+        // A thousandth beyond: what the row does there against what the
+        // quotient says it should.
+        y_pert[uj] = y[uj] + base * (1.0 + kFdResolveStep);
+        const double beyond = y_pert[uj] - (y[uj] + base);
+        if (beyond > 0.0) {
+            eval(y_pert.data(), g_fine.data());
+            for (std::size_t i = 0; i < um; ++i) {
+                const double expect = own[s * um + i] * beyond;
+                const double off = std::abs((g_fine[i] - g1[i]) - expect);
+                resolved[s * um + i] = off <= kFdResolveRtol * std::abs(expect) ? 1 : 0;
+            }
+        }
+    }
+    // Each row's rounding: eps of its own value and of each entry times its
+    // species (a small species' entry at its own step).
+    const double eps = std::numeric_limits<double>::epsilon();
+    std::vector<double> rounding(um);
+    for (std::size_t i = 0; i < um; ++i) {
+        rounding[i] = std::abs(g0[i]);
+    }
+    {
+        std::size_t s = 0;
+        for (int j = 0; j < ns; ++j) {
+            const auto uj = static_cast<std::size_t>(j);
+            const bool is_small = s < n_small && small[s] == j;
+            const double *col = is_small && step[s] > 0.0 ? own.data() + s * um : D + uj * um;
+            for (std::size_t i = 0; i < um; ++i) {
+                const double term = col[i] * y[j];
+                if (std::isfinite(term)) {
+                    rounding[i] += std::abs(term);
+                }
+            }
+            if (is_small) {
+                ++s;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < um; ++i) {
+        rounding[i] *= eps;
+    }
+    std::vector<char> take(um);
+    for (std::size_t s = 0; s < n_small; ++s) {
+        if (!(step[s] > 0.0)) {
+            continue;
+        }
+        const double *col = D + static_cast<std::size_t>(small[s]) * um;
+        bool whole = true;
+        bool any = false;
+        for (std::size_t i = 0; i < um && whole; ++i) {
+            const double q = own[s * um + i];
+            take[i] = 0;
+            const double apart = std::abs(wide[s * um + i] - q);
+            const double noise = kFdNoise * rounding[i] / step[s];
+            const double size = std::abs(q);
+            const double gap = std::abs(q - col[i]);
+            if (moved[s * um + i] != 0 && resolved[s * um + i] != 0 && noise <= kFdSettled * size &&
+                apart <= kFdSettled * size && gap > 2.0 * (kFdRefineRtol * size + noise + apart)) {
+                take[i] = 1;
+                any = true;
+            } else if (!(gap <= kFdRefineRtol * size)) {
+                // (A quotient that is no number comes here: nothing is that
+                // near an infinity.)
+                whole = false;
+            }
+        }
+        if (!whole || !any) {
+            continue;
+        }
+        double *out = D_own + static_cast<std::size_t>(small[s]) * um;
+        for (std::size_t i = 0; i < um; ++i) {
+            if (take[i] != 0) {
+                out[i] = own[s * um + i];
+            }
+        }
+        changed.push_back(small[s]);
+    }
+    return changed;
 }
 
 // Dense COLUMN-MAJOR J (ns×ns, J[j*ns + i] = ∂f_i/∂y_j) at (t, y) by one-sided
