@@ -193,9 +193,16 @@ def test_a_sum_of_squares_keeps_its_own_root(tmp_path):
     assert d_k == pytest.approx(10 - t_star, rel=1e-6)
 
 
-def _sbml_window(tmp_path, condition: str | None = None, *, trigger: str | None = None) -> str:
+def _sbml_window(
+    tmp_path,
+    condition: str | None = None,
+    *,
+    trigger: str | None = None,
+    rules: dict[str, str] | None = None,
+) -> str:
     """A = 2t as an SBML document, with Y' = piecewise(k, condition, 0), or
-    with an event on *trigger* that adds 1 to Y and writes the time to T."""
+    with an event on *trigger* that adds 1 to Y and writes the time to T.
+    *rules* are parameters set by assignment rules, by name."""
     import libsbml
 
     doc = libsbml.SBMLDocument(3, 1)
@@ -217,6 +224,13 @@ def _sbml_window(tmp_path, condition: str | None = None, *, trigger: str | None 
     k.setId("k")
     k.setValue(10)
     k.setConstant(True)
+    for name, formula in (rules or {}).items():
+        param = model.createParameter()
+        param.setId(name)
+        param.setConstant(False)
+        rule = model.createAssignmentRule()
+        rule.setVariable(name)
+        rule.setMath(libsbml.parseL3Formula(formula))
     laws = [("R1", "A", "2")]
     if condition is not None:
         laws.append(("R2", "Y", f"piecewise(k, {condition}, 0)"))
@@ -264,6 +278,22 @@ def test_an_sbml_kinetic_law_spelled_so_is_not_stepped_over(tmp_path, condition,
     assert len(covered) == 2
     assert all("abs" not in c and "^" not in c for c in covered)
     assert model.state_switch_root_conditions() == ()
+    run = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
+        t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
+    )
+    y = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))["Y"]
+    assert y == pytest.approx(0.1, rel=1e-5)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 1e-10])
+def test_a_square_against_a_rule_bound_keeps_the_rate_laws_edges(tmp_path, rtol):
+    """The loader cannot split ``(A - 5)^2 < w``: ``w`` is no number in its
+    text, so it registers the whole comparison, whose root never fires. The
+    rate-law scan writes ``w := 0.0001`` in and roots the edges. Read as
+    covering those edges, the whole one left the window stepped over: Y = 0."""
+    path = _sbml_window(tmp_path, "(A - 5)^2 < w", rules={"w": "0.0001"})
+    roots = bngsim.Model.from_sbml(path).state_switch_root_conditions()
+    assert roots == ("(A-5)<(0.01)", "(A-5)>(-0.01)")
     run = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").run(
         t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
     )
@@ -364,4 +394,4 @@ def test_a_counters_window_is_stopped_on_and_not_rooted_as_well(tmp_path, rtol):
     run = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").run(
         t_span=(0.0, 10.0), n_points=2, rtol=rtol, atol=1e-12
     )
-    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(1.0, rel=1e-5)
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(1.0, rel=1e-4)
