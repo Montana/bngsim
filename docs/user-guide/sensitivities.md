@@ -333,6 +333,8 @@ cover:
 - the same window written any other way, such as `pow(X - 5, 2)` in a `.net`
   model, `2*abs(X - 5) < 0.02`, or a square compared with a bound that is not
   a number, `(X - 5)^2 < w`. Each is still rooted whole;
+- an SBML event trigger that calls a function definition holding the
+  comparison, which is not scanned for edges at all;
 - `steady_state()`.
 
 ### A rate that rises from zero at the crossing
