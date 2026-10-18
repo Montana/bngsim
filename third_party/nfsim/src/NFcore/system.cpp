@@ -10,6 +10,8 @@
 #include <math.h>
 #include <fstream>
 #include <stdexcept>
+#include <algorithm>
+#include <limits>
 #include "../NFscheduler/NFstream.h"
 #include "../NFscheduler/Scheduler.h"
 
@@ -1154,10 +1156,44 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
 	return current_time;
 }
 
+void System::addTimeBreakpoints(const vector<double> &xs)
+{
+	timeBreakpoints.insert(timeBreakpoints.end(), xs.begin(), xs.end());
+	std::sort(timeBreakpoints.begin(), timeBreakpoints.end());
+	timeBreakpoints.erase(std::unique(timeBreakpoints.begin(), timeBreakpoints.end()),
+		timeBreakpoints.end());
+}
+
+double System::nextTimeBreakpoint(double t) const
+{
+	vector<double>::const_iterator it =
+		std::upper_bound(timeBreakpoints.begin(), timeBreakpoints.end(), t);
+	return it == timeBreakpoints.end() ? std::numeric_limits<double>::infinity() : *it;
+}
+
+void System::refreshTimeDependentPropensities()
+{
+	for(unsigned int r=0; r<allReactions.size(); r++) {
+		allReactions.at(r)->update_a();
+	}
+	recompute_A_tot();
+}
+
 double System::stepTo(double stoppingTime)
 {
 	while(current_time < stoppingTime)
 	{
+		// A table indexed by the time changes its value at its breakpoints
+		// whether or not anything fires (bngsim GH #892). The propensities were
+		// read again only after a firing, so a rate that is 0 until a later
+		// breakpoint never turned on, and one that was tiny turned on late. A
+		// draw that passes the next breakpoint is dropped there, the tables are
+		// read again and the waiting time is drawn anew, which is exact for a
+		// step table because the waiting time is memoryless. A linear table is
+		// read at its breakpoints too; between them it holds the value it was
+		// last read at, as it did before. A breakpoint on the stopping time is
+		// read there: the next call starts on it and looks past it.
+		const double nextBreak = nextTimeBreakpoint(current_time);
 		if(!pendingStepEventValid) {
 			// Preserve the pending waiting-time draw across output boundaries so
 			// repeated stepTo() calls consume the same RNG stream as sim().
@@ -1165,11 +1201,22 @@ double System::stepTo(double stoppingTime)
 				pendingStepEventTime =
 					current_time + (-log(rng_.random_open()) / a_tot);
 				pendingStepEventValid = true;
+			} else if(nextBreak <= stoppingTime) {
+				current_time = nextBreak;
+				refreshTimeDependentPropensities();
+				continue;
 			} else {
 				current_time = stoppingTime;
 				cout << "Total propensity is zero, no further rxns can fire in this step." << endl;
 				break;
 			}
+		}
+
+		if(pendingStepEventTime > nextBreak && nextBreak <= stoppingTime) {
+			current_time = nextBreak;
+			invalidateStepToCache();
+			refreshTimeDependentPropensities();
+			continue;
 		}
 
 		// Check if we've reached stopping time

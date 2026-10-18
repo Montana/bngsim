@@ -386,6 +386,24 @@ CARRY_QUEUE = (
             },
         ],
     },
+    {
+        "topic": "bngsim/carry-step-to-time-table-breakpoints",
+        "kind": "local",
+        "status": (
+            "Read every table function indexed by the time at each of its breakpoints in "
+            "stepTo(), whether or not a reaction has fired: a waiting-time draw that passes "
+            "the next breakpoint is dropped there and drawn again, and a total propensity of "
+            "0 advances to the next breakpoint rather than the stopping time. A rate that is "
+            "0 until a later breakpoint never turned on. Exact for a step table; a linear "
+            "table holds its last value between breakpoints, as before. See bngsim GH #892."
+        ),
+        "commits": [
+            {
+                "commit": "684182792dbb96c376e9078bdb24622d22e0e133",
+                "summary": "bngsim: read time-indexed tables at their breakpoints in stepTo",
+            },
+        ],
+    },
 )
 
 SUMMARY_PREVIEW_LIMIT = 12
