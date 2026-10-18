@@ -140,10 +140,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # MSVC builds serially without these; windows-tail.yml's build step
-          # says why. Exported here, for this step and the Windows leg only.
+          # MSVC builds serially without this, and -MP is spelled with a dash;
+          # windows-tail.yml's build step says why. Exported here, for this step
+          # and the Windows leg only.
           if [ "$RUNNER_OS" = Windows ]; then
-            export CL=/MP CMAKE_BUILD_PARALLEL_LEVEL=2
+            export CL=-MP
           fi
           python -m pip install --upgrade pip
           # BNGSIM_ENABLE_MIR=ON builds the vendored MIR backend; KLU off (and

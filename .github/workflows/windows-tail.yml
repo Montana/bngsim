@@ -137,18 +137,19 @@ jobs:
       - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      # MSBuild compiled this build one file at a time: no /MP, no /m, so on a
-      # 4-core runner the 10.5-minute build was serial, 7.5 minutes of it the
-      # NFsim sources (measured on 2026-10-18's run). CL is the environment
-      # variable cl.exe reads its own options from, and /MP compiles a target's
-      # files in parallel; CMAKE_BUILD_PARALLEL_LEVEL makes `cmake --build` pass
-      # /m, so independent targets overlap too. Both are this step's alone, so
-      # the cl that tests compile codegen with later runs as it did. Same
-      # generator, same compiler, same flags otherwise.
+      # MSBuild compiled this build one file at a time: scikit-build-core passes
+      # no parallel level to the Visual Studio generator and nothing set /MP, so
+      # on a 4-core runner the build was serial, 7m32s of it NFsim's sources
+      # (2026-10-18). CL is the environment variable cl.exe reads options from,
+      # and -MP compiles a target's sources in parallel, one process per core.
+      # Spelled -MP, not /MP: this step runs in Git Bash, which rewrites an
+      # environment value that looks like a POSIX path before a Windows program
+      # sees it, and cl got CL=C:/Program Files/Git/MP and failed CMake's
+      # compiler check. The variable is this step's alone, so the cl that tests
+      # compile codegen with later runs as it did.
       - name: Build & install bngsim (NFsim on, KLU off)
         env:
-          CL: /MP
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+          CL: -MP
         shell: bash
         run: |
           set -euxo pipefail

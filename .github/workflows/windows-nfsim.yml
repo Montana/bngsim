@@ -82,8 +82,7 @@ jobs:
       # Compile in parallel; windows-tail.yml's build step says why.
       - name: Build & install bngsim (NFsim on, KLU off)
         env:
-          CL: /MP
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+          CL: -MP
         shell: bash
         run: |
           set -euxo pipefail
