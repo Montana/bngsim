@@ -122,8 +122,7 @@ Source→license map:
 | `bngl_models`    | wshlavacek/BNGL-Models          | `CC-BY-4.0`     | yes (attribution)|
 | `bngl_library`   | wshlavacek/BNGL-Models          | `CC-BY-4.0`     | yes (attribution)|
 | `curated`        | wshlavacek/BNGL-Models          | `CC-BY-4.0`     | yes (attribution)|
-| `biomodels`      | BioModels curated `BIOMD*`      | `CC0-1.0`       | no              |
-| `biomodels`      | BioModels non-curated `MODEL*`  | `unknown`       | case-by-case    |
+| `biomodels`      | BioModels `BIOMD*` and `MODEL*` | `CC0-1.0`       | no              |
 | `temp-biomodels` | sys-bio/temp-biomodels          | `CC0-1.0`       | no              |
 | `dsmts`          | sbmlteam DSMTS                  | `LGPL-2.1-or-later` | yes             |
 | `sbml-test-suite`| sbmlteam SBML Test Suite        | `LGPL-2.1-or-later` | yes             |

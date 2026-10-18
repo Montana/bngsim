@@ -2,6 +2,10 @@
 # Downloaded by fetch_sedml.py, never committed to git
 sedml_source/
 
+# BioModels-only SBML from bngsim's release-asset copy (~98 MB)
+# Downloaded by fetch_biomodels_mirror.py, never committed to git
+biomodels_sbml/
+
 # Local one-off backups of pre-repair corpus files (the bad COPASI/empty originals);
 # kept locally, never committed. The committed fix lives in sbml_overrides/.
 corpus_repair_backup_*/
