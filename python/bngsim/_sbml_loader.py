@@ -2115,11 +2115,36 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if v is None:
                 return None
             amt_rate += net * v
+        # A conversion factor scales what the reactions do to the species: its
+        # own, or the model's where it has none (issue #738). Left out, the fold
+        # was 1/cf of what the run reads at t = 0 (01405: -0.5 for -1).
+        cf_id = (
+            sp.getConversionFactor()
+            if sp.isSetConversionFactor()
+            else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
+        )
+        if cf_id:
+            cf = ctx.get(cf_id)
+            if cf is None:
+                return None
+            amt_rate *= cf
         # ``current_derivs`` is d[conc]/dt; rateOf reports amount-rate for a hOSU
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
-        return amt_rate / vol if vol else None
+        if not vol:
+            return None
+        # d[S]/dt = (d amount/dt)/V - [S]·(dV/dt)/V. dV/dt is the compartment's
+        # rate rule, or 0 (issue #738: 01822 folded 1 for 0.675 without it).
+        dvol = resolver(sp.getCompartment(), ctx)
+        if dvol is None:
+            return None
+        if dvol == 0.0:
+            return amt_rate / vol
+        conc = ctx.get(name)
+        if conc is None:
+            return None
+        return amt_rate / vol - conc * dvol / vol
 
     return resolver
 

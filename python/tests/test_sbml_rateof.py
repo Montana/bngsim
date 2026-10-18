@@ -1336,3 +1336,105 @@ def test_rateof_event_trigger_fires_robustly_across_atol():
         assert p2[-1] == pytest.approx(5.0), f"event never fired at atol={atol}"
         fire_t = t[int(np.argmax(p2 < 7.5))]
         assert fire_t == pytest.approx(t_cross, abs=3 * (t[1] - t[0])), f"atol={atol}"
+
+
+# ── Issue #738: rateOf folded into an initialAssignment ─────────────────────
+
+_MATHML = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+_S1_TO_S2 = (
+    '<reaction id="J0" reversible="false"><listOfReactants>'
+    '<speciesReference species="S1" stoichiometry="1" constant="true"/></listOfReactants>'
+    '<listOfProducts><speciesReference species="S2" stoichiometry="1" constant="true"/>'
+    f"</listOfProducts><kineticLaw><math {_MATHML}><apply><times/><cn>0.1</cn><ci>S1</ci>"
+    "</apply></math></kineticLaw></reaction>"
+)
+
+
+def _conc_species(sid: str, conc: float, extra: str = "") -> str:
+    return (
+        f'<species id="{sid}" compartment="C" initialConcentration="{conc}" '
+        f'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"{extra}/>'
+    )
+
+
+def _folded(*, comp, species, rxns, params="", rules="", model_attr="", feed=False) -> str:
+    """P0 := rateOf(S1) as an initialAssignment; with *feed*, Y' = P0 as well."""
+    ia_math = f"<math {_MATHML}><apply>{_RATEOF_CSYMBOL}<ci>S1</ci></apply></math>"
+    if feed:
+        params += '<parameter id="Y" value="0" constant="false"/>'
+        rules += f'<rateRule variable="Y"><math {_MATHML}><ci>P0</ci></math></rateRule>'
+    return _sbml(f"""
+  <model id="m"{model_attr}>
+    <listOfCompartments>{comp}</listOfCompartments>
+    <listOfSpecies>{species}</listOfSpecies>
+    <listOfParameters>{params}<parameter id="P0" value="0" constant="true"/></listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="P0">{ia_math}</initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules>{rules}</listOfRules>
+    <listOfReactions>{rxns}</listOfReactions>
+  </model>""")
+
+
+_UNIT_C = '<compartment id="C" size="1" constant="true"/>'
+_CF = '<parameter id="cf" value="2" constant="true"/>'
+
+_FOLDS = {
+    # 01405 with its rule an initialAssignment: 2 * (-0.1 * 5)
+    "species conversionFactor": (
+        dict(
+            comp=_UNIT_C,
+            species=_conc_species("S1", 5, ' conversionFactor="cf"') + _conc_species("S2", 5),
+            params=_CF,
+            rxns=_S1_TO_S2,
+        ),
+        -1.0,
+    ),
+    "model conversionFactor": (
+        dict(
+            comp=_UNIT_C,
+            species=_conc_species("S1", 5) + _conc_species("S2", 5),
+            params=_CF,
+            rxns=_S1_TO_S2,
+            model_attr=' conversionFactor="cf"',
+        ),
+        -1.0,
+    ),
+    # 01822 with its rule an initialAssignment: 2/2 - 1.3 * 0.5/2
+    "rate-ruled compartment": (
+        dict(
+            comp='<compartment id="C" size="2" constant="false"/>',
+            species=_conc_species("S1", 1.3),
+            rules=f'<rateRule variable="C"><math {_MATHML}><cn>0.5</cn></math></rateRule>',
+            rxns=(
+                '<reaction id="J0" reversible="false"><listOfProducts>'
+                '<speciesReference species="S1" stoichiometry="1" constant="true"/>'
+                f"</listOfProducts><kineticLaw><math {_MATHML}><cn>2</cn></math>"
+                "</kineticLaw></reaction>"
+            ),
+        ),
+        0.675,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_FOLDS))
+def test_rateof_folded_into_an_initial_assignment_is_the_t0_rate(case):
+    """Issue #738: the fold read neither conversion factor (-0.5 for -1) nor the
+    -[S]·V'/V dilution of a rate-ruled compartment (1 for 0.675). The values
+    are the SBML suite's t = 0 rateOf for 01405 and 01822."""
+    kw, want = _FOLDS[case]
+    model = bngsim.Model.from_sbml_string(_folded(**kw))
+    assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
+
+
+def test_a_folded_rateof_feeds_a_rate_rule_with_its_conversion_factor():
+    """The folded value is baked in at load: Y' = P0 integrates it."""
+    kw, want = _FOLDS["species conversionFactor"]
+    model = bngsim.Model.from_sbml_string(_folded(**kw, feed=True))
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, 1.0), n_points=2, rtol=1e-10, atol=1e-12
+    )
+    names = [*run.observable_names, *run.expression_names]
+    values = np.hstack([np.asarray(run.observables), np.asarray(run.expressions)])
+    assert values[-1, names.index("Y")] == pytest.approx(want, rel=1e-8)
