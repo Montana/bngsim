@@ -601,6 +601,16 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "to the GH #212 form — except for a state-dependent trigger, whose "
             "∂t*/∂p the solver differentiates at the fire instead (issue #144).")
         .def(
+            "set_stall_watch_conditions",
+            [](bngsim::SolverOptions &self, const std::vector<std::string> &conditions) {
+                self.sensitivity.stall_watch_conditions = conditions;
+            },
+            py::arg("conditions"),
+            "Issue #959: conditions over model state, as source text, that a run "
+            "without sensitivities watches for a state pinned on their surface "
+            "(issue #928) and puts across, without registering them as roots. For "
+            "thresholds rooted another way, an SBML model's discontinuity triggers.")
+        .def(
             "set_state_switch_reactions",
             [](bngsim::SolverOptions &self, const std::vector<std::vector<int>> &reactions) {
                 self.sensitivity.state_switch_reactions = reactions;

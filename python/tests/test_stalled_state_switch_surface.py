@@ -501,3 +501,26 @@ def test_a_product_of_two_moving_species_is_put_across(tmp_path):
     assert b == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
     assert y == pytest.approx(KB * (SPELLED_END - 5.0), abs=0.1 * KB * 1e-10 / 1e-8)
     assert run.solver_stats["n_steps"] < 100_000
+
+
+@pytest.mark.parametrize("eps", [1e-6, 1e-7, 1e-8, 1e-9])
+def test_one_switch_under_a_slow_approach_in_sbml(eps):
+    """Issue #959: the slow approach above, written in SBML. Its threshold is
+    rooted by the loader's discontinuity trigger, so it is no state switch,
+    and the run was not put across: each of these ended in the wall-clock
+    timeout. The core now watches the loader's thresholds for a pinned state
+    too, without a root of their own. Y is held as above."""
+    thr = 1.0 + 5.0 * eps
+    text = (
+        f"species A, Y; A = 1; Y = 0; eps = {eps!r}; thr = {thr!r}; kb = {KB!r}\n"
+        "J1: -> A; eps\n"
+        "J2: -> Y; piecewise(kb, A > thr, 0)\n"
+    )
+    model = bngsim.Model.from_antimony_string(text)
+    assert model.state_switch_root_conditions() == ()  # rooted by the loader
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, SLOW_END), n_points=2, rtol=SLOW_RTOL, atol=1e-12, timeout=5.0
+    )
+    a, y = np.asarray(run.species)[-1]
+    assert a == pytest.approx(1.0 + eps * SLOW_END, rel=0.0, abs=1e-3 * eps * SLOW_END)
+    assert y == pytest.approx(KB * (SLOW_END - (thr - 1.0) / eps), abs=0.1 * KB * SLOW_RTOL / eps)

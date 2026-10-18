@@ -903,6 +903,10 @@ class SolverOptions:
         """
         Set parameter names for forward sensitivity analysis
         """
+    def set_stall_watch_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
+        """
+        Issue #959: conditions over model state, as source text, that a run without sensitivities watches for a state pinned on their surface (issue #928) and puts across, without registering them as roots. For thresholds rooted another way, an SBML model's discontinuity triggers.
+        """
     def set_state_switch_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
         """
         Set the rate-law conditions that read model state, as source text — one relational atom per entry, `Virus<1` (issue #150). Such a condition flips a branch of f at a crossing whose time moves with every parameter through the trajectory, so dx/dθ is DISCONTINUOUS there by the saltation term (f⁻−f⁺)·dt*/dθ — a term neither the analytic sensitivity RHS nor CVODES' difference quotient carries. run() resolves each through NetworkModel.state_switch_residual, registers that residual as a CVODE root so the crossing is located, and applies the jump there. A run without sensitivities roots the residuals it is given and applies no jump; it restarts at a crossing only where the flow clearly carries the state across (issue #897). Empty (the default) leaves the root set untouched.
