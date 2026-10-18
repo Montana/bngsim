@@ -258,7 +258,17 @@ def _ode_comment(v: dict, n_sp: int, *, multiseg: bool) -> str:
                 f" ({v['budget_forgiven']} points just outside strict tolerance, within "
                 f"solver-to-solver slack)"
             )
-        return f"Matches run_network within tolerance across all {n_sp} species, {scope}{extra}."
+        if v.get("no_signal"):
+            # Issue #873: nothing in the reference moves past its own rounding, so
+            # a frozen engine would match it too.
+            return (
+                f"NO SIGNAL: no species moves in run_network's trajectory ({n_sp} species, "
+                f"{scope}), so agreement says nothing about the dynamics."
+            )
+        return (
+            f"Matches run_network within tolerance across all {n_sp} species, {scope}{extra}; "
+            f"worst error {v.get('max_err_over_movement', 0.0):.1e} of a species' movement."
+        )
     n_bad = v["n_hard_fail"] or v["n_fail"]
     return (
         f"Differs from run_network beyond tolerance at {n_bad}/{v['n_cells']} points "

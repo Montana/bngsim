@@ -20,6 +20,10 @@ deterministic_verdict
     (metamorphic: the protocol is scale-aware), and `forgive_mask` only ever
     loosens (superset property)
   * a shape mismatch raises
+  * the movement gate (issue #873): a frozen engine, and a 4% error on one
+    species, fail where a clamped reservoir, a nearly constant one or a large
+    baseline sets the scale; an engine that agrees passes in each, and so does
+    0.9% of every species; a reference where nothing moves is ``no_signal``
 
 ensemble_verdict
   * equal means pass; a sub-particle cell (one side floored to 0, the other a
@@ -82,10 +86,13 @@ def test_subceiling_column_forgiven_regardless_of_count(n_soft):
     decayed-tail / integrator-noise class the gate was added for (rr_check forgives
     it on reldiv<0.05): an arbitrarily large fraction of sub-ceiling soft cells is
     not a divergence. (Before the gate this DIFFed once the soft fraction passed
-    FAIL_FRAC_BUDGET — the behavior change this test pins.)"""
+    FAIL_FRAC_BUDGET — the behavior change this test pins.)
+
+    The 1% is on bngsim's side: the same wiggle in a reference that bngsim does
+    not follow is a frozen engine, which the movement gate fails (issue #873)."""
     a = np.ones((100, 5))
     b = np.ones((100, 5))
-    flat = b.reshape(-1)
+    flat = a.reshape(-1)
     flat[:n_soft] = 1.01  # 1% relative on a unit-magnitude column: < HARD_REL_CEILING
     ok, v = _passed(a, b)
     assert ok
@@ -99,11 +106,11 @@ def test_budget_forgives_soft_cells_within_a_real_column():
     cell (so it is a real divergence the gate does NOT forgive) plus n soft 1%
     cells. The model DIFFs either way (the hard cell), but the budget controls
     whether the soft cells are reported as forgiven vs counted — the budget
-    bookkeeping the gate keeps."""
+    bookkeeping the gate keeps. (On bngsim's side, as above.)"""
     a = np.ones((100, 5))
     b = np.ones((100, 5))
-    b[0, 0] = 1.10  # hard: 9.1% of col peak > HARD_REL_CEILING → column is real
-    b[1, 0] = b[2, 0] = 1.01  # 2 soft cells (2/500 = 0.004 <= FAIL_FRAC_BUDGET)
+    a[0, 0] = 1.10  # hard: 9.1% of col peak > HARD_REL_CEILING → column is real
+    a[1, 0] = a[2, 0] = 1.01  # 2 soft cells (2/500 = 0.004 <= FAIL_FRAC_BUDGET)
     ok, v = _passed(a, b)
     assert not ok  # the hard cell DIFFs regardless
     assert v["n_hard_fail"] == 1
@@ -363,3 +370,105 @@ def test_ensemble_frac_pass_gate_boundary(n_fail, expect_pass):
 def test_ensemble_shape_mismatch_raises():
     with pytest.raises(ValueError):
         differ.ensemble_verdict(np.ones((3, 2)), np.ones((3, 2)), np.ones((3, 2)), np.ones((3, 3)))
+
+
+# --------------------------------------------------------------------------- #
+# The movement gate (issue #873)
+# --------------------------------------------------------------------------- #
+def _trajectory(n=121, *, reservoir=None, baseline=0.0):
+    """A reference with a substrate decaying from 6e5, a product rising to it,
+    and optionally a reservoir column and a large baseline under the moving ones:
+    the shapes of #873's three mechanisms."""
+    t = np.linspace(0.0, 3600.0, n)
+    s = 6.022e5 * np.exp(-t / 900.0)
+    cols = [baseline + s, baseline + (6.022e5 - s), baseline + 514.0 * (1 - np.exp(-t / 300.0))]
+    if reservoir is not None:
+        cols.append(reservoir(t))
+    return np.column_stack(cols)
+
+
+_MECHANISMS = {
+    # (a) a clamped species sets the file scale (catalysis.bngl, $ATP = 6.022e8)
+    "clamped": dict(reservoir=lambda t: np.full_like(t, 6.022e8)),
+    # (b) a nearly constant unclamped one does (moves 1e-8 of its peak)
+    "nearly-constant": dict(reservoir=lambda t: 6.022e8 * (1 - 1e-8 * t / 3600.0)),
+    # (c) the moving species sit on a baseline 1e3 times what they move by:
+    #     they move by 0.1% of their peak, never 5% of it
+    "baseline": dict(baseline=6.022e8),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MECHANISMS))
+def test_a_frozen_engine_fails(shape):
+    """An engine that never moves off the initial state. On catalysis.bngl the
+    verdict was PASS with max_rel 0.0, 960 of 1210 cells past the per-cell
+    tolerance."""
+    ref = _trajectory(**_MECHANISMS[shape])
+    frozen = np.tile(ref[0], (ref.shape[0], 1))
+    ok, v = _passed(frozen, ref)
+    assert not ok
+    assert v["n_hard_fail"] > 0
+    assert v["max_err_over_movement"] >= 0.5
+    assert not v["no_signal"]
+
+
+@pytest.mark.parametrize("shape", sorted(_MECHANISMS))
+def test_a_four_percent_error_on_one_species_fails(shape):
+    """One significant moving species 4% off throughout: 68% of such cases
+    passed the corpus before the movement gate."""
+    ref = _trajectory(**_MECHANISMS[shape])
+    a = ref.copy()
+    a[:, 1] = ref[:, 1] + 0.04 * (ref[:, 1] - ref[0, 1])
+    assert not _passed(a, ref)[0]
+
+
+@pytest.mark.parametrize("shape", sorted(_MECHANISMS))
+def test_an_engine_that_agrees_passes(shape):
+    """Control. 1e-6 of each column's movement, past the worst p99 of the
+    census (4.4e-5) by nothing, passes in every shape."""
+    ref = _trajectory(**_MECHANISMS[shape])
+    span = ref.max(axis=0) - ref.min(axis=0)
+    a = ref + 1e-6 * span * np.sin(np.arange(ref.shape[0]))[:, np.newaxis]
+    ok, v = _passed(a, ref)
+    assert ok
+    assert v["max_err_over_movement"] == pytest.approx(1e-6, rel=1e-2)
+
+
+def test_an_error_under_the_movement_ceiling_passes():
+    """Control. Every species ×1.009 passed all 582 corpus references, and
+    still does: 0.9% of a species that moves its whole peak."""
+    t = np.linspace(0.0, 10.0, 101)
+    ref = np.column_stack([1.0 - np.exp(-t), np.exp(-t)])
+    ok, v = _passed(1.009 * ref, ref)
+    assert ok
+    assert v["max_err_over_movement"] < differ.MOVE_CEILING
+
+
+def test_a_reference_that_does_not_move_is_no_signal():
+    """Nothing moves (the 5 STATIC corpus models): a frozen engine is right,
+    and the verdict says it could not have told otherwise."""
+    ref = np.tile([6.022e8, 6.022e7, 6.022e5], (50, 1))
+    ok, v = _passed(ref.copy(), ref)
+    assert ok
+    assert v["no_signal"]
+    assert v["max_err_over_movement"] == 0.0
+
+
+def test_the_movement_gate_is_invariant_under_positive_rescaling():
+    """Metamorphic, as for the magnitude gates."""
+    ref = _trajectory(**_MECHANISMS["clamped"])
+    frozen = np.tile(ref[0], (ref.shape[0], 1))
+    for c in (1e-6, 1.0, 1e6):
+        assert not _passed(c * frozen, c * ref)[0]
+
+
+def test_forgive_mask_forgives_a_movement_fail():
+    """The step-shift mask still applies to cells the movement gate fails."""
+    t = np.linspace(0.0, 10.0, 101)
+    ref = np.column_stack([1.0 - np.exp(-t), np.exp(-t)])
+    a = ref.copy()
+    a[40, 0] += 0.02
+    assert not _passed(a, ref)[0]
+    mask = np.zeros(ref.shape, dtype=bool)
+    mask[40, 0] = True
+    assert _passed(a, ref, forgive_mask=mask)[0]

@@ -221,7 +221,9 @@ def _compare_ode(bn, rr) -> tuple[str, float, str, str, float, bool]:
     status = "pass" if v["passed"] else "diff"
     comment = (
         f"{len(common)} sp; fail {v['n_fail']}/{v['n_cells']} "
-        f"(hard {v['n_hard_fail']}, soft {v['n_soft_fail']}, forgiven {v['budget_forgiven']})"
+        f"(hard {v['n_hard_fail']}, soft {v['n_soft_fail']}, forgiven {v['budget_forgiven']}); "
+        f"err/movement {v['max_err_over_movement']:.1e}"
+        + ("; NO SIGNAL (nothing in the reference moves)" if v["no_signal"] else "")
     )
     covers = _reference_nonfinite_covers(a, b) if status == "diff" else False
     return status, v["max_rel"], comment, metric, tol, covers
