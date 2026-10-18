@@ -7383,6 +7383,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
     _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
+    # (compartment, trigger, size before, size after), all ExprTk (#1054).
+    _size_jumps: list[tuple[str, str, str, str]] = []
+    _jump_species: dict[str, list[str]] = {}  # compartment -> species it rescales
     if ar_comp_targets:
         import re as _re
 
@@ -7544,6 +7547,82 @@ def _build_model_from_sbml_doc_in_context(doc):
             return cid
 
         _refusals: list[str] = []
+
+        # A piecewise size jumps where one of its conditions flips (#1054). The
+        # chain rule above differentiates each piece, which is right between
+        # the jumps, but a jump is a delta no ODE term carries, so it gets what
+        # an event's resize gets (#74): each concentration × V_before/V_after,
+        # at the condition's root. The size is inlined through the rules it
+        # reads, and each condition is set true and false in it for the size on
+        # either side. A condition over constants and event targets alone moves
+        # only at an event, whose own rescale owns that jump; one that reads an
+        # event target and the state or time could flip at the event and then
+        # again by the jump event, so it is refused.
+        _event_targets = {
+            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+            for k in range(sbml_model.getNumEvents())
+            for j in range(sbml_model.getEvent(k).getNumEventAssignments())
+        }
+        _moving = (
+            {_TIME_SYM}
+            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | set(_rr_alias)
+            | set(_rate_token_species)
+        )
+
+        def _inlined_size(safe_var: str, seen: frozenset):
+            ex = _ar_rhs_ex.get(safe_var)
+            if ex is None or safe_var in seen:
+                return None
+            g = _exprtk_to_sympy(ex)
+            if g is None:
+                return None
+            subs = {}
+            for s in g.free_symbols:
+                if str(s) in _ar_alias:
+                    inner = _inlined_size(_ar_alias[str(s)], seen | {safe_var})
+                    if inner is None:
+                        return None
+                    subs[s] = inner
+            return g.xreplace(subs)
+
+        for comp, vdot in _comp_vdot.items():
+            if vdot is None:
+                continue
+            g = _inlined_size(_safe_name(comp), frozenset())
+            if g is None:
+                continue
+            conds = dict.fromkeys(
+                c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)
+            )
+            for c in conds:
+                names = {str(s) for s in c.free_symbols}
+                if not names & _moving:
+                    continue
+                if names & _event_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where "
+                        f"{c} flips, which reads "
+                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
+                        "moves with the run as well; bngsim would rescale its "
+                        "concentrations twice when an event flips it"
+                    )
+                    continue
+                v_false, v_true = (g.xreplace({c: b}) for b in (_sp.false, _sp.true))
+                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
+                if any(t is None for t in texts):
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        "flips, and bngsim cannot write the size on either side"
+                    )
+                    continue
+                rises, falls, v_false, v_true = (_unalias(t) for t in texts)
+                _jump_species[comp] = [
+                    s for s, sc in species_comp.items() if sc == comp and _diluted(s)
+                ]
+                _size_jumps.append((comp, rises, v_false, v_true))
+                _size_jumps.append((comp, falls, v_true, v_false))
+
         for comp, rated in _comp_rated.items():
             for leaf in sorted(rated):
                 if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
@@ -8933,6 +9012,25 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             for _ai, _size, _base in rescale_meta:
                 builder.set_last_event_assignment_rescale(_ai, _size, _base)
+
+    # (#1054) A piecewise size's jumps, found in §8c: an event at each
+    # condition's root, each way, rescales the compartment's concentrations so
+    # their amounts hold. ODE only, as every resize rescale is (#81); it is
+    # added after the model's own events so their indices stay as they were.
+    for k, (comp, trigger, before, after) in enumerate(_size_jumps):
+        builder.add_event(
+            f"_size_jump_{_safe_name(comp)}_{k}",
+            trigger,
+            [
+                (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
+                for sid in _jump_species[comp]
+            ],
+            persistent=True,
+            initial_value=True,
+            assignment_ode_only=[True] * len(_jump_species[comp]),
+        )
+        for sid in _jump_species[comp]:
+            ar_dilution_species.add(sid)
 
     # (#81) Apply the deferred SSA live-volume tags. §9 recorded each mass-action
     # varvol reaction as (rxn_idx, comp_id, exp); the compartment's promoted
