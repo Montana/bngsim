@@ -2625,9 +2625,18 @@ def test_biomd416_a_column_of_nothing_that_never_settles_is_returned_as_that():
     what rounding makes of that at each state: 1e-12, of either sign, and all
     of itself different at the next. No step settles it, the ten are taken,
     and the last state is returned with the column it has there: it is under
-    1e-5 of 1/|p|, which is nothing, and is not refused for moving."""
+    1e-5 of 1/|p|, which is nothing, and is not refused for moving.
+
+    The root is Newton's. A run of this model is at IAAp = 26.56 from t = 1e3
+    on, with ||f||/n wandering between 5e-8 and 9e-7 and not falling, so an
+    integration gets under tol = 1e-9 only at a step that happens to land
+    there. One did while the generated C was compiled with contraction, and
+    none has since #963 compiled it without; a tighter rtol, 1e-9 to 1e-12,
+    lands none either. The polish lands at 1e-13 either way, and the run taken
+    on from beside it needs more than its default 10,000 steps to reach
+    max_time."""
     sim = bngsim.Simulator(bngsim.Model.from_sbml(_biomodel("BIOMD0000000416")), method="ode")
-    out = sim.steady_state(sensitivity_params=["etaAuxTIR1"])
+    out = sim.steady_state(sensitivity_params=["etaAuxTIR1"], method="newton", max_steps=100_000)
     assert out.sens_root_newton_steps == 10
     assert np.max(np.abs(np.asarray(out.sensitivity))) < 1e-8
     assert out.sens_root_column_shift < 1e-6 and out.sens_root_state_shift < 1e-9
@@ -2820,12 +2829,20 @@ def test_biomd908_is_refused_for_what_its_absent_species_would_do(asked):
     vs to move, and dS*/dvs = -3.61 came back, with dT*/dvs = 1.6e13. Asked
     for d, l and s, nothing makes S, a run stays, and the columns main
     returns agree with differences of runs: a right answer that is refused,
-    for the same eigenvalue (issue #961)."""
+    for the same eigenvalue (issue #961).
+
+    Solved to tol = 1e-6, not the default 1e-9. Four species are 2.5e8 to
+    2.1e9 (C at 2.1e9, where one unit in the last place is 2.4e-7), and ||f||/n under
+    1e-9 asks the right-hand side for less than it can resolve. The run ends
+    at 8.5e-9 and the default reports no steady state at all, by integration
+    or by Newton; it found one only while the generated C was compiled with
+    contraction, before #963. From 1e-8 up the root is found, and refused,
+    compiled either way."""
     sim = bngsim.Simulator(bngsim.Model.from_sbml(_biomodel("BIOMD0000000908")), method="ode")
     with pytest.raises(
         bngsim.SimulationError, match=r"#995.*does not rest at.*real part of 0\.277 "
     ):
-        sim.steady_state(sensitivity_params=asked)
+        sim.steady_state(sensitivity_params=asked, tol=1e-6)
 
 
 def test_model1607210000_says_that_the_run_stayed_and_the_columns_did_not():
