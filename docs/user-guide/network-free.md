@@ -157,14 +157,22 @@ nothing fires, is not seen until something does, and until then the run is flat
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
-times small at a large `t_start`. RuleMonkey integrates a rate that reads the
-clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
-whose span is too short for the doubles near its times to place them (a span of
-2 at t = 1e13), rather than return a run that never fires. A model that reads
-the clock still places its events on absolute time, so once the total
-propensity times |t| nears 1e15 its waiting times are rounded and the run is
-biased with no error, as `method="ssa"` is on any model there (issue #1059).
-Keep such a run's times moderate.
+times small at a large `t_start`. So does a one-shot `method="rm"` run of a
+model that reads the clock through `time()`: it reads the clock as `time()`
+plus the run's `t_start`, and its events are placed on elapsed time (issue
+#1063). Before that its waiting times were rounded once the total propensity
+times |t| neared 1e15, and from t = 1e12 the run was biased with no error.
+
+A `RuleMonkeySession`, and any run of a model with a table indexed by time,
+still places its events on absolute time, so the same rounding applies there,
+as it does to `method="ssa"` on any model (issue #1059): keep such a run's times
+moderate. (Offsetting a table's clock would index it through a function, and
+RuleMonkey 3.11.0 recurses without end on a table whose counter is a function,
+richardposner/RuleMonkey#111.)
+RuleMonkey integrates a rate that reads the clock on panels of a thousandth of a
+span, so on absolute time `method="rm"` refuses a span too short for the
+doubles near its times to place them (a span of 2 at t = 1e13), rather than
+return a run that never fires.
 
 ### Arrhenius (energy) rules
 

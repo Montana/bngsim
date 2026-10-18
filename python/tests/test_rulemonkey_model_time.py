@@ -337,11 +337,14 @@ def test_a_span_that_is_not_finite_is_refused(xml):
 def test_a_clock_too_coarse_to_integrate_over_is_refused():
     """At t = 1e13 the doubles are 0.002 apart, and a span of 2 has integration
     panels of 0.002: RuleMonkey fired nothing where a constant rate written
-    through time() should have left 135 of 1000. A longer span, or one nearer
-    0, runs."""
-    with pytest.raises(bngsim.SimulationError, match="too coarse") as err:
-        _rm(f"{RAMP}.xml", 1, t_span=(1e13, 1e13 + 2.0), n_points=3)
-    assert "to 10000000000002" in str(err.value)
+    through time() should have left 135 of 1000. A session runs on model time
+    and refuses such a span. A longer span, or one nearer 0, runs.
+
+    A one-shot run integrates on elapsed time since issue #1063, and reads the
+    clock as time() + t_start: 0.02 * 1e13 per molecule clears all 1000 in the
+    first instant, as the closed form exp(-0.02 * (t^2 - t0^2) / 2) does."""
+    a = np.asarray(_rm(f"{RAMP}.xml", 1, t_span=(1e13, 1e13 + 2.0), n_points=3).observables["A0"])
+    np.testing.assert_array_equal(a, [1000, 0, 0])
     with bngsim.RuleMonkeySession(f"{RAMP}.xml") as s:
         s.initialize(seed=1, t_start=1e13)
         with pytest.raises(bngsim.SimulationError, match="too coarse"):
@@ -385,3 +388,71 @@ def test_a_session_of_a_clock_free_model_starts_at_zero_whatever_its_start():
         r = s.simulate(1e12, 1e12 + 2.0, n_points=3)
     np.testing.assert_array_equal(r.time, [1e12, 1e12 + 1.0, 1e12 + 2.0])
     np.testing.assert_array_equal(np.asarray(r.observables), np.asarray(one_shot.observables))
+
+
+# ── #1063: a model that reads the clock, from a large t_start ───────────────
+
+
+def test_a_late_start_keeps_its_waiting_times():
+    """RuleMonkey places each event at t + tau. From t = 1e12, where the doubles
+    are 1.2e-4 apart, the waiting times of 20000 molecules at 0.5 (1e-4 each)
+    rounded away, and the survival at 1e12 + 2 came back 10.8 standard errors
+    under exp(-1) over 10 seeds (z = -291 at 1e5 molecules in the issue). A model
+    that reads the clock runs on elapsed time now and reads the clock as
+    time() + t_start. The span is long enough for model time's own refusal."""
+    T = [1e12, 1e12 + 2.0, 1e12 + 1.3e5]
+    rows = [_rm(SWITCH, seed, sample_times=T) for seed in range(1, 11)]
+    np.testing.assert_array_equal(rows[0].time, T)
+    q = np.exp(-0.5 * (np.asarray(T) - T[0]))
+    _assert_mean([r.observables["A0"] for r in rows], 20000 * q, 20000 * q * (1 - q))
+
+
+def test_an_output_function_reports_on_model_time():
+    """The function the ramp's rate reads, f() = 0.02 * time(), at t = 5, 6, 7:
+    the rewritten clock is the model's, not the run's elapsed time."""
+    r = _rm(f"{RAMP}.xml", 1, t_span=(5.0, 7.0), n_points=3)
+    np.testing.assert_allclose(r.expressions["f"], 0.02 * np.array([5.0, 6.0, 7.0]), rtol=1e-12)
+
+
+def test_the_clock_is_offset_in_every_spelling():
+    from bngsim._rulemonkey_clock import OFFSET_PARAM, offset_clock_text
+
+    xml = SWITCH.read_text(encoding="utf-8")
+    bare = xml.replace("if(time()>=6,k,0)", "if(time>=6,k,0)*1")
+    for text in (xml, bare):
+        out = offset_clock_text(text, SWITCH.parent)
+        assert f"if((time()+{OFFSET_PARAM})>=6,k,0)" in out
+        assert f'<Parameter id="{OFFSET_PARAM}" type="Constant" value="0" expr="0"/>' in out
+
+
+def test_a_model_that_names_the_offset_is_refused():
+    from bngsim._rulemonkey_clock import OFFSET_PARAM, offset_clock_text
+
+    xml = SWITCH.read_text(encoding="utf-8").replace('id="k"', f'id="{OFFSET_PARAM}"')
+    with pytest.raises(bngsim.ModelError, match=OFFSET_PARAM):
+        offset_clock_text(xml, SWITCH.parent)
+
+
+def test_a_table_indexed_by_the_clock_is_not_offset():
+    """Its counter would have to be a function, and RuleMonkey 3.11.0 recurses
+    without end evaluating such a table. The model runs on model time, as the
+    late-start test of #892 above checks."""
+    from bngsim._rulemonkey_clock import offsettable
+
+    assert not offsettable(TFUN.read_text(encoding="utf-8"))
+    assert offsettable(SWITCH.read_text(encoding="utf-8"))
+
+
+def test_a_table_file_is_found_from_the_copy(tmp_path):
+    """The copy is written elsewhere, so a table's data file named relative to
+    the original XML is made absolute."""
+    from bngsim._rulemonkey_clock import offset_clock_text
+
+    (tmp_path / "x.tfun").write_text("0 1\n1 2\n")
+    xml = SWITCH.read_text(encoding="utf-8").replace(
+        "</ListOfFunctions>",
+        '<Function id="g" type="TFUN" ctrName="A0" file="x.tfun" method="linear">'
+        "<Expression> __TFUN_VAL__ </Expression></Function>\n    </ListOfFunctions>",
+    )
+    out = offset_clock_text(xml, tmp_path)
+    assert f'file="{(tmp_path / "x.tfun").resolve()}"' in out

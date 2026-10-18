@@ -694,6 +694,8 @@ class Simulator:
         "_canonical_method",
         "_requested_method",
         "_sim",
+        "_rm_clock_offset",
+        "_rm_clock_dir",
         "_rtol",
         "_atol",
         # Issue #196 — per-species absolute tolerance, or None for the scalar
@@ -834,6 +836,8 @@ class Simulator:
         self._method = dispatch  # internal dispatch key
         self._canonical_method = canonical
         self._xml_path = xml_path
+        self._rm_clock_offset = False
+        self._rm_clock_dir = None
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
@@ -1045,12 +1049,25 @@ class Simulator:
 
             refuse_rulemonkey_compartments(xml_path)
             refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
-            self._sim = RuleMonkeySimulator(xml_path)
+            # Elapsed time, which keeps event times small at a large t_start. A
+            # model that reads the clock reads model time (issue #1022): through
+            # time(), from a copy of its XML whose clock is time() + __bngsim_t0,
+            # set to each run's t_start (issue #1063), since on model time itself
+            # RuleMonkey's waiting times round away there. A table indexed by the
+            # clock cannot be offset (bngsim/_rulemonkey_clock.py), and a model
+            # with one runs on model time as before.
+            from bngsim._rulemonkey_clock import offset_clock_xml, offsettable
+
+            reads_clock = bool(clock_readers(xml_path))
+            self._rm_clock_offset = reads_clock and offsettable(
+                Path(xml_path).read_text(encoding="utf-8")
+            )
+            rm_xml = xml_path
+            if self._rm_clock_offset:
+                rm_xml, self._rm_clock_dir = offset_clock_xml(xml_path)
+            self._sim = RuleMonkeySimulator(rm_xml)
             warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
-            # Model time where the model reads the clock (issue #1022); elsewhere
-            # elapsed time, which no such model can tell apart and which keeps
-            # event times small at a large t_start.
-            self._sim.set_reads_clock(bool(clock_readers(xml_path)))
+            self._sim.set_reads_clock(reads_clock and not self._rm_clock_offset)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             self._sim.set_block_same_complex_binding(bool(block_same_complex_binding))
@@ -4768,6 +4785,11 @@ class Simulator:
                 self._apply_ssa_breakpoints([self._sim], self._model, t_start, t_end)
                 core_result = self._sim.run_psa(times, used_seed, self._poplevel, timeout_seconds)
             elif self._method == "nfsim" or self._method == "rulemonkey":
+                if self._method == "rulemonkey" and self._rm_clock_offset:
+                    from bngsim._rulemonkey_clock import OFFSET_PARAM
+
+                    # The run's start on the model's clock (issue #1063).
+                    self._sim.set_param(OFFSET_PARAM, float(t_start))
                 core_result = self._sim.run(times, used_seed, timeout_seconds)
             else:
                 raise ValueError(f"Unknown method: {self._method}")
