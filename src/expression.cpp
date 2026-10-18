@@ -604,8 +604,8 @@ static double mratio_a_zero_series(double b, double z) {
 // every b - a above about 1e-290; below that, out to z = -775 at most, the call
 // is refused, where the fraction returned its Lentz floor. Against mpmath, none
 // of 60000 triples with b in [1e-12, 10], |a| in [1e-15, 10] and z in
-// [-2000, 0] is off by more than 1e-8 (worst 4.2e-14, where the fraction was
-// off by that much in 2605 of 20000, by up to 1.2e-2), and none of 6000 with b
+// [-2000, 0] is off by more than 1e-8 (worst 4.2e-14; the fraction was off by
+// more than 1e-8 in 2605 of 20000, by up to 1.2e-2), and none of 6000 with b
 // down to 1e-300 and z out to -1e9 (worst 1.2e-14). It is slower than the
 // fraction was: about 7 us at z = -700 for the series and just past it for the
 // asymptotic route, against 2 us, and the same 6 us by z = -5000.

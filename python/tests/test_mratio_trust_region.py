@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 
 import bngsim
 import pytest
@@ -509,3 +510,28 @@ def test_a_tiny_b_no_longer_leaks_through_the_fractions_start(tmp_path, a, b, z,
     BNG's never come near, since they have b >= 1."""
     assert abs(old - true_value) / abs(true_value) > 1e-8
     assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+@pytest.mark.parametrize(
+    "b, z, true_value",
+    [
+        # M(0, b, z) = 1, so the ratio is M(1, b+1, z): mpmath at 100 digits.
+        (-2.5, -500.0, -0.005035318510732385),
+        (-0.5, -100.0, -0.005076943751970561),
+        (-7.3, -2000.0, -0.003665218300681953),
+    ],
+)
+def test_a_zero_with_a_negative_b_far_out_is_answered(tmp_path, b, z, true_value):
+    """A side effect of the asymptotic route taking M(0, b, z) = 1 as exact
+    (issue #1080). Its zero-term rule used to refuse every a = 0 because the
+    denominator's expansion stops after its first term, and a b <= 0 asks that
+    route whatever z is, so these were refusals. Now they are answers."""
+    assert _value(tmp_path, 0.0, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+def test_a_p_2_past_the_largest_double_still_comes_back_nan(tmp_path):
+    """Here p_2 = z*(a-b)/(b*(b+1)) = -1.4e310 overflows. The fraction's second
+    step keeps the old arithmetic in that case, so the call returns the NaN it
+    always did, which the non-finite warner reports. It does not take C_2 = 1:
+    with D_2 = 1/(1 + p_2) = 0 that would make the answer a quiet, wrong 0."""
+    assert math.isnan(_value(tmp_path, -5.5, 1e-310, 0.25))
