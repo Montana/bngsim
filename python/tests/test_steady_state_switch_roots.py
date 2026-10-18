@@ -135,7 +135,9 @@ def test_a_state_held_on_its_threshold_ends_where_it_did(tmp_path, monkeypatch, 
     root. With the difference quotient it crosses back and forth, and past
     1000 crossings it roots them no more and goes on over the switch. Either
     way it ends where the march with nothing rooted ended: S on the threshold,
-    not converged."""
+    not converged. How near the threshold a march that slides along it stops
+    is the integrator's, and differs by platform (2.4e-5 above it on Linux CI,
+    1e-9 here), so it is held to 1e-3."""
     path = tmp_path / "slide.net"
     path.write_text(SLIDE)
     out = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian=jacobian)
@@ -151,5 +153,5 @@ def test_a_state_held_on_its_threshold_ends_where_it_did(tmp_path, monkeypatch, 
     before = before.steady_state()
     assert before.n_state_switch_roots == 0
     assert not out.converged and not before.converged
-    assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-6)
-    assert np.asarray(before.concentrations)[0] == pytest.approx(0.5, abs=1e-6)
+    assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+    assert np.asarray(before.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
