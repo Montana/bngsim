@@ -524,3 +524,23 @@ def test_one_switch_under_a_slow_approach_in_sbml(eps):
     a, y = np.asarray(run.species)[-1]
     assert a == pytest.approx(1.0 + eps * SLOW_END, rel=0.0, abs=1e-3 * eps * SLOW_END)
     assert y == pytest.approx(KB * (SLOW_END - (thr - 1.0) / eps), abs=0.1 * KB * SLOW_RTOL / eps)
+
+
+@pytest.mark.parametrize("r, rtol", [(1e-6, 1e-8), (1e-7, 1e-8), (1e-4, 1e-10)])
+def test_a_window_closing_slowly_in_sbml(r, rtol):
+    """Issue #905: Y integrates k while c <= A < c + r*w, with A rising at r,
+    so Y(5) = k*w = 0.1. Rooted by the loader, the window's closing edge was
+    one the run could neither cross nor pass, and it held the gate open: Y
+    came back 1.48 and 15.7 times too large after 19 and 53 million steps, and
+    at rtol 1e-10 the run timed out. The .net form is put across by #928, and
+    now so is this. The crossing time is known as well as A is."""
+    w = 0.01
+    text = (
+        f"species A, Y; A = {5.0 - r!r}; Y = 0; k = 10; r = {r!r}; c = 5; cw = {5.0 + r * w!r}\n"
+        "J1: -> A; r\n"
+        "J2: -> Y; piecewise(k, (A >= c) && (A < cw), 0)\n"
+    )
+    run = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
+        t_span=(0.0, 5.0), n_points=3, rtol=rtol, atol=rtol * 1e-2, timeout=10.0
+    )
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(10.0 * w, rel=0.01)
