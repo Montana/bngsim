@@ -6293,10 +6293,16 @@ def _build_model_from_sbml_doc_in_context(doc):
         # amount-rate — for a CONSTANT-volume compartment (01455/01457) AND a
         # VARIABLE-volume compartment promoted to a state (rate-rule / event-resized,
         # 01463), with no conc·V̇ correction. Flag the species so the engine (and
-        # codegen) scale its rate_of__ accessor by volume_factor. AR-compartment
-        # volumes are not integrator states, so a hOSU species there stays on the
-        # unscaled d(conc)/dt (excluded — no rateOf case there is in the suite).
-        if hosu and (comp not in vstatic_divide_comps or comp in variable_comps):
+        # codegen) scale its rate_of__ accessor by volume_factor.
+        #
+        # An assignment-rule compartment too (issue #736). Its volume is not an
+        # integrator state, but what decides the scaling is how the species is
+        # stored, and it is stored as amount/V_static there as well: left out,
+        # its rateOf read d(amount)/dt / V_static, a third of the answer in a
+        # compartment of size 3, and a rate rule on it integrated that. Such a
+        # compartment is not in live_volume_param_comps, so codegen scales by
+        # the number V_static, which is what the storage divided by.
+        if hosu:
             builder.set_species_rateof_amount(idx)
 
         # If the species's IC was set by an initialAssignment over parameters,

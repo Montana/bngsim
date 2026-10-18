@@ -569,10 +569,9 @@ def test_rateof_hosu_amount_rate_as_output(codegen):
 def test_rateof_hosu_variable_volume_amount_scaled():
     """A hOSU=true species in a VARIABLE-volume rate-ruled compartment IS flagged
     for the amount scaling (01463): the engine stores amount/V_static, so
-    ×volume_factor recovers d(amount)/dt with no conc·V̇ term. Pins the gate — both
-    the constant-volume and the rate-ruled-compartment hOSU species carry
-    report_rateof_amount; an AR-compartment hOSU species (whose volume is a rule
-    function, not an integrator state) does not."""
+    ×volume_factor recovers d(amount)/dt with no conc·V̇ term. Pins the gate — the
+    constant-volume, the rate-ruled-compartment and the AR-compartment hOSU species
+    all carry report_rateof_amount: each is stored as amount/V_static (issue #736)."""
     body = """
   <model id="m">
     <listOfCompartments>
@@ -600,7 +599,7 @@ def test_rateof_hosu_variable_volume_amount_scaled():
     flags = {s["name"]: s["report_rateof_amount"] for s in model._core.codegen_data()["species"]}
     assert flags["Ac"] is True  # constant-volume hOSU ⇒ amount-scaled
     assert flags["Av"] is True  # rate-ruled variable-volume hOSU ⇒ amount-scaled (01463)
-    assert flags.get("Aa") is False  # AR-compartment hOSU ⇒ left unscaled (not a state)
+    assert flags["Aa"] is True  # AR-compartment hOSU ⇒ amount-scaled too (#736)
 
 
 def test_rateof_hosu_variable_volume_amount_rate_value():
@@ -1336,3 +1335,73 @@ def test_rateof_event_trigger_fires_robustly_across_atol():
         assert p2[-1] == pytest.approx(5.0), f"event never fired at atol={atol}"
         fire_t = t[int(np.argmax(p2 < 7.5))]
         assert fire_t == pytest.approx(t_cross, abs=3 * (t[1] - t[0])), f"atol={atol}"
+
+
+_M = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+_RATEOF = (
+    '<csymbol encoding="text" '
+    'definitionURL="http://www.sbml.org/sbml/symbols/rateOf">rateOf</csymbol>'
+)
+_TIME = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+def _hosu_in_ar_compartment(size_rule: str) -> str:
+    """H (hOSU, amount 6) decaying at 0.2*H in C, a compartment of size 3 an
+    assignment rule sets; R := rateOf(H), Z' = rateOf(H), P := rateOf(H) at t = 0."""
+    return _sbml(f"""
+  <model id="m">
+    <listOfCompartments><compartment id="C" size="3" constant="false"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="H" compartment="C" initialAmount="6" hasOnlySubstanceUnits="true"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="k" value="0.2" constant="true"/>
+      <parameter id="R" value="0" constant="false"/>
+      <parameter id="Z" value="0" constant="false"/>
+      <parameter id="P" value="0" constant="true"/>
+    </listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="P"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math>
+      </initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules>
+      <assignmentRule variable="C"><math {_M}>{size_rule}</math></assignmentRule>
+      <assignmentRule variable="R"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math>
+      </assignmentRule>
+      <rateRule variable="Z"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math></rateRule>
+    </listOfRules>
+    <listOfReactions>
+      <reaction id="d" reversible="false">
+        <listOfReactants><speciesReference species="H" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <kineticLaw><math {_M}><apply><times/><ci>k</ci><ci>H</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>""")
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    "size_rule",
+    ["<cn>3</cn>", f"<apply><plus/><cn>3</cn><apply><times/><cn>0.5</cn>{_TIME}</apply></apply>"],
+    ids=["constant", "time-varying"],
+)
+def test_rateof_hosu_in_an_ar_compartment_is_the_amount_rate(size_rule, codegen):
+    """Issue #736: H is an amount, H = 6 exp(-0.2 t) whatever C is, so rateOf(H)
+    is -0.2 H and Z = H - 6. Unscaled, R was a third of that (V_static = 3) and Z
+    integrated the third. The load-time fold of the same rateOf, P, agreed with
+    the closed form already and still does."""
+    model = bngsim.Model.from_sbml_string(_hosu_in_ar_compartment(size_rule))
+    assert model.get_param("P") == pytest.approx(-1.2, rel=1e-12)
+    run = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0.0, 5.0), n_points=6, rtol=1e-10, atol=1e-12
+    )
+    names = [*run.observable_names, *run.expression_names]
+    values = np.hstack([np.asarray(run.observables), np.asarray(run.expressions)])
+    t = np.asarray(run.time)
+    h = 6.0 * np.exp(-0.2 * t)
+    np.testing.assert_allclose(values[:, names.index("R")], -0.2 * h, rtol=1e-7)
+    np.testing.assert_allclose(values[:, names.index("Z")], h - 6.0, rtol=1e-7, atol=1e-9)
