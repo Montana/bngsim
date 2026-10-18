@@ -128,14 +128,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Each leg is two jobs, one per shard of the suite (BNGSIM_TEST_SHARD below;
+  # conftest splits by file and balances on ci/test_durations.json). The
+  # python-tests-counts job further down sums the two summaries of a leg for
+  # the false-green guard, which is a statement about the whole suite.
   python-tests:
-    name: Python suite · ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
+    name: Python suite · ${{ matrix.leg.label }} · ${{ matrix.shard }}/2
+    runs-on: ${{ matrix.leg.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
+        shard: [1, 2]
+        leg:
           - os: ubuntu-latest # x86_64 Linux — no Python coverage at all before #169
             label: ubuntu-latest
             apt: "" # bare host: the #178 proof. Do not add a package here.
@@ -157,11 +162,11 @@ jobs:
       # Only the LAPACK leg installs anything, and only this one package. The
       # other two legs must stay bare — see the header on lanl/bngsim#178.
       - name: Install liblapack-dev (LAPACK leg only)
-        if: matrix.apt != ''
+        if: matrix.leg.apt != ''
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
+          sudo apt-get install -y ${{ matrix.leg.apt }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -195,12 +200,30 @@ jobs:
       # h5py / pandas / jax / vivarium guarded tests — ~50 items that skip on a
       # bare install. Building bngsim itself is the slow part (SUNDIALS is
       # FetchContent'd and the KLU subset is built from source).
+      #
+      # ccache keeps that build's objects between runs. CMake (3.17+) takes
+      # CMAKE_<LANG>_COMPILER_LAUNCHER from the environment at configure, which
+      # reaches every CMake configure uv's build backend runs, the KLU autobuild
+      # included. One cache per leg, written by shard 1 only: both shards build
+      # the same thing, and two writers to one key would race.
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: python-tests-${{ matrix.leg.label }}
+          save: ${{ matrix.shard == 1 }}
+          max-size: 500M
+
       - name: Provision from uv.lock (default build config)
-        run: uv sync --extra dev --python 3.12
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          uv sync --extra dev --python 3.12
+          ccache --show-stats
 
       - name: Show build / capability info
         env:
-          EXPECT_LAPACK: ${{ matrix.expect_lapack }}
+          EXPECT_LAPACK: ${{ matrix.leg.expect_lapack }}
         run: |
           set -euxo pipefail
           uv run --no-sync python -c "import platform, sys; print(platform.platform()); print(sys.version)"
@@ -241,74 +264,36 @@ jobs:
       # strict catches tests that quietly turn into skips for a reason nobody
       # signed off on.
       #
-      # The suite runs under pytest-xdist, one test file per worker, as the
-      # pre-push hook does (ci/pre_push_pytest.py, where the measurements are).
-      # Serially this step was 16-28 minutes of a 20-33 minute job. The workers
-      # share one artifact cache: with -p no:cacheprovider each would otherwise
-      # take a temp dir of its own (conftest's no-cacheprovider branch) and
-      # compile the same codegen libraries again, and on macOS each new library
-      # also pays a first-load check that the system runs one file at a time.
-      # The skip audit and the summary line the guard below reads come from the
-      # xdist controller, as they come from the one process serially.
-      - name: Run the full Python suite
+      # The suite runs this job's shard under pytest-xdist with work stealing:
+      # one test at a time to whichever worker is free. One file per worker
+      # (--dist loadfile) left test_expression_backend_equivalence.py, a fifth of
+      # a shard's time, on a single worker. Every one of the 13,573 tests had
+      # the same outcome both ways (2026-10-18). The workers share one artifact
+      # cache: with -p no:cacheprovider each would otherwise take a temp dir of
+      # its own (conftest's no-cacheprovider branch) and compile the same codegen
+      # libraries again, and on macOS each new library also pays a first-load
+      # check that the system runs one file at a time. The skip audit and the
+      # summary line the counts job reads come from the xdist controller, as
+      # they come from the one process serially.
+      #
+      # A dispatched run with pytest_args runs those args, unsharded, in shard 1.
+      - name: Run the Python suite (this shard)
         id: pytest
+        if: ${{ matrix.shard == 1 || !github.event.inputs.pytest_args }}
         env:
           BNGSIM_SKIP_AUDIT: strict
           BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
           BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
+          BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
+          PYTEST_ARGS: ${{ github.event.inputs.pytest_args }}
         run: |
           set -o pipefail
+          if [ -n "$PYTEST_ARGS" ]; then unset BNGSIM_TEST_SHARD; fi
           uv run --no-sync python -m pytest -p no:cacheprovider python/tests \
-            -n auto --dist loadfile \
+            -n auto --dist worksteal \
+            --junitxml=python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.xml \
             -q --tb=short --durations=15 ${{ github.event.inputs.pytest_args }} \
-            2>&1 | tee python-tests-${{ matrix.label }}.log
-
-      - name: Guard against a false green
-        if: ${{ !github.event.inputs.pytest_args }}
-        run: |
-          set -euo pipefail
-          # A directory-scoped pytest cannot drift out of sync with a file list,
-          # but it can still shrink: a module that stops importing skips at
-          # collection, a rename orphans a file, a bad conftest deselects. None of
-          # those is a failure — the run stays green with a smaller denominator,
-          # which is the #28/#36 shape native-tests.yml guards with its own
-          # floors. Two counts here, because there are two ways to shrink:
-          #
-          #   1. COLLECTED (passed + skipped + xfailed + xpassed) has a floor. A
-          #      drop means tests stopped being collected. Every leg reports the
-          #      same number, because a CI checkout has no gitignored corpora (a
-          #      developer checkout that has them collects more; see
-          #      ci/test_floors.env).
-          #   2. SKIPPED has a ceiling. Crossing it means a group of tests turned
-          #      into skips for a *declared* reason that BNGSIM_SKIP_AUDIT=strict
-          #      accepts, e.g. an extra silently failing to install, provided
-          #      the group is larger than the ceiling's headroom on that leg
-          #      (30 to 56 tests; see ci/test_floors.env). This used to be a
-          #      floor on PASSED, which had to keep moving as the suite grew; a
-          #      skip count does not move when tests are added.
-          #
-          # The bounds live in ci/test_floors.env and ci/check_test_count.sh
-          # holds each count to its own (issue #584). The check fails in both
-          # directions: past the bound, and so far inside it that the bound has
-          # gone stale. The second is what used to be missing. These floors had
-          # sat untouched at 3480 and 3380 while the suite grew past 11000, so
-          # two thirds of it could have vanished and this step stayed green.
-          LOG="python-tests-${{ matrix.label }}.log"
-          summary="$(grep -E '[0-9]+ (passed|failed).* in [0-9.]+s' "$LOG" | tail -1 || true)"
-          if [ -z "$summary" ]; then
-            echo "::error::No pytest summary line — the suite did not run to completion."
-            exit 1
-          fi
-          echo "summary: $summary"
-
-          # "3 xpassed" cannot match "[0-9]+ passed", so the categories stay disjoint.
-          count() { echo "$summary" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
-          passed="$(count passed)"
-          skipped="$(count skipped)"
-          collected=$(( passed + skipped + $(count xfailed) + $(count xpassed) ))
-
-          bash ci/check_test_count.sh PYTEST_COLLECTED "$collected" "tests stopped being collected rather than failing"
-          bash ci/check_test_count.sh PYTEST_SKIPPED "$skipped" "a group of tests turned into skips"
+            2>&1 | tee python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
 
       # The parity harness's own unit tests (issue #316). Nothing ran these until
       # now, which is a false green over the code that decides every parity
@@ -339,7 +324,7 @@ jobs:
         run: |
           set -o pipefail
           uv run --no-sync python -m pytest -p no:cacheprovider parity_checks/tests \
-            -q --tb=short 2>&1 | tee parity-tests-${{ matrix.label }}.log
+            -q --tb=short 2>&1 | tee parity-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
 
       - name: Guard against a false green (parity harness)
         if: ${{ !github.event.inputs.pytest_args }}
@@ -351,7 +336,7 @@ jobs:
           # class-level, so a missing engine moves tests between columns without
           # changing the total — 443 both fully provisioned and with amici,
           # roadrunner and BNG2.pl all absent, when this guard was added.
-          LOG="parity-tests-${{ matrix.label }}.log"
+          LOG="parity-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log"
           summary="$(grep -E '[0-9]+ (passed|failed).* in [0-9.]+s' "$LOG" | tail -1 || true)"
           if [ -z "$summary" ]; then
             echo "::error::No pytest summary line — the parity suite did not run to completion."
@@ -417,7 +402,7 @@ jobs:
       - name: SBML semantic suite gate
         id: sbml_gate
         if: ${{ !cancelled() && steps.sbml_pin.outcome == 'success' && steps.sbml_fetch.outcome != 'failure' }}
-        run: uv run --no-sync python ci/sbml_suite_gate.py --suite "$RUNNER_TEMP/sbml-test-suite" --fresh-out "sbml-suite-verdicts-${{ matrix.label }}.json"
+        run: uv run --no-sync python ci/sbml_suite_gate.py --suite "$RUNNER_TEMP/sbml-test-suite" --fresh-out "sbml-suite-verdicts-${{ matrix.leg.label }}-${{ matrix.shard }}.json"
 
       # Conditioned on the pytest step having been reached, not just on always():
       # if the build fails there is no log to upload, and if-no-files-found=error
@@ -428,16 +413,18 @@ jobs:
         if: always() && steps.pytest.conclusion != 'skipped'
         uses: actions/upload-artifact@v4
         with:
-          name: python-tests-log-${{ matrix.label }}
-          path: python-tests-${{ matrix.label }}.log
+          name: python-tests-log-${{ matrix.leg.label }}-${{ matrix.shard }}
+          path: |
+            python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
+            python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.xml
           if-no-files-found: error
 
       - name: Upload parity pytest log
         if: always() && steps.parity_pytest.conclusion != 'skipped'
         uses: actions/upload-artifact@v4
         with:
-          name: parity-tests-log-${{ matrix.label }}
-          path: parity-tests-${{ matrix.label }}.log
+          name: parity-tests-log-${{ matrix.leg.label }}-${{ matrix.shard }}
+          path: parity-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
           if-no-files-found: error
 
       # This run's per-case verdicts, when they do not match the baseline. It is
@@ -447,6 +434,83 @@ jobs:
         if: always() && steps.sbml_gate.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: sbml-suite-verdicts-${{ matrix.label }}
-          path: sbml-suite-verdicts-${{ matrix.label }}.json
+          name: sbml-suite-verdicts-${{ matrix.leg.label }}-${{ matrix.shard }}
+          path: sbml-suite-verdicts-${{ matrix.leg.label }}-${{ matrix.shard }}.json
           if-no-files-found: warn
+
+  # The false-green guard for a whole leg: the sum of its two shards' summaries.
+  # conftest puts every collected test in exactly one shard, so the sum is what
+  # one unsharded job reported. The labels here are the legs' labels above;
+  # test_ci_shards.py holds the two lists together.
+  python-tests-counts:
+    name: Python suite counts · ${{ matrix.label }}
+    needs: python-tests
+    if: ${{ !cancelled() && !github.event.inputs.pytest_args }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [ubuntu-latest, macos-14, ubuntu-latest-lapack]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download this leg's shard logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-tests-log-${{ matrix.label }}-*
+          merge-multiple: true
+
+      - name: Guard against a false green
+        run: |
+          set -euo pipefail
+          # A directory-scoped pytest cannot drift out of sync with a file list,
+          # but it can still shrink: a module that stops importing skips at
+          # collection, a rename orphans a file, a bad conftest deselects. None of
+          # those is a failure — the run stays green with a smaller denominator,
+          # which is the #28/#36 shape native-tests.yml guards with its own
+          # floors. Two counts here, because there are two ways to shrink:
+          #
+          #   1. COLLECTED (passed + skipped + xfailed + xpassed) has a floor. A
+          #      drop means tests stopped being collected. Every leg reports the
+          #      same number, because a CI checkout has no gitignored corpora (a
+          #      developer checkout that has them collects more; see
+          #      ci/test_floors.env).
+          #   2. SKIPPED has a ceiling. Crossing it means a group of tests turned
+          #      into skips for a *declared* reason that BNGSIM_SKIP_AUDIT=strict
+          #      accepts, e.g. an extra silently failing to install, provided
+          #      the group is larger than the ceiling's headroom on that leg
+          #      (30 to 56 tests; see ci/test_floors.env). This used to be a
+          #      floor on PASSED, which had to keep moving as the suite grew; a
+          #      skip count does not move when tests are added.
+          #
+          # The bounds live in ci/test_floors.env and ci/check_test_count.sh
+          # holds each count to its own (issue #584). The check fails in both
+          # directions: past the bound, and so far inside it that the bound has
+          # gone stale. The second is what used to be missing. These floors had
+          # sat untouched at 3480 and 3380 while the suite grew past 11000, so
+          # two thirds of it could have vanished and this step stayed green.
+          # "3 xpassed" cannot match "[0-9]+ passed", so the categories stay disjoint.
+          #
+          # A shard whose log has no summary did not finish, and the sum would be
+          # short by a shard: fail on that rather than on the floor it would trip.
+          collected=0
+          skipped=0
+          for shard in 1 2; do
+            LOG="python-tests-${{ matrix.label }}-$shard.log"
+            summary="$(grep -E '[0-9]+ (passed|failed).* in [0-9.]+s' "$LOG" 2>/dev/null | tail -1 || true)"
+            if [ -z "$summary" ]; then
+              echo "::error::No pytest summary line for shard $shard/2 — it did not run to completion."
+              exit 1
+            fi
+            echo "shard $shard/2: $summary"
+
+            # "3 xpassed" cannot match "[0-9]+ passed", so the categories stay disjoint.
+            count() { echo "$summary" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
+            skipped=$(( skipped + $(count skipped) ))
+            collected=$(( collected + $(count passed) + $(count skipped) + $(count xfailed) + $(count xpassed) ))
+          done
+          echo "leg total: $collected collected, $skipped skipped"
+
+          bash ci/check_test_count.sh PYTEST_COLLECTED "$collected" "tests stopped being collected rather than failing"
+          bash ci/check_test_count.sh PYTEST_SKIPPED "$skipped" "a group of tests turned into skips"
