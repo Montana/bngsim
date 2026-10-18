@@ -79,7 +79,10 @@ jobs:
         with:
           python-version: ${{ inputs.python_version || '3.12' }}
 
+      # Compile in parallel; windows-tail.yml's build step says why.
       - name: Build & install bngsim (NFsim on, KLU off)
+        env:
+          CL: -MP
         shell: bash
         run: |
           set -euxo pipefail
