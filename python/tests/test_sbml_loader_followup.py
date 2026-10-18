@@ -871,6 +871,190 @@ def test_c2b_hatch_zero_reaches_the_rateof_fold(monkeypatch):
     assert model.get_param("p") == 0.0
 
 
+# ─── C2c: a conversionFactor that names a valueless parameter ───────────
+#
+# `S1 -> S2` at 0.5*S1 in a compartment of size 1, S1 = 1, S2 = 0, with a
+# conversionFactor `cf` on S1 (or on the model). SBML leaves a parameter with no
+# value, initialAssignment or assignmentRule undefined, and RoadRunner refuses
+# the model. bngsim read the factor as 1 and gave S1(1) = e^-0.5 = 0.607, with no
+# warning. With cf = 2, S1(1) = e^-1; S2(1) = (1 - e^-1)/2 when only S1 is
+# converted, and 1 - e^-1 when the model-wide factor converts S2 as well.
+
+_CF_ON = ' conversionFactor="cf"'
+_CF_UNSET = '<parameter id="cf" constant="true"/>'
+_CF_MATH_2 = '<math xmlns="http://www.w3.org/1998/Math/MathML"><cn>2</cn></math>'
+_CF_LEVELS = [
+    pytest.param({"species_cf": _CF_ON}, "the conversionFactor of species 'S1'", id="species"),
+    pytest.param({"model_cf": _CF_ON}, "the model's conversionFactor", id="model"),
+]
+
+
+def _cf_sbml(
+    *,
+    species_cf: str = "",
+    model_cf: str = "",
+    cf_param: str = _CF_UNSET,
+    extra: str = "",
+    extra_species: str = "",
+) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+      <model id="m"{model_cf}>
+        <listOfCompartments><compartment id="C" size="1" constant="true"/></listOfCompartments>
+        <listOfSpecies>
+          <species id="S1" compartment="C" initialConcentration="1"
+                   hasOnlySubstanceUnits="false" boundaryCondition="false"
+                   constant="false"{species_cf}/>
+          <species id="S2" compartment="C" initialConcentration="0"
+                   hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+          {extra_species}
+        </listOfSpecies>
+        <listOfParameters>{cf_param}</listOfParameters>
+        {extra}
+        <listOfReactions>
+          <reaction id="J0" reversible="false">
+            <listOfReactants>
+              <speciesReference species="S1" stoichiometry="1" constant="true"/>
+            </listOfReactants>
+            <listOfProducts>
+              <speciesReference species="S2" stoichiometry="1" constant="true"/>
+            </listOfProducts>
+            <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+              <apply><times/><cn>0.5</cn><ci>S1</ci></apply>
+            </math></kineticLaw>
+          </reaction>
+        </listOfReactions>
+      </model>
+    </sbml>"""
+
+
+def _cf_end_state(sbml: str) -> tuple[float, float]:
+    res = bngsim.Simulator(bngsim.Model.from_sbml_string(sbml), method="ode").run(
+        t_span=(0.0, 1.0), n_points=2, rtol=1e-10, atol=1e-12
+    )
+    names = list(res.species_names)
+    return float(res.species[-1, names.index("S1")]), float(res.species[-1, names.index("S2")])
+
+
+@pytest.mark.parametrize(("attrs", "where"), _CF_LEVELS)
+def test_c2c_valueless_conversion_factor_refuses(monkeypatch, attrs, where):
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    with pytest.raises(bngsim.UnderSpecifiedModelError) as exc:
+        bngsim.Model.from_sbml_string(_cf_sbml(**attrs))
+    msg = str(exc.value)
+    assert f"'cf' ({where})" in msg
+    assert "BNGSIM_ALLOW_UNSET_PARAMS" in msg
+
+
+@pytest.mark.parametrize(
+    ("cf_param", "extra"),
+    [
+        pytest.param('<parameter id="cf" value="2" constant="true"/>', "", id="value"),
+        pytest.param(
+            _CF_UNSET,
+            "<listOfInitialAssignments><initialAssignment symbol="
+            f'"cf">{_CF_MATH_2}</initialAssignment></listOfInitialAssignments>',
+            id="initialAssignment",
+        ),
+        pytest.param(
+            '<parameter id="cf" constant="false"/>',
+            f'<listOfRules><assignmentRule variable="cf">{_CF_MATH_2}</assignmentRule>'
+            "</listOfRules>",
+            id="assignmentRule",
+        ),
+        pytest.param(
+            '<parameter id="cf" constant="false"/>',
+            "<listOfInitialAssignments><initialAssignment symbol="
+            f'"cf">{_CF_MATH_2}</initialAssignment></listOfInitialAssignments>'
+            '<listOfRules><rateRule variable="cf"><math '
+            'xmlns="http://www.w3.org/1998/Math/MathML"><cn>0</cn></math></rateRule>'
+            "</listOfRules>",
+            id="rateRule-from-initialAssignment",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("attrs", "where"), _CF_LEVELS)
+def test_c2c_conversion_factor_the_model_gives_a_value_loads(
+    monkeypatch, attrs, where, cf_param, extra
+):
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    s1, s2 = _cf_end_state(_cf_sbml(**attrs, cf_param=cf_param, extra=extra))
+    assert s1 == pytest.approx(math.exp(-1.0), rel=1e-6)
+    converted_s2 = "model_cf" in attrs
+    assert s2 == pytest.approx((1 - math.exp(-1.0)) / (1 if converted_s2 else 2), rel=1e-6)
+
+
+def test_c2c_hatch_loads_with_the_factor_at_zero(monkeypatch, caplog):
+    """Under BNGSIM_ALLOW_UNSET_PARAMS=1 the factor is 0.0, the value the hatch
+    gives the parameter everywhere else: S1 stays at 1 while S2 gains 0.5*S1."""
+    import logging
+
+    monkeypatch.setenv("BNGSIM_ALLOW_UNSET_PARAMS", "1")
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        s1, s2 = _cf_end_state(_cf_sbml(species_cf=_CF_ON))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert [m for m in msgs if "'cf' (the conversionFactor of species 'S1')" in m], msgs
+    assert s1 == pytest.approx(1.0, rel=1e-9)
+    assert s2 == pytest.approx(0.5, rel=1e-6)
+
+
+# S3 has no initial value, so `2 + S3` has none at load.
+_CF_TWO_PLUS_S3 = (
+    '<math xmlns="http://www.w3.org/1998/Math/MathML"><apply><plus/><cn>2</cn>'
+    "<ci>S3</ci></apply></math>"
+)
+_S3_NO_VALUE = (
+    '<species id="S3" compartment="C" hasOnlySubstanceUnits="false" '
+    'boundaryCondition="false" constant="false"/>'
+)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        pytest.param(
+            {"species_cf": ' conversionFactor="C"'},
+            "conversionFactor of species 'S1' is 'C', which is not a parameter",
+            id="a-compartment",
+        ),
+        pytest.param(
+            {"model_cf": ' conversionFactor="nope"'},
+            "model's conversionFactor is 'nope', which is not a parameter",
+            id="no-such-id",
+        ),
+        pytest.param(
+            {
+                "species_cf": _CF_ON,
+                "cf_param": '<parameter id="cf" constant="false"/>',
+                "extra": f'<listOfRules><assignmentRule variable="cf">{_CF_TWO_PLUS_S3}'
+                "</assignmentRule></listOfRules>",
+                "extra_species": _S3_NO_VALUE,
+            },
+            r"could not evaluate the assignmentRule cf = 2 \+ S3 at load",
+            id="a-rule-with-no-value-at-load",
+        ),
+        pytest.param(
+            {
+                "species_cf": _CF_ON,
+                "cf_param": '<parameter id="cf" value="5" constant="true"/>',
+                "extra": '<listOfInitialAssignments><initialAssignment symbol="cf">'
+                f"{_CF_TWO_PLUS_S3}</initialAssignment></listOfInitialAssignments>",
+                "extra_species": _S3_NO_VALUE,
+            },
+            r"could not evaluate the initialAssignment cf = 2 \+ S3 at load",
+            id="an-initialAssignment-with-no-value-at-load",
+        ),
+    ],
+)
+def test_conversion_factor_with_no_value_to_read_refuses(kwargs, match):
+    """A factor that names no parameter (invalid SBML, libsbml rules 20617 and
+    20216) was read as 1. One whose assignmentRule reads a species with no initial
+    value was read as 1 too, and one whose initialAssignment does was read as its
+    declared value: 5, while the parameter itself read 2 (RoadRunner's factor)."""
+    with pytest.raises(bngsim.ModelError, match=match):
+        bngsim.Model.from_sbml_string(_cf_sbml(**kwargs))
+
+
 # ─── #580: a species the model never gives an initial value ─────────────
 #
 # SBML leaves it undefined. bngsim starts it at 0.0, as RoadRunner does (7 of the

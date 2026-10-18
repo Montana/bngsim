@@ -2053,6 +2053,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         sbml_model.getSpecies(i).getId(): sbml_model.getSpecies(i)
         for i in range(sbml_model.getNumSpecies())
     }
+    # A species' conversionFactor, its own or else the model's, scales the change
+    # every reaction makes to its amount, as the emitted rates do (§3b). Left
+    # out, `p = rateOf(S)` with S's factor 2 folded to half the rate that a rule
+    # reading rateOf(S) has at the same instant, and that RoadRunner gives.
+    model_cf = sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else None
+    cf_of = {
+        sid: sp.getConversionFactor() if sp.isSetConversionFactor() else model_cf
+        for sid, sp in species_by_id.items()
+    }
 
     def _net_stoich(rxn, sid, ctx):
         """Signed product−reactant stoichiometry of ``sid`` in ``rxn`` (0 if absent)."""
@@ -2115,6 +2124,14 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if v is None:
                 return None
             amt_rate += net * v
+        if cf_of.get(name) is not None:
+            # A factor with no value yet fails the fold: the initialAssignment
+            # or rule that gives it one refolds this on a later pass, and C2c
+            # refuses one the model never gives.
+            cf = ctx.get(cf_of[name])
+            if cf is None:
+                return None
+            amt_rate *= cf
         # ``current_derivs`` is d[conc]/dt; rateOf reports amount-rate for a hOSU
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
@@ -5030,6 +5047,69 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "BNGSIM_ALLOW_UNSET_PARAMS=1."
             )
 
+    # ── C2c: a conversionFactor that names a valueless parameter ──
+    # A conversionFactor attribute, the model's or a species' own, reads a global
+    # parameter as surely as a rate law does, but it is not math, so C2's walk
+    # does not see it. SBML leaves such a parameter's value undefined, and the
+    # factor scales every change a reaction makes to the species' amount. §3b
+    # used to read it as 1, so the model ran as if it declared no factor:
+    # `S1 -> S2` at 0.5*S1 with S1's factor `cf` left without a value gave
+    # S1(1) = e^-0.5 = 0.607 and no warning. RoadRunner refuses the model. A
+    # factor that an initialAssignment or an assignmentRule gives a value is not
+    # in `_unset_param_ids` and loads as before (SBML suite 01642-01644 and
+    # 01651-01653 give theirs by an initialAssignment). One whose
+    # initialAssignment does not fold at load is in it too, but the model does
+    # assign it, so it is left to §3b, which names the assignment it could not
+    # evaluate. Like C2 this goes by what the attribute names, so a model-wide
+    # factor that every species overrides still refuses. Same refusal and hatch
+    # as C2; under the hatch the factor is 0.0, the value the parameter itself is
+    # given everywhere else.
+    _cf_unset = _unset_param_ids - {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+    }
+    _unset_cf: list[tuple[str, str]] = []
+    if sbml_model.isSetConversionFactor() and sbml_model.getConversionFactor() in _cf_unset:
+        _unset_cf.append((sbml_model.getConversionFactor(), "the model's conversionFactor"))
+    for j in range(sbml_model.getNumSpecies()):
+        _sp = sbml_model.getSpecies(j)
+        if _sp.isSetConversionFactor() and _sp.getConversionFactor() in _cf_unset:
+            _unset_cf.append(
+                (_sp.getConversionFactor(), f"the conversionFactor of species {_sp.getId()!r}")
+            )
+    if _unset_cf:
+        import os
+
+        from bngsim._exceptions import UnderSpecifiedModelError
+
+        one = len(_unset_cf) == 1
+        names = ", ".join(f"{pid!r} ({where})" for pid, where in _unset_cf)
+        lead = (f"Parameter {names} has" if one else f"Parameters {names} have") + (
+            " no value attribute, initialAssignment or assignmentRule"
+        )
+        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            logger.warning(
+                "%s, so SBML leaves the conversion %s undefined. bngsim takes %s as 0.0 "
+                "(BNGSIM_ALLOW_UNSET_PARAMS=1), so no reaction changes the amount of a "
+                "species %s converts. Set the %s.",
+                lead,
+                "factor" if one else "factors",
+                "it" if one else "them",
+                "it" if one else "they",
+                "value" if one else "values",
+            )
+        else:
+            raise UnderSpecifiedModelError(
+                f"{lead}, so SBML leaves the conversion "
+                f"{'factor' if one else 'factors'} undefined. The model is "
+                "under-specified: bngsim refuses to read a factor as 1, which would "
+                "silently drop it from every reaction that changes the species and "
+                "return a wrong-but-plausible trajectory (RoadRunner refuses the same "
+                "model). Set the parameter value or add an initialAssignment. To load "
+                "with the factor at 0.0, the legacy lenient default for a parameter "
+                "with no value, set BNGSIM_ALLOW_UNSET_PARAMS=1."
+            )
+
     # Pre-scan rate-rule targets and event-assignment targets up front so
     # both step 1 (compartments) and step 2 (parameters) can skip IDs that
     # will be promoted to species later in step 8 / event handling. Without
@@ -6354,16 +6434,50 @@ def _build_model_from_sbml_doc_in_context(doc):
     # expressed as a single rate scale and are refused loudly there (never
     # silently mis-integrated). Models with no conversionFactor leave
     # ``_has_conversion_factor`` False and this is a complete no-op.
-    def _resolve_const_param_value(pid):
-        # conversionFactor parameters are constant: value = initialAssignment if
-        # any, else the declared value.
-        if pid in ia_values:
-            return ia_values[pid]
+    def _resolve_const_param_value(pid, what):
+        # conversionFactor parameters are constant, and the factor is folded into
+        # the rates as a number: the value its initialAssignment (or an
+        # assignmentRule) gives it at load, else the declared one. Nothing falls
+        # back to a number the model did not give. A factor read as 1 is a factor
+        # dropped without a word, and a declared value that an assignment
+        # replaces is not the factor either: `cf = 5` with the initialAssignment
+        # `cf = 2 + S3`, S3 given no initial value, scaled the rates by 5 while
+        # the parameter read 2 (RoadRunner: 2). C2c refused a factor the model
+        # gives no value at all; under its hatch the factor is 0.0, as the
+        # parameter is.
+        from bngsim._exceptions import ModelError
+
         p = sbml_model.getParameter(pid)
-        return p.getValue() if (p is not None and p.isSetValue()) else 1.0
+        if p is None:
+            # Invalid SBML (libsbml validation rules 20216 and 20617).
+            raise ModelError(
+                f"{what} is {pid!r}, which is not a parameter of the model. SBML "
+                "requires a conversionFactor to name a constant parameter, and bngsim "
+                "will not read it as 1."
+            )
+        if pid in _ia_math or pid in _ar_targets:
+            kind = "initialAssignment" if pid in _ia_math else "assignmentRule"
+            # `ia_values` holds the declared value for an initialAssignment that
+            # did not fold (issue #732), so whether it folds is asked directly.
+            folded = _ia_folds(_ia_math[pid]) if pid in _ia_math else pid in ia_values
+            if folded and pid in ia_values:
+                return ia_values[pid]
+            _m = _ia_math[pid] if pid in _ia_math else sbml_model.getRuleByVariable(pid).getMath()
+            raise ModelError(
+                f"{what} is {pid!r}, and bngsim could not evaluate the {kind} "
+                f"{pid} = {libsbml.formulaToL3String(_m)} at load, so it has no "
+                "number to scale the rates by: it reads something with no value "
+                "there. A conversionFactor must name a constant parameter; give it a "
+                "value, or an initialAssignment that evaluates at load."
+            )
+        if p.isSetValue():
+            return p.getValue()
+        return 0.0  # BNGSIM_ALLOW_UNSET_PARAMS=1: C2c refused it otherwise, and warned
 
     _model_cf_val = (
-        _resolve_const_param_value(sbml_model.getConversionFactor())
+        _resolve_const_param_value(
+            sbml_model.getConversionFactor(), "The model's conversionFactor"
+        )
         if sbml_model.isSetConversionFactor()
         else None
     )
@@ -6372,7 +6486,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     for _sid in species_ids:
         _sp = sbml_model.getSpecies(_sid)
         if _sp is not None and _sp.isSetConversionFactor():
-            species_cf[_sid] = _resolve_const_param_value(_sp.getConversionFactor())
+            species_cf[_sid] = _resolve_const_param_value(
+                _sp.getConversionFactor(), f"The conversionFactor of species {_sid!r}"
+            )
             _any_species_cf = True
         elif _model_cf_val is not None:
             species_cf[_sid] = _model_cf_val
@@ -9237,6 +9353,11 @@ def _build_model_from_sbml_doc_in_context(doc):
                     # The rate of a concentration is the amount's over the
                     # size (`c = 1 + rateOf(B)`: a write to B's `d` 0.33 off).
                     _rate.add(_sp_r.getCompartment())
+                # And its conversionFactor scales the amount's rate.
+                if _sp_r.isSetConversionFactor():
+                    _rate.add(_sp_r.getConversionFactor())
+                elif sbml_model.isSetConversionFactor():
+                    _rate.add(sbml_model.getConversionFactor())
     for _j in range(sbml_model.getNumRules() if _uses_rateof else 0):
         _r = sbml_model.getRule(_j)
         if _r.isRate() and _r.getMath() is not None:
