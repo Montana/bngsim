@@ -210,5 +210,5 @@ def test_a_condition_an_event_also_moves_is_refused():
         params='<parameter id="p" value="3" constant="false"/>',
         events=event,
     )
-    with pytest.raises(bngsim.ModelError, match=r"event target"):
+    with pytest.raises(bngsim.ModelError, match=r"p, which an event changes"):
         bngsim.Model.from_sbml_string(xml)

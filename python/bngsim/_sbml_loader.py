@@ -2208,6 +2208,136 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
 
 
+def _rule_compartments_an_event_resizes(
+    rule_math: dict,
+    ar_comp_targets,
+    resized_comps: list[tuple[str, str]],
+    assigned: dict[str, str],
+    rescaled_species: dict[str, list[str]],
+    to_exprtk,
+    cache: dict | None = None,
+) -> list[tuple[str, str]]:
+    """``(compartment, new size)`` for each assignment-rule compartment an event
+    resizes that ``resized_comps`` does not already hold, each after the ones
+    whose resize it reads (issue #1055).
+
+    A compartment is resized by an event that changes anything its size rule
+    reads: a variable the event assigns, another compartment the event resizes,
+    or a species whose concentration that resize rescales (a concentration in a
+    resized compartment keeps its amount, so it moves). And the rule is read
+    through other assignment rules, not only its own names: ``cv := 1 + q``,
+    ``q := 0.5*p`` is resized by ``p := 4``. Only the rule's own names were read
+    before, so both kinds of indirection left the compartment's species
+    unrescaled.
+
+    The order matters because the engine reads each new size after the rescales
+    listed before it. So the set is found first and ordered after: a
+    compartment listed when it first reaches a change could still read a
+    species a later one rescales (``cw := p + 0.1*Sn`` with Sn in ``cv :=
+    1 + 0.1*Kw``, and an event setting p and Kw's compartment), and its size
+    was then read with that species unmoved.
+
+    The new size is the rule with the rules it reaches written out and the
+    event's values put in: an assigned variable's value, a resized
+    compartment's new size, and a rescaled species' value after the rescale.
+    The event's sensitivity support reads that text.
+
+    ``rule_math`` maps each assignment rule's variable to its math, in document
+    order; ``assigned`` maps each variable the event assigns to its value;
+    ``rescaled_species`` maps a compartment to the species a resize of it
+    rescales; ``to_exprtk`` writes math as ExprTk text. ``cache``, kept by the
+    caller from one event to the next, holds what is read from the rules
+    alone, so that each rule is walked once per model rather than once per
+    event.
+    """
+    cache = {} if cache is None else cache
+    reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
+
+    def reads(var: str) -> frozenset:
+        """Every name the rule for ``var`` reads, itself or through the rules
+        it reads. Each rule is walked once, which a diamond of rules needs."""
+        if var not in reads_memo:
+            reads_memo[var] = frozenset()  # a cycle of rules reads no further
+            names: set[str] = set()
+            for n in _ast_name_set(rule_math[var]):
+                names.add(n)
+                if n in rule_math:
+                    names |= reads(n)
+            reads_memo[var] = frozenset(names)
+        return reads_memo[var]
+
+    def moves(comp: str) -> set[str]:
+        """The compartment and the species a resize of it rescales."""
+        return {comp, *rescaled_species.get(comp, ())}
+
+    changed = set(assigned)
+    for comp, _ in resized_comps:
+        changed |= moves(comp)
+    resized: list[str] = []
+    progress = True
+    while progress:
+        progress = False
+        for comp in rule_math:
+            if comp in ar_comp_targets and comp not in changed and reads(comp) & changed:
+                resized.append(comp)
+                changed |= moves(comp)
+                progress = True
+
+    # Each one after every other whose size or species it reads. Two that read
+    # each other's species have no such order and keep the document's.
+    ordered: list[str] = []
+    pending = list(resized)
+    while pending:
+        comp = next(
+            (c for c in pending if not any(reads(c) & moves(d) for d in pending if d != c)),
+            pending[0],
+        )
+        pending.remove(comp)
+        ordered.append(comp)
+
+    replacements = {_safe_name(var): expr for var, expr in assigned.items()}
+
+    def note_rescaled(comp: str, new_size: str) -> None:
+        # A species the event also assigns is given that value in the old size,
+        # and keeps the amount it makes there (as the rescale the caller
+        # injects for it does).
+        for sid in rescaled_species.get(comp, ()):
+            amount = f"({assigned[sid]})" if sid in assigned else _safe_name(sid)
+            replacements[_safe_name(sid)] = f"{amount} * ({_safe_name(comp)}) / ({new_size})"
+
+    for comp, new_size in resized_comps:
+        note_rescaled(comp, new_size)
+
+    if "rule_of" not in cache:
+        cache["rule_of"] = {_safe_name(var): var for var in rule_math}
+    rule_of: dict[str, str] = cache["rule_of"]
+    rule_text: dict[str, str] = cache.setdefault("text", {})
+
+    def inlined(expr: str, depth: int = 0) -> str:
+        """The text with each rule it reads that reaches a change written out,
+        so that the event's values can be put in."""
+        if depth > 64:
+            return expr
+        inner = {}
+        for name in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)):
+            var = rule_of.get(name)
+            if var is not None and var not in changed and reads(var) & changed:
+                if var not in rule_text:
+                    rule_text[var] = to_exprtk(rule_math[var])
+                inner[name] = rule_text[var]
+        if not inner:
+            return expr
+        return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
+
+    found: list[tuple[str, str]] = []
+    for comp in ordered:
+        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        found.append((comp, new_size))
+        replacements[_safe_name(comp)] = new_size
+        note_rescaled(comp, new_size)
+    return found
+
+
 def _piecewise_branches(node) -> tuple[list, list]:
     """``(condition_children, value_children)`` of a MathML ``piecewise``.
 
@@ -7658,14 +7788,72 @@ def _build_model_from_sbml_doc_in_context(doc):
         # own rescale owns that jump; one that reads an event target and the
         # state or time could flip at the event and then again by the jump
         # event, so it is refused.
-        _event_targets = {
-            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+        #
+        # An event moves more than what it assigns: a concentration in a
+        # compartment it resizes, directly or through the compartment's rule,
+        # is rescaled there, and that resize's own rescale carries any jump of
+        # a size that reads it (#1055). Left out, both rescaled at the event:
+        # `cv := piecewise(2, Kw > 7, 1)` with Kw in a compartment the event
+        # doubles took [Sn] to 20 for 10. And a species no reaction or rule
+        # moves, in a compartment that holds its size between events, moves
+        # only at an event, though it is not constant: `cv := piecewise(1, Kw >
+        # 7, 2)` beside `at (t > 1): Kw = 2` was refused, where the event's
+        # resize alone is right.
+        _event_moved = {
+            sbml_model.getEvent(k).getEventAssignment(j).getVariable()
             for k in range(sbml_model.getNumEvents())
             for j in range(sbml_model.getEvent(k).getNumEventAssignments())
         }
+        _rescaled_in: dict[str, set[str]] = {}
+        for _sid, _scomp in species_comp.items():
+            if not species_hosu.get(_sid, False) and _sid not in assignment_targets:
+                _rescaled_in.setdefault(_scomp, set()).add(_sid)
+        _size_rule_math = {
+            sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
+            for j in range(sbml_model.getNumRules())
+            if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
+        }
+        _rule_reach: dict[str, frozenset] = {}
+
+        def _reaches(var: str) -> frozenset:
+            if var not in _rule_reach:
+                _rule_reach[var] = frozenset()  # a cycle of rules reads no further
+                names: set[str] = set()
+                for n in _ast_name_set(_size_rule_math[var]):
+                    names.add(n)
+                    if n in _size_rule_math:
+                        names |= _reaches(n)
+                _rule_reach[var] = frozenset(names)
+            return _rule_reach[var]
+
+        for _comp in _event_moved & _comp_id_set:
+            _event_moved |= _rescaled_in.get(_comp, set())
+        _grew = True
+        while _grew:
+            _grew = False
+            for _comp in sorted(ar_comp_targets - _event_moved):
+                if _reaches(_comp) & _event_moved:
+                    _event_moved |= {_comp, *_rescaled_in.get(_comp, ())}
+                    _grew = True
+        _event_targets = {_alias(_safe_name(n)) for n in _event_moved}
+        _flow_free = {
+            s
+            for s in _sbml_species_ids
+            if s not in reaction_species
+            and s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _moving = (
             {_TIME_SYM}
-            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | {
+                a
+                for a, s in _species_alias.items()
+                if s not in _still_species and s not in _flow_free
+            }
             | set(_rr_alias)
             | set(_rate_token_species)
         )
@@ -7706,8 +7894,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where "
                         f"{c} flips, which reads "
-                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
-                        "moves with the run as well; bngsim would rescale its "
+                        f"{', '.join(sorted(names & _event_targets))}, which an event "
+                        "changes, and moves with the run as well; bngsim would rescale its "
                         "concentrations twice when an event flips it"
                     )
                     continue
@@ -8904,6 +9092,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         # or priority that is a plain number still folds.
         event_fold_ctx: dict[str, float] = {}
 
+        # What an event's resize of an assignment-rule compartment is found
+        # from (issue #1055): each assignment rule's math, in document order,
+        # and the species a resize of each compartment rescales. Both are the
+        # same for every event, so they are read once, not once per event.
+        event_rule_math: dict[str, object] = {}
+        event_rescaled_species: dict[str, list[str]] = {}
+        event_rule_cache: dict = {}
+        if ar_comp_targets:
+            for j in range(sbml_model.getNumRules()):
+                rule = sbml_model.getRule(j)
+                if rule.isAssignment() and rule.getMath() is not None:
+                    event_rule_math[rule.getVariable()] = rule.getMath()
+            for sid, scomp in species_comp.items():
+                if not species_hosu.get(sid, False) and sid not in assignment_targets:
+                    event_rescaled_species.setdefault(scomp, []).append(sid)
+
         for i in range(n_events):
             event = sbml_model.getEvent(i)
             eid = event.getId() or f"_event_{i}"
@@ -9083,29 +9287,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                     assignments.append((sp_i, value_expr))
 
-            if assignment_value_expr_by_var and ar_comp_targets:
-                event_assignment_replacements = {
-                    _safe_name(var): expr for var, expr in assignment_value_expr_by_var.items()
-                }
-                assigned_vars = set(assignment_value_expr_by_var)
-                for j in range(sbml_model.getNumRules()):
-                    rule = sbml_model.getRule(j)
-                    comp_id = rule.getVariable()
-                    rmath = rule.getMath()
-                    if (
-                        not rule.isAssignment()
-                        or comp_id not in ar_comp_targets
-                        or comp_id in directly_resized_comps
-                        or rmath is None
-                        or not (_ast_name_set(rmath) & assigned_vars)
-                    ):
-                        continue
-                    old_size_expr = _ast_to_exprtk_with_funcdefs(rmath, func_defs)
-                    new_size_expr = _replace_exprtk_symbols(
-                        old_size_expr, event_assignment_replacements
+            if ar_comp_targets and (assignment_value_expr_by_var or resized_comps):
+                resized_comps.extend(
+                    _rule_compartments_an_event_resizes(
+                        event_rule_math,
+                        ar_comp_targets,
+                        resized_comps,
+                        assignment_value_expr_by_var,
+                        event_rescaled_species,
+                        lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
+                        event_rule_cache,
                     )
-                    if new_size_expr != old_size_expr:
-                        resized_comps.append((comp_id, new_size_expr))
+                )
 
             # (#74) Inject per-species concentration rescaling for any
             # compartment whose size this event changes. bngsim stores every
