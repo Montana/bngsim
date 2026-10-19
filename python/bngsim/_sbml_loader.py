@@ -2325,6 +2325,11 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
 
 
+# Past this many characters, a new size written out through its rules reads a
+# rule more than one path reaches by a function of its own (issue #1124, item 4).
+_RESIZE_INLINE_LIMIT = 20_000
+
+
 def _rule_compartments_an_event_resizes(
     rule_math: dict,
     ar_comp_targets,
@@ -2333,6 +2338,7 @@ def _rule_compartments_an_event_resizes(
     rescaled_species: dict[str, list[str]],
     to_exprtk,
     cache: dict | None = None,
+    define_helper=None,
 ) -> list[tuple[str, str]]:
     """``(compartment, new size)`` for each assignment-rule compartment an event
     resizes that ``resized_comps`` does not already hold, each after the ones
@@ -2369,6 +2375,16 @@ def _rule_compartments_an_event_resizes(
     caller from one event to the next, holds what is read from the rules
     alone, so that each rule is walked once per model rather than once per
     event.
+
+    Written out, a rule that more than one path reaches is written once per
+    path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made the text
+    exponential in its depth: 278 KB at 22 rules, 1.9 MB at 26 (issue #1124,
+    item 4). Where the text would pass ``_RESIZE_INLINE_LIMIT``, and the caller
+    gives ``define_helper(key, text) -> name``, each such rule's value after
+    the event is a function of its own instead, which the rules reaching it
+    read by name: the text is then as long as the rules are. A function reads
+    the state the event fires from, as the text does. Below the limit the
+    text is written out as before.
     """
     cache = {} if cache is None else cache
     reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
@@ -2449,9 +2465,78 @@ def _rule_compartments_an_event_resizes(
             return expr
         return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
 
+    def reached_in(var: str) -> dict[str, int]:
+        """The rules ``var``'s rule reads that reach a change, and how many
+        times it reads each."""
+        if var not in rule_text:
+            rule_text[var] = to_exprtk(rule_math[var])
+        counts: dict[str, int] = {}
+        for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", rule_text[var]):
+            inner = rule_of.get(name)
+            if inner is not None and inner not in changed and reads(inner) & changed:
+                counts[inner] = counts.get(inner, 0) + 1
+        return counts
+
+    def through_helpers(comp: str) -> str | None:
+        """The new size of ``comp`` with each rule more than one path reaches
+        read through a function of its own, or None where the text written
+        out is short enough, or the rules read each other in a cycle."""
+        children: dict[str, dict[str, int]] = {}
+        written: dict[str, int] = {}  # length written out; -1 while under way
+
+        def length(var: str) -> int | None:
+            if var in written:
+                return None if written[var] < 0 else written[var]
+            written[var] = -1
+            children[var] = reached_in(var)
+            n = len(rule_text[var])
+            for inner, k in children[var].items():
+                m = length(inner)
+                if m is None:
+                    return None
+                n += k * (m + 2)
+            written[var] = n
+            return n
+
+        total = length(comp)
+        if total is None or total <= _RESIZE_INLINE_LIMIT:
+            return None
+        paths: dict[str, int] = {}
+        for reads_of in children.values():
+            for inner, k in reads_of.items():
+                paths[inner] = paths.get(inner, 0) + k
+        after: dict[str, str] = {}
+
+        def value_after(var: str) -> str:
+            # The rule's text with what it reads after the event put in.
+            if var not in after:
+                subs = dict(replacements)
+                for inner in children[var]:
+                    subs[_safe_name(inner)] = (
+                        helper_of(inner) if paths[inner] > 1 else value_after(inner)
+                    )
+                after[var] = _replace_exprtk_symbols(rule_text[var], subs)
+            return after[var]
+
+        helpers: dict[str, str] = {}
+
+        def helper_of(var: str) -> str:
+            if var not in helpers:
+                helpers[var] = define_helper(
+                    f"{_safe_name(comp)}_{_safe_name(var)}", value_after(var)
+                )
+            return helpers[var]
+
+        return value_after(comp)
+
     found: list[tuple[str, str]] = []
     for comp in ordered:
-        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        through = through_helpers(comp) if define_helper is not None else None
+        new_size = (
+            through
+            if through is not None
+            else _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        )
         found.append((comp, new_size))
         replacements[_safe_name(comp)] = new_size
         note_rescaled(comp, new_size)
@@ -9726,6 +9811,15 @@ def _build_model_from_sbml_doc_in_context(doc):
     # by promoting them to species with initial value = param value,
     # adding an observable, and re-targeting the event assignment.
     n_events = sbml_model.getNumEvents()
+
+    # A rule's value after an event's resize, as a function of its own, where
+    # the new size written out through its rules would be too long (issue
+    # #1124, item 4).
+    def _resize_helper(key: str, text: str) -> str:
+        name = f"_rsz_{_safe_name(key)}"
+        builder.add_function(name, text)
+        return name
+
     if n_events > 0:
         # Track which parameters need promotion for event assignments
         event_param_promotions = {}  # param_id → species_idx
@@ -9964,6 +10058,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         event_rescaled_species,
                         lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
                         event_rule_cache,
+                        lambda key, text, _eid=eid: _resize_helper(f"{_eid}_{key}", text),
                     )
                 )
 
@@ -10133,6 +10228,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             _jump_moves,
             lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
             cache,
+            lambda key, text, _k=k: _resize_helper(f"_size_jump_{_k}_{key}", text),
         )
         rescales: list[tuple[int, str]] = []
         for follower, new_size in followers:
