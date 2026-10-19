@@ -1939,6 +1939,22 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         // first.
         return t_event;
     };
+    // Whether an output row at ts, less than sample_event_tol below a change
+    // the probe placed, comes before the change: every trigger that reads the
+    // clock still reads its recorded truth at ts itself, the discrete state
+    // held where the probe found it. The bisection places a change only to its
+    // own precision, so a row that close to it was always deferred to record
+    // the state after the event. That is right where the trigger already holds
+    // at the row (`time >= 2.5` at a row at 2.5, which fires there) and wrong
+    // where it does not yet: `time > 2.5` is false at 2.5, and ODE and
+    // libRoadRunner record that row before the event.
+    auto row_before_time_change = [&](double ts) -> bool {
+        model.evaluate_functions(ts);
+        for (int ei : time_triggers)
+            if ((eval_ref.evaluate(events[ei].trigger_expr_idx) > 0.5) != trigger_was_true[ei])
+                return false;
+        return true;
+    };
 
     // Wall-clock check is hoisted out of the per-reaction hot loop with a
     // stride so the cost amortizes to a few ns/step. The stride is small
@@ -2589,6 +2605,30 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             ++next_output;
         };
 
+        // The triggers the panel's probe watches: with rate rules any trigger
+        // may read a target that moves; without, only one that reads the clock
+        // can change between firings.
+        std::vector<int> all_triggers;
+        if (m > 0)
+            for (int ei = 0; ei < n_events; ++ei)
+                all_triggers.push_back(ei);
+        const std::vector<int> &watched = m > 0 ? all_triggers : time_triggers;
+        // Whether row tk = tp + th·hh, less than sample_event_tol below an event
+        // the probe placed, comes before it: every watched trigger still reads
+        // its recorded truth at tk, on the dense y (row_before_time_change,
+        // for this loop).
+        auto row_before_event = [&](double th, double tk) -> bool {
+            if (m > 0) {
+                dense_y(th, ytmp.data());
+                load_y(ytmp.data());
+            }
+            sync_state(tk);
+            for (int ei : watched)
+                if ((eval_ref.evaluate(events[ei].trigger_expr_idx) > 0.5) != trigger_was_true[ei])
+                    return false;
+            return true;
+        };
+
         auto draw_exp = [&]() {
             double r1 = next_u01();
             while (r1 == 0.0)
@@ -2897,12 +2937,6 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 probe_prev.assign(trigger_was_true.begin(), trigger_was_true.end());
                 probe_cur.assign(static_cast<std::size_t>(n_events), 0);
                 double th_prev = th0;
-                // With rate rules any trigger may read a target that moves.
-                std::vector<int> all_triggers;
-                if (m > 0)
-                    for (int ei = 0; ei < n_events; ++ei)
-                        all_triggers.push_back(ei);
-                const std::vector<int> &watched = m > 0 ? all_triggers : time_triggers;
                 for (int q = 1; q <= 4 && th_ev > 1.0; ++q) {
                     const double thq = q == 4 ? 1.0 : th0 + (1.0 - th0) * 0.25 * q;
                     if (m > 0) {
@@ -2938,11 +2972,14 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             const double s_cut = th_cut >= 1.0 ? s1 : tp + th_cut * hh;
 
             // Rows strictly before the change (a row within bisection precision
-            // of an event records the post-event state, as the old loop did).
+            // of an event records the post-event state, as the old loop did,
+            // unless no trigger has changed at the row yet).
             while (next_output < n_out) {
                 const double tk = t_out[next_output];
-                const bool before = event_first ? tk < s_cut - sample_event_tol(s_cut)
-                                                : (fire_first ? tk < s_cut : tk <= s1);
+                const bool before = event_first
+                                        ? tk < s_cut - sample_event_tol(s_cut) ||
+                                              (tk < s_cut && row_before_event((tk - tp) / hh, tk))
+                                        : (fire_first ? tk < s_cut : tk <= s1);
                 if (!before)
                     break;
                 record_at(tk, (tk - tp) / hh);
@@ -3107,9 +3144,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     // Only the time: the batch is taken from every trigger below.
                     const double t_event_idle = probe_events_in_window(t, t_lim);
                     if (std::isfinite(t_event_idle) && t_event_idle <= t_lim) {
-                        // Record any samples strictly before t_event_idle.
-                        while (next_output < n_out && t_event_idle > t_out[next_output] &&
-                               t_out[next_output] < t_event_idle - sample_event_tol(t_event_idle)) {
+                        // Record any samples strictly before t_event_idle, a
+                        // row within the tolerance below it as step 5 below
+                        // decides.
+                        while (
+                            next_output < n_out && t_event_idle > t_out[next_output] &&
+                            (t_out[next_output] < t_event_idle - sample_event_tol(t_event_idle) ||
+                             row_before_time_change(t_out[next_output]))) {
                             const double *cc = conc.data();
                             model.update_observables(cc);
                             for (int j = 0; j < n_obs; ++j) {
@@ -3222,9 +3263,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             //    defer that sample so it records post-event state on the next
             //    iteration — matches ODE rootfind semantics. The tolerance is
             //    several orders wider than bisect_tol so a legitimate sample
-            //    strictly before t_event is still recorded pre-event.
+            //    strictly before t_event is still recorded pre-event. A sample
+            //    within it at which no trigger has changed yet is before the
+            //    event all the same (row_before_time_change).
             while (next_output < n_out && t_advance >= t_out[next_output]) {
-                if (event_wins && t_out[next_output] >= t_event - sample_event_tol(t_event))
+                const double ts = t_out[next_output];
+                if (event_wins && ts >= t_event - sample_event_tol(t_event) &&
+                    !(ts < t_event && row_before_time_change(ts)))
                     break;
                 const double *cc = conc.data();
                 model.update_observables(cc);
