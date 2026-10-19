@@ -1012,3 +1012,144 @@ def test_ar_compartment_sized_by_a_constant_species_in_a_moving_compartment():
     t = np.asarray(res.time)
     np.testing.assert_allclose(_conc(res, "Kw"), 10 / (1 + t), rtol=1e-7)
     np.testing.assert_allclose(_conc(res, "Sn"), 10 * (1 + t) / (2 + t), rtol=1e-6, atol=1e-8)
+
+
+# ── A diamond of rules under the size ────────────────────────────────────────
+#
+# r_1 := t, r_2 := 1 + t, r_i := f(r_{i-1}, r_{i-2}), cv := a + b*r_n: each rule
+# is read by the next two, so the paths from the size down to r_1 double every
+# two rules. §8c parsed and differentiated each rule once per path (the chain
+# rule for V̇, and the inlined size the #1054 jumps read), 17.6 s to load at
+# n = 22, and wrote each rate and size out once per path as well: for a
+# non-linear f the term had 22,122 characters at n = 16 and the jump's rescale
+# 44,839, x2.6 for every two more rules. S is flux-free, so [S] = A/V(t).
+
+_T_CI = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+def _diamond_sbml(n, nonlinear=False, jump=False):
+    """f = sin(r_{i-1}) + cos(r_{i-2}) with cv := 2 + 0.1*r_n, or f = r_{i-1} + r_{i-2}
+    with cv := 1 + 0.001*r_n; ``jump`` adds 2 to the size from t = 2 on, as a
+    piecewise."""
+
+    def rule(var, body):
+        return f'<assignmentRule variable="{var}"><math {_MATHML}>{body}</math></assignmentRule>'
+
+    rules = [rule("r_1", _T_CI), rule("r_2", f"<apply><plus/><cn>1</cn>{_T_CI}</apply>")]
+    for i in range(3, n + 1):
+        a, b = f"<ci>r_{i - 1}</ci>", f"<ci>r_{i - 2}</ci>"
+        body = (
+            f"<apply><plus/><apply><sin/>{a}</apply><apply><cos/>{b}</apply></apply>"
+            if nonlinear
+            else f"<apply><plus/>{a}{b}</apply>"
+        )
+        rules.append(rule(f"r_{i}", body))
+    base, scale = (2, 0.1) if nonlinear else (1, 0.001)
+
+    def size(offset):
+        return (
+            f"<apply><plus/><cn>{base + offset}</cn>"
+            f"<apply><times/><cn>{scale}</cn><ci>r_{n}</ci></apply></apply>"
+        )
+
+    cv = (
+        f"<piecewise><piece>{size(0)}<apply><lt/>{_T_CI}<cn>2</cn></apply></piece>"
+        f"<otherwise>{size(2)}</otherwise></piecewise>"
+        if jump
+        else size(0)
+    )
+    params = "".join(
+        f'<parameter id="r_{i}" value="0" constant="false"/>' for i in range(1, n + 1)
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+ <model id="diamond">
+  <listOfCompartments><compartment id="cv" size="1" constant="false"/></listOfCompartments>
+  <listOfSpecies>
+   <species id="S" compartment="cv" initialConcentration="2" hasOnlySubstanceUnits="false"
+            boundaryCondition="false" constant="false"/>
+  </listOfSpecies>
+  <listOfParameters>{params}</listOfParameters>
+  <listOfRules>{"".join(rules)}{rule("cv", cv)}</listOfRules>
+ </model>
+</sbml>"""
+
+
+def _diamond_size(t, n, nonlinear=False, jump=False):
+    r = [None, t, 1 + t]
+    for i in range(3, n + 1):
+        r.append(np.sin(r[i - 1]) + np.cos(r[i - 2]) if nonlinear else r[i - 1] + r[i - 2])
+    v = 2 + 0.1 * r[n] if nonlinear else 1 + 0.001 * r[n]
+    return v + 2 * (t >= 2) if jump else v
+
+
+def _parses(monkeypatch) -> list:
+    from bngsim import _jacobian
+
+    real = _jacobian._exprtk_to_sympy
+    parsed: list = []
+
+    def counted(text, *args, **kwargs):
+        parsed.append(text)
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(_jacobian, "_exprtk_to_sympy", counted)
+    return parsed
+
+
+def test_a_diamond_of_rules_is_parsed_once_per_rule(monkeypatch):
+    """Each of the 13 rules is parsed once, not once per path to it: 576
+    parses at n = 12, r_2's 178 times."""
+    parsed = _parses(monkeypatch)
+    bngsim.Model.from_sbml_string(_diamond_sbml(12, nonlinear=True, jump=True))
+    assert len(parsed) == len(set(parsed)) == 13
+
+
+def test_a_diamond_of_rules_is_written_once_per_rule(monkeypatch):
+    """Each rule's rate is written once (a shared one as its own `_ddt_`
+    function), and the jump's sizes read the rules by name, so the text grows
+    with the rules, not with the paths through them."""
+    from bngsim import _bngsim_core
+
+    rescales: list[str] = []
+
+    class Builder(_bngsim_core.ModelBuilder):
+        def add_event(self, name, trigger, assignments, *args, **kwargs):
+            if name.startswith("_size_jump_"):
+                rescales.extend(expr for _, expr in assignments)
+            return super().add_event(name, trigger, assignments, *args, **kwargs)
+
+    monkeypatch.setattr(_bngsim_core, "ModelBuilder", Builder)
+    n = 16
+    model = bngsim.Model.from_sbml_string(_diamond_sbml(n, nonlinear=True, jump=True))
+    rate_text = sum(
+        len(expr)
+        for name, expr in zip(
+            model._core.function_names, model._core.function_expressions, strict=True
+        )
+        if name.startswith(("_dil_", "_ddt_"))
+    )
+    assert rate_text < 60 * n  # 542 characters, from 22,122
+    assert len(rescales) == 2 and all(len(r) < 200 for r in rescales)  # 81 each, from 44,839
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    ("nonlinear", "jump"),
+    [(False, False), (True, False), (True, True)],
+    ids=["linear", "non-linear", "non-linear-jump"],
+)
+def test_a_diamond_of_rules_dilutes(nonlinear, jump, codegen):
+    """[S] = A/V(t), A = 2·V(0), through the rates written by name and the
+    jump at t = 2."""
+    n = 12
+    model = bngsim.Model.from_sbml_string(_diamond_sbml(n, nonlinear, jump))
+    res = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0, 4), n_points=9, rtol=1e-11, atol=1e-13
+    )
+    t = np.asarray(res.time)
+    amount = 2 * _diamond_size(0.0, n, nonlinear, jump)
+    expected = amount / _diamond_size(t, n, nonlinear, jump)
+    np.testing.assert_allclose(_conc(res), expected, rtol=1e-7, atol=1e-10)
