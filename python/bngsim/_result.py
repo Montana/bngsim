@@ -482,10 +482,11 @@ class Result:
         )
 
         # GH #85: species_idx → live-volume column idx for species whose
-        # concentration column has been rescaled to amount/V_live(t) (a
-        # variable-volume compartment). Populated by Simulator._stamp. Tells
-        # as_roadrunner() to recover the amount as conc * V_live(t) rather than
-        # conc * V_static for those species. None ⇒ no variable-volume species.
+        # concentration column holds amount/V_live(t) (an hOSU=false species in a
+        # rate-rule compartment, whose dilution is integrated). Populated by
+        # Simulator._stamp. Tells as_roadrunner() to recover the amount as
+        # conc * V_live(t) rather than conc * V_static for those species. None ⇒
+        # no such species.
         self._varvol_live_vol: dict[int, int] | None = None
 
         # GH #131: species_idx → per-sample concentration factor V_static/V_live(t)
@@ -505,8 +506,12 @@ class Result:
         # rescale already ran), so the bare ``X`` amount selector reports the
         # amount as raw·V_live rather than the stale raw·V_static the volume factor
         # would give. V_live is read from the event-promoted compartment's
-        # observable column. Takes priority over the species-column live_vol and
-        # the static volume factor in as_roadrunner. None ⇒ no such species.
+        # observable column. Also carries the size for a column the
+        # variable-volume passes rescaled to amount/V_live (V_static at a sample
+        # where V_live is 0, which they leave at amount/V_static) and for a
+        # rule-target concentration species. Takes priority over the
+        # species-column live_vol and the static volume factor in as_roadrunner.
+        # None ⇒ no such species.
         self._varvol_amount_factor: dict[int, np.ndarray] | None = None
 
         # Issue #787: which bngsim wrote the file this result was loaded from
@@ -2456,11 +2461,12 @@ class Result:
                 lv = self._varvol_live_vol
                 af = self._varvol_amount_factor
                 if af is not None and idx in af:
-                    # GH #131: this column holds amount/V_live(t) but its live
-                    # volume lives in an OBSERVABLE column (an hOSU=false
-                    # event-resized compartment, hidden from species output per
-                    # #71), so the amount = conc · V_live(t) is recovered from the
-                    # stored live-volume array rather than a species column.
+                    # GH #131: this column holds amount/V_live(t), and the size it
+                    # is multiplied by is stored per sample: the live volume may
+                    # live in an OBSERVABLE column (an hOSU=false event-resized
+                    # compartment, hidden from species output per #71), and a
+                    # sample where the size is 0 holds amount/V_static, so it is
+                    # multiplied by V_static there.
                     col = col * af[idx]
                 elif lv is not None and idx in lv:
                     # GH #85: this species column holds amount/V_live(t), so the
