@@ -9352,7 +9352,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                         time_value=None,
                         avogadro_value=None,
                     )
-                    if pri_numeric is not None and float(pri_numeric).is_integer():
+                    # The int field holds a C int: an integer past it, 1e10 or
+                    # 1e308, failed the load with pybind11's "incompatible
+                    # function arguments". It takes the double path below.
+                    if (
+                        pri_numeric is not None
+                        and float(pri_numeric).is_integer()
+                        and abs(float(pri_numeric)) <= 2**31 - 1
+                    ):
                         priority_val = int(pri_numeric)
                     elif pri_numeric is not None:
                         # SBML L3 §4.11.3 priorities are REAL numbers, but the
