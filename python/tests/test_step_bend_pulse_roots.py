@@ -12,8 +12,12 @@ Each call is now rooted where it jumps or bends: a rounding call where
 or ``min()`` inside such a turn unfolded into its branches, which cross at the
 pulse's feet.
 
-T = k*t, so the pulse lasts 0.01/k and Y = 10(1 - exp(-1/k)) for the
-rectangle, 10(1 - exp(-0.5/k)) for the triangle.
+T = k*t, so the pulse lasts 0.01/k and Y = 10(1 - exp(-kx/k)) for the
+rectangle, 10(1 - exp(-kx/(2k))) for the triangle.
+
+A run with sensitivities roots the bends as stops: it jumps nothing there, as
+the pulse is continuous, and without them the triangle gave Y = 0 and dY/dkx
+= 0 beside a plain run that was right.
 """
 
 from __future__ import annotations
@@ -21,13 +25,15 @@ from __future__ import annotations
 import bngsim
 import numpy as np
 import pytest
-from bngsim._switch_sensitivity import _bend_branches, _turn_atoms
+from bngsim._codegen import _find_close_paren_strict
+from bngsim._switch_sensitivity import _bend_branches, _turn_atoms, state_switch_root_conditions
 
 NET = """begin parameters
     1 k_clock {k}
+    2 kx 1
 end parameters
 begin functions
-    1 pulse() {law}
+    1 pulse() kx*({law})
 end functions
 begin species
     1 T() 0
@@ -51,7 +57,13 @@ PULSES = {
     "inrange": ("100*inrange(50,Tobs,50.01)", 1.0),
     "max-abs triangle": ("100*max(0,1-abs(Tobs-50.005)/0.005)", 0.5),
     "min-max triangle": ("100*max(0,min((Tobs-50)/0.005,(50.01-Tobs)/0.005))", 0.5),
+    "mod": ("mod(Tobs+49.99,100)-mod(Tobs+50,100)+0.01", 1.0),
+    "round": ("100*(round((Tobs-50)/100+0.5)-round((Tobs-50.01)/100+0.5))", 1.0),
+    "trunc": ("100*(trunc((Tobs-50)/100+1)-trunc((Tobs-50.01)/100+1))", 1.0),
+    "clamp triangle": ("100*(clamp(0,(Tobs-50)/0.01,1)-clamp(0,(Tobs-50.01)/0.01,1))", 1.0),
 }
+# The pulses made of bends alone, which have an analytic sensitivity RHS.
+BENDS = ["max-abs triangle", "min-max triangle", "clamp triangle"]
 
 
 def _model(tmp_path, law: str, k: float) -> bngsim.Model:
@@ -98,3 +110,64 @@ def test_a_bend_in_a_turn_unfolds_into_its_branches():
     assert _bend_branches("abs(a)<max(b,c,d)") == []  # six branches
     assert _bend_branches("a<b") == []
     assert _bend_branches("abs(abs(a)-1)<0.1") == []
+
+
+@pytest.mark.parametrize("k", [2.0, 0.5])
+@pytest.mark.parametrize("name", BENDS)
+def test_a_sensitivity_run_does_not_step_over_a_bend_pulse(tmp_path, name, k):
+    """The plain run's roots for the bends are this run's stops; before, the
+    triangle gave Y = 0 and dY/dkx = 0 here while the plain run was right."""
+    law, area = PULSES[name]
+    run = bngsim.Simulator(_model(tmp_path, law, k), method="ode", sensitivity_params=["kx"]).run(
+        t_span=(0.0, 60.0 / k), n_points=3
+    )
+    y = float(np.asarray(run.species)[-1, 2])
+    dy = float(np.asarray(run.sensitivities)[-1, 2, 0])
+    assert y == pytest.approx(10 * (1 - np.exp(-area / k)), rel=1e-5)
+    assert dy == pytest.approx(10 * (area / k) * np.exp(-area / k), rel=1e-4)
+
+
+@pytest.mark.parametrize("sens", [None, ["kx"]])
+def test_a_ramp_rooted_where_it_bends_keeps_its_answer(tmp_path, sens):
+    """``max(0, T - 50)`` bends without making a pulse, and its root at T = 50
+    must leave the run as right as it was."""
+    model = _model(tmp_path, "0.001*max(0,Tobs-50)", 2.0)
+    assert model.state_switch_root_conditions() == ("(0)<(Tobs-50)",)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=sens).run(
+        t_span=(0.0, 30.0), n_points=3, rtol=1e-10, atol=1e-12
+    )
+    # T = 2t reaches 60, so the integral of the rate over t is 0.001*10^2/(2*2).
+    a = 0.001 * 10**2 / 4
+    assert float(np.asarray(run.species)[-1, 2]) == pytest.approx(10 * (1 - np.exp(-a)), rel=1e-8)
+    if sens:
+        dy = float(np.asarray(run.sensitivities)[-1, 2, 0])
+        assert dy == pytest.approx(10 * a * np.exp(-a), rel=1e-6)
+
+
+def test_calls_only_leaves_out_the_comparisons(tmp_path):
+    model = _model(tmp_path, "if(Tobs>55,max(0,Tobs-50),0)", 2.0)
+    covered = model.time_discontinuity_conditions()
+    assert state_switch_root_conditions(model._core, covered) == ("Tobs>55", "(0)<(Tobs-50)")
+    assert state_switch_root_conditions(model._core, covered, calls_only=True) == (
+        "(0)<(Tobs-50)",
+    )
+
+
+def _close_paren_by_char(expr: str, open_pos: int) -> int:
+    depth = 1
+    for i in range(open_pos + 1, len(expr)):
+        if expr[i] == "(":
+            depth += 1
+        elif expr[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def test_the_close_paren_scan_matches_a_scan_by_character():
+    rng = np.random.default_rng(1068)
+    for _ in range(2000):
+        expr = "".join(rng.choice(list("(()))ab+"), size=int(rng.integers(1, 40))))
+        for pos in [i for i, c in enumerate(expr) if c == "("]:
+            assert _find_close_paren_strict(expr, pos) == _close_paren_by_char(expr, pos)

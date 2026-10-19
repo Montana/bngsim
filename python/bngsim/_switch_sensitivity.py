@@ -7759,7 +7759,9 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     return out
 
 
-def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) -> tuple[str, ...]:
+def state_switch_root_conditions(
+    core, covered: Sequence[str] = (), ctx=None, *, calls_only: bool = False
+) -> tuple[str, ...]:
     """Rate-law conditions over model state that a run without sensitivities roots on (#897).
 
     Inside each branch of ``if((time() >= onset) && (time() < onset + w), k, 0)``
@@ -7796,10 +7798,19 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
       counter is a clock at one rate and not at another (issue #726), so a fit
       over such a rate pays once per verdict, and any other fit once.
 
+    A step or bend call over state is rooted where it jumps or bends, as a
+    comparison is where it flips (issue #1068), so ``max(A, 0)`` alone gets a
+    root at ``A = 0``.
+
+    With *calls_only*, only the roots that stand for those calls are returned:
+    the set a run with sensitivities adds as stops to the conditions
+    :func:`state_switch_conditions` jumps. It is this set with the comparisons
+    taken out, deduplicated as here.
+
     Equalities are skipped for the reason :func:`state_switch_conditions` gives.
     Deduplicated by residual, read through :func:`_surface_key`, so one crossing
     written two ways is one root. Empty for a model with no conditional rate
-    law, before the model is probed.
+    law and no step or bend call, before the model is probed.
     """
     from bngsim._jacobian import _IDENT_RE, _inline_functions
 
@@ -7851,24 +7862,38 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
     def pieces(atom: str) -> list[str]:
         return _monotone_pieces(atom) or _bend_branches(atom) or [atom]
 
+    def is_call(text: str) -> bool:
+        return bool(_STEP_CALL.match(text) or _BEND_CALL.match(text)) and (
+            _find_close_paren_strict(text, text.index("(")) == len(text) - 1
+        )
+
     def call_atoms(text: str) -> list[str]:
-        if not (_STEP_CALL.match(text) or _BEND_CALL.match(text)):
-            return []
-        if _find_close_paren_strict(text, text.index("(")) != len(text) - 1:
+        if not is_call(text):
             return []
         return [p for atom in _turn_atoms(text) for p in pieces(atom)]
+
+    # One atom is met again from every rate law and function that reads it, and
+    # a min() of two inlined assignment rules has a residual 11k characters
+    # long, whose key costs milliseconds (BIOMD0000000385).
+    keys: dict[str, str | None] = {}
+
+    def surface(atom: str) -> str | None:
+        if atom not in keys:
+            residual = state_switch_residual(core, atom)
+            keys[atom] = _surface_key(residual) if residual else None
+        return keys[atom]
 
     seen: set[str] = set()
     for cond in covered:
         nested = []
-        if call_atoms(cond):
+        if is_call(cond):
             for pattern in (_STEP_CALL, _BEND_CALL):
                 for call, _arg in _iter_step_calls(cond, pattern=pattern):
                     nested.extend(call_atoms(call))
         for atom in nested or _monotone_pieces(cond) or [cond]:
-            residual = state_switch_residual(core, inline(atom))
-            if residual:
-                seen.add(_surface_key(residual))
+            key = surface(inline(atom))
+            if key is not None:
+                seen.add(key)
 
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a
@@ -7884,14 +7909,12 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
 
     conditions: list[str] = []
 
-    def admit(atom: str) -> None:
-        residual = state_switch_residual(core, atom)
-        if not residual:
-            return
-        key = _surface_key(residual)
-        if key not in seen:
+    def admit(atom: str, keep: bool = True) -> None:
+        key = surface(atom)
+        if key is not None and key not in seen:
             seen.add(key)
-            conditions.append(atom)
+            if keep:
+                conditions.append(atom)
 
     for text in (*rate_laws, *(func_map[name] for name in reached)):
         if not switches(text):
@@ -7909,7 +7932,7 @@ def state_switch_root_conditions(core, covered: Sequence[str] = (), ctx=None) ->
                 # A residual that turns within a step (`abs(A-5) < 0.01`) is
                 # rooted at each of its edges instead (issue #904).
                 for atom in _monotone_pieces(whole) or [whole]:
-                    admit(atom)
+                    admit(atom, keep=not calls_only)
         # Every step or bend call outside the comparisons, nested ones too: the
         # abs() inside `max(0, 1 - abs(u)/w)` bends the rate law as the max()
         # does (issue #1068). One inside a comparison jumps it only through
@@ -7935,6 +7958,7 @@ _SURFACE_KEY_SUBS = (
 )
 
 
+@functools.lru_cache(maxsize=256)
 def _surface_key(residual: str) -> str:
     """One spelling per crossing surface, for :func:`state_switch_root_conditions`.
 
@@ -7945,6 +7969,10 @@ def _surface_key(residual: str) -> str:
     parser drops redundant parentheses, and the smaller of the two operand
     orders is kept. Text it cannot parse is its own key, which only costs a
     duplicate root.
+
+    Kept for the residuals last asked about: the key is a function of the text
+    alone, and a fresh model of the same structure asks about the same ones,
+    which on BIOMD0000000385 are 11k characters long (issue #1068).
     """
     import ast
 

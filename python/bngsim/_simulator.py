@@ -2710,7 +2710,7 @@ class Simulator:
         """
         self._codegen_sens_rhs_available = None
 
-    def _apply_state_switch_sens(self, opts, core) -> None:
+    def _apply_state_switch_sens(self, opts, core, model=None, covered=None) -> None:
         """Register the state-dependent rate-law switches to jump at (issue #150).
 
         The rate-law twin of :meth:`_apply_event_time_sens`. A condition that
@@ -2725,10 +2725,25 @@ class Simulator:
         list: a *state* crossing moves with every column, initial conditions
         included, so there is no subset it can be skipped for.
 
-        A no-op for any model with no conditional rate law, which leaves the
-        root set — and the whole integration — untouched.
+        Given the *model* and the *covered* set :meth:`_apply_crossing_stops`
+        returned, the roots a plain run has for step and bend calls are added
+        as stops (issue #1068). ``max(0, 1 - abs(T-50.005)/0.005)`` over a
+        counter that is not a clock is a pulse a step spanned, and the run
+        returned Y = 0 with its columns, while the plain run, which roots it,
+        was right. The pulse is continuous, so no rate law is listed for these
+        and the solver jumps none of them. A surface a condition above already
+        roots is not added again.
+
+        A no-op for any model with no conditional rate law and no step or bend
+        call over state, which leaves the root set — and the whole integration —
+        untouched.
         """
-        from bngsim._switch_sensitivity import state_switch_conditions, state_switch_reactions
+        from bngsim._switch_sensitivity import (
+            _surface_key,
+            state_switch_conditions,
+            state_switch_reactions,
+            state_switch_residual,
+        )
 
         try:
             conditions = state_switch_conditions(core)
@@ -2745,6 +2760,17 @@ class Simulator:
                 e,
             )
             return
+        stops: list[str] = []
+        if model is not None and covered is not None:
+            jumped = set()
+            for cond in conditions:
+                residual = state_switch_residual(core, cond)
+                if residual:
+                    jumped.add(_surface_key(residual))
+            for atom in model._state_switch_stops_beside(covered):
+                residual = state_switch_residual(core, atom)
+                if residual and _surface_key(residual) not in jumped:
+                    stops.append(atom)
         if conditions:
             logger.info(
                 "State-switch forward sensitivity: %d condition(s) rooted and jumped "
@@ -2752,7 +2778,13 @@ class Simulator:
                 len(conditions),
                 ", ".join(repr(c) for c in conditions),
             )
-            opts.set_state_switch_conditions(conditions)
+        if stops:
+            logger.debug(
+                "State-switch stops for a sensitivity run (issue #1068): %s",
+                ", ".join(repr(c) for c in stops),
+            )
+        if conditions or stops:
+            opts.set_state_switch_conditions([*conditions, *stops])
             try:
                 reactions = state_switch_reactions(core, conditions)
             except Exception as e:  # pragma: no cover - defensive
@@ -2764,7 +2796,10 @@ class Simulator:
                     e,
                 )
             else:
-                opts.set_state_switch_reactions(reactions)
+                # A stop lists no rate law, so the solver takes its crossing as
+                # continuous. A bend is; a step call over state has no analytic
+                # sensitivity right-hand side, so its run is refused before this.
+                opts.set_state_switch_reactions([*reactions, *([] for _ in stops)])
 
     def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).
@@ -4818,7 +4853,7 @@ class Simulator:
                     # Outside the parameter guard on purpose: a *state* crossing
                     # moves every column, initial conditions included (issue
                     # #150 / #144), so an IC-only request needs the jump too.
-                    self._apply_state_switch_sens(opts, self._model._core)
+                    self._apply_state_switch_sens(opts, self._model._core, self._model, covered)
                 else:
                     self._apply_state_switch_roots(opts, self._model, covered)
 
@@ -6270,7 +6305,7 @@ class Simulator:
                     self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1])
                     # See the note at the single-shot site: keyed on "any
                     # sensitivity at all", not on a parameter request.
-                    self._apply_state_switch_sens(opts, clone._core)
+                    self._apply_state_switch_sens(opts, clone._core, clone, covered)
                 else:
                     self._apply_state_switch_roots(opts, clone, covered)
                 # The GH #176 retry, as run() places it. Without it a row raised
@@ -6976,7 +7011,9 @@ class Simulator:
         # same crossing stops — a chunk that lost them would wedge where the
         # others did not, and issue #243 is the standing reminder that "which
         # chunk you are in" must not decide whether the solve succeeds.
-        self._apply_crossing_stops(opts, t_span[0], t_span[1], model=clone, sensitivities=True)
+        covered = self._apply_crossing_stops(
+            opts, t_span[0], t_span[1], model=clone, sensitivities=True
+        )
         # Report this chunk's OWN subset of ∂x(0)/∂θ; the stitch takes the union
         # over chunks, which is the full requested set (issue #155).
         chunk_ic_seed = self._apply_ic_param_sens_seed(opts, clone, sens_params)
@@ -6984,7 +7021,7 @@ class Simulator:
         # must be built against that subset rather than the full request.
         self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
         self._apply_event_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
-        self._apply_state_switch_sens(opts, clone._core)
+        self._apply_state_switch_sens(opts, clone._core, clone, covered)
         opts.set_sensitivity_method(self._sensitivity_method)
 
         try:

@@ -1164,6 +1164,9 @@ def _shard_value_lines(
 # ─── Expression scanning ────────────────────────────────────────────────
 
 
+_PAREN = re.compile(r"[()]")
+
+
 def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     """Return the index of the ')' that matches '(' at ``expr[open_pos]``,
     or -1 if the parens are unbalanced.
@@ -1173,18 +1176,19 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     unbalanced input so the caller can keep slicing. The callers here (the
     derived-expression and switch-condition parsers, the JAX translator) need to
     fail loudly instead, hence the separate function.
+
+    It visits the parentheses alone: an inlined min() of two assignment rules
+    runs to 11k characters, and a visit per character cost the state-switch
+    scan 45 ms on BIOMD0000000385 (issue #1068).
     """
     depth = 1
-    i = open_pos + 1
-    while i < len(expr):
-        c = expr[i]
-        if c == "(":
+    for m in _PAREN.finditer(expr, open_pos + 1):
+        if m.group() == "(":
             depth += 1
-        elif c == ")":
+        else:
             depth -= 1
             if depth == 0:
-                return i
-        i += 1
+                return m.start()
     return -1
 
 
