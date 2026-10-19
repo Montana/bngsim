@@ -51,7 +51,7 @@ def _ci(x):
     return f"<ci>{x}</ci>"
 
 
-def _doc(rules, *, functions="", params="", events=""):
+def _doc(rules, *, functions="", params="", events="", species=""):
     rule_xml = "".join(
         f'<assignmentRule variable="{v}"><math {M}>{b}</math></assignmentRule>' for v, b in rules
     )
@@ -64,7 +64,7 @@ def _doc(rules, *, functions="", params="", events=""):
   <species id="S" compartment="c" initialAmount="10" hasOnlySubstanceUnits="false"
    boundaryCondition="false" constant="false"/>
   <species id="Sn" compartment="cv" initialConcentration="5"
-   hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+   hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>{species}
  </listOfSpecies>
  <listOfParameters><parameter id="k" value="0.5" constant="true"/>{params}</listOfParameters>
  <listOfRules>{rule_xml}</listOfRules>
@@ -177,13 +177,17 @@ def _set_sn_at_2(priority):
     )
 
 
-@pytest.mark.parametrize("priority", [None, 5], ids=["no priority", "a priority"])
+@pytest.mark.parametrize(
+    "priority", [None, 5, "1e308"], ids=["no priority", "a priority", "the jump's priority"]
+)
 def test_an_event_at_the_jump_keeps_the_concentration_it_sets(priority):
     """``at (t >= 2): Sn = 10`` fires where ``cv := piecewise(1 + t, t < 2,
     5)`` jumps. Sn is 10 after, the concentration the event sets in the
     compartment as it is then; the jump's rescale of Sn from before the instant
     overwrote it whenever it ran second, by the priority or the draw between
-    equal ones."""
+    equal ones. At the jump's own priority, 1e308, the draw was a fair one, and
+    the model did not load: 1e308 is an integer too large for the int field a
+    constant priority was given."""
     xml = _doc([("cv", T_STEP)], events=_set_sn_at_2(priority))
     for seed in range(4):
         result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
@@ -192,6 +196,161 @@ def test_an_event_at_the_jump_keeps_the_concentration_it_sets(priority):
         t = np.asarray(result.time)
         sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
         np.testing.assert_allclose(sn, np.where(t < 2, 5 / (1 + t), 10), rtol=1e-5, atol=1e-8)
+
+
+# ─── What an event at the jump reads (issue #1054's review) ─────────────────
+#
+# `cv := piecewise(1 + t, t < 2, 5)` takes [Sn] from 5/3 just before t = 2 to 1
+# at t = 2. The jump's rescale executed first, but an event triggered at the
+# instant had its trigger, values and delay read with the rest of the batch,
+# before it, at [Sn] = 5/3: `Sn = Sn + 1` left 8/3 where [Sn] at t = 2 is 1, and
+# libRoadRunner gives 2.
+
+
+def _event(eid, trigger, assignments, *, uvftt=True, persistent=True, delay=None, priority=None):
+    body = "".join(
+        f'<eventAssignment variable="{v}"><math {M}>{e}</math></eventAssignment>'
+        for v, e in assignments
+    )
+    return (
+        f'<event id="{eid}" useValuesFromTriggerTime="{str(uvftt).lower()}">'
+        f'<trigger initialValue="false" persistent="{str(persistent).lower()}">'
+        f"<math {M}>{trigger}</math></trigger>"
+        + (f"<delay><math {M}>{delay}</math></delay>" if delay is not None else "")
+        + (f"<priority><math {M}>{priority}</math></priority>" if priority is not None else "")
+        + f"<listOfEventAssignments>{body}</listOfEventAssignments></event>"
+    )
+
+
+def _sp(sid):
+    return (
+        f'<species id="{sid}" compartment="c" initialConcentration="0" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+    )
+
+
+AT_2 = _rel("geq", T, _cn(2))
+SN_PLUS_1 = _plus(_ci("Sn"), _cn(1))
+
+
+def _sn(after):
+    return lambda t: np.where(t < 2, 5 / (1 + t), after)
+
+
+def _from(t0, value):
+    return lambda t: np.where(t < t0, 0.0, value)
+
+
+AT_THE_JUMP = {
+    "a value frozen at the trigger": ([_event("e", AT_2, [("Sn", SN_PLUS_1)])], {"Sn": _sn(2.0)}),
+    # control: read when it executes, after the jump, it was right
+    "a value read when it executes": (
+        [_event("e", AT_2, [("Sn", SN_PLUS_1)], uvftt=False)],
+        {"Sn": _sn(2.0)},
+    ),
+    "another species set from it": ([_event("e", AT_2, [("X", _ci("Sn"))])], {"X": _from(2, 1.0)}),
+    "a priority": (
+        [_event("e", AT_2, [("X", _ci("Sn"))], priority=_cn(5))],
+        {"X": _from(2, 1.0)},
+    ),
+    "after a delay": (
+        [_event("e", AT_2, [("X", _ci("Sn"))], delay=_cn(0.9))],
+        {"X": _from(2.9, 1.0)},
+    ),
+    # 0.6·[Sn] is 0.6 at t = 2, and was read 1
+    "a delay that reads it": (
+        [_event("e", AT_2, [("X", _cn(1))], delay=_times(_cn(0.6), _ci("Sn")))],
+        {"X": _from(2.6, 1.0)},
+    ),
+    # [Sn] > 1.5 is false at t = 2, and was read true
+    "a trigger that reads it": (
+        [
+            _event(
+                "e",
+                f"<apply><and/>{AT_2}{_rel('gt', _ci('Sn'), _cn(1.5))}</apply>",
+                [("X", _cn(7))],
+            )
+        ],
+        {"X": _from(0, 0.0)},
+    ),
+    # control: the jump cancelled it, as its trigger fell
+    "a trigger that reads it, not persistent": (
+        [
+            _event(
+                "e",
+                f"<apply><and/>{AT_2}{_rel('gt', _ci('Sn'), _cn(1.5))}</apply>",
+                [("X", _cn(7))],
+                persistent=False,
+            )
+        ],
+        {"X": _from(0, 0.0)},
+    ),
+    # Y is frozen at the instant too: before e sets X, after the jump
+    "two events in turn": (
+        [
+            _event("e", AT_2, [("X", _ci("Sn"))], priority=_cn(2)),
+            _event("f", AT_2, [("Y", _plus(_ci("X"), _ci("Sn")))], priority=_cn(1)),
+        ],
+        {"X": _from(2, 1.0), "Y": _from(2, 1.0)},
+    ),
+}
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("case", list(AT_THE_JUMP))
+def test_an_event_at_the_jump_reads_the_concentration_after_it(case, codegen):
+    events, closed_forms = AT_THE_JUMP[case]
+    xml = _doc([("cv", T_STEP)], events="".join(events), species=_sp("X") + _sp("Y"))
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", codegen=codegen
+    ).run(t_span=(0.0, 4.0), n_points=17)
+    t = np.asarray(result.time)
+    names = list(result.species_names)
+    for sid, closed_form in closed_forms.items():
+        got = np.asarray(result.species)[:, names.index(sid)]
+        np.testing.assert_allclose(got, closed_form(t), rtol=1e-5, atol=1e-8, err_msg=sid)
+
+
+def _sensitivities(events):
+    xml = _doc([("cv", T_STEP)], events="".join(events), species=_sp("X") + _sp("Y"))
+    sim = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", sensitivity_params=["k"]
+    )
+    return sim.run(t_span=(0.0, 4.0), n_points=17)
+
+
+def test_the_sensitivity_of_a_value_frozen_after_the_jump():
+    """``X = k*Sn`` at the jump: dX/dk is [Sn] at t = 2, 1. Read before the
+    jump it was 5/3, beside an X of 5/6."""
+    result = _sensitivities([_event("e", AT_2, [("X", _times(_ci("k"), _ci("Sn")))])])
+    t = np.asarray(result.time)
+    x = list(result.species_names).index("X")
+    np.testing.assert_allclose(
+        np.asarray(result.species)[:, x], _from(2, 0.5)(t), rtol=1e-5, atol=1e-8
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.sensitivities)[:, x, 0], _from(2, 1.0)(t), rtol=1e-5, atol=1e-8
+    )
+
+
+def test_the_sensitivity_of_a_value_frozen_between_two_fires_is_refused():
+    """f's values are frozen after the jump and before e sets X, which they
+    read: that state is neither the one before the batch nor the one at f, the
+    two the sensitivity jump reads at."""
+    events = AT_THE_JUMP["two events in turn"][0]
+    with pytest.raises(bngsim.SimulationError, match=r"frozen between two fires of one instant"):
+        _sensitivities(events)
+
+
+def test_run_diffrax_names_the_jump():
+    """The model has no event of its own; the two are the jump's, each way."""
+    pytest.importorskip("diffrax")
+    from bngsim._diffrax_solver import run_diffrax
+
+    model = bngsim.Model.from_sbml_string(_doc([("cv", S_SWITCH)]))
+    assert model.n_events == 2
+    with pytest.raises(ValueError, match=r"keeps the amounts in compartment cv across a jump"):
+        run_diffrax(model, t_end=4.0)
 
 
 def test_a_condition_an_event_also_moves_is_refused():

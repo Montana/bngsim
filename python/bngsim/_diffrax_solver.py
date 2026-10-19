@@ -148,9 +148,18 @@ def run_diffrax(
         for name, value in ordered:
             model.set_param(name, value)
     if model.n_events:
+        # A compartment size that jumps keeps the amounts in it through an event
+        # the loader adds (issue #1054), which is no event of the model's own.
+        jumps = list(model._core.event_size_jump_compartments)
+        n_own = sum(1 for comp in jumps if not comp)
+        has = (
+            f"this model has {n_own}"
+            if n_own
+            else "this model keeps the amounts in compartment "
+            f"{', '.join(sorted(set(jumps)))} across a jump of its size with one (issue #1054)"
+        )
         raise ValueError(
-            f"run_diffrax does not implement events, and this model has {model.n_events}; "
-            "use Simulator(method='ode')."
+            f"run_diffrax does not implement events, and {has}; use Simulator(method='ode')."
         )
     state_switches = model.state_switch_root_conditions()
     if state_switches:

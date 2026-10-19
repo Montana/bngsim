@@ -948,6 +948,13 @@ struct Event {
     bool initial_value =
         true; // trigger state at t=0 (true = treat as already true → no fire at t=0)
     bool use_values_from_trigger_time = true; // SBML L3: snapshot RHS at trigger time
+    // Issue #1054 — the SBML loader's rescale where a piecewise assignment-rule
+    // compartment size jumps: the compartment's id, and empty for every other
+    // event. The size at the instant of a jump is already the new one, so the
+    // concentrations there are the rescaled ones. The ODE engine executes such
+    // an event before anything else at its instant, and the other events
+    // triggered there read their trigger, values and delay after it.
+    std::string size_jump_compartment;
 };
 
 // ─── Sensitivity options ─────────────────────────────────────────────────────

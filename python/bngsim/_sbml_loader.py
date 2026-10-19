@@ -7588,11 +7588,15 @@ def _build_model_from_sbml_doc_in_context(doc):
         #
         # Nor one the per-species divide cannot serve, which §9 writes out one
         # species at a time instead and SSA refuses: a reaction that changes a
-        # species in an assignment-rule compartment, which is no state to divide
-        # by (#745), or that mixes conversion factors. Certified, those took the
-        # per-species divide anyway: an irreversible `A + E => B + E` with A and
-        # B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a mixed
-        # factor refused to load, where the same law flagged reversible was right.
+        # species in an assignment-rule compartment whose size moves, which is no
+        # state to divide by (#745), or that mixes conversion factors. Certified,
+        # those took the per-species divide anyway: an irreversible `A + E => B + E`
+        # with A and B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a
+        # mixed factor refused to load, where the same law flagged reversible was
+        # right. A rule over constants (`C := 2`) holds its load-time size, as a
+        # write to what it reads is refused, so the per-species divide by that
+        # size serves its species as it serves a static compartment's, and the
+        # SSA reads their counts over it exactly.
         _xcomp_varvol = _varvol_reject.get("xcomp_varvol_comps")
         if _xcomp_varvol and not _rev_difference and not _cf_mixed:
             _net: dict[str, float] = {}
@@ -7604,7 +7608,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         float("nan") if _st is None else _st
                     )
             if not any(
-                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_targets
+                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_moving
                 for _sid, _n in _net.items()
             ):
                 ssa_varvol_xcompartment[i] = _xcomp_varvol
@@ -7975,12 +7979,32 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _rr_sym_cache[safe] = _exprtk_to_sympy(_rr_rhs_ex[safe])
             return _rr_sym_cache[safe]  # sympy expr, or None on parse failure
 
-        def _leaf_deriv(nm: str, seen: frozenset):
+        # Each rule is parsed once and its rate derived once, however many
+        # rules read it. The chain rule and the inlined size below both walk
+        # the rules a size reads, and they used to start each rule afresh on
+        # every path that reached it, so a diamond of rules (r_i := r_{i-1} +
+        # r_{i-2}, each read by the next two) cost a parse and a derivation per
+        # path — exponential in its depth: over 17 s to load at 22 rules, and
+        # ×6.9 for every four more.
+        _ar_sym_cache: dict[str, object] = {}
+
+        def _ar_sym(safe: str):
+            if safe not in _ar_sym_cache:
+                _ar_sym_cache[safe] = _exprtk_to_sympy(_ar_rhs_ex[safe])
+            return _ar_sym_cache[safe]  # sympy expr, or None on parse failure
+
+        _on_path = object()  # a rule whose walk is under way: reaching it again is a cycle
+        # safe(var) -> its rate, or None ⇒ unknown
+        _rule_rate: dict[str, object] = {}
+        # safe(var) -> the nonzero terms of its rate: (∂g/∂s, s, ṡ)
+        _rule_terms: dict[str, list] = {}
+
+        def _leaf_deriv(nm: str):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
             if nm == _TIME_SYM:
                 return _sp.Integer(1)
             if nm in _ar_alias:  # an assignment target, a species among them
-                return _vdot_sym(_ar_alias[nm], seen)
+                return _vdot_sym(_ar_alias[nm])
             if nm in _species_alias:  # its live rate, rateOf(S) (#1052)
                 sid = _species_alias[nm]
                 if sid in _still_species:
@@ -7993,22 +8017,33 @@ def _build_model_from_sbml_doc_in_context(doc):
             # used to make V̇ unknown and drop the whole term).
             return _sp.Integer(0)
 
-        def _vdot_sym(safe_var: str, seen: frozenset):
-            ex = _ar_rhs_ex.get(safe_var)
-            if ex is None or safe_var in seen:
+        def _vdot_sym(safe_var: str):
+            # A rule on a cycle of rules, or one reading such a rule, has no
+            # rate (None), as before: the walk that meets a rule still under way
+            # unwinds with None through every rule on the cycle.
+            if safe_var in _rule_rate:
+                got = _rule_rate[safe_var]
+                return None if got is _on_path else got
+            if safe_var not in _ar_rhs_ex:
                 return None
-            g = _exprtk_to_sympy(ex)
+            _rule_rate[safe_var] = _on_path
+            _rule_rate[safe_var], _rule_terms[safe_var] = _chain_rule(_ar_sym(safe_var))
+            return _rule_rate[safe_var]
+
+        def _chain_rule(g):
+            # (Σ ∂g/∂s·ṡ over g's symbols, its nonzero terms), or (None, []).
             if g is None:
-                return None
-            seen2 = seen | {safe_var}
-            total = _sp.Integer(0)
+                return None, []
+            total, terms = _sp.Integer(0), []
             for s in g.free_symbols:
-                d = _leaf_deriv(str(s), seen2)
+                d = _leaf_deriv(str(s))
                 if d is None:
-                    return None
+                    return None, []
                 if d != 0:
-                    total = total + _sp.diff(g, s) * d
-            return total
+                    p = _sp.diff(g, s)
+                    terms.append((p, s, d))
+                    total = total + p * d
+            return total, terms
 
         # Reverse the keyword aliasing _exprtk_to_sympy applies, so the emitted
         # term references the engine's real safe names.
@@ -8041,23 +8076,126 @@ def _build_model_from_sbml_doc_in_context(doc):
                 and sid not in assignment_targets
             )
 
+        def _subexpressions(expr) -> list:
+            # Each distinct node of a sympy expression, once. A rate or size
+            # built from shared rules' is a DAG, and its tree — what
+            # `free_symbols` and `atoms` walk, and what printing spells out —
+            # can be exponentially larger than the DAG.
+            seen: set[int] = set()
+            out, stack = [], [expr]
+            while stack:
+                e = stack.pop()
+                if id(e) not in seen:
+                    seen.add(id(e))
+                    out.append(e)
+                    stack.extend(e.args)
+            return out
+
+        def _tree_size(expr) -> int:
+            # Nodes in the tree the expression prints as, a shared node counted
+            # once per use, found without walking the tree.
+            size: dict[int, int] = {}
+            stack = [(expr, False)]
+            while stack:
+                e, expanded = stack.pop()
+                if id(e) in size:
+                    continue
+                if expanded:
+                    size[id(e)] = 1 + sum(size[id(a)] for a in e.args)
+                else:
+                    stack.append((e, True))
+                    stack.extend((a, False) for a in e.args if id(a) not in size)
+            return size[id(expr)]
+
+        def _rate_tokens(expr) -> set[str]:
+            return {
+                _rate_token_species[str(s)]
+                for s in _subexpressions(expr)
+                if s.is_Symbol and str(s) in _rate_token_species
+            }
+
         # V̇ of each compartment that holds a species to dilute, and the species
         # whose rates it reads.
         _comp_vdot: dict[str, object] = {}
         _comp_rated: dict[str, set[str]] = {}
         for sid, comp in species_comp.items():
             if comp not in _comp_vdot and _diluted(sid):
-                vdot = _vdot_sym(_safe_name(comp), frozenset())
+                vdot = _vdot_sym(_safe_name(comp))
                 _comp_vdot[comp] = vdot
-                _comp_rated[comp] = (
-                    {
-                        _rate_token_species[str(s)]
-                        for s in vdot.free_symbols
-                        if str(s) in _rate_token_species
-                    }
-                    if vdot is not None
-                    else set()
-                )
+                _comp_rated[comp] = _rate_tokens(vdot) if vdot is not None else set()
+
+        # Written out in full, a rate that more than one rule reads is written
+        # once per path to it, and the term is as exponential as the walk was
+        # (r_i := sin(r_{i-1}) + cos(r_{i-2}): 22,122 characters at 16 rules,
+        # ×2.6 for every two more). So such a rate becomes a function of its own,
+        # `_ddt_<rule>`, that the rules reading it read by name, wherever that is
+        # shorter than writing V̇ out; elsewhere — a rate that is a number or a
+        # symbol, a rule only one rule reads, a sum the chain rule collapses —
+        # V̇ is written out exactly as before.
+        _readers: dict[str, int] = {}
+        _reached: set[str] = set()
+        _walk = [_safe_name(c) for c, v in _comp_vdot.items() if v is not None]
+        while _walk:
+            r = _walk.pop()
+            if r in _reached:
+                continue
+            _reached.add(r)
+            for _, s, _ in _rule_terms[r]:
+                child = _ar_alias.get(str(s))
+                if child is not None:
+                    _readers[child] = _readers.get(child, 0) + 1
+                    _walk.append(child)
+        _rate_fn = {
+            r: f"_ddt_{r}"
+            for r, n in sorted(_readers.items())
+            if n > 1 and not _rule_rate[r].is_Atom
+        }
+        _named_rate: dict[str, object] = {}
+
+        def _rate_by_name(safe_var: str):
+            # The rule's rate with each shared rate it reads read by name.
+            if safe_var not in _named_rate:
+                total = _sp.Integer(0)
+                for p, s, d in _rule_terms[safe_var]:
+                    child = _ar_alias.get(str(s))
+                    if child in _rate_fn:
+                        d = _sp.Symbol(_rate_fn[child])
+                    elif child is not None and not d.is_Atom:
+                        d = _rate_by_name(child)
+                    total = total + p * d
+                _named_rate[safe_var] = total
+            return _named_rate[safe_var]
+
+        def _functions_read(expr) -> list[str]:
+            # The `_ddt_` rules expr reads, directly or through each other,
+            # each after the ones it reads.
+            fn_rule = {fn: r for r, fn in _rate_fn.items()}
+            order: list[str] = []
+            done: set[str] = set()
+
+            def visit(e):
+                for s in _subexpressions(e):
+                    r = fn_rule.get(str(s)) if s.is_Symbol else None
+                    if r is not None and r not in done:
+                        done.add(r)
+                        visit(_rate_by_name(r))
+                        order.append(r)
+
+            visit(expr)
+            return order
+
+        # compartment -> (V̇ by name, the `_ddt_` rules it reads), where shorter
+        _comp_by_name: dict[str, tuple[object, list[str]]] = {}
+        if _rate_fn:
+            for comp, vdot in _comp_vdot.items():
+                if vdot is None or vdot == 0:
+                    continue
+                expr = _rate_by_name(_safe_name(comp))
+                rules = _functions_read(expr)
+                if _tree_size(expr) + sum(
+                    _tree_size(_rate_by_name(r)) for r in rules
+                ) < _tree_size(vdot):
+                    _comp_by_name[comp] = (expr, rules)
 
         def _size_text(cid: str) -> str:
             for j in range(sbml_model.getNumRules()):
@@ -8157,31 +8295,81 @@ def _build_model_from_sbml_doc_in_context(doc):
             | set(_rate_token_species)
         )
 
-        def _inlined_size(safe_var: str, seen: frozenset):
-            ex = _ar_rhs_ex.get(safe_var)
-            if ex is None or safe_var in seen:
+        # safe(var) -> the size written through the rules it reads, once a rule
+        # (None ⇒ unknown, _on_path while under way, as for the rates)
+        _inlined: dict[str, object] = {}
+
+        def _inlined_size(safe_var: str):
+            if safe_var in _inlined:
+                got = _inlined[safe_var]
+                return None if got is _on_path else got
+            if safe_var not in _ar_rhs_ex:
                 return None
-            g = _exprtk_to_sympy(ex)
+            _inlined[safe_var] = _on_path
+            _inlined[safe_var] = _inline_rules(_ar_sym(safe_var))
+            return _inlined[safe_var]
+
+        def _inline_rules(g):
             if g is None:
                 return None
             subs = {}
             for s in g.free_symbols:
                 if str(s) in _ar_alias:
-                    inner = _inlined_size(_ar_alias[str(s)], seen | {safe_var})
+                    inner = _inlined_size(_ar_alias[str(s)])
                     if inner is None:
                         return None
                     subs[s] = inner
             return g.xreplace(subs)
 
+        def _xreplace_once(expr, rule: dict):
+            # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
+            # walks the tree, which a size read through shared rules makes
+            # exponentially larger than the expression.
+            done: dict[int, object] = {}
+
+            def go(e):
+                if id(e) not in done:
+                    if e in rule:
+                        done[id(e)] = rule[e]
+                    else:
+                        args = tuple(go(a) for a in e.args)
+                        changed = any(a is not b for a, b in zip(args, e.args, strict=True))
+                        done[id(e)] = e.func(*args) if changed else e
+                return done[id(e)]
+
+            return go(expr)
+
+        def _rules_by_name() -> dict:
+            # A rule's size, written through the rules it reads, -> the rule's
+            # own symbol, for each rule whose size holds no condition: it is the
+            # same on either side of a jump, so the sizes there may read it by
+            # name, as everything else in the model does.
+            return {
+                full: _sp.Symbol(_alias(safe))
+                for safe, full in _inlined.items()
+                if isinstance(full, _sp.Basic)  # not None, not under way
+                and not full.is_Atom
+                and not any(
+                    isinstance(e, (_sp.Piecewise, _sp.core.relational.Relational))
+                    for e in _subexpressions(full)
+                )
+            }
+
         for comp, vdot in _comp_vdot.items():
             if vdot is None:
                 continue
-            g = _inlined_size(_safe_name(comp), frozenset())
+            g = _inlined_size(_safe_name(comp))
             if g is None:
                 continue
             # In a fixed order, so the events do not move with the hash seed.
             conds = sorted(
-                {c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)},
+                {
+                    c
+                    for pw in _subexpressions(g)
+                    if isinstance(pw, _sp.Piecewise)
+                    for _, c in pw.args
+                    if c not in (_sp.true,)
+                },
                 key=_sp.default_sort_key,
             )
             relations: set = set()
@@ -8214,6 +8402,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         break
                 else:
                     roots.append((d, [(r, _sp.Integer(1))]))
+            by_name = _rules_by_name() if roots else {}
             for _, rels in roots:
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
@@ -8229,8 +8418,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                     side_true = -1 if c.func(-q, 0) else 1
                     side_false = -side_true
                 v_false, v_true = (
-                    g.xreplace({r: r.func(rq * side, 0) for r, rq in rels})
+                    _xreplace_once(g, {r: r.func(rq * side, 0) for r, rq in rels})
                     for side in (side_false, side_true)
+                )
+                # Written out in full, a size that reads shared rules is as
+                # exponential as the rates were; it reads those of its rules
+                # that hold no condition by name where that is shorter.
+                v_false, v_true = (
+                    min((v, _xreplace_once(v, by_name)), key=_tree_size) for v in (v_false, v_true)
                 )
                 texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
                 if any(t is None for t in texts):
@@ -8316,15 +8511,40 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "that reads its own concentration too (a recursive assignment rule)."
             )
 
+        # compartment -> (V̇ as ExprTk, [(`_ddt_` function, its ExprTk)], whether
+        # they read a rate), or None where one of them does not print
+        _comp_vdot_ex: dict[str, tuple[str, list[tuple[str, str]], bool] | None] = {}
+        _rate_fns_added: set[str] = set()
         for sid, comp in species_comp.items():
             if _diluted(sid):
                 vdot = _comp_vdot[comp]
                 if vdot is None or vdot == 0:
                     continue
-                vdot_ex = sympy_to_exprtk(vdot)
-                if vdot_ex is None:
+                if comp not in _comp_vdot_ex:
+                    expr, rules = _comp_by_name.get(comp, (vdot, []))
+                    parts = [expr, *map(_rate_by_name, rules)]
+                    texts = [sympy_to_exprtk(e) for e in parts]
+                    _comp_vdot_ex[comp] = (
+                        None
+                        if any(t is None for t in texts)
+                        else (
+                            _unalias(texts[0]),
+                            [
+                                (_rate_fn[r], _unalias(t))
+                                for r, t in zip(rules, texts[1:], strict=True)
+                            ],
+                            # By name, a rate the full V̇ cancels can still be read.
+                            bool(_comp_rated[comp])
+                            or (bool(rules) and any(_rate_tokens(e) for e in parts)),
+                        )
+                    )
+                if _comp_vdot_ex[comp] is None:
                     continue
-                vdot_ex = _unalias(vdot_ex)
+                vdot_ex, rate_fns, reads_rate = _comp_vdot_ex[comp]
+                for fn, fn_ex in rate_fns:  # each after the ones it reads
+                    if fn not in _rate_fns_added:
+                        _rate_fns_added.add(fn)
+                        builder.add_function(fn, fn_ex)
                 s_safe = _safe_name(sid)
                 c_safe = _safe_name(comp)
                 dil_name = f"_dil_{s_safe}_{c_safe}"
@@ -8345,7 +8565,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 # from the AR compartment's expression column), not the stale
                 # conc·V_static. Recorded for the report-time amount remap below.
                 ar_dilution_species.add(sid)
-                if _comp_rated[comp]:
+                if reads_rate:
                     _dilution_reads_rate = True
 
     # ── 9. Reactions → BNGsim reaction emission ──────────────────────
@@ -9497,7 +9717,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                         time_value=None,
                         avogadro_value=None,
                     )
-                    if pri_numeric is not None and float(pri_numeric).is_integer():
+                    # The int field holds a C int: an integer past it, 1e10 or
+                    # 1e308, failed the load with pybind11's "incompatible
+                    # function arguments". It takes the double path below.
+                    if (
+                        pri_numeric is not None
+                        and float(pri_numeric).is_integer()
+                        and abs(float(pri_numeric)) <= 2**31 - 1
+                    ):
                         priority_val = int(pri_numeric)
                     elif pri_numeric is not None:
                         # SBML L3 §4.11.3 priorities are REAL numbers, but the
@@ -9730,12 +9957,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # condition's root, each way, rescales the compartment's concentrations so
     # their amounts hold. ODE only, as every resize rescale is (#81); it is
     # added after the model's own events so their indices stay as they were.
-    # It executes before any of the model's events at the same instant, by a
-    # priority none of theirs reaches: the jump belongs to the size at that
-    # instant, and executed after an event there that sets a concentration in
-    # the compartment, its rescale of the value from before overwrote that
-    # setting (`at (time >= 2): Sn = 10` beside `cv := piecewise(1, time < 2,
-    # 5)` left Sn at 1 or 10 as the same-priority draw went, #242).
+    # The jump belongs to the size at that instant. Marked as a jump, it
+    # executes before anything else there, and the model's events triggered at
+    # the instant read their trigger, values and delay after it: read before
+    # it, `at (time >= 2): X = Sn` beside `cv := piecewise(1, time < 2, 5)`
+    # gave X the concentration from before the jump. Executed after an event
+    # there that sets a concentration in the compartment, its rescale of the
+    # value from before overwrote that setting (`at (time >= 2): Sn = 10` left
+    # Sn at 1 or 10 as the same-priority draw went, #242). The priority keeps
+    # it out of the draw against the model's own events under SSA, where it
+    # writes nothing.
     for k, (comp, trigger, before, after) in enumerate(_size_jumps):
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
@@ -9749,6 +9980,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             priority_expr="1e308",
             assignment_ode_only=[True] * len(_jump_species[comp]),
         )
+        builder.set_last_event_size_jump(comp)
         for sid in _jump_species[comp]:
             ar_dilution_species.add(sid)
 
