@@ -1249,6 +1249,9 @@ _HELD_LAWS = {
     "an-amount-out-of-it": (
         "substanceOnly species A in C; species B in D; A = 50; B = 0; k = 0.3; J: A => B; k*A;"
     ),
+    "with-its-size-as-a-factor": (
+        "species A in C, B in D; A = 50; B = 0; k = 0.3; J: A => B; C*k*A;"
+    ),
 }
 
 
@@ -1279,6 +1282,25 @@ def test_c4_cross_compartment_held_by_a_rule_runs_as_its_static_twin(law, held):
         for sizes in (_HELD[held], _HELD_TWIN)
     ]
     np.testing.assert_allclose(np.asarray(ode[0]), np.asarray(ode[1]), rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("held", ["C := 2", "q = 1; C := 2*q"])
+def test_a_law_with_a_held_size_as_its_factor_in_one_compartment(held):
+    """``A => ; C*k*A`` in ``C := 2`` folds the size into an Elementary rate,
+    as with ``C`` declared constant: [A] = 50*exp(-k*t) under the ODE, and
+    the SSA gives the twin's trajectory for the same seed."""
+    law = "species A in C; A = 50; k = 0.3; J: A => ; C*k*A;"
+    t = np.linspace(0.0, 8.0, 9)
+    model = bngsim.Model.from_antimony_string(f"compartment C = 1; {held}; {law}")
+    run = bngsim.Simulator(model).run(t_span=(0.0, 8.0), n_points=9, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(run.as_roadrunner(["[A]"]))[:, 0], 50.0 * np.exp(-0.3 * t)
+    )
+    ssa = [
+        _held_run(sizes, law, 5, ("A", "[A]"))
+        for sizes in (f"compartment C = 1; {held};", "compartment C = 2;")
+    ]
+    np.testing.assert_array_equal(ssa[0], ssa[1])
 
 
 def test_c4_cross_compartment_held_by_a_rule_matches_the_exact_mean():

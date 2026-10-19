@@ -3893,7 +3893,7 @@ def _classify_mass_action_ast(
             species_multiset[name] += 1
             continue
         if name in comp_ids:
-            if name in assignment_targets:
+            if name in moving_ar_comps:
                 # (#98) An ASSIGNMENT-RULE (variable-volume) compartment factor —
                 # e.g. the leading ``tC`` of a COPASI-style ``tC * (kf·A·B − …)``
                 # law where ``tC := mC + …``. Folding ``comp_volumes[tC]`` into the
@@ -3904,6 +3904,12 @@ def _classify_mass_action_ast(
                 # classification so the reaction takes the Functional path, where
                 # the live ``tC`` symbol stays inside the law and the #87
                 # numeric-V_static storage divide integrates it correctly.
+                #
+                # A rule over constants (``C := 2``) holds the load-time size, as a
+                # write to what it reads is refused, so its factor folds as a
+                # static compartment's does. Refused here, it kept a
+                # cross-compartment ``C*k*A`` from the record §7 certifies for the
+                # SSA, which ran the same law with ``C`` declared constant.
                 return None
             compartment_factors[name] += 1
             continue
