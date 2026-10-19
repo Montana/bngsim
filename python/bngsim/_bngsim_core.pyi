@@ -87,6 +87,10 @@ class ModelBuilder:
         """
         Issue #936: mark an assignment of the most recently added event as the concentration rescale a compartment resize injects. size_expr is the compartment's size; base_assign_idx0 the event's own assignment to the same species, or -1. The engine stores base * size before / size after the event's other assignments rather than the assignment's expression.
         """
+    def set_last_event_size_jump(self, compartment: str) -> None:
+        """
+        Issue #1054: mark the most recently added event as the rescale where the piecewise assignment-rule size of the compartment jumps. The ODE engine executes it before the other events of its instant read their trigger, values and delay.
+        """
     def set_net_file_dir(self, dir: str) -> None:
         """
         Set the directory a relative table-function path resolves against — the source .net file's own directory, which is where BNG writes the .tfun beside it. Empty leaves a relative path to resolve against the process's working directory.
@@ -342,6 +346,11 @@ class NetworkModel:
     def event_assigned_species(self) -> list[int]:
         """
         Sorted 0-based indices of every species some event assigns (issue #733): such a species is reset by the event, so its value is not time plus a constant even where its right-hand side is 1.
+        """
+    @property
+    def event_size_jump_compartments(self) -> list[str]:
+        """
+        Per event, the compartment whose piecewise assignment-rule size jumps where the event rescales its concentrations (issue #1054), or '' for an event of the model's own. n_events counts both.
         """
     @property
     def function_eval_expressions(self) -> list[str]:

@@ -306,6 +306,12 @@ class ModelBuilder {
     void set_last_event_assignment_rescale(int assign_idx0, const std::string &size_expr,
                                            int base_assign_idx0);
 
+    /// Issue #1054: mark the most recently added event as the rescale where the
+    /// piecewise assignment-rule size of `compartment` jumps. The ODE engine
+    /// executes it before the other events of its instant read their trigger,
+    /// values and delay (Event::size_jump_compartment).
+    void set_last_event_size_jump(const std::string &compartment);
+
     // ─── Discontinuity triggers (GH #72) ───────────────────────────────────
 
     /// Register a time-dependent inequality condition (e.g. "time()<=0.125")

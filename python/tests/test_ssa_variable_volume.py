@@ -1318,6 +1318,126 @@ def test_c4_reversible_cross_compartment_still_refused():
     assert "varvol_non_mass_action" in codes or "reversible_non_mass_action" in codes
 
 
+# A compartment an assignment rule holds constant: ``C := 2``, or ``C := 2*q``
+# over a parameter, a write to which is refused. Its size never moves, so a
+# monomial between it and a rate-rule compartment D is the static-and-varvol
+# case above, and its counts are read over that size exactly. It was refused
+# (varvol_non_mass_action), as a compartment an assignment rule moves is.
+_HELD = {
+    "C := 2": "compartment C = 2, D = 2; C := 2; D' = 0.1;",
+    "C := 2*q": "q = 1; compartment C = 1, D = 2; C := 2*q; D' = 0.1;",
+}
+_HELD_TWIN = "compartment C = 2, D = 2; D' = 0.1;"
+_HELD_LAWS = {
+    "out-of-it": "species A in C, B in D; A = 50; B = 0; k = 0.3; J: A => B; k*A;",
+    "into-it": "species A in C, B in D; A = 0; B = 30; k = 0.3; J: B => A; k*B;",
+    "bimolecular": (
+        "species A in C, B in D, P in C; A = 50; B = 20; P = 0; k = 0.01; J: A + B => P; k*A*B;"
+    ),
+    "an-amount-out-of-it": (
+        "substanceOnly species A in C; species B in D; A = 50; B = 0; k = 0.3; J: A => B; k*A;"
+    ),
+}
+
+
+def _held_run(sizes, law, seed, selectors=("A", "[A]", "B", "[B]")):
+    # A fresh model per run: a Simulator run continues from the model's state.
+    model = bngsim.Model.from_antimony_string(sizes + " " + law)
+    run = bngsim.Simulator(model, method="ssa").run(t_span=(0.0, 8.0), n_points=9, seed=seed)
+    return np.asarray(run.as_roadrunner(list(selectors)))
+
+
+@pytest.mark.parametrize("held", sorted(_HELD))
+@pytest.mark.parametrize("law", sorted(_HELD_LAWS))
+def test_c4_cross_compartment_held_by_a_rule_runs_as_its_static_twin(law, held):
+    """Certified, and for the same seed the same trajectory as with C declared
+    constant, in every count and concentration. The ODE, which the
+    certification moves onto the per-species divide, is the twin's too."""
+    model = bngsim.Model.from_antimony_string(_HELD[held] + " " + _HELD_LAWS[law])
+    assert not [i for i in bngsim.validate_for_ssa(model) if i.severity == "error"]
+    for seed in (1, 2, 3):
+        np.testing.assert_array_equal(
+            _held_run(_HELD[held], _HELD_LAWS[law], seed),
+            _held_run(_HELD_TWIN, _HELD_LAWS[law], seed),
+        )
+    ode = [
+        bngsim.Simulator(bngsim.Model.from_antimony_string(sizes + " " + _HELD_LAWS[law]))
+        .run(t_span=(0.0, 8.0), n_points=9, rtol=1e-10, atol=1e-12)
+        .as_roadrunner(["A", "[A]", "B", "[B]"])
+        for sizes in (_HELD[held], _HELD_TWIN)
+    ]
+    np.testing.assert_allclose(np.asarray(ode[0]), np.asarray(ode[1]), rtol=1e-9, atol=1e-12)
+
+
+def test_c4_cross_compartment_held_by_a_rule_matches_the_exact_mean():
+    """``A => B`` at ``k*[A]``, A in ``C := 2`` from a count of 100: the mean
+    count of A is ``100*exp(-k*t/2)``, and the mean [B] what A lost over D's
+    live size, ``2 + 0.1*t``."""
+    reps, k = 1500, 0.3
+    t = np.linspace(0.0, 8.0, 9)
+    runs = np.stack(
+        [
+            _held_run(_HELD["C := 2"], _HELD_LAWS["out-of-it"], 600 + i, ("A", "[B]"))
+            for i in range(reps)
+        ]
+    )
+    n_a = 100.0 * np.exp(-k * t / 2.0)
+    for col, want in ((0, n_a), (1, (100.0 - n_a) / (2.0 + 0.1 * t))):
+        got = runs[:, :, col]
+        z = np.abs(got.mean(0) - want)[1:] / (got.std(0, ddof=1)[1:] / np.sqrt(reps))
+        assert z.max() < 5.0, (col, got.mean(0), want)
+
+
+def test_c4_cross_compartment_held_by_a_rule_bimolecular_matches_extrande():
+    """``A + B => P`` at ``k*[A]*[B]``, A in ``C := 2`` and B in D, which grows:
+    ρ = k·(A/2)·(B/V_D)."""
+    k, reps, seed = 0.01, 1500, 61
+    t = np.linspace(0.0, 8.0, 9)
+    n_p = np.stack(
+        [
+            _held_run(_HELD["C := 2"], _HELD_LAWS["bimolecular"], seed + i, ("P",))[:, 0]
+            for i in range(reps)
+        ]
+    )
+    ref = ext.RefModel(
+        species=["A", "B", "P"],
+        x0={"A": 100, "B": 40, "P": 0},
+        reactions=[
+            ext.ReactionSpec(
+                stoich={"A": -1, "B": -1, "P": 1},
+                propensity=lambda s: k * (s["A"] / 2.0) * (s["B"] / s["D"]),
+            )
+        ],
+        cont={"D": lambda s: 0.1},
+        c0={"D": 2.0},
+    )
+    oref = ext.simulate_batch(ref, t, reps, seed=seed - 1, look_ahead=0.1)
+    pb, pe = n_p.mean(0), oref[:, :, 2].mean(0)
+    se = np.sqrt(n_p.var(0, ddof=1) / reps + oref[:, :, 2].var(0, ddof=1) / reps)
+    for i in range(1, len(t)):
+        z = abs(pb[i] - pe[i]) / (se[i] + 1e-12)
+        assert z < 5.0, f"held t={t[i]:.1f}: bng={pb[i]:.2f} ext={pe[i]:.2f} z={z:.2f}"
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        "compartment C = 1, D = 2; C := 1 + 0.1*time; D' = 0.1;",
+        "q = 1; compartment C = 1, D = 2; C := 2*q; q' = 0.1; D' = 0.1;",
+        "q = 1; compartment C = 1, D = 2; C := 2*q; D' = 0.1; at time > 1: q = 2;",
+        "compartment C = 1, D = 2, W = 1; C := 1 + 0.01*Z; species Z in W; Z = 0;"
+        " JZ: => Z; 1; D' = 0.1;",
+    ],
+    ids=["the-clock", "a-rate-rule", "an-event", "a-species"],
+)
+def test_c4_cross_compartment_a_rule_moves_is_still_refused(sizes):
+    """Control. A rule over the clock, a rate-rule or event target, or a
+    species moves the size, and the SSA does not follow it."""
+    model = bngsim.Model.from_antimony_string(sizes + " " + _HELD_LAWS["out-of-it"])
+    codes = {i.code for i in bngsim.validate_for_ssa(model) if i.severity == "error"}
+    assert "varvol_non_mass_action" in codes
+
+
 # ── (#171) Analytical Jacobian for cross-compartment variable-volume reactions ──
 #
 # These reactions always SIMULATE correctly (the RHS divides each species's

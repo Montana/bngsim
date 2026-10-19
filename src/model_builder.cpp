@@ -386,6 +386,7 @@ struct ModelBuilder::BuilderImpl {
         bool persistent = true;
         bool initial_value = true;
         bool use_values_from_trigger_time = true;
+        std::string size_jump_compartment; // issue #1054; "" for a model's own event
     };
     std::vector<EventSpec> event_specs;
 
@@ -701,6 +702,14 @@ void ModelBuilder::set_last_event_assignment_rescale(int assign_idx0, const std:
     spec.assignment_rescale_base.resize(n, -1);
     spec.assignment_rescale_size[static_cast<std::size_t>(assign_idx0)] = size_expr;
     spec.assignment_rescale_base[static_cast<std::size_t>(assign_idx0)] = base_assign_idx0;
+}
+
+void ModelBuilder::set_last_event_size_jump(const std::string &compartment) {
+    if (bimpl_->event_specs.empty())
+        throw std::runtime_error("ModelBuilder: set_last_event_size_jump with no event");
+    if (compartment.empty())
+        throw std::runtime_error("ModelBuilder: set_last_event_size_jump with no compartment");
+    bimpl_->event_specs.back().size_jump_compartment = compartment;
 }
 
 void ModelBuilder::add_discontinuity_trigger(const std::string &condition_expr) {
@@ -2698,6 +2707,7 @@ NetworkModel ModelBuilder::build() {
             ev.persistent = espec.persistent;
             ev.initial_value = espec.initial_value;
             ev.use_values_from_trigger_time = espec.use_values_from_trigger_time;
+            ev.size_jump_compartment = espec.size_jump_compartment;
 
             // Compile trigger expression. The source is retained verbatim
             // (issue #49): the event-time sensitivity detector differentiates
