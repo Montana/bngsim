@@ -696,6 +696,47 @@ def test_rateof_in_initial_assignment_reaction_species():
     assert reac.get_param("p2") == pytest.approx(-1.0)  # reactant ⇒ -rate
 
 
+@pytest.mark.parametrize("on", ["species", "model"])
+def test_rateof_in_initial_assignment_scales_by_the_conversion_factor(on, caplog):
+    """S's conversionFactor cf = 2 doubles the change the reaction makes to it, so
+    ``p2 = rateOf(S)`` folds to -cf*k*S = -1, the value the rule ``p3 :=
+    rateOf(S)`` has at t = 0 and RoadRunner gives both. The fold left the factor
+    out and gave -0.5, and the #313 warning, which names what the fold froze, left
+    out ``cf``."""
+    species_cf = ' conversionFactor="cf"' if on == "species" else ""
+    model_cf = ' conversionFactor="cf"' if on == "model" else ""
+    rate_of_s = (
+        '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+        f"<apply>{_RATEOF_CSYMBOL}<ci>S</ci></apply></math>"
+    )
+    body = f"""
+  <model id="m"{model_cf}>
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialConcentration="1" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"{species_cf}/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="cf" value="2" constant="true"/>
+      <parameter id="k" value="0.5" constant="true"/>
+      <parameter id="p2" constant="true"/>
+      <parameter id="p3" constant="false"/>
+    </listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="p2">{rate_of_s}</initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules><assignmentRule variable="p3">{rate_of_s}</assignmentRule></listOfRules>
+    <listOfReactions>{_decay_reaction("S")}</listOfReactions>
+  </model>"""
+    with caplog.at_level("WARNING", logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(_sbml(body))
+    assert model.get_param("p2") == pytest.approx(-1.0)
+    assert "cf" in (_frozen_warning(caplog) or "").split(", ")
+    p3 = _read_value(_run(model, t_end=1.0, n_points=2), "p3")
+    assert p3 is not None
+    assert p3[0] == pytest.approx(-1.0)
+
+
 # ─── Issue #1045: rateOf of a parameter no rule changes, in an initial value ───
 #
 # ``p2 = rateOf(p1)`` with p1 a parameter that no rate rule changes is 0 (SBML
