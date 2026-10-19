@@ -12,17 +12,20 @@ The first doubles of a run cannot be read for it: where ``t_start`` is not 0 the
 elapsed time there is no larger than its rounding, and a stop or a root a few
 ulps on (another event due, a row) reads the state with that rounding in its
 sign. Read there, a trigger that leaves into its false side fired, and one that
-leaves into its true side fell and fired again. So such a trigger is held: if
-the flow carries it into the true side at first order it fires at its first
-root and is not read false again for a short hold after the start; otherwise
-it reads false for that hold and is read as it is from the hold's end, where a
-departure into the true side at a higher order fires. The hold is 1e4 doubles
-of t_start, the scale of that rounding: 1.6e-12 from 0.7, and none from 0.
+leaves into its true side fell and fired again. So such a trigger is held: it
+reads false until the hold's end and is read as it is from there, where every
+departure into the true side fires, in one batch. A write that changes its
+residual inside the hold ends the hold for it. The hold is 1e4·eps·|t_start|,
+the scale of that rounding: 1.6e-12 from 0.7, and none from 0, so a run from 0
+fires at the first root, as libRoadRunner does. Dynamics inside the hold are
+not resolved: a trigger that starts on its threshold and rises and falls again
+within it is read once, at its end.
 
 A departure without first-order motion has no derivative for its fire time
 (moving the threshold, or the flow's first motion, moves the fire from the
 start to later), so a forward-sensitivity run refuses it by name, as issue
-#960's envelope asks, until the residual has been read off the threshold.
+#960's envelope asks, when it fires at the start. Whether the residual moves
+at first order is read off a probe along the flow at δ and δ/2 (ratio 2).
 
 Issue #340 had refused that first root wherever the flow did not carry the
 residual off at first order, on BIOMD0000000285 (``PIdeath > 0``, with the
@@ -494,3 +497,113 @@ def test_a_trigger_true_only_briefly_after_the_start_fires(trigger):
     x = np.asarray(run.species)
     assert x[1, names.index("F")] == 1.0
     assert x[1, names.index("B")] == pytest.approx(1.0, rel=1e-6)
+
+
+# ─── What the second review found ─────────────────────────────────────────
+
+
+def _obs_last(text, t0, t_end, n_points=8, **params):
+    model = bngsim.Model.from_antimony_string(text)
+    for name, value in params.items():
+        model.set_param(name, value)
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(t0, t_end), n_points=n_points, rtol=1e-8, atol=1e-10
+    )
+    values = dict(zip(run.species_names, np.asarray(run.species)[-1], strict=True))
+    values.update(zip(run.observable_names, np.asarray(run.observables)[-1], strict=True))
+    return values
+
+
+@pytest.mark.parametrize("t0", [0.0, 0.5, 300.0])
+def test_a_trigger_that_resets_itself_fires_each_time_from_any_start(t0):
+    """X' = 1 from X(t0) = 0 with `at (X > 0): X = -1`: fires at t0, t0+1,
+    t0+2, t0+3. Pinned true through the start hold, the reset's fall was not
+    read and nothing fired after the first (from any t0 but 0)."""
+    text = "species X = 0; n = 0;\nX' = 1;\nE: at (X > 0), t0=false: X = -1, n = n + 1;\n"
+    last = _obs_last(text, t0, t0 + 3.5)
+    assert last["n"] == 4.0
+    assert last["X"] == pytest.approx(-0.5, abs=1e-6)
+
+
+@pytest.mark.parametrize("t0", [0.0, 1.0, 10.0])
+def test_a_ratchet_from_its_threshold_counts_every_unit(t0):
+    """`at (X > lvl): lvl = lvl + 1` from X = lvl = 0 with X' = 1: n = 4 over
+    3.5, as in libRoadRunner."""
+    text = (
+        "species X = 0; lvl = 0; n = 0;\nX' = 1;\n"
+        "E: at (X > lvl), t0=false: lvl = lvl + 1, n = n + 1;\n"
+    )
+    assert _obs_last(text, t0, t0 + 3.5)["n"] == 4.0
+
+
+@pytest.mark.parametrize("t0", [0.0, 5.0, 1e6])
+def test_start_fires_at_different_orders_keep_their_priorities(t0):
+    """E1 leaves its threshold at second order, E2 at first; both fire at the
+    start, one instant, E1 (priority 10) before E2: v = 2, as in libRoadRunner."""
+    text = (
+        "species A = 0, B = 0, Y = 0; v = 0;\nA' = 1; B' = A; Y' = 1;\n"
+        "E1: at (B > 0), t0=false, priority=10: v = 1;\n"
+        "E2: at (Y > 0), t0=false, priority=0: v = 2;\n"
+    )
+    assert _obs_last(text, t0, t0 + 1.0, n_points=3)["v"] == 2.0
+
+
+@pytest.mark.parametrize("t0", [0.0, 2.0])
+@pytest.mark.parametrize("grid", [[0.0, 3.0], [0.0, 1.0, 3.0]])
+def test_a_flat_start_that_crosses_back_is_differentiated_on_any_grid(t0, grid):
+    """X = 1 - s^2/2 + a*s^3 leaves `X > 1` at second order into the false side
+    and crosses back transversally at 1/(2a): dG/da = 1000/(2a^2) = 4500 at
+    a = 1/3. With no row before the crossing, a refusal that waited for a read
+    of the residual off its threshold refused it."""
+    text = (
+        "species S = 0, X = 1, F = 0, G = 0; c = 1; a = 0.3333333333333333;\n"
+        "S' = 1;\nX' = -S + 3*a*S^2;\nG' = F;\nE: at (X > c), t0=false: F = 1000;\n"
+    )
+    res = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["a"]
+    ).run(sample_times=[t0 + x for x in grid], rtol=1e-10, atol=1e-12)
+    g = list(res.species_names).index("G")
+    assert np.asarray(res.sensitivities)[-1, g, 0] == pytest.approx(4500.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("ulps", [5, 1000])
+def test_a_write_that_opens_a_held_trigger_is_a_cascade_fire(ulps):
+    """X(5) = 0 with X' = -k is held at the start; U sets X = k a few ulps on.
+    The write ends E's hold, so E rises at U's write like any trigger an
+    assignment opens, and a sensitivity run refuses it (issue #144). Deferred
+    to the hold's end it was differentiated as a crossing: dG/dk = -1000, for
+    a central difference of 0."""
+    import math
+
+    text = (
+        "species X = 0, F = 0, G = 0; k = 1; tU = 1;\nX' = -k;\nG' = F;\n"
+        "U: at (time >= tU), t0=false: X = k;\nE: at (X > 0), t0=false: F = 1000;\n"
+    )
+    model = bngsim.Model.from_antimony_string(text)
+    model.set_param("tU", 5.0 + ulps * math.ulp(5.0))
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["k"])
+    with pytest.raises(bngsim.SimulationError, match="another event's assignment"):
+        sim.run(sample_times=[5.0, 6.0, 7.0], rtol=1e-10, atol=1e-12)
+    model = bngsim.Model.from_antimony_string(text)
+    model.set_param("tU", 5.0 + ulps * math.ulp(5.0))
+    run = bngsim.Simulator(model, method="ode").run(
+        sample_times=[5.0, 6.0, 7.0], rtol=1e-10, atol=1e-12
+    )
+    names = list(run.species_names)
+    assert np.asarray(run.species)[-1, names.index("G")] == pytest.approx(2000.0, rel=1e-9)
+
+
+@pytest.mark.parametrize("trigger", ["X^2 > c", "X*Y > c"])
+def test_a_residual_that_leaves_at_second_order_through_the_state_refuses(trigger):
+    """X = Y = t: `X^2 > c` and `X*Y > c` leave c = 0 at second order though
+    the state moves at first order, so a first-order step along the flow moved
+    the residual and the fire was differentiated: dG/dc = -7e28."""
+    text = (
+        "species X = 0, Y = 0, F = 0, G = 0; c = 0\nX' = 1;\nY' = 1;\nG' = F;\n"
+        f"E: at ({trigger}), t0=false: F = 1000;\n"
+    )
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["c"]
+    )
+    with pytest.raises(bngsim.SimulationError, match=r"no first-order motion \(issue #934\)"):
+        sim.run(sample_times=[0.0, 1.0, 2.0], rtol=1e-10, atol=1e-12)

@@ -11907,24 +11907,23 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // larger than its rounding, and a stop or a root there (another event due a
     // few ulps on, a row) reads the state with that rounding in its sign. Read
     // there, a trigger that left into its false side fired, and one that left
-    // into its true side fell and fired again. So until `start_hold_end` such a
-    // trigger is not read as it stands:
-    //   1 — the flow does not carry it into the true side at first order. It
-    //       reads false, its root is held false, and from start_hold_end on it
-    //       is read as it is: a departure into the true side at a higher order
-    //       fires there, a hold's length after the start.
-    //   2 — the flow carries it into the true side at first order. It fires at
-    //       its first root, as any rise does, and is not read false again
-    //       before start_hold_end.
+    // into its true side fell and fired again. So such a trigger is held
+    // (start_hold = 1): until `start_hold_end` it reads false and its root is
+    // held false, and from there on it is read as it is, so a departure into the
+    // true side fires there, all of them in one batch. A write that changes its
+    // residual inside the hold ends the hold for it: what the write opens is
+    // read at once, as at any other time.
     // Filled by the t_start initialization below; 0 for every other event.
     std::vector<char> start_hold(n_events, 0);
-    // Held (1) with a residual that does not move at first order: the
-    // departure is not transversal, and the time the event fires has no
+    // Held with a residual that does not move at first order along the flow:
+    // the departure is not transversal, and the time the event fires has no
     // derivative with respect to anything that moves the residual or a lower
-    // order of its flow there. A sensitivity run refuses the fire (issue #934,
-    // the envelope of lanl/bngsim#960) unless the residual has been read off
-    // the threshold since without a fire.
+    // order of its flow there. A sensitivity run refuses such a fire at the
+    // start (issue #934, the envelope of lanl/bngsim#960).
     std::vector<char> flat_start(n_events, 0);
+    // A held trigger's residual before the execution in progress, to tell a
+    // write that changed it.
+    std::vector<double> held_residual(n_events, 0.0);
 
     // ─── Random tie-break among equal-priority simultaneous events (GH #242) ──
     // SBML L3v2 §4.11.6: among events firing at the same instant with the SAME
@@ -12365,38 +12364,37 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     };
 
     // How long a trigger that starts on its threshold is held (see start_hold):
-    // kStartHoldUlps doubles of t_start, past where the rounding of the elapsed
-    // time decides a sign. That rounding is t_start's own spacing, so a run
-    // that starts at 0 has none to hold over and is read from its first root,
-    // as libRoadRunner reads it.
+    // kStartHoldUlps·eps·|t_start| (1e4 to 2e4 doubles of t_start), past where
+    // the rounding of the elapsed time decides a sign. That rounding is
+    // t_start's own spacing, so a run that starts at 0 has none to hold over
+    // and is read from its first root, as libRoadRunner reads it.
     constexpr double kStartHoldUlps = 1.0e4;
     const double start_hold_end = times.t_start + kStartHoldUlps *
                                                       std::numeric_limits<double>::epsilon() *
                                                       std::fabs(times.t_start);
     user_data.event_start_hold = (n_events > 0) ? start_hold.data() : nullptr;
     user_data.start_hold_end = start_hold_end;
+    // The probe step of the t_start classification below; a fire of a flat
+    // start up to this far past the start (or to the hold's end) is the fire of
+    // its departure.
+    const double start_probe_step =
+        1e-6 * std::max({t_out.back() - times.t_start, std::fabs(times.t_start), 1.0});
+    const double start_fire_end = std::max(start_hold_end, times.t_start + start_probe_step);
     // An event's trigger as the run reads it at `t`, the start hold applied.
     auto read_trigger = [&](int ei, double t) -> bool {
-        const bool raw = eval_ref_outer.evaluate(events_outer[ei].trigger_expr_idx) > 0.5;
-        if (start_hold[ei] == 0 || !(t < start_hold_end)) {
-            return raw;
+        if (start_hold[ei] != 0 && t < start_hold_end) {
+            return false;
         }
-        return start_hold[ei] == 1 ? false : (raw || trigger_was_true[ei]);
+        return eval_ref_outer.evaluate(events_outer[ei].trigger_expr_idx) > 0.5;
     };
-    // A read without a fire of a trigger that left its threshold flat: once its
-    // residual is off the threshold, a later rise is a crossing like any other.
-    auto clear_flat_start_off_threshold = [&](int ei) {
-        if (flat_start[ei] == 0) {
-            return;
-        }
+    auto residual_now = [&](int ei) -> double {
         const int gidx = model.event_trigger_residual_expr(ei);
-        if (gidx >= 0 && eval_ref_outer.evaluate(gidx) != 0.0) {
-            flat_start[ei] = 0;
-        }
+        return gidx >= 0 ? eval_ref_outer.evaluate(gidx) : 0.0;
     };
-    // A sensitivity run's fire of a trigger that left its threshold flat.
+    // A sensitivity run's fire, at the start, of a trigger that left its
+    // threshold flat.
     auto refuse_a_flat_start_fire = [&](int ei, double t) {
-        if (sens.n_total > 0 && flat_start[ei] != 0) {
+        if (sens.n_total > 0 && flat_start[ei] != 0 && !(t > start_fire_end)) {
             throw std::runtime_error(
                 "Forward sensitivity: event '" + events_outer[ei].id +
                 "' fires at t=" + std::to_string(t) +
@@ -12748,6 +12746,16 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     }
                 }
             }
+            const bool any_held_now =
+                t_now < start_hold_end &&
+                std::find(start_hold.begin(), start_hold.end(), 1) != start_hold.end();
+            if (any_held_now) {
+                for (int ei = 0; ei < n_events; ++ei) {
+                    if (start_hold[ei] != 0) {
+                        held_residual[ei] = residual_now(ei);
+                    }
+                }
+            }
             write_event_values(ev, nv, t_now);
             any_immediate = true;
             if (sens.n_total > 0) {
@@ -12844,6 +12852,13 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             for (int ei = 0; ei < n_events; ++ei) {
                 if (t_now < trigger_changed_at[ei]) {
                     continue; // read behind its last change
+                }
+                // A write that changed a held trigger's residual ends its hold
+                // (see start_hold): what the write opened is read now.
+                if (start_hold[ei] != 0 && t_now < start_hold_end &&
+                    residual_now(ei) != held_residual[ei]) {
+                    start_hold[ei] = 0;
+                    flat_start[ei] = 0;
                 }
                 bool now_true = read_trigger(ei, t_now);
                 bool was = prev[ei];
@@ -13016,8 +13031,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             if (now_true && !trigger_was_true[ei] && !event_dormant[ei]) {
                 refuse_a_flat_start_fire(ei, t_now);
                 risers.push_back(ei);
-            } else if (!now_true && !(t_now < start_hold_end)) {
-                clear_flat_start_off_threshold(ei);
             }
             if (trigger_was_true[ei] != now_true) {
                 trigger_changed_at[ei] = t_now;
@@ -13369,15 +13382,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                                     }),
                                      pending_events.end());
 
-            // Triggers that start ON their threshold (issues #340, #934): which
-            // of them the flow carries into the true side at first order, asked
-            // of the trigger itself a small step along the flow, δ a millionth
-            // of the time the fastest species it reads takes to change by its
-            // own size (in the model's units; a gradient of the residual is
-            // past a pole or a root of it where a species is 0, and a residual
-            // that moves to one side only has none). f is taken just past
-            // t_start, so a rate gated on `time > t_start` counts. See
-            // start_hold for what is done with the answer.
+            // Triggers that start ON their threshold (issues #340, #934): each is
+            // held (see start_hold). Whether its residual moves at first order
+            // is asked of the residual itself, a small step along the flow and
+            // half of one: at first order the two readings are in the ratio 2,
+            // at order k in 2^k, and a residual that stays at 0 is flat too. δ
+            // is a millionth of the time the fastest species it reads takes to
+            // change by its own size, in the model's units, and f is taken just
+            // past t_start, so a rate gated on `time > t_start` counts.
             {
                 std::vector<double> t0_f;
                 std::vector<double> t0_x;
@@ -13389,6 +13401,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     if (gidx < 0 || eval_ref_outer.evaluate(gidx) != 0.0) {
                         continue;
                     }
+                    start_hold[ei] = 1;
+                    if (sens.n_total == 0) {
+                        continue;
+                    }
                     if (t0_f.empty()) {
                         t0_f.assign(static_cast<std::size_t>(ns), 0.0);
                         model.compute_derivs(
@@ -13396,9 +13412,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             y_data, t0_f.data());
                         t0_x.assign(y_data, y_data + ns);
                     }
-                    const double horizon =
-                        std::max({t_out.back() - times.t_start, std::fabs(times.t_start), 1.0});
-                    double delta = 1e-6 * horizon;
+                    double delta = start_probe_step;
                     const std::vector<int> &support = model.event_trigger_residual_species(ei);
                     for (int j : support) {
                         const auto uj = static_cast<std::size_t>(j);
@@ -13406,18 +13420,21 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             delta = std::min(delta, 1e-6 * std::fabs(t0_x[uj] / t0_f[uj]));
                         }
                     }
-                    std::vector<double> x_probe(t0_x);
-                    for (int j : support) {
-                        const auto uj = static_cast<std::size_t>(j);
-                        x_probe[uj] += delta * t0_f[uj];
-                    }
-                    impl_->sync_model_at(times.t_start + delta, x_probe.data(), ns);
-                    const bool leaves_into_true =
-                        eval_ref_outer.evaluate(events_outer[ei].trigger_expr_idx) > 0.5;
-                    const bool moves = eval_ref_outer.evaluate(gidx) != 0.0;
+                    auto residual_at = [&](double step) {
+                        std::vector<double> x_probe(t0_x);
+                        for (int j : support) {
+                            const auto uj = static_cast<std::size_t>(j);
+                            x_probe[uj] += step * t0_f[uj];
+                        }
+                        impl_->sync_model_at(times.t_start + step, x_probe.data(), ns);
+                        return eval_ref_outer.evaluate(gidx);
+                    };
+                    const double g_full = residual_at(delta);
+                    const double g_half = residual_at(0.5 * delta);
                     impl_->sync_model_at(times.t_start, t0_x.data(), ns);
-                    start_hold[ei] = leaves_into_true ? 2 : 1;
-                    flat_start[ei] = (!leaves_into_true && !moves) ? 1 : 0;
+                    const bool first_order =
+                        g_full != 0.0 && g_half != 0.0 && std::fabs(g_full / g_half) < 3.0;
+                    flat_start[ei] = first_order ? 0 : 1;
                 }
             }
 
@@ -14565,8 +14582,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     if (trigger_now && !trigger_was_true[ei]) {
                         refuse_a_flat_start_fire(ei, static_cast<double>(t_ret));
                         firing.push_back(ei);
-                    } else if (!trigger_now && !(static_cast<double>(t_ret) < start_hold_end)) {
-                        clear_flat_start_off_threshold(ei);
                     }
                     if (!trigger_now && !events_outer[ei].persistent) {
                         drop_pending_of(ei);
@@ -15285,7 +15300,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 rise_on_stop_due = true;
             } else if (!pending_events.empty()) {
                 const auto &events = model.events();
-                auto &eval_ref = model.evaluator();
                 auto &sp_vec = const_cast<std::vector<Species> &>(model.species());
 
                 // Cancel non-persistent events whose trigger is no longer true
@@ -15509,17 +15523,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // columns keeps the time it stands at: its columns are read there,
         // and may hold a switch's jump the time asked for is still before.)
         result.record(i, t_row, y_data, obs_buf.data());
-
-        // A row is a read too: a trigger that left its threshold flat and reads
-        // false here, off the threshold, rises later by a crossing like any
-        // other (see flat_start).
-        if (sens.n_total > 0 && !(t_row < start_hold_end)) {
-            for (int ei = 0; ei < n_events; ++ei) {
-                if (flat_start[ei] != 0 && !trigger_was_true[ei] && !read_trigger(ei, t_row)) {
-                    clear_flat_start_off_threshold(ei);
-                }
-            }
-        }
 
         // Record function values
         if (n_func > 0) {
