@@ -7282,6 +7282,7 @@ def _functional_jacobian_groups(
         _TIME_SYM,
         build_per_species_c,
         differentiate_rate_law_c,
+        rateof_rate_laws,
     )
 
     params = data["parameters"]
@@ -7325,7 +7326,8 @@ def _functional_jacobian_groups(
     # ── Functional context (read like attach_functional_jacobian) ───────────
     ctx = core.functional_jacobian_context()
     frxns = ctx.get("functional_reactions") or []
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
     obs_groups = {name: [(int(si), float(f)) for si, f in grp] for name, grp in ctx["observables"]}
     species_meta = {i: (bool(av), float(vf)) for i, (av, vf) in enumerate(ctx["species_meta"])}
     # (#170 stage 2) Same map attach_functional_jacobian builds, for the same reason:
@@ -10227,11 +10229,16 @@ def _functional_dfdp_terms(
     functions = data["functions"]
     reactions = data["reactions"]
 
-    from bngsim._jacobian import _DerivationBudgetExceeded, has_condition_construct
+    from bngsim._jacobian import (
+        _DerivationBudgetExceeded,
+        has_condition_construct,
+        rateof_rate_laws,
+    )
 
     ctx = core.functional_jacobian_context()
     frxn_by_idx = {int(r["rxn_idx"]): r for r in (ctx.get("functional_reactions") or [])}
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
 
     param_idx_by_name = {p["name"]: i for i, p in enumerate(params)}
     primary_param_names = {p["name"] for p in params if p.get("is_const", True)}
@@ -11054,7 +11061,32 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     tfun_specs = data.get("table_functions", [])
 
     if any(_RATEOF_PREFIX in f["expression"] for f in functions):
-        return None
+        # A function that reads rate_of__X reads X's rate law in its place,
+        # written out to species and parameters (issue #1124, item 7): the
+        # sensitivity RHS has no live dx/dt, and the value is the same. Where
+        # X's rate is not one rateof_rate_laws can state, or the rates read
+        # each other in a ring, the model declines as before.
+        from bngsim._jacobian import _inline_functions, rateof_rate_laws
+
+        def _wrapped_from(flat: dict[str, str]) -> Callable[[re.Match[str]], str]:
+            return lambda m: f"({flat[m.group(0)]})"
+
+        laws = rateof_rate_laws(data)
+        bodies = {**laws, **{f["name"]: f["expression"] for f in functions}}
+        token = re.compile(r"\b" + _RATEOF_PREFIX + r"[A-Za-z0-9_]+")
+        rewritten = []
+        for f in functions:
+            expr = f["expression"]
+            if _RATEOF_PREFIX in expr:
+                flat: dict[str, str] = {}
+                for tok in set(token.findall(expr)):
+                    law = _inline_functions(laws[tok], bodies) if tok in laws else None
+                    if law is None or _RATEOF_PREFIX in law:
+                        return None
+                    flat[tok] = law
+                f = {**f, "expression": token.sub(_wrapped_from(flat), expr)}
+            rewritten.append(f)
+        functions = rewritten
 
     tfun_names = [spec["name"] for spec in tfun_specs]
     for f in functions:

@@ -353,4 +353,36 @@ class TestSensValueLines:
         assert cg._sens_value_lines(data) is None
 
     def test_declines_rateof(self):
+        """With no reaction list there is no rate to read in its place."""
         assert cg._sens_value_lines(_data([("fA", f"{cg._RATEOF_PREFIX}A * 2")])) is None
+
+    def test_reads_a_rate_of_as_its_rate_law(self):
+        """Issue #1124, item 7: A is lost at the rate law ``vA``, so rateOf(A)
+        is -vA, written out to what vA reads."""
+        data = _data([("vA", "kd*A"), ("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["reactions"] = [
+            {
+                "type": "functional",
+                "function_name": "vA",
+                "stat_factor": 1.0,
+                "apply_species_factor": False,
+                "per_species_volume_scaling": False,
+                "reactants": [0],
+                "products": [],
+            }
+        ]
+        _obs, func = cg._sens_value_lines(data)
+        assert func[2] == "    func[1] = (((-1.0)*(p[1]*y[0]))) * 2.0;  /* fA */"
+
+    def test_declines_a_rate_of_a_species_a_mass_action_reaction_moves(self):
+        data = _data([("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["reactions"] = [
+            {
+                "type": "elementary",
+                "function_name": "k",
+                "stat_factor": 1.0,
+                "reactants": [0],
+                "products": [],
+            }
+        ]
+        assert cg._sens_value_lines(data) is None
