@@ -15523,10 +15523,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // Half of CVODE's own root tolerance. CVodeGetDky reads a whole
             // one past the end of the step, which is often the row itself (a
             // step stopped on it): half is inside that by more than rounding.
-            const double t_ahead =
-                t_out[i] + 50.0 * std::numeric_limits<double>::epsilon() *
-                               (std::fabs(static_cast<double>(t_step_end)) +
-                                std::fabs(static_cast<double>(h_last)));
+            const double t_ahead = t_out[i] + 50.0 * std::numeric_limits<double>::epsilon() *
+                                                  (std::fabs(static_cast<double>(t_step_end)) +
+                                                   std::fabs(static_cast<double>(h_last)));
             NVectorGuard ahead(N_VClone(y));
             if (CVodeGetDky(cvode_mem, static_cast<sunrealtype>(t_ahead), 0, ahead) == CV_SUCCESS) {
                 const double *x_ahead = N_VGetArrayPointer(ahead);
