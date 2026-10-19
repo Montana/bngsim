@@ -9587,9 +9587,11 @@ class SteadyStateResult:
     n_rhs_evals : int
         Number of RHS evaluations.
     n_state_switch_roots : int
-        The crossings of a rate-law condition over model state that the
-        march stopped and restarted on, so a window the approach passes
-        through is integrated over (issue #904).
+        The crossings of a rate-law condition over model state (or of an
+        SBML model's discontinuity trigger) the march stopped at, so a window
+        the approach passes through is integrated over (issue #904). It
+        restarts on each one up to 1000; the 1001st, where it stops rooting
+        them, is counted too.
     state_switch_roots_dropped : bool
         Whether the march stopped rooting those conditions after 1000
         crossings, as a state that slides along its threshold makes, and

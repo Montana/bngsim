@@ -3,7 +3,7 @@
 A rate law switched by a comparison over model state is constant on each side
 of its switch, so a step that spans a narrow window reads it as off at both
 ends, and the window is lost at every tolerance. ``run()`` roots each such
-condition since #897. The march ``steady_state()`` integrates by built its own
+condition since #897. The march ``steady_state()`` integrates with built its own
 integrator and rooted nothing: with Y made at k while ``0.5 < S < 0.505`` and S
 decaying from 1, ``steady_state()`` returned Y = 0 with ``converged=True``,
 where a run gives 2·k·ln(1.01) = 0.1990.
@@ -155,3 +155,35 @@ def test_a_state_held_on_its_threshold_ends_where_it_did(tmp_path, monkeypatch, 
     assert not out.converged and not before.converged
     assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
     assert np.asarray(before.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+
+
+ANTIMONY = """
+compartment c = 2; species S in c, Y in c; S = 1; Y = 0;
+k = {k!r}; kd = {kd!r}; lo = {lo!r}; hi = {hi!r};
+R1: S -> ; c*kd*S
+R2: -> Y; c*{law}
+"""
+
+SBML_LAWS = {
+    "two-atoms": "piecewise(k, (S > lo) && (S < hi), 0)",
+    "abs-window": "piecewise(k, abs(S - (lo + hi)/2) < (hi - lo)/2, 0)",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(SBML_LAWS))
+def test_an_sbml_window_on_the_approach_is_integrated_over(spelling):
+    """An SBML model's conditions are the loader's discontinuity triggers,
+    which a run roots, and not ``state_switch_root_conditions()``, which is
+    empty for it. The march rooted only the latter, so the same window read
+    from SBML still left Y at 0 with converged=True."""
+    text = ANTIMONY.format(k=K, kd=KD, lo=LO, hi=HI, law=SBML_LAWS[spelling])
+    model = bngsim.Model.from_antimony_string(text)
+    assert model.state_switch_root_conditions() == ()
+    out = bngsim.Simulator(model, method="ode").steady_state()
+    assert out.converged
+    assert np.asarray(out.concentrations)[1] == pytest.approx(Y_SS, rel=1e-5)
+    assert out.n_state_switch_roots >= 2
+    run = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
+        t_span=(0, 80), n_points=2
+    )
+    assert np.asarray(run.species)[-1, 1] == pytest.approx(Y_SS, rel=1e-5)

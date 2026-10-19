@@ -1274,10 +1274,11 @@ struct SteadyStateResult {
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
     int n_rhs_evals = 0;
-    // Issue #904: the crossings of a rate-law condition over model state the
-    // march restarted on (SteadyStateOptions::state_switch_conditions), and
-    // whether it stopped rooting them, past 1000, to march over a state that
-    // slides along its threshold as it did before.
+    // Issue #904: the crossings the march stopped at, of a rate-law condition
+    // over model state (SteadyStateOptions::state_switch_conditions) or of an
+    // SBML model's discontinuity trigger; it restarts on the first 1000 and
+    // counts the 1001st, where it stops rooting them to march over a state
+    // that slides along its threshold as it did before. And whether it did.
     int n_state_switch_roots = 0;
     bool state_switch_roots_dropped = false;
 
