@@ -307,8 +307,9 @@ class SteadyStateRhs {
     // Absent for three reasons, all of which the caller answers the same way (fall
     // back to finite differences): the model has no compiled artifact at all; the
     // artifact was built without `_want_output_sens` so the symbol was never
-    // emitted; or `_analyze_output_sens` declined the whole model (rateOf, an
-    // embedded table-function wrapper, no user-selectable functions).
+    // emitted; or `_analyze_output_sens` declined the whole model, for a reason its
+    // `decline` field gives (an embedded table-function wrapper, no user-selectable
+    // functions, and the others listed there).
     bool has_analytical_output_sens() const { return output_sens_fn_ != nullptr; }
 
     // d(func_m)/dθ_c into func_sens_out[c*n_func + m], from the per-column state
@@ -4428,12 +4429,15 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
 //               derivative; dropping either is a confidently wrong gradient.
 //
 // The fallback is not vestigial. It answers a whole-model decline (no compiled
-// artifact, an artifact built without `_want_output_sens`, or `_analyze_output_sens`
-// declining on rateOf / an embedded table-function wrapper) AND the per-function
-// cases inside a live artifact: a function the emitter marked unsupported (written
-// NaN) and one it left outside the user-function closure (left untouched). Both are
-// detected the same way — pre-fill the buffer with NaN, and any row that comes back
-// non-finite is one the compiled evaluator did not answer. Rows it did answer are
+// artifact, an artifact built without `_want_output_sens`, or a model
+// `_analyze_output_sens` declines whole, for a reason its `decline` field gives)
+// AND the per-function cases inside a live artifact: a function the emitter marked
+// unsupported (written NaN; an if() conditional, a max(), and the others its
+// per-function reason names) and one it left outside the user-function closure
+// (left untouched). Both are detected the same way — pre-fill the buffer with NaN,
+// and any row that comes back non-finite is one the compiled evaluator did not
+// answer. A supported function that reads a species with no row comes back NaN
+// too, and the FD sweep then records which species it was. Rows it did answer are
 // skipped by the FD sweep, so a model where every function is supported never pays
 // for the ns species perturbations at all.
 //
@@ -4539,6 +4543,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
     // ── Functions: compiled chain rule, differenced where it declines ─────────
     if (n_func > 0) {
         result.function_sensitivity.assign(static_cast<size_t>(n_func) * np, 0.0);
+        result.function_sens_missing_species.assign(static_cast<size_t>(n_func), -1);
         const double nan = std::numeric_limits<double>::quiet_NaN();
 
         // param_names[p] was validated to exist by compute_ss_sensitivity, which
@@ -4649,6 +4654,21 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             // its roundoff floor (issue #123). It is the function-side analogue
             // of the Jacobian row sum compute_ss_sensitivity uses, and it comes
             // free: the partials are already in hand.
+            //
+            // A species the solve leaves out has a NaN row: a caller's mask= species
+            // (issue #74), and every assignment-rule target, which
+            // _ss_mask_excluding_ar_species takes out of the solve (GH #247). A
+            // function that does not read such a species has a partial of exactly
+            // zero for it, since its value is evaluated from bit-identical inputs,
+            // and it takes nothing from that row. The product 0·NaN is NaN, though,
+            // so the term is skipped rather than added: `W := piecewise(P, …)`
+            // beside `T := 2*P` came back NaN where it is [5, −25]. A rule
+            // target is never read through its own slot, because its rule lives
+            // under the species' name and shadows it, so a function that reads T
+            // reads the rule and gets its derivative through P's row. A function
+            // that does read a species with no row keeps the NaN, which is the
+            // honest answer, and the first such species is recorded for it so
+            // that a refusal can name it (function_sens_missing_species).
             const double y_scale = state_probe_scale(y_ss, ns, result.excluded_species);
             std::vector<double> func_term_scale(static_cast<size_t>(n_func), 0.0);
             for (int i = 0; i < ns; ++i) {
@@ -4658,11 +4678,19 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                 model.evaluate_functions(0.0);
                 f1 = model.function_value_cache();
                 const double *dxi = result.sensitivity.data() + static_cast<size_t>(i) * np;
+                const bool has_row =
+                    std::all_of(dxi, dxi + np, [](double v) { return std::isfinite(v); });
                 for (int m = 0; m < n_func; ++m) {
                     if (!need_fd[m]) {
                         continue;
                     }
                     const double dfm_dxi = (f1[m] - f0[m]) / h;
+                    if (dfm_dxi == 0.0) {
+                        continue; // func_m does not read x_i
+                    }
+                    if (!has_row && result.function_sens_missing_species[m] < 0) {
+                        result.function_sens_missing_species[m] = i;
+                    }
                     func_term_scale[static_cast<size_t>(m)] += std::abs(dfm_dxi * y_ss[i]);
                     double *out = result.function_sensitivity.data() + static_cast<size_t>(m) * np;
                     for (int p = 0; p < np; ++p) {

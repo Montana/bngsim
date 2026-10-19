@@ -1491,6 +1491,13 @@ struct SteadyStateResult {
     std::vector<std::string> function_names;    // n_functions (raw, incl _rateLawN)
     std::vector<double> observable_sensitivity; // (n_observables × n_sens_params)
     std::vector<double> function_sensitivity;   // (n_functions × n_sens_params)
+    // For each raw function, the first species (0-based) whose dY_ss/dp row its
+    // finite-difference derivative needed and the solve has none of: one mask=
+    // left out, or a rule target (whose row the Python layer fills from its
+    // rule afterwards). That function's row is NaN. -1 where the derivative
+    // needed no such row, which includes every row the compiled evaluator
+    // answered; empty when function_sensitivity is.
+    std::vector<int> function_sens_missing_species;
 
     // ─── What the convergence test covered, and why it failed (issue #74) ─────
     // How many species entered ||f||₂/n — n_species unless
