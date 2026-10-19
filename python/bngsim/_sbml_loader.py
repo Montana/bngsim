@@ -2031,13 +2031,16 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
       * **rate-rule target** (parameter / species / compartment): the rate is the
         rule's RHS — ``dx/dt`` is stated directly (01250: ``rateOf(p1)`` where
         ``p1`` has rate rule ``1`` ⇒ ``1``).
-      * **reaction-driven species**: ``dAmount/dt = Σ net_stoich·kineticLaw``
-        over every reaction, in the species' reporting units — amount-rate for a
-        ``hasOnlySubstanceUnits`` species, else concentration-rate (``÷V``). This
+      * **reaction-driven species**: ``dAmount/dt = cf·Σ net_stoich·kineticLaw``
+        over every reaction, with ``cf`` the species' conversion factor or the
+        model's (1 with neither), in the species' reporting units — amount-rate
+        for a ``hasOnlySubstanceUnits`` species, else concentration-rate
+        (``÷V``, less ``[S]·V'/V`` where a rate rule sizes the compartment). This
         mirrors ``current_derivs`` (which holds d[conc]/dt) and the sub-cluster-3
         ``report_rateof_amount`` ×V convention (01251/01252/01254, all V=1).
       * **boundary / constant species** with no rate rule: not changed by
-        reactions ⇒ ``0``.
+        reactions ⇒ ``0``, or ``-[S]·V'/V`` for a concentration in a compartment
+        a rate rule sizes (its amount holds).
 
     Returns ``None`` (fold fails, target keeps its declared value) when the
     derivative can't be evaluated — an unknown symbol, an unsupported kinetic
@@ -2082,6 +2085,22 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 net += sign * sval
         return net
 
+    def _concentration_rate(name, sp, amt_rate, ctx):
+        """d[S]/dt = (d amount/dt)/V - [S]·(dV/dt)/V. dV/dt is the compartment's
+        rate rule, or 0 (issue #738: 01822 folded 1 for 0.675 without it)."""
+        vol = ctx.get(sp.getCompartment(), 1.0)
+        if not vol:
+            return None
+        dvol = resolver(sp.getCompartment(), ctx)
+        if dvol is None:
+            return None
+        if dvol == 0.0:
+            return amt_rate / vol
+        conc = ctx.get(name)
+        if conc is None:
+            return None
+        return amt_rate / vol - conc * dvol / vol
+
     def resolver(name, ctx):
         # 1) rate-rule target — dx/dt is the rule's RHS, in the target's units.
         if name in rate_rule_math:
@@ -2094,10 +2113,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             # functionDefinition whose body reads rateOf, which would reach
             # here with the body's own argument name.
             return 0.0
-        # 2) species — boundary or constant species is held by reactions ⇒ 0.
+        # 2) species — reactions do not change a boundary or constant species, so
+        # its amount holds. Held as a concentration in a compartment a rate rule
+        # sizes, it is diluted all the same (suite 01117/01118 hold the amount as
+        # the size grows), and the run's rateOf reads -[S]·V'/V; the fold gave 0
+        # (issue #738).
         if sp.getBoundaryCondition() or sp.getConstant():
-            return 0.0
-        vol = ctx.get(sp.getCompartment(), 1.0)
+            if sp.getHasOnlySubstanceUnits() or sp.getCompartment() not in rate_rule_math:
+                return 0.0
+            return _concentration_rate(name, sp, 0.0, ctx)
         amt_rate = 0.0
         for j in range(sbml_model.getNumReactions()):
             rxn = sbml_model.getReaction(j)
@@ -2115,11 +2139,24 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if v is None:
                 return None
             amt_rate += net * v
+        # A conversion factor scales what the reactions do to the species: its
+        # own, or the model's where it has none (issue #738). Left out, the fold
+        # was 1/cf of what the run reads at t = 0 (01405: -0.5 for -1).
+        cf_id = (
+            sp.getConversionFactor()
+            if sp.isSetConversionFactor()
+            else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
+        )
+        if cf_id:
+            cf = ctx.get(cf_id)
+            if cf is None:
+                return None
+            amt_rate *= cf
         # ``current_derivs`` is d[conc]/dt; rateOf reports amount-rate for a hOSU
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
-        return amt_rate / vol if vol else None
+        return _concentration_rate(name, sp, amt_rate, ctx)
 
     return resolver
 
@@ -3525,6 +3562,7 @@ def _classify_mass_action(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3595,6 +3633,7 @@ def _classify_mass_action(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         varvol_reject=varvol_reject,
@@ -3649,6 +3688,7 @@ def _split_reversible_kinetic_law(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3693,6 +3733,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3711,6 +3752,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3777,6 +3819,7 @@ def _classify_mass_action_ast(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     prefix_factors: tuple = (),
@@ -3795,6 +3838,10 @@ def _classify_mass_action_ast(
     splitter to distribute outer-product wrappers (e.g. the ``compartment``
     factor in COPASI-style ``compartment * (kf*A - kr*B)``) onto each
     side of the MINUS.
+
+    ``moving_ar_comps`` are the assignment-rule compartments whose size moves
+    during a run (``_moving_assignment_rule_vars``); the variable-volume guards
+    below treat them as they treat a rate-rule or event-resized compartment.
     """
     # 3. Flatten the AST into a list of accepted leaves.
     factors: list = list(prefix_factors)
@@ -3977,18 +4024,27 @@ def _classify_mass_action_ast(
     #     — the f_c power cancels. So §9's species-only m_c derivation already folds
     #     the explicit factor (it lives in ``base_func``, not in m_c). Validated vs
     #     RR+COPASI (ODE) and Extrande (SSA).
-    # Scoped to all-hOSU=false species; hOSU=true cross-compartment shapes (whose
-    # amount bookkeeping differs) stay refused (varvol_non_mass_action), and the §9
-    # certification is guarded to IRREVERSIBLE only. Record the variable-volume
-    # storage compartments so §9 can certify + correct the emitted reaction.
+    # Scoped to all-hOSU=false species; a mix with an amount that changes such a
+    # concentration is certified below, where the load-time sizes agree (#787),
+    # and other hOSU=true cross-compartment shapes stay refused
+    # (varvol_non_mass_action). The §9 certification is guarded to IRREVERSIBLE
+    # only. Record the variable-volume storage compartments so §9 can certify +
+    # correct the emitted reaction.
+    #
+    # (#745) An assignment-rule compartment whose size moves during the run is
+    # routed the same way; it is left out of what §9 certifies for the SSA,
+    # which does not run such a compartment. One whose rule reads constants
+    # alone (``moving_ar_comps`` leaves it out) holds its load-time size, as a
+    # write to what the rule reads is refused, so the Elementary rate is right.
     _storage_comps = {species_comp[s] for s in rxn_species}
     _varvol_storage = _storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+    _ar_storage = _storage_comps & set(moving_ar_comps)
     if (
         len(_storage_comps) > 1
-        and _varvol_storage
+        and (_varvol_storage or _ar_storage)
         and all(not species_hosu.get(s, False) for s in rxn_species)
     ):
-        if varvol_reject is not None:
+        if varvol_reject is not None and _varvol_storage:
             varvol_reject["xcomp_varvol_comps"] = sorted(_varvol_storage)
         return None
 
@@ -4055,7 +4111,16 @@ def _classify_mass_action_ast(
                 m for sid, m in species_multiset.items() if not species_hosu.get(sid, False)
             )
 
-    varvol_comp_ids = (set(rate_rule_targets) | set(event_promoted_params)) & comp_ids
+    # (#745) An assignment-rule compartment whose size moves is a variable
+    # volume here as well: left out, a bare ``k*A`` in ``C := 2 + time`` stayed
+    # Elementary with V_static baked in and ran 36% off (BIOMD0000000342's
+    # TGF_beta_ex, 37%). One over constants keeps its load-time size, and its
+    # Elementary rate, which a reversible split needs to run under the SSA.
+    # _record_varvol_reject keeps to rate-rule and event compartments, which
+    # are the ones the SSA correction it feeds is for.
+    varvol_comp_ids = (
+        set(rate_rule_targets) | set(event_promoted_params) | set(moving_ar_comps)
+    ) & comp_ids
     if varvol_comp_ids:
         if all(not species_hosu.get(s, False) for s in rxn_species):
             storage_comps = {species_comp[s] for s in rxn_species}
@@ -4088,6 +4153,18 @@ def _classify_mass_action_ast(
             storage_comps = {species_comp[s] for s in rxn_species}
             if len(storage_comps) == 1:
                 _record_varvol_reject(next(iter(storage_comps)))
+            elif varvol_reject is not None:
+                # Across compartments it takes the per-species emission, each row
+                # over its own size, and the SSA correction §9 certifies for that
+                # emission counts the concentration factors alone: an amount is
+                # read exactly. So it serves this mix as it serves a monomial over
+                # concentrations. #787's `A => B; k*A`, A an amount and B a
+                # concentration in a compartment a rate rule or an event resizes,
+                # ran under the SSA while its ODE was wrong (B over the load-time
+                # size), and was refused once the ODE was right.
+                _vv = storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+                if _vv:
+                    varvol_reject["xcomp_varvol_comps"] = sorted(_vv)
             return None
 
     if not elementary:
@@ -5114,6 +5191,13 @@ def _build_model_from_sbml_doc_in_context(doc):
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     } & _comp_id_set
 
+    # (#745) The assignment-rule compartments whose size can move during a run:
+    # their rule reads the clock, a species, a rate-rule or event target, or
+    # another rule that does. One that reads constants alone holds its load-time
+    # size for the whole run, as a write to what it reads is refused. The same
+    # set §9 keeps from the SSA.
+    ar_comp_moving = ar_comp_targets & _moving_assignment_rule_vars(sbml_model)[1]
+
     # (#86) Compartments driven by a RATE RULE — continuously variable volume
     # V(t). A concentration-valued (hOSU=false) species in such a compartment
     # needs an explicit dilution term ``-[S]·V̇/V`` in its concentration ODE
@@ -5145,7 +5229,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # Compartments whose live symbol must divide Functional reaction laws even
     # when their load-time size is 1.0. ``variable_comps`` intentionally excludes
-    # assignment-rule compartments for state-volume/rateOf paths, but reaction
+    # assignment-rule compartments for state-volume paths, but reaction
     # storage conversion still needs ``law / V_live`` for hOSU=false species in
     # AR compartments (suite 00946/00948: ``C := fakeC``, event changes fakeC).
     live_symbol_divide_comps = variable_comps | ar_comp_targets
@@ -6293,10 +6377,16 @@ def _build_model_from_sbml_doc_in_context(doc):
         # amount-rate — for a CONSTANT-volume compartment (01455/01457) AND a
         # VARIABLE-volume compartment promoted to a state (rate-rule / event-resized,
         # 01463), with no conc·V̇ correction. Flag the species so the engine (and
-        # codegen) scale its rate_of__ accessor by volume_factor. AR-compartment
-        # volumes are not integrator states, so a hOSU species there stays on the
-        # unscaled d(conc)/dt (excluded — no rateOf case there is in the suite).
-        if hosu and (comp not in vstatic_divide_comps or comp in variable_comps):
+        # codegen) scale its rate_of__ accessor by volume_factor.
+        #
+        # An assignment-rule compartment too (issue #736). Its volume is not an
+        # integrator state, but what decides the scaling is how the species is
+        # stored, and it is stored as amount/V_static there as well: left out,
+        # its rateOf read d(amount)/dt / V_static, a third of the answer in a
+        # compartment of size 3, and a rate rule on it integrated that. Such a
+        # compartment is not in live_volume_param_comps, so codegen scales by
+        # the number V_static, which is what the storage divided by.
+        if hosu:
             builder.set_species_rateof_amount(idx)
 
         # If the species's IC was set by an initialAssignment over parameters,
@@ -7049,6 +7139,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rate_rule_targets,
             event_promoted_params,
             assignment_targets,
+            ar_comp_moving,
             local_param_map,
             local_param_values,
             _resolve_stoich,
@@ -7125,6 +7216,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 rate_rule_targets,
                 event_promoted_params,
                 assignment_targets,
+                ar_comp_moving,
                 local_param_map,
                 local_param_values,
                 _resolve_stoich,
@@ -7383,6 +7475,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
     _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
+    # (compartment, trigger, size before, size after), all ExprTk (#1054).
+    _size_jumps: list[tuple[str, str, str, str]] = []
+    _jump_species: dict[str, list[str]] = {}  # compartment -> species it rescales
     if ar_comp_targets:
         import re as _re
 
@@ -7544,6 +7639,126 @@ def _build_model_from_sbml_doc_in_context(doc):
             return cid
 
         _refusals: list[str] = []
+
+        # A piecewise size jumps where one of its conditions flips (#1054). The
+        # chain rule above differentiates each piece, which is right between
+        # the jumps, but a jump is a delta no ODE term carries, so it gets what
+        # an event's resize gets (#74): each concentration × V_before/V_after,
+        # at the condition's root. The size is inlined through the rules it
+        # reads, and the relations in its conditions are set as they read on
+        # either side of each root for the size there. Relations that compare
+        # one difference (or a multiple of it) with 0 change at one root, as
+        # `t < 2` and `t >= 2` do in a piecewise with no otherwise, so they are
+        # set together. Set one at a time, the event of each read the other
+        # after its flip: two rescales at the instant took [S] in
+        # `piecewise(1, t < 2, 5, t >= 2)` to 0 or left it right, as the hash
+        # seed ordered them, and with `t < 2` and `t > 2` the size between the
+        # two, which no piece gives, was read as 0 and divided by. A condition
+        # over constants and event targets alone moves only at an event, whose
+        # own rescale owns that jump; one that reads an event target and the
+        # state or time could flip at the event and then again by the jump
+        # event, so it is refused.
+        _event_targets = {
+            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+            for k in range(sbml_model.getNumEvents())
+            for j in range(sbml_model.getEvent(k).getNumEventAssignments())
+        }
+        _moving = (
+            {_TIME_SYM}
+            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | set(_rr_alias)
+            | set(_rate_token_species)
+        )
+
+        def _inlined_size(safe_var: str, seen: frozenset):
+            ex = _ar_rhs_ex.get(safe_var)
+            if ex is None or safe_var in seen:
+                return None
+            g = _exprtk_to_sympy(ex)
+            if g is None:
+                return None
+            subs = {}
+            for s in g.free_symbols:
+                if str(s) in _ar_alias:
+                    inner = _inlined_size(_ar_alias[str(s)], seen | {safe_var})
+                    if inner is None:
+                        return None
+                    subs[s] = inner
+            return g.xreplace(subs)
+
+        for comp, vdot in _comp_vdot.items():
+            if vdot is None:
+                continue
+            g = _inlined_size(_safe_name(comp), frozenset())
+            if g is None:
+                continue
+            # In a fixed order, so the events do not move with the hash seed.
+            conds = sorted(
+                {c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)},
+                key=_sp.default_sort_key,
+            )
+            relations: set = set()
+            for c in conds:
+                names = {str(s) for s in c.free_symbols}
+                if not names & _moving:
+                    continue
+                if names & _event_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where "
+                        f"{c} flips, which reads "
+                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
+                        "moves with the run as well; bngsim would rescale its "
+                        "concentrations twice when an event flips it"
+                    )
+                    continue
+                relations |= {
+                    r
+                    for r in c.atoms(_sp.core.relational.Relational)
+                    if {str(s) for s in r.free_symbols} & _moving
+                }
+            # (difference, [(relation, its difference over that one)])
+            roots: list[tuple[object, list]] = []
+            for r in sorted(relations, key=_sp.default_sort_key):
+                d = r.lhs - r.rhs
+                for d0, rels in roots:
+                    ratio = _sp.cancel(d / d0)
+                    if ratio.is_number and ratio != 0:
+                        rels.append((r, ratio))
+                        break
+                else:
+                    roots.append((d, [(r, _sp.Integer(1))]))
+            for _, rels in roots:
+                # A side is the sign of the difference there, and an inequality
+                # in the set, where it has one, says which side is true: an
+                # equality holds at the root alone, so it reads false on both.
+                c, q = next(
+                    ((r, q) for r, q in rels if not isinstance(r, (_sp.Eq, _sp.Ne))), rels[0]
+                )
+                if isinstance(c, _sp.Eq):
+                    side_true, side_false = 0, 1
+                elif isinstance(c, _sp.Ne):
+                    side_true, side_false = 1, 0
+                else:
+                    side_true = -1 if c.func(-q, 0) else 1
+                    side_false = -side_true
+                v_false, v_true = (
+                    g.xreplace({r: r.func(rq * side, 0) for r, rq in rels})
+                    for side in (side_false, side_true)
+                )
+                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
+                if any(t is None for t in texts):
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        "flips, and bngsim cannot write the size on either side"
+                    )
+                    continue
+                rises, falls, v_false, v_true = (_unalias(t) for t in texts)
+                _jump_species[comp] = [
+                    s for s, sc in species_comp.items() if sc == comp and _diluted(s)
+                ]
+                _size_jumps.append((comp, rises, v_false, v_true))
+                _size_jumps.append((comp, falls, v_true, v_false))
+
         for comp, rated in _comp_rated.items():
             for leaf in sorted(rated):
                 if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
@@ -8201,6 +8416,28 @@ def _build_model_from_sbml_doc_in_context(doc):
         )
         if _xc_varvol_species:
             unified_ok = False
+        # (#745) The same holds for a concentration in a compartment an
+        # assignment rule moves: its row is law/V_live, which the single divide
+        # gives only to the species of the representative compartment.
+        # `H => A; k*H` with H an amount and A a concentration in
+        # `C := 3 + 0.5*time` divided H's row by the live size: [H](5) was 0.527
+        # for 0.401. Two such compartments of one load-time size shared the
+        # first one's divide, and at a size of 1 had none. A catalyst elsewhere
+        # counts here, as the representative compartment can be the catalyst's.
+        # The per-species branch below adds the live size to these rows.
+        _xc_ar_species = (
+            [
+                _sid
+                for _sid in net
+                if net[_sid] != 0
+                and species_comp[_sid] in ar_comp_moving
+                and not species_hosu.get(_sid, False)
+            ]
+            if len(_rxn_comps) > 1 or _changes_an_amount
+            else []
+        )
+        if _xc_ar_species:
+            unified_ok = False
         # Two kinds of such a reaction cannot take the per-species divide either.
         # One that also changes a species in an assignment-rule compartment: that
         # compartment is no state, so there is nothing to point its divide at
@@ -8209,7 +8446,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         # compartment's live symbol and with its own factor, as a non-integer
         # stoichiometry is. That form has no SSA reading, and these are refused
         # under SSA already. The certified monomial keeps the per-species divide,
-        # which its SSA correction is written for.
+        # which its SSA correction is written for. A reaction routed off the
+        # single divide for a moving assignment-rule compartment alone goes the
+        # same way when it mixes conversion factors.
         _xc_by_function = (
             bool(_xc_varvol_species)
             and i not in ssa_varvol_xcompartment
@@ -8217,7 +8456,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _cf_mixed_i
                 or any(net[_sid] != 0 and species_comp[_sid] in ar_comp_targets for _sid in net)
             )
-        )
+        ) or (bool(_xc_ar_species) and _cf_mixed_i)
         # (#192) The same by-value hazard for a WRITABLE STATIC volume, which is
         # #170's territory rather than #144's and was never done. `involved_vs`
         # holds volume VALUES, so a reaction whose species span several
@@ -8472,6 +8711,35 @@ def _build_model_from_sbml_doc_in_context(doc):
             _ssa_ff = _ssa_falling_factorial_terms(rxn, species_idx, _ssa_ff_continuous)
             if _ssa_ff:
                 builder.set_reaction_ssa_falling_factorial(_xrxn_idx, _ssa_ff)
+            # (#745) The per-species divide above is by each species' load-time
+            # size. For a concentration in a compartment an assignment rule sizes
+            # the row is law/V_live; the engine has no state column for that size,
+            # so the difference is added as its own reaction on that species, as
+            # the §8c dilution is: net·law·(1/C - 1/V_static), with C the
+            # compartment's live symbol. The two rows sum to net·law/C, and the
+            # Jacobian and the sensitivities reach C through its rule as they do
+            # in any rate law. ODE only, as the SSA does not run such a
+            # compartment. BIOMD0000000342's re9 was 37% off without it. Only for
+            # a size that can move (_xc_ar_species keeps to ar_comp_moving): for
+            # one that cannot, the term is 0, and a reaction on one species would
+            # hide a conservation law the right-hand side keeps.
+            for _sid in _xc_ar_species:
+                _n = net[_sid]
+                _c = species_comp[_sid]
+                _corr = f"_vd_{_safe_name(rid)}_{_safe_name(_sid)}_live"
+                builder.add_function(
+                    _corr,
+                    f"({float(_n) * _cf_i!r})*({base_func})"
+                    f"*(1.0/({_safe_name(_c)}) - 1.0/({float(comp_volumes.get(_c, 1.0))!r}))",
+                )
+                builder.add_reaction(
+                    [],
+                    [species_idx[_sid]],
+                    "functional",
+                    _corr,
+                    apply_species_factor=False,
+                    ode_only=True,
+                )
             # (#144 case 4) Cross-compartment variable-volume monomial certified by
             # the classifier (§7). The per-species emission above divides each
             # species's storage derivative by its *static* volume_factor, which is
@@ -8934,6 +9202,32 @@ def _build_model_from_sbml_doc_in_context(doc):
             for _ai, _size, _base in rescale_meta:
                 builder.set_last_event_assignment_rescale(_ai, _size, _base)
 
+    # (#1054) A piecewise size's jumps, found in §8c: an event at each
+    # condition's root, each way, rescales the compartment's concentrations so
+    # their amounts hold. ODE only, as every resize rescale is (#81); it is
+    # added after the model's own events so their indices stay as they were.
+    # It executes before any of the model's events at the same instant, by a
+    # priority none of theirs reaches: the jump belongs to the size at that
+    # instant, and executed after an event there that sets a concentration in
+    # the compartment, its rescale of the value from before overwrote that
+    # setting (`at (time >= 2): Sn = 10` beside `cv := piecewise(1, time < 2,
+    # 5)` left Sn at 1 or 10 as the same-priority draw went, #242).
+    for k, (comp, trigger, before, after) in enumerate(_size_jumps):
+        builder.add_event(
+            f"_size_jump_{_safe_name(comp)}_{k}",
+            trigger,
+            [
+                (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
+                for sid in _jump_species[comp]
+            ],
+            persistent=True,
+            initial_value=True,
+            priority_expr="1e308",
+            assignment_ode_only=[True] * len(_jump_species[comp]),
+        )
+        for sid in _jump_species[comp]:
+            ar_dilution_species.add(sid)
+
     # (#81) Apply the deferred SSA live-volume tags. §9 recorded each mass-action
     # varvol reaction as (rxn_idx, comp_id, exp); the compartment's promoted
     # species index is only resolvable now (an event-resized compartment is
@@ -9236,6 +9530,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         if _r.isRate() and _r.getMath() is not None:
             _reads.setdefault(f"rateOf({_r.getVariable()})", set()).update(
                 _names_read(_r.getMath())
+            )
+    # A concentration in a compartment a rate rule sizes is diluted as the size
+    # changes, whether reactions move it or not, so its rate also reads its own
+    # value, the size and the size's rate (issue #738): `p = rateOf(B)` under
+    # `c' = g` left `g` writable, and `p` 0.675 where a rebuild after `g = 1`
+    # gives 0.35. One with a rate rule of its own has its rate stated.
+    for _j in range(sbml_model.getNumSpecies() if _uses_rateof else 0):
+        _sp_d = sbml_model.getSpecies(_j)
+        _sid_d, _cid_d = _sp_d.getId(), _sp_d.getCompartment()
+        if (
+            _cid_d in rate_rule_comps
+            and not _sp_d.getHasOnlySubstanceUnits()
+            and _sid_d not in rate_rule_targets
+        ):
+            _reads.setdefault(f"rateOf({_sid_d})", set()).update(
+                {_sid_d, _cid_d, f"rateOf({_cid_d})"}
             )
     for _rxn_i in range(sbml_model.getNumReactions()):
         _rxn_f = sbml_model.getReaction(_rxn_i)
@@ -9613,6 +9923,28 @@ def _build_model_from_sbml_doc_in_context(doc):
     for sid in ar_dilution_species:
         varvol_ar_amount_map[_safe_name(sid)] = _safe_name(species_comp[sid])
     model._varvol_ar_amount_map = varvol_ar_amount_map
+
+    # (#728) The amount report of a concentration species that a rule sets. The
+    # two maps above take their species from the dilution gate, which leaves
+    # out a rule target, rightly: its rule states its derivative or its value.
+    # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
+    # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
+    # under every method, so V_live(t) is all the report needs, read from the
+    # compartment's promoted-species column (a rate rule) or its expression
+    # column (an assignment rule).
+    varvol_target_amount_map: dict[str, tuple[str, str]] = {}
+    for sid, cid in species_comp.items():
+        if (
+            sid not in species_idx
+            or species_hosu.get(sid, False)
+            or (sid not in rate_rule_targets and sid not in assignment_targets)
+        ):
+            continue
+        if cid in rate_rule_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
+        elif cid in ar_comp_targets:
+            varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+    model._varvol_target_amount_map = varvol_target_amount_map
 
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
     # compartments (an event assignment writes the compartment's size). Unlike a

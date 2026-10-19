@@ -3409,6 +3409,7 @@ class Simulator:
         self._apply_ar_report_map(result, ar_map)
         self._apply_varvol_conc_map(result, model)
         self._apply_varvol_ar_conc_map(result, model)
+        self._apply_varvol_target_amount_map(result, model)
         self._apply_varvol_event_resize_map(result, model)
         result._ar_sens_map = ar_map
         result._ar_sens_blocked = ar_blocked
@@ -3927,6 +3928,16 @@ class Simulator:
             rescaled.append((s_name, j, factor, np.array(v_live, copy=True), "expression", k))
         if changed:
             result._species = sp
+            # The column now holds amount/V_live, so the bare-id amount is it times
+            # V_live; left to the volume factor it was amount·V_static/V_live, and a
+            # conserved amount of 5 in c := 2 + time read 0.83 at t = 10 (issue
+            # #728), under SSA as under ODE, since this pass rescales both. At a
+            # sample where the size is 0 the guard above left the column at
+            # amount/V_static, so the amount there is it times V_static, not 0.
+            amount_factor = result._varvol_amount_factor or {}
+            for name, j, _factor, v_live, _kind, _k in rescaled:
+                amount_factor[j] = np.where(v_live != 0.0, v_live, (amap or {})[name][1])
+            result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
         # (#234) Record V_live(t) per diluted hOSU=false species so as_roadrunner's
@@ -3961,6 +3972,43 @@ class Simulator:
                     result._varvol_amount_factor = amount_factor
                 if conc_factor:
                     result._varvol_conc_factor = conc_factor
+
+    def _apply_varvol_target_amount_map(self, result: Result, model: Model | None = None) -> None:
+        """Record V_live(t) for a rule-target concentration species (issue #728).
+
+        A concentration species that a rate rule or an assignment rule sets, in a
+        compartment a rate rule or an assignment rule sizes, holds its rule's
+        concentration under every method: nothing about it is a count. Its amount
+        is that times V_live(t), and :meth:`Result.as_roadrunner` read the static
+        volume factor instead (01198: S1 = 0.2 for 0.28). The live size is read
+        from the compartment's promoted-species column or its expression column,
+        as the loader's map says. The column itself is left as it is. No-op with
+        no such species, and for a 3-D stack.
+        """
+        model = model or self._model
+        tmap = getattr(model, "_varvol_target_amount_map", None)
+        if not tmap:
+            return
+        species_names = result._species_names
+        if not species_names or result._species.ndim != 2:
+            return
+        sp_idx = {n: i for i, n in enumerate(species_names)}
+        expr_idx = {n: i for i, n in enumerate(result._expression_names or [])}
+        amount_factor = result._varvol_amount_factor or {}
+        for s_name, (kind, c_name) in tmap.items():
+            j = sp_idx.get(s_name)
+            if j is None:
+                continue
+            if kind == "species":
+                k = sp_idx.get(c_name)
+                v_live = result._species[:, k] if k is not None else None
+            else:
+                k = expr_idx.get(c_name)
+                v_live = result._expressions[:, k] if k is not None else None
+            if v_live is not None:
+                amount_factor[j] = np.array(v_live, dtype=np.float64, copy=True)
+        if amount_factor:
+            result._varvol_amount_factor = amount_factor
 
     def _apply_varvol_event_resize_map(self, result: Result, model: Model | None = None) -> None:
         """Report species in EVENT-RESIZED compartments at amount/V_live(t).
