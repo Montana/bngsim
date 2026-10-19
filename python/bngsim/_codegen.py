@@ -11341,10 +11341,13 @@ def _analyze_output_sens(model) -> dict:
     loudly rather than silently dropping the term).
 
     Returns a dict with ``decline`` (non-None ⇒ the whole codegen is declined,
-    mirroring :func:`generate_outputs_from_model`'s rateOf / embedded-tfun /
-    no-function declines), ``func_infos`` (per-function ``{name, supported,
-    reason, partials}`` in declaration order), and the emitter context. **Treat
-    the returned dict as read-only** — every caller now shares one instance.
+    mirroring :func:`generate_outputs_from_model`'s embedded-tfun / no-function
+    declines), ``func_infos`` (per-function ``{name, supported, reason,
+    partials}`` in declaration order), and the emitter context. **Treat the
+    returned dict as read-only** — every caller now shares one instance.
+
+    A function that reads ``rateOf`` is unsupported on its own, and so is one
+    that depends on it; the rest of the model is not declined (issue #787).
 
     Memoized on the model (GH #97) for cost *and* for correctness. Both callers
     above run it, so a sensitivity workflow paid it twice — 85.7 s twice on the
@@ -11426,15 +11429,14 @@ def _compute_output_sens_analysis(model, core) -> dict:
 
     if n_func == 0:
         return {"decline": "model has no global functions", "func_infos": [], **base}
-    # rateOf needs the live dx/dt buffer the RHS's probe passes publish; an
-    # output-point evaluation has none — the value codegen declines here too, so
-    # the internal obs[]/func[] recomputation cannot be emitted standalone.
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
-        return {
-            "decline": "model uses rateOf (live derivatives unavailable at an output point)",
-            "func_infos": [],
-            **base,
-        }
+    # rateOf needs the live dx/dt buffer the RHS's probe passes publish, and an
+    # output-point evaluation has none. That is a fact about the functions that
+    # read a rate, not about the model, so only they are unsupported (below),
+    # with every function that depends on them. A whole-model decline took the
+    # rest with them: the §8c dilution term of a concentration in a compartment
+    # whose size an assignment rule moves reads the rate of what the rule reads
+    # (issue #1052), so `C := 1 + P` with a concentration in C had no
+    # sensitivity for any expression, C's own size included (issue #787).
 
     # Whole-body tfun functions dispatch through data->tfun_eval (a *value*
     # callback only; table functions are intentionally not differentiated, so
@@ -11565,6 +11567,17 @@ def _compute_output_sens_analysis(model, core) -> dict:
                     "status": "unsupported",
                     "reason": "table-function output sensitivities are not supported "
                     "(table functions are not differentiated)",
+                    "partials": None,
+                }
+            )
+            continue
+        if _RATEOF_PREFIX in f["expression"]:
+            func_infos.append(
+                {
+                    "name": name,
+                    "status": "unsupported",
+                    "reason": "it reads rateOf, and the live derivatives it needs are "
+                    "not available at an output point",
                     "partials": None,
                 }
             )
@@ -11757,9 +11770,12 @@ def generate_output_sens_from_model(model) -> str | None:
     and value never diverge.
 
     Returns ``None`` (⇒ no symbol; expression selectors raise) when
-    :func:`_analyze_output_sens` declines (no functions / rateOf / embedded tfun).
+    :func:`_analyze_output_sens` declines (no functions / embedded tfun).
     Unsupported functions are emitted with a ``NaN`` sentinel so a result is never
-    silently wrong; the Result raises the targeted reason at selection time.
+    silently wrong; the Result raises the targeted reason at selection time. A
+    function that reads ``rateOf`` is one of them: its value is recomputed here
+    with each rate read as ``NAN``, since there is no live derivative to read,
+    and no supported function reads that value (issue #787).
     """
     analysis = _analyze_output_sens(model)
     if analysis["decline"] is not None:
@@ -11786,12 +11802,21 @@ def generate_output_sens_from_model(model) -> str | None:
 
     av_factor, av_param = _amount_volume_factors(species)
 
-    # Value recomputation (same emitters as the RHS / value codegen).
+    # Value recomputation (same emitters as the RHS / value codegen). A rate
+    # (rateOf) is read as NAN: the function that reads one is unsupported, and
+    # so is every function whose derivative would read its value, so the NAN
+    # reaches no row that is not NaN already. Left as it is, the token is an
+    # undeclared name in C.
     obs_value_lines = (
         _emit_observable_lines(observables, av_factor, av_param) if observables else []
     )
+    no_rates = (
+        {f"{_RATEOF_PREFIX}{s['name']}": "NAN" for s in species}
+        if any(_RATEOF_PREFIX in f["expression"] for f in functions)
+        else None
+    )
     func_value_lines = _emit_function_lines(
-        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, None
+        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, no_rates
     )
 
     # Parameter-axis contributions, grouped by the differentiated parameter index

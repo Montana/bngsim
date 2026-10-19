@@ -307,7 +307,7 @@ class TestPartialCut:
         assert analysis["func_infos"][0]["partials"]["param"]  # a real derivative
 
     def test_the_whole_analysis_is_not_declined(self, monkeypatch):
-        """``decline`` is the whole-model refusal (rateOf, embedded tfun, no
+        """``decline`` is the whole-model refusal (an embedded tfun, no
         functions) and turns the evaluator into no symbol at all. A budget expiry
         is not that: the symbol is still emitted, with the derived functions
         intact."""

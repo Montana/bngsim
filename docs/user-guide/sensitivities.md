@@ -110,6 +110,12 @@ gets the same quotient rule, through its rule's row (issue #787): `T := 2*P` in
 `C := 1 + P` reports `2P/(1 + P)`, and d[T]/dkp at t = 1 is 0.4988. Its row was
 `NaN`. `output_sensitivities("species:T")` returns the same row.
 
+A function that reads `rateOf` has no expression output sensitivity: there is
+no live derivative to read at an output point. That holds for that function and
+the functions that depend on it, not for the rest of the model. Before issue
+#787 a model with one such function had none for any expression, and the
+dilution term of a concentration in `C := 1 + P` reads the rate of `P`.
+
 The row is right where the amount at the start is the model's own number.
 Where it was made at load by converting the declared value with the size the
 rule had then (a concentration held as an amount, or an amount held as a

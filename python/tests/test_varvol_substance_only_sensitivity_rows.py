@@ -712,3 +712,30 @@ def test_a_rule_s_amount_has_the_row_of_what_it_reads_at_the_start(size):
         return _column(bngsim.Simulator(m, method="ode").run(**RUN), "H")
 
     np.testing.assert_allclose(row, (column(h) - column(-h)) / (2 * h), rtol=2e-5, atol=1e-8)
+
+
+def test_a_rule_s_amount_beside_a_concentration_whose_dilution_reads_a_rate():
+    """A concentration ``G`` in ``V := 1 + P`` is diluted at the rate of P, and
+    the dilution term reads that rate (issue #1052). Codegen declined the
+    output sensitivity of every expression for it, the size's own among them,
+    so H's row had no dV/dθ to take: NaN. Only the dilution term reads a rate,
+    and only it is declined now."""
+    text = _ruled_text(
+        "an-assignment-rule", extra="species G in V; G = 2; kg = 0.5; J5: G => ; kg*G;\n"
+    )
+    params = ["kp", "kd"]
+    course = {**RUN, "rtol": 1e-10, "atol": 1e-12}
+    model = bngsim.Model.from_antimony_string(text)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = bngsim.Simulator(model, method="ode", sensitivity_params=params).run(**course)
+    assert result.ar_sensitivity_refused == frozenset()
+    row = _row(result, "H")
+    np.testing.assert_allclose(
+        row, _ruled_rows("an-assignment-rule", params), rtol=1e-6, atol=1e-9
+    )
+    for c, name in enumerate(params):
+        want = _by_plain_runs(text, "H", name, NOMINAL[name])
+        np.testing.assert_allclose(row[:, c], want, rtol=2e-5, atol=1e-8, err_msg=name)
+    size = np.asarray(result.output_sensitivities("expression:V"))[:, 0, :]
+    np.testing.assert_allclose(size[-1], [2.7534, -4.7802], atol=1e-4)

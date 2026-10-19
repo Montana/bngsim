@@ -7312,7 +7312,7 @@ class Simulator:
         solved ``dY_ss/dp`` columns — so a steady-state gradient and a long-run
         one now come from the same evaluator. Finite differences remain the
         per-function fallback for what that evaluator declines (a table function,
-        a non-smooth construct, a whole-model ``rateOf`` decline);
+        a non-smooth construct, a function that reads ``rateOf``);
         ``ss.sens_output_source`` reports ``"codegen"``, ``"mixed"``, or
         ``"finite-difference"``. The *observable* block is an exact linear
         projection through the group factors and never differences anything.
