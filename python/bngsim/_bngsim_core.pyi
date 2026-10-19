@@ -1216,6 +1216,14 @@ class SteadyStateOptions:
     def sensitivity_params(self, arg0: collections.abc.Sequence[str]) -> None:
         ...
     @property
+    def state_switch_conditions(self) -> list[str]:
+        """
+        Rate-law conditions over model state the march roots, so a window on the approach is not stepped over (issue #904).
+        """
+    @state_switch_conditions.setter
+    def state_switch_conditions(self, arg0: collections.abc.Sequence[str]) -> None:
+        ...
+    @property
     def steady_state_mask(self) -> list[int]:
         ...
     @steady_state_mask.setter
@@ -1267,6 +1275,9 @@ class SteadyStateResultCore:
         ...
     @property
     def n_sens_params(self) -> int:
+        ...
+    @property
+    def n_state_switch_roots(self) -> int:
         ...
     @property
     def n_steps(self) -> int:
@@ -1399,6 +1410,9 @@ class SteadyStateResultCore:
         ...
     @property
     def species_names(self) -> list[str]:
+        ...
+    @property
+    def state_switch_roots_dropped(self) -> bool:
         ...
     @property
     def unconverged_pure_sinks(self) -> list[str]:

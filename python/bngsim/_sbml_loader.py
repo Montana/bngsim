@@ -3184,14 +3184,16 @@ def _math_names(node) -> tuple[set[str], bool]:
 
 def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     """The names each assignment rule reads, by variable, and the variables whose
-    value moves during a run: one that reads the clock, a species, a rate-rule or
-    event target, or another moving rule's variable. A rule over constants
+    value moves during a run: one that reads the clock, a species that a
+    reaction, a rule or an event changes, a rate-rule or event target, a reaction
+    whose rate moves, or another moving rule's variable. A rule over constants
     (``C := 2``, ``C := p``) holds its value. A concentration moves with its
     compartment's size, so a constant species is a constant only in a
     compartment whose size holds."""
     reads: dict[str, set[str]] = {}
     moving: set[str] = set()
     rate_vars = set()
+    algebraic_names: set[str] = set()
     for j in range(sbml_model.getNumRules()):
         r = sbml_model.getRule(j)
         if r.isAssignment() and r.getMath() is not None:
@@ -3201,26 +3203,75 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
                 moving.add(r.getVariable())
         elif r.isRate():
             rate_vars.add(r.getVariable())
+        elif r.isAlgebraic() and r.getMath() is not None:
+            algebraic_names |= _math_names(r.getMath())[0]
+    if not reads:
+        return reads, moving  # no assignment rule, so none moves
     sources = set(rate_vars)
     for j in range(sbml_model.getNumEvents()):
         ev = sbml_model.getEvent(j)
         for k in range(ev.getNumEventAssignments()):
             sources.add(ev.getEventAssignment(k).getVariable())
-    # A species moves unless declared constant (a boundary species moves only
-    # through a rule or an event, which name it among the sources already).
+    species = [sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies())]
+    # A reaction's id in math is that reaction's rate, its kinetic law's value,
+    # so a rule that reads it moves when the law does. `cf := J0`, with J0 at
+    # 0.5*S1, was taken for still, and the conversion factor was folded at its
+    # load value of 0.5: S1(1) was 0.7788 where libRoadRunner, which follows the
+    # rate, gives 0.8000. A law's local parameters shadow the model's names.
+    # Only the laws a rule reads, directly or through other laws, are walked: a
+    # name that is no species, parameter, compartment or rule variable.
+    known = (
+        {sp.getId() for sp in species}
+        | {sbml_model.getParameter(j).getId() for j in range(sbml_model.getNumParameters())}
+        | {sbml_model.getCompartment(j).getId() for j in range(sbml_model.getNumCompartments())}
+        | set(reads)
+    )
+    law_reads: dict[str, set[str]] = {}
+    pending = set().union(*reads.values()) - known
+    while pending:
+        rid = pending.pop()
+        if rid in law_reads or rid in sources:
+            continue
+        rxn = sbml_model.getReaction(rid)
+        kl = rxn.getKineticLaw() if rxn is not None else None
+        if kl is None or kl.getMath() is None:
+            continue
+        names, clock = _math_names(kl.getMath())
+        if clock:
+            sources.add(rid)
+            continue
+        law_reads[rid] = names - {lp.getId() for lp in _kinetic_law_local_params(kl)}
+        pending |= law_reads[rid] - known
+    # A species moves when a reaction changes it, as a reactant or a product
+    # that is not a boundary species; a rate rule, an event or an assignment
+    # rule that moves it is counted with the rules and events. A species that
+    # nothing changes holds its value, as a constant one does: `C := 1 +
+    # 0.1*S`, with S in no reaction, holds C at its load-time size, where SSA
+    # refused C's reactions as if it moved. An algebraic rule can set any name
+    # it reads, so its species move. Only the species a rule or a law reads
+    # matter here, and the reactions are scanned only for those.
+    read = set().union(*reads.values(), *law_reads.values())
+    candidates = {sp.getId() for sp in species if not sp.getConstant()} & read
+    changed_by_reaction: set[str] = set()
+    for j in range(sbml_model.getNumReactions() if candidates - sources else 0):
+        rxn = sbml_model.getReaction(j)
+        for lst in (rxn.getListOfReactants(), rxn.getListOfProducts()):
+            changed_by_reaction |= {lst.get(k).getSpecies() for k in range(lst.size())}
     sources |= {
         sp.getId()
-        for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
-        if not sp.getConstant() and not sp.getBoundaryCondition()
+        for sp in species
+        if sp.getId() in candidates
+        and (
+            (sp.getId() in changed_by_reaction and not sp.getBoundaryCondition())
+            or sp.getId() in algebraic_names
+        )
     }
     # A resize keeps a species' amount, so the concentration of a constant or
     # boundary species moves with its compartment's size, though nothing names
     # it. `cv := 1 + 0.1*Kw` with Kw constant in `ce` was taken for still across
     # an event `ce = 2`, and SSA ran cv's reactions at its load-time size.
     conc_comp = {
-        sp.getId(): sp.getCompartment()
-        for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
-        if not sp.getHasOnlySubstanceUnits()
+        sp.getId(): sp.getCompartment() for sp in species if not sp.getHasOnlySubstanceUnits()
     }
     changed = True
     while changed:  # to the fixed point: a rule over a moving rule moves
@@ -3228,6 +3279,10 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
         for sid, comp in conc_comp.items():
             if sid not in sources and (comp in sources or comp in moving):
                 sources.add(sid)
+                changed = True
+        for rid, names in law_reads.items():
+            if rid not in sources and (names & sources or names & moving):
+                sources.add(rid)
                 changed = True
         for var, names in reads.items():
             if var not in moving and (names & sources or names & moving):
@@ -3244,7 +3299,9 @@ def _ssa_rule_event_conc_reads(
     rate-rule-resized), directly or through assignment rules: the SSA stores a
     count over the load-time size, so such a read is stale. ``x' = S`` with S in
     ``C := 1 + 0.5*time`` integrated 40 against the ODE's 22, and ``at S < 6``
-    never fired. Returns ``[(location, [compartments])]``."""
+    never fired. ``rules`` maps each assignment rule's variable, and each
+    reaction id a rule or a law reads, to the names it reads. Returns
+    ``[(location, [compartments])]``."""
     if not moving_comps:
         return []
 
@@ -3312,7 +3369,8 @@ def _ssa_moving_ar_comp_reads(
     assignment rule: the SSA's live-volume correction covers the species of the
     compartment a reaction acts in, and no others.
 
-    ``rules`` maps each assignment rule's variable to the names it reads. A
+    ``rules`` maps each assignment rule's variable, and each reaction id a rule
+    or a law reads, to the names it reads (a reaction id reads its law). A
     species a rule sets (``rule_targets``) holds the value its rule gives it,
     not a count over a size, so reading it is not stale."""
     if not moving_comps and not varvol_comps:
@@ -4441,6 +4499,20 @@ def _kinetic_law_local_params(kl) -> list:
     return [kl.getParameter(j) for j in range(kl.getNumParameters())]
 
 
+def _law_math_in_model_scope(rxn):
+    """A reaction's kinetic law as the reaction's id reads in a rule or an event:
+    a copy with each local parameter renamed to ``_lp_<rid>_<id>``, the name §9
+    registers it by, so that a global of the same id does not take its place.
+    None when the reaction has no law."""
+    kl = rxn.getKineticLaw()
+    if kl is None or kl.getMath() is None:
+        return None
+    math = kl.getMath().deepCopy()
+    for lp in _kinetic_law_local_params(kl):
+        math.renameSIdRefs(lp.getId(), f"_lp_{rxn.getId()}_{lp.getId()}")
+    return math
+
+
 def _local_param_value(lp) -> float:
     """A local parameter's value. An unset one has none: NaN, so nothing passes
     it off as a number, or the 0.0 ``BNGSIM_ALLOW_UNSET_PARAMS=1`` asks for. A law
@@ -5103,11 +5175,25 @@ def _build_model_from_sbml_doc_in_context(doc):
         for j in range(sbml_model.getNumRules())
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     }
+    # An initialAssignment gives its target a value as surely as a rule does,
+    # whether or not it folds here. One that does not fold is evaluated by the
+    # engine at the start, as it is for a parameter that declares a value the
+    # assignment replaces (#732), or refused by name (#871). `k = 0.5 + S3`,
+    # with S3 given no initial value, does not fold, as S3 is only started at
+    # 0 (#580) further on; C2 refused k as having "no initialAssignment",
+    # where libRoadRunner, and bngsim with any declared value for k, give
+    # k = 0.5.
+    _ia_targets = {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+        if sbml_model.getInitialAssignment(j).getMath() is not None
+    }
     _unset_param_ids = {
         pid
         for pid in _all_param_ids
         if not sbml_model.getParameter(pid).isSetValue()
         and pid not in ia_values
+        and pid not in _ia_targets
         and pid not in _ar_targets
     }
     if _unset_param_ids:
@@ -5268,17 +5354,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # S1(1) = e^-0.5 = 0.607 and no warning. RoadRunner refuses the model. A
     # factor that an initialAssignment or an assignmentRule gives a value is not
     # in `_unset_param_ids` and loads as before (SBML suite 01642-01644 and
-    # 01651-01653 give theirs by an initialAssignment). One whose
-    # initialAssignment does not fold at load is in it too, but the model does
-    # assign it, so it is left to §3b, which names the assignment it could not
-    # evaluate. Like C2 this goes by what the attribute names, so a model-wide
-    # factor that every species overrides still refuses. Same refusal and hatch
-    # as C2; under the hatch the factor is 0.0, the value the parameter itself is
-    # given everywhere else.
-    _cf_unset = _unset_param_ids - {
-        sbml_model.getInitialAssignment(j).getSymbol()
-        for j in range(sbml_model.getNumInitialAssignments())
-    }
+    # 01651-01653 give theirs by an initialAssignment). Nor is one whose
+    # initialAssignment does not fold at load: the model does assign it, so it
+    # is left to §3b, which names the assignment it could not evaluate. An
+    # initialAssignment with no math assigns nothing, so its factor is refused
+    # here; it used to be left to §3b too, which read it as 0.0 without a word
+    # (S1 held at 1). Like C2 this goes by what the attribute names, so a
+    # model-wide factor that every species overrides still refuses. Same
+    # refusal and hatch as C2; under the hatch the factor is 0.0, the value the
+    # parameter itself is given everywhere else.
+    _cf_unset = _unset_param_ids
     _unset_cf: list[tuple[str, str]] = []
     if sbml_model.isSetConversionFactor() and sbml_model.getConversionFactor() in _cf_unset:
         _unset_cf.append((sbml_model.getConversionFactor(), "the model's conversionFactor"))
@@ -5406,11 +5491,13 @@ def _build_model_from_sbml_doc_in_context(doc):
     } & _comp_id_set
 
     # (#745) The assignment-rule compartments whose size can move during a run:
-    # their rule reads the clock, a species, a rate-rule or event target, or
-    # another rule that does. One that reads constants alone holds its load-time
-    # size for the whole run, as a write to what it reads is refused. The same
-    # set §9 keeps from the SSA.
-    ar_comp_moving = ar_comp_targets & _moving_assignment_rule_vars(sbml_model)[1]
+    # their rule reads the clock, a species that changes, a rate-rule or event
+    # target, a reaction's rate that moves, or another rule that does. One that
+    # reads constants alone holds its load-time size for the whole run, as a
+    # write to what it reads is refused. The same set §9 keeps from the SSA.
+    # Which rules move is found once here, for §3b and §9 as well.
+    _ar_rules, _ar_moving_vars = _moving_assignment_rule_vars(sbml_model)
+    ar_comp_moving = ar_comp_targets & _ar_moving_vars
 
     # (#86) Compartments driven by a RATE RULE — continuously variable volume
     # V(t). A concentration-valued (hOSU=false) species in such a compartment
@@ -6661,8 +6748,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # a rate rule (a rate of 0 leaves it where it is), an event that assigns it
     # (one with a trigger, as the event pre-scan counts them), or an assignment
     # rule that moves (`_moving_assignment_rule_vars`: it reads the time, a
-    # species, or something a rate rule or an event changes). A rule over
-    # constants alone holds its value and is folded like an initialAssignment.
+    # species that changes, a reaction's rate that does, or something a rate
+    # rule or an event changes). A rule over constants, or over a species that
+    # nothing changes, holds its value and is folded like an initialAssignment.
     _cf_ids = {
         _sp.getConversionFactor()
         for _sp in (sbml_model.getSpecies(_j) for _j in range(sbml_model.getNumSpecies()))
@@ -6672,7 +6760,6 @@ def _build_model_from_sbml_doc_in_context(doc):
         _cf_ids.add(sbml_model.getConversionFactor())
     _cf_changed_by: dict[str, list[str]] = {}
     if _cf_ids:
-        _, _cf_moving_ars = _moving_assignment_rule_vars(sbml_model)
         for _j in range(sbml_model.getNumRules()):
             _r = sbml_model.getRule(_j)
             _v = _r.getVariable()
@@ -6688,7 +6775,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 ):
                     continue
                 _cf_changed_by.setdefault(_v, []).append(f"the rate rule d({_v})/dt = {_txt}")
-            elif _r.isAssignment() and _v in _cf_moving_ars:
+            elif _r.isAssignment() and _v in _ar_moving_vars:
                 _cf_changed_by.setdefault(_v, []).append(
                     f"the assignment rule {_v} := {_txt}, which reads the time or a value "
                     "that changes,"
@@ -7250,6 +7337,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         _walk_name_refs(kl_j.getMath(), _reaction_ids_set, refs_j)
         refs_j.discard(rxn_j.getId())  # drop self-reference
         referenced_reaction_ids |= refs_j
+    # An event reads a reaction's id as a rule does: `at J0 < 15` failed to
+    # compile, J0 an undefined symbol, where libRoadRunner fires it at J0's
+    # crossing.
+    for j in range(sbml_model.getNumEvents()):
+        ev_j = sbml_model.getEvent(j)
+        ev_maths = [
+            x.getMath()
+            for x in (ev_j.getTrigger(), ev_j.getDelay(), ev_j.getPriority())
+            if x is not None
+        ]
+        ev_maths += [
+            ev_j.getEventAssignment(k).getMath() for k in range(ev_j.getNumEventAssignments())
+        ]
+        for m_j in ev_maths:
+            if m_j is not None:
+                _walk_name_refs(m_j, _reaction_ids_set, referenced_reaction_ids)
 
     # What a name in a kinetic law is, for _law_is_nonnegative: a species or a
     # compartment is, a constant parameter is by its value after initial
@@ -7831,14 +7934,30 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _ar_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
             elif _rule.isRate() and _v not in _sbml_species_ids:
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+        # A reaction's id in math is its kinetic law's value, so a size is
+        # followed through the law as through an assignment rule: for its rate
+        # here, and for its jumps below. Read as a constant, `C := 1 + 0.5*J0`
+        # with J0 at k*A gave C no rate, and [X] in C was not diluted: [X](5)
+        # was 0.677 where libRoadRunner gives 1.267.
+        _law_math: dict[str, object] = {}
+        for j in range(sbml_model.getNumReactions()):
+            _rx = sbml_model.getReaction(j)
+            if _rx.getId() not in referenced_reaction_ids:
+                continue  # no rule or law reads its rate
+            _lm = _law_math_in_model_scope(_rx)
+            if _lm is not None:
+                _law_math[_rx.getId()] = _lm
+                _ar_rhs_ex[_safe_name(_rx.getId())] = _ast_to_exprtk_with_funcdefs(_lm, func_defs)
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
         _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
         _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
         # A species whose value never moves continuously, so its rate is 0 and
         # reading it needs no rate accessor: nothing changes its amount (constant,
-        # or boundary with no rate rule), and the value is that amount or a
-        # concentration in a compartment whose size holds between events.
+        # boundary, or in no reaction, with no rate rule), and the value is that
+        # amount or a concentration in a compartment whose size holds between
+        # events. `C := 1 + 0.1*S`, S in no reaction, read rateOf(S), which SSA
+        # cannot run, for a rate of 0.
         _still_species = {
             s
             for s in _sbml_species_ids
@@ -7847,6 +7966,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             and (
                 sbml_model.getSpecies(s).getConstant()
                 or sbml_model.getSpecies(s).getBoundaryCondition()
+                or s not in reaction_species
             )
             and (
                 species_hosu.get(s, False)
@@ -8127,11 +8247,12 @@ def _build_model_from_sbml_doc_in_context(doc):
         for _sid, _scomp in species_comp.items():
             if not species_hosu.get(_sid, False) and _sid not in assignment_targets:
                 _rescaled_in.setdefault(_scomp, set()).add(_sid)
+        # A rate a size reads is read through its law, as a rule is.
         _size_rule_math = {
             sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
             for j in range(sbml_model.getNumRules())
             if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
-        }
+        } | _law_math
         _rule_reach: dict[str, frozenset] = {}
 
         def _reaches(var: str) -> frozenset:
@@ -8473,8 +8594,24 @@ def _build_model_from_sbml_doc_in_context(doc):
     # Continuous slots never take a falling factorial (see
     # _ssa_falling_factorial_terms); built once, not per reaction.
     _ssa_ff_continuous = set(assignment_targets) | set(rate_rule_targets)
-    _ar_rules, _ar_moving_vars = _moving_assignment_rule_vars(sbml_model)
     _ar_moving_comps = ar_comp_targets & _ar_moving_vars
+    # The SSA's stale-read walks below follow a reaction id that a rule or a law
+    # reads into its kinetic law, as they follow a rule: the id is the law's
+    # value, evaluated on the stored counts. `x' = J0`, J0 at k*S*C with C
+    # doubled by an event, ran with no refusal, x(3) 72.3 for libRoadRunner's
+    # 45.1, where `x' = S` is refused.
+    _ssa_reads = dict(_ar_rules)
+    for _j in range(sbml_model.getNumReactions()):
+        _rx = sbml_model.getReaction(_j)
+        _kl = _rx.getKineticLaw()
+        if (
+            _rx.getId() in referenced_reaction_ids
+            and _kl is not None
+            and _kl.getMath() is not None
+        ):
+            _ssa_reads[_rx.getId()] = _math_names(_kl.getMath())[0] - {
+                lp.getId() for lp in _kinetic_law_local_params(_kl)
+            }
     for i in range(sbml_model.getNumReactions()):
         rxn = sbml_model.getReaction(i)
         rid = rxn.getId()
@@ -8491,7 +8628,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         # by a law, is read live.
         _ar_conc, _vv_read = _ssa_moving_ar_comp_reads(
             rxn,
-            _ar_rules,
+            _ssa_reads,
             _ar_moving_vars,
             _ar_moving_comps,
             species_comp,
@@ -9441,7 +9578,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     for _loc, _comps in _ssa_rule_event_conc_reads(
         sbml_model,
-        _ar_rules,
+        _ssa_reads,
         _ar_moving_comps | varvol_ssa_comps,
         species_comp,
         species_hosu,
@@ -9496,7 +9633,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         # What an event's resize of an assignment-rule compartment is found
         # from (issue #1055): each assignment rule's math, in document order,
         # and the species a resize of each compartment rescales. Both are the
-        # same for every event, so they are read once, not once per event.
+        # same for every event, so they are read once, not once per event. A
+        # reaction id a rule reads is its kinetic law, so the law is read with
+        # the rules: `C := 1 + 0.5*J0`, J0 at k*A, is resized by `k = 0.6`.
         event_rule_math: dict[str, object] = {}
         event_rescaled_species: dict[str, list[str]] = {}
         event_rule_cache: dict = {}
@@ -9505,6 +9644,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                 rule = sbml_model.getRule(j)
                 if rule.isAssignment() and rule.getMath() is not None:
                     event_rule_math[rule.getVariable()] = rule.getMath()
+            for j in range(sbml_model.getNumReactions()):
+                _rx = sbml_model.getReaction(j)
+                if _rx.getId() in referenced_reaction_ids:
+                    _lm = _law_math_in_model_scope(_rx)
+                    if _lm is not None:
+                        event_rule_math[_rx.getId()] = _lm
             for sid, scomp in species_comp.items():
                 if not species_hosu.get(sid, False) and sid not in assignment_targets:
                     event_rescaled_species.setdefault(scomp, []).append(sid)
