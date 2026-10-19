@@ -398,6 +398,102 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     return False
 
 
+def _rated_functions(func_defs: dict) -> set[str]:
+    """The functionDefinitions whose body reads ``rateOf``, through the COPASI
+    idiom or the csymbol, directly or through another they call."""
+    idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
+    rated: set[str] = set()
+    grew = True
+    while grew:
+        grew = False
+        for fid, (_p, body) in func_defs.items():
+            if fid in rated or body is _RATEOF_FUNCDEF:
+                continue
+            for n in _iter_ast_subtree(body):
+                t = n.getType()
+                if t == libsbml.AST_FUNCTION_RATE_OF or (
+                    t == libsbml.AST_FUNCTION and (n.getName() in idiom_names | rated)
+                ):
+                    rated.add(fid)
+                    grew = True
+                    break
+    return rated
+
+
+def _expand_rated_function_calls(sbml_model, func_defs: dict) -> None:
+    """Write each call to a functionDefinition whose body reads ``rateOf`` out
+    in place, with the caller's arguments put in for the parameters (issue
+    #1124, item 8).
+
+    ``f(y) = 2*rateOf(y)`` called as ``f(S)`` then reads ``2*rateOf(S)``, the
+    rate of what was passed, and the checks, the initial-value fold and the
+    emitter take it as they take a call written there. Inside the body the
+    argument is the function's own parameter, which none of them follows into
+    the caller: the load refused every such call. A rate of an argument that
+    is not a single symbol is refused by the check after this (rule 10223).
+    """
+    rated = _rated_functions(func_defs)
+    if not rated:
+        return
+
+    def is_rated_call(n) -> bool:
+        return n.getType() == libsbml.AST_FUNCTION and n.getName() in rated
+
+    def written_out(call):
+        params, body = func_defs[call.getName()]
+        out = body.deepCopy()
+        if out.getType() == libsbml.AST_NAME and out.getName() in params:
+            # A body that is a bare parameter: the argument itself.
+            j = params.index(out.getName())
+            return call.getChild(j).deepCopy() if j < call.getNumChildren() else out
+        for j, pname in enumerate(params):
+            if j < call.getNumChildren():
+                out.replaceArgument(pname, call.getChild(j))
+        return out
+
+    def expanded(root):
+        # A recursive definition is invalid SBML (rule 20512); the bound keeps
+        # one from looping here, and the checks after report what is left.
+        for _ in range(10_000):
+            if is_rated_call(root):
+                root = written_out(root)
+                continue
+            for parent in _iter_ast_subtree(root):
+                hit = next(
+                    (
+                        j
+                        for j in range(parent.getNumChildren())
+                        if is_rated_call(parent.getChild(j))
+                    ),
+                    None,
+                )
+                if hit is not None:
+                    parent.replaceChild(hit, written_out(parent.getChild(hit)), True)
+                    break
+            else:
+                return root
+        return root
+
+    holders = [sbml_model.getRule(i) for i in range(sbml_model.getNumRules())]
+    holders += [
+        sbml_model.getReaction(i).getKineticLaw() for i in range(sbml_model.getNumReactions())
+    ]
+    holders += [
+        sbml_model.getInitialAssignment(i) for i in range(sbml_model.getNumInitialAssignments())
+    ]
+    for i in range(sbml_model.getNumEvents()):
+        ev = sbml_model.getEvent(i)
+        holders += [ev.getTrigger(), ev.getDelay(), ev.getPriority()]
+        holders += [ev.getEventAssignment(j) for j in range(ev.getNumEventAssignments())]
+    for holder in holders:
+        if holder is None or not holder.isSetMath():
+            continue
+        math = holder.getMath()
+        if not any(is_rated_call(n) for n in _iter_ast_subtree(math)):
+            continue
+        holder.setMath(expanded(math.deepCopy()))
+
+
 def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
     """Refuse, by name, a ``rateOf`` that the model has no value for.
 
@@ -425,12 +521,12 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
       csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
       for NaN, and a rule read either as 0 with a warning.
     * a call to a functionDefinition whose body reads ``rateOf``, directly or
-      through another it calls. The argument there is the function's own
-      parameter: both paths took the rate of that name, 0 unless a model
-      symbol shares it, rather than of what the caller passed. libsbml rejects
-      the csymbol in a function body (rule 20304); a call to the idiom there is
-      valid SBML, but bngsim does not follow the caller's argument into it. A
-      function nothing calls is left alone.
+      through another it calls, that is still there. The argument there is the
+      function's own parameter: both paths took the rate of that name, 0
+      unless a model symbol shares it, rather than of what the caller passed.
+      :func:`_expand_rated_function_calls` writes every such call out first
+      (issue #1124, item 8), so this is a backstop. A function nothing calls
+      is left alone.
 
     A kinetic law's own local parameter shadows a global of its id, so
     ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
@@ -453,16 +549,9 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         )
 
     # functionDefinitions whose body reads rateOf, directly or through a call.
-    rated_funcs: set[str] = set()
-    grew = True
-    while grew:
-        grew = False
-        for fid, (_p, body) in func_defs.items():
-            if fid in rated_funcs or body is _RATEOF_FUNCDEF:
-                continue
-            if any(_reads_rateof(n, rated_funcs) for n in _iter_ast_subtree(body)):
-                rated_funcs.add(fid)
-                grew = True
+    # A call to one is written out before this check (issue #1124, item 8), so
+    # one is left here only where that could not be done.
+    rated_funcs = _rated_functions(func_defs)
     # A species held as a concentration, by its compartment (rule 10225), but
     # not one whose rate a rate rule of its own states.
     conc_compartment = {
@@ -535,8 +624,7 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         "reports each, and RoadRunner refuses them. Earlier bngsim releases loaded "
         "most of these with a wrong rate, or failed with an ExprTk error that "
         "named none of it. Make such a variable a rateRule target, or write its "
-        "rate from the rule's own inputs; call rateOf directly rather than "
-        "inside a functionDefinition."
+        "rate from the rule's own inputs; pass rateOf a single symbol."
     )
 
 
@@ -4909,7 +4997,10 @@ def _build_model_from_sbml_doc_in_context(doc):
     # rateOf of an assignmentRule variable (issue #1046, rule 10224), of a
     # concentration in a rule-sized compartment (10225), of anything but a
     # symbol (10223), and through a functionDefinition. Checked once, before
-    # the fold below or the emitter would give any of them a wrong rate.
+    # the fold below or the emitter would give any of them a wrong rate. A call
+    # to a functionDefinition that reads rateOf is written out first, so its
+    # rate is of what the caller passed (issue #1124, item 8).
+    _expand_rated_function_calls(sbml_model, func_defs)
     _check_rateof_targets(sbml_model, func_defs)
     # What no rule sets has rate 0 wherever it is read (see _rateof_call).
     _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
