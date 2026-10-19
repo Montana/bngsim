@@ -3497,6 +3497,20 @@ PYBIND11_MODULE(_bngsim_core, m) {
                                        r.function_sensitivity, r.n_sens_params,
                                        user_function_indices(r.function_names));
                                })
+        // Which species with no dY_ss/dp row each expression's derivative read
+        // (-1 for none), filtered as ``expression_names`` is so the two stay
+        // index-parallel.
+        .def_property_readonly("expression_sens_missing_species",
+                               [](const bngsim::SteadyStateResult &r) {
+                                   std::vector<int> filtered;
+                                   if (r.function_sens_missing_species.empty()) {
+                                       return filtered;
+                                   }
+                                   for (size_t i : user_function_indices(r.function_names)) {
+                                       filtered.push_back(r.function_sens_missing_species[i]);
+                                   }
+                                   return filtered;
+                               })
         .def_readonly("raw_expression_names", &bngsim::SteadyStateResult::function_names)
         .def_property_readonly("raw_expression_sensitivity_data",
                                [](const bngsim::SteadyStateResult &r) {

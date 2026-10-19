@@ -273,6 +273,8 @@ Excluded species come back with a **NaN** `dY_ss/dp` row. A species with no
 steady value has no steady-state gradient, and `0.0` would be a confident wrong
 answer a fitter would read as "this parameter does not matter". Any observable
 or expression sensitivity that sums such a species is NaN for the same reason.
+One that does not read it has its value, also where the expression's
+derivative is taken by finite differences.
 
 `steady_state_batch(mask=...)` applies one mask to every entry — the pure-sink
 set is structural, so it does not move with the parameter set, which is what

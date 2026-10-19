@@ -8263,8 +8263,12 @@ class Simulator:
 
         A row ``mask=`` left out of the solve is NaN (issue #74) and stays NaN;
         the passes are given 0 there, so that they do not refuse it again. A
-        species the solve kept, in a compartment whose size it left out, has no
-        row to be given, and is refused by name.
+        species the solve kept, in a compartment whose size has no row, has no
+        row to be given, and is refused by name, with the species the size's
+        row needed and why the solve has none for it. An assignment-rule
+        target is left out of the solve too, by
+        :meth:`_ss_mask_excluding_ar_species` and not by the caller, so the
+        refusal blames ``mask=`` only for a species the caller's mask left out.
 
         The other passes of :meth:`_stamp` record what
         :meth:`Result.as_roadrunner` reads an amount with, which a steady state
@@ -8284,25 +8288,49 @@ class Simulator:
             size_kept = np.isfinite(result._expression_sensitivity).all(axis=1)
             sp_idx = result._name_to_idx
             expr_idx = {n: i for i, n in enumerate(result._expression_names)}
-            short = [
-                s
-                for s, c in rate_sized.items()
-                if s in sp_idx and c in sp_idx and kept[sp_idx[s]] and not kept[sp_idx[c]]
-            ] + [
-                s
-                for s, (c, _v_static) in rule_sized.items()
-                if s in sp_idx
-                and kept[sp_idx[s]]
-                and expr_idx.get(c, len(size_kept)) < len(size_kept)
-                and not size_kept[expr_idx[c]]
-            ]
+            missing = result._expression_sens_missing
+            rule_targets = getattr(model, "_ar_report_map", None) or {}
+            masked = {result._species_names[i] for i in result.excluded_species} - set(
+                rule_targets
+            )
+
+            needed_masked: set[str] = set()
+
+            def _no_row(name: str) -> str:
+                # Why the solve returned no row for this species.
+                if name in masked:
+                    needed_masked.add(name)
+                    return f"{name}, which mask= left out of the solve"
+                if name in rule_targets:
+                    return f"{name}, the target of an assignment rule, which the solve leaves out"
+                return f"{name}, whose row the solve did not return"
+
+            short: dict[str, str] = {}
+            for s, c in rate_sized.items():
+                if s in sp_idx and c in sp_idx and kept[sp_idx[s]] and not kept[sp_idx[c]]:
+                    short[s] = f"its size is the species {_no_row(c)}"
+            for s, (c, _v_static) in rule_sized.items():
+                k = expr_idx.get(c, len(size_kept))
+                if s in sp_idx and kept[sp_idx[s]] and k < len(size_kept) and not size_kept[k]:
+                    read = missing[k] if k < len(missing) else None
+                    short[s] = (
+                        f"its size {c} reads {_no_row(read)}"
+                        if read is not None
+                        else f"the derivative of its size {c} is not a number at this state"
+                    )
             if short:
+                causes = "; ".join(f"for {s}, {short[s]}" for s in sorted(short))
+                remedy = (
+                    f"Keep {sorted(needed_masked)} in the mask, or leave these species out as well"
+                    if needed_masked
+                    else "Take these rows from a time course with forward sensitivities run "
+                    "to the steady state"
+                )
                 raise SimulationError(
                     f"Steady-state dY_ss/dp of {sorted(short)}: each is an amount reported "
                     "as a concentration in a compartment whose size changes, so its row "
-                    "needs the size's own row, and the solve has none: mask= left the "
-                    "size, or a species its rule reads, out of the solve. Keep it in the "
-                    "mask, or leave these species out as well (issue #787)."
+                    f"needs the size's own row, and the solve has none: {causes}. "
+                    f"{remedy} (issue #787)."
                 )
 
         def _block(arr: np.ndarray) -> np.ndarray | None:
@@ -10021,6 +10049,7 @@ class SteadyStateResult:
         "_expression_names",
         "_observable_sensitivity",
         "_expression_sensitivity",
+        "_expression_sens_missing",
         "_observable_values",
         "_expression_values",
     )
@@ -10130,6 +10159,11 @@ class SteadyStateResult:
         self._expression_names = list(getattr(core, "expression_names", []))
         self._observable_sensitivity = _ss_output_sens_block(core, "observable_sensitivity_data")
         self._expression_sensitivity = _ss_output_sens_block(core, "expression_sensitivity_data")
+        # Per expression, the species with no dY_ss/dp row that its derivative
+        # read, which is why that row is NaN; None where it read none.
+        self._expression_sens_missing = [
+            _named(species, i) for i in getattr(core, "expression_sens_missing_species", [])
+        ]
         # Issue #247 — observable / function VALUES at the returned state. Present
         # on every solve (the sensitivity blocks above are not), because what they
         # are here for is the assignment-rule species whose own slot is frozen.

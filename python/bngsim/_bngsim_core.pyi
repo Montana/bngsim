@@ -1256,6 +1256,9 @@ class SteadyStateResultCore:
     def expression_names(self) -> list[str]:
         ...
     @property
+    def expression_sens_missing_species(self) -> list[int]:
+        ...
+    @property
     def expression_sensitivity_data(self) -> numpy.typing.NDArray[numpy.float64]:
         ...
     @property
