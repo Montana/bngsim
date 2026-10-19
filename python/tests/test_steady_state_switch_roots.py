@@ -3,8 +3,8 @@
 A rate law switched by a comparison over model state is constant on each side
 of its switch, so a step that spans a narrow window reads it as off at both
 ends, and the window is lost at every tolerance. ``run()`` roots each such
-condition since #897. The march ``steady_state()`` integrates with built its own
-integrator and rooted nothing: with Y made at k while ``0.5 < S < 0.505`` and S
+condition since #897. ``steady_state()``'s march built its own integrator and
+rooted nothing: with Y made at k while ``0.5 < S < 0.505`` and S
 decaying from 1, ``steady_state()`` returned Y = 0 with ``converged=True``,
 where a run gives 2·k·ln(1.01) = 0.1990.
 
