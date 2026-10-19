@@ -732,13 +732,13 @@ reports which path the expression block took:
 
 - `"codegen"` — every function came from the compiled chain rule.
 - `"mixed"` — some did; the rest were finite-differenced. That is a function the
-  codegen declines to differentiate (a table function, or a non-smooth builtin
-  such as `abs`/`min`/`max`/`floor` — the same constructs listed for `∂f/∂p`
-  above), or an auto-generated `_rateLawN` intermediate outside the
-  user-selectable set.
+  codegen declines to differentiate (a table function, a function that reads
+  `rateOf`, or a non-smooth builtin such as `abs`/`min`/`max`/`floor` — the
+  same constructs listed for `∂f/∂p` above), or an auto-generated `_rateLawN`
+  intermediate outside the user-selectable set.
 - `"finite-difference"` — none did, because the model has no compiled
-  output-sensitivity evaluator at all (a `rateOf` model, an embedded
-  table-function wrapper, or a model with no user-selectable global functions).
+  output-sensitivity evaluator at all (an embedded table-function wrapper, or
+  a model with no user-selectable global functions).
 
 The observable block is the exact linear projection either way, and is not
 covered by this field. Its weights are the group factors times the amount-valued

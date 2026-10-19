@@ -3405,15 +3405,23 @@ class Simulator:
         # two ways, so both passes take the ONE resolved map (GH #221) — a second
         # place that recomputes `vdiv` is a place the two can drift apart, which
         # is exactly how the #170 writable-volume divisor went stale on one side.
+        #
+        # The derivative pass runs before the variable-volume passes, as the
+        # steady state's does (issue #787). An assignment-rule amount in a
+        # compartment whose size moves is reported as its rule over the live
+        # size; the passes below rescale the value and apply the quotient rule
+        # to whatever row the species has. Given the rule's row first, they
+        # differentiate the reported value. Run after them, the pass had only
+        # NaN to put there.
         ar_map, ar_blocked = self._ar_sensitivity_metadata(model)
         self._apply_ar_report_map(result, ar_map)
+        self._apply_ar_sensitivity_map(result, ar_map)
         self._apply_varvol_conc_map(result, model)
         self._apply_varvol_ar_conc_map(result, model)
         self._apply_varvol_target_amount_map(result, model)
         self._apply_varvol_event_resize_map(result, model)
         result._ar_sens_map = ar_map
         result._ar_sens_blocked = ar_blocked
-        self._apply_ar_sensitivity_map(result, ar_map, ar_blocked)
         return result
 
     def _ar_sensitivity_metadata(
@@ -3433,9 +3441,11 @@ class Simulator:
 
         The blocked set is AR species whose reported value *also* carries a
         time-varying volume rescale (``_varvol_conc_map`` / ``_varvol_ar_conc_map``,
-        GH #85/#87): the redirect scales only by the constant ``vdiv``, so those
-        species' output sensitivities are refused rather than returned subtly
-        wrong. Both are empty for .net and non-AR models (no redirect).
+        GH #85/#87). The redirect scales only by the constant ``vdiv``, so a
+        ``species:<ar>`` selector for one of them reads the species' own row of
+        ``Result.sensitivities`` instead, which the variable-volume passes have
+        put through the quotient rule (issue #787), and is refused by name where
+        that row is NaN. Both are empty for .net and non-AR models (no redirect).
 
         The ``vdiv`` carried here is **resolved live** (:meth:`_ar_report_vdiv`),
         not the load-time number baked into ``_ar_report_map``. A ``Result`` has
@@ -3542,7 +3552,6 @@ class Simulator:
         self,
         result: Result,
         amap: dict[str, tuple[str, str, float, str]],
-        blocked: frozenset[str],
     ) -> None:
         """Differentiate the value :meth:`_apply_ar_report_map` reported (GH #221).
 
@@ -3573,12 +3582,20 @@ class Simulator:
         row ends up ``NaN`` rather than at a structural zero nobody can tell from
         a measurement — the one outcome GH #221 rules out — and the species is
         recorded in ``Result.ar_sensitivity_refused`` and named in a warning.
-        Three cases: a *blocked* species, whose reported value carries a
-        time-varying volume rescale the constant ``vdiv`` does not (GH #85/#87,
-        the same refusal ``output_sensitivities`` raises by name); a source block
-        that was never computed for this run; and — the common one on the corpus
-        — a source row that is itself ``NaN`` because codegen declined that
-        expression's own output sensitivity (GH #198).
+        Two cases: a source block that was never computed for this run; and —
+        the common one on the corpus — a source row that is itself ``NaN``
+        because codegen declined that expression's own output sensitivity
+        (GH #198).
+
+        A species whose reported value also carries a time-varying volume
+        rescale (GH #85/#87) is filled here like any other, with the row of its
+        rule over ``vdiv``, the load-time size: that is the derivative of the
+        column this pass writes. The variable-volume passes run next, rescale
+        the column to the rule over the live size, and put the row through the
+        quotient rule with the size's own row (issue #787). Where the size has
+        no row, they refuse it there. Such a species was refused here instead,
+        and its row was NaN wherever the size moved: ``T := 2*P`` in
+        ``C := 1 + P`` had no row, where d[T]/dkp at t = 1 is 0.4988.
 
         The value pass writes ``rule/V`` where the species is an amount in a
         compartment whose size ``V`` is a writable parameter, so in that size's
@@ -3631,7 +3648,7 @@ class Simulator:
                 if src not in src_idx:
                     continue
                 src_block = obs_block if kind == "observable" else expr_block
-                if name in blocked or src_block.size == 0 or src_block.ndim != 3:
+                if src_block.size == 0 or src_block.ndim != 3:
                     out[:, j, :] = np.nan
                     refused.add(name)
                     changed = True
@@ -3645,7 +3662,7 @@ class Simulator:
                         if column == vdiv_param:
                             out[:, j, c] -= result._species[:, j] / vdiv
                 changed = True
-                # The third refusal, and the common one on the corpus: the source
+                # The second refusal, and the common one on the corpus: the source
                 # row is ITSELF NaN because codegen declined that expression's
                 # output sensitivity (an `if()` conditional, a table function, a
                 # dependency on another declined function — GH #198 refuses rather
@@ -3664,8 +3681,8 @@ class Simulator:
                 "in their Result.sensitivities row: the chain rule through the assignment "
                 "is not available for them, because codegen declined the rule's own "
                 "output sensitivity (GH #198 refuses an `if()` conditional or a table "
-                "function rather than guess), because the reported value carries a "
-                "time-varying volume rescale the redirect does not model (GH #85/#87), or "
+                "function rather than guess), because the run computed no output "
+                "sensitivity for the rule (codegen built none for this model), or "
                 "because the rule's own value is not finite there. "
                 "NaN rather than 0.0 because a structural zero is indistinguishable "
                 "from a measured one, and Result.gradient would read it as a flat "
@@ -3830,8 +3847,10 @@ class Simulator:
         *rescaled* is ``(species, column, V_static/V_live, V_live, kind,
         index)`` for each column a pass rescaled, with *kind* ``"species"`` or
         ``"expression"`` for where the live volume is read. A species an
-        assignment rule sets as well is refused afterwards by
-        :meth:`_apply_ar_sensitivity_map`, which overwrites its row. Both
+        assignment rule sets as well comes here with its rule's row, from
+        :meth:`_apply_ar_sensitivity_map`, and the same quotient rule gives the
+        row of its rule over the live size (issue #787); a row that pass has
+        already refused stays NaN and is not named a second time. Both
         sensitivity axes, parameter and initial condition.
         """
         if not rescaled:
@@ -3857,14 +3876,15 @@ class Simulator:
                     dv = expr_block[:, k, :]
                 else:
                     out[:, j, :] = np.nan
-                    refused.add(name)
+                    if name not in result._ar_sens_refused:
+                        refused.add(name)
                     continue
                 if not dv.any() and (factor == 1.0).all():
                     continue  # a size that does not move, in these columns or at all
                 with np.errstate(divide="ignore", invalid="ignore"):
                     share = np.where(v_live != 0.0, result._species[:, j] / v_live, 0.0)
                 out[:, j, :] = factor[:, None] * block[:, j, :] - share[:, None] * dv
-                if not np.isfinite(out[:, j, :]).all():
+                if not np.isfinite(out[:, j, :]).all() and name not in result._ar_sens_refused:
                     refused.add(name)
             setattr(result, sp_attr, out)
         if refused:
@@ -7292,7 +7312,7 @@ class Simulator:
         solved ``dY_ss/dp`` columns — so a steady-state gradient and a long-run
         one now come from the same evaluator. Finite differences remain the
         per-function fallback for what that evaluator declines (a table function,
-        a non-smooth construct, a whole-model ``rateOf`` decline);
+        a non-smooth construct, a function that reads ``rateOf``);
         ``ss.sens_output_source`` reports ``"codegen"``, ``"mixed"``, or
         ``"finite-difference"``. The *observable* block is an exact linear
         projection through the group factors and never differences anything.

@@ -538,8 +538,9 @@ class Result:
 
         # GH #205: AR-species names whose reported value also carries a
         # time-varying volume rescale (variable-volume compartment, #85/#87). The
-        # redirect above accounts only for the constant vdiv, so those species'
-        # output sensitivities are refused rather than returned subtly wrong.
+        # redirect above accounts only for the constant vdiv, so a selector for
+        # one of them reads its own row of the species tensor, which is put
+        # through the quotient rule with the size's row (issue #787).
         self._ar_sens_blocked: frozenset[str] = frozenset()
 
         # GH #221: AR-species names whose sensitivity TENSOR row carries NaN
@@ -966,8 +967,10 @@ class Result:
         :attr:`sensitivities` tensor carries that same redirected row, so this
         method and the tensor agree for those species; the redirect is kept here
         because it raises **by name** where the tensor can only hold ``NaN``
-        (a blocked variable-volume species; an expression whose output
-        sensitivity a construct declines).
+        (an expression whose output sensitivity a construct declines). A rule
+        target in a compartment whose size changes is read from the tensor, whose
+        row has the size's share in it (issue #787), and is refused by name where
+        that row is ``NaN``.
 
         .. rubric:: The two axes are not independent (GH #155)
 
@@ -1111,19 +1114,28 @@ class Result:
         # is no longer the only place it exists — it is kept because recursing on
         # the SOURCE selector propagates that source's support / empty-block
         # errors, which a NaN row in the tensor cannot state by name.
-        if kind == "species":
-            # Checked before the redirect, which a loaded result does not carry,
-            # so the refusal is the same after a save and load (issue #787).
-            if meta["name"] in self._ar_sens_blocked:
-                raise ValueError(
-                    f"output_sensitivities: assignment-rule species "
-                    f"{meta['selector']!r} is reported with a time-varying "
-                    "volume rescale (variable-volume compartment); its "
-                    "output sensitivity is not supported (GH #205). "
-                    "Result.sensitivities is NaN in this row for the same "
-                    "reason (GH #221); Result.ar_sensitivity_refused lists "
-                    "every such species."
-                )
+        #
+        # A species in a compartment whose size moves is reported as its rule
+        # over the live size, which the redirect below, a division by a
+        # constant, does not give. Its own row of the species tensor is that
+        # value's derivative (issue #787), so the selector reads it, and refuses
+        # by name where the row is NaN. Checked before the redirect, which a
+        # loaded result does not carry, so the answer is the same after a save
+        # and load.
+        live_sized = kind == "species" and meta["name"] in self._ar_sens_blocked
+        if live_sized and meta["name"] in self._ar_sens_refused:
+            raise ValueError(
+                f"output_sensitivities: assignment-rule species "
+                f"{meta['selector']!r} is reported over the live size of a "
+                "compartment whose size changes, and its row of "
+                "Result.sensitivities is NaN: it needs the output sensitivity "
+                "of the rule and that of the size, and the run has not got "
+                "both: codegen declined one of them (GH #198), or built no "
+                "output sensitivities for this model. "
+                "Result.ar_sensitivity_refused lists every such species "
+                "(GH #221)."
+            )
+        if kind == "species" and not live_sized:
             redirect = self._ar_sens_map.get(meta["name"])
             if redirect is not None:
                 src_kind, src_name, vdiv, vdiv_param = redirect
@@ -1966,8 +1978,8 @@ class Result:
         measurement, and the run warns naming these species. Two causes: codegen
         declined the rule's own output sensitivity (GH #198 refuses an ``if()``
         conditional or a table function rather than guess — the common one), or
-        the reported value carries a time-varying volume rescale the redirect
-        does not model (GH #85/#87).
+        the target is an amount in a compartment whose size changes and codegen
+        declined the output sensitivity of the size's own rule (issue #787).
 
         Also listed: an amount-valued species (``hasOnlySubstanceUnits``) that is
         no rule's target, in a compartment an assignment rule resizes, where the
