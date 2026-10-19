@@ -2233,7 +2233,10 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if sp.isSetConversionFactor()
             else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
         )
-        if cf_id:
+        # (Not where the reactions do nothing to it: 0 is 0 at any factor, and
+        # a factor that reads this rate, `cf := 1 + rateOf(S3)` with S3 in no
+        # reaction, had no value for it, issue #1124 item 9.)
+        if cf_id and amt_rate != 0.0:
             # A factor with no value yet fails the fold: the initialAssignment
             # or rule that gives it one refolds this on a later pass, and C2c
             # refuses one the model never gives.
@@ -3280,15 +3283,20 @@ _MASS_ACTION_MAX_POWER = 1000
 
 def _math_names(node) -> tuple[set[str], bool]:
     """The names a math AST reads, and whether it reads the clock (the time
-    csymbol, ``delay``, ``rateOf``). Iterative: a rule over a thousand terms is
-    a thousand-deep tree."""
+    csymbol, ``delay``). Iterative: a rule over a thousand terms is a
+    thousand-deep tree.
+
+    ``rateOf(x)`` reads ``x``: its rate moves where ``x`` does, and is 0 where
+    nothing changes ``x``. Counted as the clock, `cf := 1 + rateOf(S3)` with S3
+    in no reaction was refused as a conversion factor that moves, where
+    libRoadRunner runs it with cf = 1 (issue #1124, item 9)."""
     names: set[str] = set()
     clock = False
     stack = [node] if node is not None else []
     while stack:
         n = stack.pop()
         t = n.getType()
-        if t in (libsbml.AST_NAME_TIME, libsbml.AST_FUNCTION_DELAY, libsbml.AST_FUNCTION_RATE_OF):
+        if t in (libsbml.AST_NAME_TIME, libsbml.AST_FUNCTION_DELAY):
             clock = True
         elif t == libsbml.AST_NAME:
             names.add(n.getName())
