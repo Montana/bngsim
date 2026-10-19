@@ -2042,9 +2042,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         reactions ⇒ ``0``, or ``-[S]·V'/V`` for a concentration in a compartment
         a rate rule sizes (its amount holds).
 
+    A rate rule or kinetic law can itself read a rateOf: ``p' = 0.5*rateOf(S3)``
+    makes ``rateOf(p)`` half the rate of ``S3``. Such a rateOf is resolved
+    through this resolver as well, on the same initial state.
+
     Returns ``None`` (fold fails, target keeps its declared value) when the
     derivative can't be evaluated — an unknown symbol, an unsupported kinetic
-    law, or a rateOf of something with no rate rule and no reaction.
+    law, a rateOf of something with no rate rule and no reaction, or rates that
+    are written in terms of each other in a ring (an algebraic loop, which the
+    run refuses too).
     """
     rate_rule_math: dict[str, libsbml.ASTNode] = {}
     for i in range(sbml_model.getNumRules()):
@@ -2056,6 +2062,74 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         sbml_model.getSpecies(i).getId(): sbml_model.getSpecies(i)
         for i in range(sbml_model.getNumSpecies())
     }
+    idiom_names = {
+        name for name, (_p, body) in (func_defs or {}).items() if body is _RATEOF_FUNCDEF
+    }
+
+    def _rateof_args(m) -> set[str]:
+        """The symbols whose rateOf ``m`` reads, by the csymbol or by a call to
+        COPASI's rateOf idiom."""
+        return {
+            n.getChild(0).getName()
+            for n in _iter_ast_subtree(m)
+            if (
+                n.getType() == libsbml.AST_FUNCTION_RATE_OF
+                or (n.getType() == libsbml.AST_FUNCTION and n.getName() in idiom_names)
+            )
+            and n.getNumChildren() >= 1
+            and n.getChild(0).getType() == libsbml.AST_NAME
+        }
+
+    law_rates_read: dict[int, set[str]] = {}
+
+    def _rates_read(name, ctx) -> set[str]:
+        """The symbols whose rate ``_rate`` reads in working out the rate of
+        ``name``: those a rate rule or a kinetic law of a reaction that changes
+        it reads the rateOf of, and the size of the compartment that dilutes a
+        concentration."""
+        if name in rate_rule_math:
+            return _rateof_args(rate_rule_math[name])
+        sp = species_by_id.get(name)
+        if sp is None:
+            return set()
+        out = set() if sp.getHasOnlySubstanceUnits() else {sp.getCompartment()}
+        if sp.getBoundaryCondition() or sp.getConstant():
+            return out
+        for j in range(sbml_model.getNumReactions()):
+            rxn = sbml_model.getReaction(j)
+            kl = rxn.getKineticLaw()
+            if kl is None or not kl.isSetMath() or not _net_stoich(rxn, name, ctx):
+                continue
+            if j not in law_rates_read:
+                # A local parameter shadows the global of the same id, and
+                # nothing changes it.
+                law_rates_read[j] = (
+                    _rateof_args(kl.getMath()) - _kinetic_law_local_values(kl).keys()
+                )
+            out |= law_rates_read[j]
+        return out
+
+    def _rates_first(name, ctx) -> list[str] | None:
+        """``name`` and every symbol whose rate its rate reads, each after the
+        ones its own rate reads; ``None`` where they read each other in a ring.
+        The walk keeps its own stack, so a long chain of rates costs no depth."""
+        order: list[str] = []
+        on_path, finished = {name}, set()
+        stack = [(name, iter(_rates_read(name, ctx)))]
+        while stack:
+            n, reads = stack[-1]
+            nxt = next(reads, None)
+            if nxt is None:
+                stack.pop()
+                on_path.discard(n)
+                finished.add(n)
+                order.append(n)
+            elif nxt in on_path:
+                return None
+            elif nxt not in finished:
+                on_path.add(nxt)
+                stack.append((nxt, iter(_rates_read(nxt, ctx))))
+        return order
 
     def _net_stoich(rxn, sid, ctx):
         """Signed product−reactant stoichiometry of ``sid`` in ``rxn`` (0 if absent)."""
@@ -2101,10 +2175,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             return None
         return amt_rate / vol - conc * dvol / vol
 
-    def resolver(name, ctx):
+    def _rate(name, ctx):
         # 1) rate-rule target — dx/dt is the rule's RHS, in the target's units.
+        # A rateOf the rule reads is the rate of its argument at the same
+        # instant: `rateOf(p)` under `p' = 0.5*rateOf(S3)` was refused at
+        # load, where the run and libRoadRunner read 0.2.
         if name in rate_rule_math:
-            return _eval_ast_numeric(rate_rule_math[name], ctx, func_defs)
+            return _eval_ast_numeric(
+                rate_rule_math[name], ctx, func_defs, rateof_resolver=resolver
+            )
         sp = species_by_id.get(name)
         if sp is None:
             # A parameter / compartment with no rate rule is constant ⇒ 0. One
@@ -2135,7 +2214,14 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 return None
             _lv = _kinetic_law_local_values(kl)
             law_ctx = {**ctx, **_lv} if _lv else ctx
-            v = _eval_ast_numeric(kl.getMath(), law_ctx, func_defs)
+            v = _eval_ast_numeric(
+                kl.getMath(),
+                law_ctx,
+                func_defs,
+                # The rate of a local parameter is 0; the rate of any other
+                # symbol is read on the model's state, not the law's.
+                rateof_resolver=lambda n, _c, _lv=_lv: 0.0 if n in _lv else resolver(n, ctx),
+            )
             if v is None:
                 return None
             amt_rate += net * v
@@ -2160,6 +2246,34 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
         return _concentration_rate(name, sp, amt_rate, ctx)
+
+    # The rates worked out for the outermost rateOf being resolved, by symbol.
+    # Every rate it reads is worked out first, in the order `_rates_first`
+    # gives, so a rateOf read on the way finds its value here rather than
+    # working it out again (a diamond of rates on rates would be read once per
+    # path through it) or on a deeper stack.
+    known_rates: list[dict | None] = [None]
+
+    def resolver(name, ctx):
+        known = known_rates[0]
+        if known is not None:
+            if name not in known:
+                # Read through the body of a function, which the walk does not
+                # follow. It is marked first so that a ring through it reads no
+                # value rather than recursing.
+                known[name] = None
+                known[name] = _rate(name, ctx)
+            return known[name]
+        order = _rates_first(name, ctx)
+        if order is None:
+            return None  # rates written in terms of each other: no value
+        known_rates[0] = known = {}
+        try:
+            for n in order:
+                known[n] = _rate(n, ctx)
+        finally:
+            known_rates[0] = None
+        return known[name]
 
     return resolver
 

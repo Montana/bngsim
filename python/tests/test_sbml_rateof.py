@@ -1564,6 +1564,184 @@ def test_a_folded_rateof_reads_a_level_2_kinetic_law_local_parameter(global_k):
     assert bngsim.Model.from_sbml_string(doc).get_param("p") == pytest.approx(-3.0, rel=1e-12)
 
 
+# ── A folded rateOf of a rate that reads rateOf itself ──────────────────────
+
+
+def _rate_of_a_rate(ant: str, of: str, *, cf_on: str = "", maths: dict | None = None) -> str:
+    """The SBML of Antimony *ant* with ``P0 = rateOf(<of>)`` an initialAssignment.
+    *cf_on* names the species, or ``"model"``, that ``cf`` is the conversion
+    factor of. *maths* rewrites a rate rule's or a reaction's math by its
+    variable or id, for a ring of rates, which Antimony refuses to write."""
+    import antimony
+    import libsbml
+
+    antimony.clearPreviousLoads()
+    text = f"{ant}\nP0 = rateOf({of}); const P0\n"
+    assert antimony.loadAntimonyString(text) >= 0, antimony.getLastError()
+    doc = libsbml.readSBMLFromString(antimony.getSBMLString(antimony.getMainModuleName()))
+    model = doc.getModel()
+    for key, formula in (maths or {}).items():
+        rule = model.getRateRule(key)
+        (rule or model.getReaction(key).getKineticLaw()).setMath(libsbml.parseL3Formula(formula))
+    if cf_on == "model":
+        model.setConversionFactor("cf")
+    elif cf_on:
+        model.getSpecies(cf_on).setConversionFactor("cf")
+    return libsbml.writeSBMLToString(doc)
+
+
+_MADE_AT_K = "compartment D = 1; species S3 in D = 1; k = 0.4; J1: -> S3; k\n"
+
+# (Antimony, rateOf of, conversionFactor on, the t = 0 rate, what the fold froze).
+# Each rate is libRoadRunner's and the run's own rateOf at t = 0.
+_RATES_OF_RATES = {
+    # rateOf(p) = 0.5 * 0.4
+    "rate rule": (_MADE_AT_K + "p = 0; p' = 0.5*rateOf(S3)", "p", "", 0.2, ["D", "k"]),
+    # rateOf(p) = 3 * a * 0.4/1.5
+    "two rate rules": (
+        "compartment D = 1.5; species S3 in D = 1; k = 0.4; J1: -> S3; k\n"
+        "a = 2; q = 0; q' = a*rateOf(S3); p = 0; p' = 3*rateOf(q)",
+        "p",
+        "",
+        1.6,
+        ["D", "a", "k"],
+    ),
+    # rateOf(c) read along two paths: rateOf(p) = 0.25 + 2 * 0.25
+    "diamond": (
+        "r = 0.25; c = 0; c' = r; a = 0; a' = rateOf(c); b = 0; b' = 2*rateOf(c)\n"
+        "p = 0; p' = rateOf(a) + rateOf(b)",
+        "p",
+        "",
+        0.75,
+        ["r"],
+    ),
+    # A species' rate rule: rateOf(S5) = 3 * 0.4
+    "species rate rule": (
+        _MADE_AT_K + "species S5 in D = 0; S5' = 3*rateOf(S3)",
+        "S5",
+        "",
+        1.2,
+        ["D", "k"],
+    ),
+    # A kinetic law: rateOf(S4) = h * g / D
+    "kinetic law": (
+        "compartment D = 2; species S4 in D = 1; g = 0.3; h = 2; p = 0; p' = g\n"
+        "J2: -> S4; h*rateOf(p)",
+        "S4",
+        "",
+        0.3,
+        ["D", "g", "h"],
+    ),
+    # A compartment the rate of p sizes: rateOf(S6) = k6/C - [S6] * g/C
+    "dilution": (
+        "compartment C = 2; species S6 in C = 1; g = 0.3; k6 = 1; p = 0; p' = g\n"
+        "C' = rateOf(p); J6: -> S6; k6",
+        "S6",
+        "",
+        0.35,
+        ["g", "k6"],
+    ),
+    # The factor scales the rate read: rateOf(p) = 0.5 * cf * 0.4
+    "conversionFactor of the rate read": (
+        _MADE_AT_K + "cf = 2; p = 0; p' = 0.5*rateOf(S3)",
+        "p",
+        "S3",
+        0.4,
+        ["D", "cf", "k"],
+    ),
+    # ... or the rate folded: rateOf(S4) = cf * 0.4
+    "conversionFactor of the rate folded": (
+        _MADE_AT_K + "cf = 2; species S4 in D = 1; J2: -> S4; rateOf(S3)",
+        "S4",
+        "S4",
+        0.8,
+        ["D", "cf", "k"],
+    ),
+    # ... or, the model's, both: rateOf(S4) = cf * cf * 0.4
+    "model conversionFactor": (
+        _MADE_AT_K + "cf = 2; species S4 in D = 1; J2: -> S4; rateOf(S3)",
+        "S4",
+        "model",
+        1.6,
+        ["D", "cf", "k"],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_RATES_OF_RATES))
+def test_a_folded_rateof_reads_a_rate_written_with_rateof(case):
+    """The fold worked a rate rule or kinetic law out with no value for a
+    rateOf in it, so ``P0 = rateOf(p)`` under ``p' = 0.5*rateOf(S3)`` was
+    refused at load, where the run and libRoadRunner read 0.2. The rate read
+    is worked out on the same state, and what it reads is frozen with what
+    the fold reads, so a write to ``k`` is refused rather than leaving ``P0``
+    at the rate it gave."""
+    ant, of, cf_on, want, frozen = _RATES_OF_RATES[case]
+    model = bngsim.Model.from_sbml_string(_rate_of_a_rate(ant, of, cf_on=cf_on))
+    assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
+    assert sorted(model.frozen_params) == frozen
+    for name in frozen:
+        with pytest.raises(bngsim.ParameterError, match="initial value of 'P0'"):
+            model.set_param(name, 3.0)
+
+
+_PAIR = {"X": "0.5*rateOf(Y) + 1", "Y": "0.5*rateOf(X) + 1"}
+
+
+@pytest.mark.parametrize(
+    ("ant", "of", "maths"),
+    [
+        ("X = 0; Y = 0; X' = 1; Y' = 1", "X", _PAIR),
+        ("X = 0; X' = 1", "X", {"X": "0.5*rateOf(X) + 1"}),
+        ("X = 0; Y = 0; X' = 1; Y' = 1; p = 0; p' = rateOf(X)", "p", _PAIR),
+        (
+            "compartment D = 1; species A in D = 0; species B in D = 0; Ja: -> A; 1; Jb: -> B; 1",
+            "A",
+            {"Ja": "0.5*rateOf(B) + 1", "Jb": "0.5*rateOf(A) + 1"},
+        ),
+        # The concentration's rate reads the size's, which reads its own.
+        ("compartment C = 2; species S in C = 1; C' = 1; J: -> S; 1", "S", {"C": "rateOf(S)"}),
+    ],
+    ids=["pair", "itself", "read from beside", "kinetic laws", "dilution"],
+)
+def test_a_folded_rateof_of_rates_in_a_ring_is_refused(ant, of, maths):
+    """Rates written in terms of each other are an algebraic loop: the run
+    refuses one by name (lanl/bngsim#991) and libRoadRunner as recursive. The
+    fold, which now reads a rateOf in a rate through itself, has no value for
+    one either, and the load is refused rather than recursing."""
+    doc = _rate_of_a_rate(ant, of, maths=maths)
+    with pytest.raises(bngsim.ModelError, match="initialAssignment for 'P0' cannot be evaluated"):
+        bngsim.Model.from_sbml_string(doc)
+
+
+def test_a_folded_rateof_of_a_long_chain_of_rates_costs_no_stack():
+    """``p0' = 1`` and ``pi' = rateOf(p(i-1))``: each rate is worked out before
+    the one that reads it, so 1,500 links fold to 1 where one call for each
+    would pass the interpreter's recursion limit."""
+    import libsbml
+
+    n = 1500
+    doc = libsbml.SBMLDocument(3, 2)
+    model = doc.createModel()
+    for i in range(n + 1):
+        p = model.createParameter()
+        p.setId(f"p{i}")
+        p.setValue(0.0)
+        p.setConstant(False)
+        rule = model.createRateRule()
+        rule.setVariable(f"p{i}")
+        rule.setMath(libsbml.parseL3Formula(f"rateOf(p{i - 1})" if i else "1"))
+    p0 = model.createParameter()
+    p0.setId("P0")
+    p0.setValue(0.0)
+    p0.setConstant(True)
+    ia = model.createInitialAssignment()
+    ia.setSymbol("P0")
+    ia.setMath(libsbml.parseL3Formula(f"rateOf(p{n})"))
+    loaded = bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
+    assert loaded.get_param("P0") == 1.0
+
+
 _M = 'xmlns="http://www.w3.org/1998/Math/MathML"'
 _RATEOF = (
     '<csymbol encoding="text" '
