@@ -10754,12 +10754,49 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
                 flow = flow_here;
             }
             approach = flow;
+            // The tolerances bound what each step adds to the state's error,
+            // not the error itself, which is what the residual is off by where
+            // the root is found. Taken as one step's, `V >= e^(6 + 2·1.99e-5)`
+            // with V = e^(2t) was 39 to 185 of it out at t = 3 over 80 to 126
+            // steps, was placed before an event at t = 3 that it follows, and
+            // the run returned dW/dtau = −1.05 for −3.15 at every rtol around
+            // the one it was refused at (issue #1025). So the relative part is
+            // counted twice for every step taken, for a species whose rate
+            // changes as the run goes: one whose rate holds is linear in time,
+            // which the run has exactly, and keeps one step's. That is read
+            // from the flow a little before the crossing, on the side the
+            // state came from, against the run's time so far. The absolute
+            // part is a floor under a species near 0 and is taken once:
+            // summed, a guard on a species decayed to 1e-9 had a reach of 684.
+            long segment_steps = 0;
+            CVodeGetNumSteps(cvode_mem, &segment_steps);
+            const double steps_taken = static_cast<double>(closed_segments.steps + segment_steps);
+            const double back = 1e-6 * std::max(std::fabs(t_evt), 1.0);
+            std::vector<double> x_back(static_cast<std::size_t>(ns), 0.0);
+            std::vector<double> f_back(static_cast<std::size_t>(ns), 0.0);
+            for (int i = 0; i < ns; ++i) {
+                const auto ui = static_cast<std::size_t>(i);
+                x_back[ui] = x[ui] - back * f_minus[ui];
+            }
+            model.compute_derivs(t_evt - back, x_back.data(), f_back.data());
+            sync(x, t_evt);
+            const double run_time = std::max(std::fabs(t_evt), step);
             double allowed = 0.0;
             for (int j : sw.species) {
                 const auto uj = static_cast<std::size_t>(j);
                 if (j >= 0 && j < ns) {
                     const double atol_j = run_atol_vec.empty() ? run_atol : run_atol_vec[uj];
-                    allowed += std::fabs(gx[uj]) * (run_rtol * std::fabs(x[uj]) + atol_j);
+                    const double bends = std::fabs(f_minus[uj] - f_back[uj]) / back * run_time;
+                    double weight = 0.0;
+                    if (std::isfinite(bends)) {
+                        weight = std::fabs(f_minus[uj]) > 0.0
+                                     ? std::min(1.0, bends / std::fabs(f_minus[uj]))
+                                     : (bends > 0.0 ? 1.0 : 0.0);
+                    }
+                    const double accumulated =
+                        1.0 + weight * (2.0 * std::max(steps_taken, 1.0) - 1.0);
+                    allowed +=
+                        std::fabs(gx[uj]) * (accumulated * run_rtol * std::fabs(x[uj]) + atol_j);
                 }
             }
             if (std::isfinite(flow) && flow != 0.0 && std::isfinite(allowed)) {

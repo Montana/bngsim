@@ -500,19 +500,43 @@ def test_an_event_between_the_two_does_not_hide_the_first():
     _refused(text, ["c"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
 
 
+SWITCH_BETWEEN = (
+    "species X, W, V, Z, Q; X = 0; W = 0; V = 1; Z = 5.9999996; Q = 0; a = 2; q = 0.7;"
+    " tau = 3; kv = 2\n"
+    "J0: -> X; a\nJv: -> V; kv*V\nJz: Z -> ; 2\nJq: -> Q; piecewise(1, Z <= 0, 0)\n"
+    f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)\n"
+    "E1: at (time >= tau): X = 0.5*X\n"
+)
+
+
 def test_a_switch_between_the_two_does_not_hide_the_first():
     """The switch on V = e^(2t) is 1.99e-5 after the event at tau, found
     before it at rtol 1e-6, and a second switch that jumps, on Z through 0,
     crosses between them. Only the last crossing was remembered: dW/dtau came
     back −1.05 for −3.15."""
-    text = (
-        "species X, W, V, Z, Q; X = 0; W = 0; V = 1; Z = 5.9999996; Q = 0; a = 2; q = 0.7;"
-        " tau = 3; kv = 2\n"
-        "J0: -> X; a\nJv: -> V; kv*V\nJz: Z -> ; 2\nJq: -> Q; piecewise(1, Z <= 0, 0)\n"
-        f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)\n"
-        "E1: at (time >= tau): X = 0.5*X\n"
+    _refused(SWITCH_BETWEEN, ["tau"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize("rtol", [2e-6, 1.1e-6, 9e-7, 5e-7])
+def test_a_switch_whose_error_has_added_up_is_refused_around_that_tolerance(rtol):
+    """Issue #1025. V = e^(2t) carries what every step added to its error:
+    39 to 185 times one step's tolerance at t = 3, more than the 1.99e-5 its
+    switch follows the event by, and the run found the switch first. The
+    reach was one step's tolerance, so only rtol 1e-6 itself was refused, and
+    these returned dW/dtau = −1.05 for −3.15 with no error."""
+    _refused(SWITCH_BETWEEN, ["tau"], 945, EVENT_TIMES, rtol=rtol, atol=1e-9)
+
+
+@pytest.mark.parametrize("rtol", [1e-7, 1e-8, 1e-10])
+def test_a_switch_the_tolerance_does_place_after_the_event_runs(rtol):
+    """Control. At these the run places the switch after the event, as it is:
+    W gathers 0.7·dX/dtau = −0.7 over the 4.5 after it."""
+    model = bngsim.Model.from_antimony_string(SWITCH_BETWEEN)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=rtol, atol=1e-9, timeout=60
     )
-    _refused(text, ["tau"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
 
 
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
