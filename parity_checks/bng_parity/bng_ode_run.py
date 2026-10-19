@@ -259,11 +259,11 @@ def _ode_comment(v: dict, n_sp: int, *, multiseg: bool) -> str:
                 f"solver-to-solver slack)"
             )
         if v.get("no_signal"):
-            # Issue #873: nothing in the reference moves past its own rounding, so
-            # a frozen engine would match it too.
+            # Issue #873: nothing moves past its own rounding in either trajectory,
+            # so a frozen engine would match it too.
             return (
-                f"NO SIGNAL: no species moves in run_network's trajectory ({n_sp} species, "
-                f"{scope}), so agreement says nothing about the dynamics."
+                f"NO SIGNAL: no species moves in either trajectory ({n_sp} species, "
+                f"{scope}{extra}), so agreement says nothing about the dynamics."
             )
         return (
             f"Matches run_network within tolerance across all {n_sp} species, {scope}{extra}; "

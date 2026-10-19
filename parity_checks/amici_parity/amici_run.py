@@ -136,10 +136,7 @@ def _compare_ode(bn, am) -> tuple[str, float, str, str, float]:
     bn_idx, am_idx, common = align
     v = differ.deterministic_verdict(bn_v[:, bn_idx], am_v[:, am_idx])
     status = "pass" if v["passed"] else "diff"
-    comment = (
-        f"{len(common)} sp; fail {v['n_fail']}/{v['n_cells']} "
-        f"(hard {v['n_hard_fail']}, soft {v['n_soft_fail']}, forgiven {v['budget_forgiven']})"
-    )
+    comment = differ.ode_row_comment(v, len(common))
     return status, v["max_rel"], comment, metric, tol
 
 

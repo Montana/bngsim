@@ -64,13 +64,14 @@ SIGNIF_FLOOR = 1e-3  # peak-relative significance gate: a column whose peak-over
 #   is below this fraction of the file-wide peak is below the model's dynamic range
 #   and cannot carry a hard fail (the per-species verdict the rr_parity triage trusts,
 #   dev/investigations/rr_check.py — own/global_peak <= 1e-3 is forgiven).
-#   The movement gate below applies the same fraction to the reference's ranges.
-# Movement gate (issue #873): a reference column whose range over time is past
-# REL_TOL of its own peak moves, and one whose range is past SIGNIF_FLOOR of the
+#   The movement gate below applies the same fraction to the columns' ranges.
+# Movement gate (issue #873): a column whose range over time, on either side, is
+# past REL_TOL of its peak moves, and one whose range is past SIGNIF_FLOOR of the
 # largest such range is significant by movement. A cell of a significant moving
 # column that is further from the reference than MOVE_CEILING of that range is a
 # hard fail, whatever the magnitude gates above say: a frozen engine is at least
-# half the range off, and a reservoir or a large baseline no longer hides it.
+# half the range off, and so is an engine that moves a species the reference
+# holds still, and a reservoir or a large baseline no longer hides either.
 # 1e-2 is from the #873 census (macOS arm64, BNG 2.9.3): the worst current PASS is
 # 7.5e-3 of its movement (ph_schrodinger), p99 4.4e-5, and a 4% error on one
 # species is at least 4e-2.
@@ -102,21 +103,25 @@ def deterministic_verdict(
     and an absolute-ceiling breach are never forgiven this way. ``max_rel`` is
     reported per column peak (not per cell).
 
-    The movement gate (issue #873) is judged on the reference ``b`` alone: a
-    column whose range over time is past ``REL_TOL`` of its peak moves, and one
-    whose range is past ``SIGNIF_FLOOR`` of the largest such range is significant.
-    A cell of such a column further from the reference than ``MOVE_CEILING`` of
-    the range is a hard fail that only ``forgive_mask`` and the near-zero
-    backstop forgive. It does not need the cell to be past the per-cell
-    tolerance: a column that moves by 1e-4 of its peak, frozen, is inside it.
+    The movement gate (issue #873) takes each column's range over time as the
+    larger of the two sides' ranges: a column whose range is past ``REL_TOL`` of
+    its peak moves, and one whose range is past ``SIGNIF_FLOOR`` of the largest
+    such range is significant. A cell of such a column further from the
+    reference than ``MOVE_CEILING`` of the range is a hard fail that only
+    ``forgive_mask`` and the near-zero backstop forgive. It does not need the
+    cell to be past the per-cell tolerance: a column that moves by 1e-4 of its
+    peak, frozen, is inside it. Both sides count because the hole is symmetric:
+    an engine that never moves fails against a reference that does, and an
+    engine that moves a species the reference holds still (one it should never
+    make, a clamped one it lets drift) fails the same way.
 
     Returns a dict: ``passed`` (the gate), ``max_rel``/``max_abs`` (worst over
     the genuinely-failing cells, 0 when it passes), and the bucket counts
     (``n_fail``/``n_soft_fail``/``frac_soft_fail``/``n_hard_fail``/
     ``budget_forgiven``/``n_cells``) for the report comment, with
     ``max_err_over_movement`` (the worst cell of a significant moving column, as
-    a part of that column's range) and ``no_signal`` (no column moves, so the
-    verdict could not tell a frozen engine from a right one).
+    a part of that column's range) and ``no_signal`` (no column moves on either
+    side, so the verdict could not tell a frozen engine from a right one).
 
     When ``forgive_mask`` is given, two more keys audit what it did (issue #316).
     A caller cannot compute either from outside: the mask alone says which cells
@@ -134,10 +139,11 @@ def deterministic_verdict(
     calls real, and a column is real only if some cell exceeds
     ``HARD_REL_CEILING`` (0.05) — which is 500x ``REL_TOL``, so that cell is
     itself a hard fail. There is no way to rescue a soft cell without also
-    leaving a hard one behind. It is computed rather than inferred anyway,
-    because that equivalence is a property of two constants and a gate ordering,
-    none of which this field should depend on; ``test_noise_floor_audit`` pins
-    the equivalence so a future change to either is a visible event.
+    leaving a hard one behind, and a cell the movement gate fails is hard on its
+    own. It is computed rather than inferred anyway, because that equivalence is
+    a property of constants and a gate ordering, none of which this field should
+    depend on; ``test_noise_floor_audit`` pins the equivalence so a future change
+    to either is a visible event.
 
     Both keys are absent when no mask was passed, so a consumer cannot mistake
     "no mask" for "the mask rescued nothing".
@@ -199,7 +205,10 @@ def deterministic_verdict(
     # blow-up on one engine) and an absolute-ceiling breach are NEVER forgiven —
     # regardless of significance.
     forgive = np.zeros_like(fail_mask) if forgive_mask is None else np.asarray(forgive_mask, bool)
-    near_zero_mask = fail_mask & (colmag < zero_floor) & ~one_side_nonfinite
+    # A cell where both sides are below the file-scale floor is underflow, for the
+    # per-cell test and the movement gate alike.
+    near_zero_cell = (colmag < zero_floor) & ~one_side_nonfinite
+    near_zero_mask = fail_mask & near_zero_cell
     below_dyn_range = (
         fail_mask & (~col_is_real)[np.newaxis, :] & ~one_side_nonfinite & ~hard_abs_fail
     )
@@ -213,22 +222,19 @@ def deterministic_verdict(
     # (a sub-ceiling column is forgiven outright rather than counted against it).
     hard_rel_fail = (reld_peak > HARD_REL_CEILING) & col_significant[np.newaxis, :]
 
-    # Issue #873 — the movement gate. Each reference column's range over time,
-    # over its finite cells; the file's movement scale is the largest range of a
-    # column that moves. A frozen copy of the reference is half a range off or
-    # more in every moving column, which the magnitude gates above forgave where
-    # a clamped reservoir set the file scale (catalysis.bngl), where a nearly
-    # constant species did, or where a column moves by under HARD_REL_CEILING of
-    # its own peak (a small signal on a large baseline).
-    ref_finite = np.isfinite(b)
-    if b.shape[0]:
-        ref_hi = np.where(ref_finite, b, -np.inf).max(axis=0)
-        ref_lo = np.where(ref_finite, b, np.inf).min(axis=0)
-        ref_peak = np.where(ref_finite, np.abs(b), 0.0).max(axis=0)
-        col_range = np.where(ref_finite.any(axis=0), ref_hi - ref_lo, 0.0)
-    else:
-        ref_peak = col_range = np.zeros(b.shape[1])
-    col_moves = col_range > REL_TOL * ref_peak
+    # Issue #873 — the movement gate. Each column's range over time, over its
+    # finite cells, on whichever side moves more; the file's movement scale is the
+    # largest range of a column that moves. A frozen copy of the reference is half
+    # a range off or more in every moving column, which the magnitude gates above
+    # forgave where a clamped reservoir set the file scale (catalysis.bngl), where
+    # a nearly constant species did, or where a column moves by under
+    # HARD_REL_CEILING of its own peak (a small signal on a large baseline). An
+    # engine that moves a column the reference holds still is the same miss seen
+    # from the other side, so its range counts too.
+    ref_range, ref_peak = _range_and_peak(b)
+    eng_range, eng_peak = _range_and_peak(a)
+    col_range = np.maximum(ref_range, eng_range)
+    col_moves = col_range > REL_TOL * np.maximum(ref_peak, eng_peak)
     move_scale = float(col_range[col_moves].max()) if col_moves.any() else 0.0
     col_moves_significant = col_moves & (col_range > SIGNIF_FLOOR * move_scale)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -238,13 +244,11 @@ def deterministic_verdict(
             0.0,
         )
     hard_move_fail = err_over_move > MOVE_CEILING
-    # A cell where both sides are below the file-scale floor is underflow here
-    # as it is for the per-cell test.
-    near_zero_cell = (colmag < zero_floor) & ~one_side_nonfinite
 
-    def _resolve(forgive_now: np.ndarray) -> dict:
+    def _resolve(forgive_now: np.ndarray) -> tuple[dict, np.ndarray]:
         """Everything downstream of ``forgive``, so the #316 counterfactual is
-        the real verdict rather than a re-derivation of it that could drift."""
+        the real verdict rather than a re-derivation of it that could drift.
+        Returns the verdict and its ``effective_fail``."""
         # The movement gate is a fail of its own, not a cell past the per-cell
         # tolerance: a column that moves by 1e-4 of its peak, frozen, is inside
         # REL_TOL of it at every point.
@@ -281,27 +285,55 @@ def deterministic_verdict(
             "scale": scale,
             # Issue #873: the worst distance from the reference over the range of
             # its column, over the significant moving columns and the cells not
-            # forgiven, and whether there is no such column at all (nothing the
-            # reference does could tell a frozen engine from a right one).
+            # forgiven, and whether there is no such column at all (nothing either
+            # side does could tell a frozen engine from a right one).
             "max_err_over_movement": float(
                 np.max(np.where(forgive_now | near_zero_cell, 0.0, err_over_move))
             )
             if err_over_move.size
             else 0.0,
-            "no_signal": not bool(col_moves_significant.any()),
-        }
+            "no_signal": not bool(col_moves.any()),
+        }, effective_fail
 
-    out = _resolve(forgive)
+    out, effective_fail = _resolve(forgive)
     if forgive_mask is not None:
         # Issue #316 — what the mask actually did, which `forgive.sum()` cannot
         # say. A cell counts as rescued only if it was failing, the mask cleared
-        # it, and nothing else would have: a one-side-non-finite cell is re-added
-        # unconditionally, and a cell the near-zero backstop or the dynamic-range
-        # gate already forgave owes the mask nothing.
-        rescued = fail_mask & forgive & ~one_side_nonfinite & ~near_zero_mask & ~below_dyn_range
-        out["n_forgive_rescued"] = int(np.sum(rescued))
-        out["passed_without_forgive"] = bool(_resolve(np.zeros_like(fail_mask))["passed"])
+        # it, and nothing else would have: the failing cells of the verdict
+        # without the mask that are not failing with it. That leaves out a
+        # one-side-non-finite cell (re-added unconditionally) and a cell the
+        # near-zero backstop or the dynamic-range gate already forgave, and takes
+        # in a cell only the movement gate failed (issue #873), which no
+        # per-gate formula over `fail_mask` would see.
+        bare, bare_fail = _resolve(np.zeros_like(fail_mask))
+        out["n_forgive_rescued"] = int(np.sum(bare_fail & ~effective_fail))
+        out["passed_without_forgive"] = bool(bare["passed"])
     return out
+
+
+def ode_row_comment(v: dict, n_sp: int) -> str:
+    """The terse row comment the rr and amici runners write for a
+    :func:`deterministic_verdict`, and their matrices' ``humanize_comment`` parse:
+    the cell tallies, the worst error over movement and, where nothing moves,
+    ``NO SIGNAL`` (issue #873). One builder, so the two suites cannot drift."""
+    return (
+        f"{n_sp} sp; fail {v['n_fail']}/{v['n_cells']} "
+        f"(hard {v['n_hard_fail']}, soft {v['n_soft_fail']}, forgiven {v['budget_forgiven']}); "
+        f"err/movement {v['max_err_over_movement']:.1e}"
+        + ("; NO SIGNAL (nothing moves in either engine)" if v["no_signal"] else "")
+    )
+
+
+def _range_and_peak(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each column's range over time and its peak magnitude, over its finite
+    cells (both 0 for a column with none)."""
+    finite = np.isfinite(x)
+    if not x.shape[0]:
+        return np.zeros(x.shape[1]), np.zeros(x.shape[1])
+    hi = np.where(finite, x, -np.inf).max(axis=0)
+    lo = np.where(finite, x, np.inf).min(axis=0)
+    peak = np.where(finite, np.abs(x), 0.0).max(axis=0)
+    return np.where(finite.any(axis=0), hi - lo, 0.0), peak
 
 
 def ensemble_k_for(n_rep: int) -> float:

@@ -269,6 +269,7 @@ _ABS_TOL_FILE = 1e-9  # absolute term scaled by the file-wide peak (sub-scale co
 _NEAR_ZERO_FLOOR_REL = 1e-12  # denom floor for the reported relative diff
 _HARD_REL_CEILING = 0.05  # a magnitude-carrying column past this is a real divergence
 _SIGNIF_FLOOR = 1e-3  # column peak below this fraction of the file peak is sub-scale
+_MOVE_CEILING = 1e-2  # error past this part of a moving column's range is a fail (#873)
 
 
 def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
@@ -281,6 +282,12 @@ def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
     file-peak) or never diverges past the relative ceiling at its own peak scale
     is forgiven, matching the #214 scale-aware verdict. A cell where exactly one
     side is non-finite is an unconditional hard fail.
+
+    The movement gate of issue #873 holds every column that moves, on either
+    side, to ``_MOVE_CEILING`` of its range over time, so a conversion that
+    freezes the dynamics (or makes a species move that the source holds still)
+    fails even where a clamped reservoir or a large baseline sets the magnitude
+    scales and the gate above forgives every moving column.
     """
     import numpy as np
 
@@ -320,7 +327,35 @@ def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
     col_is_real = (col_reldiv_peak > _HARD_REL_CEILING) & col_significant
 
     below_dyn_range = fail_mask & (~col_is_real)[np.newaxis, :] & ~one_side_nonfinite
-    effective_fail = (fail_mask & ~below_dyn_range) | one_side_nonfinite
+
+    # Movement gate (issue #873), as in differ: each column's range over time on
+    # whichever side moves more; a column moves past REL_TOL of its peak, and is
+    # significant past SIGNIF_FLOOR of the largest moving range.
+    def _range_and_peak(x):
+        fin = np.isfinite(x)
+        if not x.shape[0]:
+            return np.zeros(x.shape[1]), np.zeros(x.shape[1])
+        hi = np.where(fin, x, -np.inf).max(axis=0)
+        lo = np.where(fin, x, np.inf).min(axis=0)
+        peak = np.where(fin, np.abs(x), 0.0).max(axis=0)
+        return np.where(fin.any(axis=0), hi - lo, 0.0), peak
+
+    range_a, peak_a = _range_and_peak(a)
+    range_b, peak_b = _range_and_peak(b)
+    col_range = np.maximum(range_a, range_b)
+    col_moves = col_range > _REL_TOL * np.maximum(peak_a, peak_b)
+    move_scale = float(col_range[col_moves].max()) if col_moves.any() else 0.0
+    col_moves_sig = col_moves & (col_range > _SIGNIF_FLOOR * move_scale)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        err_over_move = np.where(
+            col_moves_sig[np.newaxis, :],
+            absd_clean / np.where(col_range > 0.0, col_range, 1.0)[np.newaxis, :],
+            0.0,
+        )
+    near_zero_cell = (colmag < zero_floor) & ~one_side_nonfinite
+    move_fail = (err_over_move > _MOVE_CEILING) & ~near_zero_cell
+
+    effective_fail = (fail_mask & ~below_dyn_range) | move_fail | one_side_nonfinite
     n_fail = int(np.sum(effective_fail))
 
     max_rel = float(np.max(reld_peak[effective_fail])) if n_fail else 0.0

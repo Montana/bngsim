@@ -23,7 +23,10 @@ deterministic_verdict
   * the movement gate (issue #873): a frozen engine, and a 4% error on one
     species, fail where a clamped reservoir, a nearly constant one or a large
     baseline sets the scale; an engine that agrees passes in each, and so does
-    0.9% of every species; a reference where nothing moves is ``no_signal``
+    0.9% of every species; a reference where nothing moves is ``no_signal``;
+    the mirror image fails too (an engine that lets a clamped species drift,
+    or makes one the reference never makes); the forgive mask still applies,
+    and the rr/amici row comment carries the gate's numbers
 
 ensemble_verdict
   * equal means pass; a sub-particle cell (one side floored to 0, the other a
@@ -77,6 +80,14 @@ def test_concentrated_relative_blowup_is_diff_despite_tiny_fraction():
     assert v["max_rel"] == pytest.approx(0.2 / 1.2, rel=1e-6)
 
 
+def _swinging(n_t=100, n_c=5):
+    """Columns that each swing between -1 and 1. A 1% relative shift is then half
+    a percent of the column's movement, inside MOVE_CEILING, so the magnitude
+    gates decide; on a flat column the movement gate would (issue #873)."""
+    t = np.linspace(0.0, 4.0 * np.pi, n_t)
+    return np.column_stack([np.sin(t + k) for k in range(n_c)])
+
+
 @pytest.mark.parametrize("n_soft", [3, 50, 300])
 def test_subceiling_column_forgiven_regardless_of_count(n_soft):
     """A column whose worst divergence is a 1% relative shift (above REL_TOL=1e-4,
@@ -88,12 +99,13 @@ def test_subceiling_column_forgiven_regardless_of_count(n_soft):
     not a divergence. (Before the gate this DIFFed once the soft fraction passed
     FAIL_FRAC_BUDGET — the behavior change this test pins.)
 
-    The 1% is on bngsim's side: the same wiggle in a reference that bngsim does
-    not follow is a frozen engine, which the movement gate fails (issue #873)."""
-    a = np.ones((100, 5))
-    b = np.ones((100, 5))
-    flat = a.reshape(-1)
-    flat[:n_soft] = 1.01  # 1% relative on a unit-magnitude column: < HARD_REL_CEILING
+    The columns move (``_swinging``): a 1% blip on a column that is flat on the
+    other side is a movement the other engine never made, which the movement
+    gate fails whichever side it is on (issue #873)."""
+    b = _swinging()
+    a = b.copy()
+    flat = b.reshape(-1)
+    flat[:n_soft] *= 1.01  # 1% relative on a unit-magnitude column: < HARD_REL_CEILING
     ok, v = _passed(a, b)
     assert ok
     assert v["n_hard_fail"] == 0
@@ -106,11 +118,13 @@ def test_budget_forgives_soft_cells_within_a_real_column():
     cell (so it is a real divergence the gate does NOT forgive) plus n soft 1%
     cells. The model DIFFs either way (the hard cell), but the budget controls
     whether the soft cells are reported as forgiven vs counted — the budget
-    bookkeeping the gate keeps. (On bngsim's side, as above.)"""
-    a = np.ones((100, 5))
-    b = np.ones((100, 5))
-    a[0, 0] = 1.10  # hard: 9.1% of col peak > HARD_REL_CEILING → column is real
-    a[1, 0] = a[2, 0] = 1.01  # 2 soft cells (2/500 = 0.004 <= FAIL_FRAC_BUDGET)
+    bookkeeping the gate keeps. (On moving columns, as above; rows 12, 37 and 62
+    are where column 0 is at +-1.)"""
+    b = _swinging()
+    a = b.copy()
+    b[12, 0] *= 1.10  # hard: 9.1% of col peak > HARD_REL_CEILING → column is real
+    b[37, 0] *= 1.01  # 2 soft cells (2/500 = 0.004 <= FAIL_FRAC_BUDGET)
+    b[62, 0] *= 1.01
     ok, v = _passed(a, b)
     assert not ok  # the hard cell DIFFs regardless
     assert v["n_hard_fail"] == 1
@@ -424,8 +438,8 @@ def test_a_four_percent_error_on_one_species_fails(shape):
 
 @pytest.mark.parametrize("shape", sorted(_MECHANISMS))
 def test_an_engine_that_agrees_passes(shape):
-    """Control. 1e-6 of each column's movement, past the worst p99 of the
-    census (4.4e-5) by nothing, passes in every shape."""
+    """Control. 1e-6 of each column's movement, well inside the census p99
+    (4.4e-5), passes in every shape."""
     ref = _trajectory(**_MECHANISMS[shape])
     span = ref.max(axis=0) - ref.min(axis=0)
     a = ref + 1e-6 * span * np.sin(np.arange(ref.shape[0]))[:, np.newaxis]
@@ -463,12 +477,78 @@ def test_the_movement_gate_is_invariant_under_positive_rescaling():
 
 
 def test_forgive_mask_forgives_a_movement_fail():
-    """The step-shift mask still applies to cells the movement gate fails."""
+    """The step-shift mask still applies to cells the movement gate fails, and
+    the #316 audit credits it with them.
+
+    The reservoir at 100 keeps the 0.02 error under the absolute ceiling (1e-2 of
+    the file peak) and the column under HARD_REL_CEILING, so the magnitude gates
+    forgive the cell and only the movement gate fails it (2% of the range).
+    Without the reservoir the cell is an absolute-ceiling breach, and the test
+    would pass on main."""
     t = np.linspace(0.0, 10.0, 101)
-    ref = np.column_stack([1.0 - np.exp(-t), np.exp(-t)])
+    ref = np.column_stack([np.full_like(t, 100.0), 1.0 - np.exp(-t)])
     a = ref.copy()
-    a[40, 0] += 0.02
-    assert not _passed(a, ref)[0]
+    a[40, 1] += 0.02
+    ok, v = _passed(a, ref)
+    assert not ok
+    assert v["n_hard_fail"] == 1
     mask = np.zeros(ref.shape, dtype=bool)
-    mask[40, 0] = True
-    assert _passed(a, ref, forgive_mask=mask)[0]
+    mask[40, 1] = True
+    ok, v = _passed(a, ref, forgive_mask=mask)
+    assert ok
+    assert v["passed_without_forgive"] is False
+    assert v["n_forgive_rescued"] == 1
+
+
+def test_an_engine_that_lets_a_clamped_species_drift_fails():
+    """The mirror of a frozen engine: the reference holds the reservoir still and
+    the engine lets it drift by 0.9% over the run. That is under HARD_REL_CEILING
+    and the absolute ceiling, so the magnitude gates forgive it, and a gate that
+    looked at the reference's movement alone would never see the column."""
+    ref = _trajectory(**_MECHANISMS["clamped"])
+    a = ref.copy()
+    a[:, 3] *= 1.0 - 0.009 * np.linspace(0.0, 1.0, ref.shape[0])
+    ok, v = _passed(a, ref)
+    assert not ok
+    assert v["max_err_over_movement"] >= 0.5
+
+
+@pytest.mark.parametrize("shape", sorted(_MECHANISMS))
+def test_an_engine_that_makes_a_species_the_reference_never_makes_fails(shape):
+    """The reference never makes the last species; the engine makes 5e5 of it,
+    under the significance bar of a 6e8 reservoir or baseline."""
+    ref = _trajectory(**_MECHANISMS[shape])
+    ref = np.column_stack([ref, np.zeros(ref.shape[0])])
+    a = ref.copy()
+    a[:, -1] = 5e5 * (1.0 - np.exp(-np.linspace(0.0, 12.0, ref.shape[0])))
+    ok, v = _passed(a, ref)
+    assert not ok
+    assert v["max_err_over_movement"] >= 0.5
+
+
+def test_nothing_moving_on_either_side_is_no_signal_but_still_judged():
+    """``no_signal`` says the verdict could not see dynamics, not that it passed:
+    two flat trajectories 10% apart still DIFF."""
+    ref = np.tile([6.022e8, 6.022e5, 100.0], (50, 1))
+    a = ref.copy()
+    a[:, 1] *= 1.10
+    ok, v = _passed(a, ref)
+    assert not ok
+    assert v["no_signal"]
+
+
+@pytest.mark.parametrize("module", ["rr_run", "amici_run"])
+def test_the_rr_and_amici_rows_carry_the_movement_numbers(module):
+    """Both runners write ``differ.ode_row_comment``, so the amici rows say NO
+    SIGNAL too (the matrices' humanize_comment reads it there)."""
+    runner = pytest.importorskip(module)
+    t = np.linspace(0.0, 10.0, 11)
+    names = ["A", "B"]
+    flat = np.tile([5.0, 7.0], (t.size, 1))
+    comment = runner._compare_ode((t, flat, names), (t, flat.copy(), names))[2]
+    assert comment.startswith("2 sp; fail 0/22 (hard 0, soft 0, forgiven 0); err/movement")
+    assert "NO SIGNAL" in comment
+    moving = np.column_stack([np.exp(-t), 1.0 - np.exp(-t)])
+    comment = runner._compare_ode((t, moving, names), (t, moving.copy(), names))[2]
+    assert "err/movement 0.0e+00" in comment
+    assert "NO SIGNAL" not in comment
