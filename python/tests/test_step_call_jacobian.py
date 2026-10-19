@@ -53,8 +53,12 @@ SBML = """<?xml version="1.0" encoding="UTF-8"?>
   <listOfParameters><parameter id="kx" value="1" constant="true"/></listOfParameters>
   <listOfReactions>
    <reaction id="r2" reversible="false">
-    <listOfReactants><speciesReference species="X" stoichiometry="1" constant="true"/></listOfReactants>
-    <listOfProducts><speciesReference species="Y" stoichiometry="1" constant="true"/></listOfProducts>
+    <listOfReactants>
+     <speciesReference species="X" stoichiometry="1" constant="true"/>
+    </listOfReactants>
+    <listOfProducts>
+     <speciesReference species="Y" stoichiometry="1" constant="true"/>
+    </listOfProducts>
     <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
      <apply><times/><ci>c</ci><ci>kx</ci><ci>X</ci>
       <apply><ceiling/><apply><times/><ci>X</ci><cn>0.4</cn></apply></apply><cn>0.01</cn>
