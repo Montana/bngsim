@@ -8208,7 +8208,10 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "Forward sensitivity: %s, so the analytic sensitivity RHS is declined for "
         "this model and CVODES' internal difference quotient is used instead "
         "(correct, but slower, where every rate law is continuous in the state along "
-        "the run. A time course is refused for the jumps that are found in the rate "
+        "the run, though a column can still be wrong where a min(), max(), abs() or "
+        "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
+        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
+        "for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,

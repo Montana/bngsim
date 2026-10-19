@@ -2732,7 +2732,9 @@ class Simulator:
         returned Y = 0 with its columns, while the plain run, which roots it,
         was right. The pulse is continuous, so no rate law is listed for these
         and the solver jumps none of them. A surface a condition above already
-        roots is not added again.
+        roots is not added again. A bend has no analytic sensitivity RHS, so
+        the columns are CVODES' difference quotient, which can still read a
+        narrow one wrong (issue #1126).
 
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
@@ -2761,13 +2763,16 @@ class Simulator:
             )
             return
         stops: list[str] = []
-        if model is not None and covered is not None:
+        calls = (
+            () if model is None or covered is None else model._state_switch_stops_beside(covered)
+        )
+        if calls:
             jumped = set()
             for cond in conditions:
                 residual = state_switch_residual(core, cond)
                 if residual:
                     jumped.add(_surface_key(residual))
-            for atom in model._state_switch_stops_beside(covered):
+            for atom in calls:
                 residual = state_switch_residual(core, atom)
                 if residual and _surface_key(residual) not in jumped:
                     stops.append(atom)

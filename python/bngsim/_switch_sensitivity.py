@@ -5226,7 +5226,8 @@ def _turn_atoms(call: str) -> list[str]:
         if name in ("inrange", "clamp"):
             return [f"({x})<({lo})", f"({x})<({hi})"]
         if name == "iclamp":
-            return [f"({x})<(({lo})+({hi}))/2"]
+            # It bends at both bounds and jumps at the midpoint between them.
+            return [f"({x})<({lo})", f"({x})<({hi})", f"({x})<(({lo})+({hi}))/2"]
     if name in ("min", "max") and len(args) >= 2:
         return [f"({a})<({b})" for i, a in enumerate(args) for b in args[i + 1 :]]
     return []

@@ -166,8 +166,8 @@ def run_diffrax(
     state_switches = model.state_switch_root_conditions()
     if state_switches:
         raise ValueError(
-            "run_diffrax does not integrate a rate law that switches or bends on the model's "
-            "state (a comparison, or a step or bend call such as floor(), max() or abs()), "
+            "run_diffrax does not integrate a rate law that switches on the model's state, "
+            "with a comparison or a step or bend call such as floor(), max() or abs(), "
             "whose switch times are not known before the run, and this model has "
             f"{list(state_switches)}; use Simulator(method='ode')."
         )

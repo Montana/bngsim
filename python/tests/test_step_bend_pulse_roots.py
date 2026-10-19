@@ -61,8 +61,11 @@ PULSES = {
     "round": ("100*(round((Tobs-50)/100+0.5)-round((Tobs-50.01)/100+0.5))", 1.0),
     "trunc": ("100*(trunc((Tobs-50)/100+1)-trunc((Tobs-50.01)/100+1))", 1.0),
     "clamp triangle": ("100*(clamp(0,(Tobs-50)/0.01,1)-clamp(0,(Tobs-50.01)/0.01,1))", 1.0),
+    # x outside [50, 50.01], a bound inside it: a jump at 50.005 and bends at both ends.
+    "iclamp": ("1e6*(iclamp(50,Tobs,50.01)-Tobs)^2", 2e6 * 0.005**3 / 3),
 }
-# The pulses made of bends alone, which have an analytic sensitivity RHS.
+# The pulses made of bends alone, which a run with sensitivities accepts. They
+# have no analytic sensitivity RHS, so it runs on CVODES' difference quotient.
 BENDS = ["max-abs triangle", "min-max triangle", "clamp triangle"]
 
 
@@ -99,6 +102,7 @@ def test_the_turns_of_each_call():
     assert _turn_atoms("mod(a, b)") == [f"sin({pi}*(a)/(b))<0"]
     assert _turn_atoms("sgn(u)") == ["(u)<0"]
     assert _turn_atoms("clamp(lo,x,hi)") == ["(x)<(lo)", "(x)<(hi)"]
+    assert _turn_atoms("iclamp(lo,x,hi)") == ["(x)<(lo)", "(x)<(hi)", "(x)<((lo)+(hi))/2"]
     assert _turn_atoms("max(a,b,c)") == ["(a)<(b)", "(a)<(c)", "(b)<(c)"]
     assert _turn_atoms("floor(a,b)") == []
 
@@ -125,6 +129,21 @@ def test_a_sensitivity_run_does_not_step_over_a_bend_pulse(tmp_path, name, k):
     dy = float(np.asarray(run.sensitivities)[-1, 2, 0])
     assert y == pytest.approx(10 * (1 - np.exp(-area / k)), rel=1e-5)
     assert dy == pytest.approx(10 * (area / k) * np.exp(-area / k), rel=1e-4)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="issue #1126: a bend has no analytic sensitivity RHS, and the difference "
+    "quotient reads the clock-rate column of a narrow pulse wrong (-1.18 for -0.97)",
+)
+def test_the_clock_rate_column_of_a_bend_pulse(tmp_path):
+    law, area = PULSES["max-abs triangle"]
+    run = bngsim.Simulator(
+        _model(tmp_path, law, 2.0), method="ode", sensitivity_params=["kx", "k_clock"]
+    ).run(t_span=(0.0, 30.0), n_points=3)
+    dy = float(np.asarray(run.sensitivities)[-1, 2, 1])
+    assert dy == pytest.approx(-10 * (area / 4) * np.exp(-area / 2), rel=1e-4)
 
 
 @pytest.mark.parametrize("sens", [None, ["kx"]])
