@@ -63,6 +63,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace bngsim {
@@ -371,6 +372,12 @@ struct SteadyStateUserData {
     // first one here and returns the unrecoverable-failure code, and the solve
     // rethrows it once CVode()/KINSol() has returned.
     std::exception_ptr callback_error;
+    // The residuals of the rate-law conditions over model state the march roots
+    // (issue #904), as expression indices. Null where it roots none.
+    const std::vector<int> *state_switch_roots = nullptr;
+    // The SBML loader's discontinuity triggers (GH #72), boolean conditions
+    // rooted as `condition - 0.5` ahead of the residuals, as run() roots them.
+    const std::vector<int> *discontinuity_roots = nullptr;
 };
 
 // CVODE's error-weight callback for the tracking absolute tolerance (issue
@@ -816,6 +823,39 @@ static int cvode_ss_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatri
 }
 #endif // BNGSIM_HAS_KLU
 
+// The march's root function (issue #904): the SBML loader's discontinuity
+// triggers and then the residuals of the rate-law conditions over model state,
+// read as run()'s root function reads them. The
+// state goes to the observables and the functions and not to the species,
+// whose values the solve reads afterwards as where it started (the Newton seed,
+// the conservation totals).
+static int cvode_ss_root_fn(sunrealtype t, N_Vector y, sunrealtype *gout, void *user_data) {
+    return guard_ss_callback<SteadyStateUserData>(user_data, [&] {
+        auto *ud = static_cast<SteadyStateUserData *>(user_data);
+        NetworkModel *mdl = ud->model;
+        const double *y_ptr = N_VGetArrayPointer(y);
+        mdl->update_observables(y_ptr);
+        mdl->evaluate_functions(static_cast<double>(t));
+        if (mdl->uses_rateof()) {
+            mdl->refresh_rateof_derivs(static_cast<double>(t), y_ptr);
+            mdl->evaluate_functions(static_cast<double>(t));
+        }
+        auto &eval = mdl->evaluator();
+        std::size_t k = 0;
+        if (ud->discontinuity_roots != nullptr) {
+            for (int idx : *ud->discontinuity_roots) {
+                gout[k++] = eval.evaluate(idx) - 0.5;
+            }
+        }
+        if (ud->state_switch_roots != nullptr) {
+            for (int idx : *ud->state_switch_roots) {
+                gout[k++] = eval.evaluate(idx);
+            }
+        }
+        return 0;
+    });
+}
+
 // A CVODE session held across successive marches of the SAME trajectory.
 //
 // The two-tier solver's burst ladder (solve_by_newton_two_tier) walks one
@@ -845,6 +885,13 @@ class SteadyStateMarcher {
     // drifting in the last bits would read as progress and the capture would
     // never be recognized.
     static constexpr double STAGNATION_RTOL = 1e-3;
+
+    // How many crossings of a rate-law condition one session restarts on
+    // (issue #904) before it roots them no more. A state that slides along a
+    // threshold, its rate switching on one side and off the other, crosses it
+    // every few steps for as long as the march lasts; past this many it is
+    // marched as it was before roots, over the switch.
+    static constexpr int MAX_ROOT_RESTARTS = 1000;
 
     SteadyStateMarcher(NetworkModel &model, SteadyStateRhs &rhs, const SteadyStateOptions &opts,
                        const ResidualSubspace &sub)
@@ -881,6 +928,41 @@ class SteadyStateMarcher {
         CVodeSetMaxNumSteps(cvode_mem_, opts.max_steps);
 
         setup_linear_solver(model, rhs, opts);
+
+        // Issue #904: a rate law switched by a condition over model state is
+        // constant on each side of its switch, so a step across a narrow window
+        // reads it as off at both ends and the window is lost, as it was in
+        // run() before #897. Root each residual, once per crossing (`X<1` and
+        // `X<=1` are one). An SBML model's conditions come as the loader's
+        // discontinuity triggers instead (GH #72), which run() roots as well;
+        // they are rooted here too, or a piecewise window in a kinetic law is
+        // still stepped over on the way to the steady state.
+        discontinuity_roots_ = model.discontinuity_triggers();
+        std::unordered_set<std::string> crossings;
+        for (const std::string &condition : opts.state_switch_conditions) {
+            const NetworkModel::StateSwitch *sw = model.state_switch(condition);
+            if (sw != nullptr && crossings.insert(sw->residual_source).second) {
+                state_switch_roots_.push_back(sw->residual_expr_idx);
+            }
+        }
+        const std::size_t n_roots = discontinuity_roots_.size() + state_switch_roots_.size();
+        if (n_roots > 0) {
+            ud_.discontinuity_roots = &discontinuity_roots_;
+            ud_.state_switch_roots = &state_switch_roots_;
+            if (CVodeRootInit(cvode_mem_, static_cast<int>(n_roots), cvode_ss_root_fn) !=
+                CV_SUCCESS) {
+                throw std::runtime_error("CVodeRootInit failed (steady_state)");
+            }
+            // As run() does for the same roots (register_roots): a residual at
+            // exactly zero from the start (`P > 0` over a species that starts at
+            // 0) draws a benign "some root functions identically 0" warning, on
+            // every solve. This context's warnings go to the null sink; errors
+            // still come back as flags.
+            SUNLogger logger = nullptr;
+            if (SUNContext_GetLogger(ctx_, &logger) == SUN_SUCCESS && logger != nullptr) {
+                SUNLogger_SetWarningFilename(logger, bngsim::null_device);
+            }
+        }
     }
 
     // March forward one internal CVODE step at a time, checking the BNG2.pl
@@ -962,6 +1044,17 @@ class SteadyStateMarcher {
                 // Exhausted this march's time budget without converging.
                 break;
             }
+            if (flag == CV_ROOT_RETURN) {
+                // A rate-law condition crossed (issue #904): start again on the
+                // root, as run() does on one, so the steps after it read the
+                // law on its new side and not a history across the switch.
+                if (!restart_on_root(resid)) {
+                    integrator_failed_ = true;
+                    break;
+                }
+                CVodeSetStopTime(cvode_mem_, t_stop);
+                continue;
+            }
             if (step_budget_ >= 0 && ++steps_taken_ >= step_budget_) {
                 // A run that is taken on (take_on_for): out of steps.
                 break;
@@ -973,6 +1066,7 @@ class SteadyStateMarcher {
             } else if (++stagnant >= STAGNATION_STEPS) {
                 stagnant = 0;
                 if (++reinits > MAX_REINITS && step_budget_ < 0) {
+                    stalled_ = true;
                     // Escaped as often as it is worth escaping and still not
                     // settling: this is the model, not the history. Stop here
                     // rather than spend the rest of the budget confirming it.
@@ -1002,6 +1096,21 @@ class SteadyStateMarcher {
 
         if (!converged) {
             *residual_out = compute_residual(rhs_, y_data, ns_, sub_);
+            // Marched over a switch the state slides along (past
+            // MAX_ROOT_RESTARTS) and ended further from a steady state than
+            // where it stopped rooting: BDF with a history across the switch
+            // can run away there: an SBML slide, held at S = 0.5 by its flow
+            // from both sides, came back at S = 253 under jacobian="fd" and
+            // rtol 1e-8, a value its flow (at most 2) cannot reach. Neither is
+            // a steady state; return the state where it stopped rooting,
+            // which is where the flow holds it.
+            if (roots_dropped_ && step_budget_ < 0 && !(*residual_out <= dropped_residual_)) {
+                std::copy(dropped_at_.begin(), dropped_at_.end(), y_data);
+                *residual_out = dropped_residual_;
+                if (CVodeReInit(cvode_mem_, t_, y_) != CV_SUCCESS) {
+                    integrator_failed_ = true;
+                }
+            }
         }
         return converged;
     }
@@ -1029,12 +1138,24 @@ class SteadyStateMarcher {
         CVodeGetNumRhsEvals(cvode_mem_, &nfe);
         result.n_steps = static_cast<int>(nst + steps_before_reinit_);
         result.n_rhs_evals = static_cast<int>(nfe + rhs_evals_before_reinit_);
+        result.n_state_switch_roots = root_restarts_;
+        result.state_switch_roots_dropped = roots_dropped_;
         return result;
     }
 
     // Did CVODE give up on a march (any negative flag), as opposed to running
     // out of this march's time budget? Sticky across the ladder's rungs.
-    bool integrator_failed() const { return integrator_failed_; }
+    //
+    // A march that rooted a crossing (issue #904) and then stopped settling
+    // counts as one. l-type-calcium-channel-dynamics' `if((-70+V)<-20, ...)`
+    // failed the error test at hmin with the closed-form Jacobian, which is
+    // what calls that Jacobian off for a difference quotient (GH #176, issue
+    // #127). Restarted on the crossing, the same march no longer fails there;
+    // it is captured after it, and without this it returned unconverged
+    // where the retry converges.
+    bool integrator_failed() const {
+        return integrator_failed_ || (stalled_ && root_restarts_ > 0);
+    }
 
     // The time this session's marches have reached.
     double time() const { return static_cast<double>(t_); }
@@ -1076,10 +1197,34 @@ class SteadyStateMarcher {
             return false;
         }
         integrator_failed_ = false;
+        stalled_ = false;
         return true;
     }
 
   private:
+    // Restart on a root the march returned at (issue #904), or, past
+    // MAX_ROOT_RESTARTS of them, root no more and go on as the march went
+    // before it rooted anything: with its history, over the switch. A fresh
+    // start on a threshold the state slides along is what the history spares
+    // it; one failed the corrector at hmin there. The state and residual
+    // where it stops rooting are kept, for a march that then ends further
+    // from a steady state than that (see the end of march()).
+    bool restart_on_root(double residual) {
+        if (++root_restarts_ > MAX_ROOT_RESTARTS) {
+            roots_dropped_ = true;
+            const double *y_data = y_.data();
+            dropped_at_.assign(y_data, y_data + ns_);
+            dropped_residual_ = residual;
+            return CVodeRootInit(cvode_mem_, 0, nullptr) == CV_SUCCESS;
+        }
+        long int nst = 0, nfe = 0;
+        CVodeGetNumSteps(cvode_mem_, &nst);
+        CVodeGetNumRhsEvals(cvode_mem_, &nfe);
+        steps_before_reinit_ += nst;
+        rhs_evals_before_reinit_ += nfe;
+        return CVodeReInit(cvode_mem_, t_, y_) == CV_SUCCESS;
+    }
+
     // The Newton matrix and the solver that factors it.
     //
     // Two decisions, taken the way CvodeSimulator::run takes them:
@@ -1169,6 +1314,17 @@ class SteadyStateMarcher {
     long int rhs_evals_before_reinit_ = 0;
     long step_budget_ = -1; // of a run that is taken on; none for a solve
     long steps_taken_ = 0;
+    // The discontinuity triggers and residuals the march roots (issue #904),
+    // which ud_ points at, and the crossings it restarted on.
+    std::vector<int> discontinuity_roots_;
+    std::vector<int> state_switch_roots_;
+    int root_restarts_ = 0;
+    bool roots_dropped_ = false;
+    // The state, and its residual, where the march stopped rooting.
+    std::vector<double> dropped_at_;
+    double dropped_residual_ = 0.0;
+    // A march stopped for not settling after its stagnation escapes.
+    bool stalled_ = false;
 };
 
 static SteadyStateResult solve_by_integration(NetworkModel &model, SteadyStateRhs &rhs,
@@ -4593,6 +4749,27 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // side read at t = 0, and fire no event. A model that reads the time has no
     // f(y) = 0 without a time being chosen, and an event needs a trajectory:
     // `k*(1 - exp(-time()))` came back at its initial state as converged.
+    //
+    // A compartment size that jumps (issue #1054) keeps its species' amounts
+    // through an event the loader adds, which is no event of the model's own,
+    // so it is named for what it is.
+    bool own_event = false;
+    std::string jumps;
+    for (const auto &ev : model.events()) {
+        if (ev.size_jump_compartment.empty()) {
+            own_event = true;
+        } else if (jumps.empty()) {
+            jumps = ev.size_jump_compartment;
+        }
+    }
+    if (!own_event && !jumps.empty()) {
+        throw std::runtime_error(
+            "Cannot find steady state: the size of compartment '" + jumps +
+            "', which an assignment rule sets, jumps where a piecewise the rule reads switches, "
+            "and the amounts in it are kept there by a rescale of their concentrations that the "
+            "steady-state solvers never make (issue #1054, issue #710). Integrate it with "
+            "run().");
+    }
     if (model.n_events() > 0 || model.functions_use_time()) {
         throw std::runtime_error(
             "Cannot find steady state: the model has an event or reads the time, and the "
