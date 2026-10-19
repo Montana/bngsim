@@ -7,6 +7,11 @@ docs/_build/
 # Python bytecode caches
 __pycache__/
 
+# pytest's cache, with the suite's artifact caches inside it. pytest ignores its
+# directory through a .gitignore it writes only when it creates the directory,
+# and the pre-push hook can create it first (ci/pre_push_pytest.py).
+.pytest_cache/
+
 # macOS
 .DS_Store
 

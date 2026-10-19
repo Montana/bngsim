@@ -569,10 +569,9 @@ def test_rateof_hosu_amount_rate_as_output(codegen):
 def test_rateof_hosu_variable_volume_amount_scaled():
     """A hOSU=true species in a VARIABLE-volume rate-ruled compartment IS flagged
     for the amount scaling (01463): the engine stores amount/V_static, so
-    ×volume_factor recovers d(amount)/dt with no conc·V̇ term. Pins the gate — both
-    the constant-volume and the rate-ruled-compartment hOSU species carry
-    report_rateof_amount; an AR-compartment hOSU species (whose volume is a rule
-    function, not an integrator state) does not."""
+    ×volume_factor recovers d(amount)/dt with no conc·V̇ term. Pins the gate — the
+    constant-volume, the rate-ruled-compartment and the AR-compartment hOSU species
+    all carry report_rateof_amount: each is stored as amount/V_static (issue #736)."""
     body = """
   <model id="m">
     <listOfCompartments>
@@ -600,7 +599,7 @@ def test_rateof_hosu_variable_volume_amount_scaled():
     flags = {s["name"]: s["report_rateof_amount"] for s in model._core.codegen_data()["species"]}
     assert flags["Ac"] is True  # constant-volume hOSU ⇒ amount-scaled
     assert flags["Av"] is True  # rate-ruled variable-volume hOSU ⇒ amount-scaled (01463)
-    assert flags.get("Aa") is False  # AR-compartment hOSU ⇒ left unscaled (not a state)
+    assert flags["Aa"] is True  # AR-compartment hOSU ⇒ amount-scaled too (#736)
 
 
 def test_rateof_hosu_variable_volume_amount_rate_value():
@@ -695,6 +694,47 @@ def test_rateof_in_initial_assignment_reaction_species():
     reac = bngsim.Model.from_sbml_string(_sbml(_model(False)))
     assert prod.get_param("p2") == pytest.approx(1.0)  # product ⇒ +rate
     assert reac.get_param("p2") == pytest.approx(-1.0)  # reactant ⇒ -rate
+
+
+@pytest.mark.parametrize("on", ["species", "model"])
+def test_rateof_in_initial_assignment_scales_by_the_conversion_factor(on, caplog):
+    """S's conversionFactor cf = 2 doubles the change the reaction makes to it, so
+    ``p2 = rateOf(S)`` folds to -cf*k*S = -1, the value the rule ``p3 :=
+    rateOf(S)`` has at t = 0 and RoadRunner gives both. The fold left the factor
+    out and gave -0.5, and the #313 warning, which names what the fold froze, left
+    out ``cf``."""
+    species_cf = ' conversionFactor="cf"' if on == "species" else ""
+    model_cf = ' conversionFactor="cf"' if on == "model" else ""
+    rate_of_s = (
+        '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+        f"<apply>{_RATEOF_CSYMBOL}<ci>S</ci></apply></math>"
+    )
+    body = f"""
+  <model id="m"{model_cf}>
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialConcentration="1" hasOnlySubstanceUnits="false"
+               boundaryCondition="false" constant="false"{species_cf}/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="cf" value="2" constant="true"/>
+      <parameter id="k" value="0.5" constant="true"/>
+      <parameter id="p2" constant="true"/>
+      <parameter id="p3" constant="false"/>
+    </listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="p2">{rate_of_s}</initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules><assignmentRule variable="p3">{rate_of_s}</assignmentRule></listOfRules>
+    <listOfReactions>{_decay_reaction("S")}</listOfReactions>
+  </model>"""
+    with caplog.at_level("WARNING", logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(_sbml(body))
+    assert model.get_param("p2") == pytest.approx(-1.0)
+    assert "cf" in (_frozen_warning(caplog) or "").split(", ")
+    p3 = _read_value(_run(model, t_end=1.0, n_points=2), "p3")
+    assert p3 is not None
+    assert p3[0] == pytest.approx(-1.0)
 
 
 # ─── Issue #1045: rateOf of a parameter no rule changes, in an initial value ───
@@ -1336,3 +1376,272 @@ def test_rateof_event_trigger_fires_robustly_across_atol():
         assert p2[-1] == pytest.approx(5.0), f"event never fired at atol={atol}"
         fire_t = t[int(np.argmax(p2 < 7.5))]
         assert fire_t == pytest.approx(t_cross, abs=3 * (t[1] - t[0])), f"atol={atol}"
+
+
+# ── Issue #738: rateOf folded into an initialAssignment ─────────────────────
+
+_MATHML = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+_S1_TO_S2 = (
+    '<reaction id="J0" reversible="false"><listOfReactants>'
+    '<speciesReference species="S1" stoichiometry="1" constant="true"/></listOfReactants>'
+    '<listOfProducts><speciesReference species="S2" stoichiometry="1" constant="true"/>'
+    f"</listOfProducts><kineticLaw><math {_MATHML}><apply><times/><cn>0.1</cn><ci>S1</ci>"
+    "</apply></math></kineticLaw></reaction>"
+)
+
+
+def _conc_species(
+    sid: str, conc: float, extra: str = "", *, boundary: str = "false", constant: str = "false"
+) -> str:
+    return (
+        f'<species id="{sid}" compartment="C" initialConcentration="{conc}" '
+        f'hasOnlySubstanceUnits="false" boundaryCondition="{boundary}" '
+        f'constant="{constant}"{extra}/>'
+    )
+
+
+def _folded(*, comp, species, rxns, params="", rules="", model_attr="", feed=False) -> str:
+    """P0 := rateOf(S1) as an initialAssignment; with *feed*, Y' = P0 as well."""
+    ia_math = f"<math {_MATHML}><apply>{_RATEOF_CSYMBOL}<ci>S1</ci></apply></math>"
+    if feed:
+        params += '<parameter id="Y" value="0" constant="false"/>'
+        rules += f'<rateRule variable="Y"><math {_MATHML}><ci>P0</ci></math></rateRule>'
+    return _sbml(f"""
+  <model id="m"{model_attr}>
+    <listOfCompartments>{comp}</listOfCompartments>
+    <listOfSpecies>{species}</listOfSpecies>
+    <listOfParameters>{params}<parameter id="P0" value="0" constant="true"/></listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="P0">{ia_math}</initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules>{rules}</listOfRules>
+    <listOfReactions>{rxns}</listOfReactions>
+  </model>""")
+
+
+_UNIT_C = '<compartment id="C" size="1" constant="true"/>'
+_CF = '<parameter id="cf" value="2" constant="true"/>'
+_GROWING_C = '<compartment id="C" size="2" constant="false"/>'
+_GROWS = f'<rateRule variable="C"><math {_MATHML}><cn>0.5</cn></math></rateRule>'
+
+_FOLDS = {
+    # 01405 with its rule an initialAssignment: 2 * (-0.1 * 5)
+    "species conversionFactor": (
+        dict(
+            comp=_UNIT_C,
+            species=_conc_species("S1", 5, ' conversionFactor="cf"') + _conc_species("S2", 5),
+            params=_CF,
+            rxns=_S1_TO_S2,
+        ),
+        -1.0,
+    ),
+    "model conversionFactor": (
+        dict(
+            comp=_UNIT_C,
+            species=_conc_species("S1", 5) + _conc_species("S2", 5),
+            params=_CF,
+            rxns=_S1_TO_S2,
+            model_attr=' conversionFactor="cf"',
+        ),
+        -1.0,
+    ),
+    # 01822 with its rule an initialAssignment: 2/2 - 1.3 * 0.5/2
+    "rate-ruled compartment": (
+        dict(
+            comp=_GROWING_C,
+            species=_conc_species("S1", 1.3),
+            rules=_GROWS,
+            rxns=(
+                '<reaction id="J0" reversible="false"><listOfProducts>'
+                '<speciesReference species="S1" stoichiometry="1" constant="true"/>'
+                f"</listOfProducts><kineticLaw><math {_MATHML}><cn>2</cn></math>"
+                "</kineticLaw></reaction>"
+            ),
+        ),
+        0.675,
+    ),
+    # Reactions do not move a boundary or constant species, so its amount holds
+    # as the size grows (01117/01118) and its concentration falls: -1.3 * 0.5/2.
+    "boundary species in a rate-ruled compartment": (
+        dict(
+            comp=_GROWING_C,
+            species=_conc_species("S1", 1.3, boundary="true") + _conc_species("S2", 0),
+            rules=_GROWS,
+            rxns=_S1_TO_S2,
+        ),
+        -0.325,
+    ),
+    "constant species in a rate-ruled compartment": (
+        dict(
+            comp=_GROWING_C,
+            species=_conc_species("S1", 1.3, constant="true"),
+            rules=_GROWS,
+            rxns="",
+        ),
+        -0.325,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_FOLDS))
+def test_rateof_folded_into_an_initial_assignment_is_the_t0_rate(case):
+    """Issue #738: the fold read neither conversion factor (-0.5 for -1) nor the
+    -[S]·V'/V dilution of a rate-ruled compartment (1 for 0.675, and 0 for
+    -0.325 where the species is boundary or constant). The values are the SBML
+    suite's t = 0 rateOf for 01405 and 01822, and for the held species the run's
+    own rateOf, the slope of its [S1] = 2.6/(2 + 0.5·t). RoadRunner reports 0
+    for those, though its own [S1] falls at that rate."""
+    kw, want = _FOLDS[case]
+    model = bngsim.Model.from_sbml_string(_folded(**kw))
+    assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
+
+
+def test_a_folded_rateof_feeds_a_rate_rule_with_its_conversion_factor():
+    """The folded value is baked in at load: Y' = P0 integrates it."""
+    kw, want = _FOLDS["species conversionFactor"]
+    model = bngsim.Model.from_sbml_string(_folded(**kw, feed=True))
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, 1.0), n_points=2, rtol=1e-10, atol=1e-12
+    )
+    names = [*run.observable_names, *run.expression_names]
+    values = np.hstack([np.asarray(run.observables), np.asarray(run.expressions)])
+    assert values[-1, names.index("Y")] == pytest.approx(want, rel=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [("J0: -> S1; 2", 0.675), ("$S1 = s0", -0.325)],
+    ids=["reaction", "boundary"],
+)
+def test_a_folded_dilution_freezes_the_size_rate_and_the_value_it_read(source, want):
+    """The dilution term reads the compartment's rate rule and the species'
+    own value: under ``C' = g`` and ``S1 = s0`` a write to ``g`` or ``s0`` was
+    taken and left ``P0`` where it was (0.675, where a rebuild after ``g = 1``
+    gives 0.35), so both are refused like the kinetic laws' parameters."""
+    model = bngsim.Model.from_antimony_string(
+        "g = 0.5; s0 = 1.3; compartment C = 2; C' = g; species S1 in C; S1 = s0\n"
+        f"{source}\nP0 = rateOf(S1); const P0\n"
+    )
+    assert model.get_param("P0") == pytest.approx(want, rel=1e-12)
+    assert sorted(model.frozen_params) == ["g", "s0"]
+    with pytest.raises(bngsim.ParameterError, match="initial value of 'P0'"):
+        model.set_param("g", 1.0)
+
+
+@pytest.mark.parametrize("global_k", ["", '<parameter id="k" value="100"/>'])
+def test_a_folded_rateof_reads_a_level_2_kinetic_law_local_parameter(global_k):
+    """Issue #738's third gap: libsbml lists an L2 law's local parameters only
+    under getParameter, and a fold that asked getNumLocalParameters alone read a
+    global k = 100 (-100) or none (NaN) for the local k = 3. Closed by #580's
+    level-aware helper; this pins the rateOf fold through it: -3 * [S] with [S] = 1."""
+    doc = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+  <model id="m">
+    <listOfFunctionDefinitions>
+      <functionDefinition id="rateOf">
+        <math {_MATHML}><lambda><bvar><ci>a</ci></bvar><notanumber/></lambda></math>
+      </functionDefinition>
+    </listOfFunctionDefinitions>
+    <listOfCompartments><compartment id="c" size="1"/></listOfCompartments>
+    <listOfSpecies><species id="S" compartment="c" initialConcentration="1"/></listOfSpecies>
+    <listOfParameters>{global_k}<parameter id="p" value="0"/></listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="p">
+        <math {_MATHML}><apply><ci>rateOf</ci><ci>S</ci></apply></math>
+      </initialAssignment>
+    </listOfInitialAssignments>
+    <listOfReactions>
+      <reaction id="R" reversible="false">
+        <listOfReactants><speciesReference species="S"/></listOfReactants>
+        <kineticLaw>
+          <math {_MATHML}><apply><times/><ci>k</ci><ci>S</ci></apply></math>
+          <listOfParameters><parameter id="k" value="3"/></listOfParameters>
+        </kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>"""
+    assert bngsim.Model.from_sbml_string(doc).get_param("p") == pytest.approx(-3.0, rel=1e-12)
+
+
+_M = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+_RATEOF = (
+    '<csymbol encoding="text" '
+    'definitionURL="http://www.sbml.org/sbml/symbols/rateOf">rateOf</csymbol>'
+)
+_TIME = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+_DECAY_BY_REACTION = f"""
+    <listOfReactions>
+      <reaction id="d" reversible="false">
+        <listOfReactants><speciesReference species="H" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <kineticLaw><math {_M}><apply><times/><ci>k</ci><ci>H</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>"""
+_DECAY_BY_RATE_RULE = (
+    f'<rateRule variable="H"><math {_M}><apply><times/><cn>-1</cn><ci>k</ci><ci>H</ci>'
+    "</apply></math></rateRule>"
+)
+
+
+def _hosu_in_ar_compartment(size_rule: str, driver: str) -> str:
+    """H (hOSU, amount 6) decaying at 0.2*H in C, a compartment of size 3 an
+    assignment rule sets; R := rateOf(H), Z' = rateOf(H), P := rateOf(H) at t = 0.
+    The decay is a reaction or H's own rate rule: each divides by the size its
+    own way, and both store H as amount/V_static."""
+    reactions = _DECAY_BY_REACTION if driver == "reaction" else ""
+    h_rule = _DECAY_BY_RATE_RULE if driver == "rate rule" else ""
+    return _sbml(f"""
+  <model id="m">
+    <listOfCompartments><compartment id="C" size="3" constant="false"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="H" compartment="C" initialAmount="6" hasOnlySubstanceUnits="true"
+               boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="k" value="0.2" constant="true"/>
+      <parameter id="R" value="0" constant="false"/>
+      <parameter id="Z" value="0" constant="false"/>
+      <parameter id="P" value="0" constant="true"/>
+    </listOfParameters>
+    <listOfInitialAssignments>
+      <initialAssignment symbol="P"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math>
+      </initialAssignment>
+    </listOfInitialAssignments>
+    <listOfRules>
+      <assignmentRule variable="C"><math {_M}>{size_rule}</math></assignmentRule>
+      <assignmentRule variable="R"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math>
+      </assignmentRule>
+      <rateRule variable="Z"><math {_M}><apply>{_RATEOF}<ci>H</ci></apply></math></rateRule>
+      {h_rule}
+    </listOfRules>{reactions}
+  </model>""")
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("driver", ["reaction", "rate rule"])
+@pytest.mark.parametrize(
+    "size_rule",
+    ["<cn>3</cn>", f"<apply><plus/><cn>3</cn><apply><times/><cn>0.5</cn>{_TIME}</apply></apply>"],
+    ids=["constant", "time-varying"],
+)
+def test_rateof_hosu_in_an_ar_compartment_is_the_amount_rate(size_rule, driver, codegen):
+    """Issue #736: H is an amount, H = 6 exp(-0.2 t) whatever C is, so rateOf(H)
+    is -0.2 H and Z = H - 6. Unscaled, R was a third of that (V_static = 3) and Z
+    integrated the third. The load-time fold of the same rateOf, P, agreed with
+    the closed form already and still does."""
+    model = bngsim.Model.from_sbml_string(_hosu_in_ar_compartment(size_rule, driver))
+    assert model.get_param("P") == pytest.approx(-1.2, rel=1e-12)
+    run = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0.0, 5.0), n_points=6, rtol=1e-10, atol=1e-12
+    )
+    names = [*run.observable_names, *run.expression_names]
+    values = np.hstack([np.asarray(run.observables), np.asarray(run.expressions)])
+    t = np.asarray(run.time)
+    h = 6.0 * np.exp(-0.2 * t)
+    np.testing.assert_allclose(values[:, names.index("R")], -0.2 * h, rtol=1e-7)
+    np.testing.assert_allclose(values[:, names.index("Z")], h - 6.0, rtol=1e-7, atol=1e-9)

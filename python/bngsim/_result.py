@@ -30,6 +30,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger("bngsim")
 
 
+def _empty_ssa_diagnostics() -> dict[str, Any]:
+    """SSA diagnostics dict for a result built from raw arrays: all zero/empty."""
+    return {
+        "n_negative_crossings": 0,
+        "first_negative_species": "",
+        "n_reverse_fires": 0,
+        "first_reverse_reaction": "",
+        "n_rounded_populations": 0,
+        "first_rounded_species": "",
+        # Nothing ran to say which backend evaluated the propensities;
+        # "interpreted" would name one that was never used.
+        "propensity_backend": "unknown",
+    }
+
+
 def _empty_psa_diagnostics() -> dict[str, Any]:
     """PSA diagnostics dict for a non-PSA (or non-SSA) run: inactive, all empty."""
     return {
@@ -240,6 +255,7 @@ class Result:
         "_varvol_live_vol",
         "_varvol_conc_factor",
         "_varvol_amount_factor",
+        "_volume_record_missing",
         "_ar_sens_map",
         "_ar_sens_blocked",
         "_ar_sens_refused",
@@ -263,7 +279,7 @@ class Result:
         _observable_names: list[str] | None = None,
         _expression_names: list[str] | None = None,
         _solver_stats: dict[str, int] | None = None,
-        _species_volume_factors: list[float] | None = None,
+        _species_volume_factors: list[float] | list[list[float]] | None = None,
         _seed: int | None = None,
         _ic_sensitivity_seed: dict[str, dict[str, float]] | None = None,
         # Sensitivity blocks (load / batch / stitch). All optional; absent ⇒
@@ -283,8 +299,9 @@ class Result:
         _reaction_propensity_integrals: NDArray | None = None,
         _reaction_labels: list[str] | None = None,
         # SSA diagnostics for a result built from raw arrays. ``squeeze`` passes
-        # the aggregate over its inputs; absent ⇒ the inert zero dict, whose
-        # backend reads "unknown" because nothing ran to say.
+        # the aggregate over its inputs and ``load`` the saved dict. Absent (a
+        # hand-built result, or a file that predates saving them) ⇒ the inert
+        # zero dict, whose backend reads "unknown" because nothing ran to say.
         _ssa_diagnostics: dict[str, Any] | None = None,
     ) -> None:
         self._core = core
@@ -444,17 +461,7 @@ class Result:
                 "n_dense_blas_factorizations": 0,
                 "steady_state_reached": 0,
             }
-            self._ssa_diagnostics = _ssa_diagnostics or {
-                "n_negative_crossings": 0,
-                "first_negative_species": "",
-                "n_reverse_fires": 0,
-                "first_reverse_reaction": "",
-                "n_rounded_populations": 0,
-                "first_rounded_species": "",
-                # A loaded or hand-built result ran nothing here, so no backend
-                # is known; "interpreted" would name one that was never used.
-                "propensity_backend": "unknown",
-            }
+            self._ssa_diagnostics = _ssa_diagnostics or _empty_ssa_diagnostics()
             self._psa_diagnostics = _empty_psa_diagnostics()
 
         # GH #198 — {function_name: unsupported_reason_or_None} for expression
@@ -468,14 +475,18 @@ class Result:
         # values (concentration = amount/V_c, per Phase 2's storage
         # convention) to amounts when the caller selects an `X` column.
         # Populated by Simulator.run; None means "treat as 1.0" which is
-        # correct for V=1 SBML and all .net models.
-        self._species_volume_factors: list[float] | None = _species_volume_factors
+        # correct for V=1 SBML and all .net models. A squeezed batch holds one
+        # such list per row, since a row may have written a size (issue #743).
+        self._species_volume_factors: list[float] | list[list[float]] | None = (
+            _species_volume_factors
+        )
 
         # GH #85: species_idx → live-volume column idx for species whose
-        # concentration column has been rescaled to amount/V_live(t) (a
-        # variable-volume compartment). Populated by Simulator._stamp. Tells
-        # as_roadrunner() to recover the amount as conc * V_live(t) rather than
-        # conc * V_static for those species. None ⇒ no variable-volume species.
+        # concentration column holds amount/V_live(t) (an hOSU=false species in a
+        # rate-rule compartment, whose dilution is integrated). Populated by
+        # Simulator._stamp. Tells as_roadrunner() to recover the amount as
+        # conc * V_live(t) rather than conc * V_static for those species. None ⇒
+        # no such species.
         self._varvol_live_vol: dict[int, int] | None = None
 
         # GH #131: species_idx → per-sample concentration factor V_static/V_live(t)
@@ -495,9 +506,21 @@ class Result:
         # rescale already ran), so the bare ``X`` amount selector reports the
         # amount as raw·V_live rather than the stale raw·V_static the volume factor
         # would give. V_live is read from the event-promoted compartment's
-        # observable column. Takes priority over the species-column live_vol and
-        # the static volume factor in as_roadrunner. None ⇒ no such species.
+        # observable column. Also carries the size for a column the
+        # variable-volume passes rescaled to amount/V_live (V_static at a sample
+        # where V_live is 0, which they leave at amount/V_static) and for a
+        # rule-target concentration species. Takes priority over the
+        # species-column live_vol and the static volume factor in as_roadrunner.
+        # None ⇒ no such species.
         self._varvol_amount_factor: dict[int, np.ndarray] | None = None
+
+        # Issue #787: which bngsim wrote the file this result was loaded from
+        # ("bngsim 0.11.35"), when that file predates Result.save recording the four
+        # volume fields above. Those fields are then None because the file does
+        # not say, not because every compartment has size 1, so as_roadrunner
+        # refuses a bare-id amount rather than report the stored concentration
+        # as one. None for every other result, a file that records them included.
+        self._volume_record_missing: str | None = None
 
         # GH #205: SBML AssignmentRule-target species → (kind, src, vdiv,
         # vdiv_param: the size vdiv is read from, or ""; issue #724), the
@@ -1089,18 +1112,20 @@ class Result:
         # the SOURCE selector propagates that source's support / empty-block
         # errors, which a NaN row in the tensor cannot state by name.
         if kind == "species":
+            # Checked before the redirect, which a loaded result does not carry,
+            # so the refusal is the same after a save and load (issue #787).
+            if meta["name"] in self._ar_sens_blocked:
+                raise ValueError(
+                    f"output_sensitivities: assignment-rule species "
+                    f"{meta['selector']!r} is reported with a time-varying "
+                    "volume rescale (variable-volume compartment); its "
+                    "output sensitivity is not supported (GH #205). "
+                    "Result.sensitivities is NaN in this row for the same "
+                    "reason (GH #221); Result.ar_sensitivity_refused lists "
+                    "every such species."
+                )
             redirect = self._ar_sens_map.get(meta["name"])
             if redirect is not None:
-                if meta["name"] in self._ar_sens_blocked:
-                    raise ValueError(
-                        f"output_sensitivities: assignment-rule species "
-                        f"{meta['selector']!r} is reported with a time-varying "
-                        "volume rescale (variable-volume compartment); its "
-                        "output sensitivity is not supported (GH #205). "
-                        "Result.sensitivities is NaN in this row for the same "
-                        "reason (GH #221); Result.ar_sensitivity_refused lists "
-                        "every such species."
-                    )
                 src_kind, src_name, vdiv, vdiv_param = redirect
                 src_names = self._names_for_kind(src_kind)
                 if src_name in src_names:
@@ -2357,10 +2382,21 @@ class Result:
         ------
         ValueError
             If a selector is unrecognized or names a species not in
-            the model.
+            the model, or if it asks for an amount (``"X"``) from a
+            result loaded from a file that does not record compartment
+            sizes (one written before bngsim saved them, issue #787).
         RuntimeError
-            Only if the result was loaded from disk and the array is
-            3-D batch-shaped (call :meth:`squeeze` per-row first).
+            If the result is a stacked batch (3-D species, from
+            :meth:`squeeze` or ``run_batch(..., squeeze=True)``); call this
+            on each row's Result from ``run_batch(..., squeeze=False)``.
+
+        Warns
+        -----
+        UserWarning
+            When a ``"[X]"`` column is asked of a result loaded from such a
+            file: it is the stored value, which is not the concentration
+            where a compartment's size changes during a stochastic run, or
+            for an amount-valued species an event resizes.
 
         Examples
         --------
@@ -2395,6 +2431,8 @@ class Result:
         n_t = self._time.shape[0]
         sp_idx = {name: i for i, name in enumerate(self._species_names)}
         vf = self._species_volume_factors
+        if self._volume_record_missing is not None:
+            self._check_missing_volume_record(selections, sp_idx)
 
         cols: list[NDArray[np.float64]] = []
         for sel in selections:
@@ -2423,11 +2461,12 @@ class Result:
                 lv = self._varvol_live_vol
                 af = self._varvol_amount_factor
                 if af is not None and idx in af:
-                    # GH #131: this column holds amount/V_live(t) but its live
-                    # volume lives in an OBSERVABLE column (an hOSU=false
-                    # event-resized compartment, hidden from species output per
-                    # #71), so the amount = conc · V_live(t) is recovered from the
-                    # stored live-volume array rather than a species column.
+                    # GH #131: this column holds amount/V_live(t), and the size it
+                    # is multiplied by is stored per sample: the live volume may
+                    # live in an OBSERVABLE column (an hOSU=false event-resized
+                    # compartment, hidden from species output per #71), and a
+                    # sample where the size is 0 holds amount/V_static, so it is
+                    # multiplied by V_static there.
                     col = col * af[idx]
                 elif lv is not None and idx in lv:
                     # GH #85: this species column holds amount/V_live(t), so the
@@ -2444,6 +2483,43 @@ class Result:
         for j, c in enumerate(cols):
             data[:, j] = c
         return NamedArray(data, selections)
+
+    def _check_missing_volume_record(self, selections: list[str], sp_idx: dict[str, int]) -> None:
+        """Refuse an amount, and warn on a concentration, from a file without sizes.
+
+        A file written before issue #787 holds the stored species values but not
+        the compartment sizes or the per-sample volume factors, and nothing in it
+        says whether a size was 1. An amount is the stored value times the size,
+        so it is refused rather than reported at size 1: a species of 4 in a
+        compartment of size 2 read 4 for 8. A concentration is the stored value
+        except where a size changes under SSA or PSA, or an event resizes the
+        compartment of an amount-valued species, so it is reported with a warning.
+        """
+        writer = self._volume_record_missing
+        amounts = [sel for sel in selections if sel != "time" and sel in sp_idx]
+        if amounts:
+            name = amounts[0]
+            raise ValueError(
+                f"as_roadrunner: cannot report the amount {name!r}. This result was loaded "
+                f"from a file written by {writer}, which did not save compartment "
+                "sizes, and an amount is the stored concentration times its compartment's "
+                f"size. Select '[{name}]' and multiply it by the size (where every size is "
+                "1, as in a .net model, the two are equal), or run the model again and save "
+                "the result with this version, which records the sizes (issue #787)."
+            )
+        if any(
+            sel.startswith("[") and sel.endswith("]") and sel[1:-1] in sp_idx for sel in selections
+        ):
+            warnings.warn(
+                f"as_roadrunner: this result was loaded from a file written by {writer}, "
+                "which did not save the volume factors, so each '[X]' column is "
+                "the stored species value. That is the concentration unless a compartment's "
+                "size changes during a stochastic run, or an event resizes the compartment "
+                "of an amount-valued species, where it is the amount over the starting size. "
+                "Run the model again and save the result with this version to record them "
+                "(issue #787).",
+                stacklevel=3,
+            )
 
     def _invalid_selection_message(self, sel: str) -> str:
         return (
@@ -2551,9 +2627,11 @@ class Result:
         with h5py.File(path, "w") as f:
             # Version for forward compatibility. v2 (GH #196) adds the optional
             # sensitivity blocks below; a v1 reader simply won't find them and a
-            # v2 file without sensitivities is byte-equivalent to a v1 one.
+            # v2 file without sensitivities is byte-equivalent to a v1 one. v3
+            # (issue #787) adds the volume record, and Result.load reads a file
+            # below v3 as one that does not say what the sizes were.
             f.attrs["bngsim_version"] = _bngsim_version
-            f.attrs["format_version"] = 2
+            f.attrs["format_version"] = 3
 
             # Stochastic seed actually used (omitted for ODE results).
             if self._seed is not None:
@@ -2628,11 +2706,98 @@ class Result:
                 f.create_dataset(
                     "ar_sensitivity_refused", data=sorted(self._ar_sens_refused), dtype=dt
                 )
+            # Issue #787: the assignment-rule species whose output sensitivity is
+            # refused by name because a time-varying size rescales the value.
+            # Without it a reloaded result handed back the NaN row as an answer.
+            if self._ar_sens_blocked:
+                f.create_dataset(
+                    "ar_sensitivity_blocked", data=sorted(self._ar_sens_blocked), dtype=dt
+                )
+            # GH #155: the ∂x(0)/∂θ rows the parameter axis already carries, one
+            # (species, parameter, coefficient) entry per element. Without it a
+            # reloaded result reported None, "not recorded", and a caller adding
+            # its own initial-condition term could not tell which parameter
+            # columns already hold one. Written whenever it is recorded, empty
+            # included, because {} ("nothing seeds") is a different answer.
+            if self._ic_sensitivity_seed is not None:
+                seed_rows = [
+                    (sp, p, c)
+                    for sp, row in self._ic_sensitivity_seed.items()
+                    for p, c in row.items()
+                ]
+                f.create_dataset(
+                    "ic_sensitivity_seed_species", data=[e[0] for e in seed_rows], dtype=dt
+                )
+                f.create_dataset(
+                    "ic_sensitivity_seed_params", data=[e[1] for e in seed_rows], dtype=dt
+                )
+                f.create_dataset(
+                    "ic_sensitivity_seed",
+                    data=np.array([e[2] for e in seed_rows], dtype=np.float64),
+                )
+
+            # Volume record (issue #787). as_roadrunner turns a stored species value
+            # into an amount with its compartment's size, and into a concentration
+            # with a per-sample factor where the size changes, and neither is in the
+            # arrays above: without them a species of 4 in a compartment of size 2
+            # loaded back with an amount of 4 for 8. The factor maps are keyed by
+            # species column; each per-sample array is one column of a
+            # (time, entry) block, beside the column indices it belongs to. A
+            # squeezed batch holds one record per row, so its sizes are a
+            # (sim, species) block and its factors (sim, time, entry). Each is
+            # written only when the result carries it, so one that carries none
+            # (built from raw arrays) loads back the same.
+            if self._species_volume_factors is not None:
+                f.create_dataset(
+                    "species_volume_factors",
+                    data=np.asarray(self._species_volume_factors, dtype=np.float64),
+                )
+            if self._varvol_live_vol:
+                f.create_dataset(
+                    "varvol_live_vol",
+                    data=np.array(sorted(self._varvol_live_vol.items()), dtype=np.int64),
+                )
+            for key, fmap in (
+                ("varvol_conc_factor", self._varvol_conc_factor),
+                ("varvol_amount_factor", self._varvol_amount_factor),
+            ):
+                if fmap:
+                    cols = sorted(fmap)
+                    f.create_dataset(f"{key}_species", data=np.array(cols, dtype=np.int64))
+                    f.create_dataset(
+                        key,
+                        data=np.stack(
+                            [np.asarray(fmap[j], dtype=np.float64) for j in cols], axis=-1
+                        ),
+                    )
+            # A result loaded from a file without the record keeps saying so when
+            # it is saved again; otherwise the new file would read as one whose
+            # sizes are all 1.
+            if self._volume_record_missing is not None:
+                f.attrs["volume_record_missing"] = self._volume_record_missing
 
             # Solver stats
             stats_grp = f.create_group("solver_stats")
             for key, val in self._solver_stats.items():
                 stats_grp.attrs[key] = val
+
+            # SSA boundary diagnostics (GH #110), and the PSA diagnostics (GH #15)
+            # of a run that used partial scaling; every other result carries the
+            # inactive PSA dict, which load rebuilds. Without them a loaded SSA
+            # result reported 0 rounded populations for 1 and the propensity
+            # backend "unknown" for "cc", and a PSA run read as inactive. The
+            # per-reaction PSA lists are datasets, since an attribute holds at
+            # most 64 KiB, and the scalars attributes.
+            ssa_grp = f.create_group("ssa_diagnostics")
+            for key, val in self._ssa_diagnostics.items():
+                ssa_grp.attrs[key] = val
+            if self._psa_diagnostics.get("active"):
+                psa_grp = f.create_group("psa_diagnostics")
+                for key, val in self._psa_diagnostics.items():
+                    if isinstance(val, list):
+                        psa_grp.create_dataset(key, data=np.asarray(val))
+                    else:
+                        psa_grp.attrs[key] = val
 
             # Custom attrs (only string/numeric values)
             if self.custom_attrs:
@@ -2668,6 +2833,13 @@ class Result:
             If h5py is not installed.
         FileNotFoundError
             If the file does not exist.
+
+        Notes
+        -----
+        A file written before bngsim saved compartment sizes (issue #787) loads,
+        but does not say what the sizes were. :meth:`as_roadrunner` on it refuses
+        a bare-id amount selector and warns on a ``"[X]"`` one; the arrays
+        themselves are as they were saved.
         """
         try:
             import h5py
@@ -2739,10 +2911,80 @@ class Result:
             sensitivity_params = _names("sensitivity_params")
             sensitivity_ic_species = _names("sensitivity_ic_species")
             ar_sens_refused = _names("ar_sensitivity_refused") or []
+            ar_sens_blocked = _names("ar_sensitivity_blocked") or []
             # GH #616 — absent datasets round-trip to the empty (0, 0) block.
             reaction_firing_counts = _sens("reaction_firing_counts")
             reaction_propensity_integrals = _sens("reaction_propensity_integrals")
             reaction_labels = _names("reaction_labels")
+
+            # Volume record (issue #787; format_version >= 3). In a v3 file an
+            # absent dataset means the result carried none. A file below v3 never
+            # wrote them, so it is marked as not saying, and as_roadrunner refuses
+            # the amounts that need them.
+            volume_factors = (
+                np.asarray(f["species_volume_factors"][()], dtype=np.float64).tolist()
+                if "species_volume_factors" in f
+                else None
+            )
+            live_vol = (
+                {int(j): int(k) for j, k in np.array(f["varvol_live_vol"])}
+                if "varvol_live_vol" in f
+                else None
+            )
+
+            def _factor_map(key: str) -> dict[int, NDArray[np.float64]] | None:
+                if key not in f:
+                    return None
+                block = np.array(f[key], dtype=np.float64)
+                cols = np.array(f[f"{key}_species"])
+                return {int(j): block[..., c].copy() for c, j in enumerate(cols)}
+
+            conc_factor = _factor_map("varvol_conc_factor")
+            amount_factor = _factor_map("varvol_amount_factor")
+
+            def _text(value: Any) -> str:
+                return value.decode() if isinstance(value, bytes) else str(value)
+
+            volume_record_missing: str | None = None
+            if int(f.attrs.get("format_version", 1)) < 3:
+                writer = f.attrs.get("bngsim_version")
+                volume_record_missing = (
+                    f"bngsim {_text(writer)}" if writer is not None else "an earlier bngsim"
+                )
+            elif "volume_record_missing" in f.attrs:
+                volume_record_missing = _text(f.attrs["volume_record_missing"])
+
+            # GH #155: absent ⇒ None, not recorded, as in a file that predates
+            # saving the seed.
+            ic_seed: dict[str, dict[str, float]] | None = None
+            if "ic_sensitivity_seed" in f:
+                ic_seed = {}
+                for sp, p, c in zip(
+                    _names("ic_sensitivity_seed_species") or [],
+                    _names("ic_sensitivity_seed_params") or [],
+                    f["ic_sensitivity_seed"][()],
+                    strict=True,
+                ):
+                    ic_seed.setdefault(sp, {})[p] = float(c)
+
+            # SSA / PSA diagnostics. A file that predates saving them loads the zero
+            # dicts a result built from raw arrays carries, and a key the file lacks
+            # keeps its zero value.
+            def _attr(value: Any) -> Any:
+                return value.item() if isinstance(value, np.generic) else value
+
+            ssa_diagnostics: dict[str, Any] | None = None
+            if "ssa_diagnostics" in f:
+                ssa_diagnostics = _empty_ssa_diagnostics()
+                for key, val in f["ssa_diagnostics"].attrs.items():
+                    ssa_diagnostics[key] = _attr(val)
+            psa_diagnostics = _empty_psa_diagnostics()
+            if "psa_diagnostics" in f:
+                psa_grp = f["psa_diagnostics"]
+                for key, val in psa_grp.attrs.items():
+                    psa_diagnostics[key] = _attr(val)
+                for key in psa_grp:
+                    psa_diagnostics[key] = np.array(psa_grp[key]).tolist()
 
         result = cls(
             core=None,
@@ -2754,7 +2996,9 @@ class Result:
             _observable_names=observable_names,
             _expression_names=expression_names,
             _solver_stats=solver_stats,
+            _species_volume_factors=volume_factors,
             _seed=seed,
+            _ic_sensitivity_seed=ic_seed,
             custom_attrs=custom_attrs,
             _sensitivities=sensitivities,
             _sensitivity_params=sensitivity_params,
@@ -2767,10 +3011,17 @@ class Result:
             _reaction_firing_counts=reaction_firing_counts,
             _reaction_propensity_integrals=reaction_propensity_integrals,
             _reaction_labels=reaction_labels,
+            _ssa_diagnostics=ssa_diagnostics,
         )
+        result._psa_diagnostics = psa_diagnostics
         # GH #221 — the NaN rows this file records as refusals, not as a failed
         # solve, so `gradient` keeps its zero-weight exemption after a round trip.
         result._ar_sens_refused = frozenset(ar_sens_refused)
+        result._ar_sens_blocked = frozenset(ar_sens_blocked)
+        result._varvol_live_vol = live_vol
+        result._varvol_conc_factor = conc_factor
+        result._varvol_amount_factor = amount_factor
+        result._volume_record_missing = volume_record_missing
         logger.info(
             "Loaded result: %d time points, %d species, %d observables",
             result.n_times,
@@ -2975,6 +3226,7 @@ class Result:
         prepended, e.g. ``sensitivities.shape == (n_sims, n_times, n_rows,
         n_cols)``; a block that is empty on the inputs stays empty. The
         parameter / IC-species name lists are taken from the first result.
+        Each row keeps its own compartment sizes and per-sample volume factors.
 
         Parameters
         ----------
@@ -3068,6 +3320,58 @@ class Result:
                 return np.empty((0, 0))
             return np.stack([getattr(r, attr) for r in results], axis=0)
 
+        # Each row's volume record (issue #787): its compartment sizes, which a
+        # batch row may have written (issue #743), one list per row, and its
+        # per-sample factors on a new leading sim axis. The stack took row 0's
+        # sizes for every row and none of the factors, so a batch over a size of
+        # 2 and 5 held 2 for both. A row's live-volume column is stacked as its
+        # amount factor, which as_roadrunner multiplies by in place of that
+        # column, so the rows need not agree on which species have which; a row
+        # without a factor another row has gets the one it reads instead: 1 for
+        # a concentration, its static size for an amount.
+        n_t = time.shape[0]
+        vfs = [r._species_volume_factors for r in results]
+        stack_vf = (
+            None
+            if all(v is None for v in vfs)
+            else [
+                np.asarray(v if v is not None else np.ones(len(species_names))).tolist()
+                for v in vfs
+            ]
+        )
+
+        def static_size(r: Result, j: int) -> NDArray[np.float64]:
+            vf = r._species_volume_factors
+            return np.full(n_t, vf[j] if vf is not None and j < len(vf) else 1.0, dtype=np.float64)
+
+        def stack_factors(
+            maps: list[dict[int, NDArray[np.float64]]],
+            fill: Callable[[Result, int], NDArray[np.float64]],
+        ) -> dict[int, NDArray[np.float64]] | None:
+            keys = sorted(set().union(*maps))
+            if not keys:
+                return None
+            return {
+                j: np.stack(
+                    [m[j] if j in m else fill(r, j) for r, m in zip(results, maps, strict=True)]
+                )
+                for j in keys
+            }
+
+        stack_conc = stack_factors(
+            [r._varvol_conc_factor or {} for r in results], lambda r, j: np.ones(n_t)
+        )
+        stack_amount = stack_factors(
+            [
+                {
+                    **{j: r._species[:, k] for j, k in (r._varvol_live_vol or {}).items()},
+                    **(r._varvol_amount_factor or {}),
+                }
+                for r in results
+            ],
+            static_size,
+        )
+
         out = Result(
             core=None,
             _time=time,
@@ -3078,7 +3382,7 @@ class Result:
             _observable_names=observable_names,
             _expression_names=expression_names,
             _solver_stats=agg_stats,
-            _species_volume_factors=results[0]._species_volume_factors,
+            _species_volume_factors=stack_vf,
             _seed=squeeze_seed,
             _ic_sensitivity_seed=squeeze_ic_seed,
             _sensitivities=stack_sens("_sensitivities"),
@@ -3107,6 +3411,13 @@ class Result:
         }
         out._ar_sens_blocked = frozenset().union(*(r._ar_sens_blocked for r in results))
         out._ar_sens_refused = frozenset().union(*(r._ar_sens_refused for r in results))
+        out._varvol_conc_factor = stack_conc
+        out._varvol_amount_factor = stack_amount
+        # A row loaded from a file that does not record its sizes leaves the
+        # stack's record incomplete, so the stack says so too.
+        out._volume_record_missing = next(
+            (r._volume_record_missing for r in results if r._volume_record_missing), None
+        )
         return out
 
     # ─── Dunder methods ─────────────────────────────────────────────
