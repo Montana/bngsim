@@ -51,7 +51,8 @@ refuses an amount selector (`"S"`) and warns on a concentration one
 save the result.
 
 It also keeps the run's `ic_sensitivity_seed` and its `ssa_diagnostics` and
-`psa_diagnostics`. A file written before bngsim saved these loads them as a
+`psa_diagnostics` (for a stacked batch, each run's, as
+`psa_diagnostics_per_run`). A file written before bngsim saved these loads them as a
 result built from arrays has them: the seed `None` ("not recorded"), the SSA
 counts 0 with the propensity backend `"unknown"`, and PSA inactive.
 

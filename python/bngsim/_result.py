@@ -251,6 +251,7 @@ class Result:
         "_solver_stats",
         "_ssa_diagnostics",
         "_psa_diagnostics",
+        "_psa_diagnostics_runs",
         "_species_volume_factors",
         "_varvol_live_vol",
         "_varvol_conc_factor",
@@ -463,6 +464,10 @@ class Result:
             }
             self._ssa_diagnostics = _ssa_diagnostics or _empty_ssa_diagnostics()
             self._psa_diagnostics = _empty_psa_diagnostics()
+
+        # Each run's PSA diagnostics, on a result squeeze stacked from several
+        # runs; None on a single run, whose one report is _psa_diagnostics.
+        self._psa_diagnostics_runs: list[dict[str, Any]] | None = None
 
         # GH #198 — {function_name: unsupported_reason_or_None} for expression
         # output sensitivities, set by the Simulator after a sensitivity run from
@@ -2152,8 +2157,26 @@ class Result:
         To turn ``speedup`` into a cost/precision go/no-go, pair it with the
         observable's variance-inflation ratio ``ρ`` (from a calibration/anchor
         run) via :func:`bngsim.psa_cost_decision`.
+
+        On a stacked batch (:meth:`squeeze`, ``squeeze=True``) the per-run
+        statistics are not combined into one: ``active`` is whether any run
+        used partial scaling, ``peak_population`` the largest and
+        ``activation_crossed`` whether any run crossed, and the per-reaction
+        lists, the integrals and ``speedup`` are left empty (NaN). Each run's
+        own report is in :attr:`psa_diagnostics_per_run`.
         """
         return self._psa_diagnostics
+
+    @property
+    def psa_diagnostics_per_run(self) -> list[dict[str, Any]]:
+        """Each run's :attr:`psa_diagnostics`, in the order the runs were stacked.
+
+        One report for a single run; one per row for a stacked batch
+        (:meth:`squeeze`), each exactly as that run reported it.
+        """
+        if self._psa_diagnostics_runs is None:
+            return [self._psa_diagnostics]
+        return list(self._psa_diagnostics_runs)
 
     # ─── pandas DataFrame (optional dependency) ─────────────────────
 
@@ -2803,13 +2826,22 @@ class Result:
             ssa_grp = f.create_group("ssa_diagnostics")
             for key, val in self._ssa_diagnostics.items():
                 ssa_grp.attrs[key] = val
-            if self._psa_diagnostics.get("active"):
-                psa_grp = f.create_group("psa_diagnostics")
-                for key, val in self._psa_diagnostics.items():
+
+            def _write_psa(grp: Any, diag: dict[str, Any]) -> None:
+                for key, val in diag.items():
                     if isinstance(val, list):
-                        psa_grp.create_dataset(key, data=np.asarray(val))
+                        grp.create_dataset(key, data=np.asarray(val))
                     else:
-                        psa_grp.attrs[key] = val
+                        grp.attrs[key] = val
+
+            if self._psa_diagnostics.get("active"):
+                _write_psa(f.create_group("psa_diagnostics"), self._psa_diagnostics)
+            # A stacked batch's runs, each under its index, when any used PSA.
+            runs = self._psa_diagnostics_runs
+            if runs is not None and any(run.get("active") for run in runs):
+                runs_grp = f.create_group("psa_diagnostics_runs")
+                for k, run in enumerate(runs):
+                    _write_psa(runs_grp.create_group(str(k)), run)
 
             # Custom attrs (only string/numeric values)
             if self.custom_attrs:
@@ -2990,13 +3022,24 @@ class Result:
                 ssa_diagnostics = _empty_ssa_diagnostics()
                 for key, val in f["ssa_diagnostics"].attrs.items():
                     ssa_diagnostics[key] = _attr(val)
-            psa_diagnostics = _empty_psa_diagnostics()
-            if "psa_diagnostics" in f:
-                psa_grp = f["psa_diagnostics"]
-                for key, val in psa_grp.attrs.items():
-                    psa_diagnostics[key] = _attr(val)
-                for key in psa_grp:
-                    psa_diagnostics[key] = np.array(psa_grp[key]).tolist()
+
+            def _read_psa(grp: Any) -> dict[str, Any]:
+                diag = _empty_psa_diagnostics()
+                for key, val in grp.attrs.items():
+                    diag[key] = _attr(val)
+                for key in grp:
+                    diag[key] = np.array(grp[key]).tolist()
+                return diag
+
+            psa_diagnostics = (
+                _read_psa(f["psa_diagnostics"])
+                if "psa_diagnostics" in f
+                else _empty_psa_diagnostics()
+            )
+            psa_runs: list[dict[str, Any]] | None = None
+            if "psa_diagnostics_runs" in f:
+                runs_grp = f["psa_diagnostics_runs"]
+                psa_runs = [_read_psa(runs_grp[k]) for k in sorted(runs_grp, key=int)]
 
         result = cls(
             core=None,
@@ -3026,6 +3069,7 @@ class Result:
             _ssa_diagnostics=ssa_diagnostics,
         )
         result._psa_diagnostics = psa_diagnostics
+        result._psa_diagnostics_runs = psa_runs
         # GH #221 — the NaN rows this file records as refusals, not as a failed
         # solve, so `gradient` keeps its zero-weight exemption after a round trip.
         result._ar_sens_refused = frozenset(ar_sens_refused)
@@ -3430,6 +3474,21 @@ class Result:
         out._volume_record_missing = next(
             (r._volume_record_missing for r in results if r._volume_record_missing), None
         )
+        # Each run's PSA report is kept as it was. The stack's own report says
+        # only what the runs agree on without a choice of statistic: whether any
+        # used partial scaling, the largest peak, whether any crossed the
+        # activation level. Dropped, a stack of PSA runs read as inactive, as if
+        # it had run exact SSA. A stack of stacks keeps every run's report.
+        runs = [run for r in results for run in r.psa_diagnostics_per_run]
+        out._psa_diagnostics_runs = runs
+        if any(run.get("active") for run in runs):
+            summary = _empty_psa_diagnostics()
+            summary["active"] = True
+            summary["peak_population"] = max(
+                float(run.get("peak_population", 0.0)) for run in runs
+            )
+            summary["activation_crossed"] = any(run.get("activation_crossed") for run in runs)
+            out._psa_diagnostics = summary
         return out
 
     # ─── Dunder methods ─────────────────────────────────────────────
