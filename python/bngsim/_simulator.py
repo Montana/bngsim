@@ -7401,6 +7401,7 @@ class Simulator:
         result = SteadyStateResult(core_result)
         self._apply_ss_ar_report_map(result)
         self._apply_ss_ar_sensitivity_map(result)
+        self._apply_ss_varvol_report_maps(result)
 
         logger.info(
             "Steady state %s: method=%s, backend=%s, residual=%.2e, steps=%d, species_tested=%d",
@@ -8187,6 +8188,94 @@ class Simulator:
         if changed:
             result._sensitivity = sens
 
+    def _apply_ss_varvol_report_maps(
+        self, result: SteadyStateResult, model: Model | None = None
+    ) -> None:
+        """Report an amount in a compartment whose size changes over the live size.
+
+        The steady-state analogue of the variable-volume passes of
+        :meth:`_stamp`, and the same passes: the steady state is put in a
+        one-sample :class:`Result`, :meth:`_apply_varvol_conc_map` (a rate-rule
+        compartment) and :meth:`_apply_varvol_ar_conc_map` (an assignment-rule
+        compartment) rescale it, and the value and its sensitivity row are
+        copied back. Such an amount is stored over the size the model loaded
+        with, and without them ``concentrations`` reported it so: ``H`` in
+        ``C := 1 + P`` came back 2.0 where ``run()`` to the same state reports
+        2/6 (issue #787), and its ``dY_ss/dp`` row was the stored value's, with
+        no share of the size's own row. An assignment-rule species comes here
+        after :meth:`_apply_ss_ar_report_map` has set it to its rule over the
+        load-time size, as on a time course, and its row is then the quotient
+        rule through its rule's.
+
+        A row ``mask=`` left out of the solve is NaN (issue #74) and stays NaN;
+        the passes are given 0 there, so that they do not refuse it again. A
+        species the solve kept, in a compartment whose size it left out, has no
+        row to be given, and is refused by name.
+
+        The other passes of :meth:`_stamp` record what
+        :meth:`Result.as_roadrunner` reads an amount with, which a steady state
+        has no selector for, or follow an event, which :meth:`steady_state`
+        refuses. No-op for .net and static models.
+        """
+        model = model or self._model
+        rate_sized = getattr(model, "_varvol_conc_map", None) or {}
+        rule_sized = getattr(model, "_varvol_ar_conc_map", None) or {}
+        if not rate_sized and not rule_sized:
+            return
+        sens = result._sensitivity
+        if sens is not None and sens.size == 0:
+            sens = None
+        if sens is not None:
+            kept = np.isfinite(sens).all(axis=1)
+            size_kept = np.isfinite(result._expression_sensitivity).all(axis=1)
+            sp_idx = result._name_to_idx
+            expr_idx = {n: i for i, n in enumerate(result._expression_names)}
+            short = [
+                s
+                for s, c in rate_sized.items()
+                if s in sp_idx and c in sp_idx and kept[sp_idx[s]] and not kept[sp_idx[c]]
+            ] + [
+                s
+                for s, (c, _v_static) in rule_sized.items()
+                if s in sp_idx
+                and kept[sp_idx[s]]
+                and expr_idx.get(c, len(size_kept)) < len(size_kept)
+                and not size_kept[expr_idx[c]]
+            ]
+            if short:
+                raise SimulationError(
+                    f"Steady-state dY_ss/dp of {sorted(short)}: each is an amount reported "
+                    "as a concentration in a compartment whose size changes, so its row "
+                    "needs the size's own row, and the solve has none: mask= left the "
+                    "size, or a species its rule reads, out of the solve. Keep it in the "
+                    "mask, or leave these species out as well (issue #787)."
+                )
+
+        def _block(arr: np.ndarray) -> np.ndarray | None:
+            # A (rows, params) steady-state block as a one-sample time course.
+            if sens is None or arr.ndim != 2 or arr.size == 0:
+                return None
+            return np.where(np.isfinite(arr), arr, 0.0)[None, :, :]
+
+        one = Result(
+            _time=np.zeros(1),
+            _species=np.array(result._concentrations, dtype=np.float64)[None, :],
+            _observables=np.asarray(result._observable_values, dtype=np.float64)[None, :],
+            _expressions=np.asarray(result._expression_values, dtype=np.float64)[None, :],
+            _species_names=list(result._species_names),
+            _observable_names=list(result._observable_names),
+            _expression_names=list(result._expression_names),
+            _sensitivities=None if sens is None else _block(sens),
+            _sensitivity_params=list(result._sens_param_names),
+            _observable_sensitivities=_block(result._observable_sensitivity),
+            _expression_sensitivities=_block(result._expression_sensitivity),
+        )
+        self._apply_varvol_conc_map(one, model)
+        self._apply_varvol_ar_conc_map(one, model)
+        result._concentrations = np.array(one._species[0], dtype=np.float64)
+        if sens is not None:
+            result._sensitivity = np.where(np.isfinite(sens), one._sensitivities[0], sens)
+
     def _note_ss_jacobian_retry(self, result) -> None:
         """Say so when the solver had to call off the closed-form Jacobian.
 
@@ -8436,6 +8525,7 @@ class Simulator:
             # through the unscanned volume.
             self._apply_ss_ar_report_map(result, clone)
             self._apply_ss_ar_sensitivity_map(result, clone)
+            self._apply_ss_varvol_report_maps(result, clone)
             self._note_ss_jacobian_retry(result)
             self._warn_about_pure_sinks(result)
             return result
