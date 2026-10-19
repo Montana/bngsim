@@ -635,6 +635,11 @@ def test_a_fast_forcing_at_a_large_clock():
             " k = 0.2; J0: S => ; k*S*C; J2: => P; 0.5*J0; E: at time > 1: C = 2;",
             id="law-through-a-reaction-rate",
         ),
+        pytest.param(
+            "compartment C = 1; species S in C = 100; species B = 0; k = 0.2;"
+            " J0: S => ; k*S*C; E: at time > 1: C = 2; E2: at J0 < 15: B = 50;",
+            id="trigger-through-a-reaction-rate",
+        ),
     ],
 )
 def test_more_stale_concentration_reads_are_refused(text):

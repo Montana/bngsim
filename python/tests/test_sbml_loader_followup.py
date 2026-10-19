@@ -110,6 +110,32 @@ def test_a2_rate_rule_references_reaction_id():
     assert result.species[-1, ap_idx] > 0
 
 
+@pytest.mark.parametrize(
+    ("event", "t_set", "b_set"),
+    [
+        # J0 = 20·e^(-0.2 t) crosses 15 at t = 5·ln(4/3) = 1.438.
+        ("E: at J0 < 15: B = 50;", 5 * math.log(4 / 3), 50.0),
+        ("E: at time > 1: B = J0;", 1.0, 20 * math.exp(-0.2)),
+    ],
+    ids=["trigger", "assignment"],
+)
+def test_a2_event_references_reaction_id(event, t_set, b_set):
+    """An event reads a reaction's id as a rule does, as the reaction's rate.
+    Only the ids that rules and laws read were registered, so either event
+    failed to load, `J0` an undefined symbol; libRoadRunner gives B = 50 from
+    t = 1.438, and B = 16.375 from t = 1."""
+    model = bngsim.Model.from_antimony_string(
+        f"compartment C = 1; species S in C = 100; species B = 0; k = 0.2; J0: S => ; k*S; {event}"
+    )
+    res = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, 3.0), n_points=31, rtol=1e-10, atol=1e-12
+    )
+    t = res.time
+    b = res.species[:, list(res.species_names).index("B")]
+    assert b[t < t_set - 0.05] == pytest.approx(0.0, abs=1e-12)
+    assert b[t > t_set + 0.05] == pytest.approx(b_set, rel=1e-6)
+
+
 # ─── A3: reaction without kineticLaw → clear error, not silent rate=0 ─
 
 

@@ -7334,6 +7334,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         _walk_name_refs(kl_j.getMath(), _reaction_ids_set, refs_j)
         refs_j.discard(rxn_j.getId())  # drop self-reference
         referenced_reaction_ids |= refs_j
+    # An event reads a reaction's id as a rule does: `at J0 < 15` failed to
+    # compile, J0 an undefined symbol, where libRoadRunner fires it at J0's
+    # crossing.
+    for j in range(sbml_model.getNumEvents()):
+        ev_j = sbml_model.getEvent(j)
+        ev_maths = [
+            x.getMath()
+            for x in (ev_j.getTrigger(), ev_j.getDelay(), ev_j.getPriority())
+            if x is not None
+        ]
+        ev_maths += [
+            ev_j.getEventAssignment(k).getMath() for k in range(ev_j.getNumEventAssignments())
+        ]
+        for m_j in ev_maths:
+            if m_j is not None:
+                _walk_name_refs(m_j, _reaction_ids_set, referenced_reaction_ids)
 
     # What a name in a kinetic law is, for _law_is_nonnegative: a species or a
     # compartment is, a constant parameter is by its value after initial
