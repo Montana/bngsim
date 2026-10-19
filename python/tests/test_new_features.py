@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from pathlib import Path
 
 import bngsim
@@ -327,6 +328,161 @@ class TestHdf5SaveLoad:
 
         assert "n_times=11" in repr(loaded)
         assert "n_species=2" in repr(loaded)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HDF5 save / load: the volume record (issue #787)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# as_roadrunner reports an amount as the stored value times the compartment's
+# size, and a concentration in a compartment whose size changes through a
+# per-sample factor. Neither was saved, so a species of 4 in a compartment of
+# size 2 loaded back with an amount of 4 for 8, and every variable-volume column
+# below came back at the starting size. One model per way a size is set, with an
+# amount species and a concentration species where they are reported differently.
+_VOLUME_MODELS = {
+    "static size, concentration": "compartment c = 2; species S in c = 4; S -> ; k*S; k = 0.1;",
+    "static size, amount": (
+        "compartment c = 2; substanceOnly species S in c = 4; S -> ; k*S; k = 0.1;"
+    ),
+    "rate-rule size, amount": (
+        "compartment c = 2; c' = 0.3; substanceOnly species S in c = 40; S -> ; k*S; k = 0.1;"
+    ),
+    "rate-rule size, concentration": (
+        "compartment c = 2; c' = 0.3; species S in c = 40; S -> ; k*S; k = 0.1;"
+    ),
+    "constant assignment-rule size, amount": (
+        "compartment c; c := 2*q; q = 1.5; substanceOnly species S in c = 40; S -> ; k*S; k = 0.1;"
+    ),
+    "assignment-rule size, amount": (
+        "compartment c; c := 2 + time; substanceOnly species S in c = 40; S -> ; k*S; k = 0.1;"
+    ),
+    "assignment-rule size, concentration": (
+        "compartment c; c := 2 + time; species S in c = 40; S -> ; k*S; k = 0.1;"
+    ),
+    "event-resized size, amount": (
+        "compartment c = 2; substanceOnly species S in c = 40; S -> ; k*S; k = 0.1;"
+        " at time > 2: c = 4;"
+    ),
+    "event-resized size, concentration": (
+        "compartment c = 2; species S in c = 40; S -> ; k*S; k = 0.1; at time > 2: c = 4;"
+    ),
+    "rate-rule species, rate-rule size": (
+        "compartment c = 2; c' = 0.3; species S in c; S = 3; S' = 0.1; species T in c = 10;"
+    ),
+    "assignment-rule species, assignment-rule size": (
+        "compartment c; c := 2 + time; species S in c; S := 3 + time; species T in c = 10;"
+    ),
+    "assignment-rule species, static size": (
+        "compartment c = 2; species A in c = 10; species B in c; B := 2*A; A -> ; k*A; k = 0.1;"
+    ),
+}
+# SSA refuses a reaction on a concentration in a compartment an assignment rule
+# sizes, so that model runs under ODE alone.
+_VOLUME_RUNS = [
+    (name, method)
+    for name in _VOLUME_MODELS
+    for method in ("ode", "ssa")
+    if not (method == "ssa" and name == "assignment-rule size, concentration")
+]
+
+
+def _every_column(result: Result) -> list[str]:
+    names = list(result.species_names)
+    return ["time", *(f"[{s}]" for s in names), *names]
+
+
+def _reloaded(result: Result, path: Path) -> Result:
+    result.save(path)
+    return Result.load(path)
+
+
+class TestHdf5VolumeRecord:
+    """A loaded Result reports the amounts and concentrations it was saved with."""
+
+    @pytest.fixture(autouse=True)
+    def _needs(self):
+        pytest.importorskip("h5py")
+        pytest.importorskip("antimony")
+
+    @pytest.mark.parametrize(("name", "method"), _VOLUME_RUNS)
+    def test_as_roadrunner_is_unchanged_by_a_round_trip(self, name, method, tmp_path: Path):
+        model = Model.from_antimony_string(_VOLUME_MODELS[name])
+        kw = {"seed": 1} if method == "ssa" else {}
+        result = Simulator(model, method=method).run(t_span=(0, 5), n_points=6, **kw)
+        loaded = _reloaded(result, tmp_path / "r.h5")
+        cols = _every_column(result)
+        np.testing.assert_array_equal(
+            np.asarray(loaded.as_roadrunner(cols)), np.asarray(result.as_roadrunner(cols))
+        )
+
+    @pytest.mark.parametrize("method", ["ode", "ssa"])
+    def test_batch_rows_keep_their_own_sizes(self, method, tmp_path: Path):
+        """Each row of a batch over a size and a rate-rule rate reloads with its own."""
+        model = Model.from_antimony_string(
+            "compartment d = 2; species X in d = 4; X -> ; k*X; k = 0.1;"
+            " compartment c = 2; c' = g; g = 0.3; substanceOnly species S in c = 40;"
+            " S -> ; k*S;"
+        )
+        sim = Simulator(model, method=method)
+        params = [{"d": 2.0, "g": 0.3}, {"d": 5.0, "g": 0.6}]
+        kw = {"seed": 1} if method == "ssa" else {}
+        rows = sim.run_batch(t_span=(0, 5), n_points=6, params=params, **kw)
+        for i, row in enumerate(rows):
+            loaded = _reloaded(row, tmp_path / f"row{i}.h5")
+            cols = _every_column(row)
+            np.testing.assert_array_equal(
+                np.asarray(loaded.as_roadrunner(cols)), np.asarray(row.as_roadrunner(cols))
+            )
+        # The stacked batch has no as_roadrunner, but saves and loads as before.
+        stack = sim.run_batch(t_span=(0, 5), n_points=6, params=params, squeeze=True, **kw)
+        loaded = _reloaded(stack, tmp_path / "stack.h5")
+        np.testing.assert_array_equal(loaded.species, stack.species)
+
+    def test_a_file_without_the_record_refuses_an_amount(self, tmp_path: Path):
+        """A file written before the record says nothing about the sizes.
+
+        Its amounts are refused rather than read at size 1, its concentrations
+        come with a warning, and saving it again keeps it saying so.
+        """
+        import h5py
+
+        model = Model.from_antimony_string("compartment c = 2; species S in c = 4;")
+        result = Simulator(model).run(t_span=(0, 5), n_points=3)
+        path = tmp_path / "old.h5"
+        result.save(path)
+        # What bngsim 0.11.35 wrote: format 2, and none of the volume record.
+        with h5py.File(path, "r+") as f:
+            for key in (
+                "species_volume_factors",
+                "varvol_live_vol",
+                "varvol_conc_factor",
+                "varvol_conc_factor_species",
+                "varvol_amount_factor",
+                "varvol_amount_factor_species",
+                "ar_sensitivity_blocked",
+            ):
+                if key in f:
+                    del f[key]
+            f.attrs["format_version"] = 2
+            f.attrs["bngsim_version"] = "0.11.35"
+
+        old = Result.load(path)
+        with pytest.raises(ValueError, match=r"amount 'S'.*bngsim 0\.11\.35.*compartment sizes"):
+            old.as_roadrunner(["time", "S"])
+        with pytest.warns(UserWarning, match=r"bngsim 0\.11\.35.*volume factors"):
+            conc = old.as_roadrunner(["[S]"])
+        np.testing.assert_array_equal(np.asarray(conc)[:, 0], result.species[:, 0])
+
+        again = _reloaded(old, tmp_path / "again.h5")
+        with pytest.raises(ValueError, match=r"amount 'S'.*bngsim 0\.11\.35"):
+            again.as_roadrunner(["S"])
+
+        # The same result saved by this version reports the amount, 8, unprompted.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            amount = _reloaded(result, tmp_path / "new.h5").as_roadrunner(["S", "[S]"])
+        np.testing.assert_array_equal(np.asarray(amount)[:, 0], np.full(3, 8.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

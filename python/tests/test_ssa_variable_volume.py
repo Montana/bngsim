@@ -961,7 +961,8 @@ def test_case2_bare_bimolecular_event_matches_extrande():
 # law-factor count in c) — a per-compartment vector, since the single scalar
 # correction (cases 1–3) cannot hold a product over compartments. The bare-law
 # monomial is supported (irreversible, all-hOSU=false); explicit-compartment-factor
-# and hOSU=true cross-compartment shapes stay refused. Validated against the
+# and hOSU=true cross-compartment shapes stayed refused (a mix with an amount that
+# changes a concentration here runs since #787). Validated against the
 # independent Extrande sampler (Tier 1 event + Tier 2 rate rule, one & both varvol)
 # and the exact cross-compartment ODE semantics (RK4). The ODE path is additionally
 # cross-checked vs RoadRunner + COPASI in dev/investigations/
@@ -1266,19 +1267,42 @@ def test_c5_explicit_compartment_factor_ode_matches_semantics():
             )
 
 
-# Exotic cross-compartment shapes stay refused (the hOSU=true and reversible
-# variants keep their gate; only all-hOSU=false irreversible monomials are lifted).
-def test_c4_hosu_cross_compartment_still_refused():
-    # An hOSU=true (amount-valued) reactant in a cross-compartment varvol reaction
-    # is out of scope (its volume bookkeeping differs) — stays refused.
+# The reversible cross-compartment variant keeps its gate. An amount-valued
+# reactant beside the concentrations no longer does (#787): the per-species
+# emission divides each row by its own size, and the live-volume term counts the
+# concentration factors alone, an amount being read exactly.
+def test_c4_hosu_cross_compartment_matches_extrande():
+    # A a concentration in the growing cell, B an amount in the static dish:
+    # ρ = k·[A]·n_B = k·A·B/V_cell. This was refused as out of scope.
+    k, g, reps, seed = 0.02, 0.1, 2000, 51
     src = (
         "model m; compartment cell=1.0; compartment dish=1.0; "
         "species A in cell=100; substanceOnly species B in dish=100; species P in cell=0; "
-        "k=0.02; g=0.1; cell'=g; J1: A+B=>P; k*A*B; end"
+        f"k={k}; g={g}; cell'=g; J1: A+B=>P; k*A*B; end"
     )
     model = bngsim.Model.from_antimony_string(src)
-    codes = {i.code for i in bngsim.validate_for_ssa(model) if i.severity == "error"}
-    assert "varvol_non_mass_action" in codes
+    assert not [i for i in bngsim.validate_for_ssa(model) if i.severity == "error"]
+    names, arr = _ssa_counts(model, 10.0, 11, reps=reps, seed=seed)
+    n_p = arr[:, :, names.index("P")]  # V_static = 1 ⇒ stored == count
+    t = np.linspace(0.0, 10.0, 11)
+    ref = ext.RefModel(
+        species=["A", "B", "P"],
+        x0={"A": 100, "B": 100, "P": 0},
+        reactions=[
+            ext.ReactionSpec(
+                stoich={"A": -1, "B": -1, "P": 1},
+                propensity=lambda s: k * s["A"] * s["B"] / s["cell"],
+            )
+        ],
+        cont={"cell": lambda s: g},
+        c0={"cell": 1.0},
+    )
+    oref = ext.simulate_batch(ref, t, reps, seed=seed + 1, look_ahead=0.1)
+    pb, pe = n_p.mean(0), oref[:, :, 2].mean(0)
+    se = np.sqrt(n_p.var(0, ddof=1) / reps + oref[:, :, 2].var(0, ddof=1) / reps)
+    for i in range(1, len(t)):
+        z = abs(pb[i] - pe[i]) / (se[i] + 1e-12)
+        assert z < 5.0, f"c4 hOSU t={t[i]:.1f}: bng={pb[i]:.2f} ext={pe[i]:.2f} z={z:.2f}"
 
 
 def test_c4_reversible_cross_compartment_still_refused():

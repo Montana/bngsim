@@ -789,3 +789,22 @@ def test_refused_set_round_trips_through_hdf5(tmp_path):
         return g
 
     assert np.isfinite(back.gradient(dL_dY)).all()
+
+
+def test_selector_refusal_round_trips_through_hdf5(tmp_path):
+    """A reloaded result refuses the blocked species' selector by name, as the
+    run did, rather than hand back its NaN row as the answer (issue #787)."""
+    pytest.importorskip("h5py")
+    m = bngsim.Model.from_sbml_string(BLOCKED_VARVOL)
+    sim = bngsim.Simulator(m, method="ode", sensitivity_params=["k", "g"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        r = sim.run(t_span=(0.0, 5.0), n_points=6, **_RUN)
+    path = tmp_path / "r.h5"
+    r.save(path)
+    back = bngsim.Result.load(path)
+    with pytest.raises(ValueError, match="time-varying volume rescale"):
+        back.output_sensitivities("species:T")
+    np.testing.assert_array_equal(
+        back.output_sensitivities("species:A"), r.output_sensitivities("species:A")
+    )
