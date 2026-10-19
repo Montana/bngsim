@@ -80,12 +80,13 @@ result.output_sensitivities("species:stimulus")
 
 Two things put a species there: codegen declined the rule's own output
 sensitivity (a `piecewise` lowers to an `if()`, which #198 refuses rather than
-guess at), or the reported value carries a time-varying volume rescale the
-redirect does not model. A `NaN` row does **not** cost you the rest of the
-gradient: `gradient`, `sse_gradient`, `chi2_gradient` and
-`neg_log_likelihood_gradient` drop these rows wherever your `dL/dY` is exactly
-zero, so a fit that never scores that species still gets a number. Weight one and
-the gradient is `NaN`, which is the honest answer.
+guess at), or the species is an amount in a compartment whose size changes and
+codegen declined the output sensitivity of the size's own rule (see below). A
+`NaN` row does **not** cost you the rest of the gradient: `gradient`,
+`sse_gradient`, `chi2_gradient` and `neg_log_likelihood_gradient` drop these
+rows wherever your `dL/dY` is exactly zero, so a fit that never scores that
+species still gets a number. Weight one and the gradient is `NaN`, which is the
+honest answer.
 
 ### An amount in a compartment whose size changes
 
@@ -102,9 +103,12 @@ The compartment's derivative is the row of its own state where a rate rule
 moves it, and of its rule's expression where an assignment rule sets it. Where
 that expression's row is not available (a `piecewise` in the rule, which #198
 refuses), the species' row is `NaN`, the run warns naming it, and it is in
-`result.ar_sensitivity_refused` beside the assignment-rule species above. A
-species that an assignment rule sets *and* that sits in such a compartment is
-refused as before.
+`result.ar_sensitivity_refused` beside the assignment-rule species above.
+
+A species that an assignment rule sets *and* that sits in such a compartment
+gets the same quotient rule, through its rule's row (issue #787): `T := 2*P` in
+`C := 1 + P` reports `2P/(1 + P)`, and d[T]/dkp at t = 1 is 0.4988. Its row was
+`NaN`. `output_sensitivities("species:T")` returns the same row.
 
 The row is right where the amount at the start is the model's own number.
 Where it was made at load by converting the declared value with the size the
