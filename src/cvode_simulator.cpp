@@ -14327,6 +14327,15 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             if (carried) {
                 std::fill(state_switch_zero_hold.begin(), state_switch_zero_hold.end(), 0.0);
                 t_now = t_ret;
+                // The state was put across with no step, so no root saw an
+                // event trigger that reads the surface change, and CVODE reads
+                // every root afresh from the restart. The triggers are read
+                // here as at a stop. Without this an SBML event on the
+                // threshold of a piecewise rate law (#959) never fired: Z = 0
+                // where the run without the carry timed out.
+                if (n_events > 0) {
+                    fire_rises_on_stop(static_cast<double>(t_ret), static_cast<double>(t_ret));
+                }
                 continue;
             }
 
