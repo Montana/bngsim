@@ -530,6 +530,107 @@ def _exprtk_to_sympy(expr: str):
 # ─── Function inlining ─────────────────────────────────────────────────────
 
 
+# Past this many characters, the text written out function by function is read
+# through sympy instead, each function once (issue #1124, item 4 has the same
+# limit for an event's resize).
+_INLINE_TEXT_LIMIT = 20_000
+
+
+def _inlined_length(expr: str, func_map: dict[str, str]) -> int | None:
+    """How long ``expr`` written out by :func:`_inline_functions` would be, without
+    writing it, or ``None`` where its functions read each other in a cycle."""
+    length: dict[str, int] = {}
+    on_path: set[str] = set()
+
+    def of(text: str) -> int | None:
+        n = len(text)
+        for name in _IDENT_RE.findall(text):
+            if name not in func_map:
+                continue
+            if name in on_path:
+                return None
+            if name not in length:
+                on_path.add(name)
+                got = of(func_map[name])
+                on_path.discard(name)
+                if got is None:
+                    return None
+                length[name] = got
+            n += length[name] + 2 - len(name)
+        return n
+
+    try:
+        return of(expr)
+    except RecursionError:
+        return None
+
+
+def _compact_inlined(expr: str, func_map: dict[str, str]) -> str | None:
+    """``expr`` with its functions written in, as sympy prints the result, where
+    writing them in as text would pass :data:`_INLINE_TEXT_LIMIT`; else ``None``.
+
+    Written in as text, a function that more than one path reaches is copied
+    once per path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made a
+    rate law that reads the last one exponential in the depth: the first ODE run
+    took 1.2 s at 26 rules and a codegen run 2.8 s, spent tokenizing, parsing and
+    compiling the text and its derivatives (issue #1124, item 5). Here each
+    function is parsed once and put in by reference, and sympy's own arithmetic
+    collects what the paths share: that diamond is a sum of two terms. The
+    printed result is used where it is short; where it is not (a diamond that
+    does not collect, ``sin(r_{i-1}) + cos(r_{i-2})``), or anything in it cannot
+    be parsed or printed, the text is written out as before.
+    """
+    predicted = _inlined_length(expr, func_map)
+    if predicted is None or predicted <= _INLINE_TEXT_LIMIT:
+        return None
+    try:
+        import sympy as sp
+    except ImportError:
+        return None
+
+    def symbol_of(name: str):
+        alias = _alias_keyword_param(name) if name in _PY_KEYWORD_PARAM_NAMES else name
+        return sp.Symbol(alias)
+
+    built: dict[str, object] = {}
+
+    def parsed(text: str):
+        sym = _exprtk_to_sympy(text)
+        if sym is None:
+            return None
+        subs = {}
+        for name in set(_IDENT_RE.findall(text)) & set(func_map):
+            if name not in built:
+                built[name] = None  # under way: a cycle reads no value
+                built[name] = parsed(func_map[name])
+            if built[name] is None:
+                return None
+            subs[symbol_of(name)] = built[name]
+        return sym.xreplace(subs) if subs else sym
+
+    try:
+        top = parsed(expr)
+    except (RecursionError, Exception):  # noqa: BLE001 - any failure keeps the text path
+        return None
+    if top is None:
+        return None
+    # The printed tree, a shared node counted once per use, before printing it.
+    size: dict[int, int] = {}
+    stack = [(top, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if id(node) in size:
+            continue
+        if expanded:
+            size[id(node)] = 1 + sum(size[id(a)] for a in node.args)
+        else:
+            stack.append((node, True))
+            stack.extend((a, False) for a in node.args if id(a) not in size)
+    if size[id(top)] * 4 > _INLINE_TEXT_LIMIT:
+        return None
+    return sympy_to_exprtk(top)
+
+
 def _inline_functions(
     expr: str,
     func_map: dict[str, str],
@@ -556,6 +657,10 @@ def _inline_functions(
         _seen = frozenset()
     if _depth > 64:
         return None
+    if _depth == 0:
+        compact = _compact_inlined(expr, func_map)
+        if compact is not None:
+            return compact
 
     # Intersect the identifiers actually present in ``expr`` with ``func_map``,
     # rather than running a regex for every function name. ``func_map`` can hold
