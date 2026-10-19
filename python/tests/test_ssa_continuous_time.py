@@ -636,3 +636,25 @@ def test_a_compartment_ruled_by_a_constant_species_runs():
     )
     m = _ant(txt)
     assert m.validate_for_ssa() == []
+
+
+@pytest.mark.parametrize(
+    "resize", ["E: at time > 1: ce = 2;", "ce' = 0.1;"], ids=["event", "rate-rule"]
+)
+@pytest.mark.parametrize(
+    "kw", ["const species Kw in ce = 10;", "species $Kw in ce = 10;"], ids=["constant", "boundary"]
+)
+def test_a_compartment_ruled_by_a_constant_species_in_a_moving_compartment_is_refused(kw, resize):
+    """A resize keeps Kw's amount, so [Kw] moves with ce's size and cv with it,
+    though no rule or event names Kw: libRoadRunner takes cv from 2 to 1.5 at
+    the event. SSA ran J at cv's load-time size, with no refusal: the mean
+    [Sn](1.5) of 400 runs was 17.25 ± 0.09 for libRoadRunner's 21.97."""
+    txt = (
+        f"compartment ce = 1; compartment cv; cv := 1 + 0.1*Kw; {kw}"
+        f" species Sn in cv = 25; k = 0.5; J: Sn => ; k*Sn; {resize}"
+    )
+    m = _ant(txt)
+    errors = [(i.code, i.location) for i in m.validate_for_ssa() if i.severity == "error"]
+    assert errors == [("assignment_rule_compartment", "reaction:J")]
+    with pytest.raises(bngsim.SsaValidationError, match="assignment rule"):
+        bngsim.Simulator(m, method="ssa").run(t_span=(0, 1), n_points=2, seed=1)

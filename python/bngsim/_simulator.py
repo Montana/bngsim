@@ -3986,13 +3986,15 @@ class Simulator:
         """Record V_live(t) for a rule-target concentration species (issue #728).
 
         A concentration species that a rate rule or an assignment rule sets, in a
-        compartment a rate rule or an assignment rule sizes, holds its rule's
-        concentration under every method: nothing about it is a count. Its amount
-        is that times V_live(t), and :meth:`Result.as_roadrunner` read the static
-        volume factor instead (01198: S1 = 0.2 for 0.28). The live size is read
-        from the compartment's promoted-species column or its expression column,
-        as the loader's map says. The column itself is left as it is. No-op with
-        no such species, and for a 3-D stack.
+        compartment a rate rule, an assignment rule or an event sizes, holds its
+        rule's concentration under every method: nothing about it is a count. Its
+        amount is that times V_live(t), and :meth:`Result.as_roadrunner` read the
+        static volume factor instead (01198: S1 = 0.2 for 0.28). The live size is
+        read from the compartment's promoted-species column, its expression column
+        or, for an event-resized compartment, which is hidden from the species
+        output (GH #71), its observable column, as the loader's map says. The
+        column itself is left as it is. No-op with no such species, and for a 3-D
+        stack.
         """
         model = model or self._model
         tmap = getattr(model, "_varvol_target_amount_map", None)
@@ -4003,6 +4005,7 @@ class Simulator:
             return
         sp_idx = {n: i for i, n in enumerate(species_names)}
         expr_idx = {n: i for i, n in enumerate(result._expression_names or [])}
+        obs_idx = {n: i for i, n in enumerate(result._observable_names or [])}
         amount_factor = result._varvol_amount_factor or {}
         for s_name, (kind, c_name) in tmap.items():
             j = sp_idx.get(s_name)
@@ -4011,6 +4014,9 @@ class Simulator:
             if kind == "species":
                 k = sp_idx.get(c_name)
                 v_live = result._species[:, k] if k is not None else None
+            elif kind == "observable":
+                k = obs_idx.get(c_name)
+                v_live = result._observables[:, k] if k is not None else None
             else:
                 k = expr_idx.get(c_name)
                 v_live = result._expressions[:, k] if k is not None else None
@@ -4039,6 +4045,10 @@ class Simulator:
             and ``[X]`` is already correct, but the bare ``X`` amount must be
             ``raw·V_live`` (RoadRunner's amount), NOT the ``raw·V_static`` the
             volume factor gives → record a live-volume amount factor.
+
+        A hOSU=false species a rule sets is not in this map: it is no count, its
+        rescale runs under SSA too, and :meth:`_apply_varvol_target_amount_map`
+        records its amount factor under every method.
 
         The event-promoted compartment is hidden from species output (GH #71) but
         is emitted as a same-named OBSERVABLE, so V_live(t) is read from there.
