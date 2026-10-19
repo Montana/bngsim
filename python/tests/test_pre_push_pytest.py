@@ -1,7 +1,8 @@
 """The pre-push hook runs the whole suite in parallel (ci/pre_push_pytest.py).
 
-Serially the hook took 44m29s; under pytest-xdist, one file per worker, 4m42s
-with the same result. These pin what that rests on: the hook still runs all of
+Serially the hook took 44m29s; under pytest-xdist, 4m42s with the same
+result, and work stealing (``--dist worksteal``) cut a corpus-less run from
+304 s to 184 s. These pin what that rests on: the hook still runs all of
 ``python/tests`` (nothing was dropped to get the speed), a worktree reuses the
 main checkout's test cache (a cold one took 19m15s, waiting on macOS to check
 each new ``.dylib``), and a venv without xdist is told so at once instead of
@@ -66,16 +67,16 @@ def _run_main(
     return code, ran, seen[0] if seen else None
 
 
-def test_with_xdist_the_whole_suite_runs_one_file_per_worker(monkeypatch):
+def test_with_xdist_the_whole_suite_runs_with_work_stealing(monkeypatch):
     monkeypatch.delenv(pre_push.WORKERS_ENV, raising=False)
     code, ran, _ = _run_main(monkeypatch, have_xdist=True)
     assert code == 7, "main() must return the suite's own exit code"
-    assert ran == [[*SERIAL, "-n", "12", "--dist", "loadfile"]]
+    assert ran == [[*SERIAL, "-n", "12", "--dist", "worksteal"]]
 
 
 def test_the_worker_count_comes_from_the_environment(monkeypatch):
     monkeypatch.setenv(pre_push.WORKERS_ENV, " 4 ")
-    expected = [[*SERIAL, "-n", "4", "--dist", "loadfile"]]
+    expected = [[*SERIAL, "-n", "4", "--dist", "worksteal"]]
     assert _run_main(monkeypatch, have_xdist=True)[1] == expected
     monkeypatch.setenv(pre_push.WORKERS_ENV, "")
     assert _run_main(monkeypatch, have_xdist=True)[1][0][5:7] == ["-n", "12"]

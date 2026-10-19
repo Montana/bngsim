@@ -237,8 +237,8 @@ push, run via `uv run`) with:
 uv run pre-commit install
 ```
 
-The push hook runs the whole suite in parallel through pytest-xdist, one test
-file per worker (`ci/pre_push_pytest.py`). That takes about five minutes where a
+The push hook runs the whole suite in parallel through pytest-xdist, with work
+stealing (`ci/pre_push_pytest.py`). That takes three to five minutes where a
 serial run takes about 45. It uses the main checkout's test cache from a
 worktree too, because a cold cache costs a worktree's first push about 15
 minutes (see below). `BNGSIM_PREPUSH_WORKERS=4 git push` sets the worker count,
@@ -246,6 +246,14 @@ and `BNGSIM_PREPUSH_WORKERS=0` runs the suite serially in one process, for a
 failure that might depend on what ran before it. A venv synced before
 pytest-xdist joined the `test` extra stops the push with a message;
 `uv sync --extra dev` (plus any groups you use) brings it in.
+
+CI splits each Python leg into two jobs. conftest reads `BNGSIM_TEST_SHARD=k/2`
+and keeps shard k's test files, so every collected test runs in exactly one
+job, and a third job per leg sums the two for the test-count guard. Files are
+balanced on `ci/test_durations.json`. When the two jobs of a leg drift apart,
+refresh it from a CI run's junit reports, which are in the `python-tests-log-*`
+artifacts: `python3 ci/test_durations.py python-tests-*.xml`. A stale table only
+unbalances the shards; it never drops a test.
 
 ### The suite's artifact caches are its own
 
