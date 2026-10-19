@@ -247,6 +247,20 @@ failure that might depend on what ran before it. A venv synced before
 pytest-xdist joined the `test` extra stops the push with a message;
 `uv sync --extra dev` (plus any groups you use) brings it in.
 
+A push skips the suite when every file it changes, deleted files included, is
+under `changelog.d/` or is one of `LICENSE`, `NOTICE`, `ACKNOWLEDGMENTS.md`,
+`CONTRIBUTORS.md`, `REPRODUCING.md`, `.readthedocs.yaml` or `.clang-format`
+(`SKIPPABLE` in `ci/pre_push_pytest.py`), or when it changes no file at all (an
+empty commit to re-run CI). The suite never reads those files, and the
+`changelog-fragments` hook still checks the fragments. The hook then passes at
+once, without starting pytest. Anything else runs the suite, docs included,
+because it runs the examples in `README.md` and `docs/`. The script diffs the
+pushed commit against the one the remote already has, so a force-push that takes
+a change away counts that change, and `python/tests/test_pre_push_pytest.py`
+pins the list against every tracked file. It also runs the suite when the pushed
+commit is not the one checked out, since the checkout is what it tests, and when
+there is no range at all, as in `pre-commit run pytest --hook-stage pre-push`.
+
 CI splits each Python leg into two jobs. conftest reads `BNGSIM_TEST_SHARD=k/2`
 and keeps shard k's test files, so every collected test runs in exactly one
 job, and a third job per leg sums the two for the test-count guard. Files are
