@@ -110,6 +110,36 @@ def test_the_sensitivity_of_a_model_with_an_event_is_refused():
     _refused(lambda: sim.steady_state(sensitivity_params=["kd"]), "1 event")
 
 
+# A compartment size that switches on a species, with no event of the model's
+# own: the loader keeps the amounts in it across each jump with an event (issue
+# #1054), one each way.
+SIZE_JUMP = (
+    "compartment c = 1; compartment cv; cv := piecewise(1 + 0.1*S, S > 3, 1 + 0.2*S)\n"
+    "species S in c = 10; species Sn in cv = 5; k = 0.5\nJ0: S -> ; k*S*c\n"
+)
+
+
+def test_a_compartment_size_that_jumps_is_refused_by_name():
+    """The refusal said "it has 2 events" of a model with none."""
+    from bngsim._bngsim_core import SteadyStateOptions, find_steady_state
+
+    model = bngsim.Model.from_antimony_string(SIZE_JUMP)
+    assert model.n_events == 2
+    sim = bngsim.Simulator(model, method="ode")
+    with pytest.raises(bngsim.SimulationError, match=r"\(issue #710\)") as err:
+        sim.steady_state()
+    assert "the size of compartment cv, which an assignment rule sets, jumps" in str(err.value)
+    assert "event" not in str(err.value)
+    with pytest.raises(RuntimeError, match=r"the size of compartment 'cv'.*issue #710"):
+        find_steady_state(model._core, SteadyStateOptions())
+
+
+def test_an_event_beside_a_compartment_size_that_jumps_is_counted_alone():
+    model = bngsim.Model.from_antimony_string(SIZE_JUMP + "E1: at (time >= 1): k = 0.4\n")
+    assert model.n_events == 3
+    _refused(bngsim.Simulator(model, method="ode").steady_state, r"it has 1 event\.")
+
+
 def test_a_batch_is_refused_for_both(tmp_path):
     """steady_state_batch came back converged at [1, 6e-9] and at A = 0."""
     ramped = bngsim.Simulator(_ramped(tmp_path), method="ode")

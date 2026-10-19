@@ -4593,6 +4593,27 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // side read at t = 0, and fire no event. A model that reads the time has no
     // f(y) = 0 without a time being chosen, and an event needs a trajectory:
     // `k*(1 - exp(-time()))` came back at its initial state as converged.
+    //
+    // A compartment size that jumps (issue #1054) keeps its species' amounts
+    // through an event the loader adds, which is no event of the model's own,
+    // so it is named for what it is.
+    bool own_event = false;
+    std::string jumps;
+    for (const auto &ev : model.events()) {
+        if (ev.size_jump_compartment.empty()) {
+            own_event = true;
+        } else if (jumps.empty()) {
+            jumps = ev.size_jump_compartment;
+        }
+    }
+    if (!own_event && !jumps.empty()) {
+        throw std::runtime_error(
+            "Cannot find steady state: the size of compartment '" + jumps +
+            "', which an assignment rule sets, jumps where a piecewise the rule reads switches, "
+            "and the amounts in it are kept there by a rescale of their concentrations that the "
+            "steady-state solvers never make (issue #1054, issue #710). Integrate it with "
+            "run().");
+    }
     if (model.n_events() > 0 || model.functions_use_time()) {
         throw std::runtime_error(
             "Cannot find steady state: the model has an event or reads the time, and the "
