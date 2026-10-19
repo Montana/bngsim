@@ -9595,7 +9595,9 @@ class SteadyStateResult:
     state_switch_roots_dropped : bool
         Whether the march stopped rooting those conditions after 1000
         crossings, as a state that slides along its threshold makes, and
-        marched over the switch from there as it did before #904.
+        marched over the switch from there as it did before #904. If that
+        march ends further from a steady state than where it stopped
+        rooting, the state there is returned.
     n_residual_species : int
         How many species entered ``||f||_2 / n`` — ``n_species`` unless
         ``steady_state(mask=...)`` restricted it (issue #74). Assert on this

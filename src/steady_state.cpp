@@ -1048,7 +1048,7 @@ class SteadyStateMarcher {
                 // A rate-law condition crossed (issue #904): start again on the
                 // root, as run() does on one, so the steps after it read the
                 // law on its new side and not a history across the switch.
-                if (!restart_on_root()) {
+                if (!restart_on_root(resid)) {
                     integrator_failed_ = true;
                     break;
                 }
@@ -1096,6 +1096,21 @@ class SteadyStateMarcher {
 
         if (!converged) {
             *residual_out = compute_residual(rhs_, y_data, ns_, sub_);
+            // Marched over a switch the state slides along (past
+            // MAX_ROOT_RESTARTS) and ended further from a steady state than
+            // where it stopped rooting: BDF with a history across the switch
+            // can run away there: an SBML slide, held at S = 0.5 by its flow
+            // from both sides, came back at S = 253 under jacobian="fd" and
+            // rtol 1e-8, a value its flow (at most 2) cannot reach. Neither is
+            // a steady state; return the state where it stopped rooting,
+            // which is where the flow holds it.
+            if (roots_dropped_ && step_budget_ < 0 && !(*residual_out <= dropped_residual_)) {
+                std::copy(dropped_at_.begin(), dropped_at_.end(), y_data);
+                *residual_out = dropped_residual_;
+                if (CVodeReInit(cvode_mem_, t_, y_) != CV_SUCCESS) {
+                    integrator_failed_ = true;
+                }
+            }
         }
         return converged;
     }
@@ -1191,10 +1206,15 @@ class SteadyStateMarcher {
     // MAX_ROOT_RESTARTS of them, root no more and go on as the march went
     // before it rooted anything: with its history, over the switch. A fresh
     // start on a threshold the state slides along is what the history spares
-    // it; one failed the corrector at hmin there.
-    bool restart_on_root() {
+    // it; one failed the corrector at hmin there. The state and residual
+    // where it stops rooting are kept, for a march that then ends further
+    // from a steady state than that (see the end of march()).
+    bool restart_on_root(double residual) {
         if (++root_restarts_ > MAX_ROOT_RESTARTS) {
             roots_dropped_ = true;
+            const double *y_data = y_.data();
+            dropped_at_.assign(y_data, y_data + ns_);
+            dropped_residual_ = residual;
             return CVodeRootInit(cvode_mem_, 0, nullptr) == CV_SUCCESS;
         }
         long int nst = 0, nfe = 0;
@@ -1300,6 +1320,9 @@ class SteadyStateMarcher {
     std::vector<int> state_switch_roots_;
     int root_restarts_ = 0;
     bool roots_dropped_ = false;
+    // The state, and its residual, where the march stopped rooting.
+    std::vector<double> dropped_at_;
+    double dropped_residual_ = 0.0;
     // A march stopped for not settling after its stagnation escapes.
     bool stalled_ = false;
 };

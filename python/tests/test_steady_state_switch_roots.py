@@ -187,3 +187,26 @@ def test_an_sbml_window_on_the_approach_is_integrated_over(spelling):
         t_span=(0, 80), n_points=2
     )
     assert np.asarray(run.species)[-1, 1] == pytest.approx(Y_SS, rel=1e-5)
+
+
+SBML_SLIDE = """
+compartment c = 1; species S in c; S = 0;
+R1: -> S; piecewise(2, S < 0.5, 0)
+R2: S -> ; S
+"""
+
+
+def test_a_march_over_a_slide_that_runs_away_returns_where_it_stopped_rooting():
+    """The SBML form of the slide above. Past 1000 crossings the march goes
+    on over the switch with its history, and under the difference quotient
+    at rtol 1e-8 BDF ran away there: S came back at 253, which a flow of at
+    most 2 cannot reach. Unconverged either way; the state returned is now
+    the one where the march stopped rooting, on the threshold."""
+    model = bngsim.Model.from_antimony_string(SBML_SLIDE)
+    out = bngsim.Simulator(model, method="ode", jacobian="fd").steady_state(
+        rtol=1e-8, max_time=1e6
+    )
+    assert out.state_switch_roots_dropped
+    assert not out.converged
+    assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+    assert out.residual == pytest.approx(0.5, abs=1e-3)
