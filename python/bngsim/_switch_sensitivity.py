@@ -5267,6 +5267,18 @@ def _bend_branches(atom: str) -> list[str]:
     return [piece + atom[cursor:] for piece in out]
 
 
+def _call_turn_pieces(call: str) -> list[str]:
+    """The roots that stand for a step or bend *call*: each of its
+    :func:`_turn_atoms`, cut at its own edges or unfolded into its bend's
+    branches (issue #1068). What :func:`state_switch_root_conditions` roots
+    and :func:`state_switch_reactions` reads, so the two cannot drift apart."""
+    return [
+        piece
+        for atom in _turn_atoms(call)
+        for piece in (_monotone_pieces(atom) or _bend_branches(atom) or [atom])
+    ]
+
+
 def _iter_step_calls(
     expr: str,
     outermost: bool = False,
@@ -7693,7 +7705,10 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     """For each condition, the 0-based functional reactions whose rate law reads it.
 
     Parallel to ``conditions`` (the list :func:`state_switch_conditions`
-    returns), for ``SolverOptions.set_state_switch_reactions``. The solver asks
+    returns, and the stops a run with sensitivities adds for step and bend
+    calls), for ``SolverOptions.set_state_switch_reactions``. A law reads a stop
+    when it holds a step call rooted there; a bend lists no law, since it does
+    not jump. The solver asks
     whether a crossing is continuous of these reactions' flux alone (issue
     #763). Asked of every species' whole dx/dt, a species the switch never
     touches decided it: one whose rate law cancels internally (``0.3*P -
@@ -7746,14 +7761,23 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
         return out
     for rxn in ctx["functional_reactions"]:
         flat = inline(str(rxn.get("rate_expr", "")))
-        if not _IF_CALL.search(flat):
-            continue
         hit: set[int] = set()
-        for written in _iter_condition_atoms(flat):
-            for whole in _split_logical_atoms(written):
-                # The edges a turning residual is rooted at (issue #904) are
-                # read by the rate law that reads the whole atom.
-                for atom in (whole, *_monotone_pieces(whole)):
+        if _IF_CALL.search(flat):
+            for written in _iter_condition_atoms(flat):
+                for whole in _split_logical_atoms(written):
+                    # The edges a turning residual is rooted at (issue #904) are
+                    # read by the rate law that reads the whole atom.
+                    for atom in (whole, *_monotone_pieces(whole)):
+                        hit.update(wanted.get(surface(atom) or "", ()))
+        # A step call jumps the law that holds it at the roots that stand for
+        # it (issue #1068). sign() over the state has an analytic sensitivity
+        # right-hand side since issue #1128, so the solver applies that jump, and
+        # it reads it from the laws listed here. Unlisted, the jump was read
+        # against the largest |dx/dt| anywhere: a 1e8-molecule pool turning over
+        # beside it took the saltation term away, and dX/dk came back 96% off.
+        if _STEP_CALL.search(flat):
+            for call, _arg in _iter_step_calls(flat):
+                for atom in _call_turn_pieces(call):
                     hit.update(wanted.get(surface(atom) or "", ()))
         for i in hit:
             out[i].append(int(rxn["rxn_idx"]))
@@ -7860,9 +7884,6 @@ def state_switch_root_conditions(
     # A covered step or bend call of a clock (issue #869) is stopped on at each
     # of its jumps, and covers the roots that stand for them and for the calls
     # inside it (issue #1068).
-    def pieces(atom: str) -> list[str]:
-        return _monotone_pieces(atom) or _bend_branches(atom) or [atom]
-
     def is_call(text: str) -> bool:
         return bool(_STEP_CALL.match(text) or _BEND_CALL.match(text)) and (
             _find_close_paren_strict(text, text.index("(")) == len(text) - 1
@@ -7871,7 +7892,7 @@ def state_switch_root_conditions(
     def call_atoms(text: str) -> list[str]:
         if not is_call(text):
             return []
-        return [p for atom in _turn_atoms(text) for p in pieces(atom)]
+        return _call_turn_pieces(text)
 
     # One atom is met again from every rate law and function that reads it, and
     # a min() of two inlined assignment rules has a residual 11k characters

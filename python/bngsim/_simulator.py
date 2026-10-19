@@ -2732,11 +2732,12 @@ class Simulator:
         as stops (issue #1068). ``max(0, 1 - abs(T-50.005)/0.005)`` over a
         counter that is not a clock is a pulse a step spanned, and the run
         returned Y = 0 with its columns, while the plain run, which roots it,
-        was right. The pulse is continuous, so no rate law is listed for these
-        and the solver jumps none of them. A surface a condition above already
-        roots is not added again. A bend has no analytic sensitivity RHS, so
-        the columns are CVODES' difference quotient, which can still read a
-        narrow one wrong (issue #1126).
+        was right. The pulse is continuous, so no rate law is listed for a bend
+        and the solver jumps none of them; a step call lists the laws that hold
+        it, and its jump is applied (issue #1128). A surface a condition above
+        already roots is not added again. A bend has no analytic sensitivity
+        RHS, so the columns are CVODES' difference quotient, which can still
+        read a narrow one wrong (issue #1126).
 
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
@@ -2793,7 +2794,7 @@ class Simulator:
         if conditions or stops:
             opts.set_state_switch_conditions([*conditions, *stops])
             try:
-                reactions = state_switch_reactions(core, conditions)
+                reactions = state_switch_reactions(core, [*conditions, *stops])
             except Exception as e:  # pragma: no cover - defensive
                 # Without the map the solver judges each crossing's continuity
                 # over the whole right-hand side, as it did before issue #763.
@@ -2803,10 +2804,11 @@ class Simulator:
                     e,
                 )
             else:
-                # A stop lists no rate law, so the solver takes its crossing as
-                # continuous. A bend is; a step call over state has no analytic
-                # sensitivity right-hand side, so its run is refused before this.
-                opts.set_state_switch_reactions([*reactions, *([] for _ in stops)])
+                # A stop lists the laws whose step call jumps there: sign() over
+                # the state has an analytic sensitivity right-hand side (issue
+                # #1128), so the solver applies its jump. A bend lists none, so
+                # its crossing is taken as continuous, which it is.
+                opts.set_state_switch_reactions(reactions)
 
     def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).
