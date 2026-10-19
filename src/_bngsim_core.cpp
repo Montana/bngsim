@@ -3355,7 +3355,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "Set the initial-condition seeds dx_i(0)/dp as (species_idx0, param_idx0, "
             "coefficient) triples, as SolverOptions.set_ic_param_sens does for a time "
             "course. A conserved total moves with them (issue #704).")
-        .def_readwrite("steady_state_mask", &bngsim::SteadyStateOptions::steady_state_mask);
+        .def_readwrite("steady_state_mask", &bngsim::SteadyStateOptions::steady_state_mask)
+        .def_readwrite("state_switch_conditions",
+                       &bngsim::SteadyStateOptions::state_switch_conditions,
+                       "Rate-law conditions over model state the march roots, so a "
+                       "window on the approach is not stepped over (issue #904).");
 
     // --- SteadyStateResult ---
     py::class_<bngsim::SteadyStateResult>(m, "SteadyStateResultCore")
@@ -3447,6 +3451,9 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("sens_mask_held_species", &bngsim::SteadyStateResult::sens_mask_held_species)
         .def_readonly("sens_mask_reader_species",
                       &bngsim::SteadyStateResult::sens_mask_reader_species)
+        .def_readonly("n_state_switch_roots", &bngsim::SteadyStateResult::n_state_switch_roots)
+        .def_readonly("state_switch_roots_dropped",
+                      &bngsim::SteadyStateResult::state_switch_roots_dropped)
         .def_property_readonly(
             "sensitivity_data",
             [](const bngsim::SteadyStateResult &r) {
