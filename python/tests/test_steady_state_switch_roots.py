@@ -1,0 +1,212 @@
+"""The steady-state march roots the rate-law conditions a plain run roots (issue #904).
+
+A rate law switched by a comparison over model state is constant on each side
+of its switch, so a step that spans a narrow window reads it as off at both
+ends, and the window is lost at every tolerance. ``run()`` roots each such
+condition since #897. ``steady_state()``'s march built its own integrator and
+rooted nothing: with Y made at k while ``0.5 < S < 0.505`` and S
+decaying from 1, ``steady_state()`` returned Y = 0 with ``converged=True``,
+where a run gives 2·k·ln(1.01) = 0.1990.
+
+Each condition is now rooted in the march too, and the march restarts on each
+crossing, as a run does. Every expected value is a closed form.
+"""
+
+from __future__ import annotations
+
+import math
+
+import bngsim
+import numpy as np
+import pytest
+
+K, KD, LO, HI = 10.0, 0.5, 0.5, 0.505
+# S = exp(-kd·t), so S is in (LO, HI) for ln(1/HI)/kd < t < ln(1/LO)/kd, and Y
+# gains k over that stretch.
+Y_SS = K * math.log(HI / LO) / KD
+
+NET = """begin parameters
+    1 k   {k!r}
+    2 kd  {kd!r}
+    3 lo  {lo!r}
+    4 hi  {hi!r}
+end parameters
+begin functions
+    1 r() {law}
+end functions
+begin species
+    1 S() 1
+    2 Y() 0
+end species
+begin reactions
+    1 1 0 kd
+    2 0 2 r
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+LAWS = {
+    "two-atoms": "if((Sobs>lo)&&(Sobs<hi),k,0)",
+    "abs-window": "if(abs(Sobs-(lo+hi)/2)<(hi-lo)/2,k,0)",
+    "as-a-number": "k*((Sobs>lo)*(Sobs<hi))",
+}
+
+
+def _model(tmp_path, law):
+    path = tmp_path / "window.net"
+    path.write_text(NET.format(k=K, kd=KD, lo=LO, hi=HI, law=law))
+    return bngsim.Model.from_net(path)
+
+
+@pytest.mark.parametrize("spelling", sorted(LAWS))
+def test_a_window_on_the_approach_is_integrated_over(tmp_path, spelling):
+    """Y was 0 with converged=True, in every spelling."""
+    out = bngsim.Simulator(_model(tmp_path, LAWS[spelling]), method="ode").steady_state()
+    assert out.converged
+    y = np.asarray(out.concentrations)
+    assert y[1] == pytest.approx(Y_SS, rel=1e-5)
+    assert abs(y[0]) < 1e-6
+    assert out.n_state_switch_roots >= 2
+    assert not out.state_switch_roots_dropped
+
+
+@pytest.mark.parametrize("spelling", sorted(LAWS))
+def test_the_march_agrees_with_a_run(tmp_path, spelling):
+    """The same model run long enough to settle."""
+    model = _model(tmp_path, LAWS[spelling])
+    run = bngsim.Simulator(model, method="ode").run(t_span=(0, 80), n_points=2)
+    out = bngsim.Simulator(_model(tmp_path, LAWS[spelling]), method="ode").steady_state()
+    assert np.asarray(out.concentrations)[1] == pytest.approx(
+        np.asarray(run.species)[-1, 1], rel=1e-5
+    )
+
+
+def test_a_batch_entry_roots_its_own_window(tmp_path):
+    """``steady_state_batch`` builds an integrator per entry; each one is
+    rooted, at its own k."""
+    sim = bngsim.Simulator(_model(tmp_path, LAWS["two-atoms"]), method="ode")
+    out = sim.steady_state_batch([{"k": 10.0}, {"k": 20.0}])
+    for r, k in zip(out, (10.0, 20.0), strict=True):
+        assert np.asarray(r.concentrations)[1] == pytest.approx(
+            k * math.log(HI / LO) / KD, rel=1e-5
+        )
+
+
+def test_a_model_with_no_condition_roots_nothing(tmp_path):
+    """Control."""
+    path = tmp_path / "plain.net"
+    path.write_text(NET.format(k=K, kd=KD, lo=LO, hi=HI, law="k*Sobs"))
+    out = bngsim.Simulator(bngsim.Model.from_net(path), method="ode").steady_state()
+    assert out.converged
+    assert out.n_state_switch_roots == 0
+    # dY/dt = k·S, integrated: k/kd.
+    assert np.asarray(out.concentrations)[1] == pytest.approx(K / KD, rel=1e-5)
+
+
+SLIDE = """begin parameters
+    1 kon  2.0
+    2 koff 1.0
+    3 thr  0.5
+end parameters
+begin functions
+    1 up() if(Sobs<thr,kon,0)
+end functions
+begin species
+    1 S() 0
+end species
+begin reactions
+    1 0 1 up
+    2 1 0 koff
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+@pytest.mark.parametrize("jacobian", ["analytical", "fd"])
+def test_a_state_held_on_its_threshold_ends_where_it_did(tmp_path, monkeypatch, jacobian):
+    """Control. S is made at 2 below 0.5 and not above, and removed at 1: the
+    flow points at the threshold from both sides, and there is no steady
+    state, only S held on 0.5. With the closed-form Jacobian the march parks
+    on it, where the residual is exactly 0 and CVODE asks no more of that
+    root. With the difference quotient it crosses back and forth, and past
+    1000 crossings it roots them no more and goes on over the switch. Either
+    way it ends where the march with nothing rooted ended: S on the threshold,
+    not converged. How near the threshold a march that slides along it stops
+    is the integrator's, and differs by platform (2.4e-5 above it on Linux CI,
+    1e-9 here), so it is held to 1e-3."""
+    path = tmp_path / "slide.net"
+    path.write_text(SLIDE)
+    out = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian=jacobian)
+    out = out.steady_state()
+    if jacobian == "analytical":
+        assert out.n_state_switch_roots <= 2
+        assert not out.state_switch_roots_dropped
+    else:
+        assert out.n_state_switch_roots == 1001
+        assert out.state_switch_roots_dropped
+    monkeypatch.setattr(bngsim.Model, "state_switch_root_conditions", lambda self: ())
+    before = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian=jacobian)
+    before = before.steady_state()
+    assert before.n_state_switch_roots == 0
+    assert not out.converged and not before.converged
+    assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+    assert np.asarray(before.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+
+
+ANTIMONY = """
+compartment c = 2; species S in c, Y in c; S = 1; Y = 0;
+k = {k!r}; kd = {kd!r}; lo = {lo!r}; hi = {hi!r};
+R1: S -> ; c*kd*S
+R2: -> Y; c*{law}
+"""
+
+SBML_LAWS = {
+    "two-atoms": "piecewise(k, (S > lo) && (S < hi), 0)",
+    "abs-window": "piecewise(k, abs(S - (lo + hi)/2) < (hi - lo)/2, 0)",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(SBML_LAWS))
+def test_an_sbml_window_on_the_approach_is_integrated_over(spelling):
+    """An SBML model's conditions are the loader's discontinuity triggers,
+    which a run roots, and not ``state_switch_root_conditions()``, which is
+    empty for it. The march rooted only the latter, so the same window read
+    from SBML still left Y at 0 with converged=True."""
+    text = ANTIMONY.format(k=K, kd=KD, lo=LO, hi=HI, law=SBML_LAWS[spelling])
+    model = bngsim.Model.from_antimony_string(text)
+    assert model.state_switch_root_conditions() == ()
+    out = bngsim.Simulator(model, method="ode").steady_state()
+    assert out.converged
+    assert np.asarray(out.concentrations)[1] == pytest.approx(Y_SS, rel=1e-5)
+    assert out.n_state_switch_roots >= 2
+    run = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
+        t_span=(0, 80), n_points=2
+    )
+    assert np.asarray(run.species)[-1, 1] == pytest.approx(Y_SS, rel=1e-5)
+
+
+SBML_SLIDE = """
+compartment c = 1; species S in c; S = 0;
+R1: -> S; piecewise(2, S < 0.5, 0)
+R2: S -> ; S
+"""
+
+
+def test_a_march_over_a_slide_that_runs_away_returns_where_it_stopped_rooting():
+    """The SBML form of the slide above. Past 1000 crossings the march goes
+    on over the switch with its history, and under the difference quotient
+    at rtol 1e-8 BDF ran away there: S came back at 253, which a flow of at
+    most 2 cannot reach. Unconverged either way; the state returned is now
+    the one where the march stopped rooting, on the threshold."""
+    model = bngsim.Model.from_antimony_string(SBML_SLIDE)
+    out = bngsim.Simulator(model, method="ode", jacobian="fd").steady_state(
+        rtol=1e-8, max_time=1e6
+    )
+    assert out.state_switch_roots_dropped
+    assert not out.converged
+    assert np.asarray(out.concentrations)[0] == pytest.approx(0.5, abs=1e-3)
+    assert out.residual == pytest.approx(0.5, abs=1e-3)

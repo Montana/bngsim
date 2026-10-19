@@ -600,7 +600,7 @@ _SPECIAL_FUNCTION_C_LINES = (
     "   Arguments the fraction cannot be trusted with are not answered wrongly:",
     "   they go to the asymptotic expansion below, which vouches for its own",
     "   accuracy, and are refused when that cannot either. Same rule as the C++",
-    "   uses -- see issues #453, #456 and #768. */",
+    "   uses -- see issues #453, #456, #768 and #1080. */",
     "/* Where the fraction can be trusted (issue #453). Outside this region it",
     "   converges to something that is not the ratio, with an error decay on the",
     "   way in that looks exactly like real convergence, so nothing downstream",
@@ -608,7 +608,10 @@ _SPECIAL_FUNCTION_C_LINES = (
     "   clause (issue #768). `a` a negative integer terminates the fraction",
     "   exactly (not a = 0, whose odd numerators start at k = 1 and never",
     "   vanish); `a <= 0` with `z <= 0` measured clean over 487 argument triples and is",
-    "   where BNG models live; b*b >= 64*|z*a| means the odd partial numerators",
+    "   where BNG models live, except past z = -20 with b - a < 1, where it loses",
+    "   about 10*eps*sqrt(-z)/(b - a) of the ratio and is refused here (issue",
+    "   #1080; the series below takes it to z = -700, the asymptotic route",
+    "   beyond); b*b >= 64*|z*a| means the odd partial numerators",
     "   are a contraction from the first step; |z| <= 20 was clean over 3400",
     "   hostile triples where the first failure anywhere is at 60. The 2*z <= b",
     "   companion for a positive z bounds the EVEN partial numerators, which the",
@@ -624,6 +627,9 @@ _SPECIAL_FUNCTION_C_LINES = (
     "    }",
     "    if (a < 0.0 && a == floor(a)) {",
     "        return 1;",
+    "    }",
+    "    if (a <= 0.0 && z < -20.0 && b - a < 1.0) {",
+    "        return 0;",
     "    }",
     "    if (a <= 0.0 && z <= 0.0) {",
     "        return 1;",
@@ -728,7 +734,14 @@ _SPECIAL_FUNCTION_C_LINES = (
     "    if (z < 0.0) {",
     "        x = -1.0 / z;",
     "        sum_num = bngsim_mratio_2f0(a + 1.0, a - b + 1.0, x, &err_num);",
-    "        sum_den = bngsim_mratio_2f0(a, a - b + 1.0, x, &err_den);",
+    "        /* a == 0 is M(0, b, z) = 1, all its expansion says, and exact: the",
+    "           zero-term rule would refuse it (issue #1080). */",
+    "        if (a == 0.0) {",
+    "            sum_den = 1.0;",
+    "            err_den = 0.0;",
+    "        } else {",
+    "            sum_den = bngsim_mratio_2f0(a, a - b + 1.0, x, &err_den);",
+    "        }",
     "        coeff = b / (-z);",
     "    } else {",
     "        if (a == 0.0) {",
@@ -796,7 +809,10 @@ _SPECIAL_FUNCTION_C_LINES = (
     "   zero of the ratio, where it is ill-conditioned anyway. The denominator is",
     "   summed times b so a tiny b cannot overflow it. Each term ratio is below",
     "   2*x/(k+1), so from k + 1 >= 4*x on the rest of a series is no larger than",
-    "   its last term. Kept identical to mratio_series in src/expression.cpp,",
+    "   its last term. Past |z| = 20 it takes one more corner, a <= 0 and",
+    "   b - a < 1 out to z = -700, where the fraction's loss goes on and grows:",
+    "   there every term of both series is positive and none overflows. Kept",
+    "   identical to mratio_series in src/expression.cpp,",
     "   which carries the full note and the measurements; the NaN test is a",
     "   comparison for the reason at bngsim_mratio_is_finite. */",
     "static int bngsim_mratio_series(double a, double b, double z, double *out) {",
@@ -808,7 +824,7 @@ _SPECIAL_FUNCTION_C_LINES = (
     "    double sd = b;",
     "    double ad = b;",
     "    int k;",
-    "    if (!(b > 0.0) || !bngsim_mratio_is_finite(b) || z == 0.0 || !(fabs(z) <= 20.0)) {",
+    "    if (!(b > 0.0) || !bngsim_mratio_is_finite(b) || z == 0.0) {",
     "        return 0;",
     "    }",
     "    x = z > 0.0 ? z : -z;",
@@ -817,7 +833,10 @@ _SPECIAL_FUNCTION_C_LINES = (
     "    if (!(alpha > -1.0 && alpha < 1.0)) {",
     "        return 0;",
     "    }",
-    "    for (k = 0; k < 1000; ++k) {",
+    "    if (!(x <= 20.0) && !(z < 0.0 && a <= 0.0 && x <= 700.0)) {",
+    "        return 0;",
+    "    }",
+    "    for (k = 0; k < 3000; ++k) {",
     "        tn = tn * ((alpha + shift + k) / (b + 1.0 + k)) * (x / (k + 1.0));",
     "        if (k == 0) {",
     "            td = alpha * x;",
@@ -898,7 +917,11 @@ _SPECIAL_FUNCTION_C_LINES = (
     "        if (fabs(D) < tiny) {",
     "            D = tiny;",
     "        }",
-    "        C = 1.0 + p / Csave;",
+    "        /* C_1 = 1 + 1/tiny stands for infinity, so C_2 = 1 exactly; taking",
+    "           p/C_1 literally added p*1e-32, which a b below about 1e-22 makes",
+    "           far from nothing (issue #1080). An infinite p_2 keeps the old",
+    "           arithmetic and its NaN. Same as the C++. */",
+    "        C = (j == 2 && fabs(p) <= 1.7976931348623157e308) ? 1.0 : 1.0 + p / Csave;",
     "        if (fabs(C) < tiny) {",
     "            C = tiny;",
     "        }",
@@ -1141,6 +1164,9 @@ def _shard_value_lines(
 # ─── Expression scanning ────────────────────────────────────────────────
 
 
+_PAREN = re.compile(r"[()]")
+
+
 def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     """Return the index of the ')' that matches '(' at ``expr[open_pos]``,
     or -1 if the parens are unbalanced.
@@ -1150,18 +1176,19 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     unbalanced input so the caller can keep slicing. The callers here (the
     derived-expression and switch-condition parsers, the JAX translator) need to
     fail loudly instead, hence the separate function.
+
+    It visits the parentheses alone: an inlined min() of two assignment rules
+    runs to 11k characters, and a visit per character cost the state-switch
+    scan 45 ms on BIOMD0000000385 (issue #1068).
     """
     depth = 1
-    i = open_pos + 1
-    while i < len(expr):
-        c = expr[i]
-        if c == "(":
+    for m in _PAREN.finditer(expr, open_pos + 1):
+        if m.group() == "(":
             depth += 1
-        elif c == ")":
+        else:
             depth -= 1
             if depth == 0:
-                return i
-        i += 1
+                return m.start()
     return -1
 
 
@@ -8181,7 +8208,10 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "Forward sensitivity: %s, so the analytic sensitivity RHS is declined for "
         "this model and CVODES' internal difference quotient is used instead "
         "(correct, but slower, where every rate law is continuous in the state along "
-        "the run. A time course is refused for the jumps that are found in the rate "
+        "the run, though a column can still be wrong where a min(), max(), abs() or "
+        "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
+        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
+        "for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -11318,10 +11348,13 @@ def _analyze_output_sens(model) -> dict:
     loudly rather than silently dropping the term).
 
     Returns a dict with ``decline`` (non-None ⇒ the whole codegen is declined,
-    mirroring :func:`generate_outputs_from_model`'s rateOf / embedded-tfun /
-    no-function declines), ``func_infos`` (per-function ``{name, supported,
-    reason, partials}`` in declaration order), and the emitter context. **Treat
-    the returned dict as read-only** — every caller now shares one instance.
+    mirroring :func:`generate_outputs_from_model`'s embedded-tfun / no-function
+    declines), ``func_infos`` (per-function ``{name, supported, reason,
+    partials}`` in declaration order), and the emitter context. **Treat the
+    returned dict as read-only** — every caller now shares one instance.
+
+    A function that reads ``rateOf`` is unsupported on its own, and so is one
+    that depends on it; the rest of the model is not declined (issue #787).
 
     Memoized on the model (GH #97) for cost *and* for correctness. Both callers
     above run it, so a sensitivity workflow paid it twice — 85.7 s twice on the
@@ -11403,15 +11436,14 @@ def _compute_output_sens_analysis(model, core) -> dict:
 
     if n_func == 0:
         return {"decline": "model has no global functions", "func_infos": [], **base}
-    # rateOf needs the live dx/dt buffer the RHS's probe passes publish; an
-    # output-point evaluation has none — the value codegen declines here too, so
-    # the internal obs[]/func[] recomputation cannot be emitted standalone.
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
-        return {
-            "decline": "model uses rateOf (live derivatives unavailable at an output point)",
-            "func_infos": [],
-            **base,
-        }
+    # rateOf needs the live dx/dt buffer the RHS's probe passes publish, and an
+    # output-point evaluation has none. That is a fact about the functions that
+    # read a rate, not about the model, so only they are unsupported (below),
+    # with every function that depends on them. A whole-model decline took the
+    # rest with them: the §8c dilution term of a concentration in a compartment
+    # whose size an assignment rule moves reads the rate of what the rule reads
+    # (issue #1052), so `C := 1 + P` with a concentration in C had no
+    # sensitivity for any expression, C's own size included (issue #787).
 
     # Whole-body tfun functions dispatch through data->tfun_eval (a *value*
     # callback only; table functions are intentionally not differentiated, so
@@ -11542,6 +11574,17 @@ def _compute_output_sens_analysis(model, core) -> dict:
                     "status": "unsupported",
                     "reason": "table-function output sensitivities are not supported "
                     "(table functions are not differentiated)",
+                    "partials": None,
+                }
+            )
+            continue
+        if _RATEOF_PREFIX in f["expression"]:
+            func_infos.append(
+                {
+                    "name": name,
+                    "status": "unsupported",
+                    "reason": "it reads rateOf, and the live derivatives it needs are "
+                    "not available at an output point",
                     "partials": None,
                 }
             )
@@ -11734,9 +11777,12 @@ def generate_output_sens_from_model(model) -> str | None:
     and value never diverge.
 
     Returns ``None`` (⇒ no symbol; expression selectors raise) when
-    :func:`_analyze_output_sens` declines (no functions / rateOf / embedded tfun).
+    :func:`_analyze_output_sens` declines (no functions / embedded tfun).
     Unsupported functions are emitted with a ``NaN`` sentinel so a result is never
-    silently wrong; the Result raises the targeted reason at selection time.
+    silently wrong; the Result raises the targeted reason at selection time. A
+    function that reads ``rateOf`` is one of them: its value is recomputed here
+    with each rate read as ``NAN``, since there is no live derivative to read,
+    and no supported function reads that value (issue #787).
     """
     analysis = _analyze_output_sens(model)
     if analysis["decline"] is not None:
@@ -11763,12 +11809,21 @@ def generate_output_sens_from_model(model) -> str | None:
 
     av_factor, av_param = _amount_volume_factors(species)
 
-    # Value recomputation (same emitters as the RHS / value codegen).
+    # Value recomputation (same emitters as the RHS / value codegen). A rate
+    # (rateOf) is read as NAN: the function that reads one is unsupported, and
+    # so is every function whose derivative would read its value, so the NAN
+    # reaches no row that is not NaN already. Left as it is, the token is an
+    # undeclared name in C.
     obs_value_lines = (
         _emit_observable_lines(observables, av_factor, av_param) if observables else []
     )
+    no_rates = (
+        {f"{_RATEOF_PREFIX}{s['name']}": "NAN" for s in species}
+        if any(_RATEOF_PREFIX in f["expression"] for f in functions)
+        else None
+    )
     func_value_lines = _emit_function_lines(
-        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, None
+        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, no_rates
     )
 
     # Parameter-axis contributions, grouped by the differentiated parameter index

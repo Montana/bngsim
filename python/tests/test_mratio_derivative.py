@@ -318,3 +318,61 @@ def test_a_refused_second_call_does_not_end_the_run(tmp_path):
     h = abs(z) * 1e-4
     fd = (species(z + h) - species(z - h)) / (2 * h)
     np.testing.assert_allclose(analytic, fd, rtol=1e-5, atol=1e-12)
+
+
+# ── Issue #1080: the derivative where the value's routes changed ─────────────
+
+SCALED_NET = """begin parameters
+    1 k     0.05  # Constant
+    2 zz    {z!r}  # Constant
+    3 scale {scale!r}  # Constant
+end parameters
+begin functions
+    1 law() k*mratio({a!r},{b!r},zz)*scale
+end functions
+begin species
+    1 A() 10.0
+end species
+begin reactions
+    1 1 0 law #_R1
+end reactions
+begin groups
+    1 A                    1
+end groups
+"""
+
+
+@pytest.mark.parametrize(
+    "a, b, z, ratio, rho",
+    [
+        # R and rho = R'(z)/R(z), from mpmath at 400 digits.
+        (-1e-12, 1e-9, -25.0, 5.562054719123343e-11, 0.28084130743545355),
+        (-1e-12, 1e-9, -1500.0, 6.671117048916142e-13, 0.0006671120025768456),
+        (
+            -4.119676222070549,
+            2.4225094582386945e-279,
+            -1.4540899212539904,
+            8.515249528874852e-280,
+            0.49160167101277846,
+        ),
+    ],
+    ids=["the series past z = -20", "the asymptotic route", "a tiny b in the fraction"],
+)
+def test_the_derivative_matches_the_reference_where_issue_1080_moved_the_value(
+    tmp_path, a, b, z, ratio, rho
+):
+    """With ``scale = 1/R`` the rate is k*A, so A = 10*e^(-k*t) and
+    dA/dzz = -k*t*rho*A exactly. The sensitivity runs through the generated
+    bngsim_mratio_dz, which is built from the calls issue #1080 changed. Before,
+    its dR/dz was 2.6e-6 off at the first row and meaningless at the third."""
+    p = tmp_path / "m1080d.net"
+    p.write_text(SCALED_NET.format(a=a, b=b, z=z, scale=1.0 / ratio))
+    with contextlib.redirect_stderr(io.StringIO()):
+        model = bngsim.Model.from_net(str(p))
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["zz"])
+    with contextlib.redirect_stderr(io.StringIO()):
+        r = sim.run(t_span=(0.0, 5.0), n_points=6, rtol=1e-12, atol=1e-14)
+    assert sim.has_analytic_sens_rhs
+    t = np.asarray(r.time)
+    expected = -0.05 * t * rho * 10.0 * np.exp(-0.05 * t)
+    np.testing.assert_allclose(np.asarray(r.sensitivities)[:, 0, 0], expected, rtol=1e-8, atol=0.0)

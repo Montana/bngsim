@@ -72,3 +72,11 @@ def test_bng_parity_licenses_match_source_repos():
         assert r["license"]["spdx"] == repo_spdx[r["origin"]["repo"]], (
             f"{r['id']}: license {r['license']['spdx']} != {repo_spdx[r['origin']['repo']]}"
         )
+
+
+def test_biomodels_licenses_are_cc0():
+    """BioModels dedicates its entire dataset to CC0, non-curated MODEL* included (#807)."""
+    for r in _load("biomodels")["records"]:
+        assert r["license"] == {"spdx": "CC0-1.0", "notice": None}, (
+            f"{r['id']}: license {r['license']}"
+        )
