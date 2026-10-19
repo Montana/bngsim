@@ -30,6 +30,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger("bngsim")
 
 
+def _empty_ssa_diagnostics() -> dict[str, Any]:
+    """SSA diagnostics dict for a result built from raw arrays: all zero/empty."""
+    return {
+        "n_negative_crossings": 0,
+        "first_negative_species": "",
+        "n_reverse_fires": 0,
+        "first_reverse_reaction": "",
+        "n_rounded_populations": 0,
+        "first_rounded_species": "",
+        # Nothing ran to say which backend evaluated the propensities;
+        # "interpreted" would name one that was never used.
+        "propensity_backend": "unknown",
+    }
+
+
 def _empty_psa_diagnostics() -> dict[str, Any]:
     """PSA diagnostics dict for a non-PSA (or non-SSA) run: inactive, all empty."""
     return {
@@ -264,7 +279,7 @@ class Result:
         _observable_names: list[str] | None = None,
         _expression_names: list[str] | None = None,
         _solver_stats: dict[str, int] | None = None,
-        _species_volume_factors: list[float] | None = None,
+        _species_volume_factors: list[float] | list[list[float]] | None = None,
         _seed: int | None = None,
         _ic_sensitivity_seed: dict[str, dict[str, float]] | None = None,
         # Sensitivity blocks (load / batch / stitch). All optional; absent ⇒
@@ -284,8 +299,9 @@ class Result:
         _reaction_propensity_integrals: NDArray | None = None,
         _reaction_labels: list[str] | None = None,
         # SSA diagnostics for a result built from raw arrays. ``squeeze`` passes
-        # the aggregate over its inputs; absent ⇒ the inert zero dict, whose
-        # backend reads "unknown" because nothing ran to say.
+        # the aggregate over its inputs and ``load`` the saved dict. Absent (a
+        # hand-built result, or a file that predates saving them) ⇒ the inert
+        # zero dict, whose backend reads "unknown" because nothing ran to say.
         _ssa_diagnostics: dict[str, Any] | None = None,
     ) -> None:
         self._core = core
@@ -445,17 +461,7 @@ class Result:
                 "n_dense_blas_factorizations": 0,
                 "steady_state_reached": 0,
             }
-            self._ssa_diagnostics = _ssa_diagnostics or {
-                "n_negative_crossings": 0,
-                "first_negative_species": "",
-                "n_reverse_fires": 0,
-                "first_reverse_reaction": "",
-                "n_rounded_populations": 0,
-                "first_rounded_species": "",
-                # A loaded or hand-built result ran nothing here, so no backend
-                # is known; "interpreted" would name one that was never used.
-                "propensity_backend": "unknown",
-            }
+            self._ssa_diagnostics = _ssa_diagnostics or _empty_ssa_diagnostics()
             self._psa_diagnostics = _empty_psa_diagnostics()
 
         # GH #198 — {function_name: unsupported_reason_or_None} for expression
@@ -469,8 +475,11 @@ class Result:
         # values (concentration = amount/V_c, per Phase 2's storage
         # convention) to amounts when the caller selects an `X` column.
         # Populated by Simulator.run; None means "treat as 1.0" which is
-        # correct for V=1 SBML and all .net models.
-        self._species_volume_factors: list[float] | None = _species_volume_factors
+        # correct for V=1 SBML and all .net models. A squeezed batch holds one
+        # such list per row, since a row may have written a size (issue #743).
+        self._species_volume_factors: list[float] | list[list[float]] | None = (
+            _species_volume_factors
+        )
 
         # GH #85: species_idx → live-volume column idx for species whose
         # concentration column has been rescaled to amount/V_live(t) (a
@@ -2372,8 +2381,9 @@ class Result:
             result loaded from a file that does not record compartment
             sizes (one written before bngsim saved them, issue #787).
         RuntimeError
-            Only if the result was loaded from disk and the array is
-            3-D batch-shaped (call :meth:`squeeze` per-row first).
+            If the result is a stacked batch (3-D species, from
+            :meth:`squeeze` or ``run_batch(..., squeeze=True)``); call this
+            on each row's Result from ``run_batch(..., squeeze=False)``.
 
         Warns
         -----
@@ -2697,6 +2707,28 @@ class Result:
                 f.create_dataset(
                     "ar_sensitivity_blocked", data=sorted(self._ar_sens_blocked), dtype=dt
                 )
+            # GH #155: the ∂x(0)/∂θ rows the parameter axis already carries, one
+            # (species, parameter, coefficient) entry per element. Without it a
+            # reloaded result reported None, "not recorded", and a caller adding
+            # its own initial-condition term could not tell which parameter
+            # columns already hold one. Written whenever it is recorded, empty
+            # included, because {} ("nothing seeds") is a different answer.
+            if self._ic_sensitivity_seed is not None:
+                seed_rows = [
+                    (sp, p, c)
+                    for sp, row in self._ic_sensitivity_seed.items()
+                    for p, c in row.items()
+                ]
+                f.create_dataset(
+                    "ic_sensitivity_seed_species", data=[e[0] for e in seed_rows], dtype=dt
+                )
+                f.create_dataset(
+                    "ic_sensitivity_seed_params", data=[e[1] for e in seed_rows], dtype=dt
+                )
+                f.create_dataset(
+                    "ic_sensitivity_seed",
+                    data=np.array([e[2] for e in seed_rows], dtype=np.float64),
+                )
 
             # Volume record (issue #787). as_roadrunner turns a stored species value
             # into an amount with its compartment's size, and into a concentration
@@ -2704,7 +2736,9 @@ class Result:
             # arrays above: without them a species of 4 in a compartment of size 2
             # loaded back with an amount of 4 for 8. The factor maps are keyed by
             # species column; each per-sample array is one column of a
-            # (time, entry) block, beside the column indices it belongs to. Each is
+            # (time, entry) block, beside the column indices it belongs to. A
+            # squeezed batch holds one record per row, so its sizes are a
+            # (sim, species) block and its factors (sim, time, entry). Each is
             # written only when the result carries it, so one that carries none
             # (built from raw arrays) loads back the same.
             if self._species_volume_factors is not None:
@@ -2726,8 +2760,8 @@ class Result:
                     f.create_dataset(f"{key}_species", data=np.array(cols, dtype=np.int64))
                     f.create_dataset(
                         key,
-                        data=np.column_stack(
-                            [np.asarray(fmap[j], dtype=np.float64) for j in cols]
+                        data=np.stack(
+                            [np.asarray(fmap[j], dtype=np.float64) for j in cols], axis=-1
                         ),
                     )
             # A result loaded from a file without the record keeps saying so when
@@ -2740,6 +2774,24 @@ class Result:
             stats_grp = f.create_group("solver_stats")
             for key, val in self._solver_stats.items():
                 stats_grp.attrs[key] = val
+
+            # SSA boundary diagnostics (GH #110), and the PSA diagnostics (GH #15)
+            # of a run that used partial scaling; every other result carries the
+            # inactive PSA dict, which load rebuilds. Without them a loaded SSA
+            # result reported 0 rounded populations for 1 and the propensity
+            # backend "unknown" for "cc", and a PSA run read as inactive. The
+            # per-reaction PSA lists are datasets, since an attribute holds at
+            # most 64 KiB, and the scalars attributes.
+            ssa_grp = f.create_group("ssa_diagnostics")
+            for key, val in self._ssa_diagnostics.items():
+                ssa_grp.attrs[key] = val
+            if self._psa_diagnostics.get("active"):
+                psa_grp = f.create_group("psa_diagnostics")
+                for key, val in self._psa_diagnostics.items():
+                    if isinstance(val, list):
+                        psa_grp.create_dataset(key, data=np.asarray(val))
+                    else:
+                        psa_grp.attrs[key] = val
 
             # Custom attrs (only string/numeric values)
             if self.custom_attrs:
@@ -2864,7 +2916,7 @@ class Result:
             # wrote them, so it is marked as not saying, and as_roadrunner refuses
             # the amounts that need them.
             volume_factors = (
-                [float(v) for v in f["species_volume_factors"][()]]
+                np.asarray(f["species_volume_factors"][()], dtype=np.float64).tolist()
                 if "species_volume_factors" in f
                 else None
             )
@@ -2879,7 +2931,7 @@ class Result:
                     return None
                 block = np.array(f[key], dtype=np.float64)
                 cols = np.array(f[f"{key}_species"])
-                return {int(j): block[:, c].copy() for c, j in enumerate(cols)}
+                return {int(j): block[..., c].copy() for c, j in enumerate(cols)}
 
             conc_factor = _factor_map("varvol_conc_factor")
             amount_factor = _factor_map("varvol_amount_factor")
@@ -2896,6 +2948,38 @@ class Result:
             elif "volume_record_missing" in f.attrs:
                 volume_record_missing = _text(f.attrs["volume_record_missing"])
 
+            # GH #155: absent ⇒ None, not recorded, as in a file that predates
+            # saving the seed.
+            ic_seed: dict[str, dict[str, float]] | None = None
+            if "ic_sensitivity_seed" in f:
+                ic_seed = {}
+                for sp, p, c in zip(
+                    _names("ic_sensitivity_seed_species") or [],
+                    _names("ic_sensitivity_seed_params") or [],
+                    f["ic_sensitivity_seed"][()],
+                    strict=True,
+                ):
+                    ic_seed.setdefault(sp, {})[p] = float(c)
+
+            # SSA / PSA diagnostics. A file that predates saving them loads the zero
+            # dicts a result built from raw arrays carries, and a key the file lacks
+            # keeps its zero value.
+            def _attr(value: Any) -> Any:
+                return value.item() if isinstance(value, np.generic) else value
+
+            ssa_diagnostics: dict[str, Any] | None = None
+            if "ssa_diagnostics" in f:
+                ssa_diagnostics = _empty_ssa_diagnostics()
+                for key, val in f["ssa_diagnostics"].attrs.items():
+                    ssa_diagnostics[key] = _attr(val)
+            psa_diagnostics = _empty_psa_diagnostics()
+            if "psa_diagnostics" in f:
+                psa_grp = f["psa_diagnostics"]
+                for key, val in psa_grp.attrs.items():
+                    psa_diagnostics[key] = _attr(val)
+                for key in psa_grp:
+                    psa_diagnostics[key] = np.array(psa_grp[key]).tolist()
+
         result = cls(
             core=None,
             _time=time,
@@ -2908,6 +2992,7 @@ class Result:
             _solver_stats=solver_stats,
             _species_volume_factors=volume_factors,
             _seed=seed,
+            _ic_sensitivity_seed=ic_seed,
             custom_attrs=custom_attrs,
             _sensitivities=sensitivities,
             _sensitivity_params=sensitivity_params,
@@ -2920,7 +3005,9 @@ class Result:
             _reaction_firing_counts=reaction_firing_counts,
             _reaction_propensity_integrals=reaction_propensity_integrals,
             _reaction_labels=reaction_labels,
+            _ssa_diagnostics=ssa_diagnostics,
         )
+        result._psa_diagnostics = psa_diagnostics
         # GH #221 — the NaN rows this file records as refusals, not as a failed
         # solve, so `gradient` keeps its zero-weight exemption after a round trip.
         result._ar_sens_refused = frozenset(ar_sens_refused)
@@ -3133,6 +3220,7 @@ class Result:
         prepended, e.g. ``sensitivities.shape == (n_sims, n_times, n_rows,
         n_cols)``; a block that is empty on the inputs stays empty. The
         parameter / IC-species name lists are taken from the first result.
+        Each row keeps its own compartment sizes and per-sample volume factors.
 
         Parameters
         ----------
@@ -3226,6 +3314,58 @@ class Result:
                 return np.empty((0, 0))
             return np.stack([getattr(r, attr) for r in results], axis=0)
 
+        # Each row's volume record (issue #787): its compartment sizes, which a
+        # batch row may have written (issue #743), one list per row, and its
+        # per-sample factors on a new leading sim axis. The stack took row 0's
+        # sizes for every row and none of the factors, so a batch over a size of
+        # 2 and 5 held 2 for both. A row's live-volume column is stacked as its
+        # amount factor, which as_roadrunner multiplies by in place of that
+        # column, so the rows need not agree on which species have which; a row
+        # without a factor another row has gets the one it reads instead: 1 for
+        # a concentration, its static size for an amount.
+        n_t = time.shape[0]
+        vfs = [r._species_volume_factors for r in results]
+        stack_vf = (
+            None
+            if all(v is None for v in vfs)
+            else [
+                np.asarray(v if v is not None else np.ones(len(species_names))).tolist()
+                for v in vfs
+            ]
+        )
+
+        def static_size(r: Result, j: int) -> NDArray[np.float64]:
+            vf = r._species_volume_factors
+            return np.full(n_t, vf[j] if vf is not None and j < len(vf) else 1.0, dtype=np.float64)
+
+        def stack_factors(
+            maps: list[dict[int, NDArray[np.float64]]],
+            fill: Callable[[Result, int], NDArray[np.float64]],
+        ) -> dict[int, NDArray[np.float64]] | None:
+            keys = sorted(set().union(*maps))
+            if not keys:
+                return None
+            return {
+                j: np.stack(
+                    [m[j] if j in m else fill(r, j) for r, m in zip(results, maps, strict=True)]
+                )
+                for j in keys
+            }
+
+        stack_conc = stack_factors(
+            [r._varvol_conc_factor or {} for r in results], lambda r, j: np.ones(n_t)
+        )
+        stack_amount = stack_factors(
+            [
+                {
+                    **{j: r._species[:, k] for j, k in (r._varvol_live_vol or {}).items()},
+                    **(r._varvol_amount_factor or {}),
+                }
+                for r in results
+            ],
+            static_size,
+        )
+
         out = Result(
             core=None,
             _time=time,
@@ -3236,7 +3376,7 @@ class Result:
             _observable_names=observable_names,
             _expression_names=expression_names,
             _solver_stats=agg_stats,
-            _species_volume_factors=results[0]._species_volume_factors,
+            _species_volume_factors=stack_vf,
             _seed=squeeze_seed,
             _ic_sensitivity_seed=squeeze_ic_seed,
             _sensitivities=stack_sens("_sensitivities"),
@@ -3265,6 +3405,13 @@ class Result:
         }
         out._ar_sens_blocked = frozenset().union(*(r._ar_sens_blocked for r in results))
         out._ar_sens_refused = frozenset().union(*(r._ar_sens_refused for r in results))
+        out._varvol_conc_factor = stack_conc
+        out._varvol_amount_factor = stack_amount
+        # A row loaded from a file that does not record its sizes leaves the
+        # stack's record incomplete, so the stack says so too.
+        out._volume_record_missing = next(
+            (r._volume_record_missing for r in results if r._volume_record_missing), None
+        )
         return out
 
     # ─── Dunder methods ─────────────────────────────────────────────
