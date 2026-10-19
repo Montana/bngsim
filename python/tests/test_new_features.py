@@ -397,6 +397,30 @@ def _reloaded(result: Result, path: Path) -> Result:
     return Result.load(path)
 
 
+# A batch whose rows write a static size and a rate-rule rate, so each row has
+# its own sizes and its own per-sample factors.
+_BATCH_MODEL = (
+    "compartment d = 2; species X in d = 4; X -> ; k*X; k = 0.1;"
+    " compartment c = 2; c' = g; g = 0.3; substanceOnly species S in c = 40;"
+    " S -> ; k*S;"
+)
+_BATCH_PARAMS = [{"d": 2.0, "g": 0.3}, {"d": 5.0, "g": 0.6}]
+
+
+def _row_of(stack: Result, i: int) -> Result:
+    """Row ``i`` of a stacked batch, as a single-run Result reading its own record."""
+    row = Result(
+        core=None,
+        _time=stack.time,
+        _species=stack.species[i],
+        _species_names=stack.species_names,
+        _species_volume_factors=stack._species_volume_factors[i],
+    )
+    row._varvol_conc_factor = {j: a[i] for j, a in (stack._varvol_conc_factor or {}).items()}
+    row._varvol_amount_factor = {j: a[i] for j, a in (stack._varvol_amount_factor or {}).items()}
+    return row
+
+
 class TestHdf5VolumeRecord:
     """A loaded Result reports the amounts and concentrations it was saved with."""
 
@@ -419,13 +443,9 @@ class TestHdf5VolumeRecord:
     @pytest.mark.parametrize("method", ["ode", "ssa"])
     def test_batch_rows_keep_their_own_sizes(self, method, tmp_path: Path):
         """Each row of a batch over a size and a rate-rule rate reloads with its own."""
-        model = Model.from_antimony_string(
-            "compartment d = 2; species X in d = 4; X -> ; k*X; k = 0.1;"
-            " compartment c = 2; c' = g; g = 0.3; substanceOnly species S in c = 40;"
-            " S -> ; k*S;"
-        )
+        model = Model.from_antimony_string(_BATCH_MODEL)
         sim = Simulator(model, method=method)
-        params = [{"d": 2.0, "g": 0.3}, {"d": 5.0, "g": 0.6}]
+        params = _BATCH_PARAMS
         kw = {"seed": 1} if method == "ssa" else {}
         rows = sim.run_batch(t_span=(0, 5), n_points=6, params=params, **kw)
         for i, row in enumerate(rows):
@@ -438,6 +458,33 @@ class TestHdf5VolumeRecord:
         stack = sim.run_batch(t_span=(0, 5), n_points=6, params=params, squeeze=True, **kw)
         loaded = _reloaded(stack, tmp_path / "stack.h5")
         np.testing.assert_array_equal(loaded.species, stack.species)
+
+    @pytest.mark.parametrize("methods", [("ode", "ode"), ("ssa", "ssa"), ("ode", "ssa")])
+    def test_each_row_of_a_stack_keeps_its_own_record(self, methods, tmp_path: Path):
+        """A stack of rows with different sizes holds each row's sizes and factors.
+
+        It held row 0's sizes for every row and none of the factors: 2 for the
+        size the second row set to 5. Nothing reads them on a stack today, since
+        as_roadrunner refuses one, so each row is read here through a single-run
+        Result built from its slice. The mixed pair records the live size two ways,
+        the ODE row as a species column and the SSA row as a concentration factor.
+        """
+        model = Model.from_antimony_string(_BATCH_MODEL)
+        rows = [
+            Simulator(model, method=method).run_batch(
+                t_span=(0, 5), n_points=6, params=[p], **({"seed": 1} if method == "ssa" else {})
+            )[0]
+            for method, p in zip(methods, _BATCH_PARAMS, strict=True)
+        ]
+        stack = Result.squeeze(rows)
+        for held in (stack, _reloaded(stack, tmp_path / "stack.h5")):
+            assert held._species_volume_factors == [r._species_volume_factors for r in rows]
+            for i, row in enumerate(rows):
+                cols = _every_column(row)
+                np.testing.assert_array_equal(
+                    np.asarray(_row_of(held, i).as_roadrunner(cols)),
+                    np.asarray(row.as_roadrunner(cols)),
+                )
 
     def test_a_file_without_the_record_refuses_an_amount(self, tmp_path: Path):
         """A file written before the record says nothing about the sizes.
@@ -477,12 +524,110 @@ class TestHdf5VolumeRecord:
         again = _reloaded(old, tmp_path / "again.h5")
         with pytest.raises(ValueError, match=r"amount 'S'.*bngsim 0\.11\.35"):
             again.as_roadrunner(["S"])
+        # A stack with such a row is missing that row's record, and says so.
+        stack = _reloaded(Result.squeeze([result, old]), tmp_path / "stack.h5")
+        assert stack._volume_record_missing == "bngsim 0.11.35"
 
         # The same result saved by this version reports the amount, 8, unprompted.
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             amount = _reloaded(result, tmp_path / "new.h5").as_roadrunner(["S", "[S]"])
         np.testing.assert_array_equal(np.asarray(amount)[:, 0], np.full(3, 8.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HDF5 save / load: the IC sensitivity seed and the SSA / PSA diagnostics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PSA_MODEL = "species A = 5000; species B = 0; A -> B; k*A; k = 0.1; B -> A; 0.1*B;"
+
+
+class TestHdf5RunRecord:
+    """A loaded Result reports the seed and the diagnostics its run did.
+
+    Neither was saved: the seed came back None, "not recorded", and the
+    diagnostics as the zero dicts of a result that ran nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs(self):
+        pytest.importorskip("h5py")
+        pytest.importorskip("antimony")
+
+    @pytest.mark.parametrize(
+        ("params", "seed"),
+        [
+            (["A0", "s", "k"], {"A": {"A0": 2.0, "s": 5.0}}),
+            # Recorded, and nothing seeds: a different answer from None.
+            (["k"], {}),
+            (None, None),
+        ],
+    )
+    def test_ic_sensitivity_seed(self, params, seed, tmp_path: Path):
+        model = Model.from_antimony_string("A0 = 5; s = 2; species A = A0*s; A -> ; k*A; k = 0.1;")
+        result = Simulator(model, sensitivity_params=params).run(t_span=(0, 5), n_points=6)
+        assert result.ic_sensitivity_seed == seed
+        assert _reloaded(result, tmp_path / "r.h5").ic_sensitivity_seed == seed
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "species A = 3.5; A -> ; k*A; k = 0.1;",
+            "species A = 10.5; species B = 0; J0: -> A; k*(5 - A); k = 1; J1: B -> ; 1;",
+        ],
+    )
+    def test_ssa_diagnostics(self, source, tmp_path: Path):
+        model = Model.from_antimony_string(source)
+        with warnings.catch_warnings():
+            # The rounding and negative-count warnings the diagnostics count.
+            warnings.simplefilter("ignore")
+            result = Simulator(model, method="ssa").run(t_span=(0, 5), n_points=6, seed=1)
+        diag = result.ssa_diagnostics
+        assert diag["n_rounded_populations"] == 1
+        assert diag["propensity_backend"] != "unknown"
+        assert _reloaded(result, tmp_path / "r.h5").ssa_diagnostics == diag
+
+    def test_psa_diagnostics(self, tmp_path: Path):
+        model = Model.from_antimony_string(_PSA_MODEL)
+        result = Simulator(model, method="psa", poplevel=10).run(t_span=(0, 5), n_points=6, seed=1)
+        diag = result.psa_diagnostics
+        assert diag["active"] and diag["activation_crossed"]
+        assert len(diag["reaction_index"]) == 2
+        loaded = _reloaded(result, tmp_path / "r.h5")
+        assert loaded.psa_diagnostics == diag
+        assert loaded.ssa_diagnostics == result.ssa_diagnostics
+
+    def test_a_file_without_them_loads_the_defaults(self, tmp_path: Path):
+        """A file written before save kept them loads what a hand-built result has."""
+        import h5py
+
+        ode = Simulator(
+            Model.from_antimony_string("A0 = 5; species A = A0; A -> ; k*A; k = 0.1;"),
+            sensitivity_params=["A0", "k"],
+        ).run(t_span=(0, 5), n_points=6)
+        psa = Simulator(Model.from_antimony_string(_PSA_MODEL), method="psa", poplevel=10).run(
+            t_span=(0, 5), n_points=6, seed=1
+        )
+        empty = Result(core=None)
+        for i, result in enumerate((ode, psa)):
+            path = tmp_path / f"old{i}.h5"
+            result.save(path)
+            with h5py.File(path, "r+") as f:
+                for key in (
+                    "ic_sensitivity_seed",
+                    "ic_sensitivity_seed_species",
+                    "ic_sensitivity_seed_params",
+                    "ssa_diagnostics",
+                    "psa_diagnostics",
+                ):
+                    if key in f:
+                        del f[key]
+            old = Result.load(path)
+            assert old.ic_sensitivity_seed is None
+            assert old.ssa_diagnostics == empty.ssa_diagnostics
+            assert old.ssa_diagnostics["propensity_backend"] == "unknown"
+            assert old.psa_diagnostics["active"] is False
+            assert old.psa_diagnostics["reaction_index"] == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
