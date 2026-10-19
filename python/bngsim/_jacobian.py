@@ -2707,7 +2707,24 @@ _UNSUPPORTED_EXPR_CONSTRUCTS: list[tuple[re.Pattern, str, bool]] = [
 _CONDITION_SAFE_CONSTRUCTS = frozenset({"floor()", "ceil()"})
 
 
-def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> str | None:
+# The constructs that bend a curve without breaking it (issue #1126). Their
+# derivative is a step, sign(a)·a' or a Heaviside, with no delta in it: a
+# delta appears only where the *value* jumps. So a sensitivity right-hand side
+# built from it is exact on both sides of a bend, and the sensitivity has no
+# jump to make up there, (f⁺ − f⁻)·dt*/dp being 0 for a continuous f.
+#
+# Only in a body made of bends alone, with no condition in it. Inside a
+# condition a bend makes crossings of its own, which the crossing gate does
+# not read: ``if(max(A − thr, 0) == 0, kb, 0)`` holds over an interval, and
+# taken on the analytic path it gave dY/dk = 0 for 2.46 with no error. The
+# sensitivity RHS asks for less still: no condition anywhere in the model
+# (``_FunctionalDfdpScope.bends_analytic``).
+_BEND_CONSTRUCTS = frozenset({"abs()", "min()", "max()"})
+
+
+def unsupported_expr_construct(
+    body: str, *, allow_conditions: bool = False, allow_bends: bool = False
+) -> str | None:
     """Return the reason a function body is unsupported for #198 output
     sensitivities, or ``None`` if no rejected construct is present.
 
@@ -2718,10 +2735,17 @@ def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> 
     rejected as before, because there it really is differentiated. Only a caller
     that has separately established the crossings are compensated may set it —
     see the table above.
+
+    ``allow_bends`` skips :data:`_BEND_CONSTRUCTS` in a body with no
+    conditional construct at all, for a caller that differentiates them through
+    :func:`_prepare_kinks` / :func:`_finish_kinks`.
     """
     spans: list[tuple[int, int]] | None = None
+    allow_bends = allow_bends and not has_condition_construct(body)
     for pat, name, conditional in _UNSUPPORTED_EXPR_CONSTRUCTS:
         if conditional and allow_conditions:
+            continue
+        if allow_bends and name in _BEND_CONSTRUCTS:
             continue
         if not pat.search(body):
             continue
