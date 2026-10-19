@@ -265,10 +265,12 @@ def _one(t):
 def test_a_catalyst_in_a_changing_compartment_is_not_a_species_it_moves(arrow):
     """Control. A and B share an assignment-rule compartment and the catalyst E
     sits in one that follows a rate rule. Nothing crosses a compartment: E is
-    left as it was found. The single divide by A and B's own compartment was
-    right, and a first cut of this fix took E for a changed species and sent the
-    reaction to the per-species divide, which for an assignment-rule compartment
-    is the load-time size (#745): [A](5) = 0.287 for 0.326."""
+    left as it was found. A first cut of this fix took E for a changed species
+    and sent the reaction to the per-species divide, which for an
+    assignment-rule compartment was the load-time size: [A](5) = 0.287 for
+    0.326. That divide now adds the live size (#745). The single divide it
+    replaced was right here only by order and size: written `E + A`, it divided
+    by E's compartment ([A](5) 0.346), and at a load-time size of 1 by nothing."""
     text = (
         "compartment C1 = 2, C3 = 2; C1 := 2 + 0.5*time; C3' = 1;\n"
         "species A in C1, B in C1, E in C3; A = 1; B = 0.2; E = 0.5; k = 0.7;\n"
@@ -277,9 +279,6 @@ def test_a_catalyst_in_a_changing_compartment_is_not_a_species_it_moves(arrow):
     want = _final(lambda a, b, t: K * a * (1.0 / _one(t)), _half, _half, 2.0, 0.4)
     model = bngsim.Model.from_antimony_string(text)
     np.testing.assert_allclose(_final_of(model), want, rtol=1e-7)
-    # And it is still the one reaction it was, not one per species.
-    reactions = model._core.codegen_data()["reactions"]
-    assert len([r for r in reactions if "J1" in r.get("function_name", "")]) == 1
 
 
 def test_a_static_catalyst_beside_two_species_in_a_changing_compartment():

@@ -111,6 +111,7 @@ class Model:
         "_varvol_amount_map",
         "_varvol_ar_conc_map",
         "_varvol_ar_amount_map",
+        "_varvol_target_amount_map",
         "_varvol_event_resize_map",
         "_periodic_disc_max_step",
         "_time_disc_conditions",
@@ -268,12 +269,22 @@ class Model:
         # conc·V_live(t); the concentration column is already correct. Empty for
         # .net, static, and AR-compartment-free models. See _sbml_loader.py.
         self._varvol_ar_amount_map: dict[str, str] = {}
+        # Populated by the SBML loader (issue #728): a concentration species that
+        # a rate rule or an assignment rule sets, in a compartment a rate rule, an
+        # assignment rule or an event sizes, mapped to ``(kind, column)``: where
+        # its live size is read, ``"species"``, ``"expression"`` or
+        # ``"observable"``. Its column holds the rule's concentration under every
+        # method, so its amount is that times V_live(t).
+        # Simulator._apply_varvol_target_amount_map records V_live(t) for
+        # Result.as_roadrunner's bare-id selector.
+        self._varvol_target_amount_map: dict[str, tuple[str, str]] = {}
         # Populated by the SBML loader (GH #131): maps a mangled species name in
         # an EVENT-RESIZED compartment to ``(comp_obs_name, V_static, hOSU)``.
         # Simulator._apply_varvol_event_resize_map applies the report-time
         # concentration correction ``× V_static/V_live`` — for every hOSU=true
         # species (both ODE and SSA) and for hOSU=false species under SSA only —
-        # reading V_live from the compartment's same-named observable column.
+        # reading V_live from the compartment's same-named observable column. A
+        # concentration species a rule sets is left to _varvol_target_amount_map.
         # Empty for .net, static, and event-resize-free models. See _sbml_loader.py.
         self._varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
         # Populated by the SBML loader (GH #88): a recommended integrator
@@ -1244,6 +1255,7 @@ class Model:
         m._varvol_amount_map = dict(self._varvol_amount_map)
         m._varvol_ar_conc_map = dict(self._varvol_ar_conc_map)
         m._varvol_ar_amount_map = dict(self._varvol_ar_amount_map)
+        m._varvol_target_amount_map = dict(self._varvol_target_amount_map)
         m._varvol_event_resize_map = dict(self._varvol_event_resize_map)
         m._periodic_disc_max_step = self._periodic_disc_max_step
         m._time_disc_conditions = self._time_disc_conditions

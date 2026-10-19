@@ -284,6 +284,93 @@ class TestUnsupportedConstructs:
             r.output_sensitivities("expression:response")
 
 
+# ── A function that reads rateOf (issue #787) ──────────────────────────────
+#
+# rateOf needs the live derivatives the right-hand side computes, and an output
+# point has none, so a function that reads one has no output sensitivity, and
+# nor has one that depends on it. The rest of the model has. The whole model
+# was declined instead, every expression with "model uses rateOf". A
+# concentration ``S`` in ``C := 1 + P`` is diluted at the rate of ``P``, which
+# the dilution term reads (issue #1052), so a model that names no rateOf had no
+# expression sensitivity either: not ``Y := 3*S + kp``, not the size ``C``.
+
+DILUTED = """
+compartment D = 1; compartment C; C := 1 + P;
+species S in C; species P in D; P = 0; S = 2;
+Y := 3*S + kp; kp = 1; kd = 0.2; ks = 0.5;
+R3: => P; kp; R4: P => ; kd*P;
+R5: S => ; ks*S;
+"""
+DILUTED_BASE = {"kp": 1.0, "kd": 0.2, "ks": 0.5}
+READS_A_RATE = """
+compartment c = 1; species A in c; A = 10; a = 0.5; k = 2;
+J0: A => ; a*A;
+r := rateOf(A); Z := 2*r; Y := k*A;
+"""
+# The model's sensitivity right-hand side reads a rate too, which CVODES then
+# differences; past rtol 1e-10 that takes millions of steps.
+_RATE_RUN = dict(rtol=1e-10, atol=1e-12, max_steps=10**6)
+
+
+def _antimony_run(text, overrides=None, sensitivity_params=None):
+    """A run of a fresh model; one without sensitivities is a difference's."""
+    m = bngsim.Model.from_antimony_string(text)
+    for k, v in (overrides or {}).items():
+        m.set_param(k, v)
+    sim = bngsim.Simulator(m, method="ode", sensitivity_params=sensitivity_params)
+    return sim.run(t_span=(0.0, 4.0), n_points=5, **(_RATE_RUN if sensitivity_params else _FD))
+
+
+class TestFunctionThatReadsARate:
+    @pytest.mark.parametrize("ename", ["Y", "C"])
+    @pytest.mark.parametrize("pname", sorted(DILUTED_BASE))
+    def test_the_rest_of_a_diluting_model_matches_fd(self, ename, pname):
+        r = _antimony_run(DILUTED, sensitivity_params=sorted(DILUTED_BASE))
+        j = list(r.expression_names).index(ename)
+        c = r.sensitivity_params.index(pname)
+        analytic = r.output_sensitivities(f"expression:{ename}")[:, 0, c]
+        np.testing.assert_array_equal(analytic, np.asarray(r.sensitivities_expressions)[:, j, c])
+        base = DILUTED_BASE[pname]
+        h = 1e-6 * base
+        up = _antimony_run(DILUTED, {pname: base + h})
+        down = _antimony_run(DILUTED, {pname: base - h})
+        fd = (np.asarray(up.expressions)[:, j] - np.asarray(down.expressions)[:, j]) / (2 * h)
+        _assert_fd_close(analytic, fd, float(np.max(np.abs(np.asarray(r.expressions)[:, j]))))
+
+    def test_the_size_has_its_closed_form(self):
+        # dC/dkp = dP/dkp = (1 - e^(-kd*t))/kd; 2.7534 at t = 4, and was refused.
+        r = _antimony_run(DILUTED, sensitivity_params=["kp"])
+        t = np.asarray(r.time)
+        np.testing.assert_allclose(
+            r.output_sensitivities("expression:C")[:, 0, 0],
+            (1.0 - np.exp(-0.2 * t)) / 0.2,
+            rtol=1e-6,
+            atol=1e-9,
+        )
+
+    def test_only_the_dilution_term_is_declined(self):
+        r = _antimony_run(DILUTED, sensitivity_params=["kp"])
+        declined = {n: why for n, why in r._expression_sens_support.items() if why}
+        assert set(declined) == {"_dil_S_C"}
+        assert "reads rateOf" in declined["_dil_S_C"]
+
+    def test_a_function_that_reads_a_rate_is_refused_by_name(self):
+        r = _antimony_run(READS_A_RATE, sensitivity_params=["a", "k"])
+        with pytest.raises(ValueError, match="'r' has no output sensitivity — it reads rateOf"):
+            r.output_sensitivities("expression:r")
+        with pytest.raises(ValueError, match="depends on unsupported function 'r'"):
+            r.output_sensitivities("expression:Z")
+        # Y = k*A with A = 10*e^(-a*t): dY/da = -k*t*A, dY/dk = A.
+        t = np.asarray(r.time)
+        held = 10.0 * np.exp(-0.5 * t)
+        np.testing.assert_allclose(
+            r.output_sensitivities("expression:Y")[:, 0, :],
+            np.stack([-2.0 * t * held, held], axis=1),
+            rtol=1e-6,
+            atol=1e-9,
+        )
+
+
 class TestCodegenInactive:
     def test_no_codegen_with_sensitivity_raises(self, monkeypatch):
         # Hard requirement (GH #214): BNGSIM_NO_CODEGEN + sensitivity_params is a

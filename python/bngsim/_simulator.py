@@ -3405,14 +3405,23 @@ class Simulator:
         # two ways, so both passes take the ONE resolved map (GH #221) — a second
         # place that recomputes `vdiv` is a place the two can drift apart, which
         # is exactly how the #170 writable-volume divisor went stale on one side.
+        #
+        # The derivative pass runs before the variable-volume passes, as the
+        # steady state's does (issue #787). An assignment-rule amount in a
+        # compartment whose size moves is reported as its rule over the live
+        # size; the passes below rescale the value and apply the quotient rule
+        # to whatever row the species has. Given the rule's row first, they
+        # differentiate the reported value. Run after them, the pass had only
+        # NaN to put there.
         ar_map, ar_blocked = self._ar_sensitivity_metadata(model)
         self._apply_ar_report_map(result, ar_map)
+        self._apply_ar_sensitivity_map(result, ar_map)
         self._apply_varvol_conc_map(result, model)
         self._apply_varvol_ar_conc_map(result, model)
+        self._apply_varvol_target_amount_map(result, model)
         self._apply_varvol_event_resize_map(result, model)
         result._ar_sens_map = ar_map
         result._ar_sens_blocked = ar_blocked
-        self._apply_ar_sensitivity_map(result, ar_map, ar_blocked)
         return result
 
     def _ar_sensitivity_metadata(
@@ -3432,9 +3441,11 @@ class Simulator:
 
         The blocked set is AR species whose reported value *also* carries a
         time-varying volume rescale (``_varvol_conc_map`` / ``_varvol_ar_conc_map``,
-        GH #85/#87): the redirect scales only by the constant ``vdiv``, so those
-        species' output sensitivities are refused rather than returned subtly
-        wrong. Both are empty for .net and non-AR models (no redirect).
+        GH #85/#87). The redirect scales only by the constant ``vdiv``, so a
+        ``species:<ar>`` selector for one of them reads the species' own row of
+        ``Result.sensitivities`` instead, which the variable-volume passes have
+        put through the quotient rule (issue #787), and is refused by name where
+        that row is NaN. Both are empty for .net and non-AR models (no redirect).
 
         The ``vdiv`` carried here is **resolved live** (:meth:`_ar_report_vdiv`),
         not the load-time number baked into ``_ar_report_map``. A ``Result`` has
@@ -3541,7 +3552,6 @@ class Simulator:
         self,
         result: Result,
         amap: dict[str, tuple[str, str, float, str]],
-        blocked: frozenset[str],
     ) -> None:
         """Differentiate the value :meth:`_apply_ar_report_map` reported (GH #221).
 
@@ -3572,12 +3582,20 @@ class Simulator:
         row ends up ``NaN`` rather than at a structural zero nobody can tell from
         a measurement — the one outcome GH #221 rules out — and the species is
         recorded in ``Result.ar_sensitivity_refused`` and named in a warning.
-        Three cases: a *blocked* species, whose reported value carries a
-        time-varying volume rescale the constant ``vdiv`` does not (GH #85/#87,
-        the same refusal ``output_sensitivities`` raises by name); a source block
-        that was never computed for this run; and — the common one on the corpus
-        — a source row that is itself ``NaN`` because codegen declined that
-        expression's own output sensitivity (GH #198).
+        Two cases: a source block that was never computed for this run; and —
+        the common one on the corpus — a source row that is itself ``NaN``
+        because codegen declined that expression's own output sensitivity
+        (GH #198).
+
+        A species whose reported value also carries a time-varying volume
+        rescale (GH #85/#87) is filled here like any other, with the row of its
+        rule over ``vdiv``, the load-time size: that is the derivative of the
+        column this pass writes. The variable-volume passes run next, rescale
+        the column to the rule over the live size, and put the row through the
+        quotient rule with the size's own row (issue #787). Where the size has
+        no row, they refuse it there. Such a species was refused here instead,
+        and its row was NaN wherever the size moved: ``T := 2*P`` in
+        ``C := 1 + P`` had no row, where d[T]/dkp at t = 1 is 0.4988.
 
         The value pass writes ``rule/V`` where the species is an amount in a
         compartment whose size ``V`` is a writable parameter, so in that size's
@@ -3630,7 +3648,7 @@ class Simulator:
                 if src not in src_idx:
                     continue
                 src_block = obs_block if kind == "observable" else expr_block
-                if name in blocked or src_block.size == 0 or src_block.ndim != 3:
+                if src_block.size == 0 or src_block.ndim != 3:
                     out[:, j, :] = np.nan
                     refused.add(name)
                     changed = True
@@ -3644,7 +3662,7 @@ class Simulator:
                         if column == vdiv_param:
                             out[:, j, c] -= result._species[:, j] / vdiv
                 changed = True
-                # The third refusal, and the common one on the corpus: the source
+                # The second refusal, and the common one on the corpus: the source
                 # row is ITSELF NaN because codegen declined that expression's
                 # output sensitivity (an `if()` conditional, a table function, a
                 # dependency on another declined function — GH #198 refuses rather
@@ -3663,8 +3681,8 @@ class Simulator:
                 "in their Result.sensitivities row: the chain rule through the assignment "
                 "is not available for them, because codegen declined the rule's own "
                 "output sensitivity (GH #198 refuses an `if()` conditional or a table "
-                "function rather than guess), because the reported value carries a "
-                "time-varying volume rescale the redirect does not model (GH #85/#87), or "
+                "function rather than guess), because the run computed no output "
+                "sensitivity for the rule (codegen built none for this model), or "
                 "because the rule's own value is not finite there. "
                 "NaN rather than 0.0 because a structural zero is indistinguishable "
                 "from a measured one, and Result.gradient would read it as a flat "
@@ -3690,8 +3708,9 @@ class Simulator:
         reading V_live(t) from the compartment's own promoted-species column
         (``volume_factor`` 1.0, so its stored value *is* the live size).
 
-        Records the live-volume column index per rescaled species in
-        ``result._varvol_live_vol`` so :meth:`Result.as_roadrunner` can recover
+        Records V_live(t) per rescaled species in ``result._varvol_amount_factor``,
+        and the live-volume column index per diluted hOSU=false species in
+        ``result._varvol_live_vol``, so :meth:`Result.as_roadrunner` can recover
         the amount (``conc * V_live``) for a bare-id selector instead of the now
         meaningless ``conc * V_static``. No-op for .net and static models (empty
         map) and for a 3-D stack, whose rows were remapped before stacking.
@@ -3717,6 +3736,7 @@ class Simulator:
         sp = np.array(result._species, dtype=np.float64, copy=True)
         live_vol: dict[int, int] = {}
         conc_factor: dict[int, np.ndarray] = {}
+        amount_factor: dict[int, np.ndarray] = {}
         changed = False
         rescaled: list[tuple[str, int, np.ndarray, np.ndarray, str, int]] = []
 
@@ -3724,8 +3744,8 @@ class Simulator:
         # amount/V_static under BOTH methods, but the V_static→V_live correction
         # is applied differently:
         #   • ODE reports in concentration space, so rescale the raw column in
-        #     place (sp[:,j] *= V_static/V_live) and record the live-volume column
-        #     so as_roadrunner recovers the amount as conc·V_live.
+        #     place (sp[:,j] *= V_static/V_live) and record V_live(t) as the
+        #     amount factor so as_roadrunner recovers the amount as conc·V_live.
         #   • SSA keeps the raw column as the conserved molecule count
         #     (amount/V_static) — every SSA test and the engine's own state read
         #     it that way — so leave sp[:,j] untouched and record the per-sample
@@ -3752,7 +3772,12 @@ class Simulator:
                 conc_factor[j] = factor
             else:
                 sp[:, j] = sp[:, j] * factor
-                live_vol[j] = k
+                # At a sample where the size is 0 the guard above left the column
+                # at amount/V_static, so the amount there is it times V_static,
+                # not 0: a conserved 5 in c' = -1 from 2 read [5, 5, 0, 5] at
+                # t = 0, 1, 2, 3, as it did in an assignment-rule compartment
+                # until #728's review.
+                amount_factor[j] = np.where(v_live != 0.0, v_live, v_static)
                 rescaled.append((s_name, j, factor, np.array(v_live, copy=True), "species", k))
             changed = True
 
@@ -3789,6 +3814,8 @@ class Simulator:
                 result._varvol_live_vol = live_vol
             if conc_factor:
                 result._varvol_conc_factor = conc_factor
+            if amount_factor:
+                result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
     def _rescale_varvol_sensitivity_rows(
@@ -3820,8 +3847,10 @@ class Simulator:
         *rescaled* is ``(species, column, V_static/V_live, V_live, kind,
         index)`` for each column a pass rescaled, with *kind* ``"species"`` or
         ``"expression"`` for where the live volume is read. A species an
-        assignment rule sets as well is refused afterwards by
-        :meth:`_apply_ar_sensitivity_map`, which overwrites its row. Both
+        assignment rule sets as well comes here with its rule's row, from
+        :meth:`_apply_ar_sensitivity_map`, and the same quotient rule gives the
+        row of its rule over the live size (issue #787); a row that pass has
+        already refused stays NaN and is not named a second time. Both
         sensitivity axes, parameter and initial condition.
         """
         if not rescaled:
@@ -3847,14 +3876,15 @@ class Simulator:
                     dv = expr_block[:, k, :]
                 else:
                     out[:, j, :] = np.nan
-                    refused.add(name)
+                    if name not in result._ar_sens_refused:
+                        refused.add(name)
                     continue
                 if not dv.any() and (factor == 1.0).all():
                     continue  # a size that does not move, in these columns or at all
                 with np.errstate(divide="ignore", invalid="ignore"):
                     share = np.where(v_live != 0.0, result._species[:, j] / v_live, 0.0)
                 out[:, j, :] = factor[:, None] * block[:, j, :] - share[:, None] * dv
-                if not np.isfinite(out[:, j, :]).all():
+                if not np.isfinite(out[:, j, :]).all() and name not in result._ar_sens_refused:
                     refused.add(name)
             setattr(result, sp_attr, out)
         if refused:
@@ -3927,6 +3957,16 @@ class Simulator:
             rescaled.append((s_name, j, factor, np.array(v_live, copy=True), "expression", k))
         if changed:
             result._species = sp
+            # The column now holds amount/V_live, so the bare-id amount is it times
+            # V_live; left to the volume factor it was amount·V_static/V_live, and a
+            # conserved amount of 5 in c := 2 + time read 0.83 at t = 10 (issue
+            # #728), under SSA as under ODE, since this pass rescales both. At a
+            # sample where the size is 0 the guard above left the column at
+            # amount/V_static, so the amount there is it times V_static, not 0.
+            amount_factor = result._varvol_amount_factor or {}
+            for name, j, _factor, v_live, _kind, _k in rescaled:
+                amount_factor[j] = np.where(v_live != 0.0, v_live, (amap or {})[name][1])
+            result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
         # (#234) Record V_live(t) per diluted hOSU=false species so as_roadrunner's
@@ -3962,6 +4002,49 @@ class Simulator:
                 if conc_factor:
                     result._varvol_conc_factor = conc_factor
 
+    def _apply_varvol_target_amount_map(self, result: Result, model: Model | None = None) -> None:
+        """Record V_live(t) for a rule-target concentration species (issue #728).
+
+        A concentration species that a rate rule or an assignment rule sets, in a
+        compartment a rate rule, an assignment rule or an event sizes, holds its
+        rule's concentration under every method: nothing about it is a count. Its
+        amount is that times V_live(t), and :meth:`Result.as_roadrunner` read the
+        static volume factor instead (01198: S1 = 0.2 for 0.28). The live size is
+        read from the compartment's promoted-species column, its expression column
+        or, for an event-resized compartment, which is hidden from the species
+        output (GH #71), its observable column, as the loader's map says. The
+        column itself is left as it is. No-op with no such species, and for a 3-D
+        stack.
+        """
+        model = model or self._model
+        tmap = getattr(model, "_varvol_target_amount_map", None)
+        if not tmap:
+            return
+        species_names = result._species_names
+        if not species_names or result._species.ndim != 2:
+            return
+        sp_idx = {n: i for i, n in enumerate(species_names)}
+        expr_idx = {n: i for i, n in enumerate(result._expression_names or [])}
+        obs_idx = {n: i for i, n in enumerate(result._observable_names or [])}
+        amount_factor = result._varvol_amount_factor or {}
+        for s_name, (kind, c_name) in tmap.items():
+            j = sp_idx.get(s_name)
+            if j is None:
+                continue
+            if kind == "species":
+                k = sp_idx.get(c_name)
+                v_live = result._species[:, k] if k is not None else None
+            elif kind == "observable":
+                k = obs_idx.get(c_name)
+                v_live = result._observables[:, k] if k is not None else None
+            else:
+                k = expr_idx.get(c_name)
+                v_live = result._expressions[:, k] if k is not None else None
+            if v_live is not None:
+                amount_factor[j] = np.array(v_live, dtype=np.float64, copy=True)
+        if amount_factor:
+            result._varvol_amount_factor = amount_factor
+
     def _apply_varvol_event_resize_map(self, result: Result, model: Model | None = None) -> None:
         """Report species in EVENT-RESIZED compartments at amount/V_live(t).
 
@@ -3982,6 +4065,10 @@ class Simulator:
             and ``[X]`` is already correct, but the bare ``X`` amount must be
             ``raw·V_live`` (RoadRunner's amount), NOT the ``raw·V_static`` the
             volume factor gives → record a live-volume amount factor.
+
+        A hOSU=false species a rule sets is not in this map: it is no count, its
+        rescale runs under SSA too, and :meth:`_apply_varvol_target_amount_map`
+        records its amount factor under every method.
 
         The event-promoted compartment is hidden from species output (GH #71) but
         is emitted as a same-named OBSERVABLE, so V_live(t) is read from there.
@@ -6967,9 +7054,10 @@ class Simulator:
     ) -> Result:
         """Stitch partial sensitivity results into a full Result.
 
-        Takes the ODE solution (time, species, observables) from the
-        first chunk, and concatenates sensitivity tensors from all
-        chunks along axis 2 (parameter axis).
+        Takes everything off the parameter axis from the first chunk — the
+        ODE solution, and the report state its stamp attached — and
+        concatenates sensitivity tensors from all chunks along axis 2
+        (parameter axis).
 
         Parameters
         ----------
@@ -6999,21 +7087,19 @@ class Simulator:
 
         full_sens = np.concatenate(sens_parts, axis=2)
 
-        # Build combined result from raw arrays
-        result = Result(
-            core=None,
-            _time=base._time.copy(),
-            _species=base._species.copy(),
-            _observables=base._observables.copy(),
-            _expressions=base._expressions.copy()
-            if base._expressions.size > 0
-            else base._expressions,
-            _species_names=base._species_names,
-            _observable_names=base._observable_names,
-            _expression_names=base._expression_names,
-            _solver_stats=base._solver_stats,
-        )
-        # Inject full sensitivity tensor + param names
+        # The stitched result is the first chunk's with its parameter axis
+        # widened. Every chunk integrated the same trajectory and was stamped by
+        # the same report passes, so everything off that axis is the first
+        # chunk's: the reported columns, the volume factors and live sizes
+        # as_roadrunner reads, the assignment-rule redirect, and the core behind
+        # Result.state. It is copied whole rather than field by field because a
+        # field list here missed each live-size map as a pass added one: a
+        # conserved amount of 2 in a compartment growing at c' = 0.2 read 2, 1,
+        # 0.667 through as_roadrunner, where run() reads 2 throughout (issue
+        # #787). The chunks are discarded after this, so sharing their arrays is
+        # safe.
+        result = copy.copy(base)
+        result.custom_attrs = dict(base.custom_attrs)
         result._sensitivities = full_sens
         result._sensitivity_params = list(all_param_names)
 
@@ -7032,9 +7118,9 @@ class Simulator:
         # along axis 2. Both blocks are populated at simulation time now (GH #197
         # observable runtime chain rule; GH #198 expression codegen evaluator), so
         # these are real concatenations whenever every chunk computed them. The IC
-        # output blocks are not parameter-chunked, so they are left at their
-        # __init__ default (empty), matching how the species IC block is handled in
-        # this param-stitching path.
+        # output blocks are not parameter-chunked, so they are the first chunk's,
+        # as the species IC block is: empty, since no chunk asks for an
+        # initial-condition axis.
         def _concat_param_block(attr: str) -> np.ndarray:
             parts = [getattr(r, attr) for r in chunk_results]
             empty = [p.size == 0 for p in parts]
@@ -7061,23 +7147,16 @@ class Simulator:
         result._observable_sensitivities = _concat_param_block("_observable_sensitivities")
         result._expression_sensitivities = _concat_param_block("_expression_sensitivities")
 
-        # Propagate volume_factors from the chunk results (all chunks
-        # came from the same model, so any non-None field is correct).
-        for r in chunk_results:
-            if r._species_volume_factors is not None:
-                result._species_volume_factors = r._species_volume_factors
-                break
-
-        # GH #205 — carry the AR-species output-sensitivity redirect map (and
-        # its blocked set) from a stamped chunk so species:<ar> selectors follow
-        # the assignment expression on the stitched result too. GH #221: the
-        # tensor rows themselves need no second pass here — each chunk's species
-        # block was already filled from that chunk's own observable/expression
-        # block, on the same parameter axis this concatenates along — but the
-        # refused set must ride through, since those rows are NaN in `full_sens`.
-        result._ar_sens_map = base._ar_sens_map
-        result._ar_sens_blocked = base._ar_sens_blocked
-        result._ar_sens_refused = base._ar_sens_refused
+        # GH #205 — the AR-species output-sensitivity redirect map and its
+        # blocked set came with the copy, so species:<ar> selectors follow the
+        # assignment expression on the stitched result too. GH #221: the tensor
+        # rows themselves need no second pass here — each chunk's species block
+        # was already filled from that chunk's own observable/expression block,
+        # on the same parameter axis this concatenates along. A row is refused
+        # where it is NaN in any chunk's columns (issue #742 refuses a row that
+        # is not finite, which can depend on the columns), so the refused set
+        # is the union over chunks, as a single run over every column has it.
+        result._ar_sens_refused = frozenset().union(*(r._ar_sens_refused for r in chunk_results))
 
         return result
 
@@ -7233,7 +7312,7 @@ class Simulator:
         solved ``dY_ss/dp`` columns — so a steady-state gradient and a long-run
         one now come from the same evaluator. Finite differences remain the
         per-function fallback for what that evaluator declines (a table function,
-        a non-smooth construct, a whole-model ``rateOf`` decline);
+        a non-smooth construct, a function that reads ``rateOf``);
         ``ss.sens_output_source`` reports ``"codegen"``, ``"mixed"``, or
         ``"finite-difference"``. The *observable* block is an exact linear
         projection through the group factors and never differences anything.
@@ -7318,6 +7397,9 @@ class Simulator:
             opts.codegen_so_path = self._codegen_so_path
         if self._codegen_c_source:
             opts.codegen_c_source = self._codegen_c_source
+        # Issue #904 — the march roots what a plain run() roots (issue #897),
+        # so a window on the approach is not stepped over.
+        opts.state_switch_conditions = list(self._model.state_switch_root_conditions())
         if sensitivity_params:
             opts.sensitivity_params = list(sensitivity_params)
             # Issue #704 — ∂x(0)/∂p, the seeding a time course starts from. A
@@ -7353,6 +7435,7 @@ class Simulator:
         result = SteadyStateResult(core_result)
         self._apply_ss_ar_report_map(result)
         self._apply_ss_ar_sensitivity_map(result)
+        self._apply_ss_varvol_report_maps(result)
 
         logger.info(
             "Steady state %s: method=%s, backend=%s, residual=%.2e, steps=%d, species_tested=%d",
@@ -7965,7 +8048,10 @@ class Simulator:
         derivatives, which are 0 at a steady state.
         """
         core = self._model._core
-        n_events = int(self._model.n_events)
+        # A compartment size that jumps keeps the amounts in it through an event
+        # the loader adds (issue #1054), which is no event of the model's own.
+        jumps = list(core.event_size_jump_compartments)
+        n_events = sum(1 for comp in jumps if not comp)
         if n_events:
             raise SimulationError(
                 f"{where} is not supported for this model: it has {n_events} "
@@ -7974,6 +8060,23 @@ class Simulator:
                 "never made, and the state they return is one the model's dynamics may never "
                 "reach (issue #710). Integrate the model with run() over a span long enough "
                 "for the trajectory to settle, and read the state where it ends."
+            )
+        if jumps:
+            comps = sorted(set(jumps))
+            what = (
+                f"the size of compartment {comps[0]}, which an assignment rule sets, jumps "
+                "where a piecewise the rule reads switches, and the amounts in it are"
+                if len(comps) == 1
+                else f"the sizes of compartments {', '.join(comps)}, which assignment rules "
+                "set, jump where a piecewise a rule reads switches, and the amounts in them are"
+            )
+            raise SimulationError(
+                f"{where} is not supported for this model: {what} kept across a jump by a "
+                "rescale of their concentrations there (issue #1054). The steady-state "
+                "solvers look for a root of the right-hand side and make no such rescale, so "
+                "the state they return can hold the concentrations from the wrong side of a "
+                "jump (issue #710). Integrate the model with run() over a span long enough for "
+                "the trajectory to settle, and read the state where it ends."
             )
         if core.functions_use_time:
             raise SimulationError(
@@ -8138,6 +8241,122 @@ class Simulator:
             changed = True
         if changed:
             result._sensitivity = sens
+
+    def _apply_ss_varvol_report_maps(
+        self, result: SteadyStateResult, model: Model | None = None
+    ) -> None:
+        """Report an amount in a compartment whose size changes over the live size.
+
+        The steady-state analogue of the variable-volume passes of
+        :meth:`_stamp`, and the same passes: the steady state is put in a
+        one-sample :class:`Result`, :meth:`_apply_varvol_conc_map` (a rate-rule
+        compartment) and :meth:`_apply_varvol_ar_conc_map` (an assignment-rule
+        compartment) rescale it, and the value and its sensitivity row are
+        copied back. Such an amount is stored over the size the model loaded
+        with, and without them ``concentrations`` reported it so: ``H`` in
+        ``C := 1 + P`` came back 2.0 where ``run()`` to the same state reports
+        2/6 (issue #787), and its ``dY_ss/dp`` row was the stored value's, with
+        no share of the size's own row. An assignment-rule species comes here
+        after :meth:`_apply_ss_ar_report_map` has set it to its rule over the
+        load-time size, as on a time course, and its row is then the quotient
+        rule through its rule's.
+
+        A row ``mask=`` left out of the solve is NaN (issue #74) and stays NaN;
+        the passes are given 0 there, so that they do not refuse it again. A
+        species the solve kept, in a compartment whose size has no row, has no
+        row to be given, and is refused by name, with the species the size's
+        row needed and why the solve has none for it. An assignment-rule
+        target is left out of the solve too, by
+        :meth:`_ss_mask_excluding_ar_species` and not by the caller, so the
+        refusal blames ``mask=`` only for a species the caller's mask left out.
+
+        The other passes of :meth:`_stamp` record what
+        :meth:`Result.as_roadrunner` reads an amount with, which a steady state
+        has no selector for, or follow an event, which :meth:`steady_state`
+        refuses. No-op for .net and static models.
+        """
+        model = model or self._model
+        rate_sized = getattr(model, "_varvol_conc_map", None) or {}
+        rule_sized = getattr(model, "_varvol_ar_conc_map", None) or {}
+        if not rate_sized and not rule_sized:
+            return
+        sens = result._sensitivity
+        if sens is not None and sens.size == 0:
+            sens = None
+        if sens is not None:
+            kept = np.isfinite(sens).all(axis=1)
+            size_kept = np.isfinite(result._expression_sensitivity).all(axis=1)
+            sp_idx = result._name_to_idx
+            expr_idx = {n: i for i, n in enumerate(result._expression_names)}
+            missing = result._expression_sens_missing
+            rule_targets = getattr(model, "_ar_report_map", None) or {}
+            masked = {result._species_names[i] for i in result.excluded_species} - set(
+                rule_targets
+            )
+
+            needed_masked: set[str] = set()
+
+            def _no_row(name: str) -> str:
+                # Why the solve returned no row for this species.
+                if name in masked:
+                    needed_masked.add(name)
+                    return f"{name}, which mask= left out of the solve"
+                if name in rule_targets:
+                    return f"{name}, the target of an assignment rule, which the solve leaves out"
+                return f"{name}, whose row the solve did not return"
+
+            short: dict[str, str] = {}
+            for s, c in rate_sized.items():
+                if s in sp_idx and c in sp_idx and kept[sp_idx[s]] and not kept[sp_idx[c]]:
+                    short[s] = f"its size is the species {_no_row(c)}"
+            for s, (c, _v_static) in rule_sized.items():
+                k = expr_idx.get(c, len(size_kept))
+                if s in sp_idx and kept[sp_idx[s]] and k < len(size_kept) and not size_kept[k]:
+                    read = missing[k] if k < len(missing) else None
+                    short[s] = (
+                        f"its size {c} reads {_no_row(read)}"
+                        if read is not None
+                        else f"the derivative of its size {c} is not a number at this state"
+                    )
+            if short:
+                causes = "; ".join(f"for {s}, {short[s]}" for s in sorted(short))
+                remedy = (
+                    f"Keep {sorted(needed_masked)} in the mask, or leave these species out as well"
+                    if needed_masked
+                    else "Take these rows from a time course with forward sensitivities run "
+                    "to the steady state"
+                )
+                raise SimulationError(
+                    f"Steady-state dY_ss/dp of {sorted(short)}: each is an amount reported "
+                    "as a concentration in a compartment whose size changes, so its row "
+                    f"needs the size's own row, and the solve has none: {causes}. "
+                    f"{remedy} (issue #787)."
+                )
+
+        def _block(arr: np.ndarray) -> np.ndarray | None:
+            # A (rows, params) steady-state block as a one-sample time course.
+            if sens is None or arr.ndim != 2 or arr.size == 0:
+                return None
+            return np.where(np.isfinite(arr), arr, 0.0)[None, :, :]
+
+        one = Result(
+            _time=np.zeros(1),
+            _species=np.array(result._concentrations, dtype=np.float64)[None, :],
+            _observables=np.asarray(result._observable_values, dtype=np.float64)[None, :],
+            _expressions=np.asarray(result._expression_values, dtype=np.float64)[None, :],
+            _species_names=list(result._species_names),
+            _observable_names=list(result._observable_names),
+            _expression_names=list(result._expression_names),
+            _sensitivities=None if sens is None else _block(sens),
+            _sensitivity_params=list(result._sens_param_names),
+            _observable_sensitivities=_block(result._observable_sensitivity),
+            _expression_sensitivities=_block(result._expression_sensitivity),
+        )
+        self._apply_varvol_conc_map(one, model)
+        self._apply_varvol_ar_conc_map(one, model)
+        result._concentrations = np.array(one._species[0], dtype=np.float64)
+        if sens is not None:
+            result._sensitivity = np.where(np.isfinite(sens), one._sensitivities[0], sens)
 
     def _note_ss_jacobian_retry(self, result) -> None:
         """Say so when the solver had to call off the closed-form Jacobian.
@@ -8374,6 +8593,8 @@ class Simulator:
                 opts.codegen_so_path = self._codegen_so_path
             if self._codegen_c_source:
                 opts.codegen_c_source = self._codegen_c_source
+            # Issue #904 — as steady_state(), of the entry's own model.
+            opts.state_switch_conditions = list(clone.state_switch_root_conditions())
             entry_mask = self._ss_mask_excluding_ar_species(mask_selector)
             if entry_mask is not None:
                 opts.steady_state_mask = entry_mask
@@ -8388,6 +8609,7 @@ class Simulator:
             # through the unscanned volume.
             self._apply_ss_ar_report_map(result, clone)
             self._apply_ss_ar_sensitivity_map(result, clone)
+            self._apply_ss_varvol_report_maps(result, clone)
             self._note_ss_jacobian_retry(result)
             self._warn_about_pure_sinks(result)
             return result
@@ -9522,6 +9744,18 @@ class SteadyStateResult:
         Number of solver steps.
     n_rhs_evals : int
         Number of RHS evaluations.
+    n_state_switch_roots : int
+        The crossings of a rate-law condition over model state (or of an
+        SBML model's discontinuity trigger) the march stopped at, so a window
+        the approach passes through is integrated over (issue #904). It
+        restarts on each one up to 1000; the 1001st, where it stops rooting
+        them, is counted too.
+    state_switch_roots_dropped : bool
+        Whether the march stopped rooting those conditions after 1000
+        crossings, as a state that slides along its threshold makes, and
+        marched over the switch from there as it did before #904. If that
+        march ends further from a steady state than where it stopped
+        rooting, the state there is returned.
     n_residual_species : int
         How many species entered ``||f||_2 / n`` — ``n_species`` unless
         ``steady_state(mask=...)`` restricted it (issue #74). Assert on this
@@ -9769,6 +10003,8 @@ class SteadyStateResult:
         "converged",
         "n_steps",
         "n_rhs_evals",
+        "n_state_switch_roots",
+        "state_switch_roots_dropped",
         "n_residual_species",
         "excluded_species",
         "unconverged_pure_sinks",
@@ -9813,6 +10049,7 @@ class SteadyStateResult:
         "_expression_names",
         "_observable_sensitivity",
         "_expression_sensitivity",
+        "_expression_sens_missing",
         "_observable_values",
         "_expression_values",
     )
@@ -9828,6 +10065,8 @@ class SteadyStateResult:
         self.converged = core.converged
         self.n_steps = core.n_steps
         self.n_rhs_evals = core.n_rhs_evals
+        self.n_state_switch_roots = getattr(core, "n_state_switch_roots", 0)
+        self.state_switch_roots_dropped = getattr(core, "state_switch_roots_dropped", False)
         # Issue #74 — what the convergence test covered, and why it failed.
         self.n_residual_species = getattr(core, "n_residual_species", len(self._species_names))
         self.excluded_species = list(getattr(core, "excluded_species", []))
@@ -9920,6 +10159,11 @@ class SteadyStateResult:
         self._expression_names = list(getattr(core, "expression_names", []))
         self._observable_sensitivity = _ss_output_sens_block(core, "observable_sensitivity_data")
         self._expression_sensitivity = _ss_output_sens_block(core, "expression_sensitivity_data")
+        # Per expression, the species with no dY_ss/dp row that its derivative
+        # read, which is why that row is NaN; None where it read none.
+        self._expression_sens_missing = [
+            _named(species, i) for i in getattr(core, "expression_sens_missing_species", [])
+        ]
         # Issue #247 — observable / function VALUES at the returned state. Present
         # on every solve (the sensitivity blocks above are not), because what they
         # are here for is the assignment-rule species whose own slot is frozen.

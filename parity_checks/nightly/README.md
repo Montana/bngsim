@@ -8,26 +8,26 @@ a regression. Nothing here blocks a PR.
 |---|---|---|
 | `sbml_semantic` | SBML Test Suite expected results | 1,824 semantic cases, pinned checkout |
 | `dsmts` | DSMTS analytic mean / sd | 39 stochastic cases, committed |
-| `rr_ode` | libRoadRunner | the 1,006 of 1,323 BioModels SBML a hosted runner can fetch, pinned and cached |
+| `rr_ode` | libRoadRunner | all 1,323 BioModels SBML, pinned, sha256-checked and cached |
 | `bng_ode` | BNG2.pl + run_network | 592 committed BNGL ODE jobs, ExprTk interpreter |
 | `bng_ode_codegen` | BNG2.pl + run_network | the same jobs on the compiled C path (`--codegen`) |
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
-| `amici_sens` | AMICI forward sensitivities | 40 of the 50 curated BioModels, staggered + simultaneous |
+| `amici_sens` | AMICI forward sensitivities | 48 of the 50 curated BioModels, staggered + simultaneous |
 
-**The BioModels gap.** 317 of the 1,323 BioModels come only from EBI's BioModels REST
-API, which answers HTTP 403 to GitHub-hosted runners (the same URLs work from a
-workstation), so CI runs the 992 temp-biomodels models plus the committed SBML
-overrides. `present_models.py` hands each runner the models that are on disk. 300 of
-the 317 carry no recorded license (17 are CC0), so re-hosting them for CI needs a
-license review first.
+**The BioModels corpus.** 992 of the 1,323 BioModels come from sys-bio/temp-biomodels
+on GitHub. The other 331 come only from BioModels itself, whose CloudFront refuses
+every request from a GitHub-hosted runner (issue #807), so CI reads bngsim's own copy
+of them: one release asset, fetched by `rr_parity/fetch_biomodels_mirror.py`, which
+checks every file against the biomodels suite's provenance manifest. BioModels
+releases its whole dataset under CC0 (https://www.biomodels.org/termsofuse), which
+is what allows the copy. `present_models.py` hands each runner the models that are on
+disk, so a local run with part of the corpus still works.
 
-**Giant models.** The dozen SBML files over 1 MB (up to 786 species) run in a
+**Giant models.** The 23 SBML files over 1 MB (up to 6,047 species) run in a
 separate `rr-ode` pass, two at a time on the interpreted RHS: their automatic C
 compile alone outlasts the per-job cap on a 4-core runner, and four at once exhausted
 its memory. `amici-sens` leaves out BIOMD0000000496/497, which time out on both
-engines even on a workstation; BIOMD0000000608, whose 66.7 MB generated sensitivity
-RHS outlasts bngsim's 600 s compile budget; and the 7 curated models that come only
-from EBI. The workflow file records the measurement behind each.
+engines even on a workstation. The workflow file records the measurement behind each.
 
 ## Why a baseline, not the exit code
 
