@@ -3691,8 +3691,9 @@ class Simulator:
         reading V_live(t) from the compartment's own promoted-species column
         (``volume_factor`` 1.0, so its stored value *is* the live size).
 
-        Records the live-volume column index per rescaled species in
-        ``result._varvol_live_vol`` so :meth:`Result.as_roadrunner` can recover
+        Records V_live(t) per rescaled species in ``result._varvol_amount_factor``,
+        and the live-volume column index per diluted hOSU=false species in
+        ``result._varvol_live_vol``, so :meth:`Result.as_roadrunner` can recover
         the amount (``conc * V_live``) for a bare-id selector instead of the now
         meaningless ``conc * V_static``. No-op for .net and static models (empty
         map) and for a 3-D stack, whose rows were remapped before stacking.
@@ -3718,6 +3719,7 @@ class Simulator:
         sp = np.array(result._species, dtype=np.float64, copy=True)
         live_vol: dict[int, int] = {}
         conc_factor: dict[int, np.ndarray] = {}
+        amount_factor: dict[int, np.ndarray] = {}
         changed = False
         rescaled: list[tuple[str, int, np.ndarray, np.ndarray, str, int]] = []
 
@@ -3725,8 +3727,8 @@ class Simulator:
         # amount/V_static under BOTH methods, but the V_static→V_live correction
         # is applied differently:
         #   • ODE reports in concentration space, so rescale the raw column in
-        #     place (sp[:,j] *= V_static/V_live) and record the live-volume column
-        #     so as_roadrunner recovers the amount as conc·V_live.
+        #     place (sp[:,j] *= V_static/V_live) and record V_live(t) as the
+        #     amount factor so as_roadrunner recovers the amount as conc·V_live.
         #   • SSA keeps the raw column as the conserved molecule count
         #     (amount/V_static) — every SSA test and the engine's own state read
         #     it that way — so leave sp[:,j] untouched and record the per-sample
@@ -3753,7 +3755,12 @@ class Simulator:
                 conc_factor[j] = factor
             else:
                 sp[:, j] = sp[:, j] * factor
-                live_vol[j] = k
+                # At a sample where the size is 0 the guard above left the column
+                # at amount/V_static, so the amount there is it times V_static,
+                # not 0: a conserved 5 in c' = -1 from 2 read [5, 5, 0, 5] at
+                # t = 0, 1, 2, 3, as it did in an assignment-rule compartment
+                # until #728's review.
+                amount_factor[j] = np.where(v_live != 0.0, v_live, v_static)
                 rescaled.append((s_name, j, factor, np.array(v_live, copy=True), "species", k))
             changed = True
 
@@ -3790,6 +3797,8 @@ class Simulator:
                 result._varvol_live_vol = live_vol
             if conc_factor:
                 result._varvol_conc_factor = conc_factor
+            if amount_factor:
+                result._varvol_amount_factor = amount_factor
         self._rescale_varvol_sensitivity_rows(result, rescaled)
 
     def _rescale_varvol_sensitivity_rows(
@@ -7015,9 +7024,10 @@ class Simulator:
     ) -> Result:
         """Stitch partial sensitivity results into a full Result.
 
-        Takes the ODE solution (time, species, observables) from the
-        first chunk, and concatenates sensitivity tensors from all
-        chunks along axis 2 (parameter axis).
+        Takes everything off the parameter axis from the first chunk — the
+        ODE solution, and the report state its stamp attached — and
+        concatenates sensitivity tensors from all chunks along axis 2
+        (parameter axis).
 
         Parameters
         ----------
@@ -7047,21 +7057,19 @@ class Simulator:
 
         full_sens = np.concatenate(sens_parts, axis=2)
 
-        # Build combined result from raw arrays
-        result = Result(
-            core=None,
-            _time=base._time.copy(),
-            _species=base._species.copy(),
-            _observables=base._observables.copy(),
-            _expressions=base._expressions.copy()
-            if base._expressions.size > 0
-            else base._expressions,
-            _species_names=base._species_names,
-            _observable_names=base._observable_names,
-            _expression_names=base._expression_names,
-            _solver_stats=base._solver_stats,
-        )
-        # Inject full sensitivity tensor + param names
+        # The stitched result is the first chunk's with its parameter axis
+        # widened. Every chunk integrated the same trajectory and was stamped by
+        # the same report passes, so everything off that axis is the first
+        # chunk's: the reported columns, the volume factors and live sizes
+        # as_roadrunner reads, the assignment-rule redirect, and the core behind
+        # Result.state. It is copied whole rather than field by field because a
+        # field list here missed each live-size map as a pass added one: a
+        # conserved amount of 2 in a compartment growing at c' = 0.2 read 2, 1,
+        # 0.667 through as_roadrunner, where run() reads 2 throughout (issue
+        # #787). The chunks are discarded after this, so sharing their arrays is
+        # safe.
+        result = copy.copy(base)
+        result.custom_attrs = dict(base.custom_attrs)
         result._sensitivities = full_sens
         result._sensitivity_params = list(all_param_names)
 
@@ -7080,9 +7088,9 @@ class Simulator:
         # along axis 2. Both blocks are populated at simulation time now (GH #197
         # observable runtime chain rule; GH #198 expression codegen evaluator), so
         # these are real concatenations whenever every chunk computed them. The IC
-        # output blocks are not parameter-chunked, so they are left at their
-        # __init__ default (empty), matching how the species IC block is handled in
-        # this param-stitching path.
+        # output blocks are not parameter-chunked, so they are the first chunk's,
+        # as the species IC block is: empty, since no chunk asks for an
+        # initial-condition axis.
         def _concat_param_block(attr: str) -> np.ndarray:
             parts = [getattr(r, attr) for r in chunk_results]
             empty = [p.size == 0 for p in parts]
@@ -7109,23 +7117,16 @@ class Simulator:
         result._observable_sensitivities = _concat_param_block("_observable_sensitivities")
         result._expression_sensitivities = _concat_param_block("_expression_sensitivities")
 
-        # Propagate volume_factors from the chunk results (all chunks
-        # came from the same model, so any non-None field is correct).
-        for r in chunk_results:
-            if r._species_volume_factors is not None:
-                result._species_volume_factors = r._species_volume_factors
-                break
-
-        # GH #205 — carry the AR-species output-sensitivity redirect map (and
-        # its blocked set) from a stamped chunk so species:<ar> selectors follow
-        # the assignment expression on the stitched result too. GH #221: the
-        # tensor rows themselves need no second pass here — each chunk's species
-        # block was already filled from that chunk's own observable/expression
-        # block, on the same parameter axis this concatenates along — but the
-        # refused set must ride through, since those rows are NaN in `full_sens`.
-        result._ar_sens_map = base._ar_sens_map
-        result._ar_sens_blocked = base._ar_sens_blocked
-        result._ar_sens_refused = base._ar_sens_refused
+        # GH #205 — the AR-species output-sensitivity redirect map and its
+        # blocked set came with the copy, so species:<ar> selectors follow the
+        # assignment expression on the stitched result too. GH #221: the tensor
+        # rows themselves need no second pass here — each chunk's species block
+        # was already filled from that chunk's own observable/expression block,
+        # on the same parameter axis this concatenates along. A row is refused
+        # where it is NaN in any chunk's columns (issue #742 refuses a row that
+        # is not finite, which can depend on the columns), so the refused set
+        # is the union over chunks, as a single run over every column has it.
+        result._ar_sens_refused = frozenset().union(*(r._ar_sens_refused for r in chunk_results))
 
         return result
 

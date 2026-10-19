@@ -87,12 +87,19 @@ def test_an_amount_species_in_an_assignment_rule_compartment_under_ssa():
     np.testing.assert_allclose(got[:, 1], 50.0 / (2.0 + T), rtol=1e-12)
 
 
-def test_an_amount_species_keeps_its_amount_where_the_size_is_zero():
-    """At t = 2 the size, 2 - t, is 0. The concentration pass does not divide by
-    it there and leaves the row at amount/V_static, so the amount is that row
-    times V_static: the conserved 5, as at every other row, and not 0."""
+@pytest.mark.parametrize(
+    "size",
+    ["c := 2 - time", "c = 2; c' = -1", "c = 2; E: at time > 1.5: c = 0"],
+    ids=["an-assignment-rule", "a-rate-rule", "an-event"],
+)
+def test_an_amount_species_keeps_its_amount_where_the_size_is_zero(size):
+    """At t = 2 the size is 0. The concentration pass does not divide by it
+    there and leaves the row at amount/V_static, so the amount is that row
+    times V_static: the conserved 5, as at every other row, and not 0. In a
+    rate-rule compartment it read [5, 5, 0, 5]. An event's resize rescales
+    only the concentration selector, so its amount was right (a control)."""
     model = bngsim.Model.from_antimony_string(
-        "compartment c; c := 2 - time; substanceOnly species H in c = 5;"
+        f"compartment c; {size}; substanceOnly species H in c = 5;"
     )
     run = bngsim.Simulator(model).run(sample_times=[0.0, 1.0, 2.0, 3.0], rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(np.asarray(run.as_roadrunner(["H"]))[:, 0], 5.0, rtol=1e-12)
