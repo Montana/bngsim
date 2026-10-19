@@ -435,8 +435,7 @@ struct NetworkModel::Impl {
     // `rateof_reads_ready` says so (NetworkModel::ensure_rateof_reads_). A
     // clone asks its original for them, and may do so while the original is
     // being evaluated on another thread: with the lists marked known before
-    // they were filled, such a clone came away with empty ones. The memo of
-    // what the residuals read is filled and copied under the same mutex.
+    // they were filled, such a clone came away with empty ones.
     std::mutex rateof_reads_mutex;
     std::atomic<bool> rateof_reads_ready{false};
 

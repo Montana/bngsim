@@ -835,11 +835,11 @@ def test_a_row_read_behind_a_root_does_not_fire_its_event_again(a1, times):
 @pytest.mark.parametrize("later", [1, 10, 100])
 @pytest.mark.parametrize("into", [3, 10, 40])
 def test_a_write_ends_the_rest_of_a_trigger_at_the_start(t0, into, later):
-    """A, `at (g*(time - a) > 0)`, rests on its threshold at the start with
-    g = 0. G sets g = 1 a few doubles into the run and a root or a stop
-    follows. The mark for a trigger that rests at the start is for a model
-    that has not moved: kept through G's write, it refused A at the read of
-    the stop, and A, opened by that write and the clock, never fired."""
+    """A, `at (g*(time - a) > 0)`, starts on its threshold with g = 0. G sets
+    g = 1 a few doubles into the run and a root or a stop follows. A, opened
+    by that write and the clock, fires once: under issue #340's rule it was
+    refused at the read of the stop and never fired; under issue #934's hold
+    it fires when the hold ends, 1e4 doubles of t0 after the start."""
     t_g = _after(t0, into)
     text = (
         "species Z = 1; JZ: Z -> ; 0.1*Z; g = 0; na = 0; nb = 0; a = 1; t0 = 0; dG = 1; T = 1;\n"

@@ -6,8 +6,23 @@ it fires at the start if the trajectory leaves the threshold into the trigger's
 true side, at whatever order it leaves, and never if it stays on the threshold
 or leaves into the false side. ``B = t^2/2`` (second order) and ``C = t^3/6``
 (third) are positive for every ``t > 0``: the event fires at once, as in
-libRoadRunner. The root bngsim registers is the boolean trigger minus 0.5, so
-that is what CVODE finds on its own; nothing at the start is special-cased.
+libRoadRunner.
+
+The first doubles of a run cannot be read for it: where ``t_start`` is not 0 the
+elapsed time there is no larger than its rounding, and a stop or a root a few
+ulps on (another event due, a row) reads the state with that rounding in its
+sign. Read there, a trigger that leaves into its false side fired, and one that
+leaves into its true side fell and fired again. So such a trigger is held: if
+the flow carries it into the true side at first order it fires at its first
+root and is not read false again for a short hold after the start; otherwise
+it reads false for that hold and is read as it is from the hold's end, where a
+departure into the true side at a higher order fires. The hold is 1e4 doubles
+of t_start, the scale of that rounding: 1.6e-12 from 0.7, and none from 0.
+
+A departure without first-order motion has no derivative for its fire time
+(moving the threshold, or the flow's first motion, moves the fire from the
+start to later), so a forward-sensitivity run refuses it by name, as issue
+#960's envelope asks, until the residual has been read off the threshold.
 
 Issue #340 had refused that first root wherever the flow did not carry the
 residual off at first order, on BIOMD0000000285 (``PIdeath > 0``, with the
@@ -145,11 +160,76 @@ _CASCADE = "species X0 = 1, X1 = 0, X2 = 0, X3 = 0, X4 = 0, fired = 0, tf = -1\n
 @pytest.mark.parametrize("spelling", ["X{k} > 0", "0 < X{k}", "X{k} - 0 > 0"])
 def test_a_departure_at_any_order_into_the_true_side_fires_at_the_start(order, spelling):
     """X_k = t^k/k! leaves 0 at order k. The trigger is true for every t > 0,
-    so the event fires at the start whatever k is (issue #934)."""
+    so the event fires at the start whatever k is (issue #934). From t = 0
+    there is no start hold, and it fires at its first root."""
     trigger = spelling.format(k=order)
     fired, tf = _fire_time(_CASCADE + f"E: at ({trigger}): fired = 1, tf = time\n")
     assert fired == 1.0
-    assert tf == pytest.approx(0.0, abs=1e-12)
+    assert 0.0 <= tf <= 5e-12
+
+
+def _near_start(t0, order, slope, due, rows, rtol=1e-10, atol=1e-12):
+    """(fires of E0, the last fire's time) for X_k = slope*(t - t0)^k/k! from
+    t0, beside events due at `due` (absolute times) and rows at `rows`."""
+    text = "species X0 = 1" + "".join(f", X{j} = 0" for j in range(1, order + 1)) + ";\n"
+    text += "".join(
+        f"X{j}' = {(repr(slope) + '*') if j == order else ''}X{j - 1};\n"
+        for j in range(1, order + 1)
+    )
+    text += f"n0 = 0; tf = -1;\nE0: at (X{order} > 0), t0=false: n0 = n0 + 1, tf = time;\n"
+    text += "".join(
+        f"tU{e} = 1; U{e}: at (time >= tU{e}), t0=false: q{e} = 1; q{e} = 0;\n"
+        for e in range(len(due))
+    )
+    model = bngsim.Model.from_antimony_string(text)
+    for e, t_due in enumerate(due):
+        model.set_param(f"tU{e}", t_due)
+    res = bngsim.Simulator(model, method="ode").run(
+        sample_times=sorted({t0, *rows, t0 + 1.0}), rtol=rtol, atol=atol
+    )
+    last = dict(zip(res.observable_names, np.asarray(res.observables)[-1], strict=True))
+    return last["n0"], last["tf"]
+
+
+def _ulps(x, n):
+    import math
+
+    for _ in range(n):
+        x = math.nextafter(x, math.inf)
+    return x
+
+
+@pytest.mark.parametrize(
+    "t0, order, due, rows, tol",
+    [
+        (0.3, 1, [25], [1], (1e-10, 1e-12)),
+        (0.3, 2, [10, 50, 10, 2], [], (1e-10, 1e-12)),
+        (0.3, 3, [10, 50, 50], [], (1e-6, 1e-9)),
+        (5.0, 2, [3, 200], [8, 100], (1e-8, 1e-14)),
+    ],
+)
+def test_a_departure_into_the_false_side_beside_reads_a_few_ulps_on_does_not_fire(
+    t0, order, due, rows, tol
+):
+    """X_k = -2(t - t0)^k/k! is negative for every t > t0, so E0 never fires.
+    Other events due (and rows) a few ulps after a t_start that is not 0 read
+    the state where its rounding decides X's sign; without the start hold E0
+    fired there (issue #934's first review)."""
+    n0, _ = _near_start(
+        t0, order, -2.0, [_ulps(t0, k) for k in due], [_ulps(t0, k) for k in rows], *tol
+    )
+    assert n0 == 0.0
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+@pytest.mark.parametrize("t0, slope", [(0.7, 2.0), (0.3, 1e-3)])
+def test_a_departure_into_the_true_side_beside_reads_a_few_ulps_on_fires_once(t0, slope, order):
+    """The true-side twin: E0 fires once, at the start. Read at the rounding a
+    few ulps on, the trigger fell after its fire and rose again, and E0 fired
+    twice (at first order with a small slope on main too)."""
+    n0, tf = _near_start(t0, order, slope, [_ulps(t0, 100), _ulps(t0, 3), _ulps(t0, 40)], [])
+    assert n0 == 1.0
+    assert tf - t0 == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("order", [1, 2, 3, 4])
@@ -255,53 +335,80 @@ def test_biomd285s_cell_dies_at_the_start_as_in_libroadrunner():
     assert abs(values[-1, obs.index("PIdeath")]) < 1e-40  # rr: 1.2e-65
 
 
-def test_biomd285_forward_sensitivity_refuses_the_two_deaths_by_name():
+def test_biomd285_forward_sensitivity_refuses_the_deaths_by_name():
     """The path issue #340 was reported through, which issue #934's decision
-    brings back.
-
-    Both death events fire at the start, in one batch, and the crossing-time
-    shifts computed for them come out unequal (each is of the order of the
-    1e-27 the root lands at), so the batch is refused as an ambiguous
-    ``dt*/dp`` (issue #49) rather than given a number. A single event leaving
-    its threshold at second order is differentiated, and agrees with finite
-    differences (``test_a_start_fire_at_second_order_has_the_right_sensitivity``).
-    """
+    brings back: both death triggers leave 0 with no first-order motion, so
+    the time they fire has no derivative, and the run is refused by name."""
     xml = _corpus_xml()
     if xml is None:
         pytest.skip(f"model not present: {_MODEL}")
 
     model = bngsim.Model.from_sbml(str(xml))
     sim = bngsim.Simulator(model, method="ode", sensitivity_params=["kPIdeath", "kp38death"])
-    with pytest.raises(bngsim.SimulationError, match=r"fire at the same instant.*issue #49"):
+    with pytest.raises(bngsim.SimulationError, match=r"no first-order motion \(issue #934\)"):
         sim.run(t_span=(0.0, 100.0), n_points=11, rtol=1e-9, atol=1e-12)
 
 
-def test_a_start_fire_at_second_order_has_the_right_sensitivity():
-    """S = ka*t^2/2 leaves 0 at second order and E fires at the start for every
-    ka > 0, so its time does not move with ka; G' = F*(1 + S) then integrates
-    1 + S from 0. Central differences of the plain run are the oracle."""
-    text = (
-        "species S = 0, A = 0, F = 0, G = 0; ka = 1\n"
-        "JA: -> A; ka\nJS: -> S; A\nJG: -> G; F*(1 + S)\nE: at (S > 0): F = 1\n"
-    )
-    times = [0.0, 1.0, 2.0]
+def _sens_and_fd(text, param, times):
+    """(forward sensitivity, central difference) of the last row, by species."""
     res = bngsim.Simulator(
-        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["ka"]
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=[param]
     ).run(sample_times=times, rtol=1e-10, atol=1e-12)
     names = list(res.species_names)
-    sens = np.asarray(res.sensitivities)[-1, :, 0]
-
+    sens = dict(zip(names, np.asarray(res.sensitivities)[-1, :, 0], strict=True))
     h = 1e-6
     ends = []
-    for ka in (1 - h, 1 + h):
-        m = bngsim.Model.from_antimony_string(text.replace("ka = 1", f"ka = {ka!r}"))
-        r = bngsim.Simulator(m, method="ode").run(sample_times=times, rtol=1e-12, atol=1e-14)
-        ends.append(np.asarray(r.species)[-1])
-    fd = (ends[1] - ends[0]) / (2 * h)
-    for name in ("S", "A", "G"):
-        i = names.index(name)
-        assert sens[i] == pytest.approx(fd[i], rel=1e-5), name
-    assert sens[names.index("G")] == pytest.approx(4.0 / 3.0, rel=1e-6)  # d/dka of 2 + ka*4/3
+    for value in (1 - h, 1 + h):
+        model = bngsim.Model.from_antimony_string(
+            text.replace(f"{param} = 1", f"{param} = {value!r}")
+        )
+        run = bngsim.Simulator(model, method="ode").run(sample_times=times, rtol=1e-12, atol=1e-14)
+        ends.append(np.asarray(run.species)[-1])
+    fd = dict(zip(names, (ends[1] - ends[0]) / (2 * h), strict=True))
+    return sens, fd
+
+
+_FLAT = "species B = 0, A = 0, F = 0, G = 0; ka = 1; c = 0\nJA: -> A; ka\nJB: -> B; A\n"
+
+
+@pytest.mark.parametrize("param", ["ka", "c"])
+def test_a_start_fire_without_first_order_motion_refuses_sensitivities(param):
+    """B = ka*t^2/2 leaves the threshold c = 0 at second order. Moving c moves
+    the fire from the start to later (no derivative: one side 0, the other
+    unbounded), and the run returned 1e27 for dG/dc unrefused. ka does not move
+    it, but nothing at the fire tells the two apart, so both are refused."""
+    text = _FLAT + "JG: -> G; F\nE: at (B > c), t0=false: F = 1000\n"
+    model = bngsim.Model.from_antimony_string(text)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(bngsim.SimulationError, match=r"no first-order motion \(issue #934\)"):
+        sim.run(sample_times=[0.0, 1.0, 2.0], rtol=1e-10, atol=1e-12)
+
+
+def test_a_first_order_start_fire_is_differentiated():
+    """S = ka*t leaves 0 at first order: a transversal departure, which fires at
+    the start for every ka > 0. G' = F*(1 + S) integrates 1 + S from 0."""
+    text = (
+        "species S = 0, F = 0, G = 0; ka = 1\n"
+        "JS: -> S; ka\nJG: -> G; F*(1 + S)\nE: at (S > 0): F = 1\n"
+    )
+    sens, fd = _sens_and_fd(text, "ka", [0.0, 1.0, 2.0])
+    for name in ("S", "G"):
+        assert sens[name] == pytest.approx(fd[name], rel=1e-5), name
+    assert sens["G"] == pytest.approx(2.0, rel=1e-6)  # d/dka of 2 + 2*ka
+
+
+def test_a_flat_start_that_crosses_back_later_is_differentiated():
+    """S = -t^2/2 + k*t^3/6 starts on its threshold with no first-order
+    motion, leaves into the false side, and crosses back transversally at
+    t = 3/k. The rows read it off the threshold first, so that crossing is a
+    crossing like any other: dG/dk = d/dk (6 - 3/k) = 3."""
+    text = (
+        "species S = 0, A = 0, C = 0, F = 0, G = 0; k = 1\n"
+        "JC: -> C; k\nJA: -> A; C - 1\nJS: -> S; A\nJG: -> G; F\nE: at (S > 0): F = 1\n"
+    )
+    sens, fd = _sens_and_fd(text, "k", list(np.linspace(0.0, 6.0, 13)))
+    assert sens["G"] == pytest.approx(3.0, rel=1e-6)
+    assert sens["S"] == pytest.approx(fd["S"], rel=1e-5)
 
 
 # ─── the true side is the trigger's own (issue #910's review) ──────────────
