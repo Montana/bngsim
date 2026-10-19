@@ -8508,8 +8508,8 @@ class Simulator:
                 logger.warning(
                     "Steady-state dY_ss/dp: %d species were excluded from the "
                     "convergence test by mask=, so they have no steady value and "
-                    "their rows are NaN (first: %s). Any observable or expression "
-                    "sensitivity summing one of them is NaN for the same reason.",
+                    "their rows are NaN (first: %s). output_sensitivities refuses "
+                    "an observable or expression that reads one of them, by name.",
                     len(result.excluded_species),
                     ", ".join(result.species_names[i] for i in list(result.excluded_species)[:3]),
                 )
@@ -10374,7 +10374,36 @@ class SteadyStateResult:
         if not meta:
             return np.empty((0, n_params), dtype=np.float64)
         rows = [self._output_sensitivity_row(m) for m in meta]
+        for m, row in zip(meta, rows, strict=True):
+            self._raise_if_masked_out(m, row)
         return np.stack(rows, axis=0)
+
+    def _raise_if_masked_out(self, meta: dict[str, Any], row: np.ndarray) -> None:
+        """Refuse, by name, an output whose row is NaN because it reads a species
+        ``mask=`` left out of the solve (issue #1124, item 10).
+
+        Such a species has no steady value, so neither has anything that reads
+        it, and its row is NaN by construction (issue #74). Returned here, the
+        NaN reached a fitter as a row, and the only word of it was the warning
+        at the solve. Every other row of the solve is finite, or the solve was
+        refused, so a non-finite row with a mask in force is one of these. The
+        :attr:`sensitivity` tensor keeps its NaN rows.
+        """
+        if np.all(np.isfinite(row)) or not self.excluded_species:
+            return
+        excluded = [self._species_names[i] for i in self.excluded_species]
+        if meta["kind"] == "species":
+            reads = f"is {meta['name']}, which"
+        elif len(excluded) == 1:
+            reads = f"reads {excluded[0]}, which"
+        else:
+            reads = f"reads one or more of {', '.join(excluded)}, which"
+        raise ValueError(
+            f"output_sensitivities: {meta['selector']!r} has no steady-state "
+            f"derivative: it {reads} mask= left out of the solve, so it has no "
+            "steady value (issue #74). Select outputs that do not read it, or keep "
+            "it in the mask."
+        )
 
     def _resolve_one_output(self, selector: str) -> dict[str, Any]:
         """Resolve one selector to its metadata dict via the shared resolver."""
