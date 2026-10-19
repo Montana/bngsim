@@ -624,6 +624,17 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "no listed rate law reads it, so the crossing is continuous. A jump the "
             "listed reactions do not account for is judged as before.")
         .def(
+            "set_state_switch_guards",
+            [](bngsim::SolverOptions &self, const std::vector<std::string> &guards) {
+                self.sensitivity.state_switch_guards = guards;
+            },
+            py::arg("guards"),
+            "Parallel to set_state_switch_conditions (issue #1147): for each, the "
+            "if() branches its step or bend calls switch a rate law in, as an "
+            "expression that reads 1 where one of them is on, or an empty string "
+            "where one of its readings stands in no branch. A plain run steps on "
+            "through a crossing whose every branch is off rather than restart.")
+        .def(
             "set_state_switch_conditions",
             [](bngsim::SolverOptions &self, const std::vector<std::string> &conditions) {
                 self.sensitivity.state_switch_conditions = conditions;

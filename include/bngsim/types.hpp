@@ -1142,6 +1142,14 @@ struct SensitivityOptions {
     // ran out. Read only by a run without sensitivity columns.
     std::vector<std::string> stall_watch_conditions;
 
+    // Parallel to state_switch_conditions (issue #1147): for each, the if()
+    // branches its step or bend calls switch a rate law in, as an expression
+    // that reads 1 where one of them is on, or "" where one of its readings
+    // stands in no branch. A plain run steps on through a crossing whose every
+    // branch is off, which changes nothing, rather than restart there. Empty
+    // (the default) restarts at every crossing, as before.
+    std::vector<std::string> state_switch_guards;
+
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event
     // jump then collapses to the GH #212 form and the run is byte-identical to

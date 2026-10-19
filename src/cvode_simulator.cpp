@@ -11996,6 +11996,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // `X<1` and `X<=1` — the same crossing, two spellings — are one root and one
     // jump instead of two coincident ones the composition would double-count.
     std::vector<const NetworkModel::StateSwitch *> state_switches;
+    // Parallel to state_switches (issue #1147): the compiled branches each
+    // switches a rate law in, any one of which on makes its crossing one to
+    // restart at. Empty where one of its readings stands in no branch.
+    std::vector<std::vector<int>> state_switch_guards;
     std::vector<int> state_switch_roots;
     std::vector<double> state_switch_zero_hold;
     // Issue #928: from when each residual has been seen pinned, and CVODE's
@@ -12049,7 +12053,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     if (!opts.sensitivity.state_switch_conditions.empty()) {
         const auto &conds = opts.sensitivity.state_switch_conditions;
         const auto &rxn_lists = opts.sensitivity.state_switch_reactions;
+        const auto &guard_texts = opts.sensitivity.state_switch_guards;
         std::unordered_map<std::string, const NetworkModel::StateSwitch *> by_residual;
+        std::unordered_map<const NetworkModel::StateSwitch *, std::size_t> slot_of;
+        std::vector<char> unguarded;
         std::unordered_set<const NetworkModel::StateSwitch *> unmapped;
         for (std::size_t c = 0; c < conds.size(); ++c) {
             const NetworkModel::StateSwitch *sw = model.state_switch(conds[c]);
@@ -12058,8 +12065,29 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
             auto [it, fresh] = by_residual.emplace(sw->residual_source, sw);
             if (fresh) {
+                slot_of[sw] = state_switches.size();
                 state_switches.push_back(sw);
                 state_switch_roots.push_back(sw->residual_expr_idx);
+                state_switch_guards.emplace_back();
+                unguarded.push_back(0);
+            }
+            // Issue #1147: one spelling of the crossing outside every branch
+            // makes it one to restart at, whatever the rest are in.
+            {
+                const std::size_t slot = slot_of[it->second];
+                int guard_idx = -1;
+                if (c < guard_texts.size() && !guard_texts[c].empty()) {
+                    try {
+                        guard_idx = model.evaluator().compile(guard_texts[c]);
+                    } catch (const std::exception &) {
+                        guard_idx = -1;
+                    }
+                }
+                if (guard_idx < 0) {
+                    unguarded[slot] = 1;
+                } else {
+                    state_switch_guards[slot].push_back(guard_idx);
+                }
             }
             // One spelling with no reaction list makes the whole crossing
             // unmapped, judged as it always was. An EMPTY list is a finding,
@@ -12075,6 +12103,11 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         }
         for (const NetworkModel::StateSwitch *sw : unmapped) {
             impl_->state_switch_rxns.erase(sw);
+        }
+        for (std::size_t slot = 0; slot < state_switch_guards.size(); ++slot) {
+            if (unguarded[slot] != 0) {
+                state_switch_guards[slot].clear();
+            }
         }
         impl_->state_switch_all = state_switches;
     }
@@ -14889,6 +14922,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         CVodeGetNumSteps(cvode_mem, &steps_now);
                         for (int j : switched) {
                             const auto jx = static_cast<size_t>(j);
+                            // Issue #1147: a crossing every branch it switches
+                            // is off in changes nothing, and is stepped on
+                            // through as one the flow does not carry. Those
+                            // branches' conditions are rooted on their own, so
+                            // none of them turns here.
+                            if (jx < state_switch_guards.size() &&
+                                !state_switch_guards[jx].empty()) {
+                                impl_->sync_model_at(t_root, y_data, ns);
+                                bool on = false;
+                                for (int g : state_switch_guards[jx]) {
+                                    on = on || model.evaluator().evaluate(g) > 0.5;
+                                }
+                                if (!on) {
+                                    continue;
+                                }
+                            }
                             bool resolved = false;
                             std::vector<double> grad;
                             if (impl_->flow_carries_state_switch(
