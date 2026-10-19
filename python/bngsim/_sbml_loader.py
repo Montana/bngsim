@@ -5172,11 +5172,25 @@ def _build_model_from_sbml_doc_in_context(doc):
         for j in range(sbml_model.getNumRules())
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     }
+    # An initialAssignment gives its target a value as surely as a rule does,
+    # whether or not it folds here. One that does not fold is evaluated by the
+    # engine at the start, as it is for a parameter that declares a value the
+    # assignment replaces (#732), or refused by name (#871). `k = 0.5 + S3`,
+    # with S3 given no initial value, does not fold, as S3 is only started at
+    # 0 (#580) further on; C2 refused k as having "no initialAssignment",
+    # where libRoadRunner, and bngsim with any declared value for k, give
+    # k = 0.5.
+    _ia_targets = {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+        if sbml_model.getInitialAssignment(j).getMath() is not None
+    }
     _unset_param_ids = {
         pid
         for pid in _all_param_ids
         if not sbml_model.getParameter(pid).isSetValue()
         and pid not in ia_values
+        and pid not in _ia_targets
         and pid not in _ar_targets
     }
     if _unset_param_ids:
@@ -5337,17 +5351,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # S1(1) = e^-0.5 = 0.607 and no warning. RoadRunner refuses the model. A
     # factor that an initialAssignment or an assignmentRule gives a value is not
     # in `_unset_param_ids` and loads as before (SBML suite 01642-01644 and
-    # 01651-01653 give theirs by an initialAssignment). One whose
-    # initialAssignment does not fold at load is in it too, but the model does
-    # assign it, so it is left to §3b, which names the assignment it could not
-    # evaluate. Like C2 this goes by what the attribute names, so a model-wide
-    # factor that every species overrides still refuses. Same refusal and hatch
-    # as C2; under the hatch the factor is 0.0, the value the parameter itself is
-    # given everywhere else.
-    _cf_unset = _unset_param_ids - {
-        sbml_model.getInitialAssignment(j).getSymbol()
-        for j in range(sbml_model.getNumInitialAssignments())
-    }
+    # 01651-01653 give theirs by an initialAssignment). Nor is one whose
+    # initialAssignment does not fold at load: the model does assign it, so it
+    # is left to §3b, which names the assignment it could not evaluate. An
+    # initialAssignment with no math assigns nothing, so its factor is refused
+    # here; it used to be left to §3b too, which read it as 0.0 without a word
+    # (S1 held at 1). Like C2 this goes by what the attribute names, so a
+    # model-wide factor that every species overrides still refuses. Same
+    # refusal and hatch as C2; under the hatch the factor is 0.0, the value the
+    # parameter itself is given everywhere else.
+    _cf_unset = _unset_param_ids
     _unset_cf: list[tuple[str, str]] = []
     if sbml_model.isSetConversionFactor() and sbml_model.getConversionFactor() in _cf_unset:
         _unset_cf.append((sbml_model.getConversionFactor(), "the model's conversionFactor"))

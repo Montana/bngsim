@@ -338,6 +338,63 @@ def test_c2_unset_param_with_initial_assignment_does_not_warn(caplog):
     assert not [m for m in msgs if "kdeg" in m and "no value attribute" in m], msgs
 
 
+def _c2_kdeg_assigned(ia_math: str, params: str = "") -> str:
+    """`_C2_UNSET_CONSUMED_SBML` with kdeg given by the initialAssignment
+    `ia_math` (MathML), beside S3, a species with no initial value."""
+    return (
+        _C2_UNSET_CONSUMED_SBML.replace(
+            "</listOfSpecies>",
+            '<species id="S3" compartment="cell" hasOnlySubstanceUnits="false" '
+            'boundaryCondition="false" constant="false"/></listOfSpecies>',
+        )
+        .replace("</listOfParameters>", f"{params}</listOfParameters>")
+        .replace(
+            "<listOfReactions>",
+            '<listOfInitialAssignments><initialAssignment symbol="kdeg"><math '
+            f'xmlns="http://www.w3.org/1998/Math/MathML">{ia_math}</math>'
+            "</initialAssignment></listOfInitialAssignments><listOfReactions>",
+        )
+    )
+
+
+def test_c2_unset_param_whose_initial_assignment_does_not_fold_loads(monkeypatch, caplog):
+    """`kdeg = 0.5 + S3`, S3 with no initial value, does not fold at load, as S3
+    is only started at 0 (#580) after the fold. C2 refused kdeg as having "no
+    initialAssignment". The engine evaluates the assignment at the start, as it
+    does when kdeg declares a value the assignment replaces, with S3 at 0 and
+    #580's warning naming it: kdeg = 0.5 and A(1) = 10·e^-0.5 = 6.0653, as
+    libRoadRunner gives."""
+    import logging
+
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    sbml = _c2_kdeg_assigned("<apply><plus/><cn>0.5</cn><ci>S3</ci></apply>")
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        model = bngsim.Model.from_sbml_string(sbml)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert [m for m in msgs if "'S3'" in m and "initial value undefined" in m], msgs
+    assert not [m for m in msgs if "kdeg" in m and "no value attribute" in m], msgs
+    res = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, 1.0), n_points=2, rtol=1e-10, atol=1e-12
+    )
+    amount = res.as_roadrunner(selections=["A"])["A"]
+    assert float(amount[-1]) == pytest.approx(10 * math.exp(-0.5), rel=1e-6)
+
+
+def test_c2_initial_assignment_over_a_valueless_parameter_refuses_that_one(monkeypatch):
+    """`kdeg = 0.5 + q`, q with no value and no assignment: q is the parameter
+    the model gives no value, and the refusal names it alone. kdeg, which the
+    assignment gives a value, was named beside it."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    sbml = _c2_kdeg_assigned(
+        "<apply><plus/><cn>0.5</cn><ci>q</ci></apply>", '<parameter id="q" constant="true"/>'
+    )
+    with pytest.raises(bngsim.UnderSpecifiedModelError) as exc:
+        bngsim.Model.from_sbml_string(sbml)
+    msg = str(exc.value)
+    assert "Parameter 'q' has no value attribute and no initialAssignment" in msg
+    assert "kdeg" not in msg
+
+
 # ─── C2b (#580): a kineticLaw's valueless LOCAL parameter ───────────────
 #
 # C2 above covers only the model's global <parameter>s. A local one with no
@@ -986,6 +1043,20 @@ def test_c2c_conversion_factor_the_model_gives_a_value_loads(
     assert s1 == pytest.approx(math.exp(-1.0), rel=1e-6)
     converted_s2 = "model_cf" in attrs
     assert s2 == pytest.approx((1 - math.exp(-1.0)) / (1 if converted_s2 else 2), rel=1e-6)
+
+
+@pytest.mark.parametrize(("attrs", "where"), _CF_LEVELS)
+def test_c2c_conversion_factor_whose_initial_assignment_has_no_math_refuses(
+    monkeypatch, attrs, where
+):
+    """An initialAssignment with no math assigns nothing, so the factor has no
+    value. It was left to §3b, which read it as 0.0 without a word: S1 held at
+    1. RoadRunner refuses the model."""
+    monkeypatch.delenv("BNGSIM_ALLOW_UNSET_PARAMS", raising=False)
+    extra = '<listOfInitialAssignments><initialAssignment symbol="cf"/></listOfInitialAssignments>'
+    with pytest.raises(bngsim.UnderSpecifiedModelError) as exc:
+        bngsim.Model.from_sbml_string(_cf_sbml(**attrs, extra=extra))
+    assert f"'cf' ({where})" in str(exc.value)
 
 
 def test_c2c_hatch_loads_with_the_factor_at_zero(monkeypatch, caplog):
