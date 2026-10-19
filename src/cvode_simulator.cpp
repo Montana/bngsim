@@ -12044,6 +12044,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     }
     const int n_state_switch = static_cast<int>(state_switch_roots.size());
     state_switch_zero_hold.assign(static_cast<size_t>(n_state_switch), 0.0);
+    // Issue #959: the surfaces a plain run is put across when pinned on one
+    // (issue #928): its state switches, and the conditions it watches without
+    // rooting on them, an SBML model's thresholds, which the loader roots.
+    std::vector<const NetworkModel::StateSwitch *> stall_switches = state_switches;
+    if (sens.n_total == 0 && !opts.sensitivity.stall_watch_conditions.empty()) {
+        std::unordered_set<std::string> seen_residual;
+        for (const auto *sw : state_switches) {
+            seen_residual.insert(sw->residual_source);
+        }
+        for (const auto &cond : opts.sensitivity.stall_watch_conditions) {
+            const NetworkModel::StateSwitch *sw = model.state_switch(cond);
+            if (sw != nullptr && seen_residual.insert(sw->residual_source).second) {
+                stall_switches.push_back(sw);
+            }
+        }
+    }
     // Issue #908: residuals held off the root search while their crossings are
     // a slide's (StateSwitchHold). Only a run without sensitivities holds one.
     // BNGSIM_STATE_SWITCH_HOLD=0 holds none, which steps every root as before
@@ -14261,7 +14277,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // each batch it spends.
             bool carried = false;
             auto carry_if_pinned = [&](double t_batch) {
-                if (n_state_switch == 0) {
+                if (stall_switches.empty()) {
                     return false;
                 }
                 if (sens.n_total != 0) {
@@ -14280,10 +14296,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     return false;
                 }
                 state_switch_pinned_fails = failed;
-                state_switch_pinned_since.resize(state_switches.size(),
+                state_switch_pinned_since.resize(stall_switches.size(),
                                                  std::numeric_limits<double>::quiet_NaN());
                 carried = impl_->carry_across_stalled_state_switch(
-                    cvode_mem, static_cast<double>(t_ret), t_batch, y, ns, state_switches,
+                    cvode_mem, static_cast<double>(t_ret), t_batch, y, ns, stall_switches,
                     state_switch_pinned_since, false);
                 return carried;
             };
@@ -14311,6 +14327,15 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             if (carried) {
                 std::fill(state_switch_zero_hold.begin(), state_switch_zero_hold.end(), 0.0);
                 t_now = t_ret;
+                // The state was put across with no step, so no root saw an
+                // event trigger that reads the surface change, and CVODE reads
+                // every root afresh from the restart. The triggers are read
+                // here as at a stop. Without this an SBML event on the
+                // threshold of a piecewise rate law (#959) never fired: Z = 0
+                // where the run without the carry timed out.
+                if (n_events > 0) {
+                    fire_rises_on_stop(static_cast<double>(t_ret), static_cast<double>(t_ret));
+                }
                 continue;
             }
 

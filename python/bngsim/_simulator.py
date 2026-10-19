@@ -999,6 +999,7 @@ class Simulator:
                 )
             from bngsim._bngsim_core import NfsimSimulator
             from bngsim._network_free_checks import (
+                refuse_nfsim_compartments,
                 refuse_nfsim_rate_laws,
                 refuse_nfsim_stale_local_functions,
                 refuse_time_dependent_rate_laws,
@@ -1007,6 +1008,7 @@ class Simulator:
             refuse_time_dependent_rate_laws(xml_path, "nfsim")
             refuse_nfsim_rate_laws(xml_path)
             refuse_nfsim_stale_local_functions(xml_path)
+            refuse_nfsim_compartments(xml_path)
             self._sim = NfsimSimulator(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
@@ -2837,6 +2839,21 @@ class Simulator:
                 ", ".join(repr(c) for c in conditions),
             )
             opts.set_state_switch_conditions(list(conditions))
+        # Issue #959: an SBML model's thresholds are rooted by the loader's
+        # discontinuity triggers, so they are covered here and are no state
+        # switch, and a run pinned on one, unable to cross or pass, was not put
+        # across as #928 puts a state switch's: `piecewise(kb, A > thr, 0)` with
+        # A rising at 1e-8 ran until its wall clock ended it. The core watches
+        # them for that alone, with no root of their own; one that reads no
+        # state resolves to nothing there. A .net model has no such trigger.
+        if model._core.n_discontinuity_triggers:
+            watched = [
+                c
+                for c in (model.time_discontinuity_conditions() if covered is None else covered)
+                if c not in conditions
+            ]
+            if watched:
+                opts.set_stall_watch_conditions(watched)
 
     def _auto_codegen_for_sensitivity(
         self, *, jit_backend: str, n_sens_dirs: int | None = None
