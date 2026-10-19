@@ -7177,11 +7177,15 @@ def _build_model_from_sbml_doc_in_context(doc):
         #
         # Nor one the per-species divide cannot serve, which §9 writes out one
         # species at a time instead and SSA refuses: a reaction that changes a
-        # species in an assignment-rule compartment, which is no state to divide
-        # by (#745), or that mixes conversion factors. Certified, those took the
-        # per-species divide anyway: an irreversible `A + E => B + E` with A and
-        # B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a mixed
-        # factor refused to load, where the same law flagged reversible was right.
+        # species in an assignment-rule compartment whose size moves, which is no
+        # state to divide by (#745), or that mixes conversion factors. Certified,
+        # those took the per-species divide anyway: an irreversible `A + E => B + E`
+        # with A and B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a
+        # mixed factor refused to load, where the same law flagged reversible was
+        # right. A rule over constants (`C := 2`) holds its load-time size, as a
+        # write to what it reads is refused, so the per-species divide by that
+        # size serves its species as it serves a static compartment's, and the
+        # SSA reads their counts over it exactly.
         _xcomp_varvol = _varvol_reject.get("xcomp_varvol_comps")
         if _xcomp_varvol and not _rev_difference and not _cf_mixed:
             _net: dict[str, float] = {}
@@ -7193,7 +7197,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         float("nan") if _st is None else _st
                     )
             if not any(
-                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_targets
+                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_moving
                 for _sid, _n in _net.items()
             ):
                 ssa_varvol_xcompartment[i] = _xcomp_varvol
