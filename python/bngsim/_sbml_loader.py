@@ -9592,12 +9592,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # condition's root, each way, rescales the compartment's concentrations so
     # their amounts hold. ODE only, as every resize rescale is (#81); it is
     # added after the model's own events so their indices stay as they were.
-    # It executes before any of the model's events at the same instant, by a
-    # priority none of theirs reaches: the jump belongs to the size at that
-    # instant, and executed after an event there that sets a concentration in
-    # the compartment, its rescale of the value from before overwrote that
-    # setting (`at (time >= 2): Sn = 10` beside `cv := piecewise(1, time < 2,
-    # 5)` left Sn at 1 or 10 as the same-priority draw went, #242).
+    # The jump belongs to the size at that instant. Marked as a jump, it
+    # executes before anything else there, and the model's events triggered at
+    # the instant read their trigger, values and delay after it: read before
+    # it, `at (time >= 2): X = Sn` beside `cv := piecewise(1, time < 2, 5)`
+    # gave X the concentration from before the jump. Executed after an event
+    # there that sets a concentration in the compartment, its rescale of the
+    # value from before overwrote that setting (`at (time >= 2): Sn = 10` left
+    # Sn at 1 or 10 as the same-priority draw went, #242). The priority keeps
+    # it out of the draw against the model's own events under SSA, where it
+    # writes nothing.
     for k, (comp, trigger, before, after) in enumerate(_size_jumps):
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
@@ -9611,6 +9615,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             priority_expr="1e308",
             assignment_ode_only=[True] * len(_jump_species[comp]),
         )
+        builder.set_last_event_size_jump(comp)
         for sid in _jump_species[comp]:
             ar_dilution_species.add(sid)
 

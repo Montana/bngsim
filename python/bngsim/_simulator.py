@@ -8024,7 +8024,10 @@ class Simulator:
         derivatives, which are 0 at a steady state.
         """
         core = self._model._core
-        n_events = int(self._model.n_events)
+        # A compartment size that jumps keeps the amounts in it through an event
+        # the loader adds (issue #1054), which is no event of the model's own.
+        jumps = list(core.event_size_jump_compartments)
+        n_events = sum(1 for comp in jumps if not comp)
         if n_events:
             raise SimulationError(
                 f"{where} is not supported for this model: it has {n_events} "
@@ -8033,6 +8036,23 @@ class Simulator:
                 "never made, and the state they return is one the model's dynamics may never "
                 "reach (issue #710). Integrate the model with run() over a span long enough "
                 "for the trajectory to settle, and read the state where it ends."
+            )
+        if jumps:
+            comps = sorted(set(jumps))
+            what = (
+                f"the size of compartment {comps[0]}, which an assignment rule sets, jumps "
+                "where a piecewise the rule reads switches, and the amounts in it are"
+                if len(comps) == 1
+                else f"the sizes of compartments {', '.join(comps)}, which assignment rules "
+                "set, jump where a piecewise a rule reads switches, and the amounts in them are"
+            )
+            raise SimulationError(
+                f"{where} is not supported for this model: {what} kept across a jump by a "
+                "rescale of their concentrations there (issue #1054). The steady-state "
+                "solvers look for a root of the right-hand side and make no such rescale, so "
+                "the state they return can hold the concentrations from the wrong side of a "
+                "jump (issue #710). Integrate the model with run() over a span long enough for "
+                "the trajectory to settle, and read the state where it ends."
             )
         if core.functions_use_time:
             raise SimulationError(

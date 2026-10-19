@@ -2095,6 +2095,19 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "a NaN at one point for a declined analytic sensitivity RHS over the whole run.")
         .def_property_readonly("n_events", &bngsim::NetworkModel::n_events)
         .def_property_readonly(
+            "event_size_jump_compartments",
+            [](const bngsim::NetworkModel &self) {
+                std::vector<std::string> out;
+                out.reserve(self.events().size());
+                for (const auto &ev : self.events()) {
+                    out.push_back(ev.size_jump_compartment);
+                }
+                return out;
+            },
+            "Per event, the compartment whose piecewise assignment-rule size jumps where "
+            "the event rescales its concentrations (issue #1054), or '' for an event of the "
+            "model's own. n_events counts both.")
+        .def_property_readonly(
             "event_assigned_species",
             [](const bngsim::NetworkModel &self) {
                 std::vector<int> out;
@@ -3080,6 +3093,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "compartment's size; base_assign_idx0 the event's own assignment to the same "
              "species, or -1. The engine stores base * size before / size after the event's "
              "other assignments rather than the assignment's expression.")
+        .def("set_last_event_size_jump", &bngsim::ModelBuilder::set_last_event_size_jump,
+             py::arg("compartment"),
+             "Issue #1054: mark the most recently added event as the rescale where the "
+             "piecewise assignment-rule size of the compartment jumps. The ODE engine "
+             "executes it before the other events of its instant read their trigger, "
+             "values and delay.")
         .def("set_compute_conservation_laws", &bngsim::ModelBuilder::set_compute_conservation_laws,
              py::arg("enabled"),
              "Enable/disable conservation-law detection in build() (GH #102). The "
