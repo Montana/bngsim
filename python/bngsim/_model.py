@@ -1017,7 +1017,10 @@ class Model:
         times the state decides, so no stop can be placed at them before the
         run. :meth:`Simulator.run` registers each one as a CVODE root instead,
         which stops the step at the crossing rather than letting it span a
-        narrow window and miss it.
+        narrow window and miss it. A step or bend call over state, such as
+        ``floor(T/100)`` or ``max(0, 1 - abs(T-50)/w)``, is rooted where it
+        jumps or bends, since it spells the same pulse with no comparison
+        (issue #1068).
 
         The crossings :meth:`time_discontinuity_conditions` already covers are
         left out, and so is every condition in a function that no rate law
@@ -1060,6 +1063,28 @@ class Model:
             self._state_switch_root_conditions = roots
             self._state_switch_root_covered = covered
         return self._state_switch_root_conditions
+
+    def _state_switch_stops_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """The roots :meth:`_state_switch_roots_beside` has for step and bend
+        calls, which a run with sensitivities adds as stops (issue #1068).
+        Kept in the same memo, beside the same ``covered``."""
+        key = ("calls", covered)
+        stops = self._state_switch_root_memo.get(key)
+        if stops is None:
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                stops = state_switch_root_conditions(self._core, covered=covered, calls_only=True)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "State-switch root detection failed (%s); a rate law with a step or bend "
+                    "call over model state will be integrated with sensitivities and "
+                    "without a root where the call jumps or bends (issue #1068).",
+                    e,
+                )
+                stops = ()
+            _remember(self._state_switch_root_memo, key, stops)
+        return stops
 
     def table_function_breaks(self) -> list:
         """Where the model's table functions break (issue #709): for each table
