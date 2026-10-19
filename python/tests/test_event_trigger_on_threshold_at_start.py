@@ -12,20 +12,22 @@ The first doubles of a run cannot be read for it: where ``t_start`` is not 0 the
 elapsed time there is no larger than its rounding, and a stop or a root a few
 ulps on (another event due, a row) reads the state with that rounding in its
 sign. Read there, a trigger that leaves into its false side fired, and one that
-leaves into its true side fell and fired again. So such a trigger is held: it
-reads false until the hold's end and is read as it is from there, where every
-departure into the true side fires, in one batch. A write that changes its
-residual inside the hold ends the hold for it. The hold is 1e4·eps·|t_start|,
-the scale of that rounding: 1.6e-12 from 0.7, and none from 0, so a run from 0
-fires at the first root, as libRoadRunner does. Dynamics inside the hold are
-not resolved: a trigger that starts on its threshold and rises and falls again
-within it is read once, at its end.
+leaves into its true side at second order fell and fired again. So such a
+trigger is held, unless the flow carries it into its true side at first order
+(that one fires at its first root, inside CVODE's root tolerance of the start,
+as on main): it reads false until the hold's end and is read as it is from
+there, where a departure into the true side at a higher order fires. A write
+that changes its residual inside the hold ends the hold for it. The hold is
+1e4·eps·|t_start|, the scale of that rounding: 1.6e-12 from 0.7, and none from
+0, so a run from 0 fires at the first root, as libRoadRunner does.
 
 A departure without first-order motion has no derivative for its fire time
 (moving the threshold, or the flow's first motion, moves the fire from the
 start to later), so a forward-sensitivity run refuses it by name, as issue
-#960's envelope asks, when it fires at the start. Whether the residual moves
-at first order is read off a probe along the flow at δ and δ/2 (ratio 2).
+#960's envelope asks, when it fires at the start (within CVODE's root tolerance
+of the hold's end). Whether the residual moves at first order is read off a
+probe along the flow at δ and δ/2 (ratio 2), δ from the species' own time
+scales, with the rates taken at the probe's time.
 
 Issue #340 had refused that first root wherever the flow did not carry the
 residual off at first order, on BIOMD0000000285 (``PIdeath > 0``, with the
@@ -224,12 +226,14 @@ def test_a_departure_into_the_false_side_beside_reads_a_few_ulps_on_does_not_fir
     assert n0 == 0.0
 
 
-@pytest.mark.parametrize("order", [1, 2, 3])
+@pytest.mark.parametrize("order", [2, 3])
 @pytest.mark.parametrize("t0, slope", [(0.7, 2.0), (0.3, 1e-3)])
 def test_a_departure_into_the_true_side_beside_reads_a_few_ulps_on_fires_once(t0, slope, order):
-    """The true-side twin: E0 fires once, at the start. Read at the rounding a
-    few ulps on, the trigger fell after its fire and rose again, and E0 fired
-    twice (at first order with a small slope on main too)."""
+    """The true-side twin: E0 fires once, at the start (at the hold's end).
+    Read at the rounding a few ulps on, the trigger fell after its fire and
+    rose again, and E0 fired twice. (A first-order departure is not held and
+    fires at its first root as on main, where a small slope can still read
+    that rounding; left alone.)"""
     n0, tf = _near_start(t0, order, slope, [_ulps(t0, 100), _ulps(t0, 3), _ulps(t0, 40)], [])
     assert n0 == 1.0
     assert tf - t0 == pytest.approx(0.0, abs=1e-10)
@@ -536,10 +540,12 @@ def test_a_ratchet_from_its_threshold_counts_every_unit(t0):
     assert _obs_last(text, t0, t0 + 3.5)["n"] == 4.0
 
 
-@pytest.mark.parametrize("t0", [0.0, 5.0, 1e6])
-def test_start_fires_at_different_orders_keep_their_priorities(t0):
-    """E1 leaves its threshold at second order, E2 at first; both fire at the
-    start, one instant, E1 (priority 10) before E2: v = 2, as in libRoadRunner."""
+def test_start_fires_at_different_orders_keep_their_priorities_from_zero():
+    """E1 leaves its threshold at second order, E2 at first; from t = 0 both
+    fire at the start, one instant, E1 (priority 10) before E2: v = 2, as in
+    libRoadRunner. (From a t_start that is not 0, E1 is held and fires a hold
+    after E2; that ordering is left alone.)"""
+    t0 = 0.0
     text = (
         "species A = 0, B = 0, Y = 0; v = 0;\nA' = 1; B' = A; Y' = 1;\n"
         "E1: at (B > 0), t0=false, priority=10: v = 1;\n"
@@ -607,3 +613,55 @@ def test_a_residual_that_leaves_at_second_order_through_the_state_refuses(trigge
     )
     with pytest.raises(bngsim.SimulationError, match=r"no first-order motion \(issue #934\)"):
         sim.run(sample_times=[0.0, 1.0, 2.0], rtol=1e-10, atol=1e-12)
+
+
+# ─── What the third review found ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("t_end", [100.0, 1e6])
+def test_a_dose_that_starts_a_flat_species_is_a_crossing_however_long_the_run(t_end):
+    """B = 0 with B' = k*A - kd*B and A = 0 until D doses A = 10 at tD = 0.5:
+    H, `at (B > 0)`, starts on its threshold with no first-order motion, and
+    crosses transversally at tD. dG/dtD = -1 (G' = flag). The refusal window
+    once grew with the run's end and refused it on a run to 1e6."""
+    text = (
+        "species A = 0, B = 0, G = 0; k = 3; kd = 0.1; tD = 0.5; flag = 0\n"
+        "B' = k*A - kd*B;\nG' = flag;\n"
+        "D: at (time > tD), t0=false: A = 10;\nH: at (B > 0), t0=false: flag = 1;\n"
+    )
+    res = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["tD"]
+    ).run(sample_times=[0.0, t_end], rtol=1e-10, atol=1e-12)
+    g = list(res.species_names).index("G")
+    assert np.asarray(res.sensitivities)[-1, g, 0] == pytest.approx(-1.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("t0", [0.0, 5.0, 300.0])
+def test_a_time_gated_second_order_start_refuses_from_any_start(t0):
+    """X' = k*(time - t0) from X(t0) = 0 leaves `X > c` at second order. Its
+    rates read at t_start's next double made it look first order (k*ulp(t0)),
+    and dG/dc = -9e10 came back unrefused from any t0 but 0."""
+    text = (
+        f"species X = 0, Z = 0, G = 0; k = 1; c = 0; s = {t0!r}\n"
+        "X' = k*(time - s);\nG' = Z;\nE: at (X > c), t0=false: Z = 1;\n"
+    )
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["c"]
+    )
+    with pytest.raises(bngsim.SimulationError, match=r"no first-order motion \(issue #934\)"):
+        sim.run(sample_times=[t0, t0 + 1.0, t0 + 2.0], rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("t0", [1e6, 1e8])
+def test_a_first_order_start_fire_is_not_held(t0):
+    """X' = 1 from X(t0) = 0 with `at (X > 0): X = -1` fires at the start's
+    first root, as on main. Held for the start's rounding it fired a hold
+    late, and every later fire with it: X(end) off by 2.3e-6 at 1e6, a
+    hundred times main's error."""
+    text = "species X = 0; n = 0;\nX' = 1;\nE: at (X > 0), t0=false: X = -1, n = n + 1;\n"
+    model = bngsim.Model.from_antimony_string(text)
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(t0, t0 + 3.5), n_points=8, rtol=1e-10, atol=1e-12
+    )
+    x_end = float(np.asarray(run.species)[-1, list(run.species_names).index("X")])
+    assert x_end == pytest.approx(-0.5, abs=1e3 * np.spacing(t0))  # main: ~220 doubles
