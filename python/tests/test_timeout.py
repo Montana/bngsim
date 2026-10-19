@@ -87,6 +87,11 @@ def test_ssa_timeout_raises_simulation_timeout(reversible_net) -> None:
     """SSA: with a tiny budget, a long simulation must raise the typed
     exception in roughly the configured time."""
     sim = _reversible_ssa_sim(reversible_net)
+    # The first run compiles and loads the model's propensity library. That is
+    # build time, not timeout latency, and macOS checks a new library on its
+    # first load one process at a time: under the parallel pre-push run with a
+    # cold cache, this run spent 21 s there. So pay it before the clock starts.
+    sim.run(t_span=(0, 1e-6), n_points=2, seed=1)
     budget = 0.3
     t0 = time.perf_counter()
     with pytest.raises(bngsim.SimulationTimeout) as info:

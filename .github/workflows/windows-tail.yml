@@ -137,7 +137,20 @@ jobs:
       - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
+      # MSBuild compiled this build one file at a time: scikit-build-core passes
+      # no parallel level to the Visual Studio generator and nothing set /MP, so
+      # on a 4-core runner the build was serial, 7m32s of it NFsim's sources
+      # (2026-10-18). CL is the environment variable cl.exe reads options from,
+      # and -MP compiles a target's sources in parallel, one process per core.
+      # Spelled -MP, not /MP: this step runs in Git Bash, which rewrites an
+      # environment value that looks like a POSIX path before a Windows program
+      # sees it, and with CL=/MP CMake's compiler check failed on all four bash
+      # legs while cibuildwheel's (set from Python) built. The variable is this
+      # step's alone, so the cl that tests compile codegen with later runs as
+      # it did.
       - name: Build & install bngsim (NFsim on, KLU off)
+        env:
+          CL: -MP
         shell: bash
         run: |
           set -euxo pipefail

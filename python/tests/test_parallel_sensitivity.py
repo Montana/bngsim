@@ -1079,3 +1079,127 @@ def test_biomd44_resolves_every_column_at_every_chunk_size():
     # 2h. Two orders of margin over the observed agreement, which is all the claim
     # needs — a NaN or a wrong-by-orders column fails this by a mile.
     np.testing.assert_allclose(column, fd, rtol=1e-2, atol=1e-4)
+
+
+# ── Issue #787: the stitch carries what each chunk's stamp attached ──
+#
+# Each chunk is stamped by the report passes run() uses: the reported columns,
+# the volume factors, the live sizes as_roadrunner reads for a species in a
+# compartment whose size changes, and the core behind Result.state. The stitch
+# built its result from a list of fields that left the live sizes out, so
+# through as_roadrunner a conserved amount of 2 in a compartment growing at
+# c' = 0.2 read 2, 1, 0.667, and a conserved 5 in c := 2 + time read 5, 3.33,
+# 2.5. The columns and the sensitivity rows were right; the amounts and
+# concentrations read through the live size were not, with nothing said.
+
+_GROWS = "compartment c = 0.5; c' = g; g = 0.2; "
+_RULED = "compartment c; c := 2 + g*time; g = 1; "
+_FIXED = "compartment c; c := 2*q; q = 1.5; "
+_RESIZED = "compartment c = 1; E: at time > 2: c = 2; "
+_LOSE_S = "k = 0.3; k2 = 0.1; J: S -> ; k*S; J2: -> S; k2"
+_LOSE_H = "k = 0.3; k2 = 0.1; J: H -> ; k*H; J2: -> H; k2"
+
+_SIZE_MOVES = ["k", "g"]
+_SIZE_STILL = ["k", "k2"]
+_KINDS = {
+    "concentration, rate-rule size": (_GROWS + "species S in c = 4; " + _LOSE_S, _SIZE_MOVES),
+    "amount, rate-rule size": (
+        _GROWS + "substanceOnly species H in c = 5; " + _LOSE_H,
+        _SIZE_MOVES,
+    ),
+    "concentration, assignment-rule size": (
+        _RULED + "species S in c = 3; " + _LOSE_S,
+        _SIZE_MOVES,
+    ),
+    "amount, assignment-rule size": (
+        _RULED + "substanceOnly species H in c = 5; " + _LOSE_H,
+        _SIZE_MOVES,
+    ),
+    "concentration, constant assignment-rule size": (
+        _FIXED + "species S in c = 3; " + _LOSE_S,
+        _SIZE_STILL,
+    ),
+    "amount, constant assignment-rule size": (
+        _FIXED + "substanceOnly species H in c = 5; " + _LOSE_H,
+        _SIZE_STILL,
+    ),
+    "concentration, event-resized": (_RESIZED + "species S in c = 2; " + _LOSE_S, _SIZE_STILL),
+    "amount, event-resized": (
+        _RESIZED + "substanceOnly species H in c = 3; " + _LOSE_H,
+        _SIZE_STILL,
+    ),
+    "rate-rule target, rate-rule size": (
+        _GROWS + "species S in c; S = 0; S' = 0.4*k; k = 1;",
+        _SIZE_MOVES,
+    ),
+    "assignment-rule target, rate-rule size": (
+        _GROWS + "species S in c; S := 3*k; k = 1;",
+        _SIZE_MOVES,
+    ),
+    "rate-rule target, assignment-rule size": (
+        _RULED + "species S in c; S = 1; S' = k; k = 1;",
+        _SIZE_MOVES,
+    ),
+    "assignment-rule target, assignment-rule size": (
+        _RULED + "species S in c; S := 3*k; k = 1;",
+        _SIZE_MOVES,
+    ),
+}
+_STITCH_RUN = {"t_span": (0.0, 5.0), "n_points": 6, "rtol": 1e-10, "atol": 1e-12}
+
+
+def _single_and_stitched(text, params):
+    single = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=params
+    ).run(**_STITCH_RUN)
+    stitched = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode"
+    ).compute_all_sensitivities(params=params, chunk_size=1, n_workers=1, **_STITCH_RUN)
+    return single, stitched
+
+
+@pytest.mark.parametrize("kind", list(_KINDS))
+def test_stitched_columns_report_as_a_single_run_does(kind):
+    """One column per chunk, against one run over both columns: the values,
+    every amount and concentration as_roadrunner reports, the sensitivity
+    blocks and the stored state. The columns share no error test, so the two
+    agree to the solver's tolerance, not bit for bit."""
+    single, stitched = _single_and_stitched(*_KINDS[kind])
+    names = list(single.species_names)
+    selectors = names + [f"[{name}]" for name in names]
+    pairs = {
+        "species": (single.species, stitched.species),
+        "observables": (single.observables, stitched.observables),
+        "as_roadrunner": (single.as_roadrunner(selectors), stitched.as_roadrunner(selectors)),
+        "sensitivities": (single.sensitivities, stitched.sensitivities),
+        "observable sensitivities": (
+            single._observable_sensitivities,
+            stitched._observable_sensitivities,
+        ),
+        "expression sensitivities": (
+            single._expression_sensitivities,
+            stitched._expression_sensitivities,
+        ),
+        "state": (single.state, stitched.state),
+    }
+    for what, (want, got) in pairs.items():
+        np.testing.assert_allclose(
+            np.asarray(got), np.asarray(want), rtol=1e-7, atol=1e-8, err_msg=f"{kind}: {what}"
+        )
+    assert stitched.ar_sensitivity_refused == single.ar_sensitivity_refused
+
+
+@pytest.mark.parametrize(
+    "text,amount",
+    [
+        ("compartment c = 0.5; c' = 0.2; species S in c = 4; k = 1;", 2.0),
+        ("compartment c; c := 2 + time; substanceOnly species S in c = 5; k = 1;", 5.0),
+    ],
+    ids=["concentration, rate-rule size", "amount, assignment-rule size"],
+)
+def test_a_conserved_amount_reads_the_same_through_the_stitch(text, amount):
+    """Nothing reacts, so the amount is the one at load at every sample. It
+    read 2, 1, 0.667 and 5, 3.33, 2.5 through the stitch."""
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode")
+    stitched = sim.compute_all_sensitivities(params=["k"], **_STITCH_RUN)
+    np.testing.assert_allclose(np.asarray(stitched.as_roadrunner(["S"]))[:, 0], amount, rtol=1e-8)
