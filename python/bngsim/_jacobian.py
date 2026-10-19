@@ -806,16 +806,19 @@ def _prepare_steps(expr, targets: set[str]):
 
 
 def _finish_steps(deriv):
-    """After differentiation (issue #1128): each twin goes back to its call."""
+    """After differentiation (issue #1128): each twin goes back to its call.
+
+    One ``has`` and at most one ``replace``, as in :func:`_finish_zero_bases`:
+    a ``replace`` per twin, asked of every derivative, cost BIOMD0000000628 1.7 s
+    of its 20 s derivation budget, on a model with no rounding call at all."""
     try:
         import sympy as sp
     except ImportError:
         return deriv
-    for call, twin in _step_bindings(sp).values():
-        deriv = deriv.replace(
-            lambda n, twin=twin: isinstance(n, twin), lambda n, c=call: c(*n.args)
-        )
-    return deriv
+    back = {twin: call for call, twin in _step_bindings(sp).values()}
+    if not deriv.has(*back):
+        return deriv
+    return deriv.replace(lambda n: type(n) in back, lambda n: back[type(n)](*n.args))
 
 
 # ─── Issue #541: a power whose base is exactly zero ────────────────────────
