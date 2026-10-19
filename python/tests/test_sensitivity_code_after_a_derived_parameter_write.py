@@ -244,26 +244,30 @@ def test_the_steady_state_after_an_override():
 
 
 @pytest.mark.parametrize("squeeze", [False, True])
-def test_a_batch_row_that_overrides_a_derived_parameter_is_refused(squeeze):
-    """Every row runs on the one artifact. The row ``{"k2": 5.0}`` returned
-    dA/dk1 = -0.0769 for 0."""
+def test_a_batch_row_that_overrides_a_derived_parameter_runs_on_its_own_code(squeeze):
+    """The row ``{"k2": 5.0}`` returned dA/dk1 = -0.0769 for 0 when it ran on
+    the batch's artifact, and was then refused (issue #708). It runs on code
+    built for its attachment now (issue #961), beside a row that leaves ``k2``
+    attached: at ``k1 = 1.5``, ``k2`` is 3."""
     sim = _sim(_model())
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#708") as refusal:
-        sim.run_batch(params=[{"k1": 1.5}, {"k2": 5.0}], squeeze=squeeze, **RUN)
-    assert "row 1" in str(refusal.value)
-    assert "overrides the derived parameter(s) ['k2']" in str(refusal.value)
+    rows = sim.run_batch(params=[{"k1": 1.5}, {"k2": 5.0}], squeeze=squeeze, **RUN)
+    if squeeze:
+        last = np.asarray(rows.sensitivities)[:, -1, list(rows.species_names).index("A"), :]
+    else:
+        last = np.array([_columns(row) for row in rows])
+    _close(last[0], [2.0 * _dk2(3.0), _dk2(3.0)])
+    _close(last[1], PINNED_AT_5)
 
 
-def test_a_batch_row_that_attaches_one_again_is_refused():
+def test_a_batch_row_that_attaches_one_again_runs_on_its_own_code():
     """On a model with ``k2`` pinned, the row ``{"k2": 2.0}`` writes the value
-    of ``2*k1`` and attaches it. It ran on the pinned code: dA/dk1 = 0 for
-    -0.4535."""
+    of ``2*k1`` and attaches it. It ran on the pinned code (dA/dk1 = 0 for
+    -0.4535), and was then refused; it has the attached columns now."""
     model = _model()
     model.set_param("k2", 5.0)
-    sim = _sim(model)
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#708") as refusal:
-        sim.run_batch(params=[{"k2": 2.0}], **RUN)
-    assert "attaches it" in str(refusal.value)
+    rows = _sim(model).run_batch(params=[{"k2": 2.0}, {"k2": 5.0}], **RUN)
+    _close(_columns(rows[0]), ATTACHED)
+    _close(_columns(rows[1]), PINNED_AT_5)
 
 
 def test_a_batch_on_a_model_pinned_after_the_simulator_was_built():
@@ -1009,13 +1013,17 @@ def test_a_write_to_a_parameter_no_condition_reads_builds_nothing(monkeypatch):
 # ── A batch row, by the columns that are asked for ───────────────────────────
 
 
-def test_a_batch_row_that_pins_a_parameter_is_refused_by_the_columns_it_reaches():
-    """The message names the columns that reach the model through the pinned
-    parameter."""
+def test_a_batch_row_that_pins_a_parameter_runs_with_the_columns_it_reaches():
+    """``C' = Rt`` with ``Rt = 2*Q`` and ``Q = 3*R0``. Pinned at 5, C = 5t:
+    dC/dQ and dC/dR0 are 0 and dC/dRt is t. The row was refused for the
+    columns of Q and R0, which reach the model through Rt (issue #961)."""
     sim = _sim(_model(CHAIN), ["Q", "R0", "Rt"])
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#708") as refusal:
-        sim.run_batch(params=[{"Rt": 5.0}], t_span=(0.0, 2.0), n_points=3)
-    assert "['Q', 'R0']" in str(refusal.value)
+    rows = sim.run_batch(
+        params=[{"Rt": 5.0}, {"R0": 2.0}], t_span=(0.0, 2.0), n_points=3, rtol=1e-10, atol=1e-12
+    )
+    _close(np.asarray(rows[0].sensitivities)[-1, 0], [0.0, 0.0, 2.0])
+    # Attached: C = 6·R0·t, so dC/dQ = 2t, dC/dR0 = 6t, and Rt's own column is t.
+    _close(np.asarray(rows[1].sensitivities)[-1, 0], [4.0, 12.0, 2.0])
 
 
 def test_a_batch_row_that_pins_a_parameter_no_requested_column_reads_runs():

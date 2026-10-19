@@ -3156,35 +3156,20 @@ class Simulator:
         is also what a row's other refusals are decided by, so a row is not
         given one of its own; it is refused, and the message says how to run it.
 
+        A backstop since issue #961: :meth:`run_batch` gives such a row a
+        Simulator built for its attachment before the rows are dispatched
+        (:meth:`_runners_for_attachments`), and that one's artifact is built
+        for the row.
+
         Refused only where a requested column is of a parameter the changed one
         reads, directly or through others: its own column and the others are
         the same code either way. Asked only where a parameter's column is
         requested at all.
         """
-        built = self._codegen_attachment
-        if built is None or not (self._codegen_so_path or self._codegen_c_source):
+        found = self._row_reads_another_build(clone)
+        if found is None:
             return
-        was_attached = built[0]
-        now_attached = _attachment(clone)
-        if now_attached == was_attached:
-            return
-        core = clone._core
-        names = list(core.param_names)
-        changed = [
-            n for n, was, now in zip(names, was_attached, now_attached, strict=False) if was != now
-        ]
-        written = dict(zip(names, core.param_expressions, strict=False))
-        known = set(names)
-        reads: set[str] = set()
-        pending = list(changed)
-        while pending:
-            for name in _NAME.findall(written.get(pending.pop(), "") or ""):
-                if name in known and name not in reads:
-                    reads.add(name)
-                    pending.append(name)
-        upstream = [p for p in self._sensitivity_params if p in reads]
-        if not upstream:
-            return
+        changed, upstream, now_attached, names = found
         pinned = [n for n in changed if not now_attached[names.index(n)]]
         attached = [n for n in changed if now_attached[names.index(n)]]
         what = []
@@ -3202,6 +3187,105 @@ class Simulator:
             "as it stood when the batch began; those columns would be the other case's "
             f"(issue #708). {self._ROW_REMEDY}"
         )
+
+    def _row_reads_another_build(self, clone: Model):
+        """Whether a batch row's *clone* needs other sensitivity code than the
+        artifact this Simulator holds (issue #708): where its writes pin or
+        re-attach a derived parameter that a requested column reaches the model
+        through. ``(changed, upstream, attached, names)`` where it does, else
+        ``None``. A requested column of a parameter the changed one reads,
+        directly or through others, is the one whose code differs; its own
+        column and the others are the same code either way."""
+        built = self._codegen_attachment
+        if built is None or not (self._codegen_so_path or self._codegen_c_source):
+            return None
+        was_attached = built[0]
+        now_attached = _attachment(clone)
+        if now_attached == was_attached:
+            return None
+        core = clone._core
+        names = list(core.param_names)
+        changed = [
+            n for n, was, now in zip(names, was_attached, now_attached, strict=False) if was != now
+        ]
+        written = dict(zip(names, core.param_expressions, strict=False))
+        known = set(names)
+        reads: set[str] = set()
+        pending = list(changed)
+        while pending:
+            for name in _NAME.findall(written.get(pending.pop(), "") or ""):
+                if name in known and name not in reads:
+                    reads.add(name)
+                    pending.append(name)
+        upstream = [p for p in self._sensitivity_params if p in reads]
+        if not upstream:
+            return None
+        return changed, upstream, now_attached, names
+
+    def _runners_for_attachments(
+        self, params: Sequence[dict[str, float]], t_span: tuple[float, float]
+    ) -> dict[int, Simulator]:
+        """For each batch row whose writes need other sensitivity code than the
+        batch's artifact, the Simulator that runs it (issue #961).
+
+        Every row of a batch ran on the one artifact this Simulator holds, and
+        a row that pinned or re-attached a derived parameter a requested column
+        reaches the model through was refused (issue #708): ``{"k2": 5.0}`` over
+        ``k2 = 2*k1`` with a column of ``k1``. Rows are grouped here, before any
+        is dispatched, by which parameters their writes leave attached, and
+        each group that needs it is given a Simulator of its own, built for a
+        clone with the group's attachment and this Simulator's settings. Its
+        artifact is the code that row needs, and what a row asks of its
+        artifact (whether it holds the analytic columns, which expressions can
+        be differentiated) is answered by that one. A row that writes no
+        derived parameter is not cloned here.
+        """
+        core = self._model._core
+        derived = {n for n, e in zip(core.param_names, core.param_expressions, strict=False) if e}
+        if not derived:
+            return {}
+        runners: dict[tuple[bool, ...], Simulator] = {}
+        runner_of: dict[int, Simulator] = {}
+        for index, pset in enumerate(params):
+            if not derived.intersection(pset):
+                continue
+            clone = self._model.clone()
+            clone.set_params(pset)
+            if self._row_reads_another_build(clone) is None:
+                continue
+            attached = _attachment(clone)
+            runner = runners.get(attached)
+            if runner is None:
+                runner = Simulator(
+                    clone,
+                    method=self._method,
+                    jacobian=self._jacobian,
+                    force_dense_linear_solver=self._force_dense_linear_solver,
+                    force_sparse_linear_solver=self._force_sparse_linear_solver,
+                    codegen=self._codegen,
+                    sensitivity_params=list(self._sensitivity_params) or None,
+                    sensitivity_ic=list(self._sensitivity_ic) or None,
+                    sensitivity_method=self._sensitivity_method,
+                )
+                # A clone carries the artifact the model holds, built for the
+                # batch's attachment, and a Simulator built on it takes it up;
+                # it is built again here for the clone's own.
+                runner._rebuild_codegen_if_reattached()
+                runner._sync_codegen_with_the_conditions(t_span, runner._sensitivity_params)
+                runner._model._state_switch_roots_beside(
+                    runner._model.time_discontinuity_conditions()
+                )
+                runners[attached] = runner
+            runner_of[index] = runner
+        if runners:
+            logger.info(
+                "run_batch: %d row(s) pin or re-attach a derived parameter a requested "
+                "column reaches the model through; built sensitivity code for %d other "
+                "attachment(s) (issue #961).",
+                len(runner_of),
+                len(runners),
+            )
+        return runner_of
 
     def _rebuild_codegen_if_reattached(self) -> None:
         """Build the sensitivity code again where the model is no longer what
@@ -5178,9 +5262,15 @@ class Simulator:
             # share the answer through the memo a clone shares with its parent.
             self._model._state_switch_roots_beside(self._model.time_discontinuity_conditions())
 
+        # Issue #961: a row whose writes need other sensitivity code runs on a
+        # Simulator built for it, made here before any row is dispatched.
+        runner_of: dict[int, Simulator] = {}
+        if self._method == "ode" and (self._sensitivity_params or self._sensitivity_ic):
+            runner_of = self._runners_for_attachments(params, t_span)
+
         def _run_one(i: int) -> Result:
             """Run simulation i (thread-safe, GIL released)."""
-            return self._run_single_batch(
+            return runner_of.get(i, self)._run_single_batch(
                 i,
                 params[i],
                 t_span,
