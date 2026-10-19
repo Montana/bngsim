@@ -786,13 +786,12 @@ def test_a_stop_nearer_zero_than_the_integrator_steps_is_taken_where_the_run_sta
 
 # ── What the seventh review found ───────────────────────────────────────────
 @pytest.mark.parametrize("due_after", [1, 3, 5])
-def test_an_execution_due_just_into_a_leg_does_not_fire_an_event_resting_at_its_start(due_after):
-    """`E0: at (S > 0)` with S = 0 and S' = 0 at the start of the second leg:
-    resting on its threshold, by the rule for a trigger that does not leave it
-    at first order (issue #340; what it should do is issue #934). An unrelated
-    delayed execution due a few doubles into the leg is read as a stop is,
-    with every trigger, and that read fired E0, which the same leg without
-    the execution never fires."""
+def test_an_execution_due_just_into_a_leg_leaves_a_start_fire_as_it_was(due_after):
+    """`E0: at (S > 0)` with S = 0 and S' = 0 at the start of the second leg,
+    and S'' = 1 from there: S leaves 0 at second order and E0 fires at the
+    leg's start (issue #934). An unrelated delayed execution due a few doubles
+    into the leg is read as a stop is, with every trigger; it must not change
+    that, nor fire E0 twice."""
     t0 = 0.3
     due = _after(t0, due_after)
     text = (
@@ -807,7 +806,7 @@ def test_an_execution_due_just_into_a_leg_does_not_fire_an_event_resting_at_its_
     sim = bngsim.Simulator(model, method="ode")
     sim.run_until(t0, n_points=2, rtol=1e-9, atol=1e-12)
     r = sim.run_until(1.0, n_points=2, rtol=1e-9, atol=1e-12)
-    assert (_last(r, "q"), _last(r, "fired")) == (1.0, 0.0)
+    assert (_last(r, "q"), _last(r, "fired")) == (1.0, 1.0)
 
 
 @pytest.mark.parametrize(
@@ -891,69 +890,12 @@ def test_a_row_behind_a_root_is_no_rise_of_what_fell_there(c):
 
 
 # ── What the ninth review found ─────────────────────────────────────────────
-_RESTS = (
-    "species S = 0, A = 0; S' = A; A' = ka; ka = 1; fired = 0; q = 0; aU = 0;\n"
-    "E0: at (S > 0), t0=false: fired = fired + 1;\n"
-)
-
-
-@pytest.mark.parametrize(
-    "t0, span, into",
-    [(0.0, 2.0, 1e-300), (0.0, 2.0, 1e-140), (0.3, 0.7, None), (300.0, 300.0, None)],
-)
-def test_a_write_to_what_a_resting_trigger_does_not_read_leaves_it_resting(t0, span, into):
-    """E0, `at (S > 0)`, rests on its threshold at the start: S = 0 and
-    S' = A = 0 there, and S leaves at second order. It does not fire (issue
-    #340), alone. U sets q, which nothing reads, on the first double of the
-    run. With every mark for a resting trigger dropped at any write, E0 was
-    taken to rise at its first root, 6.9e-27 after the start."""
-    a_u = into if into is not None else _after(t0, 1)
-    text = _RESTS + "U: at (time >= aU): q = q + 1;\n"
-    r = _run(text, [t0, t0 + span / 2, t0 + span], {"aU": a_u}, rtol=1e-9, atol=1e-12)
-    assert (_last(r, "q"), _last(r, "fired")) == (1.0, 0.0)
-
-
-def test_a_cell_that_rests_at_the_start_lives_beside_a_write_to_something_else():
-    """BIOMD0000000285, issue #340's model: `PIdeath > 0` rests on its
-    threshold at t = 0 and must not kill the cell there. Beside one event
-    that sets a parameter nothing reads on `time >= 1e-300`, it did:
-    kalive = 0 and MisP(100) = 6.0e-27 for 38.9126."""
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[2] / "benchmarks/sbml_events/BIOMD0000000285.xml"
-    if not path.exists():
-        pytest.skip("BIOMD0000000285.xml is not in this checkout")
-    time = (
-        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">'
-        " t </csymbol>"
-    )
-    math_ns = 'xmlns="http://www.w3.org/1998/Math/MathML"'
-    event = (
-        '      <event id="Unrelated">\n'
-        f"        <trigger><math {math_ns}><apply><geq/>{time}"
-        '<cn type="e-notation"> 1 <sep/> -300 </cn></apply></math></trigger>\n'
-        '        <listOfEventAssignments><eventAssignment variable="qq">'
-        f"<math {math_ns}><cn> 1 </cn></math></eventAssignment></listOfEventAssignments>\n"
-        "      </event>\n"
-    )
-    xml = path.read_text()
-    assert "    </listOfEvents>" in xml and "    </listOfParameters>" in xml
-    xml = xml.replace("    </listOfEvents>", event + "    </listOfEvents>").replace(
-        "    </listOfParameters>",
-        '      <parameter constant="false" id="qq" value="0"/>\n    </listOfParameters>',
-    )
-    sim = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode")
-    r = sim.run(t_span=(0.0, 100.0), n_points=11, rtol=1e-9, atol=1e-12)
-    species = dict(zip(r.species_names, np.asarray(r.species)[-1], strict=True))
-    assert species["MisP"] == pytest.approx(38.912573, rel=1e-6)
-
-
 @pytest.mark.parametrize("into", [1, 3, 40])
-def test_a_write_two_rate_laws_upstream_of_a_resting_trigger_ends_its_rest(into):
-    """E0, `at (S > 0)`, rests at the start with S' = A, A' = B and B = 0. G
-    sets B = 1 a few doubles into the run: nothing the trigger reads has
-    changed and nor has S', but B feeds A and A feeds S, and S leaves zero
-    because of the write. E0 fires, once."""
+def test_a_write_two_rate_laws_upstream_of_a_trigger_on_its_threshold_fires_it(into):
+    """E0, `at (S > 0)`, starts on its threshold with S' = A, A' = B and B = 0,
+    and nothing moves. G sets B = 1 a few doubles into the run: nothing the
+    trigger reads has changed and nor has S', but B feeds A and A feeds S, and
+    S leaves zero at third order because of the write. E0 fires, once."""
     t0 = 0.3
     text = (
         "species S = 0, A = 0, B = 0; S' = A; A' = B; B' = 0; fired = 0; aG = 0;\n"
@@ -979,12 +921,10 @@ _THROUGH_RATEOF = {
 
 @pytest.mark.parametrize("how", sorted(_THROUGH_RATEOF))
 @pytest.mark.parametrize("t0, into", [(0.0, None), (0.3, 1), (0.3, 40)])
-def test_a_write_that_feeds_a_resting_trigger_through_rateof_ends_its_rest(how, t0, into):
-    """E0, `at (S > 0)`, rests at the start with S' = rateOf(A), A' = B and
-    B = 0. G sets B = 1 a few doubles into the run, and S' is 1 from then
-    on: E0 fires, once, as in libRoadRunner. The Jacobian's pattern does not
-    follow a rate law through a rateOf it reads, B was not seen to feed S,
-    and E0 kept its rest and never fired."""
+def test_a_write_that_feeds_a_trigger_through_rateof_fires_it(how, t0, into):
+    """E0, `at (S > 0)`, starts on its threshold with S' = rateOf(A), A' = B
+    and B = 0, and nothing moves. G sets B = 1 a few doubles into the run, and
+    S' is 1 from then on: E0 fires, once, as in libRoadRunner."""
     a_g = 1e-300 if into is None else _after(t0, into)
     text = (
         _THROUGH_RATEOF[how]
@@ -995,71 +935,7 @@ def test_a_write_that_feeds_a_resting_trigger_through_rateof_ends_its_rest(how, 
     assert _last(r, "fired") == 1.0
 
 
-@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7), (300.0, 300.0)])
-def test_a_trigger_on_a_rateof_rests_beside_a_write_to_something_else(t0, span):
-    """E0, `at (rateOf(S) > 0)`, rests at the start: S' = A = 0 there, and A
-    leaves zero at second order. A trigger that reads a rateOf was taken to
-    read every species, U's write to q to feed it, and E0 fired 6.9e-27
-    after the start, where it does not fire alone."""
-    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
-    text = (
-        "species S = 0, A = 0, Bb = 0; S' = A; A' = Bb; Bb' = kb; kb = 1; q = 0; fired = 0;"
-        " aU = 0;\nE0: at (rateOf(S) > 0), t0=false: fired = fired + 1;\n"
-    )
-    alone = _run(text, [t0, t0 + span / 2, t0 + span], {}, rtol=1e-9, atol=1e-12)
-    beside = _run(
-        text + "U: at (time >= aU): q = q + 1;\n",
-        [t0, t0 + span / 2, t0 + span],
-        {"aU": a_u},
-        rtol=1e-9,
-        atol=1e-12,
-    )
-    assert (_last(alone, "fired"), _last(beside, "fired"), _last(beside, "q")) == (0.0, 0.0, 1.0)
-
-
 # ── What the eleventh review found ──────────────────────────────────────────
-_RESTS_AT_THIRD_ORDER = (
-    "species S = 0, A = 0, Bb = 0, W = 0, V = 0, Y = 0; S' = A; A' = Bb; Bb' = kb; kb = 1;"
-    " V' = W; W' = 0; z = 0; fired = 0; aU = 0;\n"
-)
-
-
-@pytest.mark.parametrize(
-    "rateof",
-    ["Y' = rateOf(V);\n", "Y' = 0;\nZ: at (time >= 0.9): z = rateOf(V);\n"],
-    ids=["in a rate rule", "in an assignment"],
-)
-@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7), (300.0, 300.0)])
-def test_a_rateof_elsewhere_does_not_make_every_write_feed_every_trigger(rateof, t0, span):
-    """E0, `at (S > 0)`, rests at the start. U adds to W, which only V' reads,
-    on the first double of the run; the model has a rateOf(V) in it, in a
-    rate rule or in another event's assignment, and nothing of S's reads
-    it. Taken to feed every trigger because the model uses a rateOf, the
-    write ended E0's rest, and E0 fired 6.9e-27 after the start."""
-    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
-    text = (
-        _RESTS_AT_THIRD_ORDER
-        + rateof
-        + "E0: at (S > 0), t0=false: fired = fired + 1;\nU: at (time >= aU): W = W + 1;\n"
-    )
-    r = _run(text, [t0, t0 + span / 2, t0 + span], {"aU": a_u}, rtol=1e-9, atol=1e-12)
-    assert (_last(r, "W"), _last(r, "fired")) == (1.0, 0.0)
-
-
-@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7)])
-def test_a_write_to_the_species_itself_does_not_feed_its_rateof(t0, span):
-    """E0, `at (rateOf(S) > 0)` with S' = A, rests at the start. U writes S,
-    which S' does not read: rateOf(S) is what it was."""
-    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
-    text = (
-        "species S = 0, A = 0, Bb = 0; S' = A; A' = Bb; Bb' = kb; kb = 1; fired = 0; aU = 0;\n"
-        "E0: at (rateOf(S) > 0), t0=false: fired = fired + 1;\n"
-        "U: at (time >= aU): S = S + 1;\n"
-    )
-    r = _run(text, [t0, t0 + span / 2, t0 + span], {"aU": a_u}, rtol=1e-9, atol=1e-12)
-    assert _last(r, "fired") == 0.0
-
-
 _NESTED_RATEOF = {
     "two deep": ("species S = 0, A = 0, B = 0; S' = rateOf(A); A' = B; B' = 0;", "B"),
     "through a rule": (
@@ -1094,27 +970,134 @@ def test_a_trigger_on_a_nested_rateof_rises_with_the_write_that_opens_it(how, t0
     assert _last(r, "tf") == pytest.approx(a_g, abs=1e-12)
 
 
-# ── What the twelfth review found ───────────────────────────────────
-@pytest.mark.parametrize("index", ["time", "kb", "V"])
-@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7), (300.0, 300.0)])
-def test_a_table_function_does_not_make_every_write_feed_every_trigger(index, t0, span):
-    """The model of the eleventh review's control with a table function
-    added to it that nothing reads: over the clock, over a constant, or over
-    V, which U's write to W feeds. A table's index is not among the addresses
-    its call reads, and with one not indexed by the clock nothing was taken
-    as known of any expression: U's write ended E0's rest, and E0 fired
-    6.9e-27 after the start. A table is read by the expressions that call it,
-    with what its index reads."""
-    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
-    text = (
-        _RESTS_AT_THIRD_ORDER
-        + "Y' = V;\nE0: at (S > 0), t0=false: fired = fired + 1;\n"
-        + "U: at (time >= aU): W = W + 1;\n"
-    )
+# ── A trigger on its threshold at the start, beside a write to something else ──
+# Issue #340's rule refused the first root of a trigger that started on its
+# threshold and did not leave it at first order, and five rounds of review found
+# writes that wrongly ended or kept that refusal. Under issue #934's rule (the
+# SBML one) the trigger fires at the start whenever it leaves into its true side,
+# at any order, and a write to something it does not read changes nothing. Each
+# shape those rounds built is kept here: alone and beside U's write, E0 fires
+# once, at the start.
+_THIRD_ORDER = (
+    "species S = 0, A = 0, Bb = 0, W = 0, V = 0, Y = 0; S' = A; A' = Bb; Bb' = kb; kb = 1;"
+    " V' = W; W' = 0; z = 0;\n"
+)
+_BESIDE = {
+    "S, second order": (
+        "species S = 0, A = 0; S' = A; A' = ka; ka = 1; q = 0;\n",
+        "S > 0",
+        "q = q + 1",
+    ),
+    "rateOf(S), second order": (
+        "species S = 0, A = 0, Bb = 0; S' = A; A' = Bb; Bb' = kb; kb = 1; q = 0;\n",
+        "rateOf(S) > 0",
+        "q = q + 1",
+    ),
+    "a write to S itself": (
+        "species S = 0, A = 0, Bb = 0; S' = A; A' = Bb; Bb' = kb; kb = 1;\n",
+        "rateOf(S) > 0",
+        "S = S + 1",
+    ),
+    "a rateOf elsewhere, in a rate rule": (
+        _THIRD_ORDER + "Y' = rateOf(V);\n",
+        "S > 0",
+        "W = W + 1",
+    ),
+    "a rateOf elsewhere, in an assignment": (
+        _THIRD_ORDER + "Y' = 0;\nZ: at (time >= 0.9): z = rateOf(V);\n",
+        "S > 0",
+        "W = W + 1",
+    ),
+}
+
+
+def _start_fire(text, t0, span, a_u, table_index=None):
+    """(fired, the time E0 recorded) for `text` from t0 over span."""
     model = bngsim.Model.from_antimony_string(text)
-    model.set_param("aU", a_u)
-    model.add_table_function("g", times=[0.0, 1.0, 2.0], values=[0.0, 1.0, 2.0], index=index)
+    if a_u is not None:
+        model.set_param("aU", a_u)
+    if table_index is not None:
+        model.add_table_function(
+            "g", times=[0.0, 1.0, 2.0], values=[0.0, 1.0, 2.0], index=table_index
+        )
     r = bngsim.Simulator(model, method="ode").run(
         sample_times=[t0, t0 + span / 2, t0 + span], rtol=1e-9, atol=1e-12
     )
-    assert (_last(r, "W"), _last(r, "fired")) == (1.0, 0.0)
+    return _last(r, "fired"), _last(r, "tf")
+
+
+@pytest.mark.parametrize("shape", sorted(_BESIDE))
+@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7), (300.0, 300.0)])
+def test_a_trigger_that_leaves_its_threshold_at_the_start_fires_there_beside_any_write(
+    shape, t0, span
+):
+    """E0 leaves its threshold at second or third order at t0 and fires there,
+    alone and beside U, which writes on the first double of the run."""
+    dynamics, trigger, write = _BESIDE[shape]
+    text = (
+        dynamics
+        + "fired = 0; tf = -1; aU = 0;\n"
+        + f"E0: at ({trigger}), t0=false: fired = fired + 1, tf = time;\n"
+    )
+    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
+    alone = _start_fire(text, t0, span, None)
+    beside = _start_fire(text + f"U: at (time >= aU): {write};\n", t0, span, a_u)
+    for fired, tf in (alone, beside):
+        assert fired == 1.0
+        assert tf == pytest.approx(t0, abs=1e-9 * max(1.0, t0))
+
+
+@pytest.mark.parametrize("index", ["time", "kb", "V"])
+@pytest.mark.parametrize("t0, span", [(0.0, 2.0), (0.3, 0.7), (300.0, 300.0)])
+def test_a_table_function_nothing_reads_leaves_a_start_fire_alone(index, t0, span):
+    """The rate-rule shape above with a table function in the model that
+    nothing reads, indexed by the clock, a constant or V (which U's write to
+    W feeds): E0 still fires once, at the start."""
+    text = (
+        _THIRD_ORDER
+        + "Y' = V; fired = 0; tf = -1; aU = 0;\n"
+        + "E0: at (S > 0), t0=false: fired = fired + 1, tf = time;\n"
+        + "U: at (time >= aU): W = W + 1;\n"
+    )
+    a_u = 1e-300 if t0 == 0.0 else _after(t0, 1)
+    fired, tf = _start_fire(text, t0, span, a_u, table_index=index)
+    assert fired == 1.0
+    assert tf == pytest.approx(t0, abs=1e-9 * max(1.0, t0))
+
+
+def test_biomd285s_cell_dies_at_the_start_beside_a_write_to_something_else():
+    """BIOMD0000000285 (issues #340, #934): both death triggers leave 0 at the
+    start, at second and third order, and kill the cell there. One event that
+    sets a parameter nothing reads on `time >= 1e-300` changes nothing:
+    MisP(100) is what it is without it, as small as libRoadRunner's 6.0e-27."""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "benchmarks/sbml_events/BIOMD0000000285.xml"
+    if not path.exists():
+        pytest.skip("BIOMD0000000285.xml is not in this checkout")
+    time = (
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">'
+        " t </csymbol>"
+    )
+    math_ns = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+    event = (
+        '      <event id="Unrelated">\n'
+        f"        <trigger><math {math_ns}><apply><geq/>{time}"
+        '<cn type="e-notation"> 1 <sep/> -300 </cn></apply></math></trigger>\n'
+        '        <listOfEventAssignments><eventAssignment variable="qq">'
+        f"<math {math_ns}><cn> 1 </cn></math></eventAssignment></listOfEventAssignments>\n"
+        "      </event>\n"
+    )
+    plain = path.read_text()
+    assert "    </listOfEvents>" in plain and "    </listOfParameters>" in plain
+    beside = plain.replace("    </listOfEvents>", event + "    </listOfEvents>").replace(
+        "    </listOfParameters>",
+        '      <parameter constant="false" id="qq" value="0"/>\n    </listOfParameters>',
+    )
+    mis_p = []
+    for xml in (plain, beside):
+        sim = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode")
+        r = sim.run(t_span=(0.0, 100.0), n_points=11, rtol=1e-9, atol=1e-12)
+        mis_p.append(_last(r, "MisP"))
+        assert _last(r, "kalive") == 0.0
+    assert abs(mis_p[0]) < 1e-20 and abs(mis_p[1]) < 1e-20

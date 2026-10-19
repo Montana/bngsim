@@ -416,18 +416,6 @@ struct NetworkModel::Impl {
     std::vector<std::vector<int>> event_trigger_residual_species;
     std::vector<std::string> event_trigger_residual_reason;
 
-    // What a text reads through the model's definitions with a rateOf accessor
-    // kept apart from the species named (NetworkModel::event_trigger_residual_reads,
-    // ::derivative_rateof_reads). Indices only, so a clone's copy is as good
-    // as its own; the residuals' are dropped where the events are no longer
-    // as many as they were read for.
-    struct Reads {
-        bool known = false;
-        std::vector<int> species;
-        std::vector<int> rateof;
-    };
-    std::vector<Reads> event_trigger_residual_reads;
-    bool event_trigger_residual_reads_done = false;
     // For each species, the species whose rateOf its derivative reads; state
     // 1 known, 2 cannot be said (0 until they are filled).
     std::vector<std::vector<int>> derivative_rateof_reads;
