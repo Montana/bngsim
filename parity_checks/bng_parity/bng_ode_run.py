@@ -276,7 +276,7 @@ def _ode_comment(v: dict, n_sp: int, *, multiseg: bool) -> str:
     )
 
 
-def _compare_ode(bn, rn) -> tuple[str, float, str, str, float, float]:
+def _compare_ode(bn, rn, *, atol=None) -> tuple[str, float, str, str, float, float]:
     """(status, value, comment, metric, tol) for one deterministic job.
 
     ``bn``/``rn`` are (time, values, names). Both come from the one ``.net`` so the
@@ -299,13 +299,13 @@ def _compare_ode(bn, rn) -> tuple[str, float, str, str, float, float]:
             float("inf"),
         )
     bn_a, rn_a, n_sp = aligned
-    v = differ.deterministic_verdict(bn_a, rn_a)
+    v = differ.deterministic_verdict(bn_a, rn_a, atol=atol)
     status = "pass" if v["passed"] else "diff"
     comment = _ode_comment(v, n_sp, multiseg=False)
     return status, v["max_rel"], comment, metric, tol, v["max_abs"]
 
 
-def _compare_ode_multiseg(bn, rn) -> tuple[str, float, str, str, float, float]:
+def _compare_ode_multiseg(bn, rn, *, atol=None) -> tuple[str, float, str, str, float, float]:
     """(status, value, comment, metric, tol) for a dirty_carryover ODE job (GH #179).
 
     ``bn`` is the bngsim representative segment (full-protocol replay); ``rn`` is the
@@ -335,7 +335,7 @@ def _compare_ode_multiseg(bn, rn) -> tuple[str, float, str, str, float, float]:
     bn_a, rn_a = bn_v[1:, :n_sp], rn_on_grid[1:, :n_sp]  # drop the continue-boundary row
     if bn_a.shape[0] == 0:
         bn_a, rn_a = bn_v[:, :n_sp], rn_on_grid[:, :n_sp]
-    v = differ.deterministic_verdict(bn_a, rn_a)
+    v = differ.deterministic_verdict(bn_a, rn_a, atol=atol)
     status = "pass" if v["passed"] else "diff"
     comment = _ode_comment(v, n_sp, multiseg=True)
     return status, v["max_rel"], comment, metric, tol, v["max_abs"]
@@ -615,7 +615,7 @@ def _worker(spec: dict, q) -> None:
 
         try:
             comparer = _compare_ode_multiseg if dirty else _compare_ode
-            status, value, comment, metric, m_tol, max_abs = comparer(bn, rn)
+            status, value, comment, metric, m_tol, max_abs = comparer(bn, rn, atol=ode["atol"])
             res["status"], res["value"], res["comment"] = status, value, comment
             res["metric"], res["tol"] = metric, m_tol
             # GH #69: a DIFF on a catalogued comparison artifact (integrator

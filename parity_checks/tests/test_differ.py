@@ -552,3 +552,42 @@ def test_the_rr_and_amici_rows_carry_the_movement_numbers(module):
     comment = runner._compare_ode((t, moving, names), (t, moving.copy(), names))[2]
     assert "err/movement 0.0e+00" in comment
     assert "NO SIGNAL" not in comment
+
+
+def _molar_trajectory(n=201):
+    """BioModels in molar units: a species at 3e-5 that moves by 1e-8 sets the
+    scale, and the one that moves its whole range sits at 9.3e-11, a hundred
+    atol at rr_ode's 1e-12 (BIOMD0000000186 on rr_ode, in miniature)."""
+    t = np.linspace(0.0, 100.0, n)
+    return np.column_stack([3.1e-5 - 1e-8 * (1 - np.exp(-t / 10)), 9.3e-11 * (1 - np.exp(-t / 5))])
+
+
+def test_a_few_atol_apart_cannot_fail_the_movement_gate():
+    """4% of a 9.3e-11 species is 3.7e-12, 3.7 atol at 1e-12: two solvers that
+    each hold their local error to atol land that far apart near zero
+    (BIOMD0000000186/187 did, at 3.8 atol). Without ``atol`` the movement gate
+    fails it (8 rr_ode PASSes flipped this way); with it, it passes, and the
+    worst error over movement leaves the noise out."""
+    ref = _molar_trajectory()
+    a = ref.copy()
+    a[:, 1] *= 1.04
+    assert not _passed(a, ref)[0]
+    ok, v = _passed(a, ref, atol=1e-12)
+    assert ok
+    assert v["max_err_over_movement"] < differ.MOVE_CEILING
+    # Past MOVE_ATOL_FACTOR atol it is a divergence again.
+    a[:, 1] = ref[:, 1] * 1.2  # 1.9e-11 apart: 19 atol
+    assert not _passed(a, ref, atol=1e-12)[0]
+
+
+def test_the_atol_floor_does_not_reopen_the_frozen_engine():
+    """A frozen engine is off by the whole movement, which is far past atol on any
+    species the solvers resolve."""
+    ref = _trajectory(**_MECHANISMS["clamped"])
+    frozen = np.tile(ref[0], (ref.shape[0], 1))
+    ok, v = _passed(frozen, ref, atol=1e-8)
+    assert not ok
+    assert v["max_err_over_movement"] >= 0.5
+    ref = _molar_trajectory()  # 9.3e-11 of movement: 93 atol at 1e-12
+    frozen = np.tile(ref[0], (ref.shape[0], 1))
+    assert not _passed(frozen, ref, atol=1e-12)[0]

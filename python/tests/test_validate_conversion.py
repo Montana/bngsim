@@ -338,6 +338,17 @@ def test_l3_verdict_fails_a_conversion_that_froze_beside_a_reservoir() -> None:
     assert _scale_aware_verdict(src, src * (1.0 + 1e-7))["passed"]
 
 
+def test_l3_verdict_leaves_differences_inside_atol_to_the_solver() -> None:
+    """A species at 4e-11 that the two runs place 2% apart under atol 1e-8 moves
+    in the solver's noise; the movement gate leaves it alone when told the atol."""
+    t = np.linspace(0.0, 100.0, 201)
+    src = np.column_stack([3.1e-5 - 1e-8 * (1 - np.exp(-t / 10)), 4.3e-11 * (1 - np.exp(-t / 5))])
+    tgt = src.copy()
+    tgt[:, 1] *= 1.02
+    assert not _scale_aware_verdict(src, tgt)["passed"]
+    assert _scale_aware_verdict(src, tgt, atol=1e-8)["passed"]
+
+
 def test_l3_verdict_fails_a_conversion_that_lets_the_reservoir_drift() -> None:
     src = _reservoir_trajectory()
     drift = src.copy()

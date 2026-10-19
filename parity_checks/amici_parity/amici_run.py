@@ -111,7 +111,7 @@ DEFAULT_ATOL = ac.DEFAULT_ATOL
 # Comparison (the oracle, applied in the worker) — identical to rr_parity's, the
 # shared _core.differ protocol over the common species.
 # --------------------------------------------------------------------------- #
-def _compare_ode(bn, am) -> tuple[str, float, str, str, float]:
+def _compare_ode(bn, am, *, atol=None) -> tuple[str, float, str, str, float]:
     """(status, value, comment, metric, tol) for one deterministic job."""
     bn_t, bn_v, bn_n = bn
     am_t, am_v, am_n = am
@@ -134,7 +134,7 @@ def _compare_ode(bn, am) -> tuple[str, float, str, str, float]:
             tol,
         )
     bn_idx, am_idx, common = align
-    v = differ.deterministic_verdict(bn_v[:, bn_idx], am_v[:, am_idx])
+    v = differ.deterministic_verdict(bn_v[:, bn_idx], am_v[:, am_idx], atol=atol)
     status = "pass" if v["passed"] else "diff"
     comment = differ.ode_row_comment(v, len(common))
     return status, v["max_rel"], comment, metric, tol
@@ -295,7 +295,7 @@ def _worker(spec: dict, q) -> None:
 
     # --- both ran: compare (shared _core.differ protocol) ---
     try:
-        status, value, comment, metric, m_tol = _compare_ode(bn, am)
+        status, value, comment, metric, m_tol = _compare_ode(bn, am, atol=p["atol"])
         res["status"], res["value"], res["comment"] = status, value, comment
         res["metric"], res["tol"] = metric, m_tol
     except Exception as exc:

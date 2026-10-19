@@ -76,6 +76,14 @@ SIGNIF_FLOOR = 1e-3  # peak-relative significance gate: a column whose peak-over
 # 7.5e-3 of its movement (ph_schrodinger), p99 4.4e-5, and a 4% error on one
 # species is at least 4e-2.
 MOVE_CEILING = 1e-2
+# A cell whose two values are no further apart than MOVE_ATOL_FACTOR times the
+# integration atol the caller passes cannot fail the movement gate: two solvers
+# that each hold their local error to atol differ by a few atol on a species near
+# zero. On rr_ode (atol 1e-12, BioModels in molar units) the gate without that
+# floor failed 8 current PASSes on species at 1e-11 to 1e-15, 1.0 to 3.8 atol
+# apart (BIOMD0000000186/187 the widest); the real divergence it found there
+# (BIOMD0000000285, an event bngsim never fires) is 2e13 atol apart.
+MOVE_ATOL_FACTOR = 10.0
 # Stochastic ensemble verdict.
 ENSEMBLE_K = 3.0  # per-cell sigma threshold on the difference of means (calibrated at N=10)
 ENSEMBLE_K_BASE_N = 10  # the replicate count ENSEMBLE_K was calibrated at
@@ -84,7 +92,11 @@ NEAR_ZERO_REL = 1e-9  # ensemble cells below this*scale are skipped (sampling no
 
 
 def deterministic_verdict(
-    a: np.ndarray, b: np.ndarray, *, forgive_mask: np.ndarray | None = None
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    forgive_mask: np.ndarray | None = None,
+    atol: float | None = None,
 ) -> dict:
     """Verdict for two aligned deterministic runs ``a`` (bngsim) vs ``b`` (ref).
 
@@ -113,7 +125,11 @@ def deterministic_verdict(
     peak, frozen, is inside it. Both sides count because the hole is symmetric:
     an engine that never moves fails against a reference that does, and an
     engine that moves a species the reference holds still (one it should never
-    make, a clamped one it lets drift) fails the same way.
+    make, a clamped one it lets drift) fails the same way. ``atol``, when given,
+    is the absolute integration tolerance both engines ran at: a cell whose two
+    values are no further apart than ``MOVE_ATOL_FACTOR`` times that cannot fail
+    the movement gate, since the solvers do not resolve the difference. It
+    changes nothing else.
 
     Returns a dict: ``passed`` (the gate), ``max_rel``/``max_abs`` (worst over
     the genuinely-failing cells, 0 when it passes), and the bucket counts
@@ -243,7 +259,12 @@ def deterministic_verdict(
             absd_clean / np.where(col_range > 0.0, col_range, 1.0)[np.newaxis, :],
             0.0,
         )
-    hard_move_fail = err_over_move > MOVE_CEILING
+    # Cells the movement gate leaves alone: underflow on both sides, and a
+    # difference the solvers do not resolve (a few atol on a species at 1e-11).
+    move_exempt = near_zero_cell.copy()
+    if atol is not None:
+        move_exempt |= absd_clean <= MOVE_ATOL_FACTOR * float(atol)
+    hard_move_fail = (err_over_move > MOVE_CEILING) & ~move_exempt
 
     def _resolve(forgive_now: np.ndarray) -> tuple[dict, np.ndarray]:
         """Everything downstream of ``forgive``, so the #316 counterfactual is
@@ -252,7 +273,7 @@ def deterministic_verdict(
         # The movement gate is a fail of its own, not a cell past the per-cell
         # tolerance: a column that moves by 1e-4 of its peak, frozen, is inside
         # REL_TOL of it at every point.
-        move_fail = hard_move_fail & ~(forgive_now | near_zero_cell)
+        move_fail = hard_move_fail & ~forgive_now
         effective_fail = (
             (fail_mask & ~(forgive_now | near_zero_mask | below_dyn_range))
             | move_fail
@@ -288,7 +309,7 @@ def deterministic_verdict(
             # forgiven, and whether there is no such column at all (nothing either
             # side does could tell a frozen engine from a right one).
             "max_err_over_movement": float(
-                np.max(np.where(forgive_now | near_zero_cell, 0.0, err_over_move))
+                np.max(np.where(forgive_now | move_exempt, 0.0, err_over_move))
             )
             if err_over_move.size
             else 0.0,

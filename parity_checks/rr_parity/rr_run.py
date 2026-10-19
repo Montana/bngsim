@@ -180,7 +180,7 @@ def _reference_nonfinite_covers(a: np.ndarray, b: np.ndarray) -> bool:
     return bool(differ.deterministic_verdict(a[:, finite_col], b[:, finite_col])["passed"])
 
 
-def _compare_ode(bn, rr) -> tuple[str, float, str, str, float, bool]:
+def _compare_ode(bn, rr, *, atol=None) -> tuple[str, float, str, str, float, bool]:
     """(status, value, comment, metric, tol, ref_nonfinite_covers) for one job.
 
     Applies the shared ``_core.differ.deterministic_verdict`` protocol (combined
@@ -217,7 +217,7 @@ def _compare_ode(bn, rr) -> tuple[str, float, str, str, float, bool]:
         )
     bn_idx, rr_idx, common = align
     a, b = bn_v[:, bn_idx], rr_v[:, rr_idx]
-    v = differ.deterministic_verdict(a, b)
+    v = differ.deterministic_verdict(a, b, atol=atol)
     status = "pass" if v["passed"] else "diff"
     comment = differ.ode_row_comment(v, len(common))
     covers = _reference_nonfinite_covers(a, b) if status == "diff" else False
@@ -478,7 +478,7 @@ def _worker(spec: dict, q) -> None:
 
     # --- both ran: compare (shared _core.differ protocol; metric realized here) ---
     try:
-        status, value, comment, metric, m_tol, covers = _compare_ode(bn, rr)
+        status, value, comment, metric, m_tol, covers = _compare_ode(bn, rr, atol=p["atol"])
         n_instants = (rr_timing or {}).get("event_instants", 0)
         if n_instants:
             comment = f"{comment}; RR through {n_instants} event instants"
