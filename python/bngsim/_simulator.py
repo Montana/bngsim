@@ -7377,6 +7377,9 @@ class Simulator:
             opts.codegen_so_path = self._codegen_so_path
         if self._codegen_c_source:
             opts.codegen_c_source = self._codegen_c_source
+        # Issue #904 — the march roots what a plain run() roots (issue #897),
+        # so a window on the approach is not stepped over.
+        opts.state_switch_conditions = list(self._model.state_switch_root_conditions())
         if sensitivity_params:
             opts.sensitivity_params = list(sensitivity_params)
             # Issue #704 — ∂x(0)/∂p, the seeding a time course starts from. A
@@ -8025,7 +8028,10 @@ class Simulator:
         derivatives, which are 0 at a steady state.
         """
         core = self._model._core
-        n_events = int(self._model.n_events)
+        # A compartment size that jumps keeps the amounts in it through an event
+        # the loader adds (issue #1054), which is no event of the model's own.
+        jumps = list(core.event_size_jump_compartments)
+        n_events = sum(1 for comp in jumps if not comp)
         if n_events:
             raise SimulationError(
                 f"{where} is not supported for this model: it has {n_events} "
@@ -8034,6 +8040,23 @@ class Simulator:
                 "never made, and the state they return is one the model's dynamics may never "
                 "reach (issue #710). Integrate the model with run() over a span long enough "
                 "for the trajectory to settle, and read the state where it ends."
+            )
+        if jumps:
+            comps = sorted(set(jumps))
+            what = (
+                f"the size of compartment {comps[0]}, which an assignment rule sets, jumps "
+                "where a piecewise the rule reads switches, and the amounts in it are"
+                if len(comps) == 1
+                else f"the sizes of compartments {', '.join(comps)}, which assignment rules "
+                "set, jump where a piecewise a rule reads switches, and the amounts in them are"
+            )
+            raise SimulationError(
+                f"{where} is not supported for this model: {what} kept across a jump by a "
+                "rescale of their concentrations there (issue #1054). The steady-state "
+                "solvers look for a root of the right-hand side and make no such rescale, so "
+                "the state they return can hold the concentrations from the wrong side of a "
+                "jump (issue #710). Integrate the model with run() over a span long enough for "
+                "the trajectory to settle, and read the state where it ends."
             )
         if core.functions_use_time:
             raise SimulationError(
@@ -8522,6 +8545,8 @@ class Simulator:
                 opts.codegen_so_path = self._codegen_so_path
             if self._codegen_c_source:
                 opts.codegen_c_source = self._codegen_c_source
+            # Issue #904 — as steady_state(), of the entry's own model.
+            opts.state_switch_conditions = list(clone.state_switch_root_conditions())
             entry_mask = self._ss_mask_excluding_ar_species(mask_selector)
             if entry_mask is not None:
                 opts.steady_state_mask = entry_mask
@@ -9671,6 +9696,18 @@ class SteadyStateResult:
         Number of solver steps.
     n_rhs_evals : int
         Number of RHS evaluations.
+    n_state_switch_roots : int
+        The crossings of a rate-law condition over model state (or of an
+        SBML model's discontinuity trigger) the march stopped at, so a window
+        the approach passes through is integrated over (issue #904). It
+        restarts on each one up to 1000; the 1001st, where it stops rooting
+        them, is counted too.
+    state_switch_roots_dropped : bool
+        Whether the march stopped rooting those conditions after 1000
+        crossings, as a state that slides along its threshold makes, and
+        marched over the switch from there as it did before #904. If that
+        march ends further from a steady state than where it stopped
+        rooting, the state there is returned.
     n_residual_species : int
         How many species entered ``||f||_2 / n`` — ``n_species`` unless
         ``steady_state(mask=...)`` restricted it (issue #74). Assert on this
@@ -9918,6 +9955,8 @@ class SteadyStateResult:
         "converged",
         "n_steps",
         "n_rhs_evals",
+        "n_state_switch_roots",
+        "state_switch_roots_dropped",
         "n_residual_species",
         "excluded_species",
         "unconverged_pure_sinks",
@@ -9977,6 +10016,8 @@ class SteadyStateResult:
         self.converged = core.converged
         self.n_steps = core.n_steps
         self.n_rhs_evals = core.n_rhs_evals
+        self.n_state_switch_roots = getattr(core, "n_state_switch_roots", 0)
+        self.state_switch_roots_dropped = getattr(core, "state_switch_roots_dropped", False)
         # Issue #74 — what the convergence test covered, and why it failed.
         self.n_residual_species = getattr(core, "n_residual_species", len(self._species_names))
         self.excluded_species = list(getattr(core, "excluded_species", []))
