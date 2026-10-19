@@ -7,4 +7,6 @@
   for 0.867. In `c := p` with `p` going from 2 to 4, [S](5) was 1.5 and S was
   12, for 2 and 8. SSA and PSA now rescale such a species at the resize as ODE
   does, and report it as a concentration: all three match ODE and
-  libRoadRunner exactly.
+  libRoadRunner exactly. As in ODE, the rescale is formed when the event
+  executes, so it keeps what an event of higher priority at the same instant
+  wrote to the species first: [S](3) = 1.867 there, for 1.733 before.
