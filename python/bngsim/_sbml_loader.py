@@ -8520,7 +8520,31 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     roots.append((d, [(r, _sp.Integer(1))]))
             by_name = _rules_by_name() if roots else {}
-            for _, rels in roots:
+
+            # Roots that a run constant puts on one instant (#1124): `time < t1`
+            # and `time < t2` with t1 = t2, or `S > a` and `S > b` with a = b. The
+            # two jump events read the state from their trigger time, so the last
+            # one's rescale is what stays, and each read the other's condition
+            # as already flipped: [Sn] kept 2/3 of itself for 1/3. Each now
+            # rescales by the whole instant, every coinciding condition read on
+            # the side it leaves and the side it reaches, and a sibling whose
+            # root is elsewhere is read as it stands, as before. A sibling's
+            # difference is ±this one's plus a run constant, which is 0 where
+            # they coincide; read at the run, so a set_param moves it.
+            def _siblings(d0, roots=roots) -> list[tuple[list, int, object]]:
+                out = []
+                for d1, rels1 in roots:
+                    if d1 is d0:
+                        continue
+                    for sigma in (1, -1):
+                        rest = _sp.expand(d1 - sigma * d0)
+                        if not {str(s) for s in rest.free_symbols} & _moving:
+                            if rest != 0 and not rest.is_number:
+                                out.append((rels1, sigma, rest))
+                            break
+                return out
+
+            for d0, rels in roots:
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
                 # equality holds at the root alone, so it reads false on both.
@@ -8534,10 +8558,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     side_true = -1 if c.func(-q, 0) else 1
                     side_false = -side_true
-                v_false, v_true = (
-                    _xreplace_once(g, {r: r.func(rq * side, 0) for r, rq in rels})
-                    for side in (side_false, side_true)
-                )
+                siblings = _siblings(d0)
+
+                def _at(side, siblings=siblings, rels=rels, g=g):
+                    subs = {r: r.func(rq * side, 0) for r, rq in rels}
+                    for rels1, sigma, rest in siblings:
+                        for r, rq in rels1:
+                            subs[r] = _sp.Piecewise(
+                                (r.func(rq * sigma * side, 0), _sp.Eq(rest, 0)), (r, True)
+                            )
+                    return _xreplace_once(g, subs)
+
+                v_false, v_true = (_at(side) for side in (side_false, side_true))
                 # Written out in full, a size that reads shared rules is as
                 # exponential as the rates were; it reads those of its rules
                 # that hold no condition by name where that is shorter.
