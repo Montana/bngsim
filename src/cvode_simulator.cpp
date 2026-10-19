@@ -12173,6 +12173,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // For one read after the jumps: how many fires the sensitivity record
         // `executed_fires` held when its values were read (-1 otherwise).
         int read_after = -1;
+        // For a size jump: the concentration each of its own rescales read
+        // when its values were frozen.
+        std::vector<double> jump_bases;
     };
 
     // The loader's rescale events where a piecewise compartment size jumps
@@ -12180,6 +12183,43 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     const bool model_has_size_jumps =
         std::any_of(events_outer.begin(), events_outer.end(),
                     [](const Event &e) { return !e.size_jump_compartment.empty(); });
+
+    // A size jump moves the concentrations in its own compartment, and the
+    // loader adds to it a rescale of each compartment whose size rule reads
+    // them, which follows it. Per jump, the species of each kind, sorted (the
+    // second empty where none follows).
+    std::vector<std::vector<int>> jump_own_writes(static_cast<std::size_t>(n_events));
+    std::vector<std::vector<int>> jump_follower_writes(static_cast<std::size_t>(n_events));
+    bool jumps_have_followers = false;
+    for (int ei = 0; ei < n_events; ++ei) {
+        const Event &e = events_outer[static_cast<std::size_t>(ei)];
+        if (e.size_jump_compartment.empty())
+            continue;
+        auto &own = jump_own_writes[static_cast<std::size_t>(ei)];
+        auto &followers = jump_follower_writes[static_cast<std::size_t>(ei)];
+        for (std::size_t a = 0; a < e.assignments.size(); ++a)
+            (is_resize_rescale(e, a) ? followers : own).push_back(e.assignments[a].first);
+        std::sort(own.begin(), own.end());
+        std::sort(followers.begin(), followers.end());
+        jumps_have_followers = jumps_have_followers || !followers.empty();
+    }
+    // Whether the follower rescales of jump `ei` write a species the own
+    // rescale of jump `ej` writes.
+    auto follows_into = [&](int ei, int ej) {
+        const auto &f = jump_follower_writes[static_cast<std::size_t>(ei)];
+        const auto &o = jump_own_writes[static_cast<std::size_t>(ej)];
+        auto i = f.begin();
+        auto j = o.begin();
+        while (i != f.end() && j != o.end()) {
+            if (*i == *j)
+                return true;
+            if (*i < *j)
+                ++i;
+            else
+                ++j;
+        }
+        return false;
+    };
 
     // Guard against a same-instant algebraic loop (mutually-arming events).
     // Far above any legitimate cascade depth (00978 fires ~11; 01533 ~106).
@@ -12406,6 +12446,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                          "number");
             }
             inst.delay = d < 0.0 ? 0.0 : d;
+            if (jumps_have_followers && !ev.size_jump_compartment.empty() &&
+                ev.use_values_from_trigger_time) {
+                inst.jump_bases.reserve(ev.assignments.size());
+                for (const auto &asg : ev.assignments)
+                    inst.jump_bases.push_back(y_data[asg.first]);
+            }
             return inst;
         };
 
@@ -12516,6 +12562,35 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 }
             }
 
+            // A jump whose rescale of a following compartment writes a
+            // concentration that another jump of the instant, still to
+            // execute, rescales as its own goes after that one. The own
+            // rescale then writes the value it read before the instant, which
+            // is the one the sensitivity jump differentiates: beside `cv :=
+            // piecewise(1, t < 2, 5)`, the own jump of `cw := piecewise(1, t <
+            // 2, 1 + Sn)` takes [Sw] from 3 to 3/6, and cv's rescale of it then
+            // from 3/6 to 3/2. Jumps that wait on each other in a ring, which
+            // they can only through conditions (a ring of sizes is refused at
+            // load), go as they are drawn.
+            std::vector<char> waits;
+            if (jump_left && jumps_have_followers) {
+                waits.assign(queue.size(), 0);
+                bool any_free = false;
+                for (size_t k = 0; k < queue.size(); ++k) {
+                    if (queue[k].done ||
+                        events_outer[queue[k].event_idx].size_jump_compartment.empty())
+                        continue;
+                    for (size_t m = 0; m < queue.size() && waits[k] == 0; ++m) {
+                        if (m != k && !queue[m].done &&
+                            follows_into(queue[k].event_idx, queue[m].event_idx))
+                            waits[k] = 1;
+                    }
+                    any_free = any_free || waits[k] == 0;
+                }
+                if (!any_free)
+                    waits.clear();
+            }
+
             // Collect the not-done instances sharing the MAXIMUM priority.
             // Iterating in increasing index keeps `ties` index-ordered, so the
             // single-candidate case reproduces the old lowest-index pick without
@@ -12526,6 +12601,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 if (queue[k].done)
                     continue;
                 if (jump_left && events_outer[queue[k].event_idx].size_jump_compartment.empty())
+                    continue;
+                if (!waits.empty() && waits[k] != 0)
                     continue;
                 double pk = eval_pri(queue[k]);
                 if (ties.empty() || pk > best_pri) {
@@ -12661,6 +12738,23 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             if (any_resting) {
                 y_before_write.assign(y_data, y_data + ns);
             }
+            // A size jump's own rescale is the ratio of the sizes it read
+            // before the instant times the concentration then. In a ring, a
+            // jump of the instant drawn before it can have rescaled that
+            // concentration since, as one that follows it: written as frozen,
+            // the own rescale put back the value from before that one's. The
+            // ratio is applied to the concentration as it is now instead.
+            bool jump_rebased = false;
+            if (!queue[k].jump_bases.empty()) {
+                for (size_t a = 0; a < assigns.size(); ++a) {
+                    const double was = queue[k].jump_bases[a];
+                    const double now = y_data[assigns[a].first];
+                    if (!is_resize_rescale(ev, a) && now != was && was != 0.0) {
+                        nv[a] = now * (nv[a] / was);
+                        jump_rebased = true;
+                    }
+                }
+            }
             write_event_values(ev, nv, t_now);
             any_immediate = true;
             // An event has written the state. A trigger marked as resting on
@@ -12690,6 +12784,24 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 ExecutedEventFire fire;
                 fire.event_idx = queue[k].event_idx;
                 fire.from_trigger_time = ev.use_values_from_trigger_time;
+                if (jump_rebased) {
+                    // Its value is the frozen ratio times a concentration an
+                    // earlier fire of the batch wrote, which the sensitivity
+                    // jump, reading the ratio's whole value before the batch,
+                    // does not see.
+                    const std::string id =
+                        ev.id.empty() ? std::to_string(queue[k].event_idx) : ev.id;
+                    throw std::runtime_error(
+                        "Forward sensitivity: at t=" + diag_number(t_now) +
+                        " the size of compartment '" + ev.size_jump_compartment +
+                        "' jumps (event '" + id +
+                        "'), and another compartment's jump of the same instant, whose size "
+                        "rule reads a concentration here while this one's reads one there, has "
+                        "already rescaled its concentrations as one that follows it. The "
+                        "derivative of two rescales of one concentration at one instant is not "
+                        "implemented (issue #1054). The trajectory itself is unaffected; run "
+                        "without sensitivities, or give the jumps different times.");
+                }
                 if (fire.from_trigger_time && queue[k].read_after >= 0) {
                     // Its values were frozen once the size jumps of this
                     // instant had executed (issue #1054), and the sensitivity
@@ -12758,6 +12870,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // Re-check every trigger against `prev`: a rising edge is a
             // same-instant cascade fire (enqueue a fresh instance); a falling
             // edge cancels the not-done non-persistent instances of that event.
+            const int fired_ei = queue[k].event_idx;
             for (int ei = 0; ei < n_events; ++ei) {
                 if (t_now < trigger_changed_at[ei]) {
                     continue; // read behind its last change
@@ -12765,11 +12878,23 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 double tv = eval_ref_outer.evaluate(events_outer[ei].trigger_expr_idx);
                 bool now_true = (tv > 0.5);
                 bool was = prev[ei];
+                // A jump raised by the one just executed, in a compartment that
+                // one rescaled as a follower, is a change of size that rescale
+                // has already made: it read the size the rule gives after, its
+                // flipped condition and all. `cw := piecewise(1, t < 2 || Sn >
+                // 3, 2)` beside `cv := piecewise(1, t < 2, 5)`, with [Sn] going
+                // from 5 to 1, would have [Sw] halved twice. Before the rescale
+                // there was this jump alone, and drawn ahead of cw's own jump at
+                // the clock, frozen before it, it was overwritten by that one,
+                // which left [Sw] at 3 for 3/2 as the seed went.
+                const bool followed = now_true && !was && jumps_have_followers &&
+                                      !events_outer[ei].size_jump_compartment.empty() &&
+                                      follows_into(fired_ei, ei);
                 // Skip a chatter-dormant event (GH #95): like the root and the
                 // post-batch cascade paths, the same-instant drain must not
                 // re-arm an event the chatter guard is stepping over, or a
                 // multi-event model can re-fire it here and defeat suppression.
-                if (now_true && !was && !event_dormant[ei]) {
+                if (now_true && !was && !event_dormant[ei] && !followed) {
                     // Forward sensitivity has no jump for this fire (issue
                     // #144). A cascade instance executes LATER in the same
                     // instant, reading a state that already jumped, while

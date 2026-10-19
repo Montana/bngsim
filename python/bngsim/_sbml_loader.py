@@ -2245,6 +2245,9 @@ def _rule_compartments_an_event_resizes(
     compartment's new size, and a rescaled species' value after the rescale.
     The event's sensitivity support reads that text.
 
+    A piecewise size's jump (issue #1054) asks the same of the concentrations
+    it rescales, given as the values it assigns them.
+
     ``rule_math`` maps each assignment rule's variable to its math, in document
     order; ``assigned`` maps each variable the event assigns to its value;
     ``rescaled_species`` maps a compartment to the species a resize of it
@@ -9822,20 +9825,79 @@ def _build_model_from_sbml_doc_in_context(doc):
     # Sn at 1 or 10 as the same-priority draw went, #242). The priority keeps
     # it out of the draw against the model's own events under SSA, where it
     # writes nothing.
+    #
+    # A jump moves more than its own compartment's concentrations. A size rule
+    # that reads one of them, directly or through other rules, jumps with it,
+    # whether or not a condition of its own flips there: beside `cv :=
+    # piecewise(1, t < 2, 5)` and [Sn] = 5, `cw := 1 + Sn` goes from 6 to 2 at
+    # t = 2, and its concentrations were held where their amounts are. So the
+    # jump rescales the concentrations in each such compartment too, each after
+    # the ones whose species it reads, as an event that resizes a compartment
+    # does (#1055): from the size there when the jump executes to the size its
+    # own rescale leaves, both read as the rule gives them then (#936). Where
+    # the compartment jumps at the instant itself, `cw := piecewise(1, t < 2, 1
+    # + Sn)`, its own jump goes from 1 to 1 + [Sn] at the [Sn] from before, 6,
+    # and executes first; this rescale takes it from 6 to 1 + 1, where its own
+    # new size had read [Sn] from before cv's jump and left [Sw] = 3 at 3/6 for
+    # 3/2.
+    _jump_rule_math: dict[str, object] = {}
+    _jump_moves: dict[str, list[str]] = {}
+    _jump_rule_cache: dict[str, tuple[dict, dict]] = {}
+    if _size_jumps:
+        for j in range(sbml_model.getNumRules()):
+            rule = sbml_model.getRule(j)
+            if rule.isAssignment() and rule.getMath() is not None:
+                _jump_rule_math[rule.getVariable()] = rule.getMath()
+        for sid, scomp in species_comp.items():
+            if _diluted(sid):
+                _jump_moves.setdefault(scomp, []).append(sid)
     for k, (comp, trigger, before, after) in enumerate(_size_jumps):
+        assignments = [
+            (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
+            for sid in _jump_species[comp]
+        ]
+        # Its own rule is left out of what is read. A size that reads it by name
+        # is written out through it (§8c), so it jumps at its roots by events of
+        # its own, and a condition of its own on its concentrations has a root,
+        # and an event, of its own too.
+        if comp not in _jump_rule_cache:
+            _jump_rule_cache[comp] = (
+                {var: m for var, m in _jump_rule_math.items() if var != comp},
+                {},
+            )
+        rules_beside, cache = _jump_rule_cache[comp]
+        followers = _rule_compartments_an_event_resizes(
+            rules_beside,
+            ar_comp_targets,
+            [],
+            {sid: f"{_safe_name(sid)} * ({before}) / ({after})" for sid in _jump_species[comp]},
+            _jump_moves,
+            lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
+            cache,
+        )
+        rescales: list[tuple[int, str]] = []
+        for follower, new_size in followers:
+            for sid in _jump_moves.get(follower, ()):
+                rescales.append((len(assignments), _safe_name(follower)))
+                assignments.append(
+                    (
+                        species_idx[sid],
+                        f"{_safe_name(sid)} * ({_safe_name(follower)}) / ({new_size})",
+                    )
+                )
+                ar_dilution_species.add(sid)
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
             trigger,
-            [
-                (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
-                for sid in _jump_species[comp]
-            ],
+            assignments,
             persistent=True,
             initial_value=True,
             priority_expr="1e308",
-            assignment_ode_only=[True] * len(_jump_species[comp]),
+            assignment_ode_only=[True] * len(assignments),
         )
         builder.set_last_event_size_jump(comp)
+        for ai, size in rescales:
+            builder.set_last_event_assignment_rescale(ai, size, -1)
         for sid in _jump_species[comp]:
             ar_dilution_species.add(sid)
 
