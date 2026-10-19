@@ -2278,6 +2278,12 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
     return resolver
 
 
+# Past this many nodes, the texts of a size's jump (its condition both ways and
+# the size on either side) read what more than one path reaches through
+# functions of their own (issue #1124, item 6). About 20,000 characters.
+_JUMP_TEXT_NODES = 5_000
+
+
 # ── Periodic floor()/modulo dosing-discontinuity resolution (GH #88) ──────
 #
 # The #72 machinery above registers a CVODE root for every inequality that
@@ -8436,7 +8442,32 @@ def _build_model_from_sbml_doc_in_context(doc):
                     if inner is None:
                         return None
                     subs[s] = inner
-            return g.xreplace(subs)
+            if not subs:
+                return g
+            # g.xreplace(subs), with a Piecewise and its pieces put together as
+            # they are: sympy's own constructors read the condition through
+            # (`has`), and a condition over a diamond of rules (`r21 > 0.5`) is
+            # exponentially longer as a tree than in memory (issue #1124, item
+            # 6). The pieces were a Piecewise's already, so they need no check.
+            done: dict[int, object] = {}
+
+            def go(e):
+                if id(e) not in done:
+                    if e in subs:
+                        done[id(e)] = subs[e]
+                    else:
+                        args = tuple(go(a) for a in e.args)
+                        if not any(a is not b for a, b in zip(args, e.args, strict=True)):
+                            done[id(e)] = e
+                        elif isinstance(
+                            e, (_sp.Piecewise, _sp.functions.elementary.piecewise.ExprCondPair)
+                        ):
+                            done[id(e)] = _sp.Basic.__new__(type(e), *args)
+                        else:
+                            done[id(e)] = e.func(*args)
+                return done[id(e)]
+
+            return go(g)
 
         def _xreplace_once(expr, rule: dict):
             # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
@@ -8472,6 +8503,62 @@ def _build_model_from_sbml_doc_in_context(doc):
                 )
             }
 
+        def _names_in(expr) -> set[str]:
+            # free_symbols, each distinct node visited once: sympy's walks the
+            # tree, which a size read through shared rules makes exponential.
+            return {str(e) for e in _subexpressions(expr) if e.is_Symbol}
+
+        def _through_functions(exprs: list, prefix: str) -> tuple[list, list[tuple[str, object]]]:
+            # ``exprs`` with each large node that more than one path reaches read
+            # through a function of its own, and those functions, each after the
+            # ones it reads, as (name, body) (issue #1124, item 6). A jump's
+            # condition and sizes are written from the size through its rules,
+            # and a diamond of rules under a condition, or a condition under a
+            # diamond, was written out once per path: exponential in the depth.
+            # Only where the texts would be long; only numbers, for a function
+            # returns one, so a condition stays where it is read.
+            size: dict[int, int] = {}
+            refs: dict[int, int] = {}
+            order: list = []
+            seen: set[int] = set()
+            for root in exprs:
+                refs[id(root)] = refs.get(id(root), 0) + 1
+                stack = [(root, False)]
+                while stack:
+                    e, expanded = stack.pop()
+                    if expanded:
+                        size[id(e)] = 1 + sum(size[id(a)] for a in e.args)
+                        order.append(e)
+                        continue
+                    if id(e) in seen:
+                        continue
+                    seen.add(id(e))
+                    for a in e.args:
+                        refs[id(a)] = refs.get(id(a), 0) + 1
+                    stack.append((e, True))
+                    stack.extend((a, False) for a in e.args if id(a) not in seen)
+            if sum(size[id(e)] for e in exprs) <= _JUMP_TEXT_NODES:
+                return list(exprs), []
+            helpers: list[tuple[str, object]] = []
+            built: dict[int, object] = {}
+            for e in order:  # each node after its arguments
+                args = tuple(built[id(a)] for a in e.args)
+                changed = any(a is not b for a, b in zip(args, e.args, strict=True))
+                new = e.func(*args) if changed else e
+                if (
+                    refs.get(id(e), 0) > 1
+                    and size[id(e)] >= 16
+                    and isinstance(e, _sp.Expr)
+                    and not isinstance(
+                        e, (_sp.core.relational.Relational, _sp.logic.boolalg.Boolean)
+                    )
+                ):
+                    name = f"{prefix}{len(helpers)}"
+                    helpers.append((name, new))
+                    new = _sp.Symbol(name)
+                built[id(e)] = new
+            return [built[id(e)] for e in exprs], helpers
+
         for comp, vdot in _comp_vdot.items():
             if vdot is None:
                 continue
@@ -8491,7 +8578,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             relations: set = set()
             for c in conds:
-                names = {str(s) for s in c.free_symbols}
+                names = _names_in(c)
                 if not names & _moving:
                     continue
                 if names & _event_targets:
@@ -8505,8 +8592,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                     continue
                 relations |= {
                     r
-                    for r in c.atoms(_sp.core.relational.Relational)
-                    if {str(s) for s in r.free_symbols} & _moving
+                    for r in _subexpressions(c)
+                    if isinstance(r, _sp.core.relational.Relational) and _names_in(r) & _moving
                 }
             # (difference, [(relation, its difference over that one)])
             roots: list[tuple[object, list]] = []
@@ -8520,7 +8607,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     roots.append((d, [(r, _sp.Integer(1))]))
             by_name = _rules_by_name() if roots else {}
-            for _, rels in roots:
+            for k_root, (_, rels) in enumerate(roots):
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
                 # equality holds at the root alone, so it reads false on both.
@@ -8544,13 +8631,23 @@ def _build_model_from_sbml_doc_in_context(doc):
                 v_false, v_true = (
                     min((v, _xreplace_once(v, by_name)), key=_tree_size) for v in (v_false, v_true)
                 )
-                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
-                if any(t is None for t in texts):
+                # And so does the condition (issue #1124, item 6): `r21 > 0.5`
+                # under a diamond of rules was printed written out in full.
+                c_read = min((c, _xreplace_once(c, by_name)), key=_tree_size)
+                written, helpers = _through_functions(
+                    [c_read, _sp.Not(c_read), v_false, v_true],
+                    f"_szj_{_safe_name(comp)}_{k_root}_",
+                )
+                helper_texts = [(name, sympy_to_exprtk(body)) for name, body in helpers]
+                texts = [sympy_to_exprtk(e) for e in written]
+                if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
                         "flips, and bngsim cannot write the size on either side"
                     )
                     continue
+                for name, text in helper_texts:
+                    builder.add_function(name, _unalias(text))
                 rises, falls, v_false, v_true = (_unalias(t) for t in texts)
                 _jump_species[comp] = [
                     s for s, sc in species_comp.items() if sc == comp and _diluted(s)
