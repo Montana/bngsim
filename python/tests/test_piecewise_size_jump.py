@@ -371,3 +371,317 @@ def test_a_condition_an_event_also_moves_is_refused():
     )
     with pytest.raises(bngsim.ModelError, match=r"p, which an event changes"):
         bngsim.Model.from_sbml_string(xml)
+
+
+# ─── A jump another compartment's size reads ────────────────────────────────
+#
+# `cv := piecewise(1, t < 2, 5)` takes [Sn] from 5 to 1 at t = 2, and a size
+# rule that reads [Sn] jumps with it, whether or not a condition of its own
+# flips there. Where one did, `cw := piecewise(1, t < 2, 1 + Sn)`, cw's own
+# jump read [Sn] from before cv's and went to 1 + 5 where SBML has 1 + 1 at the
+# instant, and [Sw] went from 3 to 3/6 for 3/2 (libRoadRunner 1.5). Where none
+# did, `cw := 1 + Sn`, nothing rescaled [Sw] at all.
+
+
+def _sized_doc(compartments, species, rules, *, params="", reactions=""):
+    comp_xml = "".join(
+        f'<compartment id="{c}" size="1" constant="{str(c == "c").lower()}"/>'
+        for c in compartments
+    )
+    sp_xml = "".join(
+        f'<species id="{s}" compartment="{c}" initialConcentration="{x}" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+        for s, c, x in species
+    )
+    rule_xml = "".join(
+        f'<assignmentRule variable="{v}"><math {M}>{b}</math></assignmentRule>' for v, b in rules
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
+ <listOfCompartments>{comp_xml}</listOfCompartments>
+ <listOfSpecies>{sp_xml}</listOfSpecies>
+ <listOfParameters><parameter id="k" value="0.5" constant="true"/>{params}</listOfParameters>
+ <listOfRules>{rule_xml}</listOfRules>
+ <listOfReactions>{reactions}</listOfReactions>
+</model></sbml>"""
+
+
+def _step(before, cond, after):
+    return _pw((before, cond), otherwise=after)
+
+
+BEFORE_2 = _rel("lt", T, _cn(2))
+CV_JUMP = ("cv", _step(_cn(1), BEFORE_2, _cn(5)))  # [Sn] = 5 goes to 1 at t = 2
+ONE_PLUS_SN = _plus(_cn(1), _ci("Sn"))
+S_DECAYS = (
+    '<reaction id="degS" reversible="false"><listOfReactants>'
+    '<speciesReference species="S" stoichiometry="1" constant="true"/></listOfReactants>'
+    f"<kineticLaw><math {M}>{_times(_times(_ci('k'), _ci('S')), _ci('c'))}</math></kineticLaw>"
+    "</reaction>"
+)
+T_S = 2 * np.log(10 / 3)  # where S, 10 at 0 and decaying at 0.5, falls through 3
+
+
+def _jump_to(at, before, after):
+    return lambda t: np.where(t < at, before, after)
+
+
+FOLLOWERS = {
+    "cw jumps with cv": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [CV_JUMP, ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN))],
+        ),
+        {"Sn": _jump_to(2, 5, 1), "Sw": _jump_to(2, 3, 1.5)},
+    ),
+    "in reverse document order": (
+        _sized_doc(
+            ["cw", "cv"],
+            [("Sw", "cw", 3), ("Sn", "cv", 5)],
+            [("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)), CV_JUMP],
+        ),
+        {"Sn": _jump_to(2, 5, 1), "Sw": _jump_to(2, 3, 1.5)},
+    ),
+    # [Su] 8 -> 2, cv 1 -> 3 and [Sn] 6 -> 2, cw 1 -> 3 and [Sw] 3 -> 1
+    "three in a chain": (
+        _sized_doc(
+            ["cu", "cv", "cw"],
+            [("Su", "cu", 8), ("Sn", "cv", 6), ("Sw", "cw", 3)],
+            [
+                ("cu", _step(_cn(1), BEFORE_2, _cn(4))),
+                ("cv", _step(_cn(1), BEFORE_2, _plus(_cn(1), _ci("Su")))),
+                ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+            ],
+        ),
+        {"Su": _jump_to(2, 8, 2), "Sn": _jump_to(2, 6, 2), "Sw": _jump_to(2, 3, 1)},
+    ),
+    "on a species": (
+        _sized_doc(
+            ["c", "cv", "cw"],
+            [("S", "c", 10), ("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                ("cv", _step(_cn(1), _rel("gt", _ci("S"), _cn(3)), _cn(5))),
+                ("cw", _step(_cn(1), _rel("gt", _ci("S"), _cn(3)), ONE_PLUS_SN)),
+            ],
+            reactions=S_DECAYS,
+        ),
+        {"Sn": _jump_to(T_S, 5, 1), "Sw": _jump_to(T_S, 3, 1.5)},
+    ),
+    # 1 + 5 before and 2 + 3 after: the amount, 18, over 5
+    "read on both sides": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                CV_JUMP,
+                ("cw", _step(ONE_PLUS_SN, BEFORE_2, _plus(_cn(2), _times(_cn(3), _ci("Sn"))))),
+            ],
+        ),
+        {"Sw": _jump_to(2, 3, 3.6)},
+    ),
+    # cw goes from 6 to 2, and nothing of cw's own flips: 18 over 2
+    "with no condition of its own": (
+        _sized_doc(
+            ["cv", "cw"], [("Sn", "cv", 5), ("Sw", "cw", 3)], [CV_JUMP, ("cw", ONE_PLUS_SN)]
+        ),
+        {"Sn": _jump_to(2, 5, 1), "Sw": _jump_to(2, 3, 9)},
+    ),
+    # [Sn] > 3 is true before and false after: cw goes from 1 to 2
+    "in a condition": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                CV_JUMP,
+                (
+                    "cw",
+                    _step(
+                        _cn(1),
+                        f"<apply><or/>{BEFORE_2}{_rel('gt', _ci('Sn'), _cn(3))}</apply>",
+                        _cn(2),
+                    ),
+                ),
+            ],
+        ),
+        {"Sw": _jump_to(2, 3, 1.5)},
+    ),
+    # two clocks, not one root, that agree in this run
+    "at two thresholds that are equal": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                ("cv", _step(_cn(1), _rel("lt", T, _ci("t1")), _cn(5))),
+                ("cw", _step(_cn(1), _rel("lt", T, _ci("t2")), ONE_PLUS_SN)),
+            ],
+            params='<parameter id="t1" value="2" constant="true"/>'
+            '<parameter id="t2" value="2" constant="true"/>',
+        ),
+        {"Sw": _jump_to(2, 3, 1.5)},
+    ),
+    # cw goes to 1 + 5 at t = 2, and with [Sn] to 1 + 1 at t = 3
+    "at two thresholds that differ": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                ("cv", _step(_cn(1), _rel("lt", T, _ci("t1")), _cn(5))),
+                ("cw", _step(_cn(1), _rel("lt", T, _ci("t2")), ONE_PLUS_SN)),
+            ],
+            params='<parameter id="t1" value="3" constant="true"/>'
+            '<parameter id="t2" value="2" constant="true"/>',
+        ),
+        {"Sw": lambda t: np.where(t < 2, 3, np.where(t < 3, 0.5, 1.5))},
+    ),
+    # control: cw jumps just after t = 2, where 4 - 2t < 0 first holds, and
+    # cv's jump at t = 2 has executed by then
+    "on a strict inequality": (
+        _sized_doc(
+            ["cv", "cw"],
+            [("Sn", "cv", 5), ("Sw", "cw", 3)],
+            [
+                CV_JUMP,
+                (
+                    "cw",
+                    _step(
+                        ONE_PLUS_SN,
+                        _rel("lt", f"<apply><minus/>{_cn(4)}{_times(_cn(2), T)}</apply>", _cn(0)),
+                        _cn(1),
+                    ),
+                ),
+            ],
+        ),
+        {"Sw": lambda t: np.where(t > 2, 1.5, 3)},
+    ),
+}
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("case", list(FOLLOWERS))
+def test_a_size_that_reads_a_concentration_a_jump_moves(case, codegen):
+    xml, closed_forms = FOLLOWERS[case]
+    for seed in range(4):  # the order the jumps of an instant execute in is drawn
+        result = bngsim.Simulator(
+            bngsim.Model.from_sbml_string(xml), method="ode", codegen=codegen
+        ).run(t_span=(0.0, 4.0), n_points=17, seed=seed)
+        t = np.asarray(result.time)
+        names = list(result.species_names)
+        for sid, closed_form in closed_forms.items():
+            got = np.asarray(result.species)[:, names.index(sid)]
+            np.testing.assert_allclose(
+                got, closed_form(t), rtol=1e-5, atol=1e-8, err_msg=f"{sid}, seed {seed}"
+            )
+
+
+def test_the_sensitivity_of_a_concentration_a_jump_moves():
+    """Sn decays at k in cv, and cw := piecewise(1, t < 2, 1 + Sn) from t = 2
+    on, the amount of Sw, 3, held: [Sw] = 3/(1 + e^(-kt)) there, and d[Sw]/dk =
+    3t·e^(-kt)/(1 + e^(-kt))²."""
+    decay = (
+        '<reaction id="degSn" reversible="false"><listOfReactants>'
+        '<speciesReference species="Sn" stoichiometry="1" constant="true"/></listOfReactants>'
+        f"<kineticLaw><math {M}>{_times(_times(_ci('k'), _ci('Sn')), _ci('cv'))}</math>"
+        "</kineticLaw></reaction>"
+    )
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [CV_JUMP, ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN))],
+        reactions=decay,
+    ).replace('id="k" value="0.5"', 'id="k" value="0.1"')
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", sensitivity_params=["k"]
+    ).run(t_span=(0.0, 4.0), n_points=17)
+    t = np.asarray(result.time)
+    w = list(result.species_names).index("Sw")
+    e = np.exp(-0.1 * t)
+    np.testing.assert_allclose(
+        np.asarray(result.species)[:, w], np.where(t < 2, 3, 3 / (1 + e)), rtol=1e-5, atol=1e-8
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.sensitivities)[:, w, 0],
+        np.where(t < 2, 0, 3 * t * e / (1 + e) ** 2),
+        rtol=1e-4,
+        atol=1e-7,
+    )
+
+
+def test_a_ring_of_new_sizes_is_refused():
+    """cv's new size reads [Sw] and cw's reads [Sn]: each is the other's
+    amount over a size that reads it, and libRoadRunner refuses the pair as a
+    recursive assignment rule."""
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cv", _step(_cn(1), BEFORE_2, _plus(_cn(1), _ci("Sw")))),
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
+    )
+    with pytest.raises(bngsim.ModelError, match=r"cv reads Sw in cw; cw reads Sn in cv"):
+        bngsim.Model.from_sbml_string(xml)
+
+
+def _ring_through_a_condition():
+    # cv reads [Sw] only in a condition that holds false on both sides, and cw
+    # reads [Sn] in its new size: each jump rescales the other's species.
+    return _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            (
+                "cv",
+                _step(
+                    _cn(1),
+                    f"<apply><or/>{BEFORE_2}{_rel('gt', _ci('Sw'), _cn(100))}</apply>",
+                    _ci("b"),
+                ),
+            ),
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
+        params='<parameter id="b" value="5" constant="true"/>',
+    )
+
+
+def test_a_ring_through_a_condition():
+    """The two jumps wait on each other, and execute in either order. [Sw] is
+    3/2 either way; with cv's first, cw's own jump then wrote the [Sw] it had
+    read before the instant, 3/6."""
+    xml = _ring_through_a_condition()
+    for seed in range(4):
+        result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+            t_span=(0.0, 4.0), n_points=17, seed=seed
+        )
+        t = np.asarray(result.time)
+        sw = np.asarray(result.species)[:, list(result.species_names).index("Sw")]
+        np.testing.assert_allclose(sw, _jump_to(2, 3, 1.5)(t), rtol=1e-5, atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "xml, param, match",
+    [
+        # which of the two refusals comes first goes with the order drawn
+        (
+            _ring_through_a_condition(),
+            "b",
+            r"derivative of (two rescales of one concentration at one instant|that composition) "
+            "is not implemented",
+        ),
+        (
+            FOLLOWERS["three in a chain"][0],
+            "k",
+            r"derivative of that composition is not implemented",
+        ),
+    ],
+    ids=["a ring through a condition", "three in a chain"],
+)
+def test_the_sensitivity_of_a_rescale_on_a_rescale_is_refused(xml, param, match):
+    """A concentration rescaled twice at one instant, by two jumps, or by a
+    jump's rescale of what another rescale there moved: the sensitivity jump
+    has no derivative for the second."""
+    sim = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", sensitivity_params=[param]
+    )
+    with pytest.raises(bngsim.SimulationError, match=match):
+        sim.run(t_span=(0.0, 4.0), n_points=17)
