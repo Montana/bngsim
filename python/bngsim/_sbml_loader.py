@@ -3562,6 +3562,7 @@ def _classify_mass_action(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3632,6 +3633,7 @@ def _classify_mass_action(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         varvol_reject=varvol_reject,
@@ -3686,6 +3688,7 @@ def _split_reversible_kinetic_law(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3730,6 +3733,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3748,6 +3752,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3814,6 +3819,7 @@ def _classify_mass_action_ast(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     prefix_factors: tuple = (),
@@ -3832,6 +3838,10 @@ def _classify_mass_action_ast(
     splitter to distribute outer-product wrappers (e.g. the ``compartment``
     factor in COPASI-style ``compartment * (kf*A - kr*B)``) onto each
     side of the MINUS.
+
+    ``moving_ar_comps`` are the assignment-rule compartments whose size moves
+    during a run (``_moving_assignment_rule_vars``); the variable-volume guards
+    below treat them as they treat a rate-rule or event-resized compartment.
     """
     # 3. Flatten the AST into a list of accepted leaves.
     factors: list = list(prefix_factors)
@@ -4014,18 +4024,27 @@ def _classify_mass_action_ast(
     #     — the f_c power cancels. So §9's species-only m_c derivation already folds
     #     the explicit factor (it lives in ``base_func``, not in m_c). Validated vs
     #     RR+COPASI (ODE) and Extrande (SSA).
-    # Scoped to all-hOSU=false species; hOSU=true cross-compartment shapes (whose
-    # amount bookkeeping differs) stay refused (varvol_non_mass_action), and the §9
-    # certification is guarded to IRREVERSIBLE only. Record the variable-volume
-    # storage compartments so §9 can certify + correct the emitted reaction.
+    # Scoped to all-hOSU=false species; a mix with an amount that changes such a
+    # concentration is certified below, where the load-time sizes agree (#787),
+    # and other hOSU=true cross-compartment shapes stay refused
+    # (varvol_non_mass_action). The §9 certification is guarded to IRREVERSIBLE
+    # only. Record the variable-volume storage compartments so §9 can certify +
+    # correct the emitted reaction.
+    #
+    # (#745) An assignment-rule compartment whose size moves during the run is
+    # routed the same way; it is left out of what §9 certifies for the SSA,
+    # which does not run such a compartment. One whose rule reads constants
+    # alone (``moving_ar_comps`` leaves it out) holds its load-time size, as a
+    # write to what the rule reads is refused, so the Elementary rate is right.
     _storage_comps = {species_comp[s] for s in rxn_species}
     _varvol_storage = _storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+    _ar_storage = _storage_comps & set(moving_ar_comps)
     if (
         len(_storage_comps) > 1
-        and _varvol_storage
+        and (_varvol_storage or _ar_storage)
         and all(not species_hosu.get(s, False) for s in rxn_species)
     ):
-        if varvol_reject is not None:
+        if varvol_reject is not None and _varvol_storage:
             varvol_reject["xcomp_varvol_comps"] = sorted(_varvol_storage)
         return None
 
@@ -4092,7 +4111,16 @@ def _classify_mass_action_ast(
                 m for sid, m in species_multiset.items() if not species_hosu.get(sid, False)
             )
 
-    varvol_comp_ids = (set(rate_rule_targets) | set(event_promoted_params)) & comp_ids
+    # (#745) An assignment-rule compartment whose size moves is a variable
+    # volume here as well: left out, a bare ``k*A`` in ``C := 2 + time`` stayed
+    # Elementary with V_static baked in and ran 36% off (BIOMD0000000342's
+    # TGF_beta_ex, 37%). One over constants keeps its load-time size, and its
+    # Elementary rate, which a reversible split needs to run under the SSA.
+    # _record_varvol_reject keeps to rate-rule and event compartments, which
+    # are the ones the SSA correction it feeds is for.
+    varvol_comp_ids = (
+        set(rate_rule_targets) | set(event_promoted_params) | set(moving_ar_comps)
+    ) & comp_ids
     if varvol_comp_ids:
         if all(not species_hosu.get(s, False) for s in rxn_species):
             storage_comps = {species_comp[s] for s in rxn_species}
@@ -4125,6 +4153,18 @@ def _classify_mass_action_ast(
             storage_comps = {species_comp[s] for s in rxn_species}
             if len(storage_comps) == 1:
                 _record_varvol_reject(next(iter(storage_comps)))
+            elif varvol_reject is not None:
+                # Across compartments it takes the per-species emission, each row
+                # over its own size, and the SSA correction §9 certifies for that
+                # emission counts the concentration factors alone: an amount is
+                # read exactly. So it serves this mix as it serves a monomial over
+                # concentrations. #787's `A => B; k*A`, A an amount and B a
+                # concentration in a compartment a rate rule or an event resizes,
+                # ran under the SSA while its ODE was wrong (B over the load-time
+                # size), and was refused once the ODE was right.
+                _vv = storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+                if _vv:
+                    varvol_reject["xcomp_varvol_comps"] = sorted(_vv)
             return None
 
     if not elementary:
@@ -5150,6 +5190,13 @@ def _build_model_from_sbml_doc_in_context(doc):
         for j in range(sbml_model.getNumRules())
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     } & _comp_id_set
+
+    # (#745) The assignment-rule compartments whose size can move during a run:
+    # their rule reads the clock, a species, a rate-rule or event target, or
+    # another rule that does. One that reads constants alone holds its load-time
+    # size for the whole run, as a write to what it reads is refused. The same
+    # set §9 keeps from the SSA.
+    ar_comp_moving = ar_comp_targets & _moving_assignment_rule_vars(sbml_model)[1]
 
     # (#86) Compartments driven by a RATE RULE — continuously variable volume
     # V(t). A concentration-valued (hOSU=false) species in such a compartment
@@ -7092,6 +7139,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rate_rule_targets,
             event_promoted_params,
             assignment_targets,
+            ar_comp_moving,
             local_param_map,
             local_param_values,
             _resolve_stoich,
@@ -7168,6 +7216,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 rate_rule_targets,
                 event_promoted_params,
                 assignment_targets,
+                ar_comp_moving,
                 local_param_map,
                 local_param_values,
                 _resolve_stoich,
@@ -8367,6 +8416,28 @@ def _build_model_from_sbml_doc_in_context(doc):
         )
         if _xc_varvol_species:
             unified_ok = False
+        # (#745) The same holds for a concentration in a compartment an
+        # assignment rule moves: its row is law/V_live, which the single divide
+        # gives only to the species of the representative compartment.
+        # `H => A; k*H` with H an amount and A a concentration in
+        # `C := 3 + 0.5*time` divided H's row by the live size: [H](5) was 0.527
+        # for 0.401. Two such compartments of one load-time size shared the
+        # first one's divide, and at a size of 1 had none. A catalyst elsewhere
+        # counts here, as the representative compartment can be the catalyst's.
+        # The per-species branch below adds the live size to these rows.
+        _xc_ar_species = (
+            [
+                _sid
+                for _sid in net
+                if net[_sid] != 0
+                and species_comp[_sid] in ar_comp_moving
+                and not species_hosu.get(_sid, False)
+            ]
+            if len(_rxn_comps) > 1 or _changes_an_amount
+            else []
+        )
+        if _xc_ar_species:
+            unified_ok = False
         # Two kinds of such a reaction cannot take the per-species divide either.
         # One that also changes a species in an assignment-rule compartment: that
         # compartment is no state, so there is nothing to point its divide at
@@ -8375,7 +8446,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         # compartment's live symbol and with its own factor, as a non-integer
         # stoichiometry is. That form has no SSA reading, and these are refused
         # under SSA already. The certified monomial keeps the per-species divide,
-        # which its SSA correction is written for.
+        # which its SSA correction is written for. A reaction routed off the
+        # single divide for a moving assignment-rule compartment alone goes the
+        # same way when it mixes conversion factors.
         _xc_by_function = (
             bool(_xc_varvol_species)
             and i not in ssa_varvol_xcompartment
@@ -8383,7 +8456,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _cf_mixed_i
                 or any(net[_sid] != 0 and species_comp[_sid] in ar_comp_targets for _sid in net)
             )
-        )
+        ) or (bool(_xc_ar_species) and _cf_mixed_i)
         # (#192) The same by-value hazard for a WRITABLE STATIC volume, which is
         # #170's territory rather than #144's and was never done. `involved_vs`
         # holds volume VALUES, so a reaction whose species span several
@@ -8638,6 +8711,35 @@ def _build_model_from_sbml_doc_in_context(doc):
             _ssa_ff = _ssa_falling_factorial_terms(rxn, species_idx, _ssa_ff_continuous)
             if _ssa_ff:
                 builder.set_reaction_ssa_falling_factorial(_xrxn_idx, _ssa_ff)
+            # (#745) The per-species divide above is by each species' load-time
+            # size. For a concentration in a compartment an assignment rule sizes
+            # the row is law/V_live; the engine has no state column for that size,
+            # so the difference is added as its own reaction on that species, as
+            # the §8c dilution is: net·law·(1/C - 1/V_static), with C the
+            # compartment's live symbol. The two rows sum to net·law/C, and the
+            # Jacobian and the sensitivities reach C through its rule as they do
+            # in any rate law. ODE only, as the SSA does not run such a
+            # compartment. BIOMD0000000342's re9 was 37% off without it. Only for
+            # a size that can move (_xc_ar_species keeps to ar_comp_moving): for
+            # one that cannot, the term is 0, and a reaction on one species would
+            # hide a conservation law the right-hand side keeps.
+            for _sid in _xc_ar_species:
+                _n = net[_sid]
+                _c = species_comp[_sid]
+                _corr = f"_vd_{_safe_name(rid)}_{_safe_name(_sid)}_live"
+                builder.add_function(
+                    _corr,
+                    f"({float(_n) * _cf_i!r})*({base_func})"
+                    f"*(1.0/({_safe_name(_c)}) - 1.0/({float(comp_volumes.get(_c, 1.0))!r}))",
+                )
+                builder.add_reaction(
+                    [],
+                    [species_idx[_sid]],
+                    "functional",
+                    _corr,
+                    apply_species_factor=False,
+                    ode_only=True,
+                )
             # (#144 case 4) Cross-compartment variable-volume monomial certified by
             # the classifier (§7). The per-species emission above divides each
             # species's storage derivative by its *static* volume_factor, which is
