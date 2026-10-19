@@ -375,6 +375,9 @@ struct SteadyStateUserData {
     // The residuals of the rate-law conditions over model state the march roots
     // (issue #904), as expression indices. Null where it roots none.
     const std::vector<int> *state_switch_roots = nullptr;
+    // The SBML loader's discontinuity triggers (GH #72), boolean conditions
+    // rooted as `condition - 0.5` ahead of the residuals, as run() roots them.
+    const std::vector<int> *discontinuity_roots = nullptr;
 };
 
 // CVODE's error-weight callback for the tracking absolute tolerance (issue
@@ -820,8 +823,9 @@ static int cvode_ss_colored_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatri
 }
 #endif // BNGSIM_HAS_KLU
 
-// The march's root function (issue #904): the residuals of the rate-law
-// conditions over model state, read as run()'s root function reads them. The
+// The march's root function (issue #904): the SBML loader's discontinuity
+// triggers and then the residuals of the rate-law conditions over model state,
+// read as run()'s root function reads them. The
 // state goes to the observables and the functions and not to the species,
 // whose values the solve reads afterwards as where it started (the Newton seed,
 // the conservation totals).
@@ -837,9 +841,16 @@ static int cvode_ss_root_fn(sunrealtype t, N_Vector y, sunrealtype *gout, void *
             mdl->evaluate_functions(static_cast<double>(t));
         }
         auto &eval = mdl->evaluator();
-        const std::vector<int> &roots = *ud->state_switch_roots;
-        for (std::size_t j = 0; j < roots.size(); ++j) {
-            gout[j] = eval.evaluate(roots[j]);
+        std::size_t k = 0;
+        if (ud->discontinuity_roots != nullptr) {
+            for (int idx : *ud->discontinuity_roots) {
+                gout[k++] = eval.evaluate(idx) - 0.5;
+            }
+        }
+        if (ud->state_switch_roots != nullptr) {
+            for (int idx : *ud->state_switch_roots) {
+                gout[k++] = eval.evaluate(idx);
+            }
         }
         return 0;
     });
@@ -922,7 +933,11 @@ class SteadyStateMarcher {
         // constant on each side of its switch, so a step across a narrow window
         // reads it as off at both ends and the window is lost, as it was in
         // run() before #897. Root each residual, once per crossing (`X<1` and
-        // `X<=1` are one).
+        // `X<=1` are one). An SBML model's conditions come as the loader's
+        // discontinuity triggers instead (GH #72), which run() roots as well;
+        // they are rooted here too, or a piecewise window in a kinetic law is
+        // still stepped over on the way to the steady state.
+        discontinuity_roots_ = model.discontinuity_triggers();
         std::unordered_set<std::string> crossings;
         for (const std::string &condition : opts.state_switch_conditions) {
             const NetworkModel::StateSwitch *sw = model.state_switch(condition);
@@ -930,10 +945,12 @@ class SteadyStateMarcher {
                 state_switch_roots_.push_back(sw->residual_expr_idx);
             }
         }
-        if (!state_switch_roots_.empty()) {
+        const std::size_t n_roots = discontinuity_roots_.size() + state_switch_roots_.size();
+        if (n_roots > 0) {
+            ud_.discontinuity_roots = &discontinuity_roots_;
             ud_.state_switch_roots = &state_switch_roots_;
-            if (CVodeRootInit(cvode_mem_, static_cast<int>(state_switch_roots_.size()),
-                              cvode_ss_root_fn) != CV_SUCCESS) {
+            if (CVodeRootInit(cvode_mem_, static_cast<int>(n_roots), cvode_ss_root_fn) !=
+                CV_SUCCESS) {
                 throw std::runtime_error("CVodeRootInit failed (steady_state)");
             }
             // As run() does for the same roots (register_roots): a residual at
@@ -1277,8 +1294,9 @@ class SteadyStateMarcher {
     long int rhs_evals_before_reinit_ = 0;
     long step_budget_ = -1; // of a run that is taken on; none for a solve
     long steps_taken_ = 0;
-    // The residuals the march roots (issue #904), which ud_ points at, and the
-    // crossings it restarted on.
+    // The discontinuity triggers and residuals the march roots (issue #904),
+    // which ud_ points at, and the crossings it restarted on.
+    std::vector<int> discontinuity_roots_;
     std::vector<int> state_switch_roots_;
     int root_restarts_ = 0;
     bool roots_dropped_ = false;
@@ -1317,9 +1335,6 @@ struct ReducedKinsolData {
     // first one here and returns the unrecoverable-failure code, and the solve
     // rethrows it once CVode()/KINSol() has returned.
     std::exception_ptr callback_error;
-    // The residuals of the rate-law conditions over model state the march roots
-    // (issue #904), as expression indices. Null where it roots none.
-    const std::vector<int> *state_switch_roots = nullptr;
 };
 
 // The reduced Jacobian's projection through the conservation-law reconstruction.
