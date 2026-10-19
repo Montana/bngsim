@@ -933,9 +933,9 @@ def test_ar_compartments_reading_each_others_concentrations_are_refused():
     assert "cv reads W in cw" in str(exc.value) and "cw reads X in cv" in str(exc.value)
 
 
-def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refused():
-    """An amount in a compartment an assignment rule sizes has no right rate
-    accessor yet (#736), so a size that reads one is refused, not read."""
+def _sized_by_an_amount_in_a_sized_compartment(wa_decays):
+    """cv := 1 + 0.1*Wa, Wa an amount in ``cw := 1 + time``; with ``wa_decays``
+    a reaction takes Wa down at k."""
     sbml = _species_sized_sbml(
         _one_plus_tenth_of("<ci>Wa</ci>"),
         '<species id="Wa" compartment="cw" initialAmount="1" hasOnlySubstanceUnits="true"'
@@ -948,8 +948,31 @@ def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refuse
         '<compartment id="cv" size="1" constant="false"/>'
         '<compartment id="cw" size="1" constant="false"/>',
     )
+    if wa_decays:
+        sbml = sbml.replace(
+            "</listOfReactions>",
+            '<reaction id="degWa" reversible="false"><listOfReactants>'
+            '<speciesReference species="Wa" stoichiometry="1" constant="true"/></listOfReactants>'
+            f"<kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>Wa</ci></apply></math>"
+            "</kineticLaw></reaction></listOfReactions>",
+        )
+    return sbml
+
+
+def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refused():
+    """An amount in a compartment an assignment rule sizes has no right rate
+    accessor yet (#736), so a size that reads one is refused, not read."""
     with pytest.raises(bngsim.ModelError, match=r"reads Wa, an amount in compartment cw.*#736"):
-        bngsim.Model.from_sbml_string(sbml)
+        bngsim.Model.from_sbml_string(_sized_by_an_amount_in_a_sized_compartment(True))
+
+
+def test_ar_compartment_reading_an_amount_nothing_changes_holds():
+    """An amount that no reaction, rule or event changes keeps its value
+    whatever its compartment's size does, so cv holds at 1.1 and needs no
+    rate. It was refused as above, for an accessor it does not need."""
+    model, res = _run(_sized_by_an_amount_in_a_sized_compartment(False), t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)
 
 
 def test_ar_compartment_sized_by_an_event_parameter_and_a_species_dilutes():
@@ -1012,3 +1035,109 @@ def test_ar_compartment_sized_by_a_constant_species_in_a_moving_compartment():
     t = np.asarray(res.time)
     np.testing.assert_allclose(_conc(res, "Kw"), 10 / (1 + t), rtol=1e-7)
     np.testing.assert_allclose(_conc(res, "Sn"), 10 * (1 + t) / (2 + t), rtol=1e-6, atol=1e-8)
+
+
+# ── An AR compartment whose size rule reads a reaction's rate ────────────────
+#
+# A reaction's id in math is its rate, its kinetic law's value. degS runs at
+# k*S*c = 0.5*S, so `cv := 1 + 0.1*(2*degS)` is `_SIZED_BY_S`'s size, and the
+# same closed form holds. Section 8c read degS as a constant and gave cv no
+# rate, so nothing in cv was diluted: [Sn](2) was 5 for 7.311.
+
+_SIZED_BY_DEG_S = _species_sized_sbml(
+    _one_plus_tenth_of("<apply><times/><cn>2</cn><ci>degS</ci></apply>")
+)
+_DEG_S_LAW = (
+    f"<kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>S</ci><ci>c</ci></apply>"
+    "</math></kineticLaw>"
+)
+
+
+def _deg_s_reads_a_local_rate_constant(sbml):
+    """degS reads its own local kd = 0.5 where it read k, beside a global kd = 5
+    that the local shadows."""
+    assert _DEG_S_LAW in sbml
+    return sbml.replace(
+        _DEG_S_LAW,
+        f"<kineticLaw><math {_MATHML}><apply><times/><ci>kd</ci><ci>S</ci><ci>c</ci></apply>"
+        '</math><listOfLocalParameters><localParameter id="kd" value="0.5"/>'
+        "</listOfLocalParameters></kineticLaw>",
+    ).replace(
+        "</listOfParameters>", '<parameter id="kd" value="5" constant="true"/></listOfParameters>'
+    )
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    "local", [False, True], ids=["global-rate-constant", "local-rate-constant"]
+)
+def test_ar_compartment_sized_by_a_reaction_rate_dilutes(codegen, local):
+    sbml = _deg_s_reads_a_local_rate_constant(_SIZED_BY_DEG_S) if local else _SIZED_BY_DEG_S
+    model = bngsim.Model.from_sbml_string(sbml)
+    res = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0, 4), n_points=9, rtol=1e-11, atol=1e-13
+    )
+    _assert_species_sized(res)
+
+
+def test_ar_compartment_sized_by_a_reaction_rate_is_resized_at_an_event():
+    """An event that sets S makes degS jump, and cv with it, so the event
+    rescales cv's concentrations as it does for a size that reads S itself."""
+    sbml = _SIZED_BY_DEG_S.replace(
+        " </model>",
+        f""" <listOfEvents><event id="refill" useValuesFromTriggerTime="true">
+   <trigger initialValue="false" persistent="true"><math {_MATHML}><apply><gt/>
+    <csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>
+    <cn>1</cn></apply></math></trigger>
+   <listOfEventAssignments><eventAssignment variable="S"><math {_MATHML}><cn>20</cn></math>
+   </eventAssignment></listOfEventAssignments>
+  </event></listOfEvents>
+ </model>""",
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    s = np.where(t > 1 + 1e-9, 20 * np.exp(-_K * (t - 1)), 10 * np.exp(-_K * t))
+    v = 1 + 0.1 * s
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 / v, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(_conc(res, "X"), 20 * np.exp(-_K * t) / v, rtol=1e-6, atol=1e-8)
+
+
+def _deg_s_slows_at_two(sbml):
+    """degS runs at a fifth of its rate from t = 2, so cv jumps there."""
+    assert _DEG_S_LAW in sbml
+    law = "<apply><times/><ci>k</ci><ci>S</ci><ci>c</ci></apply>"
+    return sbml.replace(
+        _DEG_S_LAW,
+        f"<kineticLaw><math {_MATHML}><piecewise><piece>{law}<apply><lt/>"
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        f"</csymbol><cn>2</cn></apply></piece><otherwise><apply><times/><cn>0.2</cn>{law}"
+        "</apply></otherwise></piecewise></math></kineticLaw>",
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [_deg_s_reads_a_local_rate_constant, _deg_s_slows_at_two],
+    ids=["local-rate-constant", "rate-that-jumps"],
+)
+def test_ar_compartment_sized_by_a_reaction_rate_matches_roadrunner(variant):
+    t_end, n = 4.0, 9
+    sbml = variant(_SIZED_BY_DEG_S)
+    ref = _rr_sim(sbml, ["time", "[Sk]", "[Sn]", "[X]", "cv"], t_end, n)
+    _, res = _run(sbml, t_end=t_end, n=n)
+    for i, sid in enumerate(("Sk", "Sn", "X"), start=1):
+        np.testing.assert_allclose(_conc(res, sid), ref[:, i], rtol=1e-6, atol=1e-8, err_msg=sid)
+
+
+def test_ar_compartment_sized_by_a_species_no_reaction_changes_takes_no_rate():
+    """A species that no reaction, rule or event changes holds its value, as a
+    constant one does, so a size that reads it has rate 0 and needs no rate
+    accessor (which the SSA cannot run)."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kf</ci>"),
+        '<species id="Kf" compartment="c" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="false" constant="false"/>',
+    )
+    model, res = _run(sbml, t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)

@@ -897,6 +897,7 @@ def _cf_sbml(
     extra: str = "",
     extra_species: str = "",
     events: str = "",
+    extra_reactions: str = "",
 ) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
     <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
@@ -924,6 +925,7 @@ def _cf_sbml(
               <apply><times/><cn>0.5</cn><ci>S1</ci></apply>
             </math></kineticLaw>
           </reaction>
+          {extra_reactions}
         </listOfReactions>
         {events}
       </model>
@@ -1070,8 +1072,10 @@ def test_conversion_factor_with_no_value_to_read_refuses(kwargs, match):
 # the factor at its initial value 2, S1(1) = e^-1 = 0.36788, where RoadRunner,
 # which follows the parameter, gives 0.28651 (rate rule), 0.28650 (`2 + time`),
 # 0.43526 (`1 + S1`), 0.17377 (an event sets it to 5 at t = 0.5) and 0.13533 (a
-# rule over `k`, which an event sets to 3). A rate rule of 0 and a rule over
-# constants alone hold the value, and load (the tests above).
+# rule over `k`, which an event sets to 3). `cf := J0` reads J0's rate, 0.5*S1,
+# and was folded at its initial value 0.5: S1(1) = 0.77880 for RoadRunner's
+# 0.80000. A rate rule of 0 and a rule over constants alone hold the value, and
+# load (the tests above and below).
 
 
 def _cf_event(var: str, value: float) -> str:
@@ -1132,6 +1136,11 @@ _TIME = (
             id="rule-reading-a-species",
         ),
         pytest.param(
+            {"cf_param": _CF_VARIABLE, "extra": _cf_rule("assignmentRule", "<ci>J0</ci>")},
+            "the assignment rule cf := J0",
+            id="rule-reading-a-reaction-rate",
+        ),
+        pytest.param(
             {
                 "cf_param": '<parameter id="cf" value="2" constant="false"/>',
                 "events": _cf_event("cf", 5),
@@ -1158,6 +1167,54 @@ def test_conversion_factor_the_run_changes_refuses(attrs, where, kwargs, changer
     assert f"{where} is 'cf', whose value {changer}".lower() in msg.lower()
     assert "changes during the run" in msg
     assert "20705" in msg
+
+
+_S3_HELD = (
+    '<species id="S3" compartment="C" initialConcentration="1" hasOnlySubstanceUnits="false" '
+    'boundaryCondition="false" constant="false"/>'
+)
+# J1 makes S3 at the rate 2, which reads nothing that changes.
+_J1_AT_TWO = (
+    '<reaction id="J1" reversible="false"><listOfProducts>'
+    '<speciesReference species="S3" stoichiometry="1" constant="true"/></listOfProducts>'
+    '<kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML"><cn>2</cn></math>'
+    "</kineticLaw></reaction>"
+)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param(
+            {
+                "extra": _cf_rule("assignmentRule", "<ci>J1</ci>"),
+                "extra_species": _S3_HELD,
+                "extra_reactions": _J1_AT_TWO,
+            },
+            id="rule-reading-a-rate-that-holds",
+        ),
+        pytest.param(
+            {
+                "extra": _cf_rule(
+                    "assignmentRule", "<apply><times/><cn>2</cn><ci>S3</ci></apply>"
+                ),
+                "extra_species": _S3_HELD,
+            },
+            id="rule-reading-a-species-nothing-changes",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("attrs", "where"), _CF_LEVELS)
+def test_conversion_factor_a_rule_that_holds_loads(attrs, where, kwargs):
+    """`cf := J1`, J1's rate the constant 2, and `cf := 2*S3`, S3 a species no
+    reaction, rule or event changes, hold the factor at 2 for the whole run, as
+    a rule over constants does. The second was refused as changing, as any
+    species not declared constant counted as moving. RoadRunner gives
+    S1(1) = e^-1 for both."""
+    s1, s2 = _cf_end_state(_cf_sbml(**attrs, cf_param=_CF_VARIABLE, **kwargs))
+    assert s1 == pytest.approx(math.exp(-1.0), rel=1e-6)
+    converted_s2 = "model_cf" in attrs
+    assert s2 == pytest.approx((1 - math.exp(-1.0)) / (1 if converted_s2 else 2), rel=1e-6)
 
 
 # ─── #580: a species the model never gives an initial value ─────────────

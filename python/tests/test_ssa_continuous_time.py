@@ -622,6 +622,19 @@ def test_a_fast_forcing_at_a_large_clock():
             " J: X => P; k*X*S*C;",
             id="cross-compartment-modifier",
         ),
+        # A reaction's id is its rate, its law evaluated on the stored counts.
+        # Both ran with no refusal: the mean x(3) of 300 runs was 72.3 for
+        # libRoadRunner's 45.1, and P(3) 36.3 for 22.6.
+        pytest.param(
+            "compartment C = 1; species S in C = 100; k = 0.2; J0: S => ; k*S*C;"
+            " x = 0; x' = J0; E: at time > 1: C = 2;",
+            id="rate-rule-through-a-reaction-rate",
+        ),
+        pytest.param(
+            "compartment C = 1; compartment D = 1; species S in C = 100; species P in D = 0;"
+            " k = 0.2; J0: S => ; k*S*C; J2: => P; 0.5*J0; E: at time > 1: C = 2;",
+            id="law-through-a-reaction-rate",
+        ),
     ],
 )
 def test_more_stale_concentration_reads_are_refused(text):
@@ -658,3 +671,44 @@ def test_a_compartment_ruled_by_a_constant_species_in_a_moving_compartment_is_re
     assert errors == [("assignment_rule_compartment", "reaction:J")]
     with pytest.raises(bngsim.SsaValidationError, match="assignment rule"):
         bngsim.Simulator(m, method="ssa").run(t_span=(0, 1), n_points=2, seed=1)
+
+
+@pytest.mark.parametrize(
+    "law", ["J0: A => ; k*A;", "J0: => A; 0.2*time;"], ids=["reads-a-species", "reads-the-time"]
+)
+def test_a_compartment_ruled_by_a_reaction_rate_is_refused(law):
+    """A reaction's id is its rate, so cv := 1 + 0.5*J0 moves as J0's law does.
+    It was taken for still: with J0 at k*A, libRoadRunner takes cv from 2.5 to
+    1.82 by t = 2 and gives [Sn](2) = 25.80, and SSA ran J at cv's load-time
+    size with no refusal, a mean [Sn](2) of 400 runs of 19.82 ± 0.07."""
+    txt = (
+        "compartment c = 1; compartment cv; cv := 1 + 0.5*J0; species A in c = 10; k = 0.3;"
+        f" {law} species Sn in cv = 25; J: Sn => ; k*Sn;"
+    )
+    m = _ant(txt)
+    errors = [(i.code, i.location) for i in m.validate_for_ssa() if i.severity == "error"]
+    assert errors == [("assignment_rule_compartment", "reaction:J")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "compartment c = 1; compartment cv; cv := 1 + J0; species B in c = 0; k = 0.3;"
+            " J0: => B; k; species Sn in cv = 50; J: Sn => ; 0.4*Sn*cv;",
+            id="a-reaction-rate-that-holds",
+        ),
+        pytest.param(
+            "compartment c = 1; compartment cv; cv := 1 + 0.1*S; species S in c = 3;"
+            " species Sn in cv = 50; J: Sn => ; 0.1*Sn*cv*S;",
+            id="a-species-no-reaction-changes",
+        ),
+    ],
+)
+def test_a_compartment_ruled_by_a_value_that_holds_runs(text):
+    """cv holds its load-time size when its rule reads a rate whose law reads
+    constants, or a species that no reaction, rule or event changes. The
+    second was refused, as any species not declared constant counted as
+    moving. The mean is the ODE's, which is libRoadRunner's."""
+    assert _ant(text).validate_for_ssa() == []
+    _mean_vs_ode(text, "Sn", 2.0, 200)
