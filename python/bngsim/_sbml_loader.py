@@ -7426,6 +7426,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
     _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
+    # (compartment, trigger, size before, size after), all ExprTk (#1054).
+    _size_jumps: list[tuple[str, str, str, str]] = []
+    _jump_species: dict[str, list[str]] = {}  # compartment -> species it rescales
     if ar_comp_targets:
         import re as _re
 
@@ -7587,6 +7590,126 @@ def _build_model_from_sbml_doc_in_context(doc):
             return cid
 
         _refusals: list[str] = []
+
+        # A piecewise size jumps where one of its conditions flips (#1054). The
+        # chain rule above differentiates each piece, which is right between
+        # the jumps, but a jump is a delta no ODE term carries, so it gets what
+        # an event's resize gets (#74): each concentration × V_before/V_after,
+        # at the condition's root. The size is inlined through the rules it
+        # reads, and the relations in its conditions are set as they read on
+        # either side of each root for the size there. Relations that compare
+        # one difference (or a multiple of it) with 0 change at one root, as
+        # `t < 2` and `t >= 2` do in a piecewise with no otherwise, so they are
+        # set together. Set one at a time, the event of each read the other
+        # after its flip: two rescales at the instant took [S] in
+        # `piecewise(1, t < 2, 5, t >= 2)` to 0 or left it right, as the hash
+        # seed ordered them, and with `t < 2` and `t > 2` the size between the
+        # two, which no piece gives, was read as 0 and divided by. A condition
+        # over constants and event targets alone moves only at an event, whose
+        # own rescale owns that jump; one that reads an event target and the
+        # state or time could flip at the event and then again by the jump
+        # event, so it is refused.
+        _event_targets = {
+            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+            for k in range(sbml_model.getNumEvents())
+            for j in range(sbml_model.getEvent(k).getNumEventAssignments())
+        }
+        _moving = (
+            {_TIME_SYM}
+            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | set(_rr_alias)
+            | set(_rate_token_species)
+        )
+
+        def _inlined_size(safe_var: str, seen: frozenset):
+            ex = _ar_rhs_ex.get(safe_var)
+            if ex is None or safe_var in seen:
+                return None
+            g = _exprtk_to_sympy(ex)
+            if g is None:
+                return None
+            subs = {}
+            for s in g.free_symbols:
+                if str(s) in _ar_alias:
+                    inner = _inlined_size(_ar_alias[str(s)], seen | {safe_var})
+                    if inner is None:
+                        return None
+                    subs[s] = inner
+            return g.xreplace(subs)
+
+        for comp, vdot in _comp_vdot.items():
+            if vdot is None:
+                continue
+            g = _inlined_size(_safe_name(comp), frozenset())
+            if g is None:
+                continue
+            # In a fixed order, so the events do not move with the hash seed.
+            conds = sorted(
+                {c for pw in g.atoms(_sp.Piecewise) for _, c in pw.args if c not in (_sp.true,)},
+                key=_sp.default_sort_key,
+            )
+            relations: set = set()
+            for c in conds:
+                names = {str(s) for s in c.free_symbols}
+                if not names & _moving:
+                    continue
+                if names & _event_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where "
+                        f"{c} flips, which reads "
+                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
+                        "moves with the run as well; bngsim would rescale its "
+                        "concentrations twice when an event flips it"
+                    )
+                    continue
+                relations |= {
+                    r
+                    for r in c.atoms(_sp.core.relational.Relational)
+                    if {str(s) for s in r.free_symbols} & _moving
+                }
+            # (difference, [(relation, its difference over that one)])
+            roots: list[tuple[object, list]] = []
+            for r in sorted(relations, key=_sp.default_sort_key):
+                d = r.lhs - r.rhs
+                for d0, rels in roots:
+                    ratio = _sp.cancel(d / d0)
+                    if ratio.is_number and ratio != 0:
+                        rels.append((r, ratio))
+                        break
+                else:
+                    roots.append((d, [(r, _sp.Integer(1))]))
+            for _, rels in roots:
+                # A side is the sign of the difference there, and an inequality
+                # in the set, where it has one, says which side is true: an
+                # equality holds at the root alone, so it reads false on both.
+                c, q = next(
+                    ((r, q) for r, q in rels if not isinstance(r, (_sp.Eq, _sp.Ne))), rels[0]
+                )
+                if isinstance(c, _sp.Eq):
+                    side_true, side_false = 0, 1
+                elif isinstance(c, _sp.Ne):
+                    side_true, side_false = 1, 0
+                else:
+                    side_true = -1 if c.func(-q, 0) else 1
+                    side_false = -side_true
+                v_false, v_true = (
+                    g.xreplace({r: r.func(rq * side, 0) for r, rq in rels})
+                    for side in (side_false, side_true)
+                )
+                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
+                if any(t is None for t in texts):
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        "flips, and bngsim cannot write the size on either side"
+                    )
+                    continue
+                rises, falls, v_false, v_true = (_unalias(t) for t in texts)
+                _jump_species[comp] = [
+                    s for s, sc in species_comp.items() if sc == comp and _diluted(s)
+                ]
+                _size_jumps.append((comp, rises, v_false, v_true))
+                _size_jumps.append((comp, falls, v_true, v_false))
+
         for comp, rated in _comp_rated.items():
             for leaf in sorted(rated):
                 if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
@@ -8976,6 +9099,32 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             for _ai, _size, _base in rescale_meta:
                 builder.set_last_event_assignment_rescale(_ai, _size, _base)
+
+    # (#1054) A piecewise size's jumps, found in §8c: an event at each
+    # condition's root, each way, rescales the compartment's concentrations so
+    # their amounts hold. ODE only, as every resize rescale is (#81); it is
+    # added after the model's own events so their indices stay as they were.
+    # It executes before any of the model's events at the same instant, by a
+    # priority none of theirs reaches: the jump belongs to the size at that
+    # instant, and executed after an event there that sets a concentration in
+    # the compartment, its rescale of the value from before overwrote that
+    # setting (`at (time >= 2): Sn = 10` beside `cv := piecewise(1, time < 2,
+    # 5)` left Sn at 1 or 10 as the same-priority draw went, #242).
+    for k, (comp, trigger, before, after) in enumerate(_size_jumps):
+        builder.add_event(
+            f"_size_jump_{_safe_name(comp)}_{k}",
+            trigger,
+            [
+                (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
+                for sid in _jump_species[comp]
+            ],
+            persistent=True,
+            initial_value=True,
+            priority_expr="1e308",
+            assignment_ode_only=[True] * len(_jump_species[comp]),
+        )
+        for sid in _jump_species[comp]:
+            ar_dilution_species.add(sid)
 
     # (#81) Apply the deferred SSA live-volume tags. §9 recorded each mass-action
     # varvol reaction as (rxn_idx, comp_id, exp); the compartment's promoted
