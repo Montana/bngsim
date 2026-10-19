@@ -27,7 +27,8 @@ Two engine pieces make this correct:
 * **Tier 1 count-preserving resize** — the loader's per-species concentration
   rescale ``s := s·V_old/V_new`` injected at a compartment resize is marked
   ODE-only and skipped under SSA, so molecule counts are unchanged across the
-  event (only the propensity's live-volume factor updates).
+  event (only the propensity's live-volume factor updates). A concentration a
+  rule sets is no count: its rescale runs under SSA too.
 * **Tier 2 dilution skip** — the #86 concentration-dilution term ``-[S]·V̇/V``
   for a rate-rule compartment is an ODE-only reaction, excluded from SSA
   entirely (firing it would spuriously consume molecules; the volume's effect on
@@ -169,6 +170,93 @@ def test_tier1_unimolecular_volume_independent():
     # break both (it would multiply the stored count by 1/4 at the event).
     assert arr[:, :, ai].max() <= 200
     assert np.allclose(arr[:, :, ai], np.round(arr[:, :, ai]))
+
+
+# ── Tier 1 — a concentration a rule sets is no count ─────────────────────────
+# A rate rule or an assignment rule sets the concentration (issue #718), so its
+# slot holds that concentration under SSA as under ODE, and the resize keeps its
+# amount under both: the rescale runs, and the report reads the column as a
+# concentration. Nothing is random here, so every method gives the closed form.
+# (case: text, [S] at t = 0, 3, 5, S at t = 0, 3, 5)
+_T1_RULE_TARGETS = {
+    # [S] := 3; c goes 1 → 3 just after t = 2.5
+    "assignment-rule target": (
+        "compartment c = 1; E1: at time > 2.5: c = 3; species S in c; S := 3;",
+        [3.0, 3.0, 3.0],
+        [3.0, 9.0, 9.0],
+    ),
+    # d[S]/dt = 0.4; the amount 2 at t = 2.5 is kept in c = 3
+    "rate-rule target": (
+        "compartment c = 1; E1: at time > 2.5: c = 3; species S in c = 1; S' = 0.4;",
+        [1.0, 2.0 / 3.0 + 0.2, 2.0 / 3.0 + 1.0],
+        [1.0, 2.6, 5.0],
+    ),
+    # c := p, p goes 2 → 4; the amount 4 at t = 2.5 is kept in c = 4
+    "rate-rule target, assignment-rule compartment": (
+        "compartment c; p = 2; c := p; E1: at time > 2.5: p = 4; species S in c = 1; S' = 0.4;",
+        [1.0, 1.2, 2.0],
+        [2.0, 4.8, 8.0],
+    ),
+}
+
+
+_METHODS = pytest.mark.parametrize(
+    ("method", "kw"),
+    [("ode", {}), ("ssa", {}), ("psa", {"poplevel": 10})],
+    ids=["ode", "ssa", "psa"],
+)
+
+
+def _rule_target_report(text, method, kw):
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method=method, **kw)
+    run_kw = {"rtol": 1e-10, "atol": 1e-12} if method == "ode" else {"seed": 1}
+    run = sim.run(sample_times=[0.0, 3.0, 5.0], **run_kw)
+    return np.asarray(run.as_roadrunner(["[S]", "S"]))
+
+
+@_METHODS
+@pytest.mark.parametrize("case", list(_T1_RULE_TARGETS))
+def test_tier1_rule_target_keeps_its_amount_across_the_resize(case, method, kw):
+    """SSA skipped the rescale as it does for a count, and the event-resize
+    report read the column as one: [S] = 1 and S = 3 for 3 and 9 (assignment
+    rule), [S](3) = 0.733 for 0.867 (rate rule), and [S](5) = 1.5 with S = 12
+    for 2 and 8 (assignment-rule compartment). The ODE agrees with
+    libRoadRunner on all three."""
+    text, conc, amount = _T1_RULE_TARGETS[case]
+    got = _rule_target_report(text, method, kw)
+    np.testing.assert_allclose(got[:, 0], conc, rtol=1e-9)
+    np.testing.assert_allclose(got[:, 1], amount, rtol=1e-9)
+
+
+@_METHODS
+def test_tier1_rule_target_rescale_reads_what_an_earlier_event_wrote(method, kw):
+    """E1, of higher priority, sets [S] = 5 at the instant E2 triples c, so the
+    amount E2 keeps is 5 and [S](3) = 5/3 + 0.2. Formed from the values frozen
+    at the trigger, the rescale read [S] from before E1 and overwrote it:
+    [S](3) = 0.867 for 1.867 under SSA, where ODE and libRoadRunner agree."""
+    got = _rule_target_report(
+        "compartment c = 1; E1: at time > 2.5, priority = 10: S = 5;"
+        " E2: at time > 2.5, priority = 1: c = 3; species S in c = 1; S' = 0.4;",
+        method,
+        kw,
+    )
+    np.testing.assert_allclose(got[:, 0], [1.0, 5.0 / 3.0 + 0.2, 5.0 / 3.0 + 1.0], rtol=1e-9)
+    np.testing.assert_allclose(got[:, 1], [1.0, 5.6, 8.0], rtol=1e-9)
+
+
+@_METHODS
+def test_tier1_rule_target_resized_to_zero(method, kw):
+    """No amount in no volume is a concentration of 0, as the ODE has it; SSA
+    took 0·1/0 for nan and refused the run. A nonzero amount in no volume has
+    no concentration, and every method refuses it by name."""
+    text = "compartment c = 1; E1: at time > 2.5: c = 0; species S in c = {s0}; S' = {rate};"
+    got = _rule_target_report(text.format(s0=0, rate=0), method, kw)
+    np.testing.assert_array_equal(got, np.zeros((3, 2)))
+    with pytest.raises(
+        bngsim.SimulationError,
+        match="resizes a compartment to 0 while a species in it holds a nonzero amount",
+    ):
+        _rule_target_report(text.format(s0=1, rate=0.4), method, kw)
 
 
 # ── Tier 2 — bimolecular A + B → P in a compartment that grows by a rate rule ─

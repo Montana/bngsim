@@ -1425,6 +1425,34 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 if (sv.ssa_live_volume_idx0 >= 0 && sv.ssa_live_volume_idx0 < ns)
                     nv[a] *= conc[sv.ssa_live_volume_idx0] / sv.volume_factor;
             }
+            auto is_ode_only = [&](size_t a) {
+                return a < ev.assignment_ode_only.size() && ev.assignment_ode_only[a];
+            };
+            auto is_resize_rescale = [&](size_t a) {
+                return a < ev.assignment_rescale_size_expr.size() &&
+                       ev.assignment_rescale_size_expr[a] >= 0;
+            };
+            // A resize's rescale of a species that is no count (a rule target;
+            // a count's is ODE-only, below) is formed here as the ODE forms it
+            // (issue #936): base·(size before)/(size after the event's other
+            // assignments), the base being the event's own value for the
+            // species or else the species' value at execution. Read from its
+            // expression, frozen at the trigger with the event's other values,
+            // it overwrote what an event of higher priority at the same instant
+            // had just written to the species ([S] 0.867 for 1.867), and 0/0 at
+            // a resize to 0 of a species at 0 was refused as nan.
+            std::vector<std::pair<size_t, double>> rescales;
+            for (size_t a = 0; a < assigns.size(); ++a) {
+                if (is_ode_only(a) || !is_resize_rescale(a))
+                    continue;
+                const int sp = assigns[a].first;
+                if (sp < 0 || sp >= ns)
+                    continue;
+                const int b = ev.assignment_rescale_base[a];
+                const double base = b >= 0 ? nv[static_cast<size_t>(b)] : conc[sp];
+                rescales.emplace_back(a,
+                                      base * eval_ref.evaluate(ev.assignment_rescale_size_expr[a]));
+            }
             for (size_t a = 0; a < assigns.size(); ++a) {
                 // GH #81 (Tier 1): skip ODE-only assignments under SSA. The
                 // SBML loader marks the per-species `s := s·V_old/V_new`
@@ -1434,7 +1462,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 // rescale must not run (it would corrupt molecule counts). The
                 // compartment's own resize assignment is NOT ode_only, so the
                 // live volume the propensity correction reads still updates.
-                if (a < ev.assignment_ode_only.size() && ev.assignment_ode_only[a])
+                if (is_ode_only(a) || is_resize_rescale(a))
                     continue;
                 int sp_idx0 = assigns[a].first;
                 if (sp_idx0 >= 0 && sp_idx0 < ns) {
@@ -1453,6 +1481,28 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                             "; an event assignment must be a finite number");
                     store_value(sp_idx0, nv[a]);
                     sp_vec_ref[sp_idx0].concentration = conc[sp_idx0];
+                }
+            }
+            if (!rescales.empty()) {
+                model.update_observables(conc.data());
+                model.evaluate_functions(t_now);
+                for (const auto &[a, num] : rescales) {
+                    const double size = eval_ref.evaluate(ev.assignment_rescale_size_expr[a]);
+                    // An amount in no volume has no concentration: refuse it by
+                    // name, as the ODE does, rather than carry an inf (or
+                    // 0·inf) into the trajectory.
+                    if (num != 0.0 && !(std::isfinite(size) && size != 0.0)) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof buf, "' at t=%g resizes a compartment to %g",
+                                      t_now, size);
+                        throw std::runtime_error(
+                            std::string(use_psa ? "PSA" : "SSA") + ": event '" + ev.id + buf +
+                            " while a species in it holds a nonzero amount, whose concentration "
+                            "is then undefined");
+                    }
+                    const int sp = assigns[a].first;
+                    store_value(sp, num == 0.0 ? 0.0 : num / size);
+                    sp_vec_ref[sp].concentration = conc[sp];
                 }
             }
             any_fired = true;

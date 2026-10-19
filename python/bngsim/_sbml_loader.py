@@ -2148,6 +2148,9 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
         )
         if cf_id:
+            # A factor with no value yet fails the fold: the initialAssignment
+            # or rule that gives it one refolds this on a later pass, and C2c
+            # refuses one the model never gives.
             cf = ctx.get(cf_id)
             if cf is None:
                 return None
@@ -2206,6 +2209,136 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
         r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(k) for k in keys) + r")(?![A-Za-z0-9_])"
     )
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
+
+
+def _rule_compartments_an_event_resizes(
+    rule_math: dict,
+    ar_comp_targets,
+    resized_comps: list[tuple[str, str]],
+    assigned: dict[str, str],
+    rescaled_species: dict[str, list[str]],
+    to_exprtk,
+    cache: dict | None = None,
+) -> list[tuple[str, str]]:
+    """``(compartment, new size)`` for each assignment-rule compartment an event
+    resizes that ``resized_comps`` does not already hold, each after the ones
+    whose resize it reads (issue #1055).
+
+    A compartment is resized by an event that changes anything its size rule
+    reads: a variable the event assigns, another compartment the event resizes,
+    or a species whose concentration that resize rescales (a concentration in a
+    resized compartment keeps its amount, so it moves). And the rule is read
+    through other assignment rules, not only its own names: ``cv := 1 + q``,
+    ``q := 0.5*p`` is resized by ``p := 4``. Only the rule's own names were read
+    before, so both kinds of indirection left the compartment's species
+    unrescaled.
+
+    The order matters because the engine reads each new size after the rescales
+    listed before it. So the set is found first and ordered after: a
+    compartment listed when it first reaches a change could still read a
+    species a later one rescales (``cw := p + 0.1*Sn`` with Sn in ``cv :=
+    1 + 0.1*Kw``, and an event setting p and Kw's compartment), and its size
+    was then read with that species unmoved.
+
+    The new size is the rule with the rules it reaches written out and the
+    event's values put in: an assigned variable's value, a resized
+    compartment's new size, and a rescaled species' value after the rescale.
+    The event's sensitivity support reads that text.
+
+    ``rule_math`` maps each assignment rule's variable to its math, in document
+    order; ``assigned`` maps each variable the event assigns to its value;
+    ``rescaled_species`` maps a compartment to the species a resize of it
+    rescales; ``to_exprtk`` writes math as ExprTk text. ``cache``, kept by the
+    caller from one event to the next, holds what is read from the rules
+    alone, so that each rule is walked once per model rather than once per
+    event.
+    """
+    cache = {} if cache is None else cache
+    reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
+
+    def reads(var: str) -> frozenset:
+        """Every name the rule for ``var`` reads, itself or through the rules
+        it reads. Each rule is walked once, which a diamond of rules needs."""
+        if var not in reads_memo:
+            reads_memo[var] = frozenset()  # a cycle of rules reads no further
+            names: set[str] = set()
+            for n in _ast_name_set(rule_math[var]):
+                names.add(n)
+                if n in rule_math:
+                    names |= reads(n)
+            reads_memo[var] = frozenset(names)
+        return reads_memo[var]
+
+    def moves(comp: str) -> set[str]:
+        """The compartment and the species a resize of it rescales."""
+        return {comp, *rescaled_species.get(comp, ())}
+
+    changed = set(assigned)
+    for comp, _ in resized_comps:
+        changed |= moves(comp)
+    resized: list[str] = []
+    progress = True
+    while progress:
+        progress = False
+        for comp in rule_math:
+            if comp in ar_comp_targets and comp not in changed and reads(comp) & changed:
+                resized.append(comp)
+                changed |= moves(comp)
+                progress = True
+
+    # Each one after every other whose size or species it reads. Two that read
+    # each other's species have no such order and keep the document's.
+    ordered: list[str] = []
+    pending = list(resized)
+    while pending:
+        comp = next(
+            (c for c in pending if not any(reads(c) & moves(d) for d in pending if d != c)),
+            pending[0],
+        )
+        pending.remove(comp)
+        ordered.append(comp)
+
+    replacements = {_safe_name(var): expr for var, expr in assigned.items()}
+
+    def note_rescaled(comp: str, new_size: str) -> None:
+        # A species the event also assigns is given that value in the old size,
+        # and keeps the amount it makes there (as the rescale the caller
+        # injects for it does).
+        for sid in rescaled_species.get(comp, ()):
+            amount = f"({assigned[sid]})" if sid in assigned else _safe_name(sid)
+            replacements[_safe_name(sid)] = f"{amount} * ({_safe_name(comp)}) / ({new_size})"
+
+    for comp, new_size in resized_comps:
+        note_rescaled(comp, new_size)
+
+    if "rule_of" not in cache:
+        cache["rule_of"] = {_safe_name(var): var for var in rule_math}
+    rule_of: dict[str, str] = cache["rule_of"]
+    rule_text: dict[str, str] = cache.setdefault("text", {})
+
+    def inlined(expr: str, depth: int = 0) -> str:
+        """The text with each rule it reads that reaches a change written out,
+        so that the event's values can be put in."""
+        if depth > 64:
+            return expr
+        inner = {}
+        for name in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)):
+            var = rule_of.get(name)
+            if var is not None and var not in changed and reads(var) & changed:
+                if var not in rule_text:
+                    rule_text[var] = to_exprtk(rule_math[var])
+                inner[name] = rule_text[var]
+        if not inner:
+            return expr
+        return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
+
+    found: list[tuple[str, str]] = []
+    for comp in ordered:
+        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        found.append((comp, new_size))
+        replacements[_safe_name(comp)] = new_size
+        note_rescaled(comp, new_size)
+    return found
 
 
 def _piecewise_branches(node) -> tuple[list, list]:
@@ -3050,7 +3183,9 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     """The names each assignment rule reads, by variable, and the variables whose
     value moves during a run: one that reads the clock, a species, a rate-rule or
     event target, or another moving rule's variable. A rule over constants
-    (``C := 2``, ``C := p``) holds its value."""
+    (``C := 2``, ``C := p``) holds its value. A concentration moves with its
+    compartment's size, so a constant species is a constant only in a
+    compartment whose size holds."""
     reads: dict[str, set[str]] = {}
     moving: set[str] = set()
     rate_vars = set()
@@ -3075,9 +3210,22 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
         for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
         if not sp.getConstant() and not sp.getBoundaryCondition()
     }
+    # A resize keeps a species' amount, so the concentration of a constant or
+    # boundary species moves with its compartment's size, though nothing names
+    # it. `cv := 1 + 0.1*Kw` with Kw constant in `ce` was taken for still across
+    # an event `ce = 2`, and SSA ran cv's reactions at its load-time size.
+    conc_comp = {
+        sp.getId(): sp.getCompartment()
+        for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
+        if not sp.getHasOnlySubstanceUnits()
+    }
     changed = True
     while changed:  # to the fixed point: a rule over a moving rule moves
         changed = False
+        for sid, comp in conc_comp.items():
+            if sid not in sources and (comp in sources or comp in moving):
+                sources.add(sid)
+                changed = True
         for var, names in reads.items():
             if var not in moving and (names & sources or names & moving):
                 moving.add(var)
@@ -5113,6 +5261,69 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "BNGSIM_ALLOW_UNSET_PARAMS=1."
             )
 
+    # ── C2c: a conversionFactor that names a valueless parameter ──
+    # A conversionFactor attribute, the model's or a species' own, reads a global
+    # parameter as surely as a rate law does, but it is not math, so C2's walk
+    # does not see it. SBML leaves such a parameter's value undefined, and the
+    # factor scales every change a reaction makes to the species' amount. §3b
+    # used to read it as 1, so the model ran as if it declared no factor:
+    # `S1 -> S2` at 0.5*S1 with S1's factor `cf` left without a value gave
+    # S1(1) = e^-0.5 = 0.607 and no warning. RoadRunner refuses the model. A
+    # factor that an initialAssignment or an assignmentRule gives a value is not
+    # in `_unset_param_ids` and loads as before (SBML suite 01642-01644 and
+    # 01651-01653 give theirs by an initialAssignment). One whose
+    # initialAssignment does not fold at load is in it too, but the model does
+    # assign it, so it is left to §3b, which names the assignment it could not
+    # evaluate. Like C2 this goes by what the attribute names, so a model-wide
+    # factor that every species overrides still refuses. Same refusal and hatch
+    # as C2; under the hatch the factor is 0.0, the value the parameter itself is
+    # given everywhere else.
+    _cf_unset = _unset_param_ids - {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+    }
+    _unset_cf: list[tuple[str, str]] = []
+    if sbml_model.isSetConversionFactor() and sbml_model.getConversionFactor() in _cf_unset:
+        _unset_cf.append((sbml_model.getConversionFactor(), "the model's conversionFactor"))
+    for j in range(sbml_model.getNumSpecies()):
+        _sp = sbml_model.getSpecies(j)
+        if _sp.isSetConversionFactor() and _sp.getConversionFactor() in _cf_unset:
+            _unset_cf.append(
+                (_sp.getConversionFactor(), f"the conversionFactor of species {_sp.getId()!r}")
+            )
+    if _unset_cf:
+        import os
+
+        from bngsim._exceptions import UnderSpecifiedModelError
+
+        one = len(_unset_cf) == 1
+        names = ", ".join(f"{pid!r} ({where})" for pid, where in _unset_cf)
+        lead = (f"Parameter {names} has" if one else f"Parameters {names} have") + (
+            " no value attribute, initialAssignment or assignmentRule"
+        )
+        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            logger.warning(
+                "%s, so SBML leaves the conversion %s undefined. bngsim takes %s as 0.0 "
+                "(BNGSIM_ALLOW_UNSET_PARAMS=1), so no reaction changes the amount of a "
+                "species %s converts. Set the %s.",
+                lead,
+                "factor" if one else "factors",
+                "it" if one else "them",
+                "it" if one else "they",
+                "value" if one else "values",
+            )
+        else:
+            raise UnderSpecifiedModelError(
+                f"{lead}, so SBML leaves the conversion "
+                f"{'factor' if one else 'factors'} undefined. The model is "
+                "under-specified: bngsim refuses to read a factor as 1, which would "
+                "silently drop it from every reaction that changes the species and "
+                "return a wrong-but-plausible trajectory (RoadRunner refuses the same "
+                "model). Set the parameter value or add an initialAssignment. To load "
+                "with the factor at 0.0, the legacy lenient default for a parameter "
+                "with no value, set BNGSIM_ALLOW_UNSET_PARAMS=1."
+            )
+
     # Pre-scan rate-rule targets and event-assignment targets up front so
     # both step 1 (compartments) and step 2 (parameters) can skip IDs that
     # will be promoted to species later in step 8 / event handling. Without
@@ -6444,16 +6655,111 @@ def _build_model_from_sbml_doc_in_context(doc):
     # expressed as a single rate scale and are refused loudly there (never
     # silently mis-integrated). Models with no conversionFactor leave
     # ``_has_conversion_factor`` False and this is a complete no-op.
-    def _resolve_const_param_value(pid):
-        # conversionFactor parameters are constant: value = initialAssignment if
-        # any, else the declared value.
-        if pid in ia_values:
-            return ia_values[pid]
+    #
+    # A factor whose parameter changes during the run is therefore one the rates
+    # cannot follow: they keep the value it has at load. SBML forbids it (rule
+    # 20705), but bngsim used to load it without a word: `cf = 2` with the rate
+    # rule `cf' = 1` gave S1(1) = 0.36788 for `S1 -> S2` at 0.5*S1, where
+    # RoadRunner, which follows the parameter, gives 0.28651. What changes one:
+    # a rate rule (a rate of 0 leaves it where it is), an event that assigns it
+    # (one with a trigger, as the event pre-scan counts them), or an assignment
+    # rule that moves (`_moving_assignment_rule_vars`: it reads the time, a
+    # species, or something a rate rule or an event changes). A rule over
+    # constants alone holds its value and is folded like an initialAssignment.
+    _cf_ids = {
+        _sp.getConversionFactor()
+        for _sp in (sbml_model.getSpecies(_j) for _j in range(sbml_model.getNumSpecies()))
+        if _sp.isSetConversionFactor()
+    }
+    if sbml_model.isSetConversionFactor():
+        _cf_ids.add(sbml_model.getConversionFactor())
+    _cf_changed_by: dict[str, list[str]] = {}
+    if _cf_ids:
+        _, _cf_moving_ars = _moving_assignment_rule_vars(sbml_model)
+        for _j in range(sbml_model.getNumRules()):
+            _r = sbml_model.getRule(_j)
+            _v = _r.getVariable()
+            if _v not in _cf_ids or _r.getMath() is None:
+                continue
+            _txt = libsbml.formulaToL3String(_r.getMath())
+            if _r.isRate():
+                _names, _clock = _math_names(_r.getMath())
+                if (
+                    not _names
+                    and not _clock
+                    and _eval_ast_numeric(_r.getMath(), {}, func_defs) == 0
+                ):
+                    continue
+                _cf_changed_by.setdefault(_v, []).append(f"the rate rule d({_v})/dt = {_txt}")
+            elif _r.isAssignment() and _v in _cf_moving_ars:
+                _cf_changed_by.setdefault(_v, []).append(
+                    f"the assignment rule {_v} := {_txt}, which reads the time or a value "
+                    "that changes,"
+                )
+        for _j in range(sbml_model.getNumEvents()):
+            _ev = sbml_model.getEvent(_j)
+            if _ev.getTrigger() is None or _ev.getTrigger().getMath() is None:
+                continue  # it never fires
+            for _k in range(_ev.getNumEventAssignments()):
+                _ea = _ev.getEventAssignment(_k)
+                if _ea.getVariable() in _cf_ids and _ea.getMath() is not None:
+                    _cf_changed_by.setdefault(_ea.getVariable(), []).append(
+                        f"event {_ev.getId()!r}" if _ev.getId() else "an event"
+                    )
+
+    def _resolve_const_param_value(pid, what):
+        # conversionFactor parameters are constant, and the factor is folded into
+        # the rates as a number: the value its initialAssignment (or an
+        # assignmentRule over constants) gives it at load, else the declared one.
+        # A parameter that the run changes is refused first. Nothing falls back
+        # to a number the model did not give. A factor read as 1 is a factor
+        # dropped without a word, and a declared value that an assignment
+        # replaces is not the factor either: `cf = 5` with the initialAssignment
+        # `cf = 2 + S3`, S3 given no initial value, scaled the rates by 5 while
+        # the parameter read 2 (RoadRunner: 2). C2c refused a factor the model
+        # gives no value at all; under its hatch the factor is 0.0, as the
+        # parameter is.
+        from bngsim._exceptions import ModelError
+
         p = sbml_model.getParameter(pid)
-        return p.getValue() if (p is not None and p.isSetValue()) else 1.0
+        if p is None:
+            # Invalid SBML (libsbml validation rules 20216 and 20617).
+            raise ModelError(
+                f"{what} is {pid!r}, which is not a parameter of the model. SBML "
+                "requires a conversionFactor to name a constant parameter, and bngsim "
+                "will not read it as 1."
+            )
+        if pid in _cf_changed_by:
+            raise ModelError(
+                f"{what} is {pid!r}, whose value {' and '.join(_cf_changed_by[pid])} "
+                "changes during the run. bngsim folds a conversion factor into the "
+                "rates as a number at load, so the run would keep the value it has at "
+                "the start. SBML requires a conversionFactor to name a constant "
+                "parameter (validation rule 20705)."
+            )
+        if pid in _ia_math or pid in _ar_targets:
+            kind = "initialAssignment" if pid in _ia_math else "assignmentRule"
+            # `ia_values` holds the declared value for an initialAssignment that
+            # did not fold (issue #732), so whether it folds is asked directly.
+            folded = _ia_folds(_ia_math[pid]) if pid in _ia_math else pid in ia_values
+            if folded and pid in ia_values:
+                return ia_values[pid]
+            _m = _ia_math[pid] if pid in _ia_math else sbml_model.getRuleByVariable(pid).getMath()
+            raise ModelError(
+                f"{what} is {pid!r}, and bngsim could not evaluate the {kind} "
+                f"{pid} = {libsbml.formulaToL3String(_m)} at load, so it has no "
+                "number to scale the rates by: it reads something with no value "
+                "there. A conversionFactor must name a constant parameter; give it a "
+                "value, or an initialAssignment that evaluates at load."
+            )
+        if p.isSetValue():
+            return p.getValue()
+        return 0.0  # BNGSIM_ALLOW_UNSET_PARAMS=1: C2c refused it otherwise, and warned
 
     _model_cf_val = (
-        _resolve_const_param_value(sbml_model.getConversionFactor())
+        _resolve_const_param_value(
+            sbml_model.getConversionFactor(), "The model's conversionFactor"
+        )
         if sbml_model.isSetConversionFactor()
         else None
     )
@@ -6462,7 +6768,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     for _sid in species_ids:
         _sp = sbml_model.getSpecies(_sid)
         if _sp is not None and _sp.isSetConversionFactor():
-            species_cf[_sid] = _resolve_const_param_value(_sp.getConversionFactor())
+            species_cf[_sid] = _resolve_const_param_value(
+                _sp.getConversionFactor(), f"The conversionFactor of species {_sid!r}"
+            )
             _any_species_cf = True
         elif _model_cf_val is not None:
             species_cf[_sid] = _model_cf_val
@@ -7668,14 +7976,72 @@ def _build_model_from_sbml_doc_in_context(doc):
         # own rescale owns that jump; one that reads an event target and the
         # state or time could flip at the event and then again by the jump
         # event, so it is refused.
-        _event_targets = {
-            _alias(_safe_name(sbml_model.getEvent(k).getEventAssignment(j).getVariable()))
+        #
+        # An event moves more than what it assigns: a concentration in a
+        # compartment it resizes, directly or through the compartment's rule,
+        # is rescaled there, and that resize's own rescale carries any jump of
+        # a size that reads it (#1055). Left out, both rescaled at the event:
+        # `cv := piecewise(2, Kw > 7, 1)` with Kw in a compartment the event
+        # doubles took [Sn] to 20 for 10. And a species no reaction or rule
+        # moves, in a compartment that holds its size between events, moves
+        # only at an event, though it is not constant: `cv := piecewise(1, Kw >
+        # 7, 2)` beside `at (t > 1): Kw = 2` was refused, where the event's
+        # resize alone is right.
+        _event_moved = {
+            sbml_model.getEvent(k).getEventAssignment(j).getVariable()
             for k in range(sbml_model.getNumEvents())
             for j in range(sbml_model.getEvent(k).getNumEventAssignments())
         }
+        _rescaled_in: dict[str, set[str]] = {}
+        for _sid, _scomp in species_comp.items():
+            if not species_hosu.get(_sid, False) and _sid not in assignment_targets:
+                _rescaled_in.setdefault(_scomp, set()).add(_sid)
+        _size_rule_math = {
+            sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
+            for j in range(sbml_model.getNumRules())
+            if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
+        }
+        _rule_reach: dict[str, frozenset] = {}
+
+        def _reaches(var: str) -> frozenset:
+            if var not in _rule_reach:
+                _rule_reach[var] = frozenset()  # a cycle of rules reads no further
+                names: set[str] = set()
+                for n in _ast_name_set(_size_rule_math[var]):
+                    names.add(n)
+                    if n in _size_rule_math:
+                        names |= _reaches(n)
+                _rule_reach[var] = frozenset(names)
+            return _rule_reach[var]
+
+        for _comp in _event_moved & _comp_id_set:
+            _event_moved |= _rescaled_in.get(_comp, set())
+        _grew = True
+        while _grew:
+            _grew = False
+            for _comp in sorted(ar_comp_targets - _event_moved):
+                if _reaches(_comp) & _event_moved:
+                    _event_moved |= {_comp, *_rescaled_in.get(_comp, ())}
+                    _grew = True
+        _event_targets = {_alias(_safe_name(n)) for n in _event_moved}
+        _flow_free = {
+            s
+            for s in _sbml_species_ids
+            if s not in reaction_species
+            and s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
         _moving = (
             {_TIME_SYM}
-            | {a for a, s in _species_alias.items() if s not in _still_species}
+            | {
+                a
+                for a, s in _species_alias.items()
+                if s not in _still_species and s not in _flow_free
+            }
             | set(_rr_alias)
             | set(_rate_token_species)
         )
@@ -7716,8 +8082,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where "
                         f"{c} flips, which reads "
-                        f"{', '.join(sorted(names & _event_targets))}, an event target, and "
-                        "moves with the run as well; bngsim would rescale its "
+                        f"{', '.join(sorted(names & _event_targets))}, which an event "
+                        "changes, and moves with the run as well; bngsim would rescale its "
                         "concentrations twice when an event flips it"
                     )
                     continue
@@ -8914,6 +9280,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         # or priority that is a plain number still folds.
         event_fold_ctx: dict[str, float] = {}
 
+        # What an event's resize of an assignment-rule compartment is found
+        # from (issue #1055): each assignment rule's math, in document order,
+        # and the species a resize of each compartment rescales. Both are the
+        # same for every event, so they are read once, not once per event.
+        event_rule_math: dict[str, object] = {}
+        event_rescaled_species: dict[str, list[str]] = {}
+        event_rule_cache: dict = {}
+        if ar_comp_targets:
+            for j in range(sbml_model.getNumRules()):
+                rule = sbml_model.getRule(j)
+                if rule.isAssignment() and rule.getMath() is not None:
+                    event_rule_math[rule.getVariable()] = rule.getMath()
+            for sid, scomp in species_comp.items():
+                if not species_hosu.get(sid, False) and sid not in assignment_targets:
+                    event_rescaled_species.setdefault(scomp, []).append(sid)
+
         for i in range(n_events):
             event = sbml_model.getEvent(i)
             eid = event.getId() or f"_event_{i}"
@@ -9093,29 +9475,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                     assignments.append((sp_i, value_expr))
 
-            if assignment_value_expr_by_var and ar_comp_targets:
-                event_assignment_replacements = {
-                    _safe_name(var): expr for var, expr in assignment_value_expr_by_var.items()
-                }
-                assigned_vars = set(assignment_value_expr_by_var)
-                for j in range(sbml_model.getNumRules()):
-                    rule = sbml_model.getRule(j)
-                    comp_id = rule.getVariable()
-                    rmath = rule.getMath()
-                    if (
-                        not rule.isAssignment()
-                        or comp_id not in ar_comp_targets
-                        or comp_id in directly_resized_comps
-                        or rmath is None
-                        or not (_ast_name_set(rmath) & assigned_vars)
-                    ):
-                        continue
-                    old_size_expr = _ast_to_exprtk_with_funcdefs(rmath, func_defs)
-                    new_size_expr = _replace_exprtk_symbols(
-                        old_size_expr, event_assignment_replacements
+            if ar_comp_targets and (assignment_value_expr_by_var or resized_comps):
+                resized_comps.extend(
+                    _rule_compartments_an_event_resizes(
+                        event_rule_math,
+                        ar_comp_targets,
+                        resized_comps,
+                        assignment_value_expr_by_var,
+                        event_rescaled_species,
+                        lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
+                        event_rule_cache,
                     )
-                    if new_size_expr != old_size_expr:
-                        resized_comps.append((comp_id, new_size_expr))
+                )
 
             # (#74) Inject per-species concentration rescaling for any
             # compartment whose size this event changes. bngsim stores every
@@ -9145,7 +9516,11 @@ def _build_model_from_sbml_doc_in_context(doc):
             # rescale (which preserves the *amount* by changing the stored
             # *concentration*) must not run. Every real event assignment applies
             # in both modes. Empty/all-False ⇒ byte-identical for non-resize
-            # events.
+            # events. A rate-rule target is the exception among the rescales: it
+            # is no count (issue #718), and its slot holds the rule's
+            # concentration under SSA as under ODE, so its rescale applies in
+            # both. Skipped under SSA, its amount changed with the size: [S]
+            # 0.733 for 0.867 a step after `c = 3`.
             assignment_ode_only = [False] * len(assignments)
             # (#936) Each rescale's (assignment index, compartment size, index of
             # the event's own assignment to the species or -1): the engine stores
@@ -9155,6 +9530,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rescale_meta: list[tuple[int, str, int]] = []
             if resized_comps:
                 explicitly_assigned = {sp_i for sp_i, _ in assignments}
+                n_own = len(assignments)
                 for comp_id, new_size_expr in resized_comps:
                     comp_safe = _safe_name(comp_id)
                     for sid, scomp in species_comp.items():
@@ -9165,7 +9541,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                         if sid in assignment_targets:
                             continue
                         sp_i = species_idx[sid]
-                        if comp_id in ar_comp_targets:
+                        ode_only = sid not in rate_rule_targets
+                        # A rate-rule target's amount is reported through the
+                        # rule-target map (#728), which reads its column as a
+                        # concentration under every method; the dilution map
+                        # reads it as a count under SSA.
+                        if comp_id in ar_comp_targets and ode_only:
                             ar_dilution_species.add(sid)
                         if sp_i in explicit_species_assignment_expr:
                             # Simultaneous event semantics evaluate all RHS
@@ -9177,20 +9558,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                             value_expr = explicit_species_assignment_expr[sp_i]
                             rescale_expr = f"({value_expr}) * ({comp_safe}) / ({new_size_expr})"
                             base_idx = next(
-                                i
-                                for i, (j, _) in enumerate(assignments)
-                                if j == sp_i and not assignment_ode_only[i]
+                                i for i, (j, _) in enumerate(assignments[:n_own]) if j == sp_i
                             )
                             rescale_meta.append((len(assignments), comp_safe, base_idx))
                             assignments.append((sp_i, rescale_expr))
-                            assignment_ode_only.append(True)
+                            assignment_ode_only.append(ode_only)
                             continue
                         if sp_i in explicitly_assigned:
                             continue
                         rescale_expr = f"{_safe_name(sid)} * ({comp_safe}) / ({new_size_expr})"
                         rescale_meta.append((len(assignments), comp_safe, -1))
                         assignments.append((sp_i, rescale_expr))
-                        assignment_ode_only.append(True)
+                        assignment_ode_only.append(ode_only)
 
             if not assignments:
                 logger.warning(f"Event '{eid}': no valid assignments, skipping")
@@ -9535,6 +9914,11 @@ def _build_model_from_sbml_doc_in_context(doc):
                     # The rate of a concentration is the amount's over the
                     # size (`c = 1 + rateOf(B)`: a write to B's `d` 0.33 off).
                     _rate.add(_sp_r.getCompartment())
+                # And its conversionFactor scales the amount's rate.
+                if _sp_r.isSetConversionFactor():
+                    _rate.add(_sp_r.getConversionFactor())
+                elif sbml_model.isSetConversionFactor():
+                    _rate.add(sbml_model.getConversionFactor())
     for _j in range(sbml_model.getNumRules() if _uses_rateof else 0):
         _r = sbml_model.getRule(_j)
         if _r.isRate() and _r.getMath() is not None:
@@ -9940,8 +10324,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
     # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
     # under every method, so V_live(t) is all the report needs, read from the
-    # compartment's promoted-species column (a rate rule) or its expression
-    # column (an assignment rule).
+    # compartment's promoted-species column (a rate rule), its expression
+    # column (an assignment rule) or its observable column (an event resize; the
+    # event-resize map below leaves such a species to this one).
     varvol_target_amount_map: dict[str, tuple[str, str]] = {}
     for sid, cid in species_comp.items():
         if (
@@ -9954,6 +10339,8 @@ def _build_model_from_sbml_doc_in_context(doc):
             varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
         elif cid in ar_comp_targets:
             varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+        elif cid in event_resize_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("observable", _safe_name(cid))
     model._varvol_target_amount_map = varvol_target_amount_map
 
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
@@ -9979,9 +10366,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # emitted as an observable) and applies the factor method-by-method. Maps
     # species_safe → (comp_obs_name, V_static, hOSU). Empty (no-op) for every
     # model with no event-resized compartment.
+    #
+    # A concentration species that a rule sets is no count, and its column holds
+    # the rule's concentration under SSA too (its rescale is not ODE-only), so
+    # this map leaves it to the rule-target map above. Read as a count, `S := 3`
+    # reported [S] = 1 and S = 3 under SSA after `c = 3`, for 3 and 9.
     varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
     if event_resize_comps:
         for sid, cid in species_comp.items():
+            if _safe_name(sid) in varvol_target_amount_map:
+                continue
             if cid in event_resize_comps and sid in species_idx:
                 varvol_event_resize_map[_safe_name(sid)] = (
                     _safe_name(cid),
