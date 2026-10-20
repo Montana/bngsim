@@ -139,3 +139,19 @@ def test_a_blow_up_on_one_side_is_infinitely_far(bad):
         }
 
     assert PG.job_fingerprint_distance(fp(bad), fp(1.0), 1e-5, 1e-6) == float("inf")
+
+
+def test_a_tolerance_override_judges_its_model_by_its_own(tmp_path, capsys, monkeypatch):
+    """0.1% is drift at the default rtol and within a model's 1e-2 override."""
+    moved = BASE.copy()
+    moved[-1, 0] *= 1.001
+    monkeypatch.setitem(PG.VERIFY_TOLERANCE_OVERRIDES, JOB.model_id, (1e-2, 1e-6, "test"))
+    code, out = _verify(tmp_path, moved, capsys=capsys)
+    assert code == 0 and "WITHIN_TOL" in out and "rtol 0.01" in out
+
+
+def test_every_override_is_a_gated_model_with_a_reason():
+    for model_id, (rtol, atol, reason) in PG.VERIFY_TOLERANCE_OVERRIDES.items():
+        assert model_id in PG.GATED_MODELS, model_id
+        assert rtol > 0 and atol > 0
+        assert len(reason) > 40, f"{model_id}: give the measurement, not a label"

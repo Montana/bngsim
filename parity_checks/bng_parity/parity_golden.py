@@ -158,6 +158,21 @@ TRAJECTORY_ALLOWLIST: dict[str, str] = {
 # platform, and the slow/glacial tiers cost minutes each.
 GATED_MODELS: list[str] = [m for m in TRAJECTORY_ALLOWLIST if m.startswith("fast/")]
 
+# A gated model whose run differs between platforms by more than the default
+# tolerance, with the measurement: model_id -> (rtol, atol, reason). `--verify`
+# judges it by these instead of --verify-rtol / --verify-atol.
+VERIFY_TOLERANCE_OVERRIDES: dict[str, tuple[float, float, str]] = {
+    "fast/rulehub/Published/Lang2024/Lang_2024.bngl": (
+        1e-4,
+        1e-6,
+        "integrates at rtol 1e-8 over t = 0..136472 (1200 rows of a cell cycle): "
+        "Linux x86_64 against a macOS arm64 golden read 1.11 times rtol 1e-5 "
+        "(about 1.1e-5 relative) on identical code, rounding carried over the "
+        "long horizon. At 1e-4 that is 0.11 of it; the other gated models sit at "
+        "0.07 or less of 1e-5.",
+    ),
+}
+
 
 def _load_parity_diff():
     """Import the sibling parity_diff module (for its tuned ``load_normalized``)."""
@@ -468,7 +483,7 @@ def verify_against_golden(
     """Compare a fresh sweep with the committed golden (issue #582). Returns the
     exit code: 0 when every job present in the sweep is identical or within
     ``rtol``/``atol`` and at least ``min_compared`` were compared, else 1."""
-    tol = f"rtol {rtol:g}, atol {atol:g}"
+    default_tol = (rtol, atol)
     committed = {g["model_id"]: g for g in json.loads(golden_path.read_text())["golden"]}
     rows: list[tuple[str, str, str]] = []
     failed = 0
@@ -493,20 +508,26 @@ def verify_against_golden(
             failed += 1
             continue
         compared += 1
+        rtol, atol = VERIFY_TOLERANCE_OVERRIDES.get(job.model_id, default_tol)[:2]
+        tol = f"rtol {rtol:g}, atol {atol:g}"
         checksum, fingerprint, _ = built
         if checksum == golden["checksum"]:
             rows.append((job.model_id, "IDENTICAL", ""))
             continue
         worst = job_fingerprint_distance(fingerprint, golden["fingerprint"], rtol, atol)
         if worst <= 1.0:
-            rows.append((job.model_id, "WITHIN_TOL", f"{worst:.2g} of the tolerance"))
+            rows.append((job.model_id, "WITHIN_TOL", f"{worst:.2g} of the tolerance ({tol})"))
         else:
             rows.append((job.model_id, "DRIFT", f"{worst:.3g} times the tolerance ({tol})"))
             failed += 1
     width = max((len(r[0]) for r in rows), default=10)
     for model_id, verdict, note in rows:
         print(f"{model_id:<{width}}  {verdict:<18} {note}")
-    print(f"\ngolden verify: {compared} compared, {failed} failing ({tol})")
+    print(
+        f"\ngolden verify: {compared} compared, {failed} failing "
+        f"(rtol {default_tol[0]:g}, atol {default_tol[1]:g}; "
+        f"{len(VERIFY_TOLERANCE_OVERRIDES)} model(s) by override)"
+    )
     if compared < min_compared:
         print(
             f"FAIL: compared {compared} < --min-compared {min_compared}: the gate checked "
