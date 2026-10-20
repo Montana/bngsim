@@ -104,6 +104,7 @@ class Model:
         "_jac_derive_sec",
         "_jac_attempted",
         "_jac_decline_reason",
+        "_jac_decline",
         "_net_path",
         "_ssa_issues",
         "_ar_report_map",
@@ -218,6 +219,8 @@ class Model:
         self._jac_attempted: bool = False
         # Issue #506: why the attempt declined, for analytical_jacobian_status.
         self._jac_decline_reason: str | None = None
+        # Issue #538: the same decline with its kind, for analytical_jacobian_decline.
+        self._jac_decline: dict | None = None
         # Set by Model.from_net: the .net file the model was loaded from.
         # Provenance only since #803: every backend reads the built model. It
         # used to select the .net codegen path (kept for "issue #15's
@@ -1135,18 +1138,24 @@ class Model:
             return bool(self._core.analytical_jacobian_complete)
         self._jac_attempted = True
         try:
-            from bngsim._jacobian import attach_functional_jacobian, last_decline_reason
+            from bngsim._jacobian import (
+                attach_functional_jacobian,
+                last_decline,
+                last_decline_reason,
+            )
 
             t0 = time.perf_counter()
             attach_functional_jacobian(self._core)
             self._jac_derive_sec = time.perf_counter() - t0
             self._jac_decline_reason = last_decline_reason()
+            self._jac_decline = last_decline()
         except Exception as e:
             # attach_functional_jacobian is contractually no-raise (it falls back
             # to FD and logs over-budget / unsupported cases itself, GH #95); this
             # guard only surfaces a genuinely unexpected error without re-deriving.
             logger.debug("Analytical Functional Jacobian skipped: %s", e)
             self._jac_decline_reason = f"an unexpected error during derivation: {e}"
+            self._jac_decline = {"kind": "unexpected_error", "reason": self._jac_decline_reason}
         return bool(self._core.analytical_jacobian_complete)
 
     @property
@@ -1174,6 +1183,29 @@ class Model:
             return "pending"
         reason = self._jac_decline_reason or "no reason was recorded"
         return f"declined: {reason}"
+
+    @property
+    def analytical_jacobian_decline(self) -> dict | None:
+        """Why the model runs on the finite-difference Jacobian, as a stable
+        category a census can group by (issue #538).
+
+        ``None`` while :attr:`analytical_jacobian_status` is ``"complete"`` or
+        ``"pending"``. Otherwise a dict with ``kind``, one of
+        :data:`bngsim._jacobian.DECLINE_KINDS`, and ``reason``, the text of the
+        status. For the C++ attach gate's kinds (``fd_mismatch``,
+        ``nonfinite_entry``, ...) it also carries the gate's verdict fields
+        (``probe``, ``rxn_idx``, ``row``, ``col``, the values) and the species
+        ``row`` and ``col`` name as ``row_species`` / ``col_species``.
+
+        The kind is what to group by: the reason embeds the rate law, names and
+        values, and its wording changes. A clone carries it, as it carries the
+        status.
+        """
+        if bool(self._core.analytical_jacobian_complete) or not self._jac_attempted:
+            return None
+        if self._jac_decline is None:
+            return {"kind": "unrecorded", "reason": "no reason was recorded"}
+        return dict(self._jac_decline)
 
     # ─── Load-phase timing accessors ──────────────────────────────────────
     # Public read-only views of the per-model setup timings the SBML loader
@@ -1255,6 +1287,7 @@ class Model:
         # solve — hence warm-before-clone for parallel fitting, GH #145 §3).
         m._jac_attempted = self._jac_attempted
         m._jac_decline_reason = self._jac_decline_reason
+        m._jac_decline = dict(self._jac_decline) if self._jac_decline is not None else None
         # GH #97: same warm-clone reasoning for the #198 output-sens analysis — a
         # clone has the parent's structure, so re-running its sympy would be N×
         # waste in parallel fitting. Shared by reference (the analysis is

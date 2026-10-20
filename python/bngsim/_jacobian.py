@@ -74,10 +74,49 @@ logger = logging.getLogger("bngsim")
 # on a pool; the reason is reset at the start of every attach.
 _decline_state = threading.local()
 
+# Issue #538: a stable category beside each decline's reason. The reason is
+# written for people and embeds the rate law, names and values, and its wording
+# changes; a census groups declines by this instead. The C++ attach gate's kinds
+# (``NetworkModel.last_functional_jacobian_decline``, issue #536) pass through
+# under their own names.
+DECLINE_KINDS: dict[str, str] = {
+    # Python side (issue #506), one per _declined site.
+    "disabled": "BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0 turned the derivation off",
+    "no_context": "the model could not provide its functional-Jacobian context",
+    "function_cycle": "a rate law's functions refer to each other in a cycle, or nest too deep",
+    "unparsed": "a rate law could not be parsed into sympy",
+    "unresolved_symbol": "a symbol survived inlining that is no observable, constant or time",
+    "nondifferentiable": "a function no emitter can differentiate is applied to the state",
+    "non_emittable": "a derivative carries a node neither emitter can print",
+    "nonfinite_derivative": "a derivative folds to a non-finite constant",
+    "nonfinite_factor": "a chain-rule factor is non-finite (an unset compartment volume)",
+    "unprintable": "a derivative could not be printed as ExprTk",
+    "budget": "the derivation ran past its time budget",
+    "attach_raised": "the C++ attach raised",
+    "unexpected_error": "an unexpected error during derivation",
+    # The C++ attach gate (issue #536).
+    "fd_mismatch": "the finite-difference self-check found a trustworthy mismatch",
+    "nonfinite_entry": "an analytical entry is non-finite where the RHS is finite",
+    "term_outside_pattern": "a derivative lands outside the Jacobian sparsity pattern",
+    "compile_failed": "a derivative did not compile",
+    "bad_reaction_index": "a derived term names a reaction the model does not have",
+    "bad_observable_index": "a derived term names an observable the model does not have",
+    "baked_volume": "a derivative would bake a writable compartment size into the Jacobian",
+    "no_sparsity": "the model has no Jacobian sparsity pattern",
+    "gate_unrecorded": "the C++ attach declined without recording why",
+    # Model.analytical_jacobian_decline: a decline with no record at all.
+    "unrecorded": "no reason was recorded",
+}
 
-def _declined(reason: str, *, log: bool = True) -> None:
-    """Record why the analytical Jacobian is declined, and say so at INFO."""
+
+def _declined(reason: str, *, kind: str, verdict: dict | None = None, log: bool = True) -> None:
+    """Record why the analytical Jacobian is declined, and say so at INFO.
+
+    ``kind`` is one of :data:`DECLINE_KINDS`; ``verdict``, for the C++ gate's
+    kinds, its fields with the species they name.
+    """
     _decline_state.reason = reason
+    _decline_state.decline = {"kind": kind, "reason": reason, **(verdict or {})}
     if log:
         logger.info(
             "GH#76 analytical Jacobian: %s; the model runs on the finite-difference Jacobian.",
@@ -87,11 +126,19 @@ def _declined(reason: str, *, log: bool = True) -> None:
 
 def _reset_decline() -> None:
     _decline_state.reason = None
+    _decline_state.decline = None
 
 
 def last_decline_reason() -> str | None:
     """The reason recorded by the most recent decline on this thread, or ``None``."""
     return getattr(_decline_state, "reason", None)
+
+
+def last_decline() -> dict | None:
+    """The most recent decline on this thread as ``{"kind", "reason", ...}``, or
+    ``None`` (issue #538)."""
+    decline = getattr(_decline_state, "decline", None)
+    return dict(decline) if decline is not None else None
 
 
 def _short(rate_expr: str, limit: int = 80) -> str:
@@ -1004,13 +1051,14 @@ def differentiate_rate_law(
     if inlined is None:
         _declined(
             f"rate law {_short(rate_expr)} references its functions in a cycle, or nests "
-            "them more than 64 deep"
+            "them more than 64 deep",
+            kind="function_cycle",
         )
         return None
 
     sym_expr = _exprtk_to_sympy(inlined)
     if sym_expr is None:
-        _declined(f"rate law {_short(rate_expr)} could not be parsed into sympy")
+        _declined(f"rate law {_short(rate_expr)} could not be parsed into sympy", kind="unparsed")
         return None
 
     # Build aliased name sets to match what _exprtk_to_sympy produced. Python
@@ -1029,7 +1077,8 @@ def differentiate_rate_law(
         _declined(
             f"rate law {_short(rate_expr)} still carries {sorted(free - allowed)} after "
             "inlining, which is neither an observable, a constant nor time (a hidden "
-            "state, or a function that could not be inlined)"
+            "state, or a function that could not be inlined)",
+            kind="unresolved_symbol",
         )
         return None
 
@@ -1050,7 +1099,8 @@ def differentiate_rate_law(
     if blocked is not None:
         _declined(
             f"rate law {_short(rate_expr)} applies {blocked} to a differentiation "
-            "variable, and no emitter can print that derivative"
+            "variable, and no emitter can print that derivative",
+            kind="nondifferentiable",
         )
         return None
 
@@ -1078,11 +1128,14 @@ def differentiate_rate_law(
             continue
         reason = _non_emittable_reason(deriv)
         if reason is not None:
+            kind = "non_emittable"
             if reason == _NON_FINITE_REASON:
+                kind = "nonfinite_derivative"
                 reason += _nonfinite_value_note(sym_expr)
             _declined(
                 f"the derivative of rate law {_short(rate_expr)} with respect to "
-                f"{obs_name} {reason}"
+                f"{obs_name} {reason}",
+                kind=kind,
             )
             return None
         result[obs_name] = deriv
@@ -3046,7 +3099,8 @@ def build_per_species_sympy(
                 # surfaced as NaN). Defer the whole model to FD.
                 _declined(
                     f"rate law {_short(rate_expr)} has a non-finite chain-rule factor "
-                    f"({coeff}) for species {sp_idx}: an unset compartment volume"
+                    f"({coeff}) for species {sp_idx}: an unset compartment volume",
+                    kind="nonfinite_factor",
                 )
                 return None
             if coeff == 0.0:
@@ -3108,7 +3162,8 @@ def build_per_species_terms(
         if s is None:
             _declined(
                 f"the derivative of rate law {_short(rate_expr)} for species {sp_idx} "
-                "could not be printed as ExprTk"
+                "could not be printed as ExprTk",
+                kind="unprintable",
             )
             return None
         out.append((sp_idx, s))
@@ -3150,7 +3205,8 @@ def build_per_observable_terms(
         if s is None:
             _declined(
                 f"the derivative of rate law {_short(rate_expr)} with respect to "
-                f"{obs_name} could not be printed as ExprTk"
+                f"{obs_name} could not be printed as ExprTk",
+                kind="unprintable",
             )
             return None
         out.append((obs_name, s))
@@ -3743,6 +3799,29 @@ def attach_decline_reason(core, terms=()) -> str:
     return f"the C++ attach declined the derived terms ({kind})"
 
 
+def attach_decline_kind(core) -> str:
+    """The C++ attach gate's ``kind`` for ``core``'s last decline, or
+    ``"gate_unrecorded"`` where it recorded none (issue #538)."""
+    verdict = core.last_functional_jacobian_decline()
+    return str(verdict["kind"]) if verdict is not None else "gate_unrecorded"
+
+
+def attach_decline_verdict(core) -> dict:
+    """The C++ attach gate's verdict fields for ``core``'s last decline, with
+    the species its ``row`` and ``col`` index (issue #538). Empty where it
+    recorded none."""
+    verdict = core.last_functional_jacobian_decline()
+    if verdict is None:
+        return {}
+    out = {k: v for k, v in dict(verdict).items() if k != "kind"}
+    species = list(core.species_names)
+    for key in ("row", "col"):
+        i = out.get(key)
+        if isinstance(i, int) and 0 <= i < len(species):
+            out[f"{key}_species"] = species[i]
+    return out
+
+
 def attach_functional_jacobian(core) -> bool:
     """Differentiate every Functional rate law of a freshly-built model and
     attach the analytical Jacobian terms.
@@ -3772,7 +3851,7 @@ def attach_functional_jacobian(core) -> bool:
     # finite-difference Jacobian on every model (e.g. to A/B the feature).
     _reset_decline()
     if os.environ.get("BNGSIM_ANALYTICAL_FUNCTIONAL_JAC") == "0":
-        _declined("disabled by BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0")
+        _declined("disabled by BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0", kind="disabled")
         return False
 
     # GH #151: no hard SymPy gate here. Each rate law is tried on the native
@@ -3785,7 +3864,10 @@ def attach_functional_jacobian(core) -> bool:
     try:
         ctx = core.functional_jacobian_context()
     except Exception as exc:
-        _declined(f"the model could not provide its functional-Jacobian context: {exc}")
+        _declined(
+            f"the model could not provide its functional-Jacobian context: {exc}",
+            kind="no_context",
+        )
         return False
     rxns = ctx.get("functional_reactions") or []
     if not rxns:
@@ -3922,6 +4004,7 @@ def attach_functional_jacobian(core) -> bool:
         _declined(
             f"the build-time derivation exceeded its {budget:.1f}s budget after "
             f"{processed}/{len(rxns)} functional reactions",
+            kind="budget",
             log=False,  # the warning / info line above already said so
         )
         return False
@@ -3929,7 +4012,7 @@ def attach_functional_jacobian(core) -> bool:
     try:
         attached = bool(core.set_functional_jacobian(all_terms))
     except Exception as exc:
-        _declined(f"the C++ attach raised {type(exc).__name__}: {exc}")
+        _declined(f"the C++ attach raised {type(exc).__name__}: {exc}", kind="attach_raised")
         return False
     if not attached:
         # Issues #506/#511/#534: the C++ attach declines for a trustworthy
@@ -3937,5 +4020,9 @@ def attach_functional_jacobian(core) -> bool:
         # non-finite where the RHS is finite, a derivative term outside the
         # sparsity pattern, or a term that did not compile — and records which,
         # so the status names the entry instead of pointing at BNGSIM_JAC_DEBUG=1.
-        _declined(attach_decline_reason(core, all_terms))
+        _declined(
+            attach_decline_reason(core, all_terms),
+            kind=attach_decline_kind(core),
+            verdict=attach_decline_verdict(core),
+        )
     return attached

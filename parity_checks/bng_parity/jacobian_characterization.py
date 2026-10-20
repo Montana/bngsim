@@ -296,7 +296,10 @@ def jacobian_evaluators(m):
     the difference quotient of ``Model.rhs`` otherwise — never the partial assembly the
     private ``_dense_analytical_jacobian`` hook returns when ``analytical_jacobian_complete``
     is False, which characterized a Lorenz attractor as a zero Jacobian. ``fields`` carries
-    the flag and, next to it, ``jacobian_method``: which source the rows were computed from.
+    the flag and, next to it, ``jacobian_method``: which source the rows were computed from;
+    ``analytical_jacobian_status``, the model's status in words; and
+    ``jacobian_decline_kind``, the category of a decline (``None`` where the analytical
+    Jacobian is complete), which :func:`analyze` counts by (issue #538).
     """
     complete = bool(m.prepare_analytical_jacobian())
     source = m.jacobian(np.asarray(m.get_state(), float)).source
@@ -307,9 +310,12 @@ def jacobian_evaluators(m):
     def rhs_at(y, t=0.0):
         return np.asarray(m.rhs(y, t=t), float)
 
+    decline = m.analytical_jacobian_decline
     fields = {
         "analytical_jacobian_complete": complete,
         "jacobian_method": JACOBIAN_METHOD.get(source, source),
+        "analytical_jacobian_status": m.analytical_jacobian_status,
+        "jacobian_decline_kind": decline["kind"] if decline else None,
     }
     return jac_at, rhs_at, fields
 
@@ -700,6 +706,7 @@ def analyze(
                 "oscillatory": bool(r.get("oscillatory")) and not degenerate,
                 "swept": swept,
                 "jacobian_method": r.get("jacobian_method"),
+                "jacobian_decline_kind": r.get("jacobian_decline_kind"),
                 "cost_sec": h.get("cost_sec"),
                 "linear_solver": h.get("linear_solver"),
             }
@@ -711,6 +718,16 @@ def analyze(
     methods: dict[str, int] = {}
     for p in pts:
         methods[str(p["jacobian_method"])] = methods.get(str(p["jacobian_method"]), 0) + 1
+    # Issue #538: the finite-difference rows by why they are on it. A report from
+    # before the field existed files them under "unrecorded".
+    declines: dict[str, list[str]] = {}
+    for p in pts:
+        if p["jacobian_method"] == "finite_difference":
+            kind = str(p.get("jacobian_decline_kind") or "unrecorded")
+            declines.setdefault(kind, []).append(p["model_id"])
+    declines = {
+        k: sorted(v) for k, v in sorted(declines.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    }
     live = [
         p
         for p in pts
@@ -780,6 +797,13 @@ def analyze(
         f"no stiffness sweep {len(no_sweep)}, live {len(live)} "
         f"| jacobian_method {methods} | incomplete analytical Jacobian (excluded) {len(incomplete)}"
     )
+    if declines:
+        print("finite-difference rows by decline kind:")
+        for kind, ids in declines.items():
+            print(
+                f"  {kind:22s} {len(ids):4d}  {', '.join(i.split('/')[-1] for i in ids[:6])}"
+                + (" ..." if len(ids) > 6 else "")
+            )
     corr_txt = "n/a" if corr is None else f"{corr:+.2f}"
     print(f"corr(log10 N, density) = {corr_txt}  (negative => big networks are sparse)")
     print(
@@ -810,6 +834,7 @@ def analyze(
             "incomplete_jacobian": len(incomplete),
         },
         "jacobian_method": methods,
+        "jacobian_decline_kind": {k: len(v) for k, v in declines.items()},
         "corr_logN_density": corr,
         "thresholds": {"dense>=": dth, "stiff>=": sth},
         "density_pctiles": {q: pct(dvals, q) for q in (10, 25, 50, 75, 90)},
@@ -827,6 +852,7 @@ def analyze(
         "oscillatory": [p["model_id"] for p in osc],
         "no_stiffness": [p["model_id"] for p in no_sweep],
         "incomplete_jacobian": incomplete,
+        "jacobian_declines": declines,
     }
 
 

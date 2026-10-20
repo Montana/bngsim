@@ -1,6 +1,8 @@
 """Issue #506: every path that puts a model on the finite-difference Jacobian says
 why — one INFO line on the ``bngsim`` logger at the decline site, and the same
-reason readable as ``Model.analytical_jacobian_status``.
+reason readable as ``Model.analytical_jacobian_status``. Issue #538: each with a
+stable kind beside it (``Model.analytical_jacobian_decline``), which a census
+groups by.
 
 Before, four of the decline paths — an un-inlinable function, a parse failure, a
 symbol that survived inlining, a derivative no emitter prints — and the C++
@@ -42,18 +44,21 @@ def test_function_cycle_is_logged(info):
     assert J.build_per_observable_terms("g*A", {"g": "g+1"}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
     assert "'g*A'" in line and "cycle" in line and "finite-difference" in line
+    assert J.last_decline()["kind"] == "function_cycle"
 
 
 def test_parse_failure_is_logged(info):
     assert J.build_per_observable_terms("k*A*", {}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
     assert "'k*A*'" in line and "could not be parsed" in line
+    assert J.last_decline()["kind"] == "unparsed"
 
 
 def test_surviving_symbol_is_named(info):
     assert J.build_per_observable_terms("k*A*Z", {}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
     assert "['Z']" in line and "hidden state" in line
+    assert J.last_decline()["kind"] == "unresolved_symbol"
 
 
 def test_underivable_function_is_named(info):
@@ -61,6 +66,7 @@ def test_underivable_function_is_named(info):
     assert J.build_per_observable_terms("k*mratio(A, 1, 2)", {}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
     assert "with respect to A carries an unevaluated Derivative" in line
+    assert J.last_decline()["kind"] == "non_emittable"
 
 
 def test_non_emittable_derivative_names_the_node_and_the_variable(info, monkeypatch):
@@ -71,6 +77,26 @@ def test_non_emittable_derivative_names_the_node_and_the_variable(info, monkeypa
     assert J.differentiate_rate_law("k*exp(A)", {}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
     assert "with respect to A carries the function Heaviside" in line
+    decline = J.last_decline()
+    assert decline["kind"] == "non_emittable"
+    assert decline["reason"] in line
+
+
+def test_a_derivative_that_folds_non_finite_is_its_own_kind(monkeypatch):
+    monkeypatch.setattr(J, "_non_emittable_reason", lambda e: J._NON_FINITE_REASON)
+    assert J.differentiate_rate_law("k*exp(A)", {}, {"A"}, {"k"}) is None
+    assert J.last_decline()["kind"] == "nonfinite_derivative"
+
+
+def test_every_kind_a_site_records_is_in_the_vocabulary():
+    # The sites pass their kinds as literals; the vocabulary is what a census
+    # documents them by.
+    import inspect
+    import re
+
+    used = set(re.findall(r'kind="(\w+)"', inspect.getsource(J)))
+    assert used, "no _declined site found"
+    assert used <= set(J.DECLINE_KINDS), used - set(J.DECLINE_KINDS)
 
 
 def test_a_rate_law_that_derives_logs_nothing(info):
@@ -126,6 +152,7 @@ def _model(tmp_path: Path, text: str) -> bngsim.Model:
 def test_status_is_complete_for_a_mass_action_model(data_dir: Path):
     m = bngsim.Model.from_net(str(data_dir / "simple_decay.net"))
     assert m.analytical_jacobian_status == "complete"  # closed form from the start
+    assert m.analytical_jacobian_decline is None
 
 
 def test_status_is_pending_until_derived_then_declined_with_the_reason(tmp_path, info):
@@ -138,6 +165,10 @@ def test_status_is_pending_until_derived_then_declined_with_the_reason(tmp_path,
     ), status
     (line,) = _decline_lines(info)
     assert status[len("declined: ") :] in line  # the same reason the log line carries
+    assert m.analytical_jacobian_decline == {
+        "kind": "non_emittable",
+        "reason": status[len("declined: ") :],
+    }
 
 
 def test_status_after_the_cpp_gate_declines(tmp_path, info):
@@ -149,19 +180,26 @@ def test_status_after_the_cpp_gate_declines(tmp_path, info):
         "the RHS is finite"
     ), status
     assert any(status[len("declined: ") :] in line for line in _decline_lines(info))
+    decline = m.analytical_jacobian_decline  # issue #538: the gate's kind and fields
+    assert decline["kind"] == "nonfinite_entry"
+    assert decline["reason"] == status[len("declined: ") :]
+    assert (decline["probe"], decline["row_species"], decline["col_species"]) == (0, "B()", "A()")
 
 
 def test_status_is_complete_once_attached(data_dir: Path):
     m = bngsim.Model.from_net(str(data_dir / "jac_selfcheck_switching_surface.net"))
     assert m.analytical_jacobian_status == "pending"
+    assert m.analytical_jacobian_decline is None
     assert m.prepare_analytical_jacobian() is True
     assert m.analytical_jacobian_status == "complete"
+    assert m.analytical_jacobian_decline is None
 
 
 def test_clone_carries_the_status(tmp_path):
     m = _model(tmp_path, _NET_MRATIO)
     m.prepare_analytical_jacobian()
     assert m.clone().analytical_jacobian_status == m.analytical_jacobian_status
+    assert m.clone().analytical_jacobian_decline == m.analytical_jacobian_decline
 
 
 def test_env_switch_is_a_named_decline(tmp_path, monkeypatch, info):
@@ -170,3 +208,4 @@ def test_env_switch_is_a_named_decline(tmp_path, monkeypatch, info):
     assert m.prepare_analytical_jacobian() is False
     expected = "declined: disabled by BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0"
     assert m.analytical_jacobian_status == expected
+    assert m.analytical_jacobian_decline["kind"] == "disabled"
