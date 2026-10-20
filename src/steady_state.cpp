@@ -1874,6 +1874,36 @@ static const char *root_stability_name(RootStability s) {
     }
 }
 
+// Issue #524: KINSOL from the state the model holds, on the reduced system, and
+// nothing else. Converged only on a finite, physical root under `tol`; the
+// stability certificate's verdict and spectrum are reported on it, never acted
+// on: enumerating roots wants the saddles too. The model's state is restored.
+static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyStateRhs &rhs,
+                                                    const SteadyStateOptions &opts,
+                                                    const ResidualSubspace &sub) {
+    const int ns = model.n_species();
+    std::vector<double> start(ns);
+    model.get_state_into(start.data());
+    SteadyStateResult r;
+    try {
+        r = ss_newton_from(model, rhs, opts, sub, start);
+    } catch (...) {
+        r = SteadyStateResult{};
+        r.converged = false;
+        r.method_used = "newton";
+    }
+    if (r.converged && !(r.residual < opts.tol && ss_state_is_physical(r.concentrations))) {
+        r.converged = false;
+    }
+    if (r.converged) {
+        RootCertificate cert = certify_root_stability(model, rhs, opts, sub, r.concentrations);
+        r.root_stability = root_stability_name(cert.verdict);
+        r.eigenvalues = std::move(cert.eigenvalues);
+    }
+    model.set_state_from(start.data());
+    return r;
+}
+
 static SteadyStateResult solve_by_newton_two_tier(NetworkModel &model, SteadyStateRhs &rhs,
                                                   const SteadyStateOptions &opts,
                                                   const ResidualSubspace &sub,
@@ -4863,6 +4893,9 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // the old Newton-first ordering returned spurious / non-finite roots.
         // Opt in for the tighter residual the polish delivers; it costs more
         // wall clock than plain integration (GH #28).
+        if (!o.newton_burst) {
+            return solve_by_newton_from_state(model, rhs, o, sub);
+        }
         return solve_by_newton_two_tier(model, rhs, o, sub, &integrator_failed);
     };
 

@@ -8553,8 +8553,9 @@ class Simulator:
 
     def steady_state_batch(
         self,
-        params,
+        params=None,
         *,
+        states=None,
         tol: float = 1e-9,
         max_time: float = 1e6,
         method: str = "integration",
@@ -8563,16 +8564,31 @@ class Simulator:
         max_steps=None,
         n_workers=None,
         mask=None,
+        newton_burst: bool = True,
     ):
-        """Compute steady states for multiple parameter sets.
+        """Compute steady states for multiple parameter sets, starting states,
+        or both.
 
         A model with an event, or one that reads the time, is refused, as
         :meth:`steady_state` refuses it (issue #710).
 
         Parameters
         ----------
-        params : sequence of dict[str, float]
-            Parameter sets.
+        params : sequence of dict[str, float], optional
+            Parameter sets. Omitted with ``states``: every entry runs at this
+            model's parameters.
+        states : array_like, optional
+            Starting states, shape ``(n_entries, n_species)`` ordered like
+            :attr:`Model.species_names` (issue #524). Entry ``i`` resets its
+            clone and then starts from ``states[i]``; with ``params``, the two
+            have the same length and pair up row by row. A conservation law's
+            total is the one the starting state holds.
+        newton_burst : bool
+            With ``method="newton"``, ``False`` solves from each starting state
+            directly, with no integration burst first, and reports the root's
+            stability (``root_stability``, ``eigenvalues``) instead of rejecting
+            an unstable one: what :meth:`steady_states` enumerates roots with.
+            Default ``True``, the two-tier solver of :meth:`steady_state`.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
@@ -8605,6 +8621,21 @@ class Simulator:
                 "steady_state_batch() is only supported for "
                 f"method='ode', not method='{self._method}'."
             )
+        if states is not None:
+            states = np.asarray(states, dtype=np.float64)
+            n_sp = self._model.n_species
+            if states.ndim != 2 or states.shape[1] != n_sp or states.shape[0] == 0:
+                raise ValueError(
+                    f"states must have shape (n_entries, {n_sp}), one row per entry "
+                    f"ordered like species_names; got {states.shape}"
+                )
+            if params is None:
+                params = [{}] * states.shape[0]
+            elif len(params) != states.shape[0]:
+                raise ValueError(
+                    f"params and states pair up row by row: {len(params)} parameter "
+                    f"sets for {states.shape[0]} states"
+                )
         if not params:
             raise ValueError("params must be non-empty")
         # Issue #710 — a row sets parameter values, not what the rates read.
@@ -8632,6 +8663,8 @@ class Simulator:
             clone = self._model.clone()
             clone.set_params(params[i])
             clone.reset()
+            if states is not None:
+                clone.set_state(states[i])
             # Of the entry's own model: a size it writes is in its laws.
             self._raise_if_a_conservation_law_is_not_conserved(
                 f"steady_state_batch() entry {i}", clone
@@ -8640,6 +8673,7 @@ class Simulator:
             opts.tol = tol
             opts.max_time = max_time
             opts.method = method
+            opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
             eff_atol_spec.apply_to(opts)
             opts.max_steps = eff_max_steps
@@ -8688,6 +8722,105 @@ class Simulator:
             results = [_run_one(i) for i in range(len(params))]
 
         return results
+
+    def steady_states(
+        self,
+        *,
+        n_starts: int = 200,
+        seed: int = 0,
+        upper=None,
+        decades: float = 4.0,
+        dedupe_rtol: float = 1e-6,
+        tol: float = 1e-9,
+        n_workers=None,
+        mask=None,
+    ) -> SteadyStates:
+        """Enumerate the steady states of this parameter set by multistart
+        Newton (issue #524).
+
+        ``n_starts`` starting states are sampled on the model's conservation
+        manifold, KINSOL is run from each with no integration burst
+        (``steady_state_batch(states=..., method="newton",
+        newton_burst=False)``), and the roots it reaches are clustered. Each
+        distinct root comes with the stability certificate's verdict, so the
+        saddles a run of the dynamics never rests on are reported too.
+
+        This is a search, not a proof: a root with a small basin, or a saddle
+        KINSOL never lands on, can be missed, and nothing here claims the list
+        is complete. Completeness for polynomial mass-action systems is what
+        homotopy continuation offers (#502).
+
+        Sampling: each independent species of the conservation laws, and each
+        species in no law, is drawn log-uniformly from ``decades`` decades below
+        its bound up to it. A species in a law is bounded by that law's total
+        over its coefficient; one in none by ``upper``, which defaults to ten
+        times the largest of 1, any initial concentration, any law's total and
+        any species of the steady state an ordinary :meth:`steady_state` solve
+        reaches (one solve, for the scale). The dependent species are then
+        solved from the laws, at the model's own totals, and a start with a
+        negative one is drawn again. A species ``mask`` leaves out keeps its
+        initial value.
+
+        Parameters
+        ----------
+        n_starts : int
+            How many starting states to solve from.
+        seed : int
+            Seed for the sampling, so a call is reproducible.
+        upper : float or array_like, optional
+            The sampling bound for a species in no conservation law: a scalar
+            or one value per species.
+        decades : float
+            How many decades below its bound a species is drawn from. Wider
+            reaches roots near zero and spends more starts where Newton
+            diverges: on the Gardner toggle, 6 decades lost 75 of 200 starts
+            and 2 found one of its three roots; 4 found all three and lost 45.
+        dedupe_rtol : float
+            Two roots are the same when every species agrees to within
+            ``dedupe_rtol`` of the larger magnitude (plus ``tol`` as an
+            absolute floor).
+        tol, n_workers, mask :
+            As in :meth:`steady_state_batch`.
+
+        Returns
+        -------
+        SteadyStates
+        """
+        if n_starts < 1:
+            raise ValueError("n_starts must be at least 1")
+        if upper is None:
+            # The scale of the model's own steady state, from one ordinary
+            # solve: a model in no conservation law that starts at zero has no
+            # other (the Gardner toggle's roots sit at 53 and 144; a bound of
+            # 10 from its initial state found two of three roots).
+            try:
+                reached = np.abs(np.asarray(self.steady_state(tol=tol).concentrations))
+            except Exception:  # noqa: BLE001 - only a scale; the default stands
+                reached = np.zeros(0)
+            cl = self._model.conservation_laws
+            scale = max(
+                [
+                    1.0,
+                    *np.abs(np.asarray(self._model.get_state(), float)).tolist(),
+                    *np.abs(np.asarray(cl["constants"], float)).tolist(),
+                    *reached[np.isfinite(reached)].tolist(),
+                ]
+            )
+            upper = 10.0 * scale
+        starts = _sample_on_conservation_manifold(
+            self._model, n_starts, np.random.default_rng(seed), upper, mask, decades
+        )
+        results = self.steady_state_batch(
+            states=starts,
+            method="newton",
+            newton_burst=False,
+            tol=tol,
+            n_workers=n_workers,
+            mask=mask,
+        )
+        return SteadyStates.cluster(
+            results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol
+        )
 
     # ─── Stop conditions ────────────────────────────────────────────
 
@@ -9784,6 +9917,163 @@ def _ss_output_sens_block(core: Any, attr: str) -> np.ndarray:
     if hasattr(core, attr):
         return np.asarray(getattr(core, attr), dtype=np.float64)
     return np.empty((0, 0))
+
+
+def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) -> np.ndarray:
+    """``n`` starting states on ``model``'s conservation manifold (issue #524).
+
+    Independent species and species in no law are drawn log-uniformly from
+    ``[b·10^-decades, b]``, ``b`` the species' bound (a law's total over its coefficient,
+    or ``upper``); the dependents are solved from the laws at the model's own
+    totals, and a draw that makes one negative is drawn again.
+    """
+    y0 = np.asarray(model.get_state(), dtype=float)
+    ns = y0.size
+    cl = model.conservation_laws
+    n_laws = int(cl["n_laws"])
+    L = (
+        np.asarray(cl["coefficients"], dtype=float).reshape(n_laws, ns)
+        if n_laws
+        else np.zeros((0, ns))
+    )
+    totals = np.asarray(cl["constants"], dtype=float) if n_laws else np.zeros(0)
+    dep = [int(i) for i in cl["dependent"]] if n_laws else []
+    keep = np.zeros(ns, dtype=bool)
+    if mask is not None:
+        sel = _resolve_ss_mask(mask, model)
+        included = np.asarray(sel, dtype=bool) if sel is not None else np.ones(ns, bool)
+        keep = ~included
+    if upper is None:
+        scale = max([1.0, *np.abs(y0).tolist(), *np.abs(totals).tolist()])
+        upper_v = np.full(ns, 10.0 * scale)
+    else:
+        upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,)).copy()
+    bound = upper_v.copy()
+    for k in range(n_laws):
+        for i in np.nonzero(L[k] > 0)[0]:
+            bound[i] = min(bound[i], totals[k] / L[k, i]) if totals[k] > 0 else 0.0
+    free = [i for i in range(ns) if i not in dep and not keep[i]]
+    out = np.empty((n, ns))
+    for row in range(n):
+        for _attempt in range(10_000):
+            y = y0.copy()
+            for i in free:
+                b = bound[i]
+                y[i] = 0.0 if b <= 0 else b * 10.0 ** rng.uniform(-decades, 0.0)
+            if n_laws:
+                others = [i for i in range(ns) if i not in dep]
+                rhs = totals - L[:, others] @ y[others]
+                y[dep] = np.linalg.solve(L[:, dep], rhs)
+            if np.all(y >= 0.0):
+                out[row] = y
+                break
+        else:
+            raise SimulationError(
+                "steady_states(): no starting state with every species non-negative "
+                "after 10000 draws; pass a smaller upper= for the species in no "
+                "conservation law"
+            )
+    return out
+
+
+class SteadyStates:
+    """The distinct steady states :meth:`Simulator.steady_states` found (issue #524).
+
+    One row per distinct root, in the order first reached.
+
+    Attributes
+    ----------
+    states : ndarray, shape (n_roots, n_species)
+        Each root's concentrations, ordered like ``species_names``: the start
+        that reached it with the smallest residual.
+    stability : list[str]
+        ``"stable"``, ``"unstable"`` or ``"undetermined"`` per root, from the
+        stability certificate.
+    eigenvalues : list[ndarray]
+        The reduced Jacobian's spectrum at each root (empty where the
+        certificate did not compute it).
+    multiplicity : ndarray of int
+        How many starts reached each root: a rough measure of its basin.
+    basins : ndarray of int, shape (n_starts,)
+        Root index per start, -1 where the solve did not converge.
+    residuals : ndarray
+        ``||f||_2 / n`` at each root.
+    n_failed : int
+        Starts whose solve did not converge.
+    species_names : list[str]
+    """
+
+    __slots__ = (
+        "states",
+        "stability",
+        "eigenvalues",
+        "multiplicity",
+        "basins",
+        "residuals",
+        "n_failed",
+        "species_names",
+    )
+    states: np.ndarray
+    stability: list[str]
+    eigenvalues: list[np.ndarray]
+    multiplicity: np.ndarray
+    basins: np.ndarray
+    residuals: np.ndarray
+    n_failed: int
+    species_names: list[str]
+
+    @classmethod
+    def cluster(cls, results, species_names, *, dedupe_rtol: float, atol: float):
+        reps: list[np.ndarray] = []
+        stab: list[str] = []
+        eig: list[np.ndarray] = []
+        res: list[float] = []
+        mult: list[int] = []
+        basins = np.full(len(results), -1, dtype=int)
+        for j, r in enumerate(results):
+            if not r.converged:
+                continue
+            y = np.asarray(r.concentrations, dtype=float)
+            for k, rep in enumerate(reps):
+                if np.all(
+                    np.abs(y - rep) <= dedupe_rtol * np.maximum(np.abs(y), np.abs(rep)) + atol
+                ):
+                    basins[j] = k
+                    mult[k] += 1
+                    if r.residual < res[k]:
+                        reps[k], res[k] = y, float(r.residual)
+                        stab[k] = r.root_stability or "undetermined"
+                        eig[k] = np.asarray(r.eigenvalues)
+                    break
+            else:
+                basins[j] = len(reps)
+                reps.append(y)
+                stab.append(r.root_stability or "undetermined")
+                eig.append(np.asarray(r.eigenvalues))
+                res.append(float(r.residual))
+                mult.append(1)
+        out = cls.__new__(cls)
+        out.states = np.array(reps).reshape(len(reps), len(species_names))
+        out.stability = stab
+        out.eigenvalues = eig
+        out.multiplicity = np.array(mult, dtype=int)
+        out.basins = basins
+        out.residuals = np.array(res)
+        out.n_failed = int(np.sum(basins < 0))
+        out.species_names = list(species_names)
+        return out
+
+    def __len__(self) -> int:
+        return self.states.shape[0]
+
+    def __repr__(self) -> str:
+        kinds = ", ".join(
+            f"{s}×{m}" for s, m in zip(self.stability, self.multiplicity, strict=False)
+        )
+        return (
+            f"SteadyStates({len(self)} distinct root(s) from {self.basins.size} starts, "
+            f"{self.n_failed} failed: {kinds})"
+        )
 
 
 class SteadyStateResult:

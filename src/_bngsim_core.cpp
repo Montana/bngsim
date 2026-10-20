@@ -3331,6 +3331,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def(py::init<>())
         .def_readwrite("tol", &bngsim::SteadyStateOptions::tol)
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
+        // Issue #524 — "newton" from the given state, no burst, stability reported.
+        .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty

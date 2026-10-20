@@ -398,9 +398,41 @@ attractor. On the toggle dose above, `method="newton"` returns the correct branc
 at a residual of `7.5e-14` against integration's `3.2e-10`.
 
 The certificate is *not* a bifurcation analysis — it says whether the root that
-was returned is linearly stable, not how many other roots exist. For the full
-picture, scan the parameter and compare `method="integration"` from different
-initial conditions.
+was returned is linearly stable, not how many other roots exist. For that, see
+the next section.
+
+### Every steady state of a parameter set (`steady_states()`, issue #524)
+
+`sim.steady_states()` looks for all of them by multistart Newton:
+
+1. It samples `n_starts` starting states on the conservation manifold.
+2. It runs KINSOL from each one with no integration burst.
+3. It clusters the roots it reaches.
+
+The burst is what carries `steady_state(method="newton")` into an attractor's basin, and the certificate is what turns a saddle down. Here neither applies: every root reached is kept and labelled.
+
+```python
+roots = sim.steady_states(n_starts=200, seed=0)   # the Gardner toggle at alpha_2 = 53.53
+roots                 # SteadyStates(3 distinct root(s) from 200 starts, 52 failed: ...)
+roots.states          # [[28.245, 1.830], [0.0076, 53.123], [144.373, 0.368]]
+roots.stability       # ["unstable", "stable", "stable"]
+roots.eigenvalues     # the spectrum at each root, as on SteadyStateResult
+roots.multiplicity    # how many starts reached each root: a rough basin size
+roots.basins          # root index per start, -1 where Newton did not converge
+```
+
+**Sampling.** Each independent species, and each species in no law, is drawn log-uniformly from `decades` (default 4) decades below its bound up to it:
+
+- A species in a conservation law is bounded by the law's total over its coefficient.
+- A species in no law is bounded by `upper`. Its default is ten times the largest of 1, any initial concentration, any law's total, and the steady state one ordinary solve reaches.
+
+The dependent species are solved from the laws at the model's own totals, and a draw that makes one negative is drawn again. A species `mask=` leaves out keeps its initial value.
+
+**Failed starts.** Newton does not converge from every start (52 of 200 on the toggle, most of them near zero, where its Hill terms turn NaN). Those starts are counted in `n_failed` and have basin -1. Two roots are the same when every species agrees to `dedupe_rtol` (default `1e-6`).
+
+**Building block.** `steady_state_batch(states=..., method="newton", newton_burst=False)` runs the same burst-free solves from starting states of your own, paired row by row with `params=` when both are given.
+
+This is a search, not a proof. A root with a small basin, or a saddle Newton never lands on, can be missed, and nothing here claims the list is complete. Completeness for polynomial mass-action systems is what homotopy continuation offers (#502).
 
 ### Time course that stops at steady state (`run(steady_state=True)`)
 
