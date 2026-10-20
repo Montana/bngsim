@@ -11957,6 +11957,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     std::vector<char> event_dormant(n_events, 0);
     std::vector<double> event_last_fire_time(n_events, 0.0);
     std::vector<int> event_chatter_count(n_events, 0);
+    // Issue #1158: how many fires in a row each event has had within CVODE's
+    // root tolerance of its previous one (see the Zeno guard below).
+    std::vector<int> event_same_instant_count(n_events, 0);
     std::vector<double> chatter_y_before; // snapshot to size on first firing
     user_data.event_dormant = (n_events > 0) ? event_dormant.data() : nullptr;
 
@@ -14735,6 +14738,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     const double horizon = t_out.back() - t_out.front();
                     const double time_eps =
                         1e-6 * std::max(std::fabs(t_fire), horizon > 0.0 ? horizon : 1.0);
+                    // ─── Zeno guard (issue #1158) ───────────────────────────────
+                    // An event whose assignments put its trigger back where the
+                    // flow makes it true again at once (`at (B > 0): B = 0,
+                    // n = n + 1` with B' = 1) fires again at the next root,
+                    // which CVODE places one root tolerance on, 100 ulps of
+                    // |t| + |h|: infinitely many fires at one instant, which no
+                    // run can continue past. The chatter guard above does not
+                    // see it, since the fires change the state by more than the
+                    // tolerance; it ran on, about 4e5 fires a second, and never
+                    // returned. A fire within twice that tolerance of the
+                    // event's previous one is the same instant to the solver, so
+                    // a run of them is the same-instant algebraic loop
+                    // CASCADE_LIMIT refuses, one rounding at a time, and is
+                    // refused the same way.
+                    sunrealtype h_now = 0.0;
+                    CVodeGetCurrentStep(cvode_mem, &h_now);
+                    const double same_instant =
+                        2.0 * 100.0 * std::numeric_limits<double>::epsilon() *
+                        (std::fabs(t_fire) + std::fabs(static_cast<double>(h_now)));
                     for (int ei : firing) {
                         const double gap = t_fire - event_last_fire_time[ei];
                         event_last_fire_time[ei] = t_fire;
@@ -14744,6 +14766,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             }
                         } else {
                             event_chatter_count[ei] = 0;
+                        }
+                        if (gap <= same_instant) {
+                            if (++event_same_instant_count[ei] > CASCADE_LIMIT) {
+                                throw std::runtime_error(
+                                    "Event '" + events_outer[ei].id + "' fired " +
+                                    std::to_string(CASCADE_LIMIT) +
+                                    " times in a row, each within CVODE's root tolerance of the "
+                                    "last, ending at t=" +
+                                    diag_number(t_fire) +
+                                    ": its assignments put its trigger back where the flow makes "
+                                    "it true again at once, so it fires infinitely often at one "
+                                    "instant (Zeno behaviour) and the run has no continuation "
+                                    "past it (issue #1158). Change the assignment or the trigger "
+                                    "so that the event leaves its trigger false for a time, for "
+                                    "example by moving the state past the threshold rather than "
+                                    "onto it.");
+                            }
+                        } else {
+                            event_same_instant_count[ei] = 0;
                         }
                     }
                 }
