@@ -11957,6 +11957,24 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     std::vector<char> event_dormant(n_events, 0);
     std::vector<double> event_last_fire_time(n_events, 0.0);
     std::vector<int> event_chatter_count(n_events, 0);
+    // ─── Zeno guard (issue #1158) ────────────────────────────────────────────
+    // An event whose assignment puts its own trigger back on its threshold
+    // while the flow carries the state straight back across it fires
+    // infinitely often, at times that accumulate (Zeno): `at (B > 0): B = 0`
+    // with B' = 1 fired every 6e-27 from t = 0, and with B' = A from a reset
+    // at 0.5 every 5.6e-15 (25 ulps of t), and the run never returned. Such a
+    // model has no continuation past the accumulation point, so it is refused
+    // by name. The chatter guard above does not see it: these fires change the
+    // state by far more than the tolerance.
+    //
+    // The test is ZENO_LIMIT fires of one event in a row, each within
+    // `zeno_eps` = 1e-9 of max(|t|, horizon) of its own previous fire: 1000
+    // times tighter in time than the chatter guard's 1e-6, and with no test on
+    // the state. A pulse train trips it only past 1e9 fires per horizon, where
+    // the fires are within a few hundred ulps of each other and CVODE cannot
+    // place them anyway; the Zeno gaps measured sit six or more orders below.
+    constexpr int ZENO_LIMIT = 1000;
+    std::vector<int> event_zeno_count(n_events, 0);
     std::vector<double> chatter_y_before; // snapshot to size on first firing
     user_data.event_dormant = (n_events > 0) ? event_dormant.data() : nullptr;
 
@@ -14735,9 +14753,27 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     const double horizon = t_out.back() - t_out.front();
                     const double time_eps =
                         1e-6 * std::max(std::fabs(t_fire), horizon > 0.0 ? horizon : 1.0);
+                    const double zeno_eps =
+                        1e-9 * std::max(std::fabs(t_fire), horizon > 0.0 ? horizon : 1.0);
                     for (int ei : firing) {
                         const double gap = t_fire - event_last_fire_time[ei];
                         event_last_fire_time[ei] = t_fire;
+                        if (gap <= zeno_eps) {
+                            if (++event_zeno_count[ei] >= ZENO_LIMIT) {
+                                const auto &ev = events_outer[static_cast<size_t>(ei)];
+                                const std::string id = ev.id.empty() ? std::to_string(ei) : ev.id;
+                                throw std::runtime_error(
+                                    "event '" + id + "' fired " + std::to_string(ZENO_LIMIT) +
+                                    " times in a row by t=" + diag_number(t_fire) +
+                                    ", each within " + diag_number(gap) +
+                                    " of the last: its assignment puts its trigger back on its "
+                                    "threshold and the flow carries it straight across again, so "
+                                    "it fires infinitely often at times that accumulate there "
+                                    "(Zeno), and the model has no continuation past that time");
+                            }
+                        } else {
+                            event_zeno_count[ei] = 0;
+                        }
                         if (subtol && gap <= time_eps) {
                             if (++event_chatter_count[ei] >= CHATTER_LIMIT) {
                                 event_dormant[ei] = 1;

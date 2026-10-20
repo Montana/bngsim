@@ -164,6 +164,12 @@ for models that need delayed events.
 
 ### Known limitations
 
+- **An event that re-arms itself as it fires is refused**: `at (B > 0): B = 0`
+  while the flow carries B straight back above 0 fires infinitely often, at
+  times that accumulate at its first fire (Zeno), and has no continuation. A run
+  stops with a `SimulationError` naming the event once it has fired 1000 times
+  in a row, each within 1e-9 of max(|t|, horizon) of the last (issue #1158).
+
 - **Delays are ODE-only**: `method="ode"` supports the full event feature set.
   `method="ssa"` and `method="psa"` support events *without* delays; a
   delay-bearing event is rejected at run entry with an error naming the event id.
