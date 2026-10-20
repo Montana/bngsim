@@ -8577,7 +8577,7 @@ class Simulator:
         params : sequence of dict[str, float], optional
             Parameter sets. Omitted with ``states``: every entry runs at this
             model's parameters.
-        states : array_like, optional
+        states : array-like, optional
             Starting states, shape ``(n_entries, n_species)`` ordered like
             :attr:`Model.species_names` (issue #524). Entry ``i`` resets its
             clone and then starts from ``states[i]``; with ``params``, the two
@@ -8767,7 +8767,7 @@ class Simulator:
             How many starting states to solve from.
         seed : int
             Seed for the sampling, so a call is reproducible.
-        upper : float or array_like, optional
+        upper : float or array-like, optional
             The sampling bound for a species in no conservation law: a scalar
             or one value per species.
         decades : float
@@ -9983,7 +9983,7 @@ class SteadyStates:
 
     Attributes
     ----------
-    states : ndarray, shape (n_roots, n_species)
+    states : ndarray, shape ``(n_roots, n_species)``
         Each root's concentrations, ordered like ``species_names``: the start
         that reached it with the smallest residual.
     stability : list[str]
@@ -9994,7 +9994,7 @@ class SteadyStates:
         certificate did not compute it).
     multiplicity : ndarray of int
         How many starts reached each root: a rough measure of its basin.
-    basins : ndarray of int, shape (n_starts,)
+    basins : ndarray of int, shape ``(n_starts,)``
         Root index per start, -1 where the solve did not converge.
     residuals : ndarray
         ``||f||_2 / n`` at each root.
