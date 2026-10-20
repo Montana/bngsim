@@ -1158,7 +1158,19 @@ struct SensitivityOptions {
 // `jacobian` asks for it (issue #127); before that each differenced its own, at
 // one RHS evaluation per unknown per setup.
 struct SteadyStateOptions {
-    double tol = 1e-9;     // convergence tolerance: ||f(y)||_2 / n_species < tol
+    double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
+    // What `converged` asks of a state (issue #1001). "residual": today's
+    // BNG2.pl parity test, ||f(y)||_2 / n_species < tol, a number in the
+    // model's units of concentration per time. "scaled": the Newton step from
+    // the state to the root, -J^-1·f(y) on the system with the conserved
+    // totals taken out, is within rtol·|y_i| + atol_i of every species, with
+    // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
+    // initial concentration the test covers. No unit of concentration or of
+    // time is in it. Above 512 unknowns the step is not taken and the
+    // residual test applies.
+    std::string criterion = "residual";
+    // Set by find_steady_state from the initial state, for "scaled".
+    double criterion_floor = 1.0;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
     double atol = 1e-8;    // CVODE absolute tolerance
@@ -1276,7 +1288,14 @@ struct SteadyStateOptions {
 struct SteadyStateResult {
     std::vector<double> concentrations; // n_species steady-state values
     std::vector<std::string> species_names;
-    double residual = 0.0;   // max|f(y)| at convergence
+    double residual = 0.0; // max|f(y)| at convergence
+    // Issue #1001: the largest |δ_i| over rtol·|y_i| + atol_i at the returned
+    // state, δ the Newton step to the root (SteadyStateOptions::criterion).
+    // At most 1 is within tolerance of a steady state. Measured whatever the
+    // criterion, for a system of up to 512 unknowns; NaN above that, and +inf
+    // where the reduced Jacobian is singular there.
+    double newton_distance = std::numeric_limits<double>::quiet_NaN();
+    std::string criterion;   // the criterion `converged` was decided by
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
