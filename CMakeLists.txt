@@ -366,6 +366,14 @@ else()
         if(NOT BNGSIM_KLU_FOUND AND BNGSIM_KLU_AUTOBUILD)
             _bngsim_autobuild_klu()
         endif()
+        # A re-configure finds a previous run's autobuilt KLU through the cache,
+        # which skips the autobuild and with it the bundle + rpath: the install
+        # then cannot load @rpath/libklu. Bundle whatever resolves there.
+        if(BNGSIM_KLU_FOUND AND NOT BNGSIM_KLU_AUTOBUILT
+           AND KLU_LIBRARY_DIR MATCHES "^${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild/")
+            set(BNGSIM_KLU_AUTOBUILT ON)
+            set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
+        endif()
         if(BNGSIM_KLU_FOUND)
             set(ENABLE_KLU ON CACHE BOOL "" FORCE)
             message(STATUS "BNGsim: found SuiteSparse/KLU — "
@@ -790,8 +798,15 @@ endif()
 add_library(bngsim ${BNGSIM_SOURCES})
 
 # ExprTk-heavy translation units can exceed MSVC's default section limit.
+# -Wall -Wextra (issue #583) are informational, not -Werror: they put what the
+# compiler sees in src/ into every build log. Not -Wmissing-field-initializers:
+# src/ initializes option and state structs as `T x{a, b}` on purpose, leaving
+# the trailing members to their default member initializers, which is all eight
+# of its findings when this was added.
+set(BNGSIM_WARNING_OPTIONS -Wall -Wextra -Wno-missing-field-initializers)
 target_compile_options(bngsim PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+    "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${BNGSIM_WARNING_OPTIONS}>"
 )
 
 target_include_directories(bngsim
@@ -936,7 +951,8 @@ if(BNGSIM_BUILD_PYTHON)
     # The single pybind binding TU registers the whole API and can exceed
     # MSVC's default COFF section limit; /bigobj raises it. GH #150.
     target_compile_options(_bngsim_core PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${BNGSIM_WARNING_OPTIONS}>")
 
     # When building for Python, link bngsim statically into the extension
     # so the .so/.dylib is self-contained (no separate libbngsim needed).

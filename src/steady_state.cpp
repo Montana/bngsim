@@ -1370,7 +1370,8 @@ static void ss_reduce_jacobian(const double *J, int ns, const ConservationLaws &
 
 // Reconstruct full y from independent species y_ind using conservation laws
 static void reconstruct_full(const double *y_ind, double *y_full, int ns,
-                             const ConservationLaws &cl, const std::vector<Species> &species) {
+                             const ConservationLaws &cl,
+                             [[maybe_unused]] const std::vector<Species> &species) {
 
     // First, copy independent species into full vector
     for (size_t k = 0; k < cl.independent.size(); ++k) {
@@ -1478,7 +1479,6 @@ static int kinsol_rhs_body(N_Vector y, N_Vector fval, void *ud) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const double *yp = N_VGetArrayPointer(y);
     double *fp = N_VGetArrayPointer(fval);
-    int ns = data->model->n_species();
 
     data->rhs->eval(0.0, yp, fp);
 

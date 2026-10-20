@@ -3174,7 +3174,8 @@ static void keep_klu_symbolic_across_reinit(SUNLinearSolver S) {
 void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx, N_Vector y,
                                                 SUNMatrixGuard &A_guard, SUNLinSolGuard &LS_guard,
                                                 const SolverOptions &opts, CvodeUserData &user_data,
-                                                bool use_sparse, int ns, int linear_solver_kind) {
+                                                [[maybe_unused]] bool use_sparse, int ns,
+                                                int linear_solver_kind) {
     int flag;
 #ifdef BNGSIM_HAS_KLU
     if (use_sparse) {

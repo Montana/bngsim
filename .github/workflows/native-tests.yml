@@ -245,3 +245,42 @@ jobs:
             fi
             echo "No BLAS backend: $skipped LAPACK cases skipped, as expected."
           fi
+
+  # Issue #583: the native suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+  # A bad index here does not crash, it returns a wrong number; this is the
+  # detector for that. Non-blocking until it has been green for a while, then
+  # drop continue-on-error. Same lean configuration as the legs above.
+  sanitizers:
+    name: C++ unit suite · ubuntu-latest · ASan + UBSan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure (sanitizers; tests ON; KLU / NFsim / RuleMonkey OFF)
+        run: |
+          SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBNGSIM_BUILD_TESTS=ON \
+            -DBNGSIM_ENABLE_KLU=OFF \
+            -DBNGSIM_REQUIRE_KLU=OFF \
+            -DBNGSIM_BUILD_NFSIM=OFF \
+            -DBNGSIM_BUILD_RULEMONKEY=OFF \
+            "-DCMAKE_C_FLAGS=$SAN" "-DCMAKE_CXX_FLAGS=$SAN" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build the test suite
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run the full C++ suite under the sanitizers (ctest)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure --no-tests=error
