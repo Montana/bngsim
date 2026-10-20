@@ -366,14 +366,6 @@ else()
         if(NOT BNGSIM_KLU_FOUND AND BNGSIM_KLU_AUTOBUILD)
             _bngsim_autobuild_klu()
         endif()
-        # A re-configure finds a previous run's autobuilt KLU through the cache,
-        # which skips the autobuild and with it the bundle + rpath: the install
-        # then cannot load @rpath/libklu. Bundle whatever resolves there.
-        if(BNGSIM_KLU_FOUND AND NOT BNGSIM_KLU_AUTOBUILT
-           AND KLU_LIBRARY_DIR MATCHES "^${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild/")
-            set(BNGSIM_KLU_AUTOBUILT ON)
-            set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
-        endif()
         if(BNGSIM_KLU_FOUND)
             set(ENABLE_KLU ON CACHE BOOL "" FORCE)
             message(STATUS "BNGsim: found SuiteSparse/KLU — "
