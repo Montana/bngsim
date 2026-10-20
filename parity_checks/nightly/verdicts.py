@@ -314,8 +314,10 @@ def diff(
 ) -> dict:
     """Compare two verdict files of the same kind. Returns a JSON-able result.
 
-    ``flaky`` maps case ids whose verdict measurably depends on runner timing to
-    the reason; any change of theirs is reported under ``changed``, never alerted.
+    ``flaky`` maps case ids whose verdict or work measurably depends on the runner
+    to the reason; any change of theirs is reported, never alerted: an outcome
+    change under ``changed``, a per-case work increase under ``efficiency`` with
+    the reason beside it (GH #1153). Their work still counts in the totals.
     ``timeout_flips_info`` does the same for every transition into or out of
     TIMEOUT: right for comparing two single nights, which may land on runner CPUs
     of different speed, and wrong for the committed baseline, where PASS ->
@@ -373,15 +375,16 @@ def diff(
             tb += vb
             tf += vf
             if vf > vb * work_ratio and vf - vb >= WORK_MIN_DELTA[key]:
-                work_items.append(
-                    {
-                        "case": c,
-                        "counter": key,
-                        "before": vb,
-                        "after": vf,
-                        "ratio": round(vf / vb, 3) if vb else None,
-                    }
-                )
+                item = {
+                    "case": c,
+                    "counter": key,
+                    "before": vb,
+                    "after": vf,
+                    "ratio": round(vf / vb, 3) if vb else None,
+                }
+                if c in flaky:
+                    item["note"] = f"flaky: {flaky[c]}"
+                work_items.append(item)
         totals[key] = {
             "before": tb,
             "after": tf,
@@ -433,7 +436,7 @@ def diff(
     alerts = {
         "regressed": len(regressed),
         "new_crash": len(new_crash),
-        "efficiency_cases": len(work_items),
+        "efficiency_cases": sum(1 for x in work_items if "note" not in x),
         "efficiency_totals": sum(1 for t in totals.values() if t["alert"]),
         "wall": int(wall["alert"]),
         "backend": len(backend_miss),
@@ -644,9 +647,10 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
             f"x{result['thresholds']['work_ratio']}**",
             "",
         ]
-        lines += _table(
-            result["efficiency"], ["case", "counter", "before", "after", "ratio"], limit
-        )
+        cols = ["case", "counter", "before", "after", "ratio"]
+        if any("note" in x for x in result["efficiency"]):
+            cols.append("note")
+        lines += _table(result["efficiency"], cols, limit)
         lines.append("")
     tot = result["work_totals"]
     if any(t["before"] for t in tot.values()):
@@ -857,7 +861,8 @@ def main(argv=None) -> int:
     d.add_argument(
         "--flaky",
         default="",
-        help="JSON file {suite: {case: reason}}: changes of these cases never alert",
+        help="JSON file {suite: {case: reason}}: changes of these cases, in outcome "
+        "or in work, never alert",
     )
     d.add_argument(
         "--timeout-flips-info",
