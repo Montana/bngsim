@@ -351,6 +351,13 @@ def main():
     )
     parser.add_argument("--runs", type=int, default=nb.DEFAULT_RUNS, help="Timing timed runs.")
     parser.add_argument(
+        "--out",
+        type=Path,
+        default=RESULTS_DIR,
+        help="Directory for psa_results.json and psa_results.md (default: results/ beside "
+        "this script). A caller aims a run elsewhere with it (issue #551).",
+    )
+    parser.add_argument(
         "--diagnostics",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -482,12 +489,12 @@ def main():
         "diagnostics": args.diagnostics,
         "results": results,
     }
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = RESULTS_DIR / "psa_results.json"
+    args.out.mkdir(parents=True, exist_ok=True)
+    json_path = args.out / "psa_results.json"
     json_path.write_text(json.dumps(payload, indent=2, default=str))
-    generate_markdown(payload, RESULTS_DIR / "psa_results.md")
+    generate_markdown(payload, args.out / "psa_results.md")
     print(f"\nResults: {json_path}")
-    print(f"Report:  {RESULTS_DIR / 'psa_results.md'}")
+    print(f"Report:  {args.out / 'psa_results.md'}")
 
 
 if __name__ == "__main__":

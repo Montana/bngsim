@@ -146,7 +146,7 @@ def _sanitize(model_id: str) -> str:
     return model_id.replace("/", "__")
 
 
-def gen_one(job, bng2_pl: str, timeout: float) -> dict:
+def gen_one(job, bng2_pl: str, timeout: float, nets: Path = NETS) -> dict:
     """Generate the full network for one ODE job; cache the .net; return a manifest row."""
     row: dict = {"model_id": job.model_id, "method": job.method}
     bngl_path = MODELS_ROOT / job.model
@@ -193,7 +193,7 @@ def gen_one(job, bng2_pl: str, timeout: float) -> dict:
             row["detail"] = err
             return row
         nsp, nrxn = net_counts(net_path)
-        dest = NETS / f"{_sanitize(job.model_id)}.net"
+        dest = nets / f"{_sanitize(job.model_id)}.net"
         # Strip the optional `reactions_text` block: it is redundant with the
         # numeric `reactions` block, and bngsim's .net loader rejects any file that
         # contains it ("stoi: no conversion" — it tries std::stoi on the species
@@ -210,7 +210,7 @@ def gen_one(job, bng2_pl: str, timeout: float) -> dict:
             dest.write_text(text)
         except OSError as exc:
             row["status"] = "cache_write_failed"
-            row["detail"] = describe_write_failure(exc, dest, NETS)[:400]
+            row["detail"] = describe_write_failure(exc, dest, nets)[:400]
             return row
         row.update({"status": "ok", "net_file": dest.name, "n_species": nsp, "n_reactions": nrxn})
         return row
@@ -222,16 +222,30 @@ def gen_one(job, bng2_pl: str, timeout: float) -> dict:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def load_manifest() -> dict:
-    if MANIFEST.exists():
-        return json.loads(MANIFEST.read_text())
+def resolve_out(args) -> tuple[Path, Path]:
+    """The ``.net`` cache and the manifest a run reads and writes (issue #551).
+
+    No ``--out``: the committed ``nets_manifest.json`` and ``nets/`` beside this
+    script, as always. With it, ``<out>/nets/`` and ``<out>/nets_manifest.json``,
+    for the resume read as well as the writes: a run that read the committed
+    manifest and wrote a scratch one would skip every model the committed one
+    already has, and hand the caller a near-empty cache.
+    """
+    if args.out is None:
+        return NETS, MANIFEST
+    return args.out / "nets", args.out / "nets_manifest.json"
+
+
+def load_manifest(manifest: Path = MANIFEST) -> dict:
+    if manifest.exists():
+        return json.loads(manifest.read_text())
     return {}
 
 
-def save_manifest(man: dict) -> None:
-    tmp = MANIFEST.with_suffix(".json.tmp")
+def save_manifest(man: dict, manifest: Path = MANIFEST) -> None:
+    tmp = manifest.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(man, indent=1, sort_keys=True) + "\n")
-    tmp.replace(MANIFEST)
+    tmp.replace(manifest)
 
 
 def main(argv=None) -> int:
@@ -245,7 +259,15 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--models", default="", help="Comma-separated model_id substring filter.")
     ap.add_argument("--limit", type=int, default=0, help="Max models after filtering (0=all).")
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Directory for the run's nets/ and nets_manifest.json, read for resume and "
+        "written (default: nets/ and the committed nets_manifest.json beside this script).",
+    )
     args = ap.parse_args(argv)
+    nets, manifest = resolve_out(args)
 
     bng2_pl = resolve_bng2pl()
     _meta, alljobs = read_manifest(JOBS)
@@ -254,12 +276,12 @@ def main(argv=None) -> int:
         subs = [s.strip() for s in args.models.split(",") if s.strip()]
         jobs = [j for j in jobs if any(s in j.model_id for s in subs)]
 
-    man = load_manifest()
+    man = load_manifest(manifest)
     todo = []
     for j in jobs:
         cur = man.get(j.model_id)
         cached_ok = (
-            cur and cur.get("status") == "ok" and (NETS / (cur.get("net_file") or "")).exists()
+            cur and cur.get("status") == "ok" and (nets / (cur.get("net_file") or "")).exists()
         )
         if args.only_failed:
             if cached_ok:
@@ -272,7 +294,7 @@ def main(argv=None) -> int:
 
     # Before the header, so the "cache:" line below reports a directory that
     # exists rather than one every write is about to fail against (GH #492).
-    ensure_cache_dir(NETS)
+    ensure_cache_dir(nets)
 
     print("=" * 72)
     print("  Phase 1 — full-network generation + .net cache (ode_fullnet)")
@@ -282,7 +304,7 @@ def main(argv=None) -> int:
         f"already ok: {sum(1 for j in jobs if (man.get(j.model_id) or {}).get('status') == 'ok')}"
     )
     print(f"  timeout: {args.timeout}s   workers: {args.workers}   BNG2.pl: {bng2_pl}")
-    print(f"  cache: {NETS}")
+    print(f"  cache: {nets}")
     print()
     if not todo:
         print("nothing to do.")
@@ -291,12 +313,12 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(gen_one, j, bng2_pl, args.timeout): j for j in todo}
+        futs = {ex.submit(gen_one, j, bng2_pl, args.timeout, nets): j for j in todo}
         for fut in as_completed(futs):
             row = fut.result()
             with _manifest_lock:
                 man[row["model_id"]] = row
-                save_manifest(man)
+                save_manifest(man, manifest)
             done += 1
             st = row.get("status")
             tag = "ok " if st == "ok" else st.upper()
@@ -317,7 +339,7 @@ def main(argv=None) -> int:
     tally = Counter((man.get(j.model_id) or {}).get("status", "missing") for j in jobs)
     print()
     print(f"  processed {done} in {dt:.0f}s. corpus status: {dict(tally)}")
-    print(f"  manifest: {MANIFEST}")
+    print(f"  manifest: {manifest}")
     return 0
 
 

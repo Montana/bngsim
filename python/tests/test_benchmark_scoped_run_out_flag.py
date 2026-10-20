@@ -77,6 +77,21 @@ SCOPED_WRITERS = {
         "jacobian/results/diag_MODEL9089538076.json",
         "results/diag_<MODEL_ID>.json",
     ),
+    # Issue #551: the last runner with a tracked artifact and no --out.
+    "ode_fullnet/gen_networks.py": (
+        "ode_fullnet/nets_manifest.json",
+        "nets_manifest.json",
+    ),
+}
+
+#: Issue #551: runners whose outputs are not tracked, but which a caller (the
+#: paper repo) still has to aim somewhere other than this tree, rather than copy
+#: their files out of it after every run. script -> what ``--help`` names as the
+#: default.
+DIRECTED_WRITERS = {
+    "psa/run.py": "results/",
+    "steady_state/run.py": "results/",
+    "ssa_table5/convert_all.py": "results/converted/",
 }
 
 HELP_TIMEOUT = 60
@@ -224,3 +239,43 @@ def test_run_forced_resolves_the_same_path_for_resume_and_write(run_forced):
     assert len(call_sites) == 2, (
         f"expected resolve_out() at the resume read and the write, got {call_sites}"
     )
+
+
+@pytest.mark.parametrize("rel", sorted(DIRECTED_WRITERS), ids=lambda r: r)
+def test_an_untracked_writer_can_be_aimed_somewhere_else(rel: str):
+    """Issue #551: ``--out`` exists, and its help names where an unflagged run
+    still writes."""
+    flat = " ".join(_help(rel).split())
+    assert "--out" in flat, f"{rel} has no --out: a caller has to copy its output out"
+    assert DIRECTED_WRITERS[rel] in flat, f"{rel} --help does not name its default"
+
+
+@pytest.fixture(scope="module")
+def gen_networks():
+    mod = _load("ode_fullnet/gen_networks.py", "gen_networks_under_test")
+    yield mod
+    sys.modules.pop("gen_networks_under_test", None)
+
+
+def test_gen_networks_defaults_to_the_committed_cache(gen_networks):
+    nets, manifest = gen_networks.resolve_out(argparse.Namespace(out=None))
+    assert (nets, manifest) == (gen_networks.NETS, gen_networks.MANIFEST)
+
+
+def test_gen_networks_out_moves_the_cache_and_the_manifest_together(gen_networks, tmp_path):
+    nets, manifest = gen_networks.resolve_out(argparse.Namespace(out=tmp_path))
+    assert (nets, manifest) == (tmp_path / "nets", tmp_path / "nets_manifest.json")
+
+
+def test_gen_networks_resumes_from_the_manifest_it_writes(gen_networks):
+    """The resume read and both writes go through the resolved paths: a run that
+    read the committed manifest and wrote a scratch one would skip every model
+    the committed one has. Structural, since running it needs BNG2.pl."""
+    src = (SUITES_DIR / "ode_fullnet/gen_networks.py").read_text()
+    main = src[src.index("def main(") :]
+    assert "nets, manifest = resolve_out(args)" in main
+    assert "load_manifest(manifest)" in main and "save_manifest(man, manifest)" in main
+    assert "NETS" not in main and "MANIFEST" not in main, (
+        "main() reaches the committed cache or manifest without going through resolve_out()"
+    )
+    assert "gen_one, j, bng2_pl, args.timeout, nets" in main
