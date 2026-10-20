@@ -57,7 +57,7 @@ bool env_opt_in() {
 constexpr long kDefaultSwitchAfter = 5; // built-in for the first 5 factorizations
 constexpr long kDefaultMinN = 256;      // never take the BLAS path below this N
 
-long env_long(const char *name, long fallback) {
+[[maybe_unused]] long env_long(const char *name, long fallback) {
     const char *v = std::getenv(name);
     if (!v || !*v)
         return fallback;
