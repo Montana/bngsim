@@ -146,10 +146,12 @@ jobs:
             label: ubuntu-latest
             apt: "" # bare host: the #178 proof. Do not add a package here.
             expect_lapack: "false"
+            coverage: "true" # the one leg that measures line coverage (#585)
           - os: macos-14 # macOS arm64 — covered only by one developer's pre-push hook
             label: macos-14
             apt: ""
             expect_lapack: "true" # Accelerate, no install needed
+            coverage: "false"
           # GH #269. Same bare-host build as the first leg plus exactly one
           # package, so the LAPACK dense solver (GH #84) is exercised against
           # reference LAPACK and not only against macOS Accelerate.
@@ -157,6 +159,7 @@ jobs:
             label: ubuntu-latest-lapack
             apt: liblapack-dev
             expect_lapack: "true"
+            coverage: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -281,6 +284,14 @@ jobs:
       # they come from the one process serially.
       #
       # A dispatched run with pytest_args runs those args, unsharded, in shard 1.
+      #
+      # On the leg with `coverage` set, the shard also records which lines of
+      # bngsim's Python ran (issue #585), into a data file the python-coverage
+      # job combines with the other shard's. No report here: half the suite's
+      # coverage is not a number anyone should read. COVERAGE_CORE=sysmon is
+      # Python 3.12's sys.monitoring, which costs next to nothing where the
+      # default tracer cost a test slice 70% more time (4.8 s plain, 5.0 s
+      # sysmon, 8.3 s traced, measured on five test files).
       - name: Run the Python suite (this shard)
         id: pytest
         if: ${{ matrix.shard == 1 || !github.event.inputs.pytest_args }}
@@ -290,11 +301,15 @@ jobs:
           BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
           BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
           PYTEST_ARGS: ${{ github.event.inputs.pytest_args }}
+          COVERAGE_CORE: sysmon
+          COVERAGE_FILE: ${{ github.workspace }}/coverage-${{ matrix.leg.label }}-${{ matrix.shard }}.dat
+          COV_ARGS: ${{ matrix.leg.coverage == 'true' && '--cov=bngsim --cov-report=' || '' }}
         run: |
           set -o pipefail
           if [ -n "$PYTEST_ARGS" ]; then unset BNGSIM_TEST_SHARD; fi
+          # shellcheck disable=SC2086  # COV_ARGS is two words or none
           uv run --no-sync python -m pytest -p no:cacheprovider python/tests \
-            -n auto --dist worksteal \
+            -n auto --dist worksteal $COV_ARGS \
             --junitxml=python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.xml \
             -q --tb=short --durations=15 ${{ github.event.inputs.pytest_args }} \
             2>&1 | tee python-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
@@ -431,6 +446,14 @@ jobs:
           path: parity-tests-${{ matrix.leg.label }}-${{ matrix.shard }}.log
           if-no-files-found: error
 
+      - name: Upload coverage data
+        if: always() && matrix.leg.coverage == 'true' && steps.pytest.conclusion != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-${{ matrix.leg.label }}-${{ matrix.shard }}
+          path: coverage-${{ matrix.leg.label }}-${{ matrix.shard }}.dat
+          if-no-files-found: warn
+
       # This run's per-case verdicts, when they do not match the baseline. It is
       # the file --update-baseline would write, for a contributor without the
       # suite checked out locally.
@@ -441,6 +464,69 @@ jobs:
           name: sbml-suite-verdicts-${{ matrix.leg.label }}-${{ matrix.shard }}
           path: sbml-suite-verdicts-${{ matrix.leg.label }}-${{ matrix.shard }}.json
           if-no-files-found: warn
+
+  # Line coverage of bngsim's Python over the whole suite (issue #585): the two
+  # shards of the coverage leg, combined. Reported, never gated: a minimum set
+  # before anyone has read the baseline would be a no-op or a wall of red, and a
+  # ratchet can follow once it is known. The full term-missing table is in this
+  # job's log and artifact; the total goes to the run's summary page. It runs
+  # when a shard failed too, since what ran is still worth seeing, and says so
+  # when a shard's data is missing: half the suite reads as a coverage drop.
+  python-coverage:
+    name: Python coverage (report only)
+    needs: python-tests
+    if: ${{ !cancelled() && !github.event.inputs.pytest_args }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Download the coverage leg's shard data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-coverage-ubuntu-latest-?
+          path: cov
+          merge-multiple: true
+
+      # The shards recorded absolute paths under this same checkout path, so the
+      # report reads the source from this checkout. The version is uv.lock's.
+      - name: Combine and report
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(cov/*.dat)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::warning::No coverage data from either shard: nothing to report."
+            exit 0
+          fi
+          if [ "${#files[@]}" -ne 2 ]; then
+            echo "::warning::Coverage data from ${#files[@]} of 2 shards: the total covers part of the suite."
+          fi
+          version="$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"] if p["name"] == "coverage"))')"
+          cov() { uvx --from "coverage==$version" coverage "$@"; }
+          cov combine --data-file=.coverage "${files[@]}"
+          cov report --data-file=.coverage -m --skip-covered --sort=cover | tee coverage-report.txt
+          cov xml --data-file=.coverage -o coverage.xml
+          total="$(cov report --data-file=.coverage --format=total)"
+          {
+            echo "### Python line coverage (report only, issue #585)"
+            echo ""
+            echo "**${total}%** of bngsim's Python statements ran across the suite (ubuntu-latest, both shards, ${#files[@]} data file(s))."
+            echo "The per-file table, with the missing lines, is in this job's log and the \`python-coverage-report\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: |
+            coverage-report.txt
+            coverage.xml
+          if-no-files-found: ignore
 
   # The false-green guard for a whole leg: the sum of its two shards' summaries.
   # conftest collects each test file in exactly one shard, so the sum is what
