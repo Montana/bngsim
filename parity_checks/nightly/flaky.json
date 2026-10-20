@@ -7,7 +7,6 @@
     "slow/rulemonkey/tests/models/corpus/rm_tlbr.bngl|stochastic": "TIMEOUT (bngsim per-replicate wall cap, 88.5 s) on run 37208083765, PASS (replicates 54-76 s) on 37126268857, both on ca6202f; NFsim's own replicates took 52 s on the first runner and 29 s on the second"
   },
   "rr_ode": {
-    "BIOMD0000000285|ode": "PASS on run 39296943924 (9488134a, EPYC 7763), DIFF on 39431974424 (cc29eacc, EPYC 9V74) with bngsim's work identical on both (44 steps, 57 RHS, 24 Jacobian evaluations) and its trajectory bit-identical at both commits locally. The reference moved: the cell-death events fire on p38death > 0, a species that leaves 0 at second order, which RoadRunner's CVODE caught on the second runner and bngsim never catches (#934). Remove once #1150 lands and bngsim fires it too.",
-    "BIOMD0000000374|ode": "n_steps 90831 on run 39296943924 (EPYC 7763), 194409 on 39431974424 (EPYC 9V74), on code doing identical work on both commits (194428 steps at 9488134a and cc29eacc locally). A stiff calcium limit cycle at rtol 1e-12 / atol 1e-16 whose step count follows the platform's rounding; the other 1217 cases good on both nights did bit-identical work across the same CPU change."
+    "BIOMD0000000285|ode": "PASS on run 39296943924 (9488134a, EPYC 7763), DIFF on 39431974424 (cc29eacc, EPYC 9V74) with bngsim's work identical on both (44 steps, 57 RHS, 24 Jacobian evaluations) and its trajectory bit-identical at both commits locally. The reference moved: the cell-death events fire on p38death > 0, a species that leaves 0 at second order, which RoadRunner's CVODE caught on the second runner and bngsim never catches (#934). Remove once #1150 lands and bngsim fires it too."
   }
 }
