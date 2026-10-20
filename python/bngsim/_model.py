@@ -1191,7 +1191,7 @@ class Model:
 
         ``None`` while :attr:`analytical_jacobian_status` is ``"complete"`` or
         ``"pending"``. Otherwise a dict with ``kind``, one of
-        :data:`bngsim._jacobian.DECLINE_KINDS`, and ``reason``, the text of the
+        ``bngsim._jacobian.DECLINE_KINDS``, and ``reason``, the text of the
         status. For the C++ attach gate's kinds (``fd_mismatch``,
         ``nonfinite_entry``, ...) it also carries the gate's verdict fields
         (``probe``, ``rxn_idx``, ``row``, ``col``, the values) and the species
