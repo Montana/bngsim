@@ -189,6 +189,10 @@ endmacro()
 # KLU was reached — a hard `pip install` failure on a bare Linux box (GH #178).
 # ci/build_suitesparse.sh now skips that probe, so the fallback is genuinely
 # self-sufficient rather than self-sufficient-where-a-BLAS-happens-to-exist.
+# Where _bngsim_autobuild_klu builds KLU. A KLU that resolves under it, on this
+# configure or one before it, is bundled beside the extension (see below).
+set(_bngsim_klu_autobuild_prefix "${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild")
+
 macro(_bngsim_autobuild_klu)
     if(WIN32)
         message(STATUS
@@ -202,7 +206,7 @@ macro(_bngsim_autobuild_klu)
                 "BNGsim: SuiteSparse/KLU auto-build needs both bash and git on "
                 "PATH; not found — skipping the from-source fallback.")
         else()
-            set(_bngsim_klu_prefix "${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild")
+            set(_bngsim_klu_prefix "${_bngsim_klu_autobuild_prefix}")
             set(_bngsim_ss_script "${CMAKE_CURRENT_SOURCE_DIR}/ci/build_suitesparse.sh")
             # Relocatable install: @rpath install-names plus an rpath so the KLU
             # dylibs find each other once copied beside the extension.
@@ -237,12 +241,8 @@ macro(_bngsim_autobuild_klu)
                 set(KLU_ROOT "${_bngsim_klu_prefix}")
                 _bngsim_discover_klu()
                 if(BNGSIM_KLU_FOUND)
-                    # Bundle the built dylibs beside the extension (install rule +
-                    # extension rpath added after the target is defined).
-                    set(BNGSIM_KLU_AUTOBUILT ON)
-                    set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
                     message(STATUS
-                        "BNGsim: built + bundling SuiteSparse/KLU from source — "
+                        "BNGsim: built SuiteSparse/KLU from source — "
                         "lib=${KLU_LIBRARY_DIR}")
                 else()
                     message(STATUS
@@ -360,19 +360,41 @@ else()
     # (set by the macro from the resolved libklu); nothing is FORCE-stomped.
     if(BNGSIM_ENABLE_KLU)
         _bngsim_discover_klu()
-        # No system SuiteSparse? Build+bundle the pinned KLU subset from source
+        # A cache from an earlier configure can name a libklu that is gone (the
+        # autobuild prefix deleted, a system package removed): find_* does not
+        # search again for a cached result. Forget it and search afresh, so a
+        # missing autobuild is rebuilt rather than linked against.
+        if(BNGSIM_KLU_FOUND AND NOT EXISTS "${KLU_LIBRARY}")
+            message(STATUS "BNGsim: cached SuiteSparse/KLU ${KLU_LIBRARY} no longer "
+                           "exists — searching again.")
+            unset(KLU_INCLUDE_DIR CACHE)
+            unset(KLU_LIBRARY CACHE)
+            unset(KLU_LIBRARY_DIR CACHE)
+            _bngsim_discover_klu()
+        endif()
+        # No system SuiteSparse? Build the pinned KLU subset from source
         # (self-sufficient sdist installs) before giving up. Sets BNGSIM_KLU_FOUND
-        # + BNGSIM_KLU_AUTOBUILT on success.
+        # on success.
         if(NOT BNGSIM_KLU_FOUND AND BNGSIM_KLU_AUTOBUILD)
             _bngsim_autobuild_klu()
         endif()
-        # A re-configure finds a previous run's autobuilt KLU through the cache,
-        # which skips the autobuild and with it the bundle + rpath: the install
-        # then cannot load @rpath/libklu. Bundle whatever resolves there.
-        if(BNGSIM_KLU_FOUND AND NOT BNGSIM_KLU_AUTOBUILT
-           AND KLU_LIBRARY_DIR MATCHES "^${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild/")
-            set(BNGSIM_KLU_AUTOBUILT ON)
-            set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
+        # A KLU under the autobuild prefix is bundled beside the extension
+        # (install rule + rpath below), whether this configure built it or one
+        # before it did: a re-configure finds it through the cache and skips the
+        # autobuild, and without the bundle the install cannot load
+        # @rpath/libklu. A prefix test, not a regex: the build path is the
+        # user's and can hold `+`, `(` or `[`.
+        set(BNGSIM_KLU_AUTOBUILT OFF)
+        if(BNGSIM_KLU_FOUND)
+            cmake_path(IS_PREFIX _bngsim_klu_autobuild_prefix "${KLU_LIBRARY_DIR}" NORMALIZE
+                       _bngsim_klu_is_autobuilt)
+            if(_bngsim_klu_is_autobuilt AND IS_DIRECTORY "${KLU_LIBRARY_DIR}")
+                set(BNGSIM_KLU_AUTOBUILT ON)
+                set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
+                message(STATUS "BNGsim: bundling the SuiteSparse/KLU built from source "
+                               "beside the extension — lib=${KLU_LIBRARY_DIR}")
+            endif()
+            unset(_bngsim_klu_is_autobuilt)
         endif()
         if(BNGSIM_KLU_FOUND)
             set(ENABLE_KLU ON CACHE BOOL "" FORCE)
