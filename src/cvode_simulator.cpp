@@ -11957,6 +11957,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     std::vector<char> event_dormant(n_events, 0);
     std::vector<double> event_last_fire_time(n_events, 0.0);
     std::vector<int> event_chatter_count(n_events, 0);
+    // Issue #1158: how many root batches in a row have fired within CVODE's
+    // root tolerance of the batch before, and which events fired in them (see
+    // the Zeno guard below).
+    long same_instant_batches = 0;
+    double last_batch_time = -std::numeric_limits<double>::infinity();
+    std::vector<char> same_instant_fired(n_events, 0);
     std::vector<double> chatter_y_before; // snapshot to size on first firing
     user_data.event_dormant = (n_events > 0) ? event_dormant.data() : nullptr;
 
@@ -14735,6 +14741,65 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     const double horizon = t_out.back() - t_out.front();
                     const double time_eps =
                         1e-6 * std::max(std::fabs(t_fire), horizon > 0.0 ? horizon : 1.0);
+                    // ─── Zeno guard (issue #1158) ───────────────────────────────
+                    // An event whose assignments put its trigger back where the
+                    // flow makes it true again at once (`at (B > 0): B = 0,
+                    // n = n + 1` with B' = 1), or a ring of events each re-arming
+                    // the next, fires again at the next root, which CVODE places
+                    // one root tolerance on (100 ulps of |t| + |h|): infinitely
+                    // many fires at one instant, which no run can continue
+                    // past. The chatter guard below does not see it, since the
+                    // fires change the state by more than the tolerance; it ran
+                    // on, about 4e5 fires a second, and never returned. A batch
+                    // within the root tolerance of the batch before is the same
+                    // instant to the solver, so a run of them is the
+                    // same-instant algebraic loop CASCADE_LIMIT refuses, one
+                    // rounding at a time, and is refused the same way. (1% over
+                    // the tolerance for the step changing between roots; a pulse
+                    // train spaced by more than that is resolved by CVODE and
+                    // runs as before.)
+                    sunrealtype h_now = 0.0;
+                    CVodeGetCurrentStep(cvode_mem, &h_now);
+                    const double root_tol =
+                        100.0 * std::numeric_limits<double>::epsilon() *
+                        (std::fabs(t_fire) + std::fabs(static_cast<double>(h_now)));
+                    if (t_fire - last_batch_time <= 1.01 * root_tol) {
+                        for (int ei : firing) {
+                            same_instant_fired[static_cast<std::size_t>(ei)] = 1;
+                        }
+                        if (++same_instant_batches > CASCADE_LIMIT) {
+                            std::string ids;
+                            int n_named = 0;
+                            for (int ei = 0; ei < n_events; ++ei) {
+                                if (same_instant_fired[static_cast<std::size_t>(ei)] == 0) {
+                                    continue;
+                                }
+                                if (n_named == 8) {
+                                    ids += ", ...";
+                                    break;
+                                }
+                                ids += (n_named++ ? ", '" : "'") + events_outer[ei].id + "'";
+                            }
+                            throw std::runtime_error(
+                                "Events fired " + std::to_string(CASCADE_LIMIT) +
+                                " times in a row, each within CVODE's root tolerance of the "
+                                "last, ending at t=" +
+                                diag_number(t_fire) + " (" + ids +
+                                "): an assignment among them puts a trigger back where the flow "
+                                "makes it true again at once, so they fire infinitely often at "
+                                "one instant (Zeno behaviour) and the run has no continuation "
+                                "past it (issue #1158). Change the assignment or the trigger so "
+                                "that the event leaves its trigger false for a time, for example "
+                                "by moving the state past the threshold rather than onto it.");
+                        }
+                    } else {
+                        same_instant_batches = 0;
+                        std::fill(same_instant_fired.begin(), same_instant_fired.end(), 0);
+                        for (int ei : firing) {
+                            same_instant_fired[static_cast<std::size_t>(ei)] = 1;
+                        }
+                    }
+                    last_batch_time = t_fire;
                     for (int ei : firing) {
                         const double gap = t_fire - event_last_fire_time[ei];
                         event_last_fire_time[ei] = t_fire;
