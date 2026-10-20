@@ -140,3 +140,23 @@ python ../parity_golden.py --regime ode --workers 4               # ODE set (fas
 python ../parity_golden.py --regime stochastic --include glacial/ --workers 2  # NFsim (supervised!)
 python ../parity_golden.py --no-run-sweep --sweep-out ../runs/golden/bngsim    # rebuild json only
 ```
+
+## The CI gate (issue #582)
+
+`golden-verify.yml` runs `parity_golden.py --verify --gate` on every pull
+request. It re-runs the nine deterministic allow-listed models (`GATED_MODELS`)
+and compares each with its entry here: an identical checksum passes, and so does
+a differing one whose per-variable stats are all within `1e-5·|y| + 1e-6`.
+Drift, a failed run, or fewer than nine compared fails.
+
+A change that moves those numbers on purpose regenerates their entries:
+
+```
+python parity_checks/bng_parity/parity_golden.py --merge --gate
+```
+
+`--merge` replaces only the swept entries, keeps every other one, and appends
+what was regenerated, from which commit and engines, to
+`_meta.regenerations`. Regenerate only from output that still agrees with
+BNG2.pl (those models PASS in `parity_checks/nightly/baselines/bng_ode.json`),
+so the gate defends a cross-validated answer.

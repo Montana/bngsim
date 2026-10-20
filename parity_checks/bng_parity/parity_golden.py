@@ -48,6 +48,27 @@ Usage
     python parity_golden.py --include fast/ --workers 3
     # or reuse an existing parity_sweep bngsim output tree:
     python parity_golden.py --sweep-out runs/core/bngsim --no-run-sweep
+
+Verify (issue #582)
+-------------------
+``--verify`` re-runs the selected jobs the same way and compares them with the
+committed ``golden.json`` instead of writing it: a job whose checksum matches is
+identical; one whose checksum differs passes if every artifact's fingerprint is
+within ``--verify-rtol``/``--verify-atol`` of its golden on every per-variable
+stat (``|x - y| <= rtol·|y| + atol``, the cross-platform comparison), and is
+drift otherwise. A job that failed to
+run, produced nothing to fingerprint, or has no golden entry fails too, and so
+does a run that compared fewer than ``--min-compared`` jobs. Exit 1 on any of
+those. This is the gate CI runs (``golden-verify.yml``) over the deterministic
+allow-listed models::
+
+    python parity_golden.py --verify --gate
+
+A PR that changes these numbers on purpose regenerates their entries with
+``--merge --gate``, which replaces only the swept entries and records the
+regeneration in ``_meta.regenerations``. Regenerate only from output that agrees
+with BNG2.pl (the nightly ``bng_ode`` baseline), so the gate defends a
+cross-validated answer and not whatever bngsim last printed.
 """
 
 from __future__ import annotations
@@ -57,6 +78,7 @@ import datetime as _dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -67,8 +89,20 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # so `from _core import ...` resolves
 
-from _core import Golden, read_manifest, require_bng, versions, write_golden  # noqa: E402
-from _core.fingerprint import CHECKSUM_SIGFIGS, _round_sig, golden_pair  # noqa: E402
+from _core import (  # noqa: E402
+    Golden,
+    read_golden,
+    read_manifest,
+    require_bng,
+    versions,
+    write_golden,
+)
+from _core.fingerprint import (  # noqa: E402
+    CHECKSUM_SIGFIGS,
+    _round_sig,
+    fingerprint_max_rel,
+    golden_pair,
+)
 from _core.versions import git_rev  # noqa: E402
 
 SWEEP = HERE / "parity_sweep.py"
@@ -117,6 +151,12 @@ TRAJECTORY_ALLOWLIST: dict[str, str] = {
     "slow/rulehub/Tutorials/NativeTutorials/CircadianOscillator/CircadianOscillator.bngl": "larger SSA circadian oscillator at seed=1",
     "glacial/rulehub/Published/Goldstein1980/blbr_heterogeneity_goldstein1980.bngl": "NFsim parameter_scan -> .scan artifact at seed=1 — exercises scan + nf paths",
 }
+
+# What `--verify --gate` re-runs on every pull request (issue #582): the
+# deterministic allow-listed models, whose fingerprints compare across platforms
+# within a tolerance. A seed=1 stochastic trajectory reproduces only within one
+# platform, and the slow/glacial tiers cost minutes each.
+GATED_MODELS: list[str] = [m for m in TRAJECTORY_ALLOWLIST if m.startswith("fast/")]
 
 
 def _load_parity_diff():
@@ -388,6 +428,94 @@ def _traj_payload(model_id, method, reason, artifacts, stride):
     return json.dumps(payload, separators=(",", ":")) + "\n"
 
 
+def job_fingerprint_distance(a: dict, b: dict, rtol: float, atol: float) -> float:
+    """How far two job fingerprints are apart, in units of the tolerance: the
+    worst ``|x - y| / (rtol·|y| + atol)`` over every artifact's per-variable
+    stats (last, min, max, mean). At most 1 is within it.
+
+    Mixed, as an integrator's own test is: ``fingerprint_max_rel`` alone divides
+    by ``max(|y|, 1e-9)``, so a species resting at 3e-8 that came back 2.3e-8,
+    below any ODE run's absolute tolerance, read as 22% (e2f-rb's CKI_Inhibition).
+    inf for a structural difference: other artifacts, other variables or another
+    row count; and where a stat is non-finite on one side and not the other,
+    which ``fingerprint_max_rel`` decides (issue #572)."""
+    aa, ba = a.get("artifacts", {}), b.get("artifacts", {})
+    if set(aa) != set(ba):
+        return float("inf")
+    worst = 0.0
+    for n in aa:
+        if not math.isfinite(fingerprint_max_rel(aa[n], ba[n])):
+            return float("inf")
+        av, bv = aa[n]["vars"], ba[n]["vars"]
+        for name in av:
+            for stat in ("last", "min", "max", "mean"):
+                x, y = av[name][stat], bv[name][stat]
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue  # the same blow-up on both sides (checked above)
+                worst = max(worst, abs(x - y) / (rtol * abs(y) + atol))
+    return worst
+
+
+def verify_against_golden(
+    golden_path: Path,
+    sweep_out: Path,
+    jobs,
+    load_normalized,
+    rtol: float,
+    atol: float,
+    min_compared: int,
+) -> int:
+    """Compare a fresh sweep with the committed golden (issue #582). Returns the
+    exit code: 0 when every job present in the sweep is identical or within
+    ``rtol``/``atol`` and at least ``min_compared`` were compared, else 1."""
+    tol = f"rtol {rtol:g}, atol {atol:g}"
+    committed = {g["model_id"]: g for g in json.loads(golden_path.read_text())["golden"]}
+    rows: list[tuple[str, str, str]] = []
+    failed = 0
+    compared = 0
+    for job in jobs:
+        out_dir = _job_out_dir(sweep_out, job.model_id, job.method)
+        if not out_dir.is_dir():
+            continue  # not selected for this sweep
+        status = _run_status(out_dir)
+        if status is not None and status != "ok":
+            rows.append((job.model_id, "RUN_FAILED", status))
+            failed += 1
+            continue
+        built, reason = build_golden_for_job(out_dir, load_normalized)
+        if built is None:
+            rows.append((job.model_id, "NOTHING_TO_COMPARE", reason))
+            failed += 1
+            continue
+        golden = committed.get(job.model_id)
+        if golden is None:
+            rows.append((job.model_id, "NO_GOLDEN", "no entry in golden.json"))
+            failed += 1
+            continue
+        compared += 1
+        checksum, fingerprint, _ = built
+        if checksum == golden["checksum"]:
+            rows.append((job.model_id, "IDENTICAL", ""))
+            continue
+        worst = job_fingerprint_distance(fingerprint, golden["fingerprint"], rtol, atol)
+        if worst <= 1.0:
+            rows.append((job.model_id, "WITHIN_TOL", f"{worst:.2g} of the tolerance"))
+        else:
+            rows.append((job.model_id, "DRIFT", f"{worst:.3g} times the tolerance ({tol})"))
+            failed += 1
+    width = max((len(r[0]) for r in rows), default=10)
+    for model_id, verdict, note in rows:
+        print(f"{model_id:<{width}}  {verdict:<18} {note}")
+    print(f"\ngolden verify: {compared} compared, {failed} failing ({tol})")
+    if compared < min_compared:
+        print(
+            f"FAIL: compared {compared} < --min-compared {min_compared}: the gate checked "
+            "too little to mean anything"
+        )
+        return 1
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -438,7 +566,50 @@ def main() -> int:
         "(stays under the 1 MB check-added-large-files hook). golden.json keeps "
         "full-resolution checksum+fingerprint regardless.",
     )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="Compare the sweep with the committed golden.json instead of writing it "
+        "(issue #582); exit 1 on drift.",
+    )
+    ap.add_argument(
+        "--verify-rtol",
+        type=float,
+        default=1e-5,
+        help="--verify: relative tolerance on each fingerprint stat of a job whose "
+        "checksum differs (|x - y| <= rtol·|y| + atol).",
+    )
+    ap.add_argument(
+        "--verify-atol",
+        type=float,
+        default=1e-6,
+        help="--verify: absolute tolerance on each fingerprint stat.",
+    )
+    ap.add_argument(
+        "--gate",
+        action="store_true",
+        help="The CI gate's selection: the deterministic allow-listed models "
+        "(GATED_MODELS), --regime ode, and --min-compared all of them.",
+    )
+    ap.add_argument(
+        "--merge",
+        action="store_true",
+        help="Write mode: replace only the swept jobs' entries in the existing "
+        "golden.json, keep every other entry, and record the regeneration in "
+        "_meta.regenerations (a partial regeneration of a subset, e.g. the gated one).",
+    )
+    ap.add_argument(
+        "--min-compared",
+        type=int,
+        default=1,
+        help="--verify: fail when fewer jobs than this were compared.",
+    )
     args = ap.parse_args()
+
+    if args.gate:
+        args.regime = "ode"
+        args.models = ",".join(Path(m).stem for m in GATED_MODELS)
+        args.min_compared = max(args.min_compared, len(GATED_MODELS))
 
     if args.workers > MAX_WORKERS_SAFE:
         print(f"WARN: --workers {args.workers} clamped to {MAX_WORKERS_SAFE} (memory safety).")
@@ -477,6 +648,17 @@ def main() -> int:
 
     _meta, jobs = read_manifest(jobs_path)
     pd = _load_parity_diff()
+
+    if args.verify:
+        return verify_against_golden(
+            golden_dir / "golden.json",
+            sweep_out,
+            jobs,
+            pd.load_normalized,
+            args.verify_rtol,
+            args.verify_atol,
+            args.min_compared,
+        )
 
     golden: list[Golden] = []
     skipped: dict[str, str] = {}
@@ -615,6 +797,28 @@ def main() -> int:
 
     golden_dir.mkdir(parents=True, exist_ok=True)
     golden_path = golden_dir / "golden.json"
+    if args.merge and golden_path.exists():
+        # A partial regeneration: the swept entries are replaced, every other one
+        # kept as the full generation in _meta wrote it, and what was redone, by
+        # what, is recorded beside that generation rather than over it.
+        old_meta, old_golden = read_golden(golden_path)
+        fresh = {g.model_id: g for g in golden}
+        golden = sorted(
+            [g for g in old_golden if g.model_id not in fresh] + list(fresh.values()),
+            key=lambda g: g.model_id,
+        )
+        regenerations = list(old_meta.get("regenerations") or [])
+        regenerations.append(
+            {
+                "date": _dt.date.today().isoformat(),
+                "git_rev": meta["git_rev"],
+                "versions": meta["versions"],
+                "bionetgen_commit": meta["bionetgen_commit"],
+                "bngsim_build_commit": meta["bngsim_build_commit"],
+                "models": sorted(fresh),
+            }
+        )
+        meta = {**old_meta, "regenerations": regenerations}
     write_golden(golden_path, golden, meta=meta)
     print(f"\ngolden: {golden_path}")
     print(f"  golden records:   {len(golden)} / {len(jobs)} manifest jobs")
