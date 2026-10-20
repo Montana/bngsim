@@ -101,9 +101,10 @@ struct Species {
     // stores amount/V_static and rescales to live volume separately, so
     // rateof_scratch is already d(amount)/dt / V_static and ×volume_factor recovers
     // the amount-rate with no conc·V̇ correction (suite 01455/01457 constant-V,
-    // 01463 rate-rule varvol). AR-compartment hOSU species stay excluded (their
-    // volume is a rule function, not verified here). Default false ⇒ byte-identical
-    // for .net, V=1, and every hOSU=false species (volume_factor=1 also a no-op).
+    // 01463 rate-rule varvol). An assignment-rule compartment is the same (#736):
+    // its species are stored as amount/V_static too, and volume_factor is that
+    // V_static. Default false ⇒ byte-identical for .net, V=1, and every hOSU=false
+    // species (volume_factor=1 also a no-op).
     bool report_rateof_amount = false;
 
     // Reported in the trajectory output? (GH #71) When false this species is a
@@ -947,6 +948,13 @@ struct Event {
     bool initial_value =
         true; // trigger state at t=0 (true = treat as already true → no fire at t=0)
     bool use_values_from_trigger_time = true; // SBML L3: snapshot RHS at trigger time
+    // Issue #1054 — the SBML loader's rescale where a piecewise assignment-rule
+    // compartment size jumps: the compartment's id, and empty for every other
+    // event. The size at the instant of a jump is already the new one, so the
+    // concentrations there are the rescaled ones. The ODE engine executes such
+    // an event before anything else at its instant, and the other events
+    // triggered there read their trigger, values and delay after it.
+    std::string size_jump_compartment;
 };
 
 // ─── Sensitivity options ─────────────────────────────────────────────────────
@@ -1126,6 +1134,13 @@ struct SensitivityOptions {
     // jump the pre-#763 test reads, and that the listed reactions do not account
     // for, is judged as before: the list has missed a reaction.
     std::vector<std::vector<int>> state_switch_reactions;
+    // Issue #959: conditions over model state that a plain run watches for a
+    // state pinned on their surface (issue #928) without rooting on them. An
+    // SBML model's thresholds are rooted by the loader's discontinuity
+    // triggers, so they are not state_switch_conditions, and a run that could
+    // neither cross one nor pass it took batches of steps until its wall clock
+    // ran out. Read only by a run without sensitivity columns.
+    std::vector<std::string> stall_watch_conditions;
 
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event
@@ -1254,6 +1269,14 @@ struct SteadyStateOptions {
     // its meaning as a per-species residual scale no matter how many species
     // were excluded. With no mask, n_included == n_species and nothing changes.
     std::vector<uint8_t> steady_state_mask;
+
+    // Rate-law conditions over model state, as source text, one relational atom
+    // each (Model.state_switch_root_conditions, the set a plain run() roots;
+    // issue #897). The march roots their residuals and restarts on each
+    // crossing, so a window the approach to the steady state passes through is
+    // not stepped over (issue #904): a rate on while 0.5 < S < 0.505 left Y at
+    // 0 for 0.199, with converged=True. Empty roots nothing, as before.
+    std::vector<std::string> state_switch_conditions;
 };
 
 // --- Steady-state result ------------------------------------------------------
@@ -1265,6 +1288,13 @@ struct SteadyStateResult {
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
     int n_rhs_evals = 0;
+    // Issue #904: the crossings the march stopped at, of a rate-law condition
+    // over model state (SteadyStateOptions::state_switch_conditions) or of an
+    // SBML model's discontinuity trigger; it restarts on the first 1000 and
+    // counts the 1001st, where it stops rooting them to march over a state
+    // that slides along its threshold as it did before. And whether it did.
+    int n_state_switch_roots = 0;
+    bool state_switch_roots_dropped = false;
 
     // Observable totals and raw function values AT the returned state (issue
     // #247), evaluated once after the solve by the same update_observables() +
@@ -1468,6 +1498,13 @@ struct SteadyStateResult {
     std::vector<std::string> function_names;    // n_functions (raw, incl _rateLawN)
     std::vector<double> observable_sensitivity; // (n_observables × n_sens_params)
     std::vector<double> function_sensitivity;   // (n_functions × n_sens_params)
+    // For each raw function, the first species (0-based) whose dY_ss/dp row its
+    // finite-difference derivative needed and the solve has none of: one mask=
+    // left out, or a rule target (whose row the Python layer fills from its
+    // rule afterwards). That function's row is NaN. -1 where the derivative
+    // needed no such row, which includes every row the compiled evaluator
+    // answered; empty when function_sensitivity is.
+    std::vector<int> function_sens_missing_species;
 
     // ─── What the convergence test covered, and why it failed (issue #74) ─────
     // How many species entered ||f||₂/n — n_species unless

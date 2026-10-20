@@ -138,9 +138,13 @@ def resolve_via_omex(mid: str, tested_sha: str, latest: int) -> tuple[str, int] 
     return None
 
 
-def _license(mid: str) -> dict:
-    # Curated BIOMD* are CC0-1.0; non-curated MODEL* are unspecified upstream.
-    return {"spdx": "CC0-1.0" if mid.startswith("BIOMD") else "unknown", "notice": None}
+def _license() -> dict:
+    # Every BioModels record is CC0-1.0, curated BIOMD* and non-curated MODEL* alike:
+    # the terms of use (https://www.biomodels.org/termsofuse) dedicate "the entire
+    # dataset", "the encoded models (whatever the formats they are provided in) and
+    # their annotations", to the public domain, and submitters must release a model
+    # as CC0 before depositing it. CC0 needs no notice to travel with a copy.
+    return {"spdx": "CC0-1.0", "notice": None}
 
 
 def main() -> int:
@@ -225,7 +229,7 @@ def main() -> int:
             },
             "vendored": None,
             "sha256": tested,
-            "license": _license(mid),
+            "license": _license(),
             "main_file": member,
             "latest_version": latest,
         }

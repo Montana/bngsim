@@ -762,3 +762,134 @@ class TestAmountValuedObservableVolumeFactor:
         np.testing.assert_allclose(
             ss.output_sensitivities(["observable:X"]), run_obs, rtol=1e-6, atol=1e-9
         )
+
+
+# ── The differenced block beside a species with no row ───────────────────────
+#
+# ``P`` is made at ``kp`` and lost at ``kd*P``: P* = kp/kd = 5, and
+# dP*/d(kp, kd) = (1/kd, -kp/kd²) = (5, -25). An if() conditional is a function
+# the compiled evaluator declines, so ``piecewise(...)`` puts a row through the
+# finite-difference fallback. A rule target (``T := ...``) is left out of the
+# solve, and so is a species ``mask=`` leaves out, and the row of each is NaN.
+# The fallback multiplied every species' row into every function's, so a
+# function that does not read such a species took 0·NaN.
+
+_MADE_AND_LOST = (
+    "compartment D = 1; species P in D; P = 0; kp = 1; kd = 0.2;\nR3: => P; kp; R4: P => ; kd*P;\n"
+)
+_DP = np.array([5.0, -25.0])
+_KP_KD = ["kp", "kd"]
+_TIGHT = {"tol": 1e-12}
+
+
+def _ant_steady_state(text, params=_KP_KD, values=None, **kw):
+    m = bngsim.Model.from_antimony_string(text)
+    for name, value in (values or {}).items():
+        m.set_param(name, value)
+    if kw.pop("mask_sinks", False):
+        kw["mask"] = ~m.is_pure_sink()
+    return bngsim.Simulator(m, method="ode").steady_state(
+        sensitivity_params=list(params) if params else None, **_TIGHT, **kw
+    )
+
+
+def _expression_value(ss, name):
+    return float(np.asarray(ss._expression_values)[ss.expression_names.index(name)])
+
+
+def _central_row(text, read, rel=1e-4):
+    """d(read(ss))/d(kp, kd) by central differences of steady_state() itself,
+    each solve on a fresh model."""
+    base = {"kp": 1.0, "kd": 0.2}
+    row = []
+    for name in _KP_KD:
+        h = rel * base[name]
+        up = _ant_steady_state(text, None, {**base, name: base[name] + h})
+        down = _ant_steady_state(text, None, {**base, name: base[name] - h})
+        row.append((read(up) - read(down)) / (2 * h))
+    return np.array(row)
+
+
+class TestFiniteDifferenceBesideARowlessSpecies:
+    def test_a_rule_target_does_not_poison_an_expression(self):
+        """``W`` is ``P`` here, so its row is (5, -25). Main returned NaN once
+        ``T := 2*P`` was beside it, though ``W`` does not read ``T``."""
+        text = _MADE_AND_LOST + "W := piecewise(P, P < 100, 2*P);\nspecies T in D; T := 2*P;\n"
+        ss = _ant_steady_state(text)
+        assert ss.sens_output_source == "finite-difference"
+        assert [ss.species_names[i] for i in ss.excluded_species] == ["T"]
+        got = ss.output_sensitivities(["expression:W"])[0]
+        np.testing.assert_allclose(got, _DP, rtol=1e-7)
+        np.testing.assert_allclose(
+            got, _central_row(text, lambda s: _expression_value(s, "W")), rtol=1e-6
+        )
+        np.testing.assert_allclose(ss.output_sensitivities(["species:T"])[0], 2 * _DP, rtol=1e-7)
+
+    @pytest.mark.parametrize(
+        "rule,want",
+        [
+            ("2*P", 2 * _DP),  # an observable 2·P
+            ("P^2", 2 * 5.0 * _DP),  # a function: d(P²) = 2P·dP
+        ],
+    )
+    def test_an_expression_that_reads_a_rule_target_has_the_rule_s_derivative(self, rule, want):
+        """``Y`` is ``T``. It reads the rule under ``T``'s name, not ``T``'s own
+        slot, so its derivative comes through ``P``'s row: (10, -50) for
+        ``2*P`` and (50, -250) for ``P^2``. Main returned NaN for both."""
+        text = _MADE_AND_LOST + f"Y := piecewise(T, P < 100, 3*T);\nspecies T in D; T := {rule};\n"
+        ss = _ant_steady_state(text)
+        np.testing.assert_allclose(ss.output_sensitivities(["expression:Y"])[0], want, rtol=1e-7)
+        np.testing.assert_allclose(ss.output_sensitivities(["species:T"])[0], want, rtol=1e-7)
+
+    def test_a_masked_species_is_nan_only_in_what_reads_it(self):
+        """``Z`` collects what ``P`` loses at ``kz*P`` and has no steady value,
+        so ``mask=`` leaves it out. P* = kp/(kd + kz), and ``W`` = ``P`` has the
+        row (1/0.3, -1/0.09); main returned NaN. ``V`` reads ``Z`` and has no
+        derivative, and its row stays NaN."""
+        text = _MADE_AND_LOST + (
+            "species Z in D; Z = 0; kz = 0.1; R5: P => Z; kz*P;\n"
+            "W := piecewise(P, P < 100, 2*P); V := piecewise(Z, P < 100, 2*Z);\n"
+        )
+        ss = _ant_steady_state(text, mask_sinks=True)
+        assert [ss.species_names[i] for i in ss.excluded_species] == ["Z"]
+        np.testing.assert_allclose(
+            ss.output_sensitivities(["expression:W"])[0], [1 / 0.3, -1 / 0.09], rtol=1e-7
+        )
+        assert np.isnan(ss.output_sensitivities(["expression:V"])[0]).all()
+
+    # ``C := piecewise(1 + P, ...)`` is 1 + P* = 6, and ``T`` is an amount 2·P
+    # in it, reported over the live size: [T] = 2P/C, d[T] = 2/C²·dP.
+    _SIZED = "C := piecewise(1 + P, P < 100, 2 + P);\nsubstanceOnly species T in C; T := 2*P;\n"
+
+    def test_a_size_by_a_differenced_rule_gives_an_amount_its_row(self):
+        """Main raised that ``mask=`` had left the size out of the solve, with
+        no ``mask=`` given: the size's row was NaN from ``T``'s."""
+        text = _MADE_AND_LOST + self._SIZED
+        ss = _ant_steady_state(text)
+        np.testing.assert_allclose(ss.output_sensitivities(["expression:C"])[0], _DP, rtol=1e-7)
+        got = ss.output_sensitivities(["species:T"])[0]
+        np.testing.assert_allclose(got, 2 / 36 * _DP, rtol=1e-7)
+        np.testing.assert_allclose(got, _central_row(text, lambda s: s["T"]), rtol=1e-6)
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            "C := piecewise(1 + Z, P < 100, 2 + Z);",  # differenced
+            "C := 1 + Z;",  # compiled
+        ],
+    )
+    def test_a_size_that_reads_a_masked_species_is_refused_by_name(self, size):
+        """The size's rule reads ``Z``, which ``mask=`` leaves out, so the size
+        has no row and neither has ``T``. The refusal names ``Z`` as the
+        cause; main said only that ``mask=`` left the size, or a species its
+        rule reads, out of the solve."""
+        text = _MADE_AND_LOST + (
+            "species Z in D; Z = 0; kz = 0.1; R5: P => Z; kz*P;\n"
+            f"{size}\nsubstanceOnly species T in C; T := 2*P;\n"
+        )
+        with pytest.raises(
+            bngsim.SimulationError,
+            match=r"\['T'\].*for T, its size C reads Z, which mask= left out of the solve\. "
+            r"Keep \['Z'\] in the mask",
+        ):
+            _ant_steady_state(text, mask_sinks=True)

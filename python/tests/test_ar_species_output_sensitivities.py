@@ -425,13 +425,21 @@ class TestARRowInTheTensor:
 
 # ── GH #221: refusal — NaN and a named warning, never a structural zero ─────
 
+
 # ``T`` is an hOSU=true AssignmentRule target in a compartment driven by a rate
-# rule, so its reported value is (rule / vdiv) · V_static/V_live(t): the redirect
-# models only the constant vdiv, and the missing d V_live/dθ makes the row wrong
-# rather than merely imprecise. GH #205 refuses the selector by name; #221 must
-# not leave the tensor row at 0.0, which no consumer could tell from a
-# measurement.
-BLOCKED_VARVOL = """<?xml version="1.0" encoding="UTF-8"?>
+# rule, so its reported value is (rule / vdiv) · V_static/V_live(t). The
+# redirect models only the constant vdiv, so the selector reads the species'
+# own tensor row, which the variable-volume pass puts through the quotient rule
+# with d V_live/dθ (issue #787). With ``T := 3*A``, ``C' = g*C`` and A lost at
+# ``C*k*A``, [A] = 100·e^(-(k+g)t) and [T] = 300·e^(-(k+2g)t): d[T]/dk is
+# -t·[T] and d[T]/dg -2t·[T]. The row was NaN, refused by name.
+#
+# Where the rule's own output sensitivity is declined (a piecewise, GH #198),
+# the quotient rule has nothing to start from, and the row is refused: NaN and
+# a named warning, never a structural zero (#221), which no consumer could tell
+# from a measurement.
+def _varvol_sbml(rule_math: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">
   <model id="ar_varvol">
     <listOfCompartments><compartment id="C" size="1" constant="false"/></listOfCompartments>
@@ -444,13 +452,14 @@ BLOCKED_VARVOL = """<?xml version="1.0" encoding="UTF-8"?>
     <listOfParameters>
       <parameter id="k" value="0.3" constant="true"/>
       <parameter id="g" value="0.1" constant="true"/>
+      <parameter id="ton" value="2.5" constant="true"/>
     </listOfParameters>
     <listOfRules>
       <rateRule variable="C"><math xmlns="http://www.w3.org/1998/Math/MathML">
         <apply><times/><ci>g</ci><ci>C</ci></apply>
       </math></rateRule>
       <assignmentRule variable="T"><math xmlns="http://www.w3.org/1998/Math/MathML">
-        <apply><times/><cn>3</cn><ci>A</ci></apply>
+        {rule_math}
       </math></assignmentRule>
     </listOfRules>
     <listOfReactions>
@@ -465,6 +474,80 @@ BLOCKED_VARVOL = """<?xml version="1.0" encoding="UTF-8"?>
     </listOfReactions>
   </model>
 </sbml>"""
+
+
+_THREE_A = "<apply><times/><cn>3</cn><ci>A</ci></apply>"
+LIVE_SIZED = _varvol_sbml(_THREE_A)
+BLOCKED_VARVOL = _varvol_sbml(
+    f"""<piecewise>
+          <piece>{_THREE_A}
+            <apply><lt/><csymbol encoding="text"
+              definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol><ci>ton</ci></apply>
+          </piece>
+          <otherwise><ci>A</ci></otherwise>
+        </piecewise>"""
+)
+VK, VG = 0.3, 0.1
+
+
+def _live_sized_value(t, k=VK, g=VG):
+    """[T] = 3·[A]/V_live = 300·e^(-(k+2g)t)."""
+    return 300.0 * np.exp(-(k + 2.0 * g) * np.asarray(t))
+
+
+class TestLiveSizedARRow:
+    def _run(self, **kw):
+        m = bngsim.Model.from_sbml_string(LIVE_SIZED)
+        sim = bngsim.Simulator(m, method="ode", **kw)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            return sim.run(t_span=(0.0, 5.0), n_points=6, **_RUN)
+
+    def test_the_fixture_is_live_sized(self):
+        m = bngsim.Model.from_sbml_string(LIVE_SIZED)
+        assert "T" in (getattr(m, "_ar_report_map", None) or {})
+        assert "T" in (getattr(m, "_varvol_conc_map", None) or {})
+
+    def test_row_matches_the_closed_form(self):
+        r = self._run(sensitivity_params=["k", "g"])
+        t = np.asarray(r.time)
+        i = list(r.species_names).index("T")
+        value = _live_sized_value(t)
+        np.testing.assert_allclose(np.asarray(r.species)[:, i], value, rtol=1e-8)
+        _assert_close(r.sensitivities[:, i, 0], -t * value)
+        _assert_close(r.sensitivities[:, i, 1], -2.0 * t * value)
+        assert r.ar_sensitivity_refused == frozenset()
+
+    @pytest.mark.parametrize("param,base", [("k", VK), ("g", VG)])
+    def test_row_matches_fd_of_the_reported_value(self, param, base):
+        r = self._run(sensitivity_params=["k", "g"])
+        i = list(r.species_names).index("T")
+
+        def value(at):
+            m = bngsim.Model.from_sbml_string(LIVE_SIZED)
+            m.set_param(param, at)
+            out = bngsim.Simulator(m, method="ode").run(t_span=(0.0, 5.0), n_points=6, **_FD)
+            return np.asarray(out.species)[:, i]
+
+        h = 1e-6
+        fd = (value(base + h) - value(base - h)) / (2 * h)
+        _assert_close(r.sensitivities[:, i, r.sensitivity_params.index(param)], fd)
+
+    def test_selector_reads_the_tensor_row(self):
+        r = self._run(sensitivity_params=["k", "g"])
+        i = list(r.species_names).index("T")
+        np.testing.assert_array_equal(
+            r.output_sensitivities("species:T")[:, 0, :], r.sensitivities[:, i, :]
+        )
+
+    def test_ic_axis_row(self):
+        # d[T]/d[A](0) = 3·e^(-(k+2g)t).
+        r = self._run(sensitivity_ic=["A"])
+        i = list(r.species_names).index("T")
+        _assert_close(r.sensitivities_ic[:, i, 0], _live_sized_value(r.time) / 100.0)
+        np.testing.assert_array_equal(
+            r.output_sensitivities("species:T", axis="ic")[:, 0, :], r.sensitivities_ic[:, i, :]
+        )
 
 
 class TestRefusedARRow:
@@ -486,10 +569,12 @@ class TestRefusedARRow:
 
     def test_the_fixture_is_actually_blocked(self):
         # Guard the fixture itself: if the loader ever stops classifying T as a
-        # variable-volume AR species, every assertion below passes vacuously.
+        # variable-volume AR species, or codegen starts differentiating its
+        # piecewise rule, every assertion below passes vacuously.
         m = bngsim.Model.from_sbml_string(BLOCKED_VARVOL)
         assert "T" in (getattr(m, "_ar_report_map", None) or {})
         assert "T" in (getattr(m, "_varvol_conc_map", None) or {})
+        assert "if()" in (self._run()._expression_sens_support.get("T") or "")
 
     def test_row_is_nan_not_zero(self):
         r = self._run()
@@ -516,7 +601,7 @@ class TestRefusedARRow:
 
     def test_selector_still_raises_by_name(self):
         r = self._run()
-        with pytest.raises(ValueError, match="time-varying volume rescale"):
+        with pytest.raises(ValueError, match=r"'species:T' is reported over the live size"):
             r.output_sensitivities("species:T")
 
     def test_a_loss_that_ignores_the_refused_row_still_gets_a_gradient(self):
@@ -789,3 +874,40 @@ def test_refused_set_round_trips_through_hdf5(tmp_path):
         return g
 
     assert np.isfinite(back.gradient(dL_dY)).all()
+
+
+def test_selector_refusal_round_trips_through_hdf5(tmp_path):
+    """A reloaded result refuses the blocked species' selector by name, as the
+    run did, rather than hand back its NaN row as the answer (issue #787)."""
+    pytest.importorskip("h5py")
+    m = bngsim.Model.from_sbml_string(BLOCKED_VARVOL)
+    sim = bngsim.Simulator(m, method="ode", sensitivity_params=["k", "g"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        r = sim.run(t_span=(0.0, 5.0), n_points=6, **_RUN)
+    path = tmp_path / "r.h5"
+    r.save(path)
+    back = bngsim.Result.load(path)
+    with pytest.raises(ValueError, match=r"'species:T' is reported over the live size"):
+        back.output_sensitivities("species:T")
+    np.testing.assert_array_equal(
+        back.output_sensitivities("species:A"), r.output_sensitivities("species:A")
+    )
+
+
+def test_a_live_sized_row_round_trips_through_hdf5(tmp_path):
+    """A reloaded result has no redirect map, and reads the live-sized species'
+    selector from its tensor row, as the run does (issue #787)."""
+    pytest.importorskip("h5py")
+    m = bngsim.Model.from_sbml_string(LIVE_SIZED)
+    sim = bngsim.Simulator(m, method="ode", sensitivity_params=["k", "g"])
+    r = sim.run(t_span=(0.0, 5.0), n_points=6, **_RUN)
+    path = tmp_path / "r.h5"
+    r.save(path)
+    back = bngsim.Result.load(path)
+    assert back.ar_sensitivity_refused == frozenset()
+    np.testing.assert_array_equal(
+        back.output_sensitivities("species:T"), r.output_sensitivities("species:T")
+    )
+    t = np.asarray(back.time)
+    _assert_close(back.output_sensitivities("species:T")[:, 0, 1], -2.0 * t * _live_sized_value(t))

@@ -136,10 +136,30 @@ jobs:
         with:
           python-version: "3.12"
 
+      # ccache keeps the build's objects between runs on the Ninja legs, whose
+      # build step is most of the job (7.8 of macos-15-intel's 11 minutes). The
+      # Windows leg builds with the Visual Studio generator, which takes no
+      # compiler launcher, so it is left out here and in the export below.
+      - name: Set up ccache
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: mir-${{ matrix.os }}
+          max-size: 500M
+
       - name: Build & install bngsim (MIR on, KLU off)
         shell: bash
         run: |
           set -euxo pipefail
+          # MSVC builds serially without this, and -MP is spelled with a dash;
+          # windows-tail.yml's build step says why. Exported here, for this step
+          # and the Windows leg only.
+          if [ "$RUNNER_OS" = Windows ]; then
+            export CL=-MP
+          else
+            # CMake (3.17+) reads these at configure, inside pip's build too.
+            export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          fi
           python -m pip install --upgrade pip
           # BNGSIM_ENABLE_MIR=ON builds the vendored MIR backend; KLU off (and
           # REQUIRE_KLU off, overriding the pyproject default) skips SuiteSparse.
@@ -149,6 +169,7 @@ jobs:
             --config-settings=cmake.define.BNGSIM_REQUIRE_KLU=OFF \
             --config-settings=cmake.define.BNGSIM_BUILD_TESTS=OFF \
             ".[test]"
+          if [ "$RUNNER_OS" != Windows ]; then ccache --show-stats; fi
 
       - name: Show build / capability info
         shell: bash
