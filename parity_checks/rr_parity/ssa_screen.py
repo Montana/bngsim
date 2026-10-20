@@ -10,7 +10,8 @@ corpora:
     n_steps from ``suite_ssa.json``); and
   * ``biomodels`` -- the SSA-compatible BioModels subset listed in
     ``benchmarks/biomodels_ssa/ssa_candidates.json`` (built by
-    ``build_ssa_candidates.py``), SBML resolved from ``$BIOMODELS_SBML_DIR``.
+    ``build_ssa_candidates.py``), SBML resolved from ``$BIOMODELS_SBML_DIR``, else the rr_parity
+    materialization (``BIOMODELS_SBML_DIR`` below says the order).
 
 For each model we run ``--n`` replicates per engine at a shared seed
 schedule and check that every (t>0, species) cell's mean z-score
@@ -133,12 +134,43 @@ SUITE_SSA = Path(
     os.environ.get("SUITE_SSA_JSON", BNGSIM_DIR / "benchmarks" / "_dev" / "suite_ssa.json")
 )
 BIOMODELS_MANIFEST = Path(os.environ.get("SSA_CANDIDATES_JSON", HERE / "ssa_candidates.json"))
-BIOMODELS_SBML_DIR = Path(
-    os.environ.get(
-        "BIOMODELS_SBML_DIR",
-        os.path.expanduser("~/Code/ssys/biomodels_batch/data/sbml_downloads"),
-    )
+# Where a BioModels candidate's SBML is read from (issue #806), first match:
+#   1. $BIOMODELS_SBML_DIR/<name>.xml, when the variable is set;
+#   2. the flat directory this screen was first run from, when it exists;
+#   3. the rr_parity materialization (models/<id>/..., the path ode_jobs.json
+#      gives), which the nightly restores from the corpus job's cache. 269 of the
+#      306 candidates are there; the other 37 have no pinned provenance.
+_BIOMODELS_SBML_ENV = os.environ.get("BIOMODELS_SBML_DIR")
+LEGACY_BIOMODELS_SBML_DIR = Path(
+    os.path.expanduser("~/Code/ssys/biomodels_batch/data/sbml_downloads")
 )
+BIOMODELS_SBML_DIR = (
+    Path(_BIOMODELS_SBML_ENV)
+    if _BIOMODELS_SBML_ENV
+    else LEGACY_BIOMODELS_SBML_DIR
+    if LEGACY_BIOMODELS_SBML_DIR.is_dir()
+    else None
+)
+RR_ODE_JOBS = HERE / "ode_jobs.json"
+
+
+def _materialized_sbml() -> dict[str, Path]:
+    """model_id -> the SBML path ode_jobs.json gives under this directory."""
+    import json
+
+    raw = json.loads(RR_ODE_JOBS.read_text())
+    jobs = raw if isinstance(raw, list) else raw.get("jobs", [])
+    return {j["model_id"]: HERE / j["model"] for j in jobs}
+
+
+def biomodels_sbml_path(name: str, materialized: dict[str, Path] | None = None) -> Path:
+    """Where candidate ``name``'s SBML is read from; see BIOMODELS_SBML_DIR."""
+    if BIOMODELS_SBML_DIR is not None:
+        return BIOMODELS_SBML_DIR / f"{name}.xml"
+    found = (materialized if materialized is not None else _materialized_sbml()).get(name)
+    return found if found is not None else HERE / "models" / name / f"{name}_url.xml"
+
+
 # Fresh-run output lands in the gitignored runs/ dir; the committed baseline the
 # regression diffs against is authored separately (GH #108 follow-up steps).
 DEFAULT_OUT = HERE / "runs" / "ssa_screen.json"
@@ -992,6 +1024,14 @@ def _time_event_verdict(
         h *= 10.0
 
 
+def _revalidate_worker(spec: dict, q) -> None:
+    """One time-event re-validation in a child process (issue #806)."""
+    try:
+        q.put({"key": spec["key"], **_time_event_verdict(**spec["call"])})
+    except Exception as e:  # noqa: BLE001 - the worker's classification stands
+        q.put({"key": spec["key"], "error": f"{type(e).__name__}: {e}"[:300]})
+
+
 def _revalidate_time_events(cases: list, specs: list, args) -> None:
     """SERIAL bngsim-vs-ODE self-validation for the time-event models the parallel
     workers tagged ``rr_time_event`` (RR can't anchor them). Run here, single-file,
@@ -1010,29 +1050,57 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     ]
     if not todo:
         return
+    cap = float(getattr(args, "revalidate_timeout", 0) or 0)
     print(
         f"  re-validating {len(todo)} time-event model(s) bngsim-vs-own-ODE "
-        "(serial; RoadRunner cannot anchor time-triggered events)…"
+        "(serial; RoadRunner cannot anchor time-triggered events"
+        + (f"; {cap:g}s cap each" if cap else "")
+        + ")…"
     )
+    # One at a time, as before, and each in a child under a wall cap (issue #806):
+    # the tail used to have none, so one model whose ensemble kept growing could
+    # hold the run past a job's time limit (30 s per replicate x replicates x up
+    # to EXTENDED_MAX_MULTIPLE horizons). On overrun the worker's classification
+    # stands and the row says the re-validation timed out.
+    rspecs = []
     for c in todo:
         spec = spec_by_name.get(c["name"])
         if not spec:
             continue
-        try:
-            tev = _time_event_verdict(
-                spec["sbml_path"],
-                float(spec["t_end"]),
-                int(spec["n_steps"]),
-                args.n,
-                args.seed_base,
-                args.min_mean_count,
-                args.self_z_tol,
-                # Serial (no parallel contention, no per-model wall): give the
-                # extended-horizon ensemble + cold codegen compile ample headroom so
-                # residual post-screen system load can't trip a false "no signal".
-                rep_timeout=30.0,
-            )
-        except Exception:
+        rspecs.append(
+            {
+                "key": c["name"],
+                "call": {
+                    "xml": spec["sbml_path"],
+                    "t_end": float(spec["t_end"]),
+                    "n_steps": int(spec["n_steps"]),
+                    "n": args.n,
+                    "seed_base": args.seed_base,
+                    "min_mean_count": args.min_mean_count,
+                    "self_z_tol": args.self_z_tol,
+                    # No parallel contention here: give the extended-horizon
+                    # ensemble + cold codegen compile ample headroom so residual
+                    # post-screen load can't trip a false "no signal".
+                    "rep_timeout": 30.0,
+                },
+            }
+        )
+    by_name = {c["name"]: c for c in todo}
+    results = rc.schedule(
+        rspecs,
+        _revalidate_worker,
+        workers=1,
+        timeout_of=lambda _s: cap if cap else 1e9,
+    )
+    for rs, tev in zip(rspecs, results, strict=False):
+        c = by_name[rs["key"]]
+        if tev.get("status") == "timeout":
+            c["revalidation"] = "timeout"
+            continue
+        if "error" in tev or tev.get("status") not in (
+            "rr_time_event",
+            "rr_time_event_unverified",
+        ):
             continue  # keep the worker's rr_time_event / no-signal classification
         c["status"] = tev["status"]
         for k in ("n_compared", "bn_tracks_own_ode", "extended_horizon", "bngsim_ode_worst"):
@@ -1587,9 +1655,10 @@ def _build_corpus(args) -> list[dict]:
         import json
 
         manifest = json.loads(BIOMODELS_MANIFEST.read_text())
+        materialized = _materialized_sbml() if BIOMODELS_SBML_DIR is None else {}
         for m in manifest["models"]:
             name = m["name"]
-            xml = BIOMODELS_SBML_DIR / f"{name}.xml"
+            xml = biomodels_sbml_path(name, materialized)
             specs.append(
                 {
                     "name": name,
@@ -1608,6 +1677,13 @@ def _build_corpus(args) -> list[dict]:
     if args.models:
         wanted = {x.strip() for x in args.models.split(",") if x.strip()}
         specs = [s for s in specs if s["name"] in wanted]
+    if getattr(args, "present_only", False):
+        # Issue #806: a candidate with no SBML on this machine is not a model
+        # the run lost, so it is left out rather than reported as a skip.
+        absent = [s["name"] for s in specs if not s["exists"]]
+        specs = [s for s in specs if s["exists"]]
+        if absent:
+            print(f"  (--present-only: {len(absent)} candidate(s) with no SBML here left out)")
     if args.max_models:
         # Keep all roundtrip, then cheapest biomodels up to the cap.
         rt = [s for s in specs if s["source"] == "roundtrip"]
@@ -1827,6 +1903,18 @@ def main() -> int:
     )
     p.add_argument("--models", type=str, default="", help="Comma-separated name filter.")
     p.add_argument(
+        "--present-only",
+        action="store_true",
+        help="Leave out candidates whose SBML is not on this machine instead of "
+        "reporting them as skips (the nightly, which holds 269 of the 306).",
+    )
+    p.add_argument(
+        "--revalidate-timeout",
+        type=float,
+        default=300.0,
+        help="Wall cap (s) on each time-event model's serial re-validation; 0 = none.",
+    )
+    p.add_argument(
         "--out",
         type=Path,
         default=DEFAULT_OUT,
@@ -1985,7 +2073,11 @@ def main() -> int:
             "seed_base": args.seed_base,
             "mean_z_tol": args.mean_z_tol,
             "min_mean_count": args.min_mean_count,
-            "biomodels_sbml_dir": str(BIOMODELS_SBML_DIR),
+            "biomodels_sbml_dir": (
+                str(BIOMODELS_SBML_DIR)
+                if BIOMODELS_SBML_DIR is not None
+                else "rr_parity materialization (ode_jobs.json paths)"
+            ),
             "reference_source": (
                 f"archive:{args.reference_archive}"
                 if args.reference_archive
