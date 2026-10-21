@@ -274,6 +274,23 @@ open runs/bng_matrix_ode.html
 - Outputs (`runs/report_ode.json`, `runs/bng_matrix_ode.html`) are gitignored
   (regenerable).
 
+### Replaying the reference from a recorded archive (issue #805)
+
+```bash
+python bng_ode_run.py --write-reference-archive runs/bng_archive   # BNG2.pl + run_network run
+python bng_ode_run.py --reference-archive runs/bng_archive         # neither is needed
+```
+
+The archive is one `.npz` per job. It holds:
+
+- **the network:** the `.net` BNG2.pl generated, or its failure;
+- **the reference's side:** run_network's trajectory, or for a carry-over model the native BNG2.pl protocol's, or the exception it raised;
+- **a `meta` record of what the entry is valid for.** That is checked in two places:
+  - the inputs, before the network is read: the BNGL file's and any injected action block's sha256, and the tolerances forced on both engines;
+  - the spec derived from them: interval, steps, tolerances, and single- or multi-segment mode.
+
+An entry matching neither is never compared. The row is REFERENCE_FAILED, `archive_stale`. On six fast models, one of them carry-over, a replay with no BNG2.pl or run_network reachable gave the live run's outcome, value and comment on every job.
+
 ## Stochastic timing + parity matrix (`bng_stoch_run.py` → `generate_bng_matrix.py`)
 
 The stochastic sibling of the ODE track: one runner, two tracks (`--track ssa|nf`),
