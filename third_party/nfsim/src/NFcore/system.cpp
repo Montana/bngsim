@@ -10,6 +10,9 @@
 #include <math.h>
 #include <fstream>
 #include <stdexcept>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include "../NFscheduler/NFstream.h"
 #include "../NFscheduler/Scheduler.h"
 
@@ -1154,10 +1157,52 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
 	return current_time;
 }
 
+void System::addTimeBreakpoints(const vector<double> &xs)
+{
+	// tfun_interpolate_value() reads a table listed in decreasing order from
+	// the other side: at one of its x values a step gives the value from before
+	// that time, not after. Read there, the run would keep the old rate for a
+	// whole segment, so such a table is read one ulp past each x instead.
+	const bool decreasing = xs.size() > 1 && xs[1] < xs[0];
+	for(unsigned int i=0; i<xs.size(); i++) {
+		timeBreakpoints.push_back(decreasing
+			? std::nextafter(xs[i], std::numeric_limits<double>::infinity()) : xs[i]);
+	}
+	std::sort(timeBreakpoints.begin(), timeBreakpoints.end());
+	timeBreakpoints.erase(std::unique(timeBreakpoints.begin(), timeBreakpoints.end()),
+		timeBreakpoints.end());
+}
+
+double System::nextTimeBreakpoint(double t) const
+{
+	vector<double>::const_iterator it =
+		std::upper_bound(timeBreakpoints.begin(), timeBreakpoints.end(), t);
+	return it == timeBreakpoints.end() ? std::numeric_limits<double>::infinity() : *it;
+}
+
+void System::refreshTimeDependentPropensities()
+{
+	for(unsigned int r=0; r<allReactions.size(); r++) {
+		allReactions.at(r)->update_a();
+	}
+	recompute_A_tot();
+}
+
 double System::stepTo(double stoppingTime)
 {
 	while(current_time < stoppingTime)
 	{
+		// A table indexed by the time changes its value at its breakpoints
+		// whether or not anything fires (bngsim GH #892). The propensities were
+		// read again only after a firing, so a rate that is 0 until a later
+		// breakpoint never turned on, and one that was tiny turned on late. A
+		// draw that passes the next breakpoint is dropped there, the tables are
+		// read again and the waiting time is drawn anew, which is exact for a
+		// step table because the waiting time is memoryless. A linear table is
+		// read at its breakpoints too; between them it holds the value it was
+		// last read at, as it did before. A breakpoint on the stopping time is
+		// read there: the next call starts on it and looks past it.
+		const double nextBreak = nextTimeBreakpoint(current_time);
 		if(!pendingStepEventValid) {
 			// Preserve the pending waiting-time draw across output boundaries so
 			// repeated stepTo() calls consume the same RNG stream as sim().
@@ -1165,11 +1210,22 @@ double System::stepTo(double stoppingTime)
 				pendingStepEventTime =
 					current_time + (-log(rng_.random_open()) / a_tot);
 				pendingStepEventValid = true;
+			} else if(nextBreak <= stoppingTime) {
+				current_time = nextBreak;
+				refreshTimeDependentPropensities();
+				continue;
 			} else {
 				current_time = stoppingTime;
 				cout << "Total propensity is zero, no further rxns can fire in this step." << endl;
 				break;
 			}
+		}
+
+		if(pendingStepEventTime > nextBreak && nextBreak <= stoppingTime) {
+			current_time = nextBreak;
+			invalidateStepToCache();
+			refreshTimeDependentPropensities();
+			continue;
 		}
 
 		// Check if we've reached stopping time
@@ -1195,10 +1251,7 @@ double System::stepTo(double stoppingTime)
 
 		// Recompute all propensities at each step to ensure time-dependent functions are updated correctly
 		if (hasTimeDependentFunctions) {
-			for(unsigned int r=0; r<allReactions.size(); r++) {
-				allReactions.at(r)->update_a();
-			}
-			recompute_A_tot();
+			refreshTimeDependentPropensities();
 		}
 	}
 
