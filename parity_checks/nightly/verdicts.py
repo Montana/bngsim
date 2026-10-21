@@ -383,6 +383,7 @@ def diff(
                     "ratio": round(vf / vb, 3) if vb else None,
                 }
                 if c in flaky:
+                    item["flaky"] = True
                     item["note"] = f"flaky: {flaky[c]}"
                 work_items.append(item)
         totals[key] = {
@@ -436,7 +437,7 @@ def diff(
     alerts = {
         "regressed": len(regressed),
         "new_crash": len(new_crash),
-        "efficiency_cases": sum(1 for x in work_items if "note" not in x),
+        "efficiency_cases": sum(1 for x in work_items if not x.get("flaky")),
         "efficiency_totals": sum(1 for t in totals.values() if t["alert"]),
         "wall": int(wall["alert"]),
         "backend": len(backend_miss),
@@ -642,11 +643,12 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
         lines += [f"**Did not run the expected backend: {len(result['backend_miss'])}**", ""]
         lines += _table(result["backend_miss"], ["case", "after", "note"], limit) + [""]
     if result["efficiency"]:
-        lines += [
-            f"**Efficiency: {len(result['efficiency'])} counter increase(s) above "
-            f"x{result['thresholds']['work_ratio']}**",
-            "",
-        ]
+        n_flaky = sum(1 for x in result["efficiency"] if x.get("flaky"))
+        n_alert = len(result["efficiency"]) - n_flaky
+        head = f"{n_alert} counter increase(s) above x{result['thresholds']['work_ratio']}"
+        if n_flaky:
+            head += f", and {n_flaky} on flaky cases, reported and not alerted"
+        lines += [f"**Efficiency: {head}**" if n_alert else f"Efficiency: {head}", ""]
         cols = ["case", "counter", "before", "after", "ratio"]
         if any("note" in x for x in result["efficiency"]):
             cols.append("note")
