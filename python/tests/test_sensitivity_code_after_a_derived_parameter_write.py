@@ -756,18 +756,19 @@ def test_a_repeating_schedule_whose_duty_stops_resolving_is_followed_by_a_rebuil
     """The same for a schedule, which the pass reads on another path: on for
     ``(t mod P) >= sqrt(E)``. At ``E = 0`` it is always on and dA/dE is
     unbounded; a model loaded there is refused. On the artifact built at 0.0625
-    every one of these returned dA/dE = 0."""
+    every one of these returned dA/dE = 0. A batch row at 0 is refused as the
+    run after the write is (issue #961)."""
     model = _model(SCHEDULE)
     sim = _sim(model, ["k", "E"])
     _close(_columns(sim.run(**TIGHT)), _scheduled(0.0625))
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#708") as refusal:
+    with pytest.raises(bngsim.SensitivityUnsupportedError) as row:
         sim.run_batch(params=[{"E": 0.0}], **TIGHT)
-    assert "row 0" in str(refusal.value)
     model.reset()
     model.set_param("E", 0.0)
     model.reset()
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="crossing time"):
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match="crossing time") as run:
         sim.run(**TIGHT)
+    assert str(row.value) == f"run_batch row 0: {run.value}"
     assert not sim.has_analytic_sens_rhs
     model.reset()
     with pytest.raises(bngsim.SensitivityUnsupportedError, match="crossing time"):
@@ -963,14 +964,22 @@ def test_a_condition_the_solver_roots_builds_nothing(monkeypatch):
 
 def test_a_batch_row_that_changes_how_a_condition_is_read_is_refused():
     """A row at ``E = 0.36`` reads the condition as the batch's build did and
-    runs. One at ``E = 0`` does not, and returned dA/dE = 0."""
+    runs. One at ``E = 0`` does not, and returned dA/dE = 0. It is refused as
+    a Simulator built at ``E = 0`` refuses its run (issue #414), and not as a
+    row the batch's one build cannot serve: code built for the row has no
+    analytic right-hand side for the condition either, so no write or run the
+    row could be moved to returns its columns (issue #961)."""
     sim = _sim(_model(GATED), ["k", "E"])
     rows = sim.run_batch(params=[{"E": 0.36}], **TIGHT)
     _close(_columns(rows[0]), _gated(0.36))
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#708") as refusal:
+    with pytest.raises(bngsim.SensitivityUnsupportedError) as refusal:
         sim.run_batch(params=[{"E": 0.36}, {"E": 0.0}], **TIGHT)
-    assert "row 1" in str(refusal.value)
-    assert "rate-law condition" in str(refusal.value)
+    at_zero = _model(GATED)
+    at_zero.set_param("E", 0.0)
+    at_zero.reset()
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match="crossing time") as run:
+        _sim(at_zero, ["k", "E"]).run(**TIGHT)
+    assert str(refusal.value) == f"run_batch row 1: {run.value}"
 
 
 def test_a_batch_on_the_quotient_asks_each_row_what_a_run_is_asked():
