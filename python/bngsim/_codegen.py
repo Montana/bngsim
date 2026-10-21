@@ -12109,7 +12109,9 @@ def _codegen_key_stream_reference(core) -> bytes:
     walking the accessors' Python dicts (the key's own route before issue #820).
 
     The core writes the same bytes from its own walk (``codegen_key_stream``),
-    two orders of magnitude faster on a large model, and this is kept as what
+    about 30 times faster on a large model (0.1 s against 3.4 s at 58k
+    reactions; this walk is slower than the key's own was, since it keeps the
+    bytes rather than feeding a hasher), and this is kept as what
     that is checked against; it is also the key's route on a core without it.
     """
     data = dict(core.codegen_data())
@@ -12174,8 +12176,10 @@ def compute_model_codegen_hash(
 
     core = model._core if hasattr(model, "_core") else model
     # Written by the core from the walk that builds the three accessors' dicts
-    # (issue #820), so a field the generator reads cannot be missing from it.
-    # Walking the dicts here instead cost ~40 Python-level steps a reaction.
+    # (issue #820), so a field of theirs the generator reads cannot be missing
+    # from it. Walking the dicts here instead cost ~40 Python-level steps a
+    # reaction. A throw from the core is not caught here: the callers key on the
+    # generated source instead (#174's fallback).
     key_stream = getattr(core, "codegen_key_stream", None)
     stream = key_stream() if key_stream is not None else _codegen_key_stream_reference(core)
 

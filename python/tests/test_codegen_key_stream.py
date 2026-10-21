@@ -3,16 +3,18 @@
 ``compute_model_codegen_hash`` (#174) hashed ``codegen_data()``,
 ``codegen_jacobian_plan()`` and ``functional_jacobian_context()`` by walking
 their Python dicts a value at a time (``_codegen._canon_update``): ~40 values a
-reaction, 3.5 s at 58k reactions, on every ``Simulator`` construction that
+reaction, 2 s at 58k reactions, on every ``Simulator`` construction that
 compiles. The core now writes the same bytes (``codegen_key_stream``) from the
 walk that builds those dicts, so a field the generator reads cannot be left out
 of the key.
 
 The stream is the Python walk's byte for byte, not merely another injective
-encoding: every key, and every ``.so`` cached under one, stays what it was. The
-walk is kept (``_codegen_key_stream_reference``), and these tests hold the two
-equal on every model they load, before and after the analytical Jacobian is
-attached, since that fills the plan.
+encoding: a key is the same whichever of the two makes it. (A ``.so`` cached by
+an earlier release is not kept by that: the code generator's own source is
+part of the key, and this change edits it.) The walk is kept
+(``_codegen_key_stream_reference``), and these tests hold the two equal on every
+model they load, before and after the analytical Jacobian is attached, since
+that fills the plan.
 """
 
 from __future__ import annotations
@@ -181,8 +183,9 @@ def test_a_core_without_the_stream_gets_the_same_key():
 
 
 def test_the_key_of_a_large_model_is_cheap():
-    """3.5 s at 58k reactions walking the dicts; about 0.1 s from the core on
-    an M1 Max. The bound has room for a slow runner and none for the walk."""
+    """About 2 s at 58k reactions walking the dicts; about 0.12 s from the core,
+    on Apple silicon. The bound has room for a slow runner and none for the
+    walk."""
     model = bngsim.Model.from_net(str(_FCERI_GAMMA))
     assert model._core.n_reactions > 50_000
     cg.compute_model_codegen_hash(model)

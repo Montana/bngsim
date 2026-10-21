@@ -243,12 +243,14 @@ static bngsim::NetworkModel::EventCarry event_carry_from_py(const py::object &ca
 // codegen_data(), codegen_jacobian_plan() and functional_jacobian_context() are
 // what the code generator reads, and the structural codegen cache key (#174) is
 // a hash of the same three. The key used to be made by walking the Python dicts
-// a value at a time (_codegen._canon_update): ~40 values a reaction, 3.5 s at
+// a value at a time (_codegen._canon_update): ~40 values a reaction, 2 s at
 // 58k reactions, on every Simulator construction that compiles. Each accessor
 // below is written once, over a sink: PySink builds the dict the generator
 // reads, KeySink writes the bytes _canon_update would feed the hasher for it.
-// A field cannot reach one without the other, so the key cannot miss a field
-// the generator reads.
+// A field cannot reach one without the other, so the key cannot miss a field of
+// these three that the generator reads. The two exceptions are deliberate and
+// named where they are made (kKeyStream): a parameter's value and a species'
+// initial_amount reach the dict and not the key.
 //
 // The two are equal byte for byte, not merely both injective, so a key is the
 // same whichever way it is made, and the Python walk stays as the test's
@@ -257,7 +259,10 @@ static bngsim::NetworkModel::EventCarry event_carry_from_py(const py::object &ca
 // KeySink writes in place, so a walk builds one container at a time: a list
 // says how many items it will hold when it is opened, and a value is made
 // where it is pushed or set, not ahead of time. KeySink throws if a walk
-// breaks either rule, and the key falls back to the Python walk.
+// breaks either rule. Nothing falls back to the Python walk then:
+// compute_model_codegen_hash raises, and its callers key the .so on the
+// generated source instead (#174's fallback), which is slow but never a wrong
+// key.
 
 namespace codegen_visit {
 
