@@ -1000,6 +1000,7 @@ class Simulator:
             from bngsim._bngsim_core import NfsimSimulator
             from bngsim._network_free_checks import (
                 refuse_nfsim_compartments,
+                refuse_nfsim_linear_time_tables,
                 refuse_nfsim_rate_laws,
                 refuse_nfsim_stale_local_functions,
                 refuse_time_dependent_rate_laws,
@@ -1009,6 +1010,7 @@ class Simulator:
             refuse_nfsim_rate_laws(xml_path)
             refuse_nfsim_stale_local_functions(xml_path)
             refuse_nfsim_compartments(xml_path)
+            refuse_nfsim_linear_time_tables(xml_path)
             self._sim = NfsimSimulator(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
@@ -1819,6 +1821,7 @@ class Simulator:
         params: Sequence[str] | None = None,
         state_crossings: bool = True,
         core=None,
+        analytic: bool | None = None,
     ) -> None:
         """Refuse a forward-sensitivity run left on the difference quotient over a
         rate-law branch crossing whose time moves (issue #414).
@@ -1826,6 +1829,12 @@ class Simulator:
         ``core`` is a batch row's model, where the row is what is asked about:
         its parameters put a condition's crossings where they are, and two of
         them on one instant are refused in the row as they are in a run.
+
+        ``analytic`` says whether the code asked about holds the analytic
+        right-hand side, where that code is not the artifact this Simulator
+        holds. It is false for a batch row that reads a condition otherwise:
+        code built at the row's values would not hold it (issue #961). ``None``
+        asks the artifact.
 
         ``time_course`` is false for a steady-state solve, which reads ``∂f/∂p``
         at one state and crosses nothing: the state-crossing refusal at the end
@@ -1894,7 +1903,7 @@ class Simulator:
         # RHS applies every jump itself, so there is nothing to refuse and no need
         # to scan. This is also what keeps a spurious re-derivation from ever
         # refusing a model the build actually admitted.
-        if self._codegen_provides_sens_rhs():
+        if self._codegen_provides_sens_rhs() if analytic is None else analytic:
             return
         from bngsim._switch_sensitivity import model_uncompensated_crossing_reason
 
@@ -2732,11 +2741,12 @@ class Simulator:
         as stops (issue #1068). ``max(0, 1 - abs(T-50.005)/0.005)`` over a
         counter that is not a clock is a pulse a step spanned, and the run
         returned Y = 0 with its columns, while the plain run, which roots it,
-        was right. The pulse is continuous, so no rate law is listed for these
-        and the solver jumps none of them. A surface a condition above already
-        roots is not added again. A bend has no analytic sensitivity RHS, so
-        the columns are CVODES' difference quotient, which can still read a
-        narrow one wrong (issue #1126).
+        was right. The pulse is continuous, so no rate law is listed for a bend
+        and the solver jumps none of them; a step call lists the laws that hold
+        it, and its jump is applied (issue #1128). A surface a condition above
+        already roots is not added again. A bend has no analytic sensitivity
+        RHS, so the columns are CVODES' difference quotient, which can still
+        read a narrow one wrong (issue #1126).
 
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
@@ -2793,7 +2803,7 @@ class Simulator:
         if conditions or stops:
             opts.set_state_switch_conditions([*conditions, *stops])
             try:
-                reactions = state_switch_reactions(core, conditions)
+                reactions = state_switch_reactions(core, [*conditions, *stops])
             except Exception as e:  # pragma: no cover - defensive
                 # Without the map the solver judges each crossing's continuity
                 # over the whole right-hand side, as it did before issue #763.
@@ -2803,10 +2813,11 @@ class Simulator:
                     e,
                 )
             else:
-                # A stop lists no rate law, so the solver takes its crossing as
-                # continuous. A bend is; a step call over state has no analytic
-                # sensitivity right-hand side, so its run is refused before this.
-                opts.set_state_switch_reactions([*reactions, *([] for _ in stops)])
+                # A stop lists the laws whose step call jumps there: sign() over
+                # the state has an analytic sensitivity right-hand side (issue
+                # #1128), so the solver applies its jump. A bend lists none, so
+                # its crossing is taken as continuous, which it is.
+                opts.set_state_switch_reactions(reactions)
 
     def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).
@@ -2839,6 +2850,21 @@ class Simulator:
                 ", ".join(repr(c) for c in conditions),
             )
             opts.set_state_switch_conditions(list(conditions))
+        # Issue #959: an SBML model's thresholds are rooted by the loader's
+        # discontinuity triggers, so they are covered here and are no state
+        # switch, and a run pinned on one, unable to cross or pass, was not put
+        # across as #928 puts a state switch's: `piecewise(kb, A > thr, 0)` with
+        # A rising at 1e-8 ran until its wall clock ended it. The core watches
+        # them for that alone, with no root of their own; one that reads no
+        # state resolves to nothing there. A .net model has no such trigger.
+        if model._core.n_discontinuity_triggers:
+            watched = [
+                c
+                for c in (model.time_discontinuity_conditions() if covered is None else covered)
+                if c not in conditions
+            ]
+            if watched:
+                opts.set_stall_watch_conditions(watched)
 
     def _auto_codegen_for_sensitivity(
         self, *, jit_backend: str, n_sens_dirs: int | None = None
@@ -6344,12 +6370,23 @@ class Simulator:
             else:
                 raise ValueError(f"Unknown method: {self._method}")
         except _ConditionReadOtherwise as e:
+            # Issue #961 — code built at this row's values would not hold the
+            # analytic right-hand side either: the gate declines it on the
+            # recognizer the pass was confirmed against. So a run() of the model
+            # at these values is refused under #414, and the row is refused as
+            # that run is, not as a row the batch's one build cannot serve: no
+            # write or run it could be moved to returns its columns.
+            try:
+                self._raise_if_uncompensated_crossing_sensitivities(
+                    core=clone._core, analytic=False
+                )
+            except SensitivityUnsupportedError as refusal:
+                raise SensitivityUnsupportedError(f"run_batch row {index}: {refusal}") from None
+            # Not reached: the pass flagged the row on that recognizer's finding.
             raise SensitivityUnsupportedError(
-                f"run_batch row {index} moves a parameter to where a rate-law condition "
-                f"({e}) is read otherwise than for the model as it stood when the batch "
-                "began: its switch time does not resolve at the row's values. Whether the "
-                "sensitivity code has an analytic right-hand side goes by that, and every "
-                f"row of a batch runs on the one build (issue #708). {self._ROW_REMEDY}"
+                f"run_batch row {index}: the switch-time pass could not compensate a "
+                f"rate-law condition ({e}) at the row's values, and the batch's code was "
+                "built where it could (issues #414, #708)."
             ) from None
         except (SimulationTimeout, SensitivityUnsupportedError):
             # A refusal is a refusal of the row's model, as it is from run().
@@ -6800,7 +6837,8 @@ class Simulator:
                     f"Forward sensitivity is not supported on this run: a rate-law condition "
                     f"({exc}) is read otherwise at the model's values now than when the "
                     "sensitivity code was built, and its switch time does not resolve here "
-                    "(issue #708). Build a new Simulator on the model as it is."
+                    "(issue #708). A Simulator built at these values is refused too: it has "
+                    "no analytic right-hand side for the condition (issues #414, #961)."
                 ) from None
             return self._recover_failed_chunk(
                 chunk_idx,

@@ -240,3 +240,8 @@ Validation rules:
 - Scientific notation is accepted, for example `1e-3` or `2.5E+2`.
 - `xData` and `yData` lengths must match.
 - `xData` must be strictly increasing.
+
+`method="nf"` refuses a model whose rate laws read a `linear` table indexed by
+time, since NFsim holds it between its x values; a `step` one is exact. See
+[Rate laws that read `time()`](network-free.md#rate-laws-that-read-time)
+(issue #1179).

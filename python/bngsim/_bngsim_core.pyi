@@ -171,6 +171,10 @@ class NetworkModel:
         """
         Dense analytical-Jacobian scatter plan (Elementary + MM, rows resolved) for the codegen .so. GH #76 Task 4.
         """
+    def codegen_key_stream(self) -> bytes:
+        """
+        The bytes the structural codegen cache key hashes for codegen_data() (less each parameter's value and species' initial_amount), codegen_jacobian_plan() and functional_jacobian_context(), in that order: what bngsim._codegen._canon_update writes for them, made from the same walk (issue #820).
+        """
     def compute_derivs(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> numpy.typing.NDArray[numpy.float64]:
         """
         dy/dt at (t, conc) as a float64 ndarray (n_species,): the interpreted RHS the CVODE callback evaluates, with the same observable/function refresh (rhs_evaluates_observables) against the live parameters. Leaves the stored concentrations untouched. Issue #523.
@@ -911,6 +915,10 @@ class SolverOptions:
     def set_sensitivity_params(self, params: collections.abc.Sequence[str]) -> None:
         """
         Set parameter names for forward sensitivity analysis
+        """
+    def set_stall_watch_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
+        """
+        Issue #959: conditions over model state, as source text, that a run without sensitivities watches for a state pinned on their surface (issue #928) and puts across, without registering them as roots. For thresholds rooted another way, an SBML model's discontinuity triggers.
         """
     def set_state_switch_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
         """

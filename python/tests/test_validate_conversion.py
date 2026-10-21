@@ -16,6 +16,7 @@ import warnings
 from pathlib import Path
 
 import bngsim
+import numpy as np
 import pytest
 from bngsim.convert import (
     ConversionValidationReport,
@@ -23,6 +24,7 @@ from bngsim.convert import (
     validate_conversion,
     write_sbml,
 )
+from bngsim.convert._validate import _scale_aware_verdict
 
 pytestmark = pytest.mark.skipif(
     not bngsim.HAS_LIBSBML, reason="conversion validation requires libsbml"
@@ -315,6 +317,43 @@ def test_lossy_conversion_caught_by_numeric_gates() -> None:
     assert report.level("L2").status == "fail"
     assert report.level("L3").status == "fail"
     assert not report.ok
+
+
+# ─── L3 holds every moving species to its own movement (issue #873) ─────────
+
+
+def _reservoir_trajectory() -> np.ndarray:
+    """A clamped 6e8 reservoir beside a substrate decaying from 6e5 and its
+    product: every moving species sits at or under the significance bar."""
+    t = np.linspace(0.0, 3600.0, 121)
+    s = 6.022e5 * np.exp(-t / 900.0)
+    return np.column_stack([np.full_like(t, 6.022e8), s, 6.022e5 - s])
+
+
+def test_l3_verdict_fails_a_conversion_that_froze_beside_a_reservoir() -> None:
+    src = _reservoir_trajectory()
+    frozen = np.tile(src[0], (src.shape[0], 1))
+    assert not _scale_aware_verdict(src, frozen)["passed"]
+    assert not _scale_aware_verdict(frozen, src)["passed"]  # whichever side froze
+    assert _scale_aware_verdict(src, src * (1.0 + 1e-7))["passed"]
+
+
+def test_l3_verdict_leaves_differences_inside_atol_to_the_solver() -> None:
+    """A species at 4e-11 that the two runs place 2% apart under atol 1e-8 moves
+    in the solver's noise; the movement gate leaves it alone when told the atol."""
+    t = np.linspace(0.0, 100.0, 201)
+    src = np.column_stack([3.1e-5 - 1e-8 * (1 - np.exp(-t / 10)), 4.3e-11 * (1 - np.exp(-t / 5))])
+    tgt = src.copy()
+    tgt[:, 1] *= 1.02
+    assert not _scale_aware_verdict(src, tgt)["passed"]
+    assert _scale_aware_verdict(src, tgt, atol=1e-8)["passed"]
+
+
+def test_l3_verdict_fails_a_conversion_that_lets_the_reservoir_drift() -> None:
+    src = _reservoir_trajectory()
+    drift = src.copy()
+    drift[:, 0] *= 1.0 - 0.009 * np.linspace(0.0, 1.0, src.shape[0])
+    assert not _scale_aware_verdict(src, drift)["passed"]
 
 
 @pytest.mark.skipif(not _SMITH.is_file(), reason="Smith2013 benchmark not present")

@@ -57,9 +57,10 @@ def test_surviving_symbol_is_named(info):
 
 
 def test_underivable_function_is_named(info):
-    assert J.build_per_observable_terms("k*sign(A)", {}, {"A"}, {"k"}) is None
+    # mratio has no closed form in its first argument (issue #457).
+    assert J.build_per_observable_terms("k*mratio(A, 1, 2)", {}, {"A"}, {"k"}) is None
     (line,) = _decline_lines(info)
-    assert "applies sign to a differentiation variable" in line
+    assert "with respect to A carries an unevaluated Derivative" in line
 
 
 def test_non_emittable_derivative_names_the_node_and_the_variable(info, monkeypatch):
@@ -89,7 +90,7 @@ def test_non_emittable_reasons_name_the_offending_node():
 
 # ─── Model.analytical_jacobian_status ────────────────────────────────────────
 
-_NET_SIGN = """\
+_NET_MRATIO = """\
 begin parameters
     1 k 0.7
 end parameters
@@ -98,10 +99,10 @@ begin species
     2 B() 0.0
 end species
 begin functions
-    1 fSign() k*sign(A_tot)
+    1 fMratio() k*mratio(A_tot, 1, 2)
 end functions
 begin reactions
-    1 1 2 fSign #A_to_B
+    1 1 2 fMratio #A_to_B
 end reactions
 begin groups
     1 A_tot 1
@@ -110,9 +111,9 @@ end groups
 """
 
 _NET_SQRT_AT_ZERO = (
-    _NET_SIGN.replace("1 A() 1.0", "1 A() 0.0")
-    .replace("fSign() k*sign(A_tot)", "fSign() k*sqrt(A_tot)")
-    .replace("1 1 2 fSign", "1 0 2 fSign")
+    _NET_MRATIO.replace("1 A() 1.0", "1 A() 0.0")
+    .replace("fMratio() k*mratio(A_tot, 1, 2)", "fMratio() k*sqrt(A_tot)")
+    .replace("1 1 2 fMratio", "1 0 2 fMratio")
 )
 
 
@@ -128,11 +129,13 @@ def test_status_is_complete_for_a_mass_action_model(data_dir: Path):
 
 
 def test_status_is_pending_until_derived_then_declined_with_the_reason(tmp_path, info):
-    m = _model(tmp_path, _NET_SIGN)
+    m = _model(tmp_path, _NET_MRATIO)
     assert m.analytical_jacobian_status == "pending"
     assert m.prepare_analytical_jacobian() is False
     status = m.analytical_jacobian_status
-    assert status.startswith("declined: rate law 'k*sign(A_tot)' applies sign"), status
+    assert status.startswith(
+        "declined: the derivative of rate law 'k*mratio(A_tot, 1, 2)' with respect to A_tot"
+    ), status
     (line,) = _decline_lines(info)
     assert status[len("declined: ") :] in line  # the same reason the log line carries
 
@@ -156,14 +159,14 @@ def test_status_is_complete_once_attached(data_dir: Path):
 
 
 def test_clone_carries_the_status(tmp_path):
-    m = _model(tmp_path, _NET_SIGN)
+    m = _model(tmp_path, _NET_MRATIO)
     m.prepare_analytical_jacobian()
     assert m.clone().analytical_jacobian_status == m.analytical_jacobian_status
 
 
 def test_env_switch_is_a_named_decline(tmp_path, monkeypatch, info):
     monkeypatch.setenv("BNGSIM_ANALYTICAL_FUNCTIONAL_JAC", "0")
-    m = _model(tmp_path, _NET_SIGN)
+    m = _model(tmp_path, _NET_MRATIO)
     assert m.prepare_analytical_jacobian() is False
     expected = "declined: disabled by BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0"
     assert m.analytical_jacobian_status == expected
