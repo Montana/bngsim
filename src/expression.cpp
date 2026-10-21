@@ -1463,10 +1463,19 @@ void ExprTkEvaluator::define_variable(const std::string &name, double *addr) {
                      mapped +
                      "', and that mangled key is already registered. Rename one of the "
                      "conflicting parameters.";
-        } else {
+        } else if (impl_->symbol_table.symbol_exists(mapped)) {
             detail = "name '" + name + "' (mapped: '" + mapped +
                      "') is already registered. Check the .net file for duplicate "
                      "parameter / observable / species names (case-sensitive).";
+        } else {
+            // add_variable gives the same `false` for a name that is no ExprTk
+            // symbol as for a duplicate, and a name like `k-1` or `2k` was told
+            // to look for a duplicate that is not there. Nothing holds the name,
+            // so the name itself was refused.
+            detail = "name '" + name + "' (mapped: '" + mapped +
+                     "') is not a valid identifier: one starts with a letter or an "
+                     "underscore and holds only letters, digits, underscores and "
+                     "periods (not as its last character). Rename it.";
         }
         throw std::runtime_error("ExprTk: failed to register variable '" + name + "'. " + detail);
     }
