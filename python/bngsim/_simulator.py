@@ -6367,7 +6367,7 @@ class Simulator:
                     core_result = sim.run(times, base_seed + index, timeout_seconds)
             else:
                 raise ValueError(f"Unknown method: {self._method}")
-        except _ConditionReadOtherwise:
+        except _ConditionReadOtherwise as e:
             # Issue #961 — code built at this row's values would not hold the
             # analytic right-hand side either: the gate declines it on the
             # recognizer the pass was confirmed against. So a run() of the model
@@ -6381,7 +6381,11 @@ class Simulator:
             except SensitivityUnsupportedError as refusal:
                 raise SensitivityUnsupportedError(f"run_batch row {index}: {refusal}") from None
             # Not reached: the pass flagged the row on that recognizer's finding.
-            raise
+            raise SensitivityUnsupportedError(
+                f"run_batch row {index}: the switch-time pass could not compensate a "
+                f"rate-law condition ({e}) at the row's values, and the batch's code was "
+                "built where it could (issues #414, #708)."
+            ) from None
         except (SimulationTimeout, SensitivityUnsupportedError):
             # A refusal is a refusal of the row's model, as it is from run().
             raise
@@ -6831,7 +6835,8 @@ class Simulator:
                     f"Forward sensitivity is not supported on this run: a rate-law condition "
                     f"({exc}) is read otherwise at the model's values now than when the "
                     "sensitivity code was built, and its switch time does not resolve here "
-                    "(issue #708). Build a new Simulator on the model as it is."
+                    "(issue #708). A Simulator built at these values is refused too: it has "
+                    "no analytic right-hand side for the condition (issues #414, #961)."
                 ) from None
             return self._recover_failed_chunk(
                 chunk_idx,

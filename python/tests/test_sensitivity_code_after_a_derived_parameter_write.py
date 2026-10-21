@@ -763,6 +763,7 @@ def test_a_repeating_schedule_whose_duty_stops_resolving_is_followed_by_a_rebuil
     _close(_columns(sim.run(**TIGHT)), _scheduled(0.0625))
     with pytest.raises(bngsim.SensitivityUnsupportedError) as row:
         sim.run_batch(params=[{"E": 0.0}], **TIGHT)
+    assert sim.has_analytic_sens_rhs
     model.reset()
     model.set_param("E", 0.0)
     model.reset()
@@ -974,6 +975,7 @@ def test_a_batch_row_that_changes_how_a_condition_is_read_is_refused():
     _close(_columns(rows[0]), _gated(0.36))
     with pytest.raises(bngsim.SensitivityUnsupportedError) as refusal:
         sim.run_batch(params=[{"E": 0.36}, {"E": 0.0}], **TIGHT)
+    assert sim.has_analytic_sens_rhs
     at_zero = _model(GATED)
     at_zero.set_param("E", 0.0)
     at_zero.reset()
