@@ -1819,6 +1819,7 @@ class Simulator:
         params: Sequence[str] | None = None,
         state_crossings: bool = True,
         core=None,
+        analytic: bool | None = None,
     ) -> None:
         """Refuse a forward-sensitivity run left on the difference quotient over a
         rate-law branch crossing whose time moves (issue #414).
@@ -1826,6 +1827,12 @@ class Simulator:
         ``core`` is a batch row's model, where the row is what is asked about:
         its parameters put a condition's crossings where they are, and two of
         them on one instant are refused in the row as they are in a run.
+
+        ``analytic`` says whether the code asked about holds the analytic
+        right-hand side, where that code is not the artifact this Simulator
+        holds. It is false for a batch row that reads a condition otherwise:
+        code built at the row's values would not hold it (issue #961). ``None``
+        asks the artifact.
 
         ``time_course`` is false for a steady-state solve, which reads ``∂f/∂p``
         at one state and crosses nothing: the state-crossing refusal at the end
@@ -1894,7 +1901,7 @@ class Simulator:
         # RHS applies every jump itself, so there is nothing to refuse and no need
         # to scan. This is also what keeps a spurious re-derivation from ever
         # refusing a model the build actually admitted.
-        if self._codegen_provides_sens_rhs():
+        if self._codegen_provides_sens_rhs() if analytic is None else analytic:
             return
         from bngsim._switch_sensitivity import model_uncompensated_crossing_reason
 
@@ -6361,12 +6368,23 @@ class Simulator:
             else:
                 raise ValueError(f"Unknown method: {self._method}")
         except _ConditionReadOtherwise as e:
+            # Issue #961 — code built at this row's values would not hold the
+            # analytic right-hand side either: the gate declines it on the
+            # recognizer the pass was confirmed against. So a run() of the model
+            # at these values is refused under #414, and the row is refused as
+            # that run is, not as a row the batch's one build cannot serve: no
+            # write or run it could be moved to returns its columns.
+            try:
+                self._raise_if_uncompensated_crossing_sensitivities(
+                    core=clone._core, analytic=False
+                )
+            except SensitivityUnsupportedError as refusal:
+                raise SensitivityUnsupportedError(f"run_batch row {index}: {refusal}") from None
+            # Not reached: the pass flagged the row on that recognizer's finding.
             raise SensitivityUnsupportedError(
-                f"run_batch row {index} moves a parameter to where a rate-law condition "
-                f"({e}) is read otherwise than for the model as it stood when the batch "
-                "began: its switch time does not resolve at the row's values. Whether the "
-                "sensitivity code has an analytic right-hand side goes by that, and every "
-                f"row of a batch runs on the one build (issue #708). {self._ROW_REMEDY}"
+                f"run_batch row {index}: the switch-time pass could not compensate a "
+                f"rate-law condition ({e}) at the row's values, and the batch's code was "
+                "built where it could (issues #414, #708)."
             ) from None
         except (SimulationTimeout, SensitivityUnsupportedError):
             # A refusal is a refusal of the row's model, as it is from run().
@@ -6817,7 +6835,8 @@ class Simulator:
                     f"Forward sensitivity is not supported on this run: a rate-law condition "
                     f"({exc}) is read otherwise at the model's values now than when the "
                     "sensitivity code was built, and its switch time does not resolve here "
-                    "(issue #708). Build a new Simulator on the model as it is."
+                    "(issue #708). A Simulator built at these values is refused too: it has "
+                    "no analytic right-hand side for the condition (issues #414, #961)."
                 ) from None
             return self._recover_failed_chunk(
                 chunk_idx,
