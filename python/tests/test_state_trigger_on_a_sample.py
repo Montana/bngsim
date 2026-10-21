@@ -86,6 +86,22 @@ def test_at_a_tight_tolerance_as_well():
     assert s == [3, 3, 3, 1, 1]
 
 
+def test_an_event_on_the_row_that_turns_the_state_back_is_read_ahead_from():
+    """An event on a stop at the sample turns q back before it reaches 2.5.
+
+    q tops out a few doubles short of 2.5 and falls, so E1 never fires. Read
+    ahead on the derivative from before E0 (q' = +1), q crossed 2.5 and E1 fired
+    in the row.
+    """
+    text = (
+        "species S = 3; q = 0; k = 1; q' = k;"
+        " E0: at (time >= 2.5): k = -1; E1: at (q >= 2.5): S = 1;"
+    )
+    for times in ([0.0, 1.0, 2.0, 2.5, 3.0], [0.0, 2.5, 3.0]):
+        assert _column(text, times, "S") == [3.0] * len(times)
+        assert max(_column(text, times, "q")) < 2.5
+
+
 def test_a_crossing_after_the_sample_by_more_than_rounding_is_after_it():
     """1e-9 after the sample is far past the root tolerance: the row is 3."""
     text = "species S = 3; q = 0; q' = 1; E1: at (q >= 2.5 + 1e-9): S = 1;"
@@ -101,3 +117,19 @@ def test_a_clock_trigger_a_double_after_the_sample_is_after_it(ulps):
     text = "species S = 3; tau = 0; E1: at (time >= tau): S = 1;"
     s = _column(text, [0.0, 1.0, 2.0, 2.5, 3.0], "S", params={"tau": tau})
     assert s == [3, 3, 3, 3, 1]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1124: fixed for plain runs only. A sensitivity run's fire needs a located "
+    "crossing for its jump, so it still records the row at 2.5 before the event (S = 3).",
+)
+def test_a_sensitivity_run_agrees_with_a_plain_run_at_the_row():
+    """The same model and grid, with and without sensitivities, at the crossing row."""
+    text = "species S = 3; q = 0; k = 1; q' = k; E1: at (q >= 2.5): S = 1;"
+    times = _GRIDS["a_sample_on_it"]
+    model = bngsim.Model.from_antimony_string(text)
+    r = bngsim.Simulator(model, method="ode", sensitivity_params=["k"]).run(sample_times=times)
+    s = [float(v) for v in np.asarray(r.species)[:, list(r.species_names).index("S")]]
+    assert s == _column(text, times, "S")
