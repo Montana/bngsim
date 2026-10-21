@@ -111,6 +111,7 @@ class Model:
         "_varvol_amount_map",
         "_varvol_ar_conc_map",
         "_varvol_ar_amount_map",
+        "_varvol_target_amount_map",
         "_varvol_event_resize_map",
         "_periodic_disc_max_step",
         "_time_disc_conditions",
@@ -268,12 +269,22 @@ class Model:
         # conc·V_live(t); the concentration column is already correct. Empty for
         # .net, static, and AR-compartment-free models. See _sbml_loader.py.
         self._varvol_ar_amount_map: dict[str, str] = {}
+        # Populated by the SBML loader (issue #728): a concentration species that
+        # a rate rule or an assignment rule sets, in a compartment a rate rule, an
+        # assignment rule or an event sizes, mapped to ``(kind, column)``: where
+        # its live size is read, ``"species"``, ``"expression"`` or
+        # ``"observable"``. Its column holds the rule's concentration under every
+        # method, so its amount is that times V_live(t).
+        # Simulator._apply_varvol_target_amount_map records V_live(t) for
+        # Result.as_roadrunner's bare-id selector.
+        self._varvol_target_amount_map: dict[str, tuple[str, str]] = {}
         # Populated by the SBML loader (GH #131): maps a mangled species name in
         # an EVENT-RESIZED compartment to ``(comp_obs_name, V_static, hOSU)``.
         # Simulator._apply_varvol_event_resize_map applies the report-time
         # concentration correction ``× V_static/V_live`` — for every hOSU=true
         # species (both ODE and SSA) and for hOSU=false species under SSA only —
-        # reading V_live from the compartment's same-named observable column.
+        # reading V_live from the compartment's same-named observable column. A
+        # concentration species a rule sets is left to _varvol_target_amount_map.
         # Empty for .net, static, and event-resize-free models. See _sbml_loader.py.
         self._varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
         # Populated by the SBML loader (GH #88): a recommended integrator
@@ -921,20 +932,25 @@ class Model:
             if derived is None:
                 try:
                     from bngsim._switch_sensitivity import (
+                        _monotone_pieces,
                         _strip_redundant_parens,
                         time_discontinuity_conditions,
                     )
 
-                    registered = {
-                        _strip_redundant_parens(c).replace(" ", "")
-                        for c in self._time_disc_conditions
-                    }
+                    def spelled(c: str) -> str:
+                        return _strip_redundant_parens(c).replace(" ", "")
+
+                    registered = {spelled(c) for c in self._time_disc_conditions}
+                    # The loader registers a turning comparison as its two
+                    # edges (issue #904), `abs(time()-5) < 0.01` as `time()-5`
+                    # against 0.01 and -0.01, so one found whole is registered
+                    # where both of its edges are.
                     derived = tuple(
                         c
                         for c in time_discontinuity_conditions(
                             self._core, clock_candidates=None if key is None else key[0]
                         )
-                        if _strip_redundant_parens(c).replace(" ", "") not in registered
+                        if not all(spelled(p) in registered for p in _monotone_pieces(c) or [c])
                     )
                 except Exception as e:  # pragma: no cover - defensive
                     # Recovery is best-effort: without it a model keeps the
@@ -1001,7 +1017,10 @@ class Model:
         times the state decides, so no stop can be placed at them before the
         run. :meth:`Simulator.run` registers each one as a CVODE root instead,
         which stops the step at the crossing rather than letting it span a
-        narrow window and miss it.
+        narrow window and miss it. A step or bend call over state, such as
+        ``floor(T/100)`` or ``max(0, 1 - abs(T-50)/w)``, is rooted where it
+        jumps or bends, since it spells the same pulse with no comparison
+        (issue #1068).
 
         The crossings :meth:`time_discontinuity_conditions` already covers are
         left out, and so is every condition in a function that no rate law
@@ -1044,6 +1063,28 @@ class Model:
             self._state_switch_root_conditions = roots
             self._state_switch_root_covered = covered
         return self._state_switch_root_conditions
+
+    def _state_switch_stops_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """The roots :meth:`_state_switch_roots_beside` has for step and bend
+        calls, which a run with sensitivities adds as stops (issue #1068).
+        Kept in the same memo, beside the same ``covered``."""
+        key = ("calls", covered)
+        stops = self._state_switch_root_memo.get(key)
+        if stops is None:
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                stops = state_switch_root_conditions(self._core, covered=covered, calls_only=True)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "State-switch root detection failed (%s); a rate law with a step or bend "
+                    "call over model state will be integrated with sensitivities and "
+                    "without a root where the call jumps or bends (issue #1068).",
+                    e,
+                )
+                stops = ()
+            _remember(self._state_switch_root_memo, key, stops)
+        return stops
 
     def table_function_breaks(self) -> list:
         """Where the model's table functions break (issue #709): for each table
@@ -1239,6 +1280,7 @@ class Model:
         m._varvol_amount_map = dict(self._varvol_amount_map)
         m._varvol_ar_conc_map = dict(self._varvol_ar_conc_map)
         m._varvol_ar_amount_map = dict(self._varvol_ar_amount_map)
+        m._varvol_target_amount_map = dict(self._varvol_target_amount_map)
         m._varvol_event_resize_map = dict(self._varvol_event_resize_map)
         m._periodic_disc_max_step = self._periodic_disc_max_step
         m._time_disc_conditions = self._time_disc_conditions
@@ -1315,41 +1357,44 @@ class Model:
             value differs from the expression's, which is what makes an ordinary
             write round-trip (issue #188, see Notes). Use this only when the
             caller's contract is "this parameter is an independent input"; the
-            one such caller in bngsim is
+            one such caller in bngsim is the function
             :func:`bngsim.jax.differentiable_solve` with ``flat=True``. Has no
             effect on a parameter that has no defining expression.
 
         Raises
         ------
         ParameterError
-            If the parameter name is not found.
+            If the parameter name is not found, or if ``name`` is one of
+            :attr:`frozen_params` and ``value`` differs from the value it holds.
         ValueError
-            If ``name`` is one of the few SBML compartment sizes this model
-            cannot resolve to a live volume, and ``value`` differs from the size
-            it was loaded at. A compartment's value is folded at load into
-            constants — per-species volume factors, amount-declared initial
-            conditions, mass-action rate constants, SSA propensity volumes, the
-            emitted RHS, and every ``<initialAssignment>`` that reads it. Issue
-            #170 put the volume back into each fold it can reach, so most sizes
-            are now ordinary writable parameters; the residue is refused by name
-            rather than half-honoured, because honoring only some folds leaves
-            the model internally inconsistent rather than moving the volume.
-            :attr:`unwritable_compartment_size_params` lists them; load at the
-            size you want instead (:meth:`from_sbml` accepts
-            ``compartment_sizes={...}``). Writing the value it already holds is
-            allowed, so round-tripping a full parameter vector still works.
-
-            Also raised, on the same unchanged-write rule, for a *synthesized
-            slot* — :attr:`param_is_internal`. One of those is a **function's**
-            name: the engine keeps the function's evaluated value in a parameter
-            slot and rewrites it from the function's own expression before every
-            derivative evaluation, so a write here is discarded at the next one.
-            It used to be accepted — :meth:`get_param` echoed the new value back
-            and the trajectory did not move (issue #227). Write the parameters
-            the function's expression reads instead.
+            If ``name`` is an SBML compartment size this model cannot resolve to
+            a live volume, or a synthesized slot, and ``value`` differs from the
+            value it holds. See Notes.
 
         Notes
         -----
+        A compartment's value is folded at load into constants — per-species
+        volume factors, amount-declared initial conditions, mass-action rate
+        constants, SSA propensity volumes, the emitted RHS, and every
+        ``<initialAssignment>`` that reads it. Issue #170 put the volume back
+        into each fold it can reach, so most sizes are now ordinary writable
+        parameters; the residue is refused by name rather than half-honoured,
+        because honoring only some folds leaves the model internally
+        inconsistent rather than moving the volume. They are listed in
+        :attr:`unwritable_compartment_size_params`; load at the size you want
+        instead (:meth:`from_sbml` accepts ``compartment_sizes={...}``). Writing
+        the value it already holds is allowed, so round-tripping a full
+        parameter vector still works.
+
+        A *synthesized slot* — :attr:`param_is_internal` — is refused on the
+        same unchanged-write rule. One of those is a **function's** name: the
+        engine keeps the function's evaluated value in a parameter slot and
+        rewrites it from the function's own expression before every derivative
+        evaluation, so a write here is discarded at the next one. It used to be
+        accepted — :meth:`get_param` echoed the new value back and the
+        trajectory did not move (issue #227). Write the parameters the
+        function's expression reads instead.
+
         Writing a parameter also re-derives every expression-valued parameter
         that reads it (BNG ``setParameter`` semantics), and — issue #79 — every
         **species initial condition that names one of them**. ``A() Stot`` in a
@@ -1364,7 +1409,7 @@ class Model:
         The **declared** initial condition always follows, so :meth:`reset`
         rebuilds from current parameter values rather than from a snapshot taken
         at load. The **live** concentration follows only while the species is
-        still sitting on that initial condition: a species a :meth:`run` has
+        still sitting on that initial condition: a species a :meth:`Simulator.run` has
         advanced, or that :meth:`set_concentration` has assigned, keeps its
         value and picks the new initial condition up at the next :meth:`reset`.
 
@@ -1375,8 +1420,8 @@ class Model:
         for an SBML ``initialAssignment`` too complex to be a single parameter
         reference (``2*init_X + offset``), which is evaluated once at load.
 
-        Writing a **derived** parameter — one of the
-        :attr:`param_is_expression` symbols, ``d`` in ``d = d__FREE`` or a
+        Writing a **derived** parameter — one of the symbols in
+        :attr:`param_is_expression`, ``d`` in ``d = d__FREE`` or a
         loader-synthesized ``_rateLaw{N}`` — *overrides* its expression rather
         than moving it: ``d`` stops tracking ``d__FREE``, which is BNG's
         ``setParameter`` semantics. The override is keyed on the value and so is
@@ -1724,6 +1769,12 @@ class Model:
 
         Implements BNG ``resetConcentrations()`` / ``resetConcentrations("name")``.
 
+        A snapshot saved with a forward-sensitivity seed (a pre-equilibrated
+        state — see :meth:`save_concentrations`) restores that ``dx/dθ`` along
+        with the concentrations, so a following
+        ``run(carry_sensitivities=True)`` measures from the right seed
+        (issue #81).
+
         Parameters
         ----------
         label : str, optional
@@ -1732,12 +1783,6 @@ class Model:
             conditions, or the last unlabeled :meth:`save_concentrations`). When a
             ``label`` is given, restores the named snapshot saved by
             ``save_concentrations(label)``.
-
-        A snapshot saved with a forward-sensitivity seed (a pre-equilibrated
-        state — see :meth:`save_concentrations`) restores that ``dx/dθ`` along
-        with the concentrations, so a following
-        ``run(carry_sensitivities=True)`` measures from the right seed
-        (issue #81).
 
         Raises
         ------
@@ -2485,13 +2530,32 @@ class Model:
         overrides the expression and flips its entry to ``False`` until the
         override is lifted (issue #188 — see :meth:`set_param`).
         :attr:`param_expressions` keeps the defining expression throughout, so
-        a non-empty expression paired with ``False`` here is exactly an
-        overridden derived parameter, as distinct from a genuine primary. That
-        pairing is also the whole of what the generated C source depends on:
-        an override moves the chain rule, and nothing else about a parameter
-        write does.
+        an entry that is ``False`` here while its expression there names
+        another of the model's symbols is exactly an overridden derived
+        parameter, as distinct from a genuine primary, whose text is a number
+        (``2e7``, ``1/7``) or empty. That pairing is also the whole of what the
+        generated C source depends on: an override moves the chain rule, and
+        nothing else about a parameter write does.
         """
         return list(self._core.param_is_expression)
+
+    @property
+    def param_expressions(self) -> list[str]:
+        """Per-parameter defining text, parallel to :attr:`param_names`.
+
+        For a derived parameter (:attr:`param_is_expression`), the expression it
+        is re-evaluated from, such as ``1/S0``. It stays on record while a
+        :meth:`set_param` override pins the parameter to a literal, which is how
+        an overridden derived parameter is told from a genuine primary.
+
+        Anything else has a number or nothing here: a primary read from a
+        ``.net`` file keeps its value as the file wrote it (``2e7``, ``1/7``),
+        and most SBML primaries and every synthesized slot
+        (:attr:`param_is_internal`) have ``""``. This is the declaration, which
+        a write does not change, so read a parameter's value with
+        :meth:`get_param`.
+        """
+        return list(self._core.param_expressions)
 
     @property
     def param_is_internal(self) -> list[bool]:

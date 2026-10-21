@@ -933,9 +933,9 @@ def test_ar_compartments_reading_each_others_concentrations_are_refused():
     assert "cv reads W in cw" in str(exc.value) and "cw reads X in cv" in str(exc.value)
 
 
-def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refused():
-    """An amount in a compartment an assignment rule sizes has no right rate
-    accessor yet (#736), so a size that reads one is refused, not read."""
+def _sized_by_an_amount_in_a_sized_compartment(wa_decays):
+    """cv := 1 + 0.1*Wa, Wa an amount in ``cw := 1 + time``; with ``wa_decays``
+    a reaction takes Wa down at k."""
     sbml = _species_sized_sbml(
         _one_plus_tenth_of("<ci>Wa</ci>"),
         '<species id="Wa" compartment="cw" initialAmount="1" hasOnlySubstanceUnits="true"'
@@ -948,8 +948,31 @@ def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refuse
         '<compartment id="cv" size="1" constant="false"/>'
         '<compartment id="cw" size="1" constant="false"/>',
     )
+    if wa_decays:
+        sbml = sbml.replace(
+            "</listOfReactions>",
+            '<reaction id="degWa" reversible="false"><listOfReactants>'
+            '<speciesReference species="Wa" stoichiometry="1" constant="true"/></listOfReactants>'
+            f"<kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>Wa</ci></apply></math>"
+            "</kineticLaw></reaction></listOfReactions>",
+        )
+    return sbml
+
+
+def test_ar_compartment_reading_an_amount_in_another_sized_compartment_is_refused():
+    """An amount in a compartment an assignment rule sizes has no right rate
+    accessor yet (#736), so a size that reads one is refused, not read."""
     with pytest.raises(bngsim.ModelError, match=r"reads Wa, an amount in compartment cw.*#736"):
-        bngsim.Model.from_sbml_string(sbml)
+        bngsim.Model.from_sbml_string(_sized_by_an_amount_in_a_sized_compartment(True))
+
+
+def test_ar_compartment_reading_an_amount_nothing_changes_holds():
+    """An amount that no reaction, rule or event changes keeps its value
+    whatever its compartment's size does, so cv holds at 1.1 and needs no
+    rate. It was refused as above, for an accessor it does not need."""
+    model, res = _run(_sized_by_an_amount_in_a_sized_compartment(False), t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)
 
 
 def test_ar_compartment_sized_by_an_event_parameter_and_a_species_dilutes():
@@ -1012,3 +1035,250 @@ def test_ar_compartment_sized_by_a_constant_species_in_a_moving_compartment():
     t = np.asarray(res.time)
     np.testing.assert_allclose(_conc(res, "Kw"), 10 / (1 + t), rtol=1e-7)
     np.testing.assert_allclose(_conc(res, "Sn"), 10 * (1 + t) / (2 + t), rtol=1e-6, atol=1e-8)
+
+
+# ── An AR compartment whose size rule reads a reaction's rate ────────────────
+#
+# A reaction's id in math is its rate, its kinetic law's value. degS runs at
+# k*S*c = 0.5*S, so `cv := 1 + 0.1*(2*degS)` is `_SIZED_BY_S`'s size, and the
+# same closed form holds. Section 8c read degS as a constant and gave cv no
+# rate, so nothing in cv was diluted: [Sn](2) was 5 for 7.311.
+
+_SIZED_BY_DEG_S = _species_sized_sbml(
+    _one_plus_tenth_of("<apply><times/><cn>2</cn><ci>degS</ci></apply>")
+)
+_DEG_S_LAW = (
+    f"<kineticLaw><math {_MATHML}><apply><times/><ci>k</ci><ci>S</ci><ci>c</ci></apply>"
+    "</math></kineticLaw>"
+)
+
+
+def _deg_s_reads_a_local_rate_constant(sbml):
+    """degS reads its own local kd = 0.5 where it read k, beside a global kd = 5
+    that the local shadows."""
+    assert _DEG_S_LAW in sbml
+    return sbml.replace(
+        _DEG_S_LAW,
+        f"<kineticLaw><math {_MATHML}><apply><times/><ci>kd</ci><ci>S</ci><ci>c</ci></apply>"
+        '</math><listOfLocalParameters><localParameter id="kd" value="0.5"/>'
+        "</listOfLocalParameters></kineticLaw>",
+    ).replace(
+        "</listOfParameters>", '<parameter id="kd" value="5" constant="true"/></listOfParameters>'
+    )
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    "local", [False, True], ids=["global-rate-constant", "local-rate-constant"]
+)
+def test_ar_compartment_sized_by_a_reaction_rate_dilutes(codegen, local):
+    sbml = _deg_s_reads_a_local_rate_constant(_SIZED_BY_DEG_S) if local else _SIZED_BY_DEG_S
+    model = bngsim.Model.from_sbml_string(sbml)
+    res = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0, 4), n_points=9, rtol=1e-11, atol=1e-13
+    )
+    _assert_species_sized(res)
+
+
+def test_ar_compartment_sized_by_a_reaction_rate_is_resized_at_an_event():
+    """An event that sets S makes degS jump, and cv with it, so the event
+    rescales cv's concentrations as it does for a size that reads S itself."""
+    sbml = _SIZED_BY_DEG_S.replace(
+        " </model>",
+        f""" <listOfEvents><event id="refill" useValuesFromTriggerTime="true">
+   <trigger initialValue="false" persistent="true"><math {_MATHML}><apply><gt/>
+    <csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>
+    <cn>1</cn></apply></math></trigger>
+   <listOfEventAssignments><eventAssignment variable="S"><math {_MATHML}><cn>20</cn></math>
+   </eventAssignment></listOfEventAssignments>
+  </event></listOfEvents>
+ </model>""",
+    )
+    _, res = _run(sbml, t_end=4.0, n=9)
+    t = np.asarray(res.time)
+    s = np.where(t > 1 + 1e-9, 20 * np.exp(-_K * (t - 1)), 10 * np.exp(-_K * t))
+    v = 1 + 0.1 * s
+    np.testing.assert_allclose(_conc(res, "Sn"), 10 / v, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(_conc(res, "X"), 20 * np.exp(-_K * t) / v, rtol=1e-6, atol=1e-8)
+
+
+def _deg_s_slows_at_two(sbml):
+    """degS runs at a fifth of its rate from t = 2, so cv jumps there."""
+    assert _DEG_S_LAW in sbml
+    law = "<apply><times/><ci>k</ci><ci>S</ci><ci>c</ci></apply>"
+    return sbml.replace(
+        _DEG_S_LAW,
+        f"<kineticLaw><math {_MATHML}><piecewise><piece>{law}<apply><lt/>"
+        '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t'
+        f"</csymbol><cn>2</cn></apply></piece><otherwise><apply><times/><cn>0.2</cn>{law}"
+        "</apply></otherwise></piecewise></math></kineticLaw>",
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [_deg_s_reads_a_local_rate_constant, _deg_s_slows_at_two],
+    ids=["local-rate-constant", "rate-that-jumps"],
+)
+def test_ar_compartment_sized_by_a_reaction_rate_matches_roadrunner(variant):
+    t_end, n = 4.0, 9
+    sbml = variant(_SIZED_BY_DEG_S)
+    ref = _rr_sim(sbml, ["time", "[Sk]", "[Sn]", "[X]", "cv"], t_end, n)
+    _, res = _run(sbml, t_end=t_end, n=n)
+    for i, sid in enumerate(("Sk", "Sn", "X"), start=1):
+        np.testing.assert_allclose(_conc(res, sid), ref[:, i], rtol=1e-6, atol=1e-8, err_msg=sid)
+
+
+def test_ar_compartment_sized_by_a_species_no_reaction_changes_takes_no_rate():
+    """A species that no reaction, rule or event changes holds its value, as a
+    constant one does, so a size that reads it has rate 0 and needs no rate
+    accessor (which the SSA cannot run)."""
+    sbml = _species_sized_sbml(
+        _one_plus_tenth_of("<ci>Kf</ci>"),
+        '<species id="Kf" compartment="c" initialConcentration="10" hasOnlySubstanceUnits="false"'
+        ' boundaryCondition="false" constant="false"/>',
+    )
+    model, res = _run(sbml, t_end=4.0, n=9)
+    assert model._core.uses_rateof is False
+    np.testing.assert_allclose(_conc(res, "Sn"), 5.0, rtol=1e-9)
+
+
+# ── A diamond of rules under the size ────────────────────────────────────────
+#
+# r_1 := t, r_2 := 1 + t, r_i := f(r_{i-1}, r_{i-2}), cv := a + b*r_n: each rule
+# is read by the next two, so the paths from the size down to r_1 double every
+# two rules. §8c parsed and differentiated each rule once per path (the chain
+# rule for V̇, and the inlined size the #1054 jumps read), 17.6 s to load at
+# n = 22, and wrote each rate and size out once per path as well: for a
+# non-linear f the term had 22,122 characters at n = 16 and the jump's rescale
+# 44,839, x2.6 for every two more rules. S is flux-free, so [S] = A/V(t).
+
+_T_CI = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+
+
+def _diamond_sbml(n, nonlinear=False, jump=False):
+    """f = sin(r_{i-1}) + cos(r_{i-2}) with cv := 2 + 0.1*r_n, or f = r_{i-1} + r_{i-2}
+    with cv := 1 + 0.001*r_n; ``jump`` adds 2 to the size from t = 2 on, as a
+    piecewise."""
+
+    def rule(var, body):
+        return f'<assignmentRule variable="{var}"><math {_MATHML}>{body}</math></assignmentRule>'
+
+    rules = [rule("r_1", _T_CI), rule("r_2", f"<apply><plus/><cn>1</cn>{_T_CI}</apply>")]
+    for i in range(3, n + 1):
+        a, b = f"<ci>r_{i - 1}</ci>", f"<ci>r_{i - 2}</ci>"
+        body = (
+            f"<apply><plus/><apply><sin/>{a}</apply><apply><cos/>{b}</apply></apply>"
+            if nonlinear
+            else f"<apply><plus/>{a}{b}</apply>"
+        )
+        rules.append(rule(f"r_{i}", body))
+    base, scale = (2, 0.1) if nonlinear else (1, 0.001)
+
+    def size(offset):
+        return (
+            f"<apply><plus/><cn>{base + offset}</cn>"
+            f"<apply><times/><cn>{scale}</cn><ci>r_{n}</ci></apply></apply>"
+        )
+
+    cv = (
+        f"<piecewise><piece>{size(0)}<apply><lt/>{_T_CI}<cn>2</cn></apply></piece>"
+        f"<otherwise>{size(2)}</otherwise></piecewise>"
+        if jump
+        else size(0)
+    )
+    params = "".join(
+        f'<parameter id="r_{i}" value="0" constant="false"/>' for i in range(1, n + 1)
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+ <model id="diamond">
+  <listOfCompartments><compartment id="cv" size="1" constant="false"/></listOfCompartments>
+  <listOfSpecies>
+   <species id="S" compartment="cv" initialConcentration="2" hasOnlySubstanceUnits="false"
+            boundaryCondition="false" constant="false"/>
+  </listOfSpecies>
+  <listOfParameters>{params}</listOfParameters>
+  <listOfRules>{"".join(rules)}{rule("cv", cv)}</listOfRules>
+ </model>
+</sbml>"""
+
+
+def _diamond_size(t, n, nonlinear=False, jump=False):
+    r = [None, t, 1 + t]
+    for i in range(3, n + 1):
+        r.append(np.sin(r[i - 1]) + np.cos(r[i - 2]) if nonlinear else r[i - 1] + r[i - 2])
+    v = 2 + 0.1 * r[n] if nonlinear else 1 + 0.001 * r[n]
+    return v + 2 * (t >= 2) if jump else v
+
+
+def _parses(monkeypatch) -> list:
+    from bngsim import _jacobian
+
+    real = _jacobian._exprtk_to_sympy
+    parsed: list = []
+
+    def counted(text, *args, **kwargs):
+        parsed.append(text)
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(_jacobian, "_exprtk_to_sympy", counted)
+    return parsed
+
+
+def test_a_diamond_of_rules_is_parsed_once_per_rule(monkeypatch):
+    """Each of the 13 rules is parsed once, not once per path to it: 576
+    parses at n = 12, r_2's 178 times."""
+    parsed = _parses(monkeypatch)
+    bngsim.Model.from_sbml_string(_diamond_sbml(12, nonlinear=True, jump=True))
+    assert len(parsed) == len(set(parsed)) == 13
+
+
+def test_a_diamond_of_rules_is_written_once_per_rule(monkeypatch):
+    """Each rule's rate is written once (a shared one as its own `_ddt_`
+    function), and the jump's sizes read the rules by name, so the text grows
+    with the rules, not with the paths through them."""
+    from bngsim import _bngsim_core
+
+    rescales: list[str] = []
+
+    class Builder(_bngsim_core.ModelBuilder):
+        def add_event(self, name, trigger, assignments, *args, **kwargs):
+            if name.startswith("_size_jump_"):
+                rescales.extend(expr for _, expr in assignments)
+            return super().add_event(name, trigger, assignments, *args, **kwargs)
+
+    monkeypatch.setattr(_bngsim_core, "ModelBuilder", Builder)
+    n = 16
+    model = bngsim.Model.from_sbml_string(_diamond_sbml(n, nonlinear=True, jump=True))
+    rate_text = sum(
+        len(expr)
+        for name, expr in zip(
+            model._core.function_names, model._core.function_expressions, strict=True
+        )
+        if name.startswith(("_dil_", "_ddt_"))
+    )
+    assert rate_text < 60 * n  # 542 characters, from 22,122
+    assert len(rescales) == 2 and all(len(r) < 200 for r in rescales)  # 81 each, from 44,839
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    ("nonlinear", "jump"),
+    [(False, False), (True, False), (True, True)],
+    ids=["linear", "non-linear", "non-linear-jump"],
+)
+def test_a_diamond_of_rules_dilutes(nonlinear, jump, codegen):
+    """[S] = A/V(t), A = 2·V(0), through the rates written by name and the
+    jump at t = 2."""
+    n = 12
+    model = bngsim.Model.from_sbml_string(_diamond_sbml(n, nonlinear, jump))
+    res = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0, 4), n_points=9, rtol=1e-11, atol=1e-13
+    )
+    t = np.asarray(res.time)
+    amount = 2 * _diamond_size(0.0, n, nonlinear, jump)
+    expected = amount / _diamond_size(t, n, nonlinear, jump)
+    np.testing.assert_allclose(_conc(res), expected, rtol=1e-7, atol=1e-10)

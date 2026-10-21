@@ -8,6 +8,7 @@ rejection is also exercised here.
 
 import math
 
+import bngsim
 import numpy as np
 import pytest
 from bngsim._bngsim_core import ModelBuilder, SsaSimulator, TimeSpec
@@ -42,6 +43,70 @@ def test_ssa_event_time_trigger_fires_at_exact_time():
             assert S[i] == 100.0, f"t={ti}: expected 100 pre-event, got {S[i]}"
         else:
             assert S[i] == 200.0, f"t={ti}: expected 200 post-event, got {S[i]}"
+
+
+def test_ssa_event_strict_time_trigger_leaves_the_row_at_its_threshold_before_it():
+    """`time() > 5` is false at 5: the event fires just after it, so the
+    sample at t=5 reads the pre-event 100, as ODE and libRoadRunner read
+    it. The bisection placed the event within 1e-12 above 5, and the row,
+    within the 1e-9 that a sample is taken as the event's own time,
+    recorded 200. Without breakpoints, as a bare SsaSimulator runs."""
+    b = ModelBuilder()
+    s_idx = b.add_species("S", 100.0)
+    b.add_event("jump", "time() > 5", [(s_idx, "200")], initial_value=False)
+    model = b.build()
+
+    result = SsaSimulator(model).run(_ts(t_end=10.0, n_points=11), 42)
+    t = np.array(result.time)
+    S = np.array(result.species_data)[:, 0]
+    np.testing.assert_array_equal(S, np.where(t > 5.0, 200.0, 100.0))
+
+
+# A row exactly at, and one 5e-10 before, the time a trigger on the clock
+# turns true, beside the run's ends. Each loop of the engine: a model that no
+# reaction changes (it idles to the event), one a reaction keeps firing, one
+# with a rate rule, and one with a rate that reads the clock.
+_ROWS_AT_THE_THRESHOLD = [0.0, 2.5 - 5e-10, 2.5, 5.0]
+_LOOPS = {
+    "idle": ("", "c = 3"),
+    "firing": ("species Y in c = 0; J: -> Y; 4", "c = 3"),
+    "rate rule": ("q = 0; q' = 1", "c = 3"),
+    "rate on the clock": ("species Y in c = 0; J: -> Y; 1 + time", "S = 1"),
+}
+
+
+@pytest.mark.parametrize("method", ["ssa", "psa"])
+@pytest.mark.parametrize("loop", list(_LOOPS))
+@pytest.mark.parametrize(
+    ("trigger", "at_threshold"), [("time > 2.5", 3.0), ("time >= 2.5", 1.0)], ids=[">", ">="]
+)
+def test_a_row_at_a_time_triggers_threshold_reads_the_side_ode_reads(
+    trigger, at_threshold, loop, method
+):
+    """`E1: at time > 2.5: c = 3` beside `species S in c = 3`: the trigger is
+    false at 2.5 itself, so nothing has fired there, and ODE and libRoadRunner
+    read [S] = 3 in a row at 2.5. With `>=` the event fires at 2.5, and the row
+    reads 1, as the SBML suite reads a row at an event's time (00928 at t = 0;
+    DSMTS 00028 at 25). SSA and PSA read 1 in both rows, for both triggers,
+    in a model with no rate rule and no rate on the clock, at any seed, and 1
+    in the row 5e-10 before a `>=` event in the other loops where the step
+    that found the event held that row too: a row within 1e-9 below an event
+    was taken as the event's own time."""
+    extra, assignment = _LOOPS[loop]
+    ant = f"compartment c = 1; species S in c = 3; E1: at {trigger}: {assignment}\n{extra}\n"
+    want = [3.0, 3.0, at_threshold, 1.0]
+
+    def conc(method, **kw):
+        model = bngsim.Model.from_antimony_string(ant)
+        run = bngsim.Simulator(model, method=method, **kw).run(
+            sample_times=_ROWS_AT_THE_THRESHOLD, seed=7
+        )
+        return np.asarray(run.as_roadrunner(["[S]"])["[S]"], dtype=float)
+
+    np.testing.assert_allclose(conc("ode"), want, rtol=1e-12)
+    np.testing.assert_array_equal(
+        conc(method, **({"poplevel": 10} if method == "psa" else {})), want
+    )
 
 
 def test_ssa_event_state_dependent_trigger():

@@ -93,7 +93,7 @@ RoundingPolicy = Literal["nearest", "floor", "ceil", "stochastic"]
 """Discretization rule for the continuous→count hand-off.
 
 ``"nearest"`` rounds half away from zero (matching the SSA engine's entry
-rounding, :func:`round_initial_population_to_storage` in ``ssa_simulator.cpp``);
+rounding, ``round_initial_population_to_storage`` in ``src/ssa_simulator.cpp``);
 ``"floor"`` / ``"ceil"`` truncate; ``"stochastic"`` rounds up with probability
 equal to the fractional part (unbiased in expectation, needs an RNG).
 """
@@ -336,7 +336,7 @@ class CouplingMap:
 
     @classmethod
     def from_model(cls, model: Model | ReactionKernel, shared_names: Sequence[str]) -> CouplingMap:
-        """Build from a model/kernel's :attr:`species_names`."""
+        """Build from a model/kernel's :attr:`~Model.species_names`."""
         m = _resolve_model(model)
         return cls(m.species_names, shared_names)
 
@@ -459,7 +459,8 @@ class DiscreteExchange:
     """Explicit, inspectable rounding at the SSA/NFsim hand-off with leak accounting.
 
     The SSA engine already rounds whatever continuous storage it is handed at the
-    next ``advance`` (:func:`round_initial_population_to_storage`), but that entry
+    next ``advance`` (``round_initial_population_to_storage`` in
+    ``src/ssa_simulator.cpp``), but that entry
     rounding is *implicit* and silent — repeatedly injecting continuous amounts
     and reading integer counts back sheds the fractional remainder every step,
     which leaks mass over a long hybrid run. :class:`DiscreteExchange` makes the
@@ -839,8 +840,8 @@ def get_compartment_volume(model: Model | ReactionKernel, name: str) -> float:
     There is no ``Compartment`` object in bngsim — a compartment volume is a
     plain parameter, so this is :meth:`Model.get_param`, named for the coupling
     use it serves: feeding the *current* volume into
-    :meth:`UnitConverter.to_concentrations` / :meth:`from_concentrations` as the
-    live-volume override.
+    :meth:`UnitConverter.to_concentrations` /
+    :meth:`UnitConverter.from_concentrations` as the live-volume override.
     """
     return _resolve_model(model).get_param(name)
 
@@ -1125,6 +1126,7 @@ def make_subset_model(
         "_varvol_amount_map",
         "_varvol_ar_conc_map",
         "_varvol_ar_amount_map",
+        "_varvol_target_amount_map",
         "_varvol_event_resize_map",
     ):
         setattr(sub, attr, dict(getattr(m, attr, {}) or {}))

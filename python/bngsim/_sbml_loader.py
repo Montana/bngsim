@@ -1219,14 +1219,25 @@ def _collect_relational_edge_conditions(
 
     ``local_params`` is the lexical scope the emitted text is written in: the
     formal-parameter → call-site-expression binding when *node* is a function
-    definition's body (see :func:`_iter_funcdef_scan_frames`). ``None`` — the
-    event-trigger and top-level cases — is model scope.
+    definition's body (see :func:`_iter_funcdef_scan_frames`), which the
+    event-trigger scan walks as the time and state scans do. ``None`` is
+    model scope.
 
     ``equalities``, a list, receives each two-sided ``==`` and ``!=`` the same
     way. Not a root: an equality on the clock holds (or fails) at one double,
     which no root finder brackets. The event-trigger scan asks for them so the
     run can stop on that double (``at (time == 2)``).
+
+    A relational of a lone ``abs()``, or of a lone square against a number,
+    is appended as the two edges it turns at (issue #904):
+    ``abs(A - 5) < 0.01`` as ``A - 5`` against ``0.01`` and ``-0.01``. Its own
+    truth is false at both ends of a step that passes A = 5, so a root on it
+    reported nothing, and an event on it never fired. Each edge flips once
+    there. The rate-law scan reads the same pieces
+    (:func:`bngsim._switch_sensitivity._monotone_pieces`).
     """
+    from bngsim._switch_sensitivity import _monotone_pieces
+
     global _INEQ_RELATIONAL_OPS
     if node is None:
         return
@@ -1248,7 +1259,8 @@ def _collect_relational_edge_conditions(
                     continue
                 lhs = _ast_to_exprtk_with_funcdefs(a, func_defs, local_params)
                 rhs = _ast_to_exprtk_with_funcdefs(b, func_defs, local_params)
-                out.append(f"({lhs}{op}{rhs})")
+                atom = f"{lhs}{op}{rhs}"
+                out.extend(f"({piece})" for piece in _monotone_pieces(atom) or [atom])
         elif (
             equalities is not None
             and nc == 2
@@ -2019,17 +2031,26 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
       * **rate-rule target** (parameter / species / compartment): the rate is the
         rule's RHS — ``dx/dt`` is stated directly (01250: ``rateOf(p1)`` where
         ``p1`` has rate rule ``1`` ⇒ ``1``).
-      * **reaction-driven species**: ``dAmount/dt = Σ net_stoich·kineticLaw``
-        over every reaction, in the species' reporting units — amount-rate for a
-        ``hasOnlySubstanceUnits`` species, else concentration-rate (``÷V``). This
+      * **reaction-driven species**: ``dAmount/dt = cf·Σ net_stoich·kineticLaw``
+        over every reaction, with ``cf`` the species' conversion factor or the
+        model's (1 with neither), in the species' reporting units — amount-rate
+        for a ``hasOnlySubstanceUnits`` species, else concentration-rate
+        (``÷V``, less ``[S]·V'/V`` where a rate rule sizes the compartment). This
         mirrors ``current_derivs`` (which holds d[conc]/dt) and the sub-cluster-3
         ``report_rateof_amount`` ×V convention (01251/01252/01254, all V=1).
       * **boundary / constant species** with no rate rule: not changed by
-        reactions ⇒ ``0``.
+        reactions ⇒ ``0``, or ``-[S]·V'/V`` for a concentration in a compartment
+        a rate rule sizes (its amount holds).
+
+    A rate rule or kinetic law can itself read a rateOf: ``p' = 0.5*rateOf(S3)``
+    makes ``rateOf(p)`` half the rate of ``S3``. Such a rateOf is resolved
+    through this resolver as well, on the same initial state.
 
     Returns ``None`` (fold fails, target keeps its declared value) when the
     derivative can't be evaluated — an unknown symbol, an unsupported kinetic
-    law, or a rateOf of something with no rate rule and no reaction.
+    law, a rateOf of something with no rate rule and no reaction, or rates that
+    are written in terms of each other in a ring (an algebraic loop, which the
+    run refuses too).
     """
     rate_rule_math: dict[str, libsbml.ASTNode] = {}
     for i in range(sbml_model.getNumRules()):
@@ -2041,6 +2062,74 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         sbml_model.getSpecies(i).getId(): sbml_model.getSpecies(i)
         for i in range(sbml_model.getNumSpecies())
     }
+    idiom_names = {
+        name for name, (_p, body) in (func_defs or {}).items() if body is _RATEOF_FUNCDEF
+    }
+
+    def _rateof_args(m) -> set[str]:
+        """The symbols whose rateOf ``m`` reads, by the csymbol or by a call to
+        COPASI's rateOf idiom."""
+        return {
+            n.getChild(0).getName()
+            for n in _iter_ast_subtree(m)
+            if (
+                n.getType() == libsbml.AST_FUNCTION_RATE_OF
+                or (n.getType() == libsbml.AST_FUNCTION and n.getName() in idiom_names)
+            )
+            and n.getNumChildren() >= 1
+            and n.getChild(0).getType() == libsbml.AST_NAME
+        }
+
+    law_rates_read: dict[int, set[str]] = {}
+
+    def _rates_read(name, ctx) -> set[str]:
+        """The symbols whose rate ``_rate`` reads in working out the rate of
+        ``name``: those a rate rule or a kinetic law of a reaction that changes
+        it reads the rateOf of, and the size of the compartment that dilutes a
+        concentration."""
+        if name in rate_rule_math:
+            return _rateof_args(rate_rule_math[name])
+        sp = species_by_id.get(name)
+        if sp is None:
+            return set()
+        out = set() if sp.getHasOnlySubstanceUnits() else {sp.getCompartment()}
+        if sp.getBoundaryCondition() or sp.getConstant():
+            return out
+        for j in range(sbml_model.getNumReactions()):
+            rxn = sbml_model.getReaction(j)
+            kl = rxn.getKineticLaw()
+            if kl is None or not kl.isSetMath() or not _net_stoich(rxn, name, ctx):
+                continue
+            if j not in law_rates_read:
+                # A local parameter shadows the global of the same id, and
+                # nothing changes it.
+                law_rates_read[j] = (
+                    _rateof_args(kl.getMath()) - _kinetic_law_local_values(kl).keys()
+                )
+            out |= law_rates_read[j]
+        return out
+
+    def _rates_first(name, ctx) -> list[str] | None:
+        """``name`` and every symbol whose rate its rate reads, each after the
+        ones its own rate reads; ``None`` where they read each other in a ring.
+        The walk keeps its own stack, so a long chain of rates costs no depth."""
+        order: list[str] = []
+        on_path, finished = {name}, set()
+        stack = [(name, iter(_rates_read(name, ctx)))]
+        while stack:
+            n, reads = stack[-1]
+            nxt = next(reads, None)
+            if nxt is None:
+                stack.pop()
+                on_path.discard(n)
+                finished.add(n)
+                order.append(n)
+            elif nxt in on_path:
+                return None
+            elif nxt not in finished:
+                on_path.add(nxt)
+                stack.append((nxt, iter(_rates_read(nxt, ctx))))
+        return order
 
     def _net_stoich(rxn, sid, ctx):
         """Signed product−reactant stoichiometry of ``sid`` in ``rxn`` (0 if absent)."""
@@ -2070,10 +2159,31 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 net += sign * sval
         return net
 
-    def resolver(name, ctx):
+    def _concentration_rate(name, sp, amt_rate, ctx):
+        """d[S]/dt = (d amount/dt)/V - [S]·(dV/dt)/V. dV/dt is the compartment's
+        rate rule, or 0 (issue #738: 01822 folded 1 for 0.675 without it)."""
+        vol = ctx.get(sp.getCompartment(), 1.0)
+        if not vol:
+            return None
+        dvol = resolver(sp.getCompartment(), ctx)
+        if dvol is None:
+            return None
+        if dvol == 0.0:
+            return amt_rate / vol
+        conc = ctx.get(name)
+        if conc is None:
+            return None
+        return amt_rate / vol - conc * dvol / vol
+
+    def _rate(name, ctx):
         # 1) rate-rule target — dx/dt is the rule's RHS, in the target's units.
+        # A rateOf the rule reads is the rate of its argument at the same
+        # instant: `rateOf(p)` under `p' = 0.5*rateOf(S3)` was refused at
+        # load, where the run and libRoadRunner read 0.2.
         if name in rate_rule_math:
-            return _eval_ast_numeric(rate_rule_math[name], ctx, func_defs)
+            return _eval_ast_numeric(
+                rate_rule_math[name], ctx, func_defs, rateof_resolver=resolver
+            )
         sp = species_by_id.get(name)
         if sp is None:
             # A parameter / compartment with no rate rule is constant ⇒ 0. One
@@ -2082,10 +2192,15 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             # functionDefinition whose body reads rateOf, which would reach
             # here with the body's own argument name.
             return 0.0
-        # 2) species — boundary or constant species is held by reactions ⇒ 0.
+        # 2) species — reactions do not change a boundary or constant species, so
+        # its amount holds. Held as a concentration in a compartment a rate rule
+        # sizes, it is diluted all the same (suite 01117/01118 hold the amount as
+        # the size grows), and the run's rateOf reads -[S]·V'/V; the fold gave 0
+        # (issue #738).
         if sp.getBoundaryCondition() or sp.getConstant():
-            return 0.0
-        vol = ctx.get(sp.getCompartment(), 1.0)
+            if sp.getHasOnlySubstanceUnits() or sp.getCompartment() not in rate_rule_math:
+                return 0.0
+            return _concentration_rate(name, sp, 0.0, ctx)
         amt_rate = 0.0
         for j in range(sbml_model.getNumReactions()):
             rxn = sbml_model.getReaction(j)
@@ -2099,15 +2214,66 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
                 return None
             _lv = _kinetic_law_local_values(kl)
             law_ctx = {**ctx, **_lv} if _lv else ctx
-            v = _eval_ast_numeric(kl.getMath(), law_ctx, func_defs)
+            v = _eval_ast_numeric(
+                kl.getMath(),
+                law_ctx,
+                func_defs,
+                # The rate of a local parameter is 0; the rate of any other
+                # symbol is read on the model's state, not the law's.
+                rateof_resolver=lambda n, _c, _lv=_lv: 0.0 if n in _lv else resolver(n, ctx),
+            )
             if v is None:
                 return None
             amt_rate += net * v
+        # A conversion factor scales what the reactions do to the species: its
+        # own, or the model's where it has none (issue #738). Left out, the fold
+        # was 1/cf of what the run reads at t = 0 (01405: -0.5 for -1).
+        cf_id = (
+            sp.getConversionFactor()
+            if sp.isSetConversionFactor()
+            else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
+        )
+        if cf_id:
+            # A factor with no value yet fails the fold: the initialAssignment
+            # or rule that gives it one refolds this on a later pass, and C2c
+            # refuses one the model never gives.
+            cf = ctx.get(cf_id)
+            if cf is None:
+                return None
+            amt_rate *= cf
         # ``current_derivs`` is d[conc]/dt; rateOf reports amount-rate for a hOSU
         # species (sub-cluster 3) and concentration-rate otherwise.
         if sp.getHasOnlySubstanceUnits():
             return amt_rate
-        return amt_rate / vol if vol else None
+        return _concentration_rate(name, sp, amt_rate, ctx)
+
+    # The rates worked out for the outermost rateOf being resolved, by symbol.
+    # Every rate it reads is worked out first, in the order `_rates_first`
+    # gives, so a rateOf read on the way finds its value here rather than
+    # working it out again (a diamond of rates on rates would be read once per
+    # path through it) or on a deeper stack.
+    known_rates: list[dict | None] = [None]
+
+    def resolver(name, ctx):
+        known = known_rates[0]
+        if known is not None:
+            if name not in known:
+                # Read through the body of a function, which the walk does not
+                # follow. It is marked first so that a ring through it reads no
+                # value rather than recursing.
+                known[name] = None
+                known[name] = _rate(name, ctx)
+            return known[name]
+        order = _rates_first(name, ctx)
+        if order is None:
+            return None  # rates written in terms of each other: no value
+        known_rates[0] = known = {}
+        try:
+            for n in order:
+                known[n] = _rate(n, ctx)
+        finally:
+            known_rates[0] = None
+        return known[name]
 
     return resolver
 
@@ -2157,6 +2323,139 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
         r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(k) for k in keys) + r")(?![A-Za-z0-9_])"
     )
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
+
+
+def _rule_compartments_an_event_resizes(
+    rule_math: dict,
+    ar_comp_targets,
+    resized_comps: list[tuple[str, str]],
+    assigned: dict[str, str],
+    rescaled_species: dict[str, list[str]],
+    to_exprtk,
+    cache: dict | None = None,
+) -> list[tuple[str, str]]:
+    """``(compartment, new size)`` for each assignment-rule compartment an event
+    resizes that ``resized_comps`` does not already hold, each after the ones
+    whose resize it reads (issue #1055).
+
+    A compartment is resized by an event that changes anything its size rule
+    reads: a variable the event assigns, another compartment the event resizes,
+    or a species whose concentration that resize rescales (a concentration in a
+    resized compartment keeps its amount, so it moves). And the rule is read
+    through other assignment rules, not only its own names: ``cv := 1 + q``,
+    ``q := 0.5*p`` is resized by ``p := 4``. Only the rule's own names were read
+    before, so both kinds of indirection left the compartment's species
+    unrescaled.
+
+    The order matters because the engine reads each new size after the rescales
+    listed before it. So the set is found first and ordered after: a
+    compartment listed when it first reaches a change could still read a
+    species a later one rescales (``cw := p + 0.1*Sn`` with Sn in ``cv :=
+    1 + 0.1*Kw``, and an event setting p and Kw's compartment), and its size
+    was then read with that species unmoved.
+
+    The new size is the rule with the rules it reaches written out and the
+    event's values put in: an assigned variable's value, a resized
+    compartment's new size, and a rescaled species' value after the rescale.
+    The event's sensitivity support reads that text.
+
+    A piecewise size's jump (issue #1054) asks the same of the concentrations
+    it rescales, given as the values it assigns them.
+
+    ``rule_math`` maps each assignment rule's variable to its math, in document
+    order; ``assigned`` maps each variable the event assigns to its value;
+    ``rescaled_species`` maps a compartment to the species a resize of it
+    rescales; ``to_exprtk`` writes math as ExprTk text. ``cache``, kept by the
+    caller from one event to the next, holds what is read from the rules
+    alone, so that each rule is walked once per model rather than once per
+    event.
+    """
+    cache = {} if cache is None else cache
+    reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
+
+    def reads(var: str) -> frozenset:
+        """Every name the rule for ``var`` reads, itself or through the rules
+        it reads. Each rule is walked once, which a diamond of rules needs."""
+        if var not in reads_memo:
+            reads_memo[var] = frozenset()  # a cycle of rules reads no further
+            names: set[str] = set()
+            for n in _ast_name_set(rule_math[var]):
+                names.add(n)
+                if n in rule_math:
+                    names |= reads(n)
+            reads_memo[var] = frozenset(names)
+        return reads_memo[var]
+
+    def moves(comp: str) -> set[str]:
+        """The compartment and the species a resize of it rescales."""
+        return {comp, *rescaled_species.get(comp, ())}
+
+    changed = set(assigned)
+    for comp, _ in resized_comps:
+        changed |= moves(comp)
+    resized: list[str] = []
+    progress = True
+    while progress:
+        progress = False
+        for comp in rule_math:
+            if comp in ar_comp_targets and comp not in changed and reads(comp) & changed:
+                resized.append(comp)
+                changed |= moves(comp)
+                progress = True
+
+    # Each one after every other whose size or species it reads. Two that read
+    # each other's species have no such order and keep the document's.
+    ordered: list[str] = []
+    pending = list(resized)
+    while pending:
+        comp = next(
+            (c for c in pending if not any(reads(c) & moves(d) for d in pending if d != c)),
+            pending[0],
+        )
+        pending.remove(comp)
+        ordered.append(comp)
+
+    replacements = {_safe_name(var): expr for var, expr in assigned.items()}
+
+    def note_rescaled(comp: str, new_size: str) -> None:
+        # A species the event also assigns is given that value in the old size,
+        # and keeps the amount it makes there (as the rescale the caller
+        # injects for it does).
+        for sid in rescaled_species.get(comp, ()):
+            amount = f"({assigned[sid]})" if sid in assigned else _safe_name(sid)
+            replacements[_safe_name(sid)] = f"{amount} * ({_safe_name(comp)}) / ({new_size})"
+
+    for comp, new_size in resized_comps:
+        note_rescaled(comp, new_size)
+
+    if "rule_of" not in cache:
+        cache["rule_of"] = {_safe_name(var): var for var in rule_math}
+    rule_of: dict[str, str] = cache["rule_of"]
+    rule_text: dict[str, str] = cache.setdefault("text", {})
+
+    def inlined(expr: str, depth: int = 0) -> str:
+        """The text with each rule it reads that reaches a change written out,
+        so that the event's values can be put in."""
+        if depth > 64:
+            return expr
+        inner = {}
+        for name in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)):
+            var = rule_of.get(name)
+            if var is not None and var not in changed and reads(var) & changed:
+                if var not in rule_text:
+                    rule_text[var] = to_exprtk(rule_math[var])
+                inner[name] = rule_text[var]
+        if not inner:
+            return expr
+        return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
+
+    found: list[tuple[str, str]] = []
+    for comp in ordered:
+        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        found.append((comp, new_size))
+        replacements[_safe_name(comp)] = new_size
+        note_rescaled(comp, new_size)
+    return found
 
 
 def _piecewise_branches(node) -> tuple[list, list]:
@@ -2999,12 +3298,16 @@ def _math_names(node) -> tuple[set[str], bool]:
 
 def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     """The names each assignment rule reads, by variable, and the variables whose
-    value moves during a run: one that reads the clock, a species, a rate-rule or
-    event target, or another moving rule's variable. A rule over constants
-    (``C := 2``, ``C := p``) holds its value."""
+    value moves during a run: one that reads the clock, a species that a
+    reaction, a rule or an event changes, a rate-rule or event target, a reaction
+    whose rate moves, or another moving rule's variable. A rule over constants
+    (``C := 2``, ``C := p``) holds its value. A concentration moves with its
+    compartment's size, so a constant species is a constant only in a
+    compartment whose size holds."""
     reads: dict[str, set[str]] = {}
     moving: set[str] = set()
     rate_vars = set()
+    algebraic_names: set[str] = set()
     for j in range(sbml_model.getNumRules()):
         r = sbml_model.getRule(j)
         if r.isAssignment() and r.getMath() is not None:
@@ -3014,21 +3317,87 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
                 moving.add(r.getVariable())
         elif r.isRate():
             rate_vars.add(r.getVariable())
+        elif r.isAlgebraic() and r.getMath() is not None:
+            algebraic_names |= _math_names(r.getMath())[0]
+    if not reads:
+        return reads, moving  # no assignment rule, so none moves
     sources = set(rate_vars)
     for j in range(sbml_model.getNumEvents()):
         ev = sbml_model.getEvent(j)
         for k in range(ev.getNumEventAssignments()):
             sources.add(ev.getEventAssignment(k).getVariable())
-    # A species moves unless declared constant (a boundary species moves only
-    # through a rule or an event, which name it among the sources already).
+    species = [sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies())]
+    # A reaction's id in math is that reaction's rate, its kinetic law's value,
+    # so a rule that reads it moves when the law does. `cf := J0`, with J0 at
+    # 0.5*S1, was taken for still, and the conversion factor was folded at its
+    # load value of 0.5: S1(1) was 0.7788 where libRoadRunner, which follows the
+    # rate, gives 0.8000. A law's local parameters shadow the model's names.
+    # Only the laws a rule reads, directly or through other laws, are walked: a
+    # name that is no species, parameter, compartment or rule variable.
+    known = (
+        {sp.getId() for sp in species}
+        | {sbml_model.getParameter(j).getId() for j in range(sbml_model.getNumParameters())}
+        | {sbml_model.getCompartment(j).getId() for j in range(sbml_model.getNumCompartments())}
+        | set(reads)
+    )
+    law_reads: dict[str, set[str]] = {}
+    pending = set().union(*reads.values()) - known
+    while pending:
+        rid = pending.pop()
+        if rid in law_reads or rid in sources:
+            continue
+        rxn = sbml_model.getReaction(rid)
+        kl = rxn.getKineticLaw() if rxn is not None else None
+        if kl is None or kl.getMath() is None:
+            continue
+        names, clock = _math_names(kl.getMath())
+        if clock:
+            sources.add(rid)
+            continue
+        law_reads[rid] = names - {lp.getId() for lp in _kinetic_law_local_params(kl)}
+        pending |= law_reads[rid] - known
+    # A species moves when a reaction changes it, as a reactant or a product
+    # that is not a boundary species; a rate rule, an event or an assignment
+    # rule that moves it is counted with the rules and events. A species that
+    # nothing changes holds its value, as a constant one does: `C := 1 +
+    # 0.1*S`, with S in no reaction, holds C at its load-time size, where SSA
+    # refused C's reactions as if it moved. An algebraic rule can set any name
+    # it reads, so its species move. Only the species a rule or a law reads
+    # matter here, and the reactions are scanned only for those.
+    read = set().union(*reads.values(), *law_reads.values())
+    candidates = {sp.getId() for sp in species if not sp.getConstant()} & read
+    changed_by_reaction: set[str] = set()
+    for j in range(sbml_model.getNumReactions() if candidates - sources else 0):
+        rxn = sbml_model.getReaction(j)
+        for lst in (rxn.getListOfReactants(), rxn.getListOfProducts()):
+            changed_by_reaction |= {lst.get(k).getSpecies() for k in range(lst.size())}
     sources |= {
         sp.getId()
-        for sp in (sbml_model.getSpecies(j) for j in range(sbml_model.getNumSpecies()))
-        if not sp.getConstant() and not sp.getBoundaryCondition()
+        for sp in species
+        if sp.getId() in candidates
+        and (
+            (sp.getId() in changed_by_reaction and not sp.getBoundaryCondition())
+            or sp.getId() in algebraic_names
+        )
+    }
+    # A resize keeps a species' amount, so the concentration of a constant or
+    # boundary species moves with its compartment's size, though nothing names
+    # it. `cv := 1 + 0.1*Kw` with Kw constant in `ce` was taken for still across
+    # an event `ce = 2`, and SSA ran cv's reactions at its load-time size.
+    conc_comp = {
+        sp.getId(): sp.getCompartment() for sp in species if not sp.getHasOnlySubstanceUnits()
     }
     changed = True
     while changed:  # to the fixed point: a rule over a moving rule moves
         changed = False
+        for sid, comp in conc_comp.items():
+            if sid not in sources and (comp in sources or comp in moving):
+                sources.add(sid)
+                changed = True
+        for rid, names in law_reads.items():
+            if rid not in sources and (names & sources or names & moving):
+                sources.add(rid)
+                changed = True
         for var, names in reads.items():
             if var not in moving and (names & sources or names & moving):
                 moving.add(var)
@@ -3044,7 +3413,9 @@ def _ssa_rule_event_conc_reads(
     rate-rule-resized), directly or through assignment rules: the SSA stores a
     count over the load-time size, so such a read is stale. ``x' = S`` with S in
     ``C := 1 + 0.5*time`` integrated 40 against the ODE's 22, and ``at S < 6``
-    never fired. Returns ``[(location, [compartments])]``."""
+    never fired. ``rules`` maps each assignment rule's variable, and each
+    reaction id a rule or a law reads, to the names it reads. Returns
+    ``[(location, [compartments])]``."""
     if not moving_comps:
         return []
 
@@ -3112,7 +3483,8 @@ def _ssa_moving_ar_comp_reads(
     assignment rule: the SSA's live-volume correction covers the species of the
     compartment a reaction acts in, and no others.
 
-    ``rules`` maps each assignment rule's variable to the names it reads. A
+    ``rules`` maps each assignment rule's variable, and each reaction id a rule
+    or a law reads, to the names it reads (a reaction id reads its law). A
     species a rule sets (``rule_targets``) holds the value its rule gives it,
     not a count over a size, so reading it is not stale."""
     if not moving_comps and not varvol_comps:
@@ -3513,6 +3885,7 @@ def _classify_mass_action(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3583,6 +3956,7 @@ def _classify_mass_action(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         varvol_reject=varvol_reject,
@@ -3637,6 +4011,7 @@ def _split_reversible_kinetic_law(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     resolve_stoich,
@@ -3681,6 +4056,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3699,6 +4075,7 @@ def _split_reversible_kinetic_law(
         rate_rule_targets,
         event_promoted_params,
         assignment_targets,
+        moving_ar_comps,
         local_param_map,
         local_param_values,
         prefix_factors=prefix,
@@ -3765,6 +4142,7 @@ def _classify_mass_action_ast(
     rate_rule_targets,
     event_promoted_params,
     assignment_targets,
+    moving_ar_comps,
     local_param_map,
     local_param_values,
     prefix_factors: tuple = (),
@@ -3783,6 +4161,10 @@ def _classify_mass_action_ast(
     splitter to distribute outer-product wrappers (e.g. the ``compartment``
     factor in COPASI-style ``compartment * (kf*A - kr*B)``) onto each
     side of the MINUS.
+
+    ``moving_ar_comps`` are the assignment-rule compartments whose size moves
+    during a run (``_moving_assignment_rule_vars``); the variable-volume guards
+    below treat them as they treat a rate-rule or event-resized compartment.
     """
     # 3. Flatten the AST into a list of accepted leaves.
     factors: list = list(prefix_factors)
@@ -3965,18 +4347,27 @@ def _classify_mass_action_ast(
     #     — the f_c power cancels. So §9's species-only m_c derivation already folds
     #     the explicit factor (it lives in ``base_func``, not in m_c). Validated vs
     #     RR+COPASI (ODE) and Extrande (SSA).
-    # Scoped to all-hOSU=false species; hOSU=true cross-compartment shapes (whose
-    # amount bookkeeping differs) stay refused (varvol_non_mass_action), and the §9
-    # certification is guarded to IRREVERSIBLE only. Record the variable-volume
-    # storage compartments so §9 can certify + correct the emitted reaction.
+    # Scoped to all-hOSU=false species; a mix with an amount that changes such a
+    # concentration is certified below, where the load-time sizes agree (#787),
+    # and other hOSU=true cross-compartment shapes stay refused
+    # (varvol_non_mass_action). The §9 certification is guarded to IRREVERSIBLE
+    # only. Record the variable-volume storage compartments so §9 can certify +
+    # correct the emitted reaction.
+    #
+    # (#745) An assignment-rule compartment whose size moves during the run is
+    # routed the same way; it is left out of what §9 certifies for the SSA,
+    # which does not run such a compartment. One whose rule reads constants
+    # alone (``moving_ar_comps`` leaves it out) holds its load-time size, as a
+    # write to what the rule reads is refused, so the Elementary rate is right.
     _storage_comps = {species_comp[s] for s in rxn_species}
     _varvol_storage = _storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+    _ar_storage = _storage_comps & set(moving_ar_comps)
     if (
         len(_storage_comps) > 1
-        and _varvol_storage
+        and (_varvol_storage or _ar_storage)
         and all(not species_hosu.get(s, False) for s in rxn_species)
     ):
-        if varvol_reject is not None:
+        if varvol_reject is not None and _varvol_storage:
             varvol_reject["xcomp_varvol_comps"] = sorted(_varvol_storage)
         return None
 
@@ -4043,7 +4434,16 @@ def _classify_mass_action_ast(
                 m for sid, m in species_multiset.items() if not species_hosu.get(sid, False)
             )
 
-    varvol_comp_ids = (set(rate_rule_targets) | set(event_promoted_params)) & comp_ids
+    # (#745) An assignment-rule compartment whose size moves is a variable
+    # volume here as well: left out, a bare ``k*A`` in ``C := 2 + time`` stayed
+    # Elementary with V_static baked in and ran 36% off (BIOMD0000000342's
+    # TGF_beta_ex, 37%). One over constants keeps its load-time size, and its
+    # Elementary rate, which a reversible split needs to run under the SSA.
+    # _record_varvol_reject keeps to rate-rule and event compartments, which
+    # are the ones the SSA correction it feeds is for.
+    varvol_comp_ids = (
+        set(rate_rule_targets) | set(event_promoted_params) | set(moving_ar_comps)
+    ) & comp_ids
     if varvol_comp_ids:
         if all(not species_hosu.get(s, False) for s in rxn_species):
             storage_comps = {species_comp[s] for s in rxn_species}
@@ -4076,6 +4476,18 @@ def _classify_mass_action_ast(
             storage_comps = {species_comp[s] for s in rxn_species}
             if len(storage_comps) == 1:
                 _record_varvol_reject(next(iter(storage_comps)))
+            elif varvol_reject is not None:
+                # Across compartments it takes the per-species emission, each row
+                # over its own size, and the SSA correction §9 certifies for that
+                # emission counts the concentration factors alone: an amount is
+                # read exactly. So it serves this mix as it serves a monomial over
+                # concentrations. #787's `A => B; k*A`, A an amount and B a
+                # concentration in a compartment a rate rule or an event resizes,
+                # ran under the SSA while its ODE was wrong (B over the load-time
+                # size), and was refused once the ODE was right.
+                _vv = storage_comps & (set(rate_rule_targets) | set(event_promoted_params))
+                if _vv:
+                    varvol_reject["xcomp_varvol_comps"] = sorted(_vv)
             return None
 
     if not elementary:
@@ -4199,6 +4611,20 @@ def _kinetic_law_local_params(kl) -> list:
     if n > 0:
         return [kl.getLocalParameter(j) for j in range(n)]
     return [kl.getParameter(j) for j in range(kl.getNumParameters())]
+
+
+def _law_math_in_model_scope(rxn):
+    """A reaction's kinetic law as the reaction's id reads in a rule or an event:
+    a copy with each local parameter renamed to ``_lp_<rid>_<id>``, the name §9
+    registers it by, so that a global of the same id does not take its place.
+    None when the reaction has no law."""
+    kl = rxn.getKineticLaw()
+    if kl is None or kl.getMath() is None:
+        return None
+    math = kl.getMath().deepCopy()
+    for lp in _kinetic_law_local_params(kl):
+        math.renameSIdRefs(lp.getId(), f"_lp_{rxn.getId()}_{lp.getId()}")
+    return math
 
 
 def _local_param_value(lp) -> float:
@@ -4863,11 +5289,25 @@ def _build_model_from_sbml_doc_in_context(doc):
         for j in range(sbml_model.getNumRules())
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     }
+    # An initialAssignment gives its target a value as surely as a rule does,
+    # whether or not it folds here. One that does not fold is evaluated by the
+    # engine at the start, as it is for a parameter that declares a value the
+    # assignment replaces (#732), or refused by name (#871). `k = 0.5 + S3`,
+    # with S3 given no initial value, does not fold, as S3 is only started at
+    # 0 (#580) further on; C2 refused k as having "no initialAssignment",
+    # where libRoadRunner, and bngsim with any declared value for k, give
+    # k = 0.5.
+    _ia_targets = {
+        sbml_model.getInitialAssignment(j).getSymbol()
+        for j in range(sbml_model.getNumInitialAssignments())
+        if sbml_model.getInitialAssignment(j).getMath() is not None
+    }
     _unset_param_ids = {
         pid
         for pid in _all_param_ids
         if not sbml_model.getParameter(pid).isSetValue()
         and pid not in ia_values
+        and pid not in _ia_targets
         and pid not in _ar_targets
     }
     if _unset_param_ids:
@@ -5018,6 +5458,68 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "BNGSIM_ALLOW_UNSET_PARAMS=1."
             )
 
+    # ── C2c: a conversionFactor that names a valueless parameter ──
+    # A conversionFactor attribute, the model's or a species' own, reads a global
+    # parameter as surely as a rate law does, but it is not math, so C2's walk
+    # does not see it. SBML leaves such a parameter's value undefined, and the
+    # factor scales every change a reaction makes to the species' amount. §3b
+    # used to read it as 1, so the model ran as if it declared no factor:
+    # `S1 -> S2` at 0.5*S1 with S1's factor `cf` left without a value gave
+    # S1(1) = e^-0.5 = 0.607 and no warning. RoadRunner refuses the model. A
+    # factor that an initialAssignment or an assignmentRule gives a value is not
+    # in `_unset_param_ids` and loads as before (SBML suite 01642-01644 and
+    # 01651-01653 give theirs by an initialAssignment). Nor is one whose
+    # initialAssignment does not fold at load: the model does assign it, so it
+    # is left to §3b, which names the assignment it could not evaluate. An
+    # initialAssignment with no math assigns nothing, so its factor is refused
+    # here; it used to be left to §3b too, which read it as 0.0 without a word
+    # (S1 held at 1). Like C2 this goes by what the attribute names, so a
+    # model-wide factor that every species overrides still refuses. Same
+    # refusal and hatch as C2; under the hatch the factor is 0.0, the value the
+    # parameter itself is given everywhere else.
+    _cf_unset = _unset_param_ids
+    _unset_cf: list[tuple[str, str]] = []
+    if sbml_model.isSetConversionFactor() and sbml_model.getConversionFactor() in _cf_unset:
+        _unset_cf.append((sbml_model.getConversionFactor(), "the model's conversionFactor"))
+    for j in range(sbml_model.getNumSpecies()):
+        _sp = sbml_model.getSpecies(j)
+        if _sp.isSetConversionFactor() and _sp.getConversionFactor() in _cf_unset:
+            _unset_cf.append(
+                (_sp.getConversionFactor(), f"the conversionFactor of species {_sp.getId()!r}")
+            )
+    if _unset_cf:
+        import os
+
+        from bngsim._exceptions import UnderSpecifiedModelError
+
+        one = len(_unset_cf) == 1
+        names = ", ".join(f"{pid!r} ({where})" for pid, where in _unset_cf)
+        lead = (f"Parameter {names} has" if one else f"Parameters {names} have") + (
+            " no value attribute, initialAssignment or assignmentRule"
+        )
+        if os.environ.get("BNGSIM_ALLOW_UNSET_PARAMS") == "1":
+            logger.warning(
+                "%s, so SBML leaves the conversion %s undefined. bngsim takes %s as 0.0 "
+                "(BNGSIM_ALLOW_UNSET_PARAMS=1), so no reaction changes the amount of a "
+                "species %s converts. Set the %s.",
+                lead,
+                "factor" if one else "factors",
+                "it" if one else "them",
+                "it" if one else "they",
+                "value" if one else "values",
+            )
+        else:
+            raise UnderSpecifiedModelError(
+                f"{lead}, so SBML leaves the conversion "
+                f"{'factor' if one else 'factors'} undefined. The model is "
+                "under-specified: bngsim refuses to read a factor as 1, which would "
+                "silently drop it from every reaction that changes the species and "
+                "return a wrong-but-plausible trajectory (RoadRunner refuses the same "
+                "model). Set the parameter value or add an initialAssignment. To load "
+                "with the factor at 0.0, the legacy lenient default for a parameter "
+                "with no value, set BNGSIM_ALLOW_UNSET_PARAMS=1."
+            )
+
     # Pre-scan rate-rule targets and event-assignment targets up front so
     # both step 1 (compartments) and step 2 (parameters) can skip IDs that
     # will be promoted to species later in step 8 / event handling. Without
@@ -5102,6 +5604,15 @@ def _build_model_from_sbml_doc_in_context(doc):
         if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
     } & _comp_id_set
 
+    # (#745) The assignment-rule compartments whose size can move during a run:
+    # their rule reads the clock, a species that changes, a rate-rule or event
+    # target, a reaction's rate that moves, or another rule that does. One that
+    # reads constants alone holds its load-time size for the whole run, as a
+    # write to what it reads is refused. The same set §9 keeps from the SSA.
+    # Which rules move is found once here, for §3b and §9 as well.
+    _ar_rules, _ar_moving_vars = _moving_assignment_rule_vars(sbml_model)
+    ar_comp_moving = ar_comp_targets & _ar_moving_vars
+
     # (#86) Compartments driven by a RATE RULE — continuously variable volume
     # V(t). A concentration-valued (hOSU=false) species in such a compartment
     # needs an explicit dilution term ``-[S]·V̇/V`` in its concentration ODE
@@ -5133,7 +5644,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # Compartments whose live symbol must divide Functional reaction laws even
     # when their load-time size is 1.0. ``variable_comps`` intentionally excludes
-    # assignment-rule compartments for state-volume/rateOf paths, but reaction
+    # assignment-rule compartments for state-volume paths, but reaction
     # storage conversion still needs ``law / V_live`` for hOSU=false species in
     # AR compartments (suite 00946/00948: ``C := fakeC``, event changes fakeC).
     live_symbol_divide_comps = variable_comps | ar_comp_targets
@@ -6281,10 +6792,16 @@ def _build_model_from_sbml_doc_in_context(doc):
         # amount-rate — for a CONSTANT-volume compartment (01455/01457) AND a
         # VARIABLE-volume compartment promoted to a state (rate-rule / event-resized,
         # 01463), with no conc·V̇ correction. Flag the species so the engine (and
-        # codegen) scale its rate_of__ accessor by volume_factor. AR-compartment
-        # volumes are not integrator states, so a hOSU species there stays on the
-        # unscaled d(conc)/dt (excluded — no rateOf case there is in the suite).
-        if hosu and (comp not in vstatic_divide_comps or comp in variable_comps):
+        # codegen) scale its rate_of__ accessor by volume_factor.
+        #
+        # An assignment-rule compartment too (issue #736). Its volume is not an
+        # integrator state, but what decides the scaling is how the species is
+        # stored, and it is stored as amount/V_static there as well: left out,
+        # its rateOf read d(amount)/dt / V_static, a third of the answer in a
+        # compartment of size 3, and a rate rule on it integrated that. Such a
+        # compartment is not in live_volume_param_comps, so codegen scales by
+        # the number V_static, which is what the storage divided by.
+        if hosu:
             builder.set_species_rateof_amount(idx)
 
         # If the species's IC was set by an initialAssignment over parameters,
@@ -6336,16 +6853,111 @@ def _build_model_from_sbml_doc_in_context(doc):
     # expressed as a single rate scale and are refused loudly there (never
     # silently mis-integrated). Models with no conversionFactor leave
     # ``_has_conversion_factor`` False and this is a complete no-op.
-    def _resolve_const_param_value(pid):
-        # conversionFactor parameters are constant: value = initialAssignment if
-        # any, else the declared value.
-        if pid in ia_values:
-            return ia_values[pid]
+    #
+    # A factor whose parameter changes during the run is therefore one the rates
+    # cannot follow: they keep the value it has at load. SBML forbids it (rule
+    # 20705), but bngsim used to load it without a word: `cf = 2` with the rate
+    # rule `cf' = 1` gave S1(1) = 0.36788 for `S1 -> S2` at 0.5*S1, where
+    # RoadRunner, which follows the parameter, gives 0.28651. What changes one:
+    # a rate rule (a rate of 0 leaves it where it is), an event that assigns it
+    # (one with a trigger, as the event pre-scan counts them), or an assignment
+    # rule that moves (`_moving_assignment_rule_vars`: it reads the time, a
+    # species that changes, a reaction's rate that does, or something a rate
+    # rule or an event changes). A rule over constants, or over a species that
+    # nothing changes, holds its value and is folded like an initialAssignment.
+    _cf_ids = {
+        _sp.getConversionFactor()
+        for _sp in (sbml_model.getSpecies(_j) for _j in range(sbml_model.getNumSpecies()))
+        if _sp.isSetConversionFactor()
+    }
+    if sbml_model.isSetConversionFactor():
+        _cf_ids.add(sbml_model.getConversionFactor())
+    _cf_changed_by: dict[str, list[str]] = {}
+    if _cf_ids:
+        for _j in range(sbml_model.getNumRules()):
+            _r = sbml_model.getRule(_j)
+            _v = _r.getVariable()
+            if _v not in _cf_ids or _r.getMath() is None:
+                continue
+            _txt = libsbml.formulaToL3String(_r.getMath())
+            if _r.isRate():
+                _names, _clock = _math_names(_r.getMath())
+                if (
+                    not _names
+                    and not _clock
+                    and _eval_ast_numeric(_r.getMath(), {}, func_defs) == 0
+                ):
+                    continue
+                _cf_changed_by.setdefault(_v, []).append(f"the rate rule d({_v})/dt = {_txt}")
+            elif _r.isAssignment() and _v in _ar_moving_vars:
+                _cf_changed_by.setdefault(_v, []).append(
+                    f"the assignment rule {_v} := {_txt}, which reads the time or a value "
+                    "that changes,"
+                )
+        for _j in range(sbml_model.getNumEvents()):
+            _ev = sbml_model.getEvent(_j)
+            if _ev.getTrigger() is None or _ev.getTrigger().getMath() is None:
+                continue  # it never fires
+            for _k in range(_ev.getNumEventAssignments()):
+                _ea = _ev.getEventAssignment(_k)
+                if _ea.getVariable() in _cf_ids and _ea.getMath() is not None:
+                    _cf_changed_by.setdefault(_ea.getVariable(), []).append(
+                        f"event {_ev.getId()!r}" if _ev.getId() else "an event"
+                    )
+
+    def _resolve_const_param_value(pid, what):
+        # conversionFactor parameters are constant, and the factor is folded into
+        # the rates as a number: the value its initialAssignment (or an
+        # assignmentRule over constants) gives it at load, else the declared one.
+        # A parameter that the run changes is refused first. Nothing falls back
+        # to a number the model did not give. A factor read as 1 is a factor
+        # dropped without a word, and a declared value that an assignment
+        # replaces is not the factor either: `cf = 5` with the initialAssignment
+        # `cf = 2 + S3`, S3 given no initial value, scaled the rates by 5 while
+        # the parameter read 2 (RoadRunner: 2). C2c refused a factor the model
+        # gives no value at all; under its hatch the factor is 0.0, as the
+        # parameter is.
+        from bngsim._exceptions import ModelError
+
         p = sbml_model.getParameter(pid)
-        return p.getValue() if (p is not None and p.isSetValue()) else 1.0
+        if p is None:
+            # Invalid SBML (libsbml validation rules 20216 and 20617).
+            raise ModelError(
+                f"{what} is {pid!r}, which is not a parameter of the model. SBML "
+                "requires a conversionFactor to name a constant parameter, and bngsim "
+                "will not read it as 1."
+            )
+        if pid in _cf_changed_by:
+            raise ModelError(
+                f"{what} is {pid!r}, whose value {' and '.join(_cf_changed_by[pid])} "
+                "changes during the run. bngsim folds a conversion factor into the "
+                "rates as a number at load, so the run would keep the value it has at "
+                "the start. SBML requires a conversionFactor to name a constant "
+                "parameter (validation rule 20705)."
+            )
+        if pid in _ia_math or pid in _ar_targets:
+            kind = "initialAssignment" if pid in _ia_math else "assignmentRule"
+            # `ia_values` holds the declared value for an initialAssignment that
+            # did not fold (issue #732), so whether it folds is asked directly.
+            folded = _ia_folds(_ia_math[pid]) if pid in _ia_math else pid in ia_values
+            if folded and pid in ia_values:
+                return ia_values[pid]
+            _m = _ia_math[pid] if pid in _ia_math else sbml_model.getRuleByVariable(pid).getMath()
+            raise ModelError(
+                f"{what} is {pid!r}, and bngsim could not evaluate the {kind} "
+                f"{pid} = {libsbml.formulaToL3String(_m)} at load, so it has no "
+                "number to scale the rates by: it reads something with no value "
+                "there. A conversionFactor must name a constant parameter; give it a "
+                "value, or an initialAssignment that evaluates at load."
+            )
+        if p.isSetValue():
+            return p.getValue()
+        return 0.0  # BNGSIM_ALLOW_UNSET_PARAMS=1: C2c refused it otherwise, and warned
 
     _model_cf_val = (
-        _resolve_const_param_value(sbml_model.getConversionFactor())
+        _resolve_const_param_value(
+            sbml_model.getConversionFactor(), "The model's conversionFactor"
+        )
         if sbml_model.isSetConversionFactor()
         else None
     )
@@ -6354,7 +6966,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     for _sid in species_ids:
         _sp = sbml_model.getSpecies(_sid)
         if _sp is not None and _sp.isSetConversionFactor():
-            species_cf[_sid] = _resolve_const_param_value(_sp.getConversionFactor())
+            species_cf[_sid] = _resolve_const_param_value(
+                _sp.getConversionFactor(), f"The conversionFactor of species {_sid!r}"
+            )
             _any_species_cf = True
         elif _model_cf_val is not None:
             species_cf[_sid] = _model_cf_val
@@ -6837,6 +7451,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         _walk_name_refs(kl_j.getMath(), _reaction_ids_set, refs_j)
         refs_j.discard(rxn_j.getId())  # drop self-reference
         referenced_reaction_ids |= refs_j
+    # An event reads a reaction's id as a rule does: `at J0 < 15` failed to
+    # compile, J0 an undefined symbol, where libRoadRunner fires it at J0's
+    # crossing.
+    for j in range(sbml_model.getNumEvents()):
+        ev_j = sbml_model.getEvent(j)
+        ev_maths = [
+            x.getMath()
+            for x in (ev_j.getTrigger(), ev_j.getDelay(), ev_j.getPriority())
+            if x is not None
+        ]
+        ev_maths += [
+            ev_j.getEventAssignment(k).getMath() for k in range(ev_j.getNumEventAssignments())
+        ]
+        for m_j in ev_maths:
+            if m_j is not None:
+                _walk_name_refs(m_j, _reaction_ids_set, referenced_reaction_ids)
 
     # What a name in a kinetic law is, for _law_is_nonnegative: a species or a
     # compartment is, a constant parameter is by its value after initial
@@ -7037,6 +7667,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rate_rule_targets,
             event_promoted_params,
             assignment_targets,
+            ar_comp_moving,
             local_param_map,
             local_param_values,
             _resolve_stoich,
@@ -7074,11 +7705,15 @@ def _build_model_from_sbml_doc_in_context(doc):
         #
         # Nor one the per-species divide cannot serve, which §9 writes out one
         # species at a time instead and SSA refuses: a reaction that changes a
-        # species in an assignment-rule compartment, which is no state to divide
-        # by (#745), or that mixes conversion factors. Certified, those took the
-        # per-species divide anyway: an irreversible `A + E => B + E` with A and
-        # B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a mixed
-        # factor refused to load, where the same law flagged reversible was right.
+        # species in an assignment-rule compartment whose size moves, which is no
+        # state to divide by (#745), or that mixes conversion factors. Certified,
+        # those took the per-species divide anyway: an irreversible `A + E => B + E`
+        # with A and B in `C1 := 2 + 0.5*time` gave [A](5) = 0.287 for 0.326, and a
+        # mixed factor refused to load, where the same law flagged reversible was
+        # right. A rule over constants (`C := 2`) holds its load-time size, as a
+        # write to what it reads is refused, so the per-species divide by that
+        # size serves its species as it serves a static compartment's, and the
+        # SSA reads their counts over it exactly.
         _xcomp_varvol = _varvol_reject.get("xcomp_varvol_comps")
         if _xcomp_varvol and not _rev_difference and not _cf_mixed:
             _net: dict[str, float] = {}
@@ -7090,7 +7725,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         float("nan") if _st is None else _st
                     )
             if not any(
-                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_targets
+                not abs(_n) <= 1e-12 and species_comp[_sid] in ar_comp_moving
                 for _sid, _n in _net.items()
             ):
                 ssa_varvol_xcompartment[i] = _xcomp_varvol
@@ -7113,6 +7748,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 rate_rule_targets,
                 event_promoted_params,
                 assignment_targets,
+                ar_comp_moving,
                 local_param_map,
                 local_param_values,
                 _resolve_stoich,
@@ -7371,6 +8007,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     # AR expression column (``_varvol_ar_amount_map`` below). Populated by 8c.
     ar_dilution_species: set[str] = set()
     _dilution_reads_rate = False  # a dilution term reads a rate_of__ accessor (#1052)
+    # (compartment, trigger, size before, size after), all ExprTk (#1054).
+    _size_jumps: list[tuple[str, str, str, str]] = []
+    _jump_species: dict[str, list[str]] = {}  # compartment -> species it rescales
     if ar_comp_targets:
         import re as _re
 
@@ -7409,14 +8048,30 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _ar_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
             elif _rule.isRate() and _v not in _sbml_species_ids:
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+        # A reaction's id in math is its kinetic law's value, so a size is
+        # followed through the law as through an assignment rule: for its rate
+        # here, and for its jumps below. Read as a constant, `C := 1 + 0.5*J0`
+        # with J0 at k*A gave C no rate, and [X] in C was not diluted: [X](5)
+        # was 0.677 where libRoadRunner gives 1.267.
+        _law_math: dict[str, object] = {}
+        for j in range(sbml_model.getNumReactions()):
+            _rx = sbml_model.getReaction(j)
+            if _rx.getId() not in referenced_reaction_ids:
+                continue  # no rule or law reads its rate
+            _lm = _law_math_in_model_scope(_rx)
+            if _lm is not None:
+                _law_math[_rx.getId()] = _lm
+                _ar_rhs_ex[_safe_name(_rx.getId())] = _ast_to_exprtk_with_funcdefs(_lm, func_defs)
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
         _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
         _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
         # A species whose value never moves continuously, so its rate is 0 and
         # reading it needs no rate accessor: nothing changes its amount (constant,
-        # or boundary with no rate rule), and the value is that amount or a
-        # concentration in a compartment whose size holds between events.
+        # boundary, or in no reaction, with no rate rule), and the value is that
+        # amount or a concentration in a compartment whose size holds between
+        # events. `C := 1 + 0.1*S`, S in no reaction, read rateOf(S), which SSA
+        # cannot run, for a rate of 0.
         _still_species = {
             s
             for s in _sbml_species_ids
@@ -7425,6 +8080,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             and (
                 sbml_model.getSpecies(s).getConstant()
                 or sbml_model.getSpecies(s).getBoundaryCondition()
+                or s not in reaction_species
             )
             and (
                 species_hosu.get(s, False)
@@ -7440,12 +8096,32 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _rr_sym_cache[safe] = _exprtk_to_sympy(_rr_rhs_ex[safe])
             return _rr_sym_cache[safe]  # sympy expr, or None on parse failure
 
-        def _leaf_deriv(nm: str, seen: frozenset):
+        # Each rule is parsed once and its rate derived once, however many
+        # rules read it. The chain rule and the inlined size below both walk
+        # the rules a size reads, and they used to start each rule afresh on
+        # every path that reached it, so a diamond of rules (r_i := r_{i-1} +
+        # r_{i-2}, each read by the next two) cost a parse and a derivation per
+        # path — exponential in its depth: over 17 s to load at 22 rules, and
+        # ×6.9 for every four more.
+        _ar_sym_cache: dict[str, object] = {}
+
+        def _ar_sym(safe: str):
+            if safe not in _ar_sym_cache:
+                _ar_sym_cache[safe] = _exprtk_to_sympy(_ar_rhs_ex[safe])
+            return _ar_sym_cache[safe]  # sympy expr, or None on parse failure
+
+        _on_path = object()  # a rule whose walk is under way: reaching it again is a cycle
+        # safe(var) -> its rate, or None ⇒ unknown
+        _rule_rate: dict[str, object] = {}
+        # safe(var) -> the nonzero terms of its rate: (∂g/∂s, s, ṡ)
+        _rule_terms: dict[str, list] = {}
+
+        def _leaf_deriv(nm: str):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
             if nm == _TIME_SYM:
                 return _sp.Integer(1)
             if nm in _ar_alias:  # an assignment target, a species among them
-                return _vdot_sym(_ar_alias[nm], seen)
+                return _vdot_sym(_ar_alias[nm])
             if nm in _species_alias:  # its live rate, rateOf(S) (#1052)
                 sid = _species_alias[nm]
                 if sid in _still_species:
@@ -7458,22 +8134,33 @@ def _build_model_from_sbml_doc_in_context(doc):
             # used to make V̇ unknown and drop the whole term).
             return _sp.Integer(0)
 
-        def _vdot_sym(safe_var: str, seen: frozenset):
-            ex = _ar_rhs_ex.get(safe_var)
-            if ex is None or safe_var in seen:
+        def _vdot_sym(safe_var: str):
+            # A rule on a cycle of rules, or one reading such a rule, has no
+            # rate (None), as before: the walk that meets a rule still under way
+            # unwinds with None through every rule on the cycle.
+            if safe_var in _rule_rate:
+                got = _rule_rate[safe_var]
+                return None if got is _on_path else got
+            if safe_var not in _ar_rhs_ex:
                 return None
-            g = _exprtk_to_sympy(ex)
+            _rule_rate[safe_var] = _on_path
+            _rule_rate[safe_var], _rule_terms[safe_var] = _chain_rule(_ar_sym(safe_var))
+            return _rule_rate[safe_var]
+
+        def _chain_rule(g):
+            # (Σ ∂g/∂s·ṡ over g's symbols, its nonzero terms), or (None, []).
             if g is None:
-                return None
-            seen2 = seen | {safe_var}
-            total = _sp.Integer(0)
+                return None, []
+            total, terms = _sp.Integer(0), []
             for s in g.free_symbols:
-                d = _leaf_deriv(str(s), seen2)
+                d = _leaf_deriv(str(s))
                 if d is None:
-                    return None
+                    return None, []
                 if d != 0:
-                    total = total + _sp.diff(g, s) * d
-            return total
+                    p = _sp.diff(g, s)
+                    terms.append((p, s, d))
+                    total = total + p * d
+            return total, terms
 
         # Reverse the keyword aliasing _exprtk_to_sympy applies, so the emitted
         # term references the engine's real safe names.
@@ -7506,23 +8193,126 @@ def _build_model_from_sbml_doc_in_context(doc):
                 and sid not in assignment_targets
             )
 
+        def _subexpressions(expr) -> list:
+            # Each distinct node of a sympy expression, once. A rate or size
+            # built from shared rules' is a DAG, and its tree — what
+            # `free_symbols` and `atoms` walk, and what printing spells out —
+            # can be exponentially larger than the DAG.
+            seen: set[int] = set()
+            out, stack = [], [expr]
+            while stack:
+                e = stack.pop()
+                if id(e) not in seen:
+                    seen.add(id(e))
+                    out.append(e)
+                    stack.extend(e.args)
+            return out
+
+        def _tree_size(expr) -> int:
+            # Nodes in the tree the expression prints as, a shared node counted
+            # once per use, found without walking the tree.
+            size: dict[int, int] = {}
+            stack = [(expr, False)]
+            while stack:
+                e, expanded = stack.pop()
+                if id(e) in size:
+                    continue
+                if expanded:
+                    size[id(e)] = 1 + sum(size[id(a)] for a in e.args)
+                else:
+                    stack.append((e, True))
+                    stack.extend((a, False) for a in e.args if id(a) not in size)
+            return size[id(expr)]
+
+        def _rate_tokens(expr) -> set[str]:
+            return {
+                _rate_token_species[str(s)]
+                for s in _subexpressions(expr)
+                if s.is_Symbol and str(s) in _rate_token_species
+            }
+
         # V̇ of each compartment that holds a species to dilute, and the species
         # whose rates it reads.
         _comp_vdot: dict[str, object] = {}
         _comp_rated: dict[str, set[str]] = {}
         for sid, comp in species_comp.items():
             if comp not in _comp_vdot and _diluted(sid):
-                vdot = _vdot_sym(_safe_name(comp), frozenset())
+                vdot = _vdot_sym(_safe_name(comp))
                 _comp_vdot[comp] = vdot
-                _comp_rated[comp] = (
-                    {
-                        _rate_token_species[str(s)]
-                        for s in vdot.free_symbols
-                        if str(s) in _rate_token_species
-                    }
-                    if vdot is not None
-                    else set()
-                )
+                _comp_rated[comp] = _rate_tokens(vdot) if vdot is not None else set()
+
+        # Written out in full, a rate that more than one rule reads is written
+        # once per path to it, and the term is as exponential as the walk was
+        # (r_i := sin(r_{i-1}) + cos(r_{i-2}): 22,122 characters at 16 rules,
+        # ×2.6 for every two more). So such a rate becomes a function of its own,
+        # `_ddt_<rule>`, that the rules reading it read by name, wherever that is
+        # shorter than writing V̇ out; elsewhere — a rate that is a number or a
+        # symbol, a rule only one rule reads, a sum the chain rule collapses —
+        # V̇ is written out exactly as before.
+        _readers: dict[str, int] = {}
+        _reached: set[str] = set()
+        _walk = [_safe_name(c) for c, v in _comp_vdot.items() if v is not None]
+        while _walk:
+            r = _walk.pop()
+            if r in _reached:
+                continue
+            _reached.add(r)
+            for _, s, _ in _rule_terms[r]:
+                child = _ar_alias.get(str(s))
+                if child is not None:
+                    _readers[child] = _readers.get(child, 0) + 1
+                    _walk.append(child)
+        _rate_fn = {
+            r: f"_ddt_{r}"
+            for r, n in sorted(_readers.items())
+            if n > 1 and not _rule_rate[r].is_Atom
+        }
+        _named_rate: dict[str, object] = {}
+
+        def _rate_by_name(safe_var: str):
+            # The rule's rate with each shared rate it reads read by name.
+            if safe_var not in _named_rate:
+                total = _sp.Integer(0)
+                for p, s, d in _rule_terms[safe_var]:
+                    child = _ar_alias.get(str(s))
+                    if child in _rate_fn:
+                        d = _sp.Symbol(_rate_fn[child])
+                    elif child is not None and not d.is_Atom:
+                        d = _rate_by_name(child)
+                    total = total + p * d
+                _named_rate[safe_var] = total
+            return _named_rate[safe_var]
+
+        def _functions_read(expr) -> list[str]:
+            # The `_ddt_` rules expr reads, directly or through each other,
+            # each after the ones it reads.
+            fn_rule = {fn: r for r, fn in _rate_fn.items()}
+            order: list[str] = []
+            done: set[str] = set()
+
+            def visit(e):
+                for s in _subexpressions(e):
+                    r = fn_rule.get(str(s)) if s.is_Symbol else None
+                    if r is not None and r not in done:
+                        done.add(r)
+                        visit(_rate_by_name(r))
+                        order.append(r)
+
+            visit(expr)
+            return order
+
+        # compartment -> (V̇ by name, the `_ddt_` rules it reads), where shorter
+        _comp_by_name: dict[str, tuple[object, list[str]]] = {}
+        if _rate_fn:
+            for comp, vdot in _comp_vdot.items():
+                if vdot is None or vdot == 0:
+                    continue
+                expr = _rate_by_name(_safe_name(comp))
+                rules = _functions_read(expr)
+                if _tree_size(expr) + sum(
+                    _tree_size(_rate_by_name(r)) for r in rules
+                ) < _tree_size(vdot):
+                    _comp_by_name[comp] = (expr, rules)
 
         def _size_text(cid: str) -> str:
             for j in range(sbml_model.getNumRules()):
@@ -7532,6 +8322,242 @@ def _build_model_from_sbml_doc_in_context(doc):
             return cid
 
         _refusals: list[str] = []
+
+        # A piecewise size jumps where one of its conditions flips (#1054). The
+        # chain rule above differentiates each piece, which is right between
+        # the jumps, but a jump is a delta no ODE term carries, so it gets what
+        # an event's resize gets (#74): each concentration × V_before/V_after,
+        # at the condition's root. The size is inlined through the rules it
+        # reads, and the relations in its conditions are set as they read on
+        # either side of each root for the size there. Relations that compare
+        # one difference (or a multiple of it) with 0 change at one root, as
+        # `t < 2` and `t >= 2` do in a piecewise with no otherwise, so they are
+        # set together. Set one at a time, the event of each read the other
+        # after its flip: two rescales at the instant took [S] in
+        # `piecewise(1, t < 2, 5, t >= 2)` to 0 or left it right, as the hash
+        # seed ordered them, and with `t < 2` and `t > 2` the size between the
+        # two, which no piece gives, was read as 0 and divided by. A condition
+        # over constants and event targets alone moves only at an event, whose
+        # own rescale owns that jump; one that reads an event target and the
+        # state or time could flip at the event and then again by the jump
+        # event, so it is refused.
+        #
+        # An event moves more than what it assigns: a concentration in a
+        # compartment it resizes, directly or through the compartment's rule,
+        # is rescaled there, and that resize's own rescale carries any jump of
+        # a size that reads it (#1055). Left out, both rescaled at the event:
+        # `cv := piecewise(2, Kw > 7, 1)` with Kw in a compartment the event
+        # doubles took [Sn] to 20 for 10. And a species no reaction or rule
+        # moves, in a compartment that holds its size between events, moves
+        # only at an event, though it is not constant: `cv := piecewise(1, Kw >
+        # 7, 2)` beside `at (t > 1): Kw = 2` was refused, where the event's
+        # resize alone is right.
+        _event_moved = {
+            sbml_model.getEvent(k).getEventAssignment(j).getVariable()
+            for k in range(sbml_model.getNumEvents())
+            for j in range(sbml_model.getEvent(k).getNumEventAssignments())
+        }
+        _rescaled_in: dict[str, set[str]] = {}
+        for _sid, _scomp in species_comp.items():
+            if not species_hosu.get(_sid, False) and _sid not in assignment_targets:
+                _rescaled_in.setdefault(_scomp, set()).add(_sid)
+        # A rate a size reads is read through its law, as a rule is.
+        _size_rule_math = {
+            sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
+            for j in range(sbml_model.getNumRules())
+            if sbml_model.getRule(j).isAssignment() and sbml_model.getRule(j).getMath() is not None
+        } | _law_math
+        _rule_reach: dict[str, frozenset] = {}
+
+        def _reaches(var: str) -> frozenset:
+            if var not in _rule_reach:
+                _rule_reach[var] = frozenset()  # a cycle of rules reads no further
+                names: set[str] = set()
+                for n in _ast_name_set(_size_rule_math[var]):
+                    names.add(n)
+                    if n in _size_rule_math:
+                        names |= _reaches(n)
+                _rule_reach[var] = frozenset(names)
+            return _rule_reach[var]
+
+        for _comp in _event_moved & _comp_id_set:
+            _event_moved |= _rescaled_in.get(_comp, set())
+        _grew = True
+        while _grew:
+            _grew = False
+            for _comp in sorted(ar_comp_targets - _event_moved):
+                if _reaches(_comp) & _event_moved:
+                    _event_moved |= {_comp, *_rescaled_in.get(_comp, ())}
+                    _grew = True
+        _event_targets = {_alias(_safe_name(n)) for n in _event_moved}
+        _flow_free = {
+            s
+            for s in _sbml_species_ids
+            if s not in reaction_species
+            and s not in rate_rule_targets
+            and s not in assignment_targets
+            and (
+                species_hosu.get(s, False)
+                or species_comp.get(s) not in (ar_comp_targets | rate_rule_comps)
+            )
+        }
+        _moving = (
+            {_TIME_SYM}
+            | {
+                a
+                for a, s in _species_alias.items()
+                if s not in _still_species and s not in _flow_free
+            }
+            | set(_rr_alias)
+            | set(_rate_token_species)
+        )
+
+        # safe(var) -> the size written through the rules it reads, once a rule
+        # (None ⇒ unknown, _on_path while under way, as for the rates)
+        _inlined: dict[str, object] = {}
+
+        def _inlined_size(safe_var: str):
+            if safe_var in _inlined:
+                got = _inlined[safe_var]
+                return None if got is _on_path else got
+            if safe_var not in _ar_rhs_ex:
+                return None
+            _inlined[safe_var] = _on_path
+            _inlined[safe_var] = _inline_rules(_ar_sym(safe_var))
+            return _inlined[safe_var]
+
+        def _inline_rules(g):
+            if g is None:
+                return None
+            subs = {}
+            for s in g.free_symbols:
+                if str(s) in _ar_alias:
+                    inner = _inlined_size(_ar_alias[str(s)])
+                    if inner is None:
+                        return None
+                    subs[s] = inner
+            return g.xreplace(subs)
+
+        def _xreplace_once(expr, rule: dict):
+            # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
+            # walks the tree, which a size read through shared rules makes
+            # exponentially larger than the expression.
+            done: dict[int, object] = {}
+
+            def go(e):
+                if id(e) not in done:
+                    if e in rule:
+                        done[id(e)] = rule[e]
+                    else:
+                        args = tuple(go(a) for a in e.args)
+                        changed = any(a is not b for a, b in zip(args, e.args, strict=True))
+                        done[id(e)] = e.func(*args) if changed else e
+                return done[id(e)]
+
+            return go(expr)
+
+        def _rules_by_name() -> dict:
+            # A rule's size, written through the rules it reads, -> the rule's
+            # own symbol, for each rule whose size holds no condition: it is the
+            # same on either side of a jump, so the sizes there may read it by
+            # name, as everything else in the model does.
+            return {
+                full: _sp.Symbol(_alias(safe))
+                for safe, full in _inlined.items()
+                if isinstance(full, _sp.Basic)  # not None, not under way
+                and not full.is_Atom
+                and not any(
+                    isinstance(e, (_sp.Piecewise, _sp.core.relational.Relational))
+                    for e in _subexpressions(full)
+                )
+            }
+
+        for comp, vdot in _comp_vdot.items():
+            if vdot is None:
+                continue
+            g = _inlined_size(_safe_name(comp))
+            if g is None:
+                continue
+            # In a fixed order, so the events do not move with the hash seed.
+            conds = sorted(
+                {
+                    c
+                    for pw in _subexpressions(g)
+                    if isinstance(pw, _sp.Piecewise)
+                    for _, c in pw.args
+                    if c not in (_sp.true,)
+                },
+                key=_sp.default_sort_key,
+            )
+            relations: set = set()
+            for c in conds:
+                names = {str(s) for s in c.free_symbols}
+                if not names & _moving:
+                    continue
+                if names & _event_targets:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where "
+                        f"{c} flips, which reads "
+                        f"{', '.join(sorted(names & _event_targets))}, which an event "
+                        "changes, and moves with the run as well; bngsim would rescale its "
+                        "concentrations twice when an event flips it"
+                    )
+                    continue
+                relations |= {
+                    r
+                    for r in c.atoms(_sp.core.relational.Relational)
+                    if {str(s) for s in r.free_symbols} & _moving
+                }
+            # (difference, [(relation, its difference over that one)])
+            roots: list[tuple[object, list]] = []
+            for r in sorted(relations, key=_sp.default_sort_key):
+                d = r.lhs - r.rhs
+                for d0, rels in roots:
+                    ratio = _sp.cancel(d / d0)
+                    if ratio.is_number and ratio != 0:
+                        rels.append((r, ratio))
+                        break
+                else:
+                    roots.append((d, [(r, _sp.Integer(1))]))
+            by_name = _rules_by_name() if roots else {}
+            for _, rels in roots:
+                # A side is the sign of the difference there, and an inequality
+                # in the set, where it has one, says which side is true: an
+                # equality holds at the root alone, so it reads false on both.
+                c, q = next(
+                    ((r, q) for r, q in rels if not isinstance(r, (_sp.Eq, _sp.Ne))), rels[0]
+                )
+                if isinstance(c, _sp.Eq):
+                    side_true, side_false = 0, 1
+                elif isinstance(c, _sp.Ne):
+                    side_true, side_false = 1, 0
+                else:
+                    side_true = -1 if c.func(-q, 0) else 1
+                    side_false = -side_true
+                v_false, v_true = (
+                    _xreplace_once(g, {r: r.func(rq * side, 0) for r, rq in rels})
+                    for side in (side_false, side_true)
+                )
+                # Written out in full, a size that reads shared rules is as
+                # exponential as the rates were; it reads those of its rules
+                # that hold no condition by name where that is shorter.
+                v_false, v_true = (
+                    min((v, _xreplace_once(v, by_name)), key=_tree_size) for v in (v_false, v_true)
+                )
+                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
+                if any(t is None for t in texts):
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        "flips, and bngsim cannot write the size on either side"
+                    )
+                    continue
+                rises, falls, v_false, v_true = (_unalias(t) for t in texts)
+                _jump_species[comp] = [
+                    s for s, sc in species_comp.items() if sc == comp and _diluted(s)
+                ]
+                _size_jumps.append((comp, rises, v_false, v_true))
+                _size_jumps.append((comp, falls, v_true, v_false))
+
         for comp, rated in _comp_rated.items():
             for leaf in sorted(rated):
                 if species_hosu.get(leaf, False) and species_comp.get(leaf) in ar_comp_targets:
@@ -7602,15 +8628,40 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "that reads its own concentration too (a recursive assignment rule)."
             )
 
+        # compartment -> (V̇ as ExprTk, [(`_ddt_` function, its ExprTk)], whether
+        # they read a rate), or None where one of them does not print
+        _comp_vdot_ex: dict[str, tuple[str, list[tuple[str, str]], bool] | None] = {}
+        _rate_fns_added: set[str] = set()
         for sid, comp in species_comp.items():
             if _diluted(sid):
                 vdot = _comp_vdot[comp]
                 if vdot is None or vdot == 0:
                     continue
-                vdot_ex = sympy_to_exprtk(vdot)
-                if vdot_ex is None:
+                if comp not in _comp_vdot_ex:
+                    expr, rules = _comp_by_name.get(comp, (vdot, []))
+                    parts = [expr, *map(_rate_by_name, rules)]
+                    texts = [sympy_to_exprtk(e) for e in parts]
+                    _comp_vdot_ex[comp] = (
+                        None
+                        if any(t is None for t in texts)
+                        else (
+                            _unalias(texts[0]),
+                            [
+                                (_rate_fn[r], _unalias(t))
+                                for r, t in zip(rules, texts[1:], strict=True)
+                            ],
+                            # By name, a rate the full V̇ cancels can still be read.
+                            bool(_comp_rated[comp])
+                            or (bool(rules) and any(_rate_tokens(e) for e in parts)),
+                        )
+                    )
+                if _comp_vdot_ex[comp] is None:
                     continue
-                vdot_ex = _unalias(vdot_ex)
+                vdot_ex, rate_fns, reads_rate = _comp_vdot_ex[comp]
+                for fn, fn_ex in rate_fns:  # each after the ones it reads
+                    if fn not in _rate_fns_added:
+                        _rate_fns_added.add(fn)
+                        builder.add_function(fn, fn_ex)
                 s_safe = _safe_name(sid)
                 c_safe = _safe_name(comp)
                 dil_name = f"_dil_{s_safe}_{c_safe}"
@@ -7631,7 +8682,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 # from the AR compartment's expression column), not the stale
                 # conc·V_static. Recorded for the report-time amount remap below.
                 ar_dilution_species.add(sid)
-                if _comp_rated[comp]:
+                if reads_rate:
                     _dilution_reads_rate = True
 
     # ── 9. Reactions → BNGsim reaction emission ──────────────────────
@@ -7657,8 +8708,24 @@ def _build_model_from_sbml_doc_in_context(doc):
     # Continuous slots never take a falling factorial (see
     # _ssa_falling_factorial_terms); built once, not per reaction.
     _ssa_ff_continuous = set(assignment_targets) | set(rate_rule_targets)
-    _ar_rules, _ar_moving_vars = _moving_assignment_rule_vars(sbml_model)
     _ar_moving_comps = ar_comp_targets & _ar_moving_vars
+    # The SSA's stale-read walks below follow a reaction id that a rule or a law
+    # reads into its kinetic law, as they follow a rule: the id is the law's
+    # value, evaluated on the stored counts. `x' = J0`, J0 at k*S*C with C
+    # doubled by an event, ran with no refusal, x(3) 72.3 for libRoadRunner's
+    # 45.1, where `x' = S` is refused.
+    _ssa_reads = dict(_ar_rules)
+    for _j in range(sbml_model.getNumReactions()):
+        _rx = sbml_model.getReaction(_j)
+        _kl = _rx.getKineticLaw()
+        if (
+            _rx.getId() in referenced_reaction_ids
+            and _kl is not None
+            and _kl.getMath() is not None
+        ):
+            _ssa_reads[_rx.getId()] = _math_names(_kl.getMath())[0] - {
+                lp.getId() for lp in _kinetic_law_local_params(_kl)
+            }
     for i in range(sbml_model.getNumReactions()):
         rxn = sbml_model.getReaction(i)
         rid = rxn.getId()
@@ -7675,7 +8742,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         # by a law, is read live.
         _ar_conc, _vv_read = _ssa_moving_ar_comp_reads(
             rxn,
-            _ar_rules,
+            _ssa_reads,
             _ar_moving_vars,
             _ar_moving_comps,
             species_comp,
@@ -8189,6 +9256,28 @@ def _build_model_from_sbml_doc_in_context(doc):
         )
         if _xc_varvol_species:
             unified_ok = False
+        # (#745) The same holds for a concentration in a compartment an
+        # assignment rule moves: its row is law/V_live, which the single divide
+        # gives only to the species of the representative compartment.
+        # `H => A; k*H` with H an amount and A a concentration in
+        # `C := 3 + 0.5*time` divided H's row by the live size: [H](5) was 0.527
+        # for 0.401. Two such compartments of one load-time size shared the
+        # first one's divide, and at a size of 1 had none. A catalyst elsewhere
+        # counts here, as the representative compartment can be the catalyst's.
+        # The per-species branch below adds the live size to these rows.
+        _xc_ar_species = (
+            [
+                _sid
+                for _sid in net
+                if net[_sid] != 0
+                and species_comp[_sid] in ar_comp_moving
+                and not species_hosu.get(_sid, False)
+            ]
+            if len(_rxn_comps) > 1 or _changes_an_amount
+            else []
+        )
+        if _xc_ar_species:
+            unified_ok = False
         # Two kinds of such a reaction cannot take the per-species divide either.
         # One that also changes a species in an assignment-rule compartment: that
         # compartment is no state, so there is nothing to point its divide at
@@ -8197,7 +9286,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         # compartment's live symbol and with its own factor, as a non-integer
         # stoichiometry is. That form has no SSA reading, and these are refused
         # under SSA already. The certified monomial keeps the per-species divide,
-        # which its SSA correction is written for.
+        # which its SSA correction is written for. A reaction routed off the
+        # single divide for a moving assignment-rule compartment alone goes the
+        # same way when it mixes conversion factors.
         _xc_by_function = (
             bool(_xc_varvol_species)
             and i not in ssa_varvol_xcompartment
@@ -8205,7 +9296,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _cf_mixed_i
                 or any(net[_sid] != 0 and species_comp[_sid] in ar_comp_targets for _sid in net)
             )
-        )
+        ) or (bool(_xc_ar_species) and _cf_mixed_i)
         # (#192) The same by-value hazard for a WRITABLE STATIC volume, which is
         # #170's territory rather than #144's and was never done. `involved_vs`
         # holds volume VALUES, so a reaction whose species span several
@@ -8460,6 +9551,35 @@ def _build_model_from_sbml_doc_in_context(doc):
             _ssa_ff = _ssa_falling_factorial_terms(rxn, species_idx, _ssa_ff_continuous)
             if _ssa_ff:
                 builder.set_reaction_ssa_falling_factorial(_xrxn_idx, _ssa_ff)
+            # (#745) The per-species divide above is by each species' load-time
+            # size. For a concentration in a compartment an assignment rule sizes
+            # the row is law/V_live; the engine has no state column for that size,
+            # so the difference is added as its own reaction on that species, as
+            # the §8c dilution is: net·law·(1/C - 1/V_static), with C the
+            # compartment's live symbol. The two rows sum to net·law/C, and the
+            # Jacobian and the sensitivities reach C through its rule as they do
+            # in any rate law. ODE only, as the SSA does not run such a
+            # compartment. BIOMD0000000342's re9 was 37% off without it. Only for
+            # a size that can move (_xc_ar_species keeps to ar_comp_moving): for
+            # one that cannot, the term is 0, and a reaction on one species would
+            # hide a conservation law the right-hand side keeps.
+            for _sid in _xc_ar_species:
+                _n = net[_sid]
+                _c = species_comp[_sid]
+                _corr = f"_vd_{_safe_name(rid)}_{_safe_name(_sid)}_live"
+                builder.add_function(
+                    _corr,
+                    f"({float(_n) * _cf_i!r})*({base_func})"
+                    f"*(1.0/({_safe_name(_c)}) - 1.0/({float(comp_volumes.get(_c, 1.0))!r}))",
+                )
+                builder.add_reaction(
+                    [],
+                    [species_idx[_sid]],
+                    "functional",
+                    _corr,
+                    apply_species_factor=False,
+                    ode_only=True,
+                )
             # (#144 case 4) Cross-compartment variable-volume monomial certified by
             # the classifier (§7). The per-species emission above divides each
             # species's storage derivative by its *static* volume_factor, which is
@@ -8572,7 +9692,7 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     for _loc, _comps in _ssa_rule_event_conc_reads(
         sbml_model,
-        _ar_rules,
+        _ssa_reads,
         _ar_moving_comps | varvol_ssa_comps,
         species_comp,
         species_hosu,
@@ -8623,6 +9743,30 @@ def _build_model_from_sbml_doc_in_context(doc):
         # which evaluates it at trigger time against the live value; a delay
         # or priority that is a plain number still folds.
         event_fold_ctx: dict[str, float] = {}
+
+        # What an event's resize of an assignment-rule compartment is found
+        # from (issue #1055): each assignment rule's math, in document order,
+        # and the species a resize of each compartment rescales. Both are the
+        # same for every event, so they are read once, not once per event. A
+        # reaction id a rule reads is its kinetic law, so the law is read with
+        # the rules: `C := 1 + 0.5*J0`, J0 at k*A, is resized by `k = 0.6`.
+        event_rule_math: dict[str, object] = {}
+        event_rescaled_species: dict[str, list[str]] = {}
+        event_rule_cache: dict = {}
+        if ar_comp_targets:
+            for j in range(sbml_model.getNumRules()):
+                rule = sbml_model.getRule(j)
+                if rule.isAssignment() and rule.getMath() is not None:
+                    event_rule_math[rule.getVariable()] = rule.getMath()
+            for j in range(sbml_model.getNumReactions()):
+                _rx = sbml_model.getReaction(j)
+                if _rx.getId() in referenced_reaction_ids:
+                    _lm = _law_math_in_model_scope(_rx)
+                    if _lm is not None:
+                        event_rule_math[_rx.getId()] = _lm
+            for sid, scomp in species_comp.items():
+                if not species_hosu.get(sid, False) and sid not in assignment_targets:
+                    event_rescaled_species.setdefault(scomp, []).append(sid)
 
         for i in range(n_events):
             event = sbml_model.getEvent(i)
@@ -8690,7 +9834,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                         time_value=None,
                         avogadro_value=None,
                     )
-                    if pri_numeric is not None and float(pri_numeric).is_integer():
+                    # The int field holds a C int: an integer past it, 1e10 or
+                    # 1e308, failed the load with pybind11's "incompatible
+                    # function arguments". It takes the double path below.
+                    if (
+                        pri_numeric is not None
+                        and float(pri_numeric).is_integer()
+                        and abs(float(pri_numeric)) <= 2**31 - 1
+                    ):
                         priority_val = int(pri_numeric)
                     elif pri_numeric is not None:
                         # SBML L3 §4.11.3 priorities are REAL numbers, but the
@@ -8803,29 +9954,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                     assignments.append((sp_i, value_expr))
 
-            if assignment_value_expr_by_var and ar_comp_targets:
-                event_assignment_replacements = {
-                    _safe_name(var): expr for var, expr in assignment_value_expr_by_var.items()
-                }
-                assigned_vars = set(assignment_value_expr_by_var)
-                for j in range(sbml_model.getNumRules()):
-                    rule = sbml_model.getRule(j)
-                    comp_id = rule.getVariable()
-                    rmath = rule.getMath()
-                    if (
-                        not rule.isAssignment()
-                        or comp_id not in ar_comp_targets
-                        or comp_id in directly_resized_comps
-                        or rmath is None
-                        or not (_ast_name_set(rmath) & assigned_vars)
-                    ):
-                        continue
-                    old_size_expr = _ast_to_exprtk_with_funcdefs(rmath, func_defs)
-                    new_size_expr = _replace_exprtk_symbols(
-                        old_size_expr, event_assignment_replacements
+            if ar_comp_targets and (assignment_value_expr_by_var or resized_comps):
+                resized_comps.extend(
+                    _rule_compartments_an_event_resizes(
+                        event_rule_math,
+                        ar_comp_targets,
+                        resized_comps,
+                        assignment_value_expr_by_var,
+                        event_rescaled_species,
+                        lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
+                        event_rule_cache,
                     )
-                    if new_size_expr != old_size_expr:
-                        resized_comps.append((comp_id, new_size_expr))
+                )
 
             # (#74) Inject per-species concentration rescaling for any
             # compartment whose size this event changes. bngsim stores every
@@ -8855,7 +9995,11 @@ def _build_model_from_sbml_doc_in_context(doc):
             # rescale (which preserves the *amount* by changing the stored
             # *concentration*) must not run. Every real event assignment applies
             # in both modes. Empty/all-False ⇒ byte-identical for non-resize
-            # events.
+            # events. A rate-rule target is the exception among the rescales: it
+            # is no count (issue #718), and its slot holds the rule's
+            # concentration under SSA as under ODE, so its rescale applies in
+            # both. Skipped under SSA, its amount changed with the size: [S]
+            # 0.733 for 0.867 a step after `c = 3`.
             assignment_ode_only = [False] * len(assignments)
             # (#936) Each rescale's (assignment index, compartment size, index of
             # the event's own assignment to the species or -1): the engine stores
@@ -8865,6 +10009,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             rescale_meta: list[tuple[int, str, int]] = []
             if resized_comps:
                 explicitly_assigned = {sp_i for sp_i, _ in assignments}
+                n_own = len(assignments)
                 for comp_id, new_size_expr in resized_comps:
                     comp_safe = _safe_name(comp_id)
                     for sid, scomp in species_comp.items():
@@ -8875,7 +10020,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                         if sid in assignment_targets:
                             continue
                         sp_i = species_idx[sid]
-                        if comp_id in ar_comp_targets:
+                        ode_only = sid not in rate_rule_targets
+                        # A rate-rule target's amount is reported through the
+                        # rule-target map (#728), which reads its column as a
+                        # concentration under every method; the dilution map
+                        # reads it as a count under SSA.
+                        if comp_id in ar_comp_targets and ode_only:
                             ar_dilution_species.add(sid)
                         if sp_i in explicit_species_assignment_expr:
                             # Simultaneous event semantics evaluate all RHS
@@ -8887,20 +10037,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                             value_expr = explicit_species_assignment_expr[sp_i]
                             rescale_expr = f"({value_expr}) * ({comp_safe}) / ({new_size_expr})"
                             base_idx = next(
-                                i
-                                for i, (j, _) in enumerate(assignments)
-                                if j == sp_i and not assignment_ode_only[i]
+                                i for i, (j, _) in enumerate(assignments[:n_own]) if j == sp_i
                             )
                             rescale_meta.append((len(assignments), comp_safe, base_idx))
                             assignments.append((sp_i, rescale_expr))
-                            assignment_ode_only.append(True)
+                            assignment_ode_only.append(ode_only)
                             continue
                         if sp_i in explicitly_assigned:
                             continue
                         rescale_expr = f"{_safe_name(sid)} * ({comp_safe}) / ({new_size_expr})"
                         rescale_meta.append((len(assignments), comp_safe, -1))
                         assignments.append((sp_i, rescale_expr))
-                        assignment_ode_only.append(True)
+                        assignment_ode_only.append(ode_only)
 
             if not assignments:
                 logger.warning(f"Event '{eid}': no valid assignments, skipping")
@@ -8921,6 +10069,96 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             for _ai, _size, _base in rescale_meta:
                 builder.set_last_event_assignment_rescale(_ai, _size, _base)
+
+    # (#1054) A piecewise size's jumps, found in §8c: an event at each
+    # condition's root, each way, rescales the compartment's concentrations so
+    # their amounts hold. ODE only, as every resize rescale is (#81); it is
+    # added after the model's own events so their indices stay as they were.
+    # The jump belongs to the size at that instant. Marked as a jump, it
+    # executes before anything else there, and the model's events triggered at
+    # the instant read their trigger, values and delay after it: read before
+    # it, `at (time >= 2): X = Sn` beside `cv := piecewise(1, time < 2, 5)`
+    # gave X the concentration from before the jump. Executed after an event
+    # there that sets a concentration in the compartment, its rescale of the
+    # value from before overwrote that setting (`at (time >= 2): Sn = 10` left
+    # Sn at 1 or 10 as the same-priority draw went, #242). The priority keeps
+    # it out of the draw against the model's own events under SSA, where it
+    # writes nothing.
+    #
+    # A jump moves more than its own compartment's concentrations. A size rule
+    # that reads one of them, directly or through other rules, jumps with it,
+    # whether or not a condition of its own flips there: beside `cv :=
+    # piecewise(1, t < 2, 5)` and [Sn] = 5, `cw := 1 + Sn` goes from 6 to 2 at
+    # t = 2, and its concentrations were held where their amounts are. So the
+    # jump rescales the concentrations in each such compartment too, each after
+    # the ones whose species it reads, as an event that resizes a compartment
+    # does (#1055): from the size there when the jump executes to the size its
+    # own rescale leaves, both read as the rule gives them then (#936). Where
+    # the compartment jumps at the instant itself, `cw := piecewise(1, t < 2, 1
+    # + Sn)`, its own jump goes from 1 to 1 + [Sn] at the [Sn] from before, 6,
+    # and executes first; this rescale takes it from 6 to 1 + 1, where its own
+    # new size had read [Sn] from before cv's jump and left [Sw] = 3 at 3/6 for
+    # 3/2.
+    _jump_rule_math: dict[str, object] = {}
+    _jump_moves: dict[str, list[str]] = {}
+    _jump_rule_cache: dict[str, tuple[dict, dict]] = {}
+    if _size_jumps:
+        for j in range(sbml_model.getNumRules()):
+            rule = sbml_model.getRule(j)
+            if rule.isAssignment() and rule.getMath() is not None:
+                _jump_rule_math[rule.getVariable()] = rule.getMath()
+        for sid, scomp in species_comp.items():
+            if _diluted(sid):
+                _jump_moves.setdefault(scomp, []).append(sid)
+    for k, (comp, trigger, before, after) in enumerate(_size_jumps):
+        assignments = [
+            (species_idx[sid], f"{_safe_name(sid)} * ({before}) / ({after})")
+            for sid in _jump_species[comp]
+        ]
+        # Its own rule is left out of what is read. A size that reads it by name
+        # is written out through it (§8c), so it jumps at its roots by events of
+        # its own, and a condition of its own on its concentrations has a root,
+        # and an event, of its own too.
+        if comp not in _jump_rule_cache:
+            _jump_rule_cache[comp] = (
+                {var: m for var, m in _jump_rule_math.items() if var != comp},
+                {},
+            )
+        rules_beside, cache = _jump_rule_cache[comp]
+        followers = _rule_compartments_an_event_resizes(
+            rules_beside,
+            ar_comp_targets,
+            [],
+            {sid: f"{_safe_name(sid)} * ({before}) / ({after})" for sid in _jump_species[comp]},
+            _jump_moves,
+            lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
+            cache,
+        )
+        rescales: list[tuple[int, str]] = []
+        for follower, new_size in followers:
+            for sid in _jump_moves.get(follower, ()):
+                rescales.append((len(assignments), _safe_name(follower)))
+                assignments.append(
+                    (
+                        species_idx[sid],
+                        f"{_safe_name(sid)} * ({_safe_name(follower)}) / ({new_size})",
+                    )
+                )
+                ar_dilution_species.add(sid)
+        builder.add_event(
+            f"_size_jump_{_safe_name(comp)}_{k}",
+            trigger,
+            assignments,
+            persistent=True,
+            initial_value=True,
+            priority_expr="1e308",
+            assignment_ode_only=[True] * len(assignments),
+        )
+        builder.set_last_event_size_jump(comp)
+        for ai, size in rescales:
+            builder.set_last_event_assignment_rescale(ai, size, -1)
+        for sid in _jump_species[comp]:
+            ar_dilution_species.add(sid)
 
     # (#81) Apply the deferred SSA live-volume tags. §9 recorded each mass-action
     # varvol reaction as (rxn_idx, comp_id, exp); the compartment's promoted
@@ -9034,9 +10272,22 @@ def _build_model_from_sbml_doc_in_context(doc):
         trigger = event.getTrigger()
         if trigger is not None and trigger.getMath() is not None:
             _from_trigger: list[str] = []
-            _collect_relational_edge_conditions(
-                trigger.getMath(), func_defs, _from_trigger, equalities=trigger_equalities
-            )
+            # Into the function definitions the trigger calls as well, as the
+            # time and state scans go: `near(A, 5, 0.01)` with `near :=
+            # abs(x - c) < w` holds its window in the body, and the trigger's
+            # own math has no relational in it. Rooted whole, the window was
+            # stepped over and the event never fired (issue #904). Every
+            # trigger atom is kept, so no formal needs judging dynamic.
+            for _body, _scope, _ in _iter_funcdef_scan_frames(
+                trigger.getMath(), func_defs, lambda *_: False
+            ):
+                _collect_relational_edge_conditions(
+                    _body,
+                    func_defs,
+                    _from_trigger,
+                    local_params=_scope,
+                    equalities=trigger_equalities,
+                )
             disc_conditions.extend(_from_trigger)
             event_disc.update(_from_trigger)
 
@@ -9206,11 +10457,32 @@ def _build_model_from_sbml_doc_in_context(doc):
                     # The rate of a concentration is the amount's over the
                     # size (`c = 1 + rateOf(B)`: a write to B's `d` 0.33 off).
                     _rate.add(_sp_r.getCompartment())
+                # And its conversionFactor scales the amount's rate.
+                if _sp_r.isSetConversionFactor():
+                    _rate.add(_sp_r.getConversionFactor())
+                elif sbml_model.isSetConversionFactor():
+                    _rate.add(sbml_model.getConversionFactor())
     for _j in range(sbml_model.getNumRules() if _uses_rateof else 0):
         _r = sbml_model.getRule(_j)
         if _r.isRate() and _r.getMath() is not None:
             _reads.setdefault(f"rateOf({_r.getVariable()})", set()).update(
                 _names_read(_r.getMath())
+            )
+    # A concentration in a compartment a rate rule sizes is diluted as the size
+    # changes, whether reactions move it or not, so its rate also reads its own
+    # value, the size and the size's rate (issue #738): `p = rateOf(B)` under
+    # `c' = g` left `g` writable, and `p` 0.675 where a rebuild after `g = 1`
+    # gives 0.35. One with a rate rule of its own has its rate stated.
+    for _j in range(sbml_model.getNumSpecies() if _uses_rateof else 0):
+        _sp_d = sbml_model.getSpecies(_j)
+        _sid_d, _cid_d = _sp_d.getId(), _sp_d.getCompartment()
+        if (
+            _cid_d in rate_rule_comps
+            and not _sp_d.getHasOnlySubstanceUnits()
+            and _sid_d not in rate_rule_targets
+        ):
+            _reads.setdefault(f"rateOf({_sid_d})", set()).update(
+                {_sid_d, _cid_d, f"rateOf({_cid_d})"}
             )
     for _rxn_i in range(sbml_model.getNumReactions()):
         _rxn_f = sbml_model.getReaction(_rxn_i)
@@ -9589,6 +10861,31 @@ def _build_model_from_sbml_doc_in_context(doc):
         varvol_ar_amount_map[_safe_name(sid)] = _safe_name(species_comp[sid])
     model._varvol_ar_amount_map = varvol_ar_amount_map
 
+    # (#728) The amount report of a concentration species that a rule sets. The
+    # two maps above take their species from the dilution gate, which leaves
+    # out a rule target, rightly: its rule states its derivative or its value.
+    # Its amount is still [S]·V_live(t), and as_roadrunner reported [S]·V_static
+    # (01198: S1 = 0.2 for 0.28). Its column holds the rule's concentration
+    # under every method, so V_live(t) is all the report needs, read from the
+    # compartment's promoted-species column (a rate rule), its expression
+    # column (an assignment rule) or its observable column (an event resize; the
+    # event-resize map below leaves such a species to this one).
+    varvol_target_amount_map: dict[str, tuple[str, str]] = {}
+    for sid, cid in species_comp.items():
+        if (
+            sid not in species_idx
+            or species_hosu.get(sid, False)
+            or (sid not in rate_rule_targets and sid not in assignment_targets)
+        ):
+            continue
+        if cid in rate_rule_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("species", _safe_name(cid))
+        elif cid in ar_comp_targets:
+            varvol_target_amount_map[_safe_name(sid)] = ("expression", _safe_name(cid))
+        elif cid in event_resize_comps:
+            varvol_target_amount_map[_safe_name(sid)] = ("observable", _safe_name(cid))
+    model._varvol_target_amount_map = varvol_target_amount_map
+
     # (#131) Variable-volume concentration report map for EVENT-RESIZED
     # compartments (an event assignment writes the compartment's size). Unlike a
     # rate-rule compartment, an event resize injects a per-species ``V_old/V_new``
@@ -9612,9 +10909,16 @@ def _build_model_from_sbml_doc_in_context(doc):
     # emitted as an observable) and applies the factor method-by-method. Maps
     # species_safe → (comp_obs_name, V_static, hOSU). Empty (no-op) for every
     # model with no event-resized compartment.
+    #
+    # A concentration species that a rule sets is no count, and its column holds
+    # the rule's concentration under SSA too (its rescale is not ODE-only), so
+    # this map leaves it to the rule-target map above. Read as a count, `S := 3`
+    # reported [S] = 1 and S = 3 under SSA after `c = 3`, for 3 and 9.
     varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
     if event_resize_comps:
         for sid, cid in species_comp.items():
+            if _safe_name(sid) in varvol_target_amount_map:
+                continue
             if cid in event_resize_comps and sid in species_idx:
                 varvol_event_resize_map[_safe_name(sid)] = (
                     _safe_name(cid),

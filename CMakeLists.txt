@@ -189,6 +189,10 @@ endmacro()
 # KLU was reached — a hard `pip install` failure on a bare Linux box (GH #178).
 # ci/build_suitesparse.sh now skips that probe, so the fallback is genuinely
 # self-sufficient rather than self-sufficient-where-a-BLAS-happens-to-exist.
+# Where _bngsim_autobuild_klu builds KLU. A KLU that resolves under it, on this
+# configure or one before it, is bundled beside the extension (see below).
+set(_bngsim_klu_autobuild_prefix "${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild")
+
 macro(_bngsim_autobuild_klu)
     if(WIN32)
         message(STATUS
@@ -202,7 +206,7 @@ macro(_bngsim_autobuild_klu)
                 "BNGsim: SuiteSparse/KLU auto-build needs both bash and git on "
                 "PATH; not found — skipping the from-source fallback.")
         else()
-            set(_bngsim_klu_prefix "${CMAKE_BINARY_DIR}/_bngsim_klu_autobuild")
+            set(_bngsim_klu_prefix "${_bngsim_klu_autobuild_prefix}")
             set(_bngsim_ss_script "${CMAKE_CURRENT_SOURCE_DIR}/ci/build_suitesparse.sh")
             # Relocatable install: @rpath install-names plus an rpath so the KLU
             # dylibs find each other once copied beside the extension.
@@ -237,12 +241,8 @@ macro(_bngsim_autobuild_klu)
                 set(KLU_ROOT "${_bngsim_klu_prefix}")
                 _bngsim_discover_klu()
                 if(BNGSIM_KLU_FOUND)
-                    # Bundle the built dylibs beside the extension (install rule +
-                    # extension rpath added after the target is defined).
-                    set(BNGSIM_KLU_AUTOBUILT ON)
-                    set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
                     message(STATUS
-                        "BNGsim: built + bundling SuiteSparse/KLU from source — "
+                        "BNGsim: built SuiteSparse/KLU from source — "
                         "lib=${KLU_LIBRARY_DIR}")
                 else()
                     message(STATUS
@@ -360,11 +360,41 @@ else()
     # (set by the macro from the resolved libklu); nothing is FORCE-stomped.
     if(BNGSIM_ENABLE_KLU)
         _bngsim_discover_klu()
-        # No system SuiteSparse? Build+bundle the pinned KLU subset from source
+        # A cache from an earlier configure can name a libklu that is gone (the
+        # autobuild prefix deleted, a system package removed): find_* does not
+        # search again for a cached result. Forget it and search afresh, so a
+        # missing autobuild is rebuilt rather than linked against.
+        if(BNGSIM_KLU_FOUND AND NOT EXISTS "${KLU_LIBRARY}")
+            message(STATUS "BNGsim: cached SuiteSparse/KLU ${KLU_LIBRARY} no longer "
+                           "exists — searching again.")
+            unset(KLU_INCLUDE_DIR CACHE)
+            unset(KLU_LIBRARY CACHE)
+            unset(KLU_LIBRARY_DIR CACHE)
+            _bngsim_discover_klu()
+        endif()
+        # No system SuiteSparse? Build the pinned KLU subset from source
         # (self-sufficient sdist installs) before giving up. Sets BNGSIM_KLU_FOUND
-        # + BNGSIM_KLU_AUTOBUILT on success.
+        # on success.
         if(NOT BNGSIM_KLU_FOUND AND BNGSIM_KLU_AUTOBUILD)
             _bngsim_autobuild_klu()
+        endif()
+        # A KLU under the autobuild prefix is bundled beside the extension
+        # (install rule + rpath below), whether this configure built it or one
+        # before it did: a re-configure finds it through the cache and skips the
+        # autobuild, and without the bundle the install cannot load
+        # @rpath/libklu. A prefix test, not a regex: the build path is the
+        # user's and can hold `+`, `(` or `[`.
+        set(BNGSIM_KLU_AUTOBUILT OFF)
+        if(BNGSIM_KLU_FOUND)
+            cmake_path(IS_PREFIX _bngsim_klu_autobuild_prefix "${KLU_LIBRARY_DIR}" NORMALIZE
+                       _bngsim_klu_is_autobuilt)
+            if(_bngsim_klu_is_autobuilt AND IS_DIRECTORY "${KLU_LIBRARY_DIR}")
+                set(BNGSIM_KLU_AUTOBUILT ON)
+                set(BNGSIM_KLU_BUNDLE_DIR "${KLU_LIBRARY_DIR}")
+                message(STATUS "BNGsim: bundling the SuiteSparse/KLU built from source "
+                               "beside the extension — lib=${KLU_LIBRARY_DIR}")
+            endif()
+            unset(_bngsim_klu_is_autobuilt)
         endif()
         if(BNGSIM_KLU_FOUND)
             set(ENABLE_KLU ON CACHE BOOL "" FORCE)
@@ -422,6 +452,27 @@ set(BNGSIM_EXPRTK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/exprtk")
 set(BNGSIM_EXPRTK_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/third_party/exprtk/exprtk.hpp")
 set(BNGSIM_EXPRTK_VENDOR_METADATA "${BNGSIM_EXPRTK_DIR}/VENDOR.json")
 
+# Every translation unit that compiles ExprTk is built without floating-point
+# contraction (issue #963). A state switch's residual `(lhs)-(rhs)` and its
+# condition `lhs > rhs` are two expressions, and the residual's sign stands for
+# the condition only if both round lhs and rhs alike. Clang contracts within an
+# expression by default, and where the target has a fused multiply-add (arm64)
+# it fused ExprTk's one-expression node for `(x*y)-(z*w)`: `(Aobs^2)-(thr^2)`
+# read +5.75e-17 with A on thr, the rounding error of thr*thr, while the
+# condition compared the two rounded squares and read false. A run sat on that
+# surface until its timeout. GCC in a GNU dialect contracts even across
+# statements. Unfused, the difference of two doubles is 0 exactly when they are
+# equal, so the residual is 0 on the surface and positive only past it, as on
+# x86-64, where nothing is fused.
+#
+# The option goes on each target that compiles exprtk.hpp, not on
+# bngsim_expression alone: ExprTk is header-only, so every such target emits
+# its own copy of the node templates, and the linker keeps one. With it on
+# bngsim_expression only, NFsim's copy (its mu::Parser shim includes
+# exprtk.hpp) was the one kept, and the residual still read 5.75e-17. The
+# option is for GCC and Clang; MSVC is left at its defaults.
+set(BNGSIM_EXPRTK_COMPILE_OPTIONS $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
+
 if(NOT EXISTS "${BNGSIM_EXPRTK_HEADER}")
     message(FATAL_ERROR
         "Missing vendored ExprTk header: ${BNGSIM_EXPRTK_HEADER}\n"
@@ -460,6 +511,7 @@ set_target_properties(bngsim_expression PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ExprTk-heavy translation units can exceed MSVC's default section limit.
 target_compile_options(bngsim_expression PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+    ${BNGSIM_EXPRTK_COMPILE_OPTIONS}
 )
 
 # ─── NFsim (vendored static library) ───────────────────────────────────────────
@@ -519,9 +571,13 @@ if(BNGSIM_BUILD_NFSIM)
             target_include_directories(NFsim_objects PRIVATE ${BNGSIM_EXPRTK_DIR})
             # ExprTk-heavy NFsim TUs (e.g. NFfunction/localFunction.cpp) exceed
             # MSVC's default COFF section limit; /bigobj raises it. GH #150.
-            # Mirrors the same flag on bngsim_expression and bngsim below.
+            # Mirrors the same flag on bngsim_expression and bngsim below. And
+            # ExprTk is compiled unfused here too, or this target's copy of its
+            # templates can be the one linked (issue #963; see
+            # BNGSIM_EXPRTK_COMPILE_OPTIONS).
             target_compile_options(NFsim_objects PRIVATE
-                $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+                $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+                ${BNGSIM_EXPRTK_COMPILE_OPTIONS})
         endif()
         if(TARGET nfsim)
             target_link_libraries(nfsim PUBLIC bngsim::expression)

@@ -427,3 +427,147 @@ def test_two_species_that_move_under_one_threshold(tmp_path, cond, a0, b0, fa, f
     assert a == pytest.approx(a0 + fa * 10.0, rel=1e-11)
     assert b == pytest.approx(b0 + fb * 10.0, rel=1e-11)
     assert y == pytest.approx(KB * 5.0, abs=0.1 * KB * 1e-10 * max(a0, b0) / 1e-8)
+
+
+# ── A residual fused off 0 on its own surface (issue #963) ───────────────────
+
+SPELLED = """begin parameters
+    1 eps 1e-8
+    2 thr {thr!r}
+    3 kb 3
+end parameters
+begin functions
+    1 fY() {cond}
+end functions
+begin species
+    1 A() 1
+    2 Y() 0
+end species
+begin reactions
+    1 0 1 eps
+    2 0 2 fY
+end reactions
+begin groups
+    1 Aobs 1
+end groups
+"""
+
+
+SPELLED_END = 6.0
+
+
+def _spelled(tmp_path, text):
+    path = tmp_path / "spelled.net"
+    path.write_text(text)
+    return bngsim.Simulator(bngsim.Model.from_net(path), method="ode").run(
+        t_span=(0.0, SPELLED_END), n_points=2, rtol=1e-10, atol=1e-12, timeout=5.0
+    )
+
+
+@pytest.mark.parametrize(
+    "cond",
+    ["if(Aobs>thr,kb,0)", "if(Aobs^2>thr^2,kb,0)", "if(Aobs*Aobs>thr*thr,kb,0)"],
+    ids=["plain", "squared", "multiplied"],
+)
+def test_a_residual_off_zero_by_rounding_on_its_surface_is_put_across(tmp_path, cond):
+    """A reaches thr = 1 + 5e-8 at t = 5, so Y(6) = kb. Where the compiler
+    fused ``A*A - thr*thr`` into one multiply-add (arm64; x86-64 with FMA
+    enabled), ``(Aobs^2)-(thr^2)`` read +5.75e-17 with A held on thr, an
+    eighth of its ulp, while the condition read false: the residual's sign
+    said across and leaving, so the state was not taken as pinned. It stayed
+    there, 17 million steps to t = 5.03 with Y = 0, and the wall-clock timeout
+    by t = 6. (At t = 10 the step sequence happens to cross.) ExprTk is now
+    compiled unfused (test_switch_residual_unfused.py), so the residual is 0
+    there as the plain one's is, and every spelling is put across with a step
+    count of the plain one's order. Only a build that would fuse tells this
+    from the bug: x86-64 runners never did."""
+    run = _spelled(tmp_path, SPELLED.format(thr=1.0 + 5e-8, cond=cond))
+    a, y = np.asarray(run.species)[-1]
+    assert a == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
+    assert y == pytest.approx(KB * (SPELLED_END - 5.0), abs=0.1 * KB * 1e-10 / 1e-8)
+    assert run.solver_stats["n_steps"] < 100_000
+
+
+def test_a_product_of_two_moving_species_is_put_across(tmp_path):
+    """A and B each rise at 1e-8 from 1, and A*B reaches (1 + 5e-8)^2 at t = 5.
+    Fused, the product's residual was not 0 on its surface either, and the run
+    timed out the same way."""
+    text = TWO_MOVING.format(
+        cond="if(Aobs*Bobs>thr,kb,0)", a0=1.0, b0=1.0, fa=1e-8, fb=1e-8, thr=(1.0 + 5e-8) ** 2
+    )
+    run = _spelled(tmp_path, text)
+    a, b, y = np.asarray(run.species)[-1]
+    assert a == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
+    assert b == pytest.approx(1.0 + 1e-8 * SPELLED_END, rel=1e-11)
+    assert y == pytest.approx(KB * (SPELLED_END - 5.0), abs=0.1 * KB * 1e-10 / 1e-8)
+    assert run.solver_stats["n_steps"] < 100_000
+
+
+@pytest.mark.parametrize("eps", [1e-6, 1e-7, 1e-8, 1e-9])
+def test_one_switch_under_a_slow_approach_in_sbml(eps):
+    """Issue #959: the slow approach above, written in SBML. Its threshold is
+    rooted by the loader's discontinuity trigger, so it is no state switch,
+    and the run was not put across: each of these ended in the wall-clock
+    timeout. The core now watches the loader's thresholds for a pinned state
+    too, without a root of their own. Y is held as above."""
+    thr = 1.0 + 5.0 * eps
+    text = (
+        f"species A, Y; A = 1; Y = 0; eps = {eps!r}; thr = {thr!r}; kb = {KB!r}\n"
+        "J1: -> A; eps\n"
+        "J2: -> Y; piecewise(kb, A > thr, 0)\n"
+    )
+    model = bngsim.Model.from_antimony_string(text)
+    assert model.state_switch_root_conditions() == ()  # rooted by the loader
+    run = bngsim.Simulator(model, method="ode").run(
+        t_span=(0.0, SLOW_END), n_points=2, rtol=SLOW_RTOL, atol=1e-12, timeout=5.0
+    )
+    a, y = np.asarray(run.species)[-1]
+    assert a == pytest.approx(1.0 + eps * SLOW_END, rel=0.0, abs=1e-3 * eps * SLOW_END)
+    assert y == pytest.approx(KB * (SLOW_END - (thr - 1.0) / eps), abs=0.1 * KB * SLOW_RTOL / eps)
+
+
+@pytest.mark.parametrize("r, rtol", [(1e-6, 1e-8), (1e-7, 1e-8), (1e-4, 1e-10)])
+def test_a_window_closing_slowly_in_sbml(r, rtol):
+    """Issue #905: Y integrates k while c <= A < c + r*w, with A rising at r,
+    so Y(5) = k*w = 0.1. Rooted by the loader, the window's closing edge was
+    one the run could neither cross nor pass, and it held the gate open: Y
+    came back 1.48 and 15.7 times too large after 19 and 53 million steps, and
+    at rtol 1e-10 the run timed out. The .net form is put across by #928, and
+    now so is this. The crossing time is known as well as A is."""
+    w = 0.01
+    text = (
+        f"species A, Y; A = {5.0 - r!r}; Y = 0; k = 10; r = {r!r}; c = 5; cw = {5.0 + r * w!r}\n"
+        "J1: -> A; r\n"
+        "J2: -> Y; piecewise(k, (A >= c) && (A < cw), 0)\n"
+    )
+    run = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
+        t_span=(0.0, 5.0), n_points=3, rtol=rtol, atol=rtol * 1e-2, timeout=10.0
+    )
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(10.0 * w, rel=0.01)
+
+
+@pytest.mark.parametrize("eps", [1e-6, 1e-8, 1e-9])
+def test_an_event_on_a_threshold_the_run_is_put_across_fires(eps):
+    """An SBML event on the threshold of the slow approach above. The run is
+    put across that threshold with no step, so no root saw the trigger change,
+    and CVODE reads every root afresh from the restart: Z stayed 0, where the
+    same run without the carry timed out. E1 rises there, and E3, true at the
+    start and false from the carry on, is armed again for the reset at t = 7.
+    Y integrates kb from the crossing at 5 to the reset at 7."""
+    thr = 1.0 + 5.0 * eps
+    text = (
+        f"species A, Y, Z, W; A = 1; Y = 0; Z = 0; W = 0; eps = {eps!r}; thr = {thr!r}\n"
+        f"kb = {KB!r}\n"
+        "J1: -> A; eps\n"
+        "J2: -> Y; piecewise(kb, A > thr, 0)\n"
+        "E1: at (A > thr): Z = time\n"
+        "E2: at (time > 7): A = 1\n"
+        "E3: at (A < thr): W = W + 1\n"
+    )
+    run = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
+        t_span=(0.0, SLOW_END), n_points=2, rtol=SLOW_RTOL, atol=1e-12, timeout=5.0
+    )
+    _, y, z, w = np.asarray(run.species)[-1]
+    assert z == pytest.approx(5.0, abs=0.1 * SLOW_RTOL / eps)
+    assert w == 1.0
+    assert y == pytest.approx(KB * 2.0, abs=0.1 * KB * SLOW_RTOL / eps)

@@ -172,3 +172,58 @@ def test_cost_decision_rho_is_required():
     # ρ is not derivable from the scaled run alone, so the helper requires it.
     with pytest.raises(TypeError):
         bngsim.psa_cost_decision(10.0)  # type: ignore[call-arg]
+
+
+# ─────────────────────────── a stacked batch of PSA runs ──────────────────────
+
+
+def _stacked(seeds=(1, 2, 3), poplevel=100.0):
+    runs = [_psa_result(poplevel=poplevel, seed=s) for s in seeds]
+    return runs, bngsim.Result.squeeze(runs)
+
+
+def test_a_stack_keeps_each_runs_psa_report():
+    """Each run's report is kept as it was, in stacking order. The stack's own
+    report read inactive, as if the batch had run exact SSA."""
+    runs, stack = _stacked()
+    assert stack.psa_diagnostics_per_run == [r.psa_diagnostics for r in runs]
+    summary = stack.psa_diagnostics
+    assert summary["active"] is True
+    assert summary["peak_population"] == max(r.psa_diagnostics["peak_population"] for r in runs)
+    assert summary["activation_crossed"] is True
+    # The per-run statistics are not combined into one, for want of a meaning.
+    assert summary["mbar"] == [] and summary["qexc"] == []
+    assert math.isnan(summary["speedup"])
+
+
+def test_a_single_run_has_one_report_per_run():
+    run = _psa_result(poplevel=100.0)
+    assert run.psa_diagnostics_per_run == [run.psa_diagnostics]
+
+
+def test_a_stack_of_exact_ssa_runs_stays_inactive():
+    model = _birth_death(2000.0, 1.0, 2000.0)
+    runs = [
+        bngsim.Simulator(model, method="ssa").run((0.0, 1.0), n_points=3, seed=s) for s in (1, 2)
+    ]
+    stack = bngsim.Result.squeeze(runs)
+    assert stack.psa_diagnostics["active"] is False
+    assert [d["active"] for d in stack.psa_diagnostics_per_run] == [False, False]
+
+
+def test_a_stack_of_stacks_keeps_every_run():
+    _, stack = _stacked(seeds=(1, 2))
+    more, _ = _stacked(seeds=(3,))
+    nested = bngsim.Result.squeeze([stack, bngsim.Result.squeeze([*more, *more])])
+    assert len(nested.psa_diagnostics_per_run) == 4
+    assert nested.psa_diagnostics["active"] is True
+
+
+def test_a_stacks_psa_reports_survive_save_and_load(tmp_path):
+    pytest.importorskip("h5py")
+    _, stack = _stacked()
+    path = tmp_path / "stack.h5"
+    stack.save(path)
+    loaded = bngsim.Result.load(path)
+    assert loaded.psa_diagnostics_per_run == stack.psa_diagnostics_per_run
+    assert loaded.psa_diagnostics["active"] is True

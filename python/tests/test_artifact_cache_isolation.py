@@ -17,6 +17,7 @@ containment where the artifact is written, since that is where the leak was.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -115,17 +116,26 @@ def test_without_a_cache_provider_the_root_is_a_throwaway(
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_this_session_took_one_of_those_two_branches(request: pytest.FixtureRequest) -> None:
+def test_this_session_took_one_of_those_branches(
+    request: pytest.FixtureRequest, artifact_caches: SimpleNamespace
+) -> None:
     """The stubs above pin the branches; this pins that the running session is on
     one of them, whichever leg it is.
+
+    The explicit root is a live branch, not only a stubbed one: the pre-push hook
+    sets it so a worktree shares the main checkout's cache
+    (``ci/pre_push_pytest.py``), and a run there resolves outside its own rootdir.
 
     ``getattr`` because ``-p no:cacheprovider`` removes the attribute rather than
     nulling it — reading ``config.cache`` directly raised ``AttributeError`` and
     took down every CI leg with an INTERNALERROR before this was written that way.
     """
     root = cg.CACHE_DIR.parent
+    explicit = os.environ.get(artifact_caches.root_env, "").strip()
     cache = getattr(request.config, "cache", None)
-    if cache is None:  # -p no:cacheprovider
+    if explicit:
+        assert root == Path(explicit).expanduser()
+    elif cache is None:  # -p no:cacheprovider
         assert not root.is_relative_to(request.config.rootpath)
     else:
         assert root == cache.mkdir("bngsim")

@@ -80,12 +80,13 @@ result.output_sensitivities("species:stimulus")
 
 Two things put a species there: codegen declined the rule's own output
 sensitivity (a `piecewise` lowers to an `if()`, which #198 refuses rather than
-guess at), or the reported value carries a time-varying volume rescale the
-redirect does not model. A `NaN` row does **not** cost you the rest of the
-gradient: `gradient`, `sse_gradient`, `chi2_gradient` and
-`neg_log_likelihood_gradient` drop these rows wherever your `dL/dY` is exactly
-zero, so a fit that never scores that species still gets a number. Weight one and
-the gradient is `NaN`, which is the honest answer.
+guess at), or the species is an amount in a compartment whose size changes and
+codegen declined the output sensitivity of the size's own rule (see below). A
+`NaN` row does **not** cost you the rest of the gradient: `gradient`,
+`sse_gradient`, `chi2_gradient` and `neg_log_likelihood_gradient` drop these
+rows wherever your `dL/dY` is exactly zero, so a fit that never scores that
+species still gets a number. Weight one and the gradient is `NaN`, which is the
+honest answer.
 
 ### An amount in a compartment whose size changes
 
@@ -102,9 +103,18 @@ The compartment's derivative is the row of its own state where a rate rule
 moves it, and of its rule's expression where an assignment rule sets it. Where
 that expression's row is not available (a `piecewise` in the rule, which #198
 refuses), the species' row is `NaN`, the run warns naming it, and it is in
-`result.ar_sensitivity_refused` beside the assignment-rule species above. A
-species that an assignment rule sets *and* that sits in such a compartment is
-refused as before.
+`result.ar_sensitivity_refused` beside the assignment-rule species above.
+
+A species that an assignment rule sets *and* that sits in such a compartment
+gets the same quotient rule, through its rule's row (issue #787): `T := 2*P` in
+`C := 1 + P` reports `2P/(1 + P)`, and d[T]/dkp at t = 1 is 0.4988. Its row was
+`NaN`. `output_sensitivities("species:T")` returns the same row.
+
+A function that reads `rateOf` has no expression output sensitivity: there is
+no live derivative to read at an output point. That holds for that function and
+the functions that depend on it, not for the rest of the model. Before issue
+#787 a model with one such function had none for any expression, and the
+dilution term of a concentration in `C := 1 + P` reads the rate of `P`.
 
 The row is right where the amount at the start is the model's own number.
 Where it was made at load by converting the declared value with the size the
@@ -316,10 +326,25 @@ is, its tolerance over its rate, and a pinned run spends a batch of
 threshold, with both branches pointing into it, is not moved, and neither is
 one that comes to rest just short of it.
 
-Issue #904 lists what this does not yet cover:
-- a comparison used as a number outside `if()`, such as `k*(X > 1)`;
-- a single comparison whose residual turns back within one step, such as
-  `abs(X - 5) < 0.01`;
+A comparison used as a number outside `if()`, such as `k*(X > 1)`, is rooted
+the same way in a run without sensitivities; a sensitivity run refuses it. A
+window can also be written as one comparison of a lone `abs()` call, or of a
+lone square of a name or a parenthesized group with a number:
+`abs(X - 5) < 0.01` or `(X - 5)^2 < 0.0001`. Its residual falls to zero and
+comes back up as X passes 5, so a root on it sees one sign at both ends of the
+step that holds the window. Such a comparison is rooted at its two edges
+instead, `X - 5` against `0.01` and `-0.01`, and a sensitivity run jumps a
+square there. `abs()` has no analytic derivative, so a sensitivity run takes
+its columns by difference quotient, and refuses the model where the state or a
+requested parameter moves the run across an edge. An SBML event trigger
+written as such a comparison is rooted at its edges too, so the event fires
+where the comparison turns true. So is one that calls a function definition
+holding the comparison, `near(X, 5, 0.01)` with `near := abs(x - c) < w`, and
+each comparison in such a body, as in the trigger itself. Issue #904 lists
+what this does not yet cover:
+- the same window written any other way, such as `pow(X - 5, 2)` in a `.net`
+  model, `2*abs(X - 5) < 0.02`, or a square compared with a bound that is not
+  a number, `(X - 5)^2 < w`. Each is still rooted whole;
 - `steady_state()`.
 
 ### A rate that rises from zero at the crossing

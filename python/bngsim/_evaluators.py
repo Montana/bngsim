@@ -41,7 +41,11 @@ class JacobianMatrix(np.ndarray):
 
     Returned by :meth:`bngsim.Model.jacobian` with ``sparse=False``. An ordinary
     float64 :class:`numpy.ndarray` in every respect — ``J @ v``,
-    ``numpy.linalg.eigvals(J)``, slicing — with one extra attribute:
+    ``numpy.linalg.eigvals(J)``, slicing — with one extra attribute, below.
+
+    ``J[i, j]`` is ``∂f_i/∂x_j`` — row ``i`` is the species whose derivative is
+    being differentiated, column ``j`` the species it is differentiated with
+    respect to, both in :attr:`bngsim.Model.species_names` order.
 
     Attributes
     ----------
@@ -51,10 +55,6 @@ class JacobianMatrix(np.ndarray):
         difference quotient of :meth:`bngsim.Model.rhs`. A model whose
         analytical Jacobian is incomplete never hands back the partial matrix
         under the first label; it differences instead and says so.
-
-    ``J[i, j]`` is ``∂f_i/∂x_j`` — row ``i`` is the species whose derivative is
-    being differentiated, column ``j`` the species it is differentiated with
-    respect to, both in :attr:`bngsim.Model.species_names` order.
     """
 
     # __slots__ omitted: ndarray subclasses must not declare __slots__
