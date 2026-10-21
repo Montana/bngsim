@@ -2986,13 +2986,14 @@ struct CvodeSimulator::Impl {
     // surface is approached and carries the residual across it in the
     // direction `dir` (+1 rising, -1 falling) the root finder reported; true
     // also when no near-side point can be built. Leaves the model synced at
-    // (t, x). Where given, `resolved` is set to whether the crossing cleared
-    // the band, and `grad` to dg/dx at (t, x) over the residual's species
-    // (issue #908).
+    // (t, x). `reads_time` is NetworkModel::state_switch_reads_time for `sw`.
+    // Where given, `resolved` is set to whether the crossing cleared the band,
+    // and `grad` to dg/dx at (t, x) over the residual's species (issue #908).
     bool flow_carries_state_switch(void *cvode_mem, double t, const double *x, int ns,
                                    const NetworkModel::StateSwitch &sw, int dir, double t_end,
                                    N_Vector scratch, double rtol, double atol,
-                                   const std::vector<double> &atol_v, bool *resolved = nullptr,
+                                   const std::vector<double> &atol_v, bool reads_time,
+                                   bool *resolved = nullptr,
                                    std::vector<double> *grad_out = nullptr);
 };
 
@@ -8488,6 +8489,15 @@ static constexpr double kStateSwitchTauAgreeTol = 1e-4;
 static double state_switch_resolve_factor(int ns) {
     return 10.0 * std::sqrt(static_cast<double>(ns));
 }
+// Issue #907: the restart test reads the step after a root at this many even
+// points, and then at halvings of it toward the root, down to 2^-40 of it at
+// most, or to where no species the residual reads can move a tolerance band.
+static constexpr int kStateSwitchResolveSamples = 16;
+static constexpr int kStateSwitchResolveHalvings = 40;
+// The best of those readings is refined where its excursion reaches this share
+// of its bar, by this many golden-section steps over its two neighbours.
+static constexpr double kStateSwitchResolveRefineShare = 0.25;
+static constexpr int kStateSwitchResolveRefinements = 24;
 // Issue #908 (StateSwitchHold). A residual is held after this many steps in a
 // row, each at most kStateSwitchHoldStepGap steps after the last, have had a
 // crossing of it declined as unresolved. A slide crosses on nearly every step.
@@ -8505,10 +8515,13 @@ static constexpr double kStateSwitchHoldGradKept = 0.75;
 // its box costs (4n + 2) * 2n evaluations.
 static constexpr std::size_t kStateSwitchHoldMaxSpecies = 16;
 
-bool CvodeSimulator::Impl::flow_carries_state_switch(
-    void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
-    int dir, double t_end, N_Vector scratch, double rtol, double atol,
-    const std::vector<double> &atol_v, bool *resolved_out, std::vector<double> *grad_out) {
+bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, const double *x,
+                                                     int ns, const NetworkModel::StateSwitch &sw,
+                                                     int dir, double t_end, N_Vector scratch,
+                                                     double rtol, double atol,
+                                                     const std::vector<double> &atol_v,
+                                                     bool reads_time, bool *resolved_out,
+                                                     std::vector<double> *grad_out) {
     // A trajectory that CROSSES the surface arrives at it with a flow that stays
     // finite as the surface is approached. One that only approaches it, parked
     // beside it or relaxing onto it, arrives with a flow that vanishes there, so
@@ -8545,6 +8558,22 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(
     // rather than its end: a window can open and close inside one step, and a
     // curved residual (3u − u³) can cross and come back, so the end may be on
     // the near side again after an excursion of 0.03.
+    //
+    // It is read evenly, and then at halvings toward the root (issue #907).
+    // After a restart CVODE grows its step about tenfold at a time, so the step
+    // can be many times the width of a hump that opens at the root, and sixteen
+    // even readings straddled the cubic's: its window, caught over (0, 5), was
+    // lost over (0, 4), (0, 10) and (0, 20). The halvings stop where no species
+    // the residual reads can move a tolerance band from the root, nor the clock
+    // move the residual a band: a reading there cannot clear 10·√N bands. The
+    // interpolant is a polynomial, so its derivatives at the root bound how far
+    // each species moves; a residual that reads the clock adds dg/dt read at
+    // the root's state. A hump that only just clears its bar does so over a
+    // core narrower than the readings' spacing, so the best reading is then
+    // refined between its two neighbours where it is within a quarter of its
+    // bar: near rtol 5e-4 the cubic's window was lost on 25 runs of 242
+    // without it. More readings can only find an excursion the solver's own
+    // trajectory makes, so a crossing inside the band is still declined.
     //
     // Where no near-side point can be built (a residual flat in every
     // coordinate, or one that does not move to the side the Newton step aims
@@ -8594,22 +8623,154 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(
     const double k_resolve = state_switch_resolve_factor(ns);
     bool resolved = false;
     if (t_end > t) {
-        constexpr int kSamples = 16;
-        for (int k = 1; k <= kSamples && !resolved; ++k) {
-            const double tk = t + (t_end - t) * static_cast<double>(k) / kSamples;
+        const double span = t_end - t;
+        auto atol_of = [&](int j) {
+            return atol_v.empty() ? atol : atol_v[static_cast<std::size_t>(j)];
+        };
+        // The excursion at t + d and the k_resolve bands it has to clear there.
+        struct Reading {
+            double d;
+            double excursion;
+            double bar;
+        };
+        bool readable = true;
+        auto read_at = [&](double d) {
+            Reading r{d, std::numeric_limits<double>::quiet_NaN(),
+                      std::numeric_limits<double>::quiet_NaN()};
+            const double tk = t + d;
             if (CVodeGetDky(cvode_mem, tk, 0, scratch) != CV_SUCCESS) {
-                break;
+                readable = false;
+                return r;
             }
             const double *xk = N_VGetArrayPointer(scratch);
             sync_model_at(tk, xk, ns);
-            const double excursion = eval.evaluate(sw.residual_expr_idx) * static_cast<double>(dir);
+            r.excursion = eval.evaluate(sw.residual_expr_idx) * static_cast<double>(dir);
             double band = 0.0;
             for (int j : sw.species) {
-                const double atol_j = atol_v.empty() ? atol : atol_v[static_cast<std::size_t>(j)];
                 band += std::fabs(grad[static_cast<std::size_t>(j)]) *
-                        (rtol * std::fabs(xk[j]) + atol_j);
+                        (rtol * std::fabs(xk[j]) + atol_of(j));
             }
-            resolved = std::isfinite(excursion) && excursion > k_resolve * band;
+            r.bar = k_resolve * band;
+            resolved = std::isfinite(r.excursion) && r.excursion > r.bar;
+            return r;
+        };
+        auto margin_of = [](const Reading &r) {
+            const double m = r.excursion - r.bar;
+            return std::isfinite(m) ? m : -std::numeric_limits<double>::infinity();
+        };
+        std::vector<Reading> readings;
+        readings.reserve(kStateSwitchResolveSamples + kStateSwitchResolveHalvings);
+        std::size_t ib = 0; // the reading with the largest margin
+        auto keep = [&](double d) {
+            const Reading r = read_at(d);
+            if (readable) {
+                if (readings.empty() || margin_of(r) > margin_of(readings[ib])) {
+                    ib = readings.size();
+                }
+                readings.push_back(r);
+            }
+        };
+        for (int k = 1; k <= kStateSwitchResolveSamples && readable && !resolved; ++k) {
+            keep(span * static_cast<double>(k) / kStateSwitchResolveSamples);
+        }
+        if (!resolved && readable) {
+            // How far each species the residual reads can move over [t, t + d]:
+            // the interpolant is a polynomial of the last step's order, so by at
+            // most Σ_m |x_j^(m)(t)|·d^m/m!. Unbounded where that cannot be read.
+            const std::size_t n_read = sw.species.size();
+            int order = 0;
+            bool bounded = CVodeGetLastOrder(cvode_mem, &order) == CV_SUCCESS && order > 0;
+            std::vector<double> taylor; // |x_j^(m)(t)|/m!, by m and then by species
+            taylor.reserve(static_cast<std::size_t>(std::max(order, 0)) * n_read);
+            double factorial = 1.0;
+            for (int m = 1; m <= order && bounded; ++m) {
+                factorial *= static_cast<double>(m);
+                bounded = CVodeGetDky(cvode_mem, t, m, scratch) == CV_SUCCESS;
+                const double *xm = N_VGetArrayPointer(scratch);
+                for (std::size_t s = 0; s < n_read && bounded; ++s) {
+                    taylor.push_back(std::fabs(xm[sw.species[s]]) / factorial);
+                }
+            }
+            double band_root = 0.0;
+            for (int j : sw.species) {
+                band_root += std::fabs(grad[static_cast<std::size_t>(j)]) *
+                             (rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j));
+            }
+            // dg/dt at the root's state, the clock's own term, read once. On its
+            // own surface h(t)·(S − thr) reads 0 here; what h does over a reach
+            // in which S moves less than its band is second order.
+            double g_time = reads_time ? -1.0 : 0.0;
+            auto may_clear = [&](double d) {
+                if (!bounded) {
+                    return true;
+                }
+                for (std::size_t s = 0; s < n_read; ++s) {
+                    const int j = sw.species[s];
+                    double reach = 0.0;
+                    double dm = 1.0;
+                    for (int m = 1; m <= order; ++m) {
+                        dm *= d;
+                        reach += taylor[static_cast<std::size_t>(m - 1) * n_read + s] * dm;
+                    }
+                    if (!(reach <=
+                          rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j))) {
+                        return true;
+                    }
+                }
+                if (g_time < 0.0) {
+                    const double ht = 1e-7 * std::max(std::fabs(t), 1.0);
+                    sync_model_at(t + ht, x, ns);
+                    g_time = std::fabs((eval.evaluate(sw.residual_expr_idx) - g_star) / ht);
+                    if (!std::isfinite(g_time)) {
+                        g_time = std::numeric_limits<double>::infinity();
+                    }
+                }
+                return !(std::fabs(g_star) + g_time * d <= band_root);
+            };
+            // 2^-1 to 2^-4 of the span are even readings already.
+            static_assert(kStateSwitchResolveSamples == 16, "halvings start past 1/16");
+            for (int m = 5; m <= kStateSwitchResolveHalvings && readable && !resolved; ++m) {
+                const double d = std::ldexp(span, -m);
+                if (!(t + d > t) || !may_clear(d)) {
+                    break;
+                }
+                keep(d);
+            }
+        }
+        if (!resolved && readable && !readings.empty() && readings[ib].excursion > 0.0 &&
+            readings[ib].excursion >= kStateSwitchResolveRefineShare * readings[ib].bar) {
+            // Between the readings either side of it in time.
+            const double d_top = readings[ib].d;
+            double lo = 0.0;
+            double hi = span;
+            for (const Reading &r : readings) {
+                if (r.d < d_top) {
+                    lo = std::max(lo, r.d);
+                } else if (r.d > d_top) {
+                    hi = std::min(hi, r.d);
+                }
+            }
+            auto margin_at = [&](double d) { return margin_of(read_at(d)); };
+            constexpr double kGolden = 0.6180339887498949; // (√5 − 1)/2
+            double d1 = hi - kGolden * (hi - lo);
+            double d2 = lo + kGolden * (hi - lo);
+            double m1 = margin_at(d1);
+            double m2 = resolved || !readable ? m1 : margin_at(d2);
+            for (int it = 0; it < kStateSwitchResolveRefinements && readable && !resolved; ++it) {
+                if (m1 >= m2) {
+                    hi = d2;
+                    d2 = d1;
+                    m2 = m1;
+                    d1 = hi - kGolden * (hi - lo);
+                    m1 = margin_at(d1);
+                } else {
+                    lo = d1;
+                    d1 = d2;
+                    m1 = m2;
+                    d2 = lo + kGolden * (hi - lo);
+                    m2 = margin_at(d2);
+                }
+            }
         }
         sync_model_at(t, x, ns);
     }
@@ -14394,7 +14555,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     const std::vector<double> x_root(x_at, x_at + ns);
                     if (impl_->flow_carries_state_switch(
                             cvode_mem, hi, x_root.data(), ns, *state_switches[jx], side_here,
-                            static_cast<double>(t_step_end), samples, rtol, atol, atol_v)) {
+                            static_cast<double>(t_step_end), samples, rtol, atol, atol_v,
+                            state_switch_hold.reads_time[jx] != 0)) {
                         t_restart = hi;
                         x_restart = x_root;
                     }
@@ -14894,7 +15056,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             if (impl_->flow_carries_state_switch(
                                     cvode_mem, t_root, y_data, ns, *state_switches[jx],
                                     root_info[n_events + n_disc + j], static_cast<double>(t_end),
-                                    scratch, rtol, atol, atol_v, &resolved, &grad)) {
+                                    scratch, rtol, atol, atol_v,
+                                    state_switch_hold.reads_time[jx] != 0, &resolved, &grad)) {
                                 restart = true;
                                 break;
                             }
