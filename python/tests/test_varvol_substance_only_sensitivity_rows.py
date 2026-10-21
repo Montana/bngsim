@@ -15,6 +15,16 @@ reported column is ``X = 2*exp(-k*t)/(1 + g*t)``. At t = 4, dX/dk came back
 
 The row is the quotient rule now. Expected values are closed forms, and central
 differences of runs with no sensitivities for the model that has none.
+
+``steady_state()`` reported the same species over the size at load, and its
+``dY_ss/dp`` row as the stored amount's, until it ran the same passes (issue
+#787): ``H`` made at 1 and lost at ``0.5*H`` in ``V := 1 + P``, with ``P``
+settling at 5, came back 2.0 for 2/6, where ``run()`` to the same state
+reports 2/6. That section checks it against closed forms.
+
+The last section is ``run()`` again, for an amount that an assignment rule
+sets in such a compartment: its row was NaN, refused by name, where the
+steady state had it (issue #787).
 """
 
 from __future__ import annotations
@@ -221,9 +231,10 @@ def test_a_run_with_no_row_for_the_rule_leaves_the_species_row_nan(monkeypatch):
 
 
 def test_both_kinds_of_refused_row_are_listed():
-    """``Z := 3*X`` is an assignment-rule species in the same compartment,
-    refused as it was (GH #221). ``X`` is refused beside it, and the list
-    holds both."""
+    """``Z := 3*X`` is an assignment-rule species in the same compartment. Its
+    row is its rule's put through the quotient rule (issue #787), which needs
+    the size's row as X's does, so it is refused beside X, and the list holds
+    both. Its selector is refused by name, as before."""
     text = DECLINED + "substanceOnly species Z in V; Z := 3*X\n"
     sim = bngsim.Simulator(
         bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["k", "g"]
@@ -232,6 +243,9 @@ def test_both_kinds_of_refused_row_are_listed():
         warnings.simplefilter("ignore")
         result = sim.run(**RUN)
     assert result.ar_sensitivity_refused == frozenset({"X", "Z"})
+    assert np.isnan(_row(result, "Z")).all()
+    with pytest.raises(ValueError, match=r"'species:Z' is reported over the live size"):
+        result.output_sensitivities("species:Z")
 
 
 # ── Where the amount at load was read off the size ──────────────────────────
@@ -459,3 +473,269 @@ def test_a_size_that_stands_still_under_a_rule_with_no_derivative_is_nan_too():
         result = sim.run(**RUN)
     assert np.isnan(_row(result)).all()
     assert "X" in result.ar_sensitivity_refused
+
+
+# ── The steady state (issue #787) ───────────────────────────────────────────
+#
+# A size that settles where it did not start: ``V' = a - b*V`` from 1 to
+# a/b = 6, or ``V := 1 + P`` with ``P`` made at ``kp`` and lost at ``kd*P``,
+# 1 + kp/kd = 6. The amount ``H`` in it is made and lost, set by a rule, or set
+# by a rate rule.
+
+SETTLES = (
+    "compartment D = 1; species P in D; P = 0; kp = 1; kd = 0.2;\nJ3: => P; kp; J4: P => ; kd*P;\n"
+)
+SIZES = {
+    "a-rate-rule": "compartment V = 1; V' = a - b*V; a = 3; b = 0.5;\n",
+    "an-assignment-rule": "compartment V; V := 1 + P;\n",
+}
+AN_AMOUNT = "substanceOnly species H in V; "
+AMOUNTS = {
+    "made": AN_AMOUNT + "H = 0; ks = 1; kh = 0.5;\nJ1: => H; ks; J2: H => ; kh*H;\n",
+    "set-by-a-rule": AN_AMOUNT + "H := 2*P;\n",
+    "set-by-a-rate-rule": AN_AMOUNT + "H = 0; ks = 1; kh = 0.5; H' = ks - kh*H;\n",
+}
+NOMINAL = {"ks": 1.0, "kh": 0.5, "kp": 1.0, "kd": 0.2, "a": 3.0, "b": 0.5}
+SS = {"tol": 1e-12, "max_time": 1e5}
+
+
+def _settles(size: str, amount: str) -> bngsim.Model:
+    return bngsim.Model.from_antimony_string(SETTLES + SIZES[size] + AMOUNTS[amount])
+
+
+def _settled(size: str, amount: str, p: dict) -> float:
+    """[H] at the steady state, the amount over the live size: 2/6, or 10/6
+    where the rule sets it to 2*P."""
+    v = p["a"] / p["b"] if size == "a-rate-rule" else 1.0 + p["kp"] / p["kd"]
+    held = 2.0 * p["kp"] / p["kd"] if amount == "set-by-a-rule" else p["ks"] / p["kh"]
+    return held / v
+
+
+def _settled_row(size: str, amount: str, params: list[str]) -> np.ndarray:
+    """d[H]/dp of the closed form, by central differences of it."""
+    row = []
+    for name in params:
+        h = 1e-6 * NOMINAL[name]
+        up, down = dict(NOMINAL), dict(NOMINAL)
+        up[name] += h
+        down[name] -= h
+        row.append((_settled(size, amount, up) - _settled(size, amount, down)) / (2 * h))
+    return np.array(row)
+
+
+EVERY_KIND = [(size, amount) for size in sorted(SIZES) for amount in sorted(AMOUNTS)]
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+@pytest.mark.parametrize("size,amount", EVERY_KIND)
+def test_a_steady_state_reports_the_amount_over_the_live_size(size, amount, method):
+    """2/6 or 10/6, where it was 2 or 10: the amount over the size at load."""
+    ss = bngsim.Simulator(_settles(size, amount), method="ode").steady_state(method=method, **SS)
+    assert ss.converged
+    want = _settled(size, amount, NOMINAL)
+    assert ss["H"] == pytest.approx(want, rel=1e-8)
+    assert ss.to_dict()["H"] == pytest.approx(want, rel=1e-8)
+    assert ss["P"] == pytest.approx(5.0, rel=1e-8)
+
+
+@pytest.mark.parametrize("size,amount", EVERY_KIND)
+def test_a_steady_state_is_where_a_long_run_ends(size, amount):
+    """Every species, the size's own among them where a rate rule moves it."""
+    ss = bngsim.Simulator(_settles(size, amount), method="ode").steady_state(**SS)
+    run = bngsim.Simulator(_settles(size, amount), method="ode").run(
+        t_span=(0.0, 400.0), n_points=3, rtol=1e-11, atol=1e-13
+    )
+    for name in run.species_names:
+        assert ss[name] == pytest.approx(_column(run, name)[-1], rel=1e-7, abs=1e-12), name
+
+
+@pytest.mark.parametrize("size,amount", EVERY_KIND)
+def test_a_steady_state_row_is_the_derivative_of_what_it_reports(size, amount):
+    """The quotient rule through the size's own row. Main returned the row of
+    the stored amount over the size at load: d[H]/dks 2 for 1/3 for the amount
+    made in either compartment, d[H]/db 0 for 2/3 in ``V' = a - b*V``, and
+    d[H]/dkp 10 for 0.2778 for ``H := 2*P`` in ``V := 1 + P``."""
+    model = _settles(size, amount)
+    params = [name for name in NOMINAL if name in model.param_names]
+    ss = bngsim.Simulator(model, method="ode").steady_state(sensitivity_params=params, **SS)
+    want = _settled_row(size, amount, params)
+    row = np.asarray(ss.sensitivity)[list(ss.species_names).index("H")]
+    np.testing.assert_allclose(row, want, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(
+        ss.output_sensitivities(["species:H"])[0], want, rtol=1e-6, atol=1e-9
+    )
+    assert np.max(np.abs(want)) > 0.1
+
+
+@pytest.mark.parametrize("size", sorted(SIZES))
+def test_each_entry_of_a_steady_state_batch(size):
+    """Each entry is reported against its own clone, at its own size."""
+    sim = bngsim.Simulator(_settles(size, "made"), method="ode")
+    entries = [{"ks": 2.0}] + (
+        [{"a": 4.0}, {"b": 0.25}] if size == "a-rate-rule" else [{"kp": 2.0}, {"kd": 0.4}]
+    )
+    for entry, ss in zip(entries, sim.steady_state_batch(entries, **SS), strict=True):
+        assert ss["H"] == pytest.approx(_settled(size, "made", {**NOMINAL, **entry}), rel=1e-8)
+
+
+@pytest.mark.parametrize("size", sorted(SIZES))
+def test_a_steady_concentration_beside_it_is_as_it_was(size):
+    """Control. ``G`` is held as a concentration, made at ``kg*V`` and lost at
+    ``kh*G*V``: 2 at every size, and its row was right."""
+    text = SETTLES + SIZES[size] + AMOUNTS["made"]
+    text += "species G in V; G = 0; kg = 1; J5: => G; kg*V; J6: G => ; kh*G*V;\n"
+    model = bngsim.Model.from_antimony_string(text)
+    ss = bngsim.Simulator(model, method="ode").steady_state(sensitivity_params=["kg", "kh"], **SS)
+    assert ss["G"] == pytest.approx(2.0, rel=1e-8)
+    row = np.asarray(ss.sensitivity)[list(ss.species_names).index("G")]
+    np.testing.assert_allclose(row, [2.0, -4.0], rtol=1e-6)
+
+
+def test_a_steady_state_with_an_accumulator_left_out():
+    """``S`` collects what ``H`` loses at ``0.1*H`` and has no steady value, so
+    ``mask=`` leaves it out and its row is NaN, as it was, with nothing said
+    about it here. ``H`` is ks/(kh + 0.1) over 6, and its row is right."""
+    text = SETTLES + SIZES["an-assignment-rule"] + AMOUNTS["made"]
+    text += "substanceOnly species S in V; S = 0; J7: H => S; 0.1*H;\n"
+    model = bngsim.Model.from_antimony_string(text)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ss = bngsim.Simulator(model, method="ode").steady_state(
+            sensitivity_params=["ks", "kd"], mask=~model.is_pure_sink(), **SS
+        )
+    names = list(ss.species_names)
+    assert np.isnan(np.asarray(ss.sensitivity)[names.index("S")]).all()
+    assert ss["H"] == pytest.approx(1.0 / 0.6 / 6.0, rel=1e-8)
+    want = [1.0 / 0.6 / 6.0, (1.0 / 0.6) / 36.0 * 25.0]
+    np.testing.assert_allclose(np.asarray(ss.sensitivity)[names.index("H")], want, rtol=1e-6)
+
+
+def test_a_steady_state_that_left_out_the_size_refuses_the_row():
+    """``mask=`` leaves out ``V`` and keeps ``H``, whose row needs ``V``'s.
+    Main returned the stored amount's row. Refused, by name."""
+    model = _settles("a-rate-rule", "made")
+    keep = [name for name in model.species_names if name != "V"]
+    sim = bngsim.Simulator(model, method="ode")
+    with pytest.raises(bngsim.SimulationError, match=r"\['H'\].*mask="):
+        sim.steady_state(sensitivity_params=["ks", "a"], mask=keep, **SS)
+
+
+# ── An amount a rule sets, on a time course (issue #787) ────────────────────
+#
+# ``H := 2*P`` in either compartment above, run rather than settled. ``run()``
+# reports the rule over the live size, and its row was NaN, refused by name,
+# where the steady state above gives it: the varvol passes' quotient rule ran
+# before the rule's row was put in. With P(t) = P0*e^(-kd*t) + (kp/kd)*(1 -
+# e^(-kd*t)) and V either 1 + P or a/b + (1 - a/b)*e^(-b*t), the reported
+# column has a closed form. Each row is checked against differences of the
+# closed form and against central differences of runs.
+
+
+def _p_of_t(p: dict, p0: float = 0.0) -> np.ndarray:
+    decay = np.exp(-p["kd"] * T)
+    return p0 * decay + p["kp"] / p["kd"] * (1.0 - decay)
+
+
+def _live_size(size: str, p: dict, p0: float = 0.0) -> np.ndarray:
+    if size == "a-rate-rule":
+        held = p["a"] / p["b"]
+        return held + (1.0 - held) * np.exp(-p["b"] * T)
+    return 1.0 + _p_of_t(p, p0)
+
+
+def _ruled(size: str, p: dict, p0: float = 0.0) -> np.ndarray:
+    """[H] = 2P/V_live."""
+    return 2.0 * _p_of_t(p, p0) / _live_size(size, p, p0)
+
+
+def _ruled_rows(size: str, params: list[str], p0: float = 0.0) -> np.ndarray:
+    """d[H]/dp of the closed form, by central differences of it."""
+    rows = []
+    for name in params:
+        h = 1e-6 * NOMINAL[name]
+        up, down = dict(NOMINAL), dict(NOMINAL)
+        up[name] += h
+        down[name] -= h
+        rows.append((_ruled(size, up, p0) - _ruled(size, down, p0)) / (2 * h))
+    return np.stack(rows, axis=1)
+
+
+def _ruled_text(size: str, p0: float = 0.0, extra: str = "") -> str:
+    return (SETTLES + SIZES[size] + AMOUNTS["set-by-a-rule"] + extra).replace(
+        "P = 0;", f"P = {p0};"
+    )
+
+
+@pytest.mark.parametrize("p0", [0.0, 1.0])
+@pytest.mark.parametrize("size", sorted(SIZES))
+def test_a_rule_s_amount_on_a_time_course_has_its_row(size, p0):
+    """At t = 4 in ``V := 1 + P`` from P = 0, d[H]/dkp is 0.3909 and d[H]/dkd
+    -0.6786; the row was NaN, and H was in ``ar_sensitivity_refused``. From
+    P = 1 the size at load is 2, which the rule's value is divided by before
+    the live size replaces it."""
+    text = _ruled_text(size, p0)
+    model = bngsim.Model.from_antimony_string(text)
+    params = [name for name in NOMINAL if name in model.param_names]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = bngsim.Simulator(model, method="ode", sensitivity_params=params).run(**RUN)
+    assert result.ar_sensitivity_refused == frozenset()
+    np.testing.assert_allclose(_column(result, "H"), _ruled(size, NOMINAL, p0), rtol=1e-8)
+    row = _row(result, "H")
+    np.testing.assert_allclose(row, _ruled_rows(size, params, p0), rtol=1e-6, atol=1e-9)
+    for c, name in enumerate(params):
+        want = _by_plain_runs(text, "H", name, NOMINAL[name])
+        np.testing.assert_allclose(row[:, c], want, rtol=2e-5, atol=1e-8, err_msg=name)
+    np.testing.assert_array_equal(result.output_sensitivities("species:H")[:, 0, :], row)
+    if size == "an-assignment-rule" and p0 == 0.0:
+        np.testing.assert_allclose(row[-1], [0.3909, -0.6786], atol=1e-4)
+
+
+@pytest.mark.parametrize("size", sorted(SIZES))
+def test_a_rule_s_amount_has_the_row_of_what_it_reads_at_the_start(size):
+    """The initial-condition axis: d[H]/dP(0) is 2*e^(-kd*t)/V, less, where P
+    sizes the compartment, [H]*e^(-kd*t)/V. It was NaN."""
+    text = _ruled_text(size)
+    model = bngsim.Model.from_antimony_string(text)
+    result = bngsim.Simulator(model, method="ode", sensitivity_ic=["P"]).run(**RUN)
+    row = np.asarray(result.sensitivities_ic)[:, list(result.species_names).index("H"), 0]
+    decay = np.exp(-NOMINAL["kd"] * T)
+    v = _live_size(size, NOMINAL)
+    dv = decay if size == "an-assignment-rule" else 0.0
+    want = 2.0 * decay / v - _ruled(size, NOMINAL) * dv / v
+    np.testing.assert_allclose(row, want, rtol=1e-6, atol=1e-9)
+    h = 1e-5
+
+    def column(at):
+        m = bngsim.Model.from_antimony_string(text)
+        m.set_concentration("P", at)
+        return _column(bngsim.Simulator(m, method="ode").run(**RUN), "H")
+
+    np.testing.assert_allclose(row, (column(h) - column(-h)) / (2 * h), rtol=2e-5, atol=1e-8)
+
+
+def test_a_rule_s_amount_beside_a_concentration_whose_dilution_reads_a_rate():
+    """A concentration ``G`` in ``V := 1 + P`` is diluted at the rate of P, and
+    the dilution term reads that rate (issue #1052). Codegen declined the
+    output sensitivity of every expression for it, the size's own among them,
+    so H's row had no dV/dθ to take: NaN. Only the dilution term reads a rate,
+    and only it is declined now."""
+    text = _ruled_text(
+        "an-assignment-rule", extra="species G in V; G = 2; kg = 0.5; J5: G => ; kg*G;\n"
+    )
+    params = ["kp", "kd"]
+    course = {**RUN, "rtol": 1e-10, "atol": 1e-12}
+    model = bngsim.Model.from_antimony_string(text)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = bngsim.Simulator(model, method="ode", sensitivity_params=params).run(**course)
+    assert result.ar_sensitivity_refused == frozenset()
+    row = _row(result, "H")
+    np.testing.assert_allclose(
+        row, _ruled_rows("an-assignment-rule", params), rtol=1e-6, atol=1e-9
+    )
+    for c, name in enumerate(params):
+        want = _by_plain_runs(text, "H", name, NOMINAL[name])
+        np.testing.assert_allclose(row[:, c], want, rtol=2e-5, atol=1e-8, err_msg=name)
+    size = np.asarray(result.output_sensitivities("expression:V"))[:, 0, :]
+    np.testing.assert_allclose(size[-1], [2.7534, -4.7802], atol=1e-4)

@@ -148,6 +148,36 @@ def test_decisiveness_currently_coincides_with_a_nonzero_rescue():
         assert decisive == (v["passed"] and v["n_forgive_rescued"] > 0)
 
 
+def test_decisiveness_coincides_with_a_rescue_where_the_movement_gate_decides():
+    """The same property where only the movement gate can fail a cell (issue
+    #873). A reservoir at 1e4 times the moving columns puts them under the
+    significance bar and every perturbation under the absolute ceiling, so the
+    magnitude gates forgive all of it. A rescue counted over ``fail_mask`` alone
+    would credit the mask with nothing here while it turned DIFFs into PASSes.
+    """
+    rng = np.random.default_rng(1)
+    n_decisive = 0
+    for _ in range(2000):
+        n_t, n_c = int(rng.integers(2, 25)), int(rng.integers(1, 5))
+        scale = 10.0 ** rng.integers(-6, 6)
+        a = rng.normal(size=(n_t, n_c)) * scale
+        b = a.copy()
+        k = int(rng.integers(1, max(2, a.size // 2)))
+        idx = rng.choice(a.size, size=k, replace=False)
+        pert = 10.0 ** rng.uniform(-6, 0, size=k)
+        b.flat[idx] = a.flat[idx] + pert * scale
+        a = np.column_stack([a, np.full(n_t, 1e4 * scale)])
+        b = np.column_stack([b, np.full(n_t, 1e4 * scale)])
+        flat = np.zeros(a.size, bool)
+        flat[rng.choice(a.size, size=int(rng.integers(1, a.size + 1)), replace=False)] = True
+
+        v = differ.deterministic_verdict(a, b, forgive_mask=flat.reshape(a.shape))
+        decisive = v["passed"] and not v["passed_without_forgive"]
+        assert decisive == (v["passed"] and v["n_forgive_rescued"] > 0)
+        n_decisive += decisive
+    assert n_decisive > 0  # the loop reached the case it is about
+
+
 # ── What "rescued" means, in `differ`'s own terms ───────────────────────────
 
 

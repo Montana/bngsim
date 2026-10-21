@@ -10,11 +10,16 @@ RuleMonkey runs such a function since 3.11.0, which integrates a rate that reads
 the clock between events (richardposner/RuleMonkey#86), and it runs on absolute
 model time (issue #1022). So does a table function indexed by time
 (``type="TFUN"`` with a clock ``ctrName``), which keeps its clock in an
-attribute while its ``<Expression>`` reads a placeholder. NFsim runs one, but
-refreshes its value only when a reaction fires, so a rate that is 0 at the
-start is not seen (issue #892), and it reads elapsed time, BNG2.pl's
-simulate_nf semantics. That is left to the fix there, since refusing it would
-take away a table function NFsim reads correctly whenever reactions fire often.
+attribute while its ``<Expression>`` reads a placeholder. NFsim runs one on
+elapsed time, BNG2.pl's simulate_nf semantics, and reads it again at each of
+its x values whether or not a reaction fires, which is exact for a step table
+(issue #892). A linear one changes between those reads, and NFsim holds the
+value it last read, after a reaction or at an x value: from a start where
+nothing can fire, 100 molecules leaving at a rate that ramps from 0 stayed at
+100 through t = 1, where the exact mean is 1.75. NFsim refuses a model whose
+rate laws read one, directly or through the functions they call, until it
+integrates such a rate (issue #1179). A table no rate law reads is read
+correctly at the output times and is let through.
 
 A RuleMonkey session uses :func:`clock_readers` to refuse a segment whose labels
 are not the clock the model reads.
@@ -38,6 +43,13 @@ vendored NFsim carries the upstream fix (gated issue #1057). Energy patterns
 alone change no rate, so only the rate law is refused. So is a rate-law type
 NFsim does not implement: BNG2.pl writes ``Hill`` into the XML, and NFsim drops
 such a rule with a message only its captured log holds, so the rule never fires.
+
+A compartment model is refused on NFsim (issue #1067): NFsim ignores pattern-level
+compartments, misses volume factors and compartment adjacency, misplaces seed
+complexes and created molecules, and mishandles MoveConnected, and BNG2.pl's
+writeXML drops NumberPerQuantityUnit (RuleWorld/nfsim#106, #108, #109, #110,
+RuleWorld/bionetgen#348). A narrower envelope kept missing cases, one of them
+invisible in the XML, so every compartment model is refused.
 
 A function with an argument that reads, outside it, an observable that can
 change, directly or through a function it calls, is refused on NFsim too
@@ -590,72 +602,26 @@ def _constant_observables(root: ET.Element) -> set[str]:
     return constant
 
 
-def _outside_reads(
-    xml_path: str | Path,
-) -> tuple[list[tuple[str, str]], set[str], dict[str, set[str]]] | None:
-    """``(reads, constant, observable types)``: every ``(function, observable)``
-    read outside an argument by a function with an argument that a rate law
-    uses, the observables no rule can change, and each observable's molecule
-    types. ``None`` when the file cannot be parsed."""
-    try:
-        root = ET.parse(str(xml_path)).getroot()
-    except (ET.ParseError, OSError):
-        return None
-    funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
-    observables = {o.get("name", "") for o in root.iter() if _local(o.tag) == "Observable"}
-    parameters = {p.get("id", "") for p in root.iter() if _local(p.tag) == "Parameter"}
+def _refs(f: ET.Element, kind: str) -> list[str]:
+    """The names *f* lists among its references with type *kind*."""
+    return [
+        r.get("name", "")
+        for lst in _children(f, "ListOfReferences")
+        for r in lst
+        if r.get("type") == kind
+    ]
 
-    def args(f: ET.Element) -> list[str]:
-        return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
 
-    def refs(f: ET.Element, kind: str) -> list[str]:
-        return [
-            r.get("name", "")
-            for lst in _children(f, "ListOfReferences")
-            for r in lst
-            if r.get("type") == kind
-        ]
+def _calls(f: ET.Element, funcs: dict[str, ET.Element]) -> list[str]:
+    """The functions *f* reads: those it references, and its counter when that is
+    a function."""
+    ctr = f.get("ctrName", "")
+    return _refs(f, "Function") + ([ctr] if ctr in funcs else [])
 
-    def counter_reads(f: ET.Element) -> set[str]:
-        """What a table function's counter reads, if it changes: an observable,
-        or the clock (``time``, or ``t`` when no model symbol has that name)."""
-        ctr = f.get("ctrName", "")
-        clock = ctr in ("time", "time()") or (
-            ctr in _RULEMONKEY_CLOCK_COUNTERS and ctr.rstrip("()") not in parameters | set(funcs)
-        )
-        return {ctr} if ctr in observables or clock else set()
 
-    def calls(f: ET.Element) -> list[str]:
-        ctr = f.get("ctrName", "")
-        return refs(f, "Function") + ([ctr] if ctr in funcs else [])
-
-    def outside(f: ET.Element) -> set[str]:
-        """Observables *f* reads itself other than through its argument."""
-        fargs = args(f)
-        expr = " ".join(e.text or "" for e in _children(f, "Expression"))
-        found = counter_reads(f)
-        for name in refs(f, "Observable"):
-            uses = re.finditer(
-                rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
-                expr,
-            )
-            if any(m.group(1) is None or m.group(2) not in fargs for m in uses):
-                found.add(name)
-        return found
-
-    def through_calls(f: ET.Element, seen: frozenset[str]) -> set[str]:
-        """Observables *f* reaches outside any argument through the functions it calls."""
-        found: set[str] = set()
-        for name in calls(f):
-            g = funcs.get(name)
-            if g is None or name in seen:
-                continue
-            if not args(g):
-                found |= outside(g)  # a global function: every read is outside
-            found |= through_calls(g, seen | {name})
-        return found
-
-    # Only functions a rate law uses can run stale; follow calls from there.
+def _rate_law_reach(root: ET.Element, funcs: dict[str, ET.Element]) -> set[str]:
+    """The functions a rule's rate law uses, directly or through the functions
+    they call."""
     used: set[str] = set()
     todo = [
         name
@@ -670,14 +636,73 @@ def _outside_reads(
         name = todo.pop()
         if name not in used:
             used.add(name)
-            todo += [c for c in calls(funcs[name]) if c in funcs]
+            todo += [c for c in _calls(funcs[name], funcs) if c in funcs]
+    return used
+
+
+def _outside_reads(
+    xml_path: str | Path,
+) -> tuple[list[tuple[str, str]], set[str], dict[str, set[str]]] | None:
+    """``(reads, constant, observable types)``: every ``(function, observable)``
+    read outside an argument by a function with an argument that a rate law
+    uses, the observables no rule can change, and each observable's molecule
+    types. ``None`` when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
+    observables = {o.get("name", "") for o in root.iter() if _local(o.tag) == "Observable"}
+
+    def args(f: ET.Element) -> list[str]:
+        return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
+
+    def counter_reads(f: ET.Element) -> set[str]:
+        """What a table function's counter reads, if it changes: an observable,
+        or the clock as NFsim reads it, which takes any case of ``time`` or
+        ``t`` before a model symbol of that name (:func:`_nfsim_clock`)."""
+        ctr = f.get("ctrName", "").strip()
+        return {ctr} if ctr in observables or _nfsim_clock(ctr) else set()
+
+    def outside(f: ET.Element) -> set[str]:
+        """Observables *f* reads itself other than through its argument."""
+        fargs = args(f)
+        expr = " ".join(e.text or "" for e in _children(f, "Expression"))
+        found = counter_reads(f)
+        for name in _refs(f, "Observable"):
+            uses = re.finditer(
+                rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])\s*(\(\s*([A-Za-z_]\w*)?\s*\))?",
+                expr,
+            )
+            if any(m.group(1) is None or m.group(2) not in fargs for m in uses):
+                found.add(name)
+        return found
+
+    def through_calls(f: ET.Element, seen: frozenset[str]) -> set[str]:
+        """Observables *f* reaches outside any argument through the functions it calls."""
+        found: set[str] = set()
+        for name in _calls(f, funcs):
+            g = funcs.get(name)
+            if g is None or name in seen:
+                continue
+            if not args(g):
+                found |= outside(g)  # a global function: every read is outside
+            found |= through_calls(g, seen | {name})
+        return found
+
+    # Only functions a rate law uses can run stale; follow calls from there.
+    used = _rate_law_reach(root, funcs)
 
     found = []
     for name, f in funcs.items():
         if name not in used or not args(f):
             continue  # unused, or global: re-evaluated whenever its observables change
         # A composite's own direct reads are NFsim's to refuse; its counter is not.
-        reads = through_calls(f, frozenset({name})) | counter_reads(f) if calls(f) else outside(f)
+        reads = (
+            through_calls(f, frozenset({name})) | counter_reads(f)
+            if _calls(f, funcs)
+            else outside(f)
+        )
         found += [(name, o) for o in sorted(reads)]
     obs_types = {
         o.get("name", ""): _molecule_names(o) for o in root.iter() if _local(o.tag) == "Observable"
@@ -757,6 +782,28 @@ def refuse_nfsim_stale_local_functions(xml_path: str | Path) -> None:
     )
 
 
+def refuse_nfsim_compartments(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if *xml_path* declares compartments. NFsim only:
+    its compartment support is wrong in ways no check of the XML can bound."""
+    comps = compartments(xml_path)
+    if not comps:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    raise ModelError(
+        f"{label} cannot run a compartment model (compartments "
+        + ", ".join(f"'{c}'" for c in comps)
+        + "). NFsim's compartment support runs such models wrong without an error: it "
+        "ignores a species-level compartment on a pattern (@EC:A()), applies no volume "
+        "factor to a rule with two or more reactants, gives no compartment to a molecule "
+        "a rule creates with none written, puts every molecule of a seed complex in the "
+        "species' compartment, binds across compartments that do not touch, and moves a "
+        "whole complex on MoveConnected; and BNG2.pl's writeXML drops "
+        "NumberPerQuantityUnit (RuleWorld/nfsim#106, #108, #109, #110, "
+        "RuleWorld/bionetgen#348; this refusal is lifted under issue #1067). Simulate the "
+        "network BNG2.pl generates with method='ode' or method='ssa'."
+    )
+
+
 def refuse_time_dependent_rate_laws(xml_path: str | Path, backend: str) -> None:
     """Raise :class:`ModelError` if *xml_path* has a function reading the clock.
 
@@ -772,4 +819,65 @@ def refuse_time_dependent_rate_laws(xml_path: str | Path, backend: str) -> None:
         + f". {why}. Simulate it with method='rm', or with method='ode' or "
         "method='ssa' on the generated network, which read time() as the model "
         "time (issue #862)."
+    )
+
+
+def _nfsim_clock(ctr: str) -> bool:
+    """Whether NFsim reads a table function's counter as the clock: it trims and
+    lowercases the name and checks it before any model symbol of that name
+    (tfun_is_time_name in third_party/nfsim/src/NFinput/parseFuncXML.cpp)."""
+    return ctr.strip().lower() in _RULEMONKEY_CLOCK_COUNTERS
+
+
+def _nfsim_table_method(f: ET.Element) -> str:
+    """The interpolation NFsim gives a table function: its ``method``, trimmed
+    and lowercased, or with none, ``step`` when the expression has the legacy
+    ``__TFUN__VAL__`` placeholder (as BNG2.pl 2.9.3 writes ``TFUN(t, "file")``)
+    and ``linear`` otherwise (processTfunFunction in parseFuncXML.cpp)."""
+    method = (f.get("method") or "").strip().lower()
+    if method:
+        return method
+    expr = " ".join(e.text or "" for e in _children(f, "Expression"))
+    return "step" if "__TFUN__VAL__" in expr and "__TFUN_VAL__" not in expr else "linear"
+
+
+def nfsim_linear_time_tables(xml_path: str | Path) -> list[str]:
+    """The ids of the linear table functions indexed by time that a rule's rate
+    law in *xml_path* reads, directly or through the functions it calls, as
+    NFsim reads them: a function is a table only when its ``type`` is exactly
+    ``TFUN``. Empty when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
+    used = _rate_law_reach(root, funcs)
+    return [
+        name
+        for name, f in funcs.items()
+        if name in used
+        and f.get("type") == "TFUN"
+        and _nfsim_clock(f.get("ctrName") or "")
+        and _nfsim_table_method(f) == "linear"
+    ]
+
+
+def refuse_nfsim_linear_time_tables(xml_path: str | Path) -> None:
+    """Raise :class:`ModelError` if a rate law in *xml_path* reads a linear table
+    function indexed by time, which NFsim holds between its x values (issue
+    #1179)."""
+    tables = nfsim_linear_time_tables(xml_path)
+    if not tables:
+        return
+    label, _ = _BACKENDS["nfsim"]
+    raise ModelError(
+        f"{label} cannot run a model whose rate laws read a linear table function "
+        "indexed by time: "
+        + ", ".join(f"'{n}'" for n in tables)
+        + ". NFsim reads such a table only at its x values and after each reaction, "
+        "and holds that value in between, so where little fires the run lags the "
+        "ramp with no error (issue #1179). Simulate it with method='rm', or with "
+        "method='ssa' on the generated network, which integrate a rate that changes "
+        'between events; or make the table a step (method=>"step") on a grid fine '
+        "enough for the ramp, which method='nf' reads exactly."
     )

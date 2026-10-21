@@ -27,7 +27,8 @@ Two engine pieces make this correct:
 * **Tier 1 count-preserving resize** — the loader's per-species concentration
   rescale ``s := s·V_old/V_new`` injected at a compartment resize is marked
   ODE-only and skipped under SSA, so molecule counts are unchanged across the
-  event (only the propensity's live-volume factor updates).
+  event (only the propensity's live-volume factor updates). A concentration a
+  rule sets is no count: its rescale runs under SSA too.
 * **Tier 2 dilution skip** — the #86 concentration-dilution term ``-[S]·V̇/V``
   for a rate-rule compartment is an ODE-only reaction, excluded from SSA
   entirely (firing it would spuriously consume molecules; the volume's effect on
@@ -169,6 +170,93 @@ def test_tier1_unimolecular_volume_independent():
     # break both (it would multiply the stored count by 1/4 at the event).
     assert arr[:, :, ai].max() <= 200
     assert np.allclose(arr[:, :, ai], np.round(arr[:, :, ai]))
+
+
+# ── Tier 1 — a concentration a rule sets is no count ─────────────────────────
+# A rate rule or an assignment rule sets the concentration (issue #718), so its
+# slot holds that concentration under SSA as under ODE, and the resize keeps its
+# amount under both: the rescale runs, and the report reads the column as a
+# concentration. Nothing is random here, so every method gives the closed form.
+# (case: text, [S] at t = 0, 3, 5, S at t = 0, 3, 5)
+_T1_RULE_TARGETS = {
+    # [S] := 3; c goes 1 → 3 just after t = 2.5
+    "assignment-rule target": (
+        "compartment c = 1; E1: at time > 2.5: c = 3; species S in c; S := 3;",
+        [3.0, 3.0, 3.0],
+        [3.0, 9.0, 9.0],
+    ),
+    # d[S]/dt = 0.4; the amount 2 at t = 2.5 is kept in c = 3
+    "rate-rule target": (
+        "compartment c = 1; E1: at time > 2.5: c = 3; species S in c = 1; S' = 0.4;",
+        [1.0, 2.0 / 3.0 + 0.2, 2.0 / 3.0 + 1.0],
+        [1.0, 2.6, 5.0],
+    ),
+    # c := p, p goes 2 → 4; the amount 4 at t = 2.5 is kept in c = 4
+    "rate-rule target, assignment-rule compartment": (
+        "compartment c; p = 2; c := p; E1: at time > 2.5: p = 4; species S in c = 1; S' = 0.4;",
+        [1.0, 1.2, 2.0],
+        [2.0, 4.8, 8.0],
+    ),
+}
+
+
+_METHODS = pytest.mark.parametrize(
+    ("method", "kw"),
+    [("ode", {}), ("ssa", {}), ("psa", {"poplevel": 10})],
+    ids=["ode", "ssa", "psa"],
+)
+
+
+def _rule_target_report(text, method, kw):
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method=method, **kw)
+    run_kw = {"rtol": 1e-10, "atol": 1e-12} if method == "ode" else {"seed": 1}
+    run = sim.run(sample_times=[0.0, 3.0, 5.0], **run_kw)
+    return np.asarray(run.as_roadrunner(["[S]", "S"]))
+
+
+@_METHODS
+@pytest.mark.parametrize("case", list(_T1_RULE_TARGETS))
+def test_tier1_rule_target_keeps_its_amount_across_the_resize(case, method, kw):
+    """SSA skipped the rescale as it does for a count, and the event-resize
+    report read the column as one: [S] = 1 and S = 3 for 3 and 9 (assignment
+    rule), [S](3) = 0.733 for 0.867 (rate rule), and [S](5) = 1.5 with S = 12
+    for 2 and 8 (assignment-rule compartment). The ODE agrees with
+    libRoadRunner on all three."""
+    text, conc, amount = _T1_RULE_TARGETS[case]
+    got = _rule_target_report(text, method, kw)
+    np.testing.assert_allclose(got[:, 0], conc, rtol=1e-9)
+    np.testing.assert_allclose(got[:, 1], amount, rtol=1e-9)
+
+
+@_METHODS
+def test_tier1_rule_target_rescale_reads_what_an_earlier_event_wrote(method, kw):
+    """E1, of higher priority, sets [S] = 5 at the instant E2 triples c, so the
+    amount E2 keeps is 5 and [S](3) = 5/3 + 0.2. Formed from the values frozen
+    at the trigger, the rescale read [S] from before E1 and overwrote it:
+    [S](3) = 0.867 for 1.867 under SSA, where ODE and libRoadRunner agree."""
+    got = _rule_target_report(
+        "compartment c = 1; E1: at time > 2.5, priority = 10: S = 5;"
+        " E2: at time > 2.5, priority = 1: c = 3; species S in c = 1; S' = 0.4;",
+        method,
+        kw,
+    )
+    np.testing.assert_allclose(got[:, 0], [1.0, 5.0 / 3.0 + 0.2, 5.0 / 3.0 + 1.0], rtol=1e-9)
+    np.testing.assert_allclose(got[:, 1], [1.0, 5.6, 8.0], rtol=1e-9)
+
+
+@_METHODS
+def test_tier1_rule_target_resized_to_zero(method, kw):
+    """No amount in no volume is a concentration of 0, as the ODE has it; SSA
+    took 0·1/0 for nan and refused the run. A nonzero amount in no volume has
+    no concentration, and every method refuses it by name."""
+    text = "compartment c = 1; E1: at time > 2.5: c = 0; species S in c = {s0}; S' = {rate};"
+    got = _rule_target_report(text.format(s0=0, rate=0), method, kw)
+    np.testing.assert_array_equal(got, np.zeros((3, 2)))
+    with pytest.raises(
+        bngsim.SimulationError,
+        match="resizes a compartment to 0 while a species in it holds a nonzero amount",
+    ):
+        _rule_target_report(text.format(s0=1, rate=0.4), method, kw)
 
 
 # ── Tier 2 — bimolecular A + B → P in a compartment that grows by a rate rule ─
@@ -873,7 +961,8 @@ def test_case2_bare_bimolecular_event_matches_extrande():
 # law-factor count in c) — a per-compartment vector, since the single scalar
 # correction (cases 1–3) cannot hold a product over compartments. The bare-law
 # monomial is supported (irreversible, all-hOSU=false); explicit-compartment-factor
-# and hOSU=true cross-compartment shapes stay refused. Validated against the
+# and hOSU=true cross-compartment shapes stayed refused (a mix with an amount that
+# changes a concentration here runs since #787). Validated against the
 # independent Extrande sampler (Tier 1 event + Tier 2 rate rule, one & both varvol)
 # and the exact cross-compartment ODE semantics (RK4). The ODE path is additionally
 # cross-checked vs RoadRunner + COPASI in dev/investigations/
@@ -1178,19 +1267,42 @@ def test_c5_explicit_compartment_factor_ode_matches_semantics():
             )
 
 
-# Exotic cross-compartment shapes stay refused (the hOSU=true and reversible
-# variants keep their gate; only all-hOSU=false irreversible monomials are lifted).
-def test_c4_hosu_cross_compartment_still_refused():
-    # An hOSU=true (amount-valued) reactant in a cross-compartment varvol reaction
-    # is out of scope (its volume bookkeeping differs) — stays refused.
+# The reversible cross-compartment variant keeps its gate. An amount-valued
+# reactant beside the concentrations no longer does (#787): the per-species
+# emission divides each row by its own size, and the live-volume term counts the
+# concentration factors alone, an amount being read exactly.
+def test_c4_hosu_cross_compartment_matches_extrande():
+    # A a concentration in the growing cell, B an amount in the static dish:
+    # ρ = k·[A]·n_B = k·A·B/V_cell. This was refused as out of scope.
+    k, g, reps, seed = 0.02, 0.1, 2000, 51
     src = (
         "model m; compartment cell=1.0; compartment dish=1.0; "
         "species A in cell=100; substanceOnly species B in dish=100; species P in cell=0; "
-        "k=0.02; g=0.1; cell'=g; J1: A+B=>P; k*A*B; end"
+        f"k={k}; g={g}; cell'=g; J1: A+B=>P; k*A*B; end"
     )
     model = bngsim.Model.from_antimony_string(src)
-    codes = {i.code for i in bngsim.validate_for_ssa(model) if i.severity == "error"}
-    assert "varvol_non_mass_action" in codes
+    assert not [i for i in bngsim.validate_for_ssa(model) if i.severity == "error"]
+    names, arr = _ssa_counts(model, 10.0, 11, reps=reps, seed=seed)
+    n_p = arr[:, :, names.index("P")]  # V_static = 1 ⇒ stored == count
+    t = np.linspace(0.0, 10.0, 11)
+    ref = ext.RefModel(
+        species=["A", "B", "P"],
+        x0={"A": 100, "B": 100, "P": 0},
+        reactions=[
+            ext.ReactionSpec(
+                stoich={"A": -1, "B": -1, "P": 1},
+                propensity=lambda s: k * s["A"] * s["B"] / s["cell"],
+            )
+        ],
+        cont={"cell": lambda s: g},
+        c0={"cell": 1.0},
+    )
+    oref = ext.simulate_batch(ref, t, reps, seed=seed + 1, look_ahead=0.1)
+    pb, pe = n_p.mean(0), oref[:, :, 2].mean(0)
+    se = np.sqrt(n_p.var(0, ddof=1) / reps + oref[:, :, 2].var(0, ddof=1) / reps)
+    for i in range(1, len(t)):
+        z = abs(pb[i] - pe[i]) / (se[i] + 1e-12)
+        assert z < 5.0, f"c4 hOSU t={t[i]:.1f}: bng={pb[i]:.2f} ext={pe[i]:.2f} z={z:.2f}"
 
 
 def test_c4_reversible_cross_compartment_still_refused():
@@ -1204,6 +1316,126 @@ def test_c4_reversible_cross_compartment_still_refused():
     model = bngsim.Model.from_antimony_string(src)
     codes = {i.code for i in bngsim.validate_for_ssa(model) if i.severity == "error"}
     assert "varvol_non_mass_action" in codes or "reversible_non_mass_action" in codes
+
+
+# A compartment an assignment rule holds constant: ``C := 2``, or ``C := 2*q``
+# over a parameter, a write to which is refused. Its size never moves, so a
+# monomial between it and a rate-rule compartment D is the static-and-varvol
+# case above, and its counts are read over that size exactly. It was refused
+# (varvol_non_mass_action), as a compartment an assignment rule moves is.
+_HELD = {
+    "C := 2": "compartment C = 2, D = 2; C := 2; D' = 0.1;",
+    "C := 2*q": "q = 1; compartment C = 1, D = 2; C := 2*q; D' = 0.1;",
+}
+_HELD_TWIN = "compartment C = 2, D = 2; D' = 0.1;"
+_HELD_LAWS = {
+    "out-of-it": "species A in C, B in D; A = 50; B = 0; k = 0.3; J: A => B; k*A;",
+    "into-it": "species A in C, B in D; A = 0; B = 30; k = 0.3; J: B => A; k*B;",
+    "bimolecular": (
+        "species A in C, B in D, P in C; A = 50; B = 20; P = 0; k = 0.01; J: A + B => P; k*A*B;"
+    ),
+    "an-amount-out-of-it": (
+        "substanceOnly species A in C; species B in D; A = 50; B = 0; k = 0.3; J: A => B; k*A;"
+    ),
+}
+
+
+def _held_run(sizes, law, seed, selectors=("A", "[A]", "B", "[B]")):
+    # A fresh model per run: a Simulator run continues from the model's state.
+    model = bngsim.Model.from_antimony_string(sizes + " " + law)
+    run = bngsim.Simulator(model, method="ssa").run(t_span=(0.0, 8.0), n_points=9, seed=seed)
+    return np.asarray(run.as_roadrunner(list(selectors)))
+
+
+@pytest.mark.parametrize("held", sorted(_HELD))
+@pytest.mark.parametrize("law", sorted(_HELD_LAWS))
+def test_c4_cross_compartment_held_by_a_rule_runs_as_its_static_twin(law, held):
+    """Certified, and for the same seed the same trajectory as with C declared
+    constant, in every count and concentration. The ODE, which the
+    certification moves onto the per-species divide, is the twin's too."""
+    model = bngsim.Model.from_antimony_string(_HELD[held] + " " + _HELD_LAWS[law])
+    assert not [i for i in bngsim.validate_for_ssa(model) if i.severity == "error"]
+    for seed in (1, 2, 3):
+        np.testing.assert_array_equal(
+            _held_run(_HELD[held], _HELD_LAWS[law], seed),
+            _held_run(_HELD_TWIN, _HELD_LAWS[law], seed),
+        )
+    ode = [
+        bngsim.Simulator(bngsim.Model.from_antimony_string(sizes + " " + _HELD_LAWS[law]))
+        .run(t_span=(0.0, 8.0), n_points=9, rtol=1e-10, atol=1e-12)
+        .as_roadrunner(["A", "[A]", "B", "[B]"])
+        for sizes in (_HELD[held], _HELD_TWIN)
+    ]
+    np.testing.assert_allclose(np.asarray(ode[0]), np.asarray(ode[1]), rtol=1e-9, atol=1e-12)
+
+
+def test_c4_cross_compartment_held_by_a_rule_matches_the_exact_mean():
+    """``A => B`` at ``k*[A]``, A in ``C := 2`` from a count of 100: the mean
+    count of A is ``100*exp(-k*t/2)``, and the mean [B] what A lost over D's
+    live size, ``2 + 0.1*t``."""
+    reps, k = 1500, 0.3
+    t = np.linspace(0.0, 8.0, 9)
+    runs = np.stack(
+        [
+            _held_run(_HELD["C := 2"], _HELD_LAWS["out-of-it"], 600 + i, ("A", "[B]"))
+            for i in range(reps)
+        ]
+    )
+    n_a = 100.0 * np.exp(-k * t / 2.0)
+    for col, want in ((0, n_a), (1, (100.0 - n_a) / (2.0 + 0.1 * t))):
+        got = runs[:, :, col]
+        z = np.abs(got.mean(0) - want)[1:] / (got.std(0, ddof=1)[1:] / np.sqrt(reps))
+        assert z.max() < 5.0, (col, got.mean(0), want)
+
+
+def test_c4_cross_compartment_held_by_a_rule_bimolecular_matches_extrande():
+    """``A + B => P`` at ``k*[A]*[B]``, A in ``C := 2`` and B in D, which grows:
+    ρ = k·(A/2)·(B/V_D)."""
+    k, reps, seed = 0.01, 1500, 61
+    t = np.linspace(0.0, 8.0, 9)
+    n_p = np.stack(
+        [
+            _held_run(_HELD["C := 2"], _HELD_LAWS["bimolecular"], seed + i, ("P",))[:, 0]
+            for i in range(reps)
+        ]
+    )
+    ref = ext.RefModel(
+        species=["A", "B", "P"],
+        x0={"A": 100, "B": 40, "P": 0},
+        reactions=[
+            ext.ReactionSpec(
+                stoich={"A": -1, "B": -1, "P": 1},
+                propensity=lambda s: k * (s["A"] / 2.0) * (s["B"] / s["D"]),
+            )
+        ],
+        cont={"D": lambda s: 0.1},
+        c0={"D": 2.0},
+    )
+    oref = ext.simulate_batch(ref, t, reps, seed=seed - 1, look_ahead=0.1)
+    pb, pe = n_p.mean(0), oref[:, :, 2].mean(0)
+    se = np.sqrt(n_p.var(0, ddof=1) / reps + oref[:, :, 2].var(0, ddof=1) / reps)
+    for i in range(1, len(t)):
+        z = abs(pb[i] - pe[i]) / (se[i] + 1e-12)
+        assert z < 5.0, f"held t={t[i]:.1f}: bng={pb[i]:.2f} ext={pe[i]:.2f} z={z:.2f}"
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        "compartment C = 1, D = 2; C := 1 + 0.1*time; D' = 0.1;",
+        "q = 1; compartment C = 1, D = 2; C := 2*q; q' = 0.1; D' = 0.1;",
+        "q = 1; compartment C = 1, D = 2; C := 2*q; D' = 0.1; at time > 1: q = 2;",
+        "compartment C = 1, D = 2, W = 1; C := 1 + 0.01*Z; species Z in W; Z = 0;"
+        " JZ: => Z; 1; D' = 0.1;",
+    ],
+    ids=["the-clock", "a-rate-rule", "an-event", "a-species"],
+)
+def test_c4_cross_compartment_a_rule_moves_is_still_refused(sizes):
+    """Control. A rule over the clock, a rate-rule or event target, or a
+    species moves the size, and the SSA does not follow it."""
+    model = bngsim.Model.from_antimony_string(sizes + " " + _HELD_LAWS["out-of-it"])
+    codes = {i.code for i in bngsim.validate_for_ssa(model) if i.severity == "error"}
+    assert "varvol_non_mass_action" in codes
 
 
 # ── (#171) Analytical Jacobian for cross-compartment variable-volume reactions ──

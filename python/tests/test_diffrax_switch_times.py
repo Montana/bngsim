@@ -128,6 +128,13 @@ def test_a_switch_on_the_state_is_refused(tmp_path) -> None:
         _diffrax(_model(tmp_path, "if(Aobs<50,5,0.1)"))
 
 
+def test_a_bend_on_the_state_is_refused(tmp_path) -> None:
+    # Rooted in a CVODE run since issue #1068: a pulse made of bends is
+    # stepped over where nothing roots it, and diffrax roots nothing.
+    with pytest.raises(ValueError, match="switches on the model's state"):
+        _diffrax(_model(tmp_path, "0.1+max(0,Aobs-50)"))
+
+
 def test_a_condition_past_the_budget_of_stops_is_refused(tmp_path) -> None:
     # More crossings than a run may stop at have none placed; integrated across
     # they are the issue again.

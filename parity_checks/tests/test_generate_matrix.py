@@ -10,6 +10,7 @@ config block existed — so they get explicit oracles here.
 
 from __future__ import annotations
 
+import generate_amici_matrix as gam
 import generate_matrix as gm
 import pytest
 
@@ -565,3 +566,29 @@ class TestSsaTiming:
         html = out.read_text()
         assert "ordered by complexity" in html  # species fallback
         assert "reaction events / time unit" not in html  # no activity line
+
+
+# ── NO SIGNAL in the ODE row note (issue #873) ───────────────────────────────
+_NO_SIGNAL_DIFF = (
+    "3 sp; fail 50/150 (hard 50, soft 0, forgiven 0); err/movement 0.0e+00; "
+    "NO SIGNAL (nothing moves in either engine)"
+)
+
+
+@pytest.mark.parametrize("mod", [gm, gam], ids=["rr", "amici"])
+def test_a_no_signal_pass_says_agreement_says_nothing(mod):
+    comment = _NO_SIGNAL_DIFF.replace("fail 50/150 (hard 50", "fail 0/150 (hard 0")
+    note = mod.humanize_comment({"comment": comment, "outcome": "PASS"})
+    assert note == (
+        "No species moves in either engine, so agreement says nothing about the dynamics."
+    )
+
+
+@pytest.mark.parametrize("mod", [gm, gam], ids=["rr", "amici"])
+def test_a_no_signal_diff_keeps_its_tallies(mod):
+    """Flat on both sides but 10% apart is a DIFF; its note must not talk of
+    agreement or drop the counts."""
+    note = mod.humanize_comment({"comment": _NO_SIGNAL_DIFF, "outcome": "DIFF"})
+    assert "agreement" not in note
+    assert note.startswith("50 of 150 compared points (over 3 shared species)")
+    assert "50 beyond the hard ceiling" in note
