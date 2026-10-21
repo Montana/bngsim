@@ -653,19 +653,16 @@ def _outside_reads(
         return None
     funcs = {f.get("id", ""): f for f in _functions(xml_path) or []}
     observables = {o.get("name", "") for o in root.iter() if _local(o.tag) == "Observable"}
-    parameters = {p.get("id", "") for p in root.iter() if _local(p.tag) == "Parameter"}
 
     def args(f: ET.Element) -> list[str]:
         return [a.get("id", "") for lst in _children(f, "ListOfArguments") for a in lst]
 
     def counter_reads(f: ET.Element) -> set[str]:
         """What a table function's counter reads, if it changes: an observable,
-        or the clock (``time``, or ``t`` when no model symbol has that name)."""
-        ctr = f.get("ctrName", "")
-        clock = ctr in ("time", "time()") or (
-            ctr in _RULEMONKEY_CLOCK_COUNTERS and ctr.rstrip("()") not in parameters | set(funcs)
-        )
-        return {ctr} if ctr in observables or clock else set()
+        or the clock as NFsim reads it, which takes any case of ``time`` or
+        ``t`` before a model symbol of that name (:func:`_nfsim_clock`)."""
+        ctr = f.get("ctrName", "").strip()
+        return {ctr} if ctr in observables or _nfsim_clock(ctr) else set()
 
     def outside(f: ET.Element) -> set[str]:
         """Observables *f* reads itself other than through its argument."""
@@ -832,11 +829,23 @@ def _nfsim_clock(ctr: str) -> bool:
     return ctr.strip().lower() in _RULEMONKEY_CLOCK_COUNTERS
 
 
+def _nfsim_table_method(f: ET.Element) -> str:
+    """The interpolation NFsim gives a table function: its ``method``, trimmed
+    and lowercased, or with none, ``step`` when the expression has the legacy
+    ``__TFUN__VAL__`` placeholder (as BNG2.pl 2.9.3 writes ``TFUN(t, "file")``)
+    and ``linear`` otherwise (processTfunFunction in parseFuncXML.cpp)."""
+    method = (f.get("method") or "").strip().lower()
+    if method:
+        return method
+    expr = " ".join(e.text or "" for e in _children(f, "Expression"))
+    return "step" if "__TFUN__VAL__" in expr and "__TFUN_VAL__" not in expr else "linear"
+
+
 def nfsim_linear_time_tables(xml_path: str | Path) -> list[str]:
     """The ids of the linear table functions indexed by time that a rule's rate
-    law in *xml_path* reads, directly or through the functions it calls. A table
-    is linear unless its ``method`` is ``step``. Empty when the file cannot be
-    parsed."""
+    law in *xml_path* reads, directly or through the functions it calls, as
+    NFsim reads them: a function is a table only when its ``type`` is exactly
+    ``TFUN``. Empty when the file cannot be parsed."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
@@ -847,9 +856,9 @@ def nfsim_linear_time_tables(xml_path: str | Path) -> list[str]:
         name
         for name, f in funcs.items()
         if name in used
-        and (f.get("type") or "").lower() == "tfun"
+        and f.get("type") == "TFUN"
         and _nfsim_clock(f.get("ctrName") or "")
-        and (f.get("method") or "").strip().lower() in ("", "linear")
+        and _nfsim_table_method(f) == "linear"
     ]
 
 

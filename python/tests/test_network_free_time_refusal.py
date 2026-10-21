@@ -129,11 +129,44 @@ def test_an_nfsim_session_refuses_a_linear_time_table():
 def test_the_linear_scan_reads_the_table_as_nfsim_does(tmp_path):
     assert nfsim_linear_time_tables(LINEAR) == ["tfun_rate"]
     assert nfsim_linear_time_tables(TFUN) == []  # a step
-    # No method is linear, and NFsim reads any case of time or t as the clock.
+    # With no method the __TFUN_VAL__ placeholder is linear, and NFsim reads any
+    # case of time or t as the clock.
     no_method = _edit(tmp_path, LINEAR, (' method="linear">', ">"))
     assert nfsim_linear_time_tables(no_method) == ["tfun_rate"]
     upper = _edit(tmp_path, LINEAR, ('ctrName="time"', 'ctrName=" Time "'))
     assert nfsim_linear_time_tables(upper) == ["tfun_rate"]
+    # NFsim takes the type only as written; a "tfun" is no table to it.
+    lower = _edit(tmp_path, LINEAR, ('type="TFUN"', 'type="tfun"'))
+    assert nfsim_linear_time_tables(lower) == []
+
+
+_LEGACY = (' method="linear">', ">"), ("__TFUN_VAL__", "__TFUN__VAL__")
+
+
+@pytest.mark.skipif(not _has_nfsim(), reason="NFsim not compiled in")
+def test_the_legacy_placeholder_without_a_method_is_a_step_and_runs(tmp_path):
+    # BNG2.pl 2.9.3 writes TFUN(t, "file") with __TFUN__VAL__ and no method,
+    # which NFsim reads as a step (parseFuncXML.cpp), exact since #892.
+    legacy = _edit(tmp_path, LINEAR, *_LEGACY)
+    assert nfsim_linear_time_tables(legacy) == []
+    m = bngsim.Model.from_net(str(DATA / "simple_decay.net"))
+    r = bngsim.Simulator(m, method="nf", xml_path=str(legacy)).run(
+        sample_times=[0.0, 0.5, 1.5], seed=1
+    )
+    assert list(r.expressions["tfun_rate"]) == pytest.approx([0.0, 0.0, 10.0])
+
+
+def test_the_legacy_placeholder_named_linear_is_refused(tmp_path):
+    legacy = _edit(tmp_path, LINEAR, *_LEGACY)
+    named = _edit(
+        tmp_path,
+        legacy,
+        (
+            '<Function id="tfun_rate" type="TFUN"',
+            '<Function id="tfun_rate" type="TFUN" method="linear"',
+        ),
+    )
+    assert nfsim_linear_time_tables(named) == ["tfun_rate"]
 
 
 def test_a_rate_law_that_reads_the_table_through_a_function_is_found(tmp_path):

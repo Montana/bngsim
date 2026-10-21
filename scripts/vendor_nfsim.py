@@ -395,7 +395,9 @@ CARRY_QUEUE = (
             "the next breakpoint is dropped there and drawn again, and a total propensity of "
             "0 advances to the next breakpoint rather than the stopping time. A rate that is "
             "0 until a later breakpoint never turned on. Exact for a step table; a linear "
-            "table holds its last value between breakpoints, as before. See bngsim GH #892."
+            "table holds its last value between breakpoints, as before. A table listed in "
+            "decreasing time is read one ulp past each x, where its new value holds. See "
+            "bngsim GH #892."
         ),
         "commits": [
             {
