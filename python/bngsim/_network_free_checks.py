@@ -10,11 +10,12 @@ RuleMonkey runs such a function since 3.11.0, which integrates a rate that reads
 the clock between events (richardposner/RuleMonkey#86), and it runs on absolute
 model time (issue #1022). So does a table function indexed by time
 (``type="TFUN"`` with a clock ``ctrName``), which keeps its clock in an
-attribute while its ``<Expression>`` reads a placeholder. NFsim runs one, but
-refreshes its value only when a reaction fires, so a rate that is 0 at the
-start is not seen (issue #892), and it reads elapsed time, BNG2.pl's
-simulate_nf semantics. That is left to the fix there, since refusing it would
-take away a table function NFsim reads correctly whenever reactions fire often.
+attribute while its ``<Expression>`` reads a placeholder. NFsim runs one on
+elapsed time, BNG2.pl's simulate_nf semantics, and reads it again at each of
+its x values whether or not a reaction fires, which is exact for a step table
+(issue #892). A linear table holds its value between those reads and the
+firings; it is not refused, since that would take away a table NFsim reads
+closely whenever reactions fire often.
 
 A RuleMonkey session uses :func:`clock_readers` to refuse a segment whose labels
 are not the clock the model reads.

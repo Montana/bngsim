@@ -136,11 +136,16 @@ def _tfun_variant(tmp_path: Path, n0: int, n1: int, dephos: float) -> Path:
     return out
 
 
-def _tfun_phos(start: int, dephos: float, t: float) -> float:
+_Steps = tuple[tuple[float, float, float], ...]
+_TFUN_STEPS: _Steps = ((0.0, 1.0, 0.0), (1.0, 2.0, 10.0), (2.0, math.inf, 20.0))
+
+
+def _tfun_phos(start: int, dephos: float, t: float, steps: _Steps = _TFUN_STEPS) -> float:
     """P(X(p~1) at t) for one molecule: X(p~0) -> X(p~1) at dephos, and back at
-    the step table 0 on [0, 1), 10 on [1, 2), 20 after, each piece solved."""
+    the step table, by default 0 on [0, 1), 10 on [1, 2), 20 after, each piece
+    solved."""
     p = float(start)
-    for lo, hi, back in ((0.0, 1.0, 0.0), (1.0, 2.0, 10.0), (2.0, math.inf, 20.0)):
+    for lo, hi, back in steps:
         if t <= lo:
             break
         rate = dephos + back

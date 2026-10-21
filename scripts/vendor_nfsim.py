@@ -399,7 +399,7 @@ CARRY_QUEUE = (
         ),
         "commits": [
             {
-                "commit": "684182792dbb96c376e9078bdb24622d22e0e133",
+                "commit": "9eb11325e05e81fda324553934edd92351d0e6fb",
                 "summary": "bngsim: read time-indexed tables at their breakpoints in stepTo",
             },
         ],

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include "../NFscheduler/NFstream.h"
 #include "../NFscheduler/Scheduler.h"
@@ -1158,7 +1159,15 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
 
 void System::addTimeBreakpoints(const vector<double> &xs)
 {
-	timeBreakpoints.insert(timeBreakpoints.end(), xs.begin(), xs.end());
+	// tfun_interpolate_value() reads a table listed in decreasing order from
+	// the other side: at one of its x values a step gives the value from before
+	// that time, not after. Read there, the run would keep the old rate for a
+	// whole segment, so such a table is read one ulp past each x instead.
+	const bool decreasing = xs.size() > 1 && xs[1] < xs[0];
+	for(unsigned int i=0; i<xs.size(); i++) {
+		timeBreakpoints.push_back(decreasing
+			? std::nextafter(xs[i], std::numeric_limits<double>::infinity()) : xs[i]);
+	}
 	std::sort(timeBreakpoints.begin(), timeBreakpoints.end());
 	timeBreakpoints.erase(std::unique(timeBreakpoints.begin(), timeBreakpoints.end()),
 		timeBreakpoints.end());
@@ -1242,10 +1251,7 @@ double System::stepTo(double stoppingTime)
 
 		// Recompute all propensities at each step to ensure time-dependent functions are updated correctly
 		if (hasTimeDependentFunctions) {
-			for(unsigned int r=0; r<allReactions.size(); r++) {
-				allReactions.at(r)->update_a();
-			}
-			recompute_A_tot();
+			refreshTimeDependentPropensities();
 		}
 	}
 

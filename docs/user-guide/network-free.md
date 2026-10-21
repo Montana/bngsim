@@ -150,10 +150,16 @@ NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
 one when the simulator or session is built, naming the function (issue #862).
 Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
 NFsim runs a table function indexed by time, on **time elapsed since
-`t_start`**, as BNG2.pl's `simulate_nf` does, and refreshes its value only when
-a reaction fires. So a rate that is 0 at the start, or that changes while
-nothing fires, is not seen until something does, and until then the run is flat
-(issue #892).
+`t_start`**, as BNG2.pl's `simulate_nf` does. It reads the table again at each
+of the table's x values, whether or not a reaction has fired, and draws the next
+waiting time from there. That is exact for a step table (`method=>"step"`): a
+rate that is 0 at the start turns on at the step that turns it on (issue #892).
+A linear table is read only at its x values and after each reaction, and holds
+that value in between, so where little fires the run lags the ramp. With 100
+`X(p~1)` leaving at a rate that rises from 0 at t = 0 to 10 at t = 1, none has
+left by t = 1 on `method="nf"`, where about 70 have left by t = 0.5. Use
+`method="rm"`, which integrates the ramp, or `method="ssa"` on the generated
+network.
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event

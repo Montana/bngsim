@@ -1,4 +1,4 @@
-From 684182792dbb96c376e9078bdb24622d22e0e133 Mon Sep 17 00:00:00 2001
+From 9eb11325e05e81fda324553934edd92351d0e6fb Mon Sep 17 00:00:00 2001
 From: Montana <montana@linux.com>
 Date: Sun, 18 Oct 2026 04:23:05 -0700
 Subject: [PATCH] bngsim: read time-indexed tables at their breakpoints in
@@ -19,12 +19,18 @@ run advances to the next breakpoint instead of the stopping time. A
 linear table is read at its breakpoints too, and between them holds the
 value it was last read at, as before. A breakpoint on the stopping time
 is read there.
+
+A table listed in decreasing time, which only a file can give, is read
+one ulp past each breakpoint: tfun_interpolate_value() reads such a
+table from the other side, so at the breakpoint itself a step still
+gives the value from before it. The refresh after a firing calls the
+same helper.
 ---
- src/NFcore/NFcore.hh         |  9 +++++++
- src/NFcore/system.cpp        | 47 ++++++++++++++++++++++++++++++++++++
+ src/NFcore/NFcore.hh         |  9 ++++++
+ src/NFcore/system.cpp        | 61 +++++++++++++++++++++++++++++++++---
  src/NFfunction/NFfunction.hh |  4 +++
  src/NFinput/parseFuncXML.cpp |  1 +
- 4 files changed, 61 insertions(+)
+ 4 files changed, 71 insertions(+), 4 deletions(-)
 
 diff --git a/src/NFcore/NFcore.hh b/src/NFcore/NFcore.hh
 index 487de97..3e2192a 100644
@@ -54,25 +60,34 @@ index 487de97..3e2192a 100644
  		    bool connectivityFlag; /* Whether to infer and use reaction connectivity  for updating molecule rxn membership*/
  		    bool nfsimV1143Compatibility = false; /* Preserve NFsim v1.14.3 selector double-draw behavior */
 diff --git a/src/NFcore/system.cpp b/src/NFcore/system.cpp
-index 36a2552..4377b3b 100644
+index 36a2552..25eae9e 100644
 --- a/src/NFcore/system.cpp
 +++ b/src/NFcore/system.cpp
-@@ -10,6 +10,8 @@
+@@ -10,6 +10,9 @@
  #include <math.h>
  #include <fstream>
  #include <stdexcept>
 +#include <algorithm>
++#include <cmath>
 +#include <limits>
  #include "../NFscheduler/NFstream.h"
  #include "../NFscheduler/Scheduler.h"
  
-@@ -1154,10 +1156,44 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
+@@ -1154,10 +1157,52 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
  	return current_time;
  }
  
 +void System::addTimeBreakpoints(const vector<double> &xs)
 +{
-+	timeBreakpoints.insert(timeBreakpoints.end(), xs.begin(), xs.end());
++	// tfun_interpolate_value() reads a table listed in decreasing order from
++	// the other side: at one of its x values a step gives the value from before
++	// that time, not after. Read there, the run would keep the old rate for a
++	// whole segment, so such a table is read one ulp past each x instead.
++	const bool decreasing = xs.size() > 1 && xs[1] < xs[0];
++	for(unsigned int i=0; i<xs.size(); i++) {
++		timeBreakpoints.push_back(decreasing
++			? std::nextafter(xs[i], std::numeric_limits<double>::infinity()) : xs[i]);
++	}
 +	std::sort(timeBreakpoints.begin(), timeBreakpoints.end());
 +	timeBreakpoints.erase(std::unique(timeBreakpoints.begin(), timeBreakpoints.end()),
 +		timeBreakpoints.end());
@@ -111,7 +126,7 @@ index 36a2552..4377b3b 100644
  		if(!pendingStepEventValid) {
  			// Preserve the pending waiting-time draw across output boundaries so
  			// repeated stepTo() calls consume the same RNG stream as sim().
-@@ -1165,6 +1201,10 @@ double System::stepTo(double stoppingTime)
+@@ -1165,6 +1210,10 @@ double System::stepTo(double stoppingTime)
  				pendingStepEventTime =
  					current_time + (-log(rng_.random_open()) / a_tot);
  				pendingStepEventValid = true;
@@ -122,7 +137,7 @@ index 36a2552..4377b3b 100644
  			} else {
  				current_time = stoppingTime;
  				cout << "Total propensity is zero, no further rxns can fire in this step." << endl;
-@@ -1172,6 +1212,13 @@ double System::stepTo(double stoppingTime)
+@@ -1172,6 +1221,13 @@ double System::stepTo(double stoppingTime)
  			}
  		}
  
@@ -136,6 +151,18 @@ index 36a2552..4377b3b 100644
  		// Check if we've reached stopping time
  		if(pendingStepEventTime >= stoppingTime) {
  			break;
+@@ -1195,10 +1251,7 @@ double System::stepTo(double stoppingTime)
+ 
+ 		// Recompute all propensities at each step to ensure time-dependent functions are updated correctly
+ 		if (hasTimeDependentFunctions) {
+-			for(unsigned int r=0; r<allReactions.size(); r++) {
+-				allReactions.at(r)->update_a();
+-			}
+-			recompute_A_tot();
++			refreshTimeDependentPropensities();
+ 		}
+ 	}
+ 
 diff --git a/src/NFfunction/NFfunction.hh b/src/NFfunction/NFfunction.hh
 index 2cf9607..b50ac88 100644
 --- a/src/NFfunction/NFfunction.hh
@@ -171,5 +198,5 @@ index a52d495..bfa4c45 100644
  		if (gf) gf->setCounterFromParameter(system, ctrName);
  		if (cf) cf->setCounterFromParameter(system, ctrName);
 -- 
-2.48.1
+2.54.0 (Apple Git-157)
 

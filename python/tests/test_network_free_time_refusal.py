@@ -75,8 +75,8 @@ def test_the_clock_readers_are_both_kinds():
 
 @pytest.mark.skipif(not _has_nfsim(), reason="NFsim not compiled in")
 def test_nfsim_still_runs_a_time_indexed_table_function():
-    # NFsim reads one correctly while reactions fire; the case where nothing
-    # fires is issue #892.
+    # NFsim reads one at its x values whether or not anything fires (issue
+    # #892); test_nfsim_time_table_breakpoints.py checks the values.
     m = bngsim.Model.from_net(str(DATA / "simple_decay.net"))
     r = bngsim.Simulator(m, method="nf", xml_path=str(TFUN)).run(t_span=(0, 1), n_points=3, seed=1)
     assert r.n_times == 3
