@@ -154,12 +154,17 @@ NFsim runs a table function indexed by time, on **time elapsed since
 of the table's x values, whether or not a reaction has fired, and draws the next
 waiting time from there. That is exact for a step table (`method=>"step"`): a
 rate that is 0 at the start turns on at the step that turns it on (issue #892).
-A linear table is read only at its x values and after each reaction, and holds
-that value in between, so where little fires the run lags the ramp. With 100
-`X(p~1)` leaving at a rate that rises from 0 at t = 0 to 10 at t = 1, none has
-left by t = 1 on `method="nf"`, where about 70 have left by t = 0.5. Use
-`method="rm"`, which integrates the ramp, or `method="ssa"` on the generated
-network.
+A linear table changes between those reads, and NFsim would hold the value it
+last read, so where little fires the run would lag the ramp: with 100 `X(p~1)`
+leaving at a rate that rises from 0 at t = 0 to 10 at t = 1, none would have
+left by t = 1, where about 70 have left by t = 0.5. So `method="nf"` refuses a
+model whose rate laws read a linear table indexed by time, directly or through
+the functions they call, and names the tables (issue #1179). Use `method="rm"`,
+which integrates the ramp, or `method="ssa"` on the generated network. To stay
+on NFsim, make the table a step on a grid fine enough for the ramp, each step
+holding the ramp's value at its middle: steps of a tenth of the ramp matched the
+exact mean within sampling noise. A linear table that no rate law reads is
+not refused; NFsim reads it correctly at each output time.
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
