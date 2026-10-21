@@ -182,6 +182,30 @@ def test_work_jump_on_one_case_alerts():
     assert r["alerts"]["efficiency_cases"] == 1
 
 
+def test_work_jump_on_a_flaky_case_is_reported_not_alerted():
+    # GH #1153: --flaky promises a listed case's changes never alert, but a
+    # listed case's per-case work increase still did.
+    more = {**W, "n_steps": 250}
+    fresh = fresh_with(A_ode=rec("PASS", work=more, sec=1.0))
+    r = V.diff(BASE, fresh, flaky={"A|ode": "steps follow the platform's rounding"})
+    assert [(x["case"], x["counter"]) for x in r["efficiency"]] == [("A|ode", "n_steps")]
+    assert r["efficiency"][0]["note"].startswith("flaky: ")
+    assert r["efficiency"][0]["flaky"] is True
+    assert r["alerts"]["efficiency_cases"] == 0
+    # It still counts in the totals: 350 steps against 200 is past x1.05, and
+    # that is the one alert.
+    assert r["work_totals"]["n_steps"]["after"] == 350
+    assert r["work_totals"]["n_steps"]["alert"] is True
+    assert r["n_alerts"] == r["alerts"]["efficiency_totals"] == 1
+    md = V.render_md(r)
+    assert "flaky: steps follow" in md
+    # The header counts it apart, not in bold among the alerting increases.
+    assert "Efficiency: 0 counter increase(s) above x1.25, and 1 on flaky cases" in md
+    assert "**Efficiency" not in md
+    # The same jump on a case not listed alerts as before.
+    assert V.diff(BASE, fresh, flaky={"B|ode": "x"})["alerts"]["efficiency_cases"] == 1
+
+
 def test_small_absolute_work_change_does_not_alert():
     # x2.5 on the Jacobian count clears the ratio bar, but +9 is under the n_jac_evals floor of 10.
     base = core({"A|ode": rec("PASS", work={"n_steps": 10, "n_rhs_evals": 20, "n_jac_evals": 6})})
