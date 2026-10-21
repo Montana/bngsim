@@ -34,6 +34,7 @@ falls back to the finite-difference Jacobian — exactly the pre-#76 behavior.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -2830,12 +2831,17 @@ def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> 
     return None
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def has_condition_construct(body: str) -> bool:
     """True when *body* carries a construct from the conditional class.
 
     The cheap pre-check that decides whether a caller needs to build the
     switch-condition scope at all — same table, so it cannot drift from what
     ``allow_conditions`` actually waives.
+
+    Kept by text: the structural codegen key asks it of every function body on
+    each ``Simulator`` construction, which a solve per call on a fresh clone
+    paid in full every call (issue #919), and the answer is the text's alone.
     """
     return any(
         pat.search(body) for pat, _name, conditional in _UNSUPPORTED_EXPR_CONSTRUCTS if conditional
