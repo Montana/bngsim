@@ -169,15 +169,10 @@ NetworkModel NetworkModel::clone() const {
     }
     // Species names are registered for event trigger / assignment-RHS
     // expressions (matches the post-build registration in
-    // model_builder.cpp). define_variable throws on duplicate, so guard
-    // against species names that collide with observables.
-    for (auto &sp : copy.impl_->species) {
-        try {
-            copy.impl_->evaluator->define_variable(sp.name, &sp.concentration);
-        } catch (...) {
-            // Already registered as a parameter or observable — skip.
-        }
-    }
+    // model_builder.cpp). A name already registered as a parameter or
+    // observable, or one that is no symbol (a .net species `A()`), is skipped.
+    for (auto &sp : copy.impl_->species)
+        copy.impl_->evaluator->try_define_variable(sp.name, &sp.concentration);
 
     // Re-bind the rateOf accessors (GH #106) BEFORE any expression that may
     // reference a rate_of__<species> token is re-compiled. The copy gets its own
