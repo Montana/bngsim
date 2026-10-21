@@ -165,3 +165,55 @@ def test_the_jacobian_is_derived_once_not_per_call(tmp_path, monkeypatch):
         differentiable_solve(model, p, T_SPAN, N_POINTS, chunk_size=1)
     assert len(calls) == 1
     assert model.analytical_jacobian_status == "complete"
+
+
+def test_a_call_while_another_thread_derives_waits_for_the_terms(tmp_path, monkeypatch):
+    """The derivation marks the model attempted before it starts. A call from a
+    second thread that read that mark unlocked, while the first thread was still
+    deriving, cloned a model with no terms, marked attempted, so its clone never
+    derived and solved on the finite-difference Jacobian: a gradient that was not
+    the one the same call gives alone. It now waits for the terms.
+    """
+    import threading
+    import time
+
+    import bngsim._jacobian as jacobian
+
+    model = _model(tmp_path, FUNCTIONAL, "m.net")
+    names = _names(model, False)
+    p = _p0(model, False)
+    ref = np.asarray(_unwarmed(tmp_path / "m.net", names, p, False, sens=True).sensitivities)
+
+    attach = jacobian.attach_functional_jacobian
+    second_calling = threading.Event()
+
+    def slow(core):
+        # Hold the derivation open until the second call is on its way in.
+        second_calling.wait(timeout=10)
+        time.sleep(0.5)
+        return attach(core)
+
+    monkeypatch.setattr(jacobian, "attach_functional_jacobian", slow)
+
+    def solve(q):
+        return differentiable_solve(model, q, T_SPAN, N_POINTS)
+
+    out = {}
+
+    def call(tag):
+        if tag == "second":
+            second_calling.set()
+        out[tag] = np.asarray(jax.jacfwd(solve)(p))
+
+    first = threading.Thread(target=call, args=("first",))
+    first.start()
+    while not model._jac_attempted:  # the first call is inside the derivation
+        time.sleep(0.001)
+    second = threading.Thread(target=call, args=("second",))
+    second.start()
+    first.join()
+    second.join()
+
+    assert set(out) == {"first", "second"}
+    for tag in ("first", "second"):
+        np.testing.assert_array_equal(out[tag], ref, err_msg=tag)

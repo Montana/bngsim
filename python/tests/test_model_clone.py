@@ -403,7 +403,7 @@ def test_clone_skips_species_names_it_cannot_register():
     model = b.build()
 
     clone = model.clone()
-    r_orig = SsaSimulator(model.clone()).run(_ts(20.0, 21), 1)
+    r_orig = SsaSimulator(model).run(_ts(20.0, 21), 1)  # build()'s registration
     r_clone = SsaSimulator(clone).run(_ts(20.0, 21), 1)
     np.testing.assert_array_equal(np.array(r_orig.species_data), np.array(r_clone.species_data))
     # S is registered in both, so the event that reads it fires in both.

@@ -46,8 +46,9 @@ def _check_jax():
         ) from None
 
 
-# One analytical-Jacobian derivation at a time on a caller's model: the calls
-# that need it may come from several threads at once.
+# One analytical-Jacobian derivation at a time on a caller's model, and no clone
+# of it while one runs: the calls that need it may come from several threads at
+# once.
 _WARM_LOCK = threading.Lock()
 
 
@@ -60,10 +61,15 @@ def _warm_clone(model):
     model. Derived once on *model*, the terms go to each clone without SymPy
     (warm-before-clone, GH #145 §3), which is what the first
     ``Simulator(model).run()`` would leave *model* holding anyway.
+
+    The lock is taken on every call, not only while ``_jac_attempted`` is
+    False: the derivation sets that sentinel before it starts, so a call that
+    read it unlocked during another thread's derivation cloned a model with no
+    terms yet, marked attempted, and that clone solved on the finite-difference
+    Jacobian. Once *model* is warm, the call under the lock is a no-op.
     """
-    if not model._jac_attempted:
-        with _WARM_LOCK:
-            model.prepare_analytical_jacobian()
+    with _WARM_LOCK:
+        model.prepare_analytical_jacobian()
     return model.clone()
 
 
