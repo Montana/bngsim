@@ -148,14 +148,26 @@ def run_diffrax(
         for name, value in ordered:
             model.set_param(name, value)
     if model.n_events:
-        raise ValueError(
-            f"run_diffrax does not implement events, and this model has {model.n_events}; "
-            "use Simulator(method='ode')."
+        # A compartment size that jumps keeps the amounts in it through an event
+        # the loader adds (issue #1054), which is no event of the model's own.
+        jumps = list(model._core.event_size_jump_compartments)
+        n_own = sum(1 for comp in jumps if not comp)
+        has = (
+            f"this model has {n_own}"
+            if n_own
+            else "this model keeps the amounts in compartment "
+            f"{', '.join(sorted(set(jumps)))} across a jump of its size with one (issue #1054)"
         )
+        raise ValueError(
+            f"run_diffrax does not implement events, and {has}; use Simulator(method='ode')."
+        )
+    # A step or bend call over state is one of these since issue #1068: a pulse
+    # written as `max(0, 1 - abs(u)/w)` is stepped over where nothing roots it.
     state_switches = model.state_switch_root_conditions()
     if state_switches:
         raise ValueError(
             "run_diffrax does not integrate a rate law that switches on the model's state, "
+            "with a comparison or a step or bend call such as floor(), max() or abs(), "
             "whose switch times are not known before the run, and this model has "
             f"{list(state_switches)}; use Simulator(method='ode')."
         )

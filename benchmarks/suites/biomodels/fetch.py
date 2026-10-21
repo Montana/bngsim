@@ -67,7 +67,8 @@ METADATA_DELAY = 0.05  # polite pause between per-model metadata calls
 # refused. The move is not why GitHub's runners get HTTP 403, though: from a
 # runner CloudFront itself refuses every request, through either host and the
 # REST API alike (.github/workflows/biomodels-probe.yml, first run 38568772108):
-# the 403s that made nightly-parity's corpus job stop asking for these models.
+# the 403s that made nightly-parity's corpus job stop asking for these models. It
+# reads bngsim's own copy instead (parity_checks/rr_parity/fetch_biomodels_mirror.py).
 BIOMODELS_BASE = "https://www.biomodels.org"
 
 logger = logging.getLogger("biomodels.fetch")

@@ -661,13 +661,15 @@ class TestFallbackContract:
 
 
 class TestNonDifferentiableConstructs:
-    """GH #250 — rate laws the emitter accepts but cannot differentiate.
+    """GH #250 — rate laws the emitter accepts but sympy differentiates badly.
 
     ``floor``, ``ceil`` and ``sign`` are ExprTk builtins, so they reach the
-    symbolic core happily as *inputs*, but their derivative comes back as an
-    unevaluated ``Derivative`` no emitter can print. The contract is that such a
-    rate law falls back (``None``), and that it does so **before** paying the
-    derivation. ``abs``, ``min`` and ``max`` were in this class too — sympy
+    symbolic core happily as *inputs*, but sympy leaves their derivative as an
+    unevaluated ``Derivative`` no emitter can print. They declined until issue
+    #1128, which differentiates them to 0 between the steps the runs root at
+    (``_prepare_steps``); a value factor of the derivative prints as the call it
+    is, and a law with many of them still derives at once. ``abs``, ``min`` and
+    ``max`` were in this class too — sympy
     differentiates them to ``re``/``im``/``Heaviside``, and on
     ``BIOMD0000000385`` three ``Abs`` cost 138 s against a 20 s budget, unbounded
     by it because one derivative is a single ``sp.diff`` — until issue #507
@@ -675,9 +677,18 @@ class TestNonDifferentiableConstructs:
     now derive and emit as nested ``if()`` (test_jacobian_kink_rewrite.py).
     """
 
-    @pytest.mark.parametrize("fn", ["floor", "ceil", "sign"])
-    def test_unary_nondifferentiable_over_observable_falls_back(self, fn):
-        assert J.build_per_observable_terms(f"k*{fn}(A)", {}, {"A"}, {"k"}) is None
+    @pytest.mark.parametrize("fn", ["floor", "ceil", "sign", "sgn"])
+    def test_a_step_over_an_observable_differentiates_to_zero(self, fn):
+        assert J.build_per_observable_terms(f"k*{fn}(A)", {}, {"A"}, {"k"}) == []
+
+    @pytest.mark.parametrize(
+        ("fn", "printed"),
+        [("floor", "floor"), ("ceil", "ceil"), ("sign", "sign"), ("sgn", "sign")],
+    )
+    def test_a_step_as_a_value_factor_prints_as_its_call(self, fn, printed):
+        terms = J.build_per_observable_terms(f"k*{fn}(0.4*A)*A", {}, {"A"}, {"k"})
+        assert terms is not None and len(terms) == 1 and terms[0][0] == "A", terms
+        assert terms[0][1].startswith(f"k*{printed}("), terms
 
     def test_abs_over_observable_differentiates_as_sign(self):
         terms = J.build_per_observable_terms("k*abs(A)", {}, {"A"}, {"k"})
@@ -706,20 +717,20 @@ class TestNonDifferentiableConstructs:
         assert "abs(A)" in terms[0][1], f"condition lost its abs(): {terms[0][1]}"
 
     def test_reached_through_an_inlined_function(self):
-        # The check runs on the *inlined* expression, so a construct hidden behind
-        # a user function is caught the same way.
-        assert J.build_per_observable_terms("g", {"g": "k*sign(A)"}, {"A"}, {"k"}) is None
+        # The rewrite runs on the *inlined* expression, so a step hidden behind a
+        # user function is read the same way.
+        terms = J.build_per_observable_terms("g", {"g": "k*floor(A)*A"}, {"A"}, {"k"})
+        assert terms == [("A", "k*floor(A)")], terms
 
-    def test_declines_without_paying_the_derivation(self):
-        # The point of the pre-check: the expensive case was expensive *because*
-        # sympy expanded Abs into re/im — 62 s for a single dAbs on
-        # BIOMD0000000385. Abs now derives as a Piecewise (issue #507), so the
-        # pre-check guards sign / floor / ceiling; a rate law with several of them
-        # over several observables must still return without a derivation.
+    def test_many_steps_derive_at_once(self):
+        # The expensive case was expensive *because* sympy expanded Abs into
+        # re/im — 62 s for a single dAbs on BIOMD0000000385. The steps' twins
+        # differentiate as constants, so several over several observables cost
+        # nothing.
         expr = "k*sign(A*B + A/B) + sign(B*B - A) + sign(A + B)"
         t0 = time.perf_counter()
-        assert J.build_per_observable_terms(expr, {}, {"A", "B"}, {"k"}) is None
-        assert time.perf_counter() - t0 < 1.0, "fell back only after differentiating"
+        assert J.build_per_observable_terms(expr, {}, {"A", "B"}, {"k"}) == []
+        assert time.perf_counter() - t0 < 1.0
 
 
 class TestUnevaluatedDerivativeIsNotEmittable:
@@ -758,9 +769,10 @@ def test_nondifferentiable_set_matches_a_live_rederivation():
     """``_NONDIFFERENTIABLE_EMITTER_FUNCS`` is a cache; this runs the derivation.
 
     The constant was produced by differentiating every name in
-    ``_SYMPY_FUNC_TO_EXPRTK`` — between the two kink steps of issue #507 that
-    ``differentiate_rate_law`` wraps ``sp.diff`` in, which is what takes ``Abs`` /
-    ``Min`` / ``Max`` out of the set — and keeping the ones whose result the
+    ``_SYMPY_FUNC_TO_EXPRTK`` — between the kink steps of issue #507 and the
+    step twins of issue #1128 that ``differentiate_rate_law`` wraps ``sp.diff``
+    in, which take ``Abs`` / ``Min`` / ``Max`` and ``ceiling`` / ``floor`` /
+    ``sign`` out of the set — and keeping the ones whose result the
     emitter refuses to print. That makes it a *fact about the emitter map*, not a judgement — so
     adding a function to the map without re-deriving would silently reintroduce
     GH #250 for that function, and dropping one would leave a stale name declining
@@ -799,8 +811,8 @@ def test_nondifferentiable_set_matches_a_live_rederivation():
             except (TypeError, ValueError):
                 continue
             built = True
-            call = J._prepare_kinks(call, {"A", "B", "C"})
-            derivs = [J._finish_kinks(sp.diff(call, arg)) for arg in args]
+            call = J._prepare_steps(J._prepare_kinks(call, {"A", "B", "C"}), {"A", "B", "C"})
+            derivs = [J._finish_steps(J._finish_kinks(sp.diff(call, arg))) for arg in args]
             refused = [
                 J.sympy_to_exprtk(d) is None and J.sympy_to_c(d, lambda n: n) is None
                 for d in derivs

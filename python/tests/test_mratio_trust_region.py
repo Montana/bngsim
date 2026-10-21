@@ -27,7 +27,11 @@ The region it is trusted in, measured against a 40 digit reference, is all for
   them vanishes there.
 * ``a <= 0`` with ``z <= 0``. This is where BNG models live, since a model builds
   ``a = -min(AT, BT)`` and ``z = -1/Keq``, and it stays true when a fit moves the
-  counts off the integers.
+  counts off the integers. Except past ``z = -20`` with ``b - a < 1`` (issue
+  #1080), where the fraction loses about ``10*eps*sqrt(-z)/(b - a)`` of the
+  ratio, which is everything once ``b`` and ``a`` are both tiny. Those are summed
+  as two series out to ``z = -700`` and left to the asymptotic expansion past
+  that. That is the very last section below.
 * ``|z| <= 20``, clean over 3400 hostile triples where the first wrong answer
   anywhere is at ``|z| = 60``. Clean of false limits, that is: issue #1080
   found it losing digits there, up to 4.4e-7, when ``a`` is tiny next to ``b``
@@ -56,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 
 import bngsim
 import pytest
@@ -250,8 +255,14 @@ def test_a_zero_the_series_cannot_finish_is_refused(tmp_path):
     """With b past about 5e8 and z near b the terms fall too slowly for the
     series' million-term cap (here it would need 7.1e6). It gives up with a NaN
     and the call goes on: the rule refuses a = 0 with 2*z > b, and the asymptotic
-    route refuses a = 0 outright. Were either to let it through, it would reach
-    the fraction at the a = 0 where it settles on a false limit."""
+    route refuses a = 0 outright.
+
+    The fraction would not have been wrong at this point. Before issue #768 it
+    answered 1253314.4707011, and the ratio is 1253314.4706489 (mpmath, summed
+    over 1.05e7 terms): 4.2e-11 off. So this pins a refusal, not a correction.
+    The refusal holds because nothing vouches for the fraction at a = 0 with
+    2*z > b: where it was checked (b up to 100, z from 20 to 400) it was wrong at
+    168 of 200 points, mratio(0, 1, 100) among them."""
     with pytest.raises(Exception, match=r"not reliable.*#768"):
         _value(tmp_path, 0.0, 1e12, 1e12)
 
@@ -370,12 +381,173 @@ def test_near_a_pole_the_error_is_what_an_ulp_of_a_does(tmp_path):
     "a, b, z, true_value",
     [
         # Just outside the box, one on each edge, where the fraction answers as
-        # before and is right to rounding. mpmath at 100 digits.
+        # before and is right to rounding. mpmath at 80 digits and more.
         (1.0, 0.026664156824421394, 19.310533421401022, 0.028008147640145812),  # alpha = 1
         (-1.0, 0.5, 10.0, -1.0 / 19.0),  # a negative integer: the fraction terminates
         (-1e-12, 1.0, -19.5, 0.051282051107778356),  # z < 0 with b - a just above 1
-        (-1e-12, 0.5, -20.5, 0.025035151439572003),  # |z| past 20
+        # |z| past 20, where the box goes on only for a <= 0 and b - a < 1 (the
+        # last section below): a positive a, then b - a just above 1, near and far.
+        (1e-6, 0.5, -20.5, 0.02503515280316255),
+        (-1e-12, 1.0, -25.0, 0.039999999999442815),
+        (-0.5, 1.5, -1000.0, 0.0014985007496251875),
     ],
 )
 def test_the_fraction_still_answers_outside_the_box(tmp_path, a, b, z, true_value):
     assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+# ── Issue #1080: past z = -20, where b - a < 1 ──────────────────────────────
+
+# a, b, z, what the fraction returned, and the ratio (mpmath at 80 digits and
+# more, two ways: hyp1f1 after Kummer's transformation, and the transformed
+# series summed directly). All in the a <= 0, z <= 0 clause, which used to
+# trust the fraction at any z. It converged to the ratio but lost about
+# 10*eps*sqrt(-z)/(b - a) of it. The first row is the issue's own example and
+# the second its a = 0. The next two were the worst of 20000 random triples
+# with b in [1e-12, 10], |a| in [1e-15, 10] and z in [-2000, 0], and both are
+# past z = -700, so the asymptotic route answers them, the second through its
+# exact M(0, b, z) = 1. The fifth is off by a factor of two. The last is a b far
+# below anything a model builds, where the fraction returned its Lentz floor.
+WAS_OFF_1080_PAST_20 = [
+    (-1e-12, 1e-9, -25.0, 5.5620506912562485e-11, 5.562054719123343e-11),
+    (0.0, 1e-9, -30.0, 3.4620717894130465e-11, 3.462069802043962e-11),
+    (
+        -2.2816251335577544e-13,
+        1.048356393428415e-12,
+        -1576.5643547958143,
+        6.572841358026786e-16,
+        6.653849543435732e-16,
+    ),
+    (
+        0.0,
+        1.1766052422876225e-12,
+        -784.9671045705651,
+        1.5179125913905077e-15,
+        1.5008374136500115e-15,
+    ),
+    (
+        -2.4013304216952906e-13,
+        1.3563113178612664e-12,
+        -786022.5708171733,
+        3.680405664315373e-18,
+        1.7255395630598238e-18,
+    ),
+    (0.0, 1e-300, -100.0, 1.292767299104767e-17, 3.720075976020836e-44),
+]
+
+
+@pytest.mark.parametrize("a, b, z, old, true_value", WAS_OFF_1080_PAST_20)
+def test_past_z_minus_20_a_tiny_b_minus_a_is_not_answered_wrongly(
+    tmp_path, a, b, z, old, true_value
+):
+    """Out to z = -700 both Kummer series are summed, after the transformation
+    that makes every term of both positive: alpha = b - a is at least b when
+    a <= 0. Past it the asymptotic route answers, which in this corner keeps a
+    branch that outweighs the dropped one by e^(-z) and so vouches for itself."""
+    assert abs(old - true_value) / true_value > 1e-8
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+@pytest.mark.parametrize(
+    "a, b, z, true_value",
+    [
+        # The same corner where b - a is not tiny and the fraction was right to
+        # rounding. These have to keep answering: on either side of z = -700,
+        # and an a = 0 past it, which the asymptotic route refused until it was
+        # told that M(0, b, z) = 1 is exact. mpmath at 80 digits.
+        (-0.25, 0.5, -700.0, 0.0007145411817709659),
+        (-0.25, 0.5, -701.0, 0.0007135215003868878),
+        (-0.5, 0.3, -1000.0, 0.0003000600420655688),
+        (0.0, 0.5, -1e4, 5.000250037509378e-05),
+        # The fraction did not converge at all here, within 100000 steps, and
+        # raised. The ratio is b/(-z) to a part in 1e9.
+        (-1e-12, 1e-9, -1e9, 1.0000000010000001e-18),
+    ],
+)
+def test_past_z_minus_20_what_the_fraction_got_right_still_answers(tmp_path, a, b, z, true_value):
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+def test_past_z_minus_700_with_b_minus_a_near_the_smallest_double_is_refused(tmp_path):
+    """The ratio is 1.41e-303 and the fraction returned 1.42e-18. Past z = -700
+    the series is not tried, since its terms could pass the largest double, and
+    the asymptotic route cannot vouch here: the branch it keeps is about
+    b/(-z) = 1.4e-303 and the one it drops about e^z = 4.5e-309, which leaves
+    3e-6 of the answer unaccounted for. That is where the refusal is left, and
+    only for b - a below about 1e-290."""
+    with pytest.raises(Exception, match=r"not reliable.*#1080"):
+        _value(tmp_path, 0.0, 1e-300, -710.0)
+
+
+# ── Issue #1080: a b below about 1e-22, wherever the fraction is trusted ─────
+
+# a, b, z, what the fraction returned, and the ratio (mpmath at 80 digits and
+# more, hyp1f1 directly and after Kummer's transformation, which agree). The
+# fraction starts from tiny = 1e-32 in place of zero, so its first C stands for
+# infinity and the next is 1 + p_2/C_1, which should be exactly 1. Taken
+# literally it is 1 + p_2*1e-32, with p_2 = z*(a-b)/(b*(b+1)), and a tiny b makes
+# that anything at all. One row per clause it reached: a <= 0 with z <= 0 (near
+# and past z = -20), a negative integer, whose fraction terminates and was still
+# 7e-7 off, and |z| <= 20 with each sign of z. The last has p_2 just under the
+# largest double, where the ratio is itself near the smallest normal one.
+WAS_OFF_1080_TINY_B = [
+    (
+        -4.119676222070549,
+        2.4225094582386945e-279,
+        -1.4540899212539904,
+        9.999999999999999e-33,
+        8.515249528874852e-280,
+    ),
+    (
+        -3.689525822973658,
+        5.126352093327822e-300,
+        -491.8281574812038,
+        1e-32,
+        1.0366673205419992e-302,
+    ),
+    (-3.0, 1e-25, 10.0, -1.347825086956521e-26, -1.3478260869565218e-26),
+    (-20.0, 1e-200, 15.0, 1e-32, -3.8469703304037625e-202),
+    (2.5, 1e-25, 10.0, 4.884009591187713e-26, 4.884008591187709e-26),
+    (12.0, 1e-100, -5.0, 9.999999999999999e-33, 7.757425751152755e-102),
+    (
+        8.48517191235676,
+        3.06959761947884e-309,
+        -0.05844426302774795,
+        9.999999999999999e-33,
+        -4.331194060173115e-309,
+    ),
+]
+
+
+@pytest.mark.parametrize("a, b, z, old, true_value", WAS_OFF_1080_TINY_B)
+def test_a_tiny_b_no_longer_leaks_through_the_fractions_start(tmp_path, a, b, z, old, true_value):
+    """The step after the first now takes C_2 = 1. For |p_2| below 5.5e15,
+    1 + p_2*1e-32 already rounded to 1, so no other argument changes by a bit;
+    BNG's never come near, since they have b >= 1."""
+    assert abs(old - true_value) / abs(true_value) > 1e-8
+    assert _value(tmp_path, a, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+@pytest.mark.parametrize(
+    "b, z, true_value",
+    [
+        # M(0, b, z) = 1, so the ratio is M(1, b+1, z): mpmath at 100 digits.
+        (-2.5, -500.0, -0.005035318510732385),
+        (-0.5, -100.0, -0.005076943751970561),
+        (-7.3, -2000.0, -0.003665218300681953),
+    ],
+)
+def test_a_zero_with_a_negative_b_far_out_is_answered(tmp_path, b, z, true_value):
+    """A side effect of the asymptotic route taking M(0, b, z) = 1 as exact
+    (issue #1080). Its zero-term rule used to refuse every a = 0 because the
+    denominator's expansion stops after its first term, and a b <= 0 asks that
+    route whatever z is, so these were refusals. Now they are answers."""
+    assert _value(tmp_path, 0.0, b, z) == pytest.approx(true_value, rel=1e-13, abs=0.0)
+
+
+def test_a_p_2_past_the_largest_double_still_comes_back_nan(tmp_path):
+    """Here p_2 = z*(a-b)/(b*(b+1)) = -1.4e310 overflows. The fraction's second
+    step keeps the old arithmetic in that case, so the call returns the NaN it
+    always did, which the non-finite warner reports. It does not take C_2 = 1:
+    with D_2 = 1/(1 + p_2) = 0 that would make the answer a quiet, wrong 0."""
+    assert math.isnan(_value(tmp_path, -5.5, 1e-310, 0.25))

@@ -42,6 +42,20 @@ result.custom_attrs["experiment"] = "dose_response_2026"
 result.save("results_with_meta.h5")
 ```
 
+The file keeps what `as_roadrunner` needs to report amounts and live
+concentrations: each species' compartment size and, where a size changes,
+the per-sample volume factors. A file written before bngsim saved these
+(format 2) does not say what the sizes were, so `as_roadrunner` on it
+refuses an amount selector (`"S"`) and warns on a concentration one
+(`"[S]"`). Multiply `"[S]"` by the size yourself, or run the model again and
+save the result.
+
+It also keeps the run's `ic_sensitivity_seed` and its `ssa_diagnostics` and
+`psa_diagnostics` (for a stacked batch, each run's, as
+`psa_diagnostics_per_run`). A file written before bngsim saved these loads them as a
+result built from arrays has them: the seed `None` ("not recorded"), the SSA
+counts 0 with the propensity backend `"unknown"`, and PSA inactive.
+
 ## Export results to text files
 
 bngsim provides three text-export methods on `Result`; pick by audience.
@@ -79,7 +93,7 @@ seed — use [HDF5](#save-and-load-results-hdf5) for a lossless capture.
 | `to_cdat(path)` | `time`, species | `#`-prefixed, space-padded | fixed-width spaces | species only |
 | `to_csv(path, kind=..., sep=...)` | `time`, observables *or* species | plain `time,A,B,...` | caller-chosen char | one block at a time |
 | `result.dataframe.to_csv(path)` | `time`, observables | pandas | pandas | observables only |
-| `result.save(path)` (HDF5) | n/a | n/a | n/a | **everything** — time/species/observables/expressions/sensitivities/solver stats/seed/custom attrs |
+| `result.save(path)` (HDF5) | n/a | n/a | n/a | **everything** — time/species/observables/expressions/sensitivities/solver stats/SSA and PSA diagnostics/seed/custom attrs |
 
 Batch (3-D) results from `run_batch(squeeze=True)` are intentionally not
 written to text files by these methods; iterate the per-replicate

@@ -163,7 +163,8 @@ class ModelBuilder {
     /// amount-rate (volume_factor·d(conc)/dt) instead of the stored d(conc)/dt.
     /// The same flag also serves a hOSU species in a VARIABLE-volume compartment:
     /// the integrator stores amount/V_static, so ×volume_factor recovers the
-    /// amount-rate there too (suite 01463). See Species::report_rateof_amount.
+    /// amount-rate there too (suite 01463), and in an assignment-rule compartment
+    /// (#736). See Species::report_rateof_amount.
     /// No-op if species_idx0 is out of range.
     void set_species_rateof_amount(int species_idx0);
 
@@ -304,6 +305,12 @@ class ModelBuilder {
     /// the event's other assignments, rather than the assignment's expression.
     void set_last_event_assignment_rescale(int assign_idx0, const std::string &size_expr,
                                            int base_assign_idx0);
+
+    /// Issue #1054: mark the most recently added event as the rescale where the
+    /// piecewise assignment-rule size of `compartment` jumps. The ODE engine
+    /// executes it before the other events of its instant read their trigger,
+    /// values and delay (Event::size_jump_compartment).
+    void set_last_event_size_jump(const std::string &compartment);
 
     // ─── Discontinuity triggers (GH #72) ───────────────────────────────────
 

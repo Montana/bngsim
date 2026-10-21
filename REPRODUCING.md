@@ -38,6 +38,7 @@ Each `fetch.py` has two modes:
 |---|---|---|---|---|
 | BioModels SED-ML + SBML | `parity_checks/rr_parity` | `sys-bio/temp-biomodels` @ `6a09daf4` | `rr_parity/fetch_sedml.py` → `materialize.py` | `rr_parity/temp_biomodels_manifest.json` |
 | BioModels SBML (Stage-2) | `benchmarks/suites/biomodels` | BioModels REST, snapshot `2026-07-03` (per-model version pin) | `benchmarks/suites/biomodels/fetch.py` | `biomodels/biomodels_provenance.json` |
+| BioModels SBML, rr_parity's 331 (copy) | `parity_checks/rr_parity` | bngsim release `data-biomodels-sbml-2026-07-03` (CC0 copy of the row above) | `rr_parity/fetch_biomodels_mirror.py` → `materialize.py --sbml-dir` | `biomodels/biomodels_provenance.json` |
 | BNGL corpus (895) | `parity_checks/bng_parity` | RuleWorld/RuleHub `479d6d62`, richardposner/RuleMonkey `0f701125`, wshlavacek/BNGL-Models `0df6cbd7` | `bng_parity/vendor_corpus.py` (committed) | `bng_parity/manifest.json` |
 | SBML semantic suite | `harness/sbml_test_suite` | `sbmlteam/sbml-test-suite` @ `473e119d` (`3.4.0-36`) | `harness/sbml_test_suite/fetch_semantic_suite.py` | `harness/sbml_test_suite/SUITE_PIN.json` |
 | DSMTS stochastic (39) | `harness/sbml_test_suite/dsmts` | same commit, **committed** (hermetic) | — | `dsmts/dsmts_manifest.json` |
@@ -90,6 +91,9 @@ pip install -e 'bngsim[roadrunner]'                     # bngsim + libRoadRunner
 # 1a. rr_parity (SBML vs RoadRunner)
 python parity_checks/rr_parity/fetch_sedml.py           # pinned temp-biomodels, sha256-verified
 python benchmarks/suites/biomodels/fetch.py             # pinned BioModels SBML
+#   (or, where BioModels refuses you, as it does GitHub runners: bngsim's copy of the 331
+#   rr_parity needs, then materialize.py --sbml-dir parity_checks/rr_parity/data/biomodels_sbml)
+#   python parity_checks/rr_parity/fetch_biomodels_mirror.py
 python parity_checks/rr_parity/materialize.py           # lay out models/<id>/
 python parity_checks/rr_parity/rr_run.py                # → runs/report_ode.json
 

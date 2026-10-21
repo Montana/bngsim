@@ -197,7 +197,10 @@ def test_ssa_runs_a_zero_constant_parameter_delay():
     # and ran under SSA; the expression form must run too.
     model = bngsim.Model.from_antimony_string(_SSA_DELAY_ANT.format(d=0))
     result = bngsim.Simulator(model, method="ssa").run(t_span=(0, 2), n_points=3, seed=1)
-    assert list(result.species[:, 0]) == [0.0, 5.0, 5.0]
+    # `time > 1` is false at 1, so the row at 1 is before the event, as ODE
+    # and libRoadRunner read it (SSA read 5 there until the row was checked
+    # against the trigger at its own time).
+    assert list(result.species[:, 0]) == [0.0, 0.0, 5.0]
 
 
 @pytest.mark.parametrize(("load", "set_to"), [(1.0, None), (0.0, 0.5)])
