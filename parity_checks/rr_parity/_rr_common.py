@@ -258,7 +258,7 @@ def _rr_warmup() -> tuple[float, str]:
     return rr_import_sec, "import-proxy"
 
 
-def measure_ssa_warmup() -> dict:
+def measure_ssa_warmup(include_roadrunner: bool = True) -> dict:
     """One-time per-process warmup cost for the SSA screen (both engines).
 
     The SSA taxonomy differs from the ODE one (see :func:`measure_warmup`):
@@ -270,11 +270,16 @@ def measure_ssa_warmup() -> dict:
     Must be called **once at worker start, before any engine call**, so the
     extension import is captured here as per-process warmup rather than charged to
     the first model's per-model load.
+
+    ``include_roadrunner=False`` (a replay from a reference archive, issue #805)
+    measures bngsim alone and never imports RoadRunner.
     """
     t0 = time.perf_counter()
     import bngsim  # noqa: F401  — the _bngsim_core .so load is the measured cost
 
     bn_sec = time.perf_counter() - t0
+    if not include_roadrunner:
+        return {"bngsim_sec": round(bn_sec, 6)}
     rr_sec, rr_source = _rr_warmup()
     return {
         "bngsim_sec": round(bn_sec, 6),

@@ -101,9 +101,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import platform
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -548,6 +550,17 @@ def _sign_indefinite_annotation(bn_ssa_diag: dict) -> dict | None:
     }
 
 
+def _rr_ode(xml, t_end, n_steps):
+    """RoadRunner's deterministic ODE (CVODE) on the screen's grid: ``(arr, names)``."""
+    import roadrunner
+
+    rr = roadrunner.RoadRunner(xml)
+    rr.setIntegrator("cvode")
+    sn = list(rr.model.getFloatingSpeciesIds())
+    rr.timeCourseSelections = ["time"] + ["[" + s + "]" for s in sn]
+    return np.asarray(rr.simulate(0, t_end, n_steps + 1))[:, 1:], sn
+
+
 def _attribute_fail(
     xml,
     t_end,
@@ -560,6 +573,7 @@ def _attribute_fail(
     mean_z_tol,
     min_mean_count,
     self_z_tol,
+    rr_ode=None,
 ) -> dict:
     """Run each engine's deterministic ODE and attribute a fail against it.
 
@@ -567,20 +581,20 @@ def _attribute_fail(
     test (molecule-aware) whether each engine's SSA mean tracks its OWN ODE and
     whether the two ODEs agree. Returns the chosen ``status``, a human-readable
     ``reason``, and supporting numbers. Raises on ODE error (the caller leaves
-    the model as an unattributed ``fail``)."""
+    the model as an unattributed ``fail``).
+
+    ``rr_ode(xml, t_end, n_steps) -> (arr, names)`` is RoadRunner's ODE on the
+    screen's grid; a replay from a reference archive (issue #805) passes the
+    recorded one."""
     import bngsim
     import numpy as np
-    import roadrunner
 
+    rr_ode = rr_ode or _rr_ode
     m = bngsim.Model.from_sbml(xml)
     bo = bngsim.Simulator(m, method="ode").run(t_span=(0, t_end), n_points=n_steps + 1, timeout=60)
     bo_arr, bo_names = np.asarray(bo.species), list(bo.species_names)
 
-    rr = roadrunner.RoadRunner(xml)
-    rr.setIntegrator("cvode")
-    sn = list(rr.model.getFloatingSpeciesIds())
-    rr.timeCourseSelections = ["time"] + ["[" + s + "]" for s in sn]
-    ro_arr, ro_names = np.asarray(rr.simulate(0, t_end, n_steps + 1))[:, 1:], sn
+    ro_arr, ro_names = rr_ode(xml, t_end, n_steps)
 
     bn_map = {n: i for i, n in enumerate(bn_names)}
     rr_map = {n: i for i, n in enumerate(rr_names)}
@@ -683,6 +697,7 @@ def _partial_adjudicate(
     max_failures: int,
     min_mean_count: float,
     rep_timeout: float,
+    rr_ssa=None,
 ) -> dict:
     """Adjudicate an SSA-slow model over the largest achievable ``[0, H]`` window.
 
@@ -696,9 +711,11 @@ def _partial_adjudicate(
     used; the caller stamps it ``partial`` (a provisional / yellow verdict, not a
     full-horizon judgment — and no ODE attribution, which would not finish either).
     Raises ``SimulationTimeout`` if even ``t_end × PARTIAL_MIN_FRACTION`` blows up
-    (genuinely intractable)."""
+    (genuinely intractable). ``rr_ssa`` stands in for :func:`_rr_common.rr_ssa`
+    (a reference archive, issue #805)."""
     import bngsim
 
+    rr_ssa = rr_ssa or rc.rr_ssa
     h = float(t_end)
     floor = float(t_end) * PARTIAL_MIN_FRACTION
     vacuous_h = None  # largest finishable window that had no above-floor signal
@@ -708,10 +725,10 @@ def _partial_adjudicate(
                 xml, 0.0, h, n_steps + 1, n, seed_base, rep_timeout=rep_timeout
             )
             try:
-                rr_times, rr_arr, rr_names, rr_timing = rc.rr_ssa(
+                rr_times, rr_arr, rr_names, rr_timing = rr_ssa(
                     xml, 0.0, h, n_steps + 1, n, seed_base
                 )
-            except bngsim.SimulationTimeout:
+            except (bngsim.SimulationTimeout, ArchiveMiss):
                 raise
             except Exception as e:
                 # RoadRunner refused/failed (e.g. its gillespie cannot do rate rules)
@@ -770,6 +787,7 @@ def _extended_adjudicate(
     max_failures: int,
     min_mean_count: float,
     rep_timeout: float,
+    rr_ssa=None,
 ) -> dict | None:
     """Adjudicate a too-QUIET model over a LARGER horizon (symmetric to
     :func:`_partial_adjudicate`).
@@ -786,9 +804,12 @@ def _extended_adjudicate(
     larger horizon trips ``rep_timeout``; and a model whose extended window
     *diverges* is rejected too (the extended regime is beyond the requested
     dynamics and prone to explosive/heavy-tailed behavior where the mean-z is
-    unreliable — not a confident verdict). All of those stay a gray vacuous gap."""
+    unreliable — not a confident verdict). All of those stay a gray vacuous gap.
+    ``rr_ssa`` stands in for :func:`_rr_common.rr_ssa` (a reference archive, issue
+    #805)."""
     import bngsim  # for SimulationTimeout in the ×10-ladder loop below
 
+    rr_ssa = rr_ssa or rc.rr_ssa
     h = float(t_end)
     cap = float(t_end) * EXTENDED_MAX_MULTIPLE
     while h < cap:
@@ -797,9 +818,9 @@ def _extended_adjudicate(
             bn_times, bn_arr, bn_names, _diag, bn_timing = rc.bn_ssa_replicates(
                 xml, 0.0, h, n_steps + 1, n, seed_base, rep_timeout=rep_timeout
             )
-            rr_times, rr_arr, rr_names, rr_timing = rc.rr_ssa(
-                xml, 0.0, h, n_steps + 1, n, seed_base
-            )
+            rr_times, rr_arr, rr_names, rr_timing = rr_ssa(xml, 0.0, h, n_steps + 1, n, seed_base)
+        except ArchiveMiss:
+            raise
         except bngsim.SimulationTimeout:
             # Grown into intractable (event-count-bomb) territory — stop; the model
             # stays a vacuous gray gap (no window both quiet-enough to finish AND
@@ -1019,6 +1040,168 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
                 c[k] = tev[k]
 
 
+# ─── The reference archive (issue #805) ─────────────────────────────────────
+#
+# A live run can record, per model, every RoadRunner result the screen used: the
+# gillespie ensemble (or the error it raised) at each horizon it ran — the full
+# horizon, and the rungs of the partial- or extended-horizon ladders it walked —
+# and, when a fail was attributed, RoadRunner's ODE on the screen's grid. A later
+# run replays from that record with no RoadRunner. An entry whose inputs no longer
+# match the model (the SBML's sha256, horizon, output steps, replicate count, seed
+# base) is stale (``archive_stale``). A replay that needs a RoadRunner result the
+# recorded run never produced — bngsim now walks a ladder rung the record did not
+# reach — is ``archive_unreplayable``. Neither is compared: both are
+# REFERENCE_FAILED rows, and re-recording clears them.
+ARCHIVE_FORMAT = 1
+
+
+class ArchiveMiss(Exception):
+    """A replay needed a RoadRunner result the reference archive does not hold."""
+
+
+def _archive_file(directory, name: str) -> Path:
+    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".npz")
+
+
+def archive_identity(spec: dict, n: int, seed_base: int) -> dict:
+    return {
+        "format": ARCHIVE_FORMAT,
+        "name": spec["name"],
+        "model_sha256": hashlib.sha256(Path(spec["sbml_path"]).read_bytes()).hexdigest(),
+        "t_end": float(spec["t_end"]),
+        "n_steps": int(spec["n_steps"]),
+        "n_rep": int(n),
+        "seed_base": int(seed_base),
+    }
+
+
+def _json_bytes(obj) -> np.ndarray:
+    return np.frombuffer(json.dumps(obj).encode(), dtype=np.uint8)
+
+
+class Reference:
+    """RoadRunner's side of one model: live, live and recorded, or replayed.
+
+    ``ssa`` and ``ode`` have the signatures of :func:`_rr_common.rr_ssa` and
+    :func:`_rr_ode`. Recording rewrites the model's entry after every RoadRunner
+    call, so a worker killed mid-ladder still leaves what it ran. Replaying
+    raises :class:`ArchiveMiss` for a call the entry does not hold."""
+
+    def __init__(self, spec: dict, n: int, seed_base: int, *, replay=None, record_to=None):
+        self.spec, self.n, self.seed_base = spec, n, seed_base
+        self.replay, self.record_to = replay, record_to
+        self.runs: dict[str, dict] = {}  # repr(horizon) -> {timing, elapsed_sec | error}
+        self.ensembles: dict[str, tuple] = {}  # repr(horizon) -> (times, arr, names)
+        self.rr_ode = None
+        self.stale = ""
+        if replay:
+            self._load()
+
+    def ssa(self, xml, t_start, t_end, n_points, n, seed_base):
+        key = repr(float(t_end))
+        if self.replay:
+            if self.stale:
+                raise ArchiveMiss(self.stale)
+            run = self.runs.get(key)
+            if run is None:
+                raise ArchiveMiss(
+                    f"the replay needs RoadRunner over t=0→{float(t_end):g}, "
+                    "which the recorded run never ran"
+                )
+            if "error" in run:
+                # Raised again under its recorded class name, which is what the
+                # callers' messages carry; a timeout is bngsim's own class, which
+                # the partial-horizon ladder catches by type.
+                if run["error_type"] == "SimulationTimeout":
+                    import bngsim
+
+                    raise bngsim.SimulationTimeout(run["error"])
+                raise type(run["error_type"], (RuntimeError,), {})(run["error"])
+            times, arr, names = self.ensembles[key]
+            return times, arr, names, {**run["timing"], "replayed_from_archive": True}
+        t0 = time.perf_counter()
+        try:
+            times, arr, names, timing = rc.rr_ssa(xml, t_start, t_end, n_points, n, seed_base)
+        except Exception as exc:
+            self.runs[key] = {"error": str(exc), "error_type": type(exc).__name__}
+            self._save()
+            raise
+        self.runs[key] = {"timing": timing, "elapsed_sec": round(time.perf_counter() - t0, 3)}
+        self.ensembles[key] = (times, arr, names)
+        self._save()
+        return times, arr, names, timing
+
+    def elapsed_sec(self, t_end) -> float | None:
+        return self.runs.get(repr(float(t_end)), {}).get("elapsed_sec")
+
+    def ode(self, xml, t_end, n_steps):
+        if self.replay:
+            if self.rr_ode is None:
+                raise ArchiveMiss(
+                    "the replay needs RoadRunner's ODE to attribute a fail, and the "
+                    "recorded run had no fail to attribute"
+                )
+            return self.rr_ode
+        self.rr_ode = _rr_ode(xml, t_end, n_steps)
+        self._save()
+        return self.rr_ode
+
+    def _save(self) -> None:
+        if not self.record_to:
+            return
+        out = _archive_file(self.record_to, self.spec["name"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        meta = {**archive_identity(self.spec, self.n, self.seed_base), "runs": {}}
+        arrays = {}
+        for i, (key, run) in enumerate(self.runs.items()):
+            meta["runs"][key] = {**run, "index": i}
+            if key in self.ensembles:
+                times, arr, names = self.ensembles[key]
+                arrays[f"times_{i}"] = np.asarray(times, dtype=float)
+                arrays[f"arr_{i}"] = np.asarray(arr, dtype=float)
+                arrays[f"names_{i}"] = _json_bytes(list(names))
+        if self.rr_ode is not None:
+            arrays["ode_arr"] = np.asarray(self.rr_ode[0], dtype=float)
+            arrays["ode_names"] = _json_bytes(list(self.rr_ode[1]))
+        tmp = out.with_name(out.name + ".tmp.npz")
+        np.savez_compressed(tmp, meta=_json_bytes(meta), **arrays)
+        tmp.replace(out)
+
+    def _load(self) -> None:
+        path = _archive_file(self.replay, self.spec["name"])
+        if not path.is_file():
+            self.stale = "no entry for this model"
+            return
+        with np.load(path, allow_pickle=False) as z:
+            meta = json.loads(bytes(z["meta"]).decode())
+            want = archive_identity(self.spec, self.n, self.seed_base)
+            changed = [k for k in want if meta.get(k) != want[k]]
+            if changed:
+                self.stale = f"the model's {', '.join(changed)} changed"
+                return
+            for key, run in meta["runs"].items():
+                i = run.pop("index")
+                self.runs[key] = run
+                if f"arr_{i}" in z:
+                    self.ensembles[key] = (
+                        np.array(z[f"times_{i}"]),
+                        np.array(z[f"arr_{i}"]),
+                        json.loads(bytes(z[f"names_{i}"]).decode()),
+                    )
+            if "ode_arr" in z:
+                self.rr_ode = (np.array(z["ode_arr"]), json.loads(bytes(z["ode_names"]).decode()))
+
+
+def _not_from_archive(entry: dict, ref: Reference, miss: ArchiveMiss) -> dict:
+    """Stamp a replay that could not use the archive. Never compared."""
+    status = "archive_stale" if ref.stale else "archive_unreplayable"
+    for k in ("max_mean_z", "partial_pass", "extended_pass"):
+        entry.pop(k, None)
+    entry["status"] = status
+    entry["error"] = f"roadrunner (archive): {status}: {miss}"
+    return entry
+
+
 def _worker(
     spec: dict,
     n: int,
@@ -1040,18 +1223,25 @@ def _worker(
     # RoadRunner's LLVM/JIT init are timed cold, not charged to the first model's
     # load. Each model is its own subprocess → one warmup sample per result; the
     # matrix aggregates them. Measurement-only: it never touches the verdict.
-    warmup = rc.measure_ssa_warmup()
+    # A replay from a reference archive never imports RoadRunner (issue #805).
+    replay = spec.get("reference_archive")
+    warmup = rc.measure_ssa_warmup(include_roadrunner=not replay)
 
     # Silence RoadRunner's stderr chatter in the disposable child. The bngsim /
     # RoadRunner C extensions are imported lazily inside rc's adapters, so the
     # spawn import here stays light and confined to this killable worker.
-    rc.set_rr_quiet()
+    if not replay:
+        rc.set_rr_quiet()
 
+    ref = Reference(
+        spec, n, seed_base, replay=replay, record_to=spec.get("write_reference_archive")
+    )
     xml = spec["sbml_path"]
     t_end = float(spec["t_end"])
     n_steps = int(spec["n_steps"])
     entry = dict(spec)
-    entry.pop("sbml_path", None)
+    for k in ("sbml_path", "reference_archive", "write_reference_archive"):
+        entry.pop(k, None)
     # Accumulate per-engine timing alongside the warmup as each engine runs, so
     # every exit path (including an engine-error early return) carries whatever was
     # measured: an RR-side error still keeps bngsim's load+ensemble timing, and the
@@ -1160,6 +1350,7 @@ def _worker(
                 max_failures,
                 min_mean_count,
                 REP_WALL_CAP,
+                rr_ssa=ref.ssa,
             )
             h = part.pop("horizon")
             ptiming = part.pop("timing", {})
@@ -1168,6 +1359,8 @@ def _worker(
             entry["timing"].update(ptiming)
             entry["partial_horizon"] = round(h, 6)
             entry["status"] = "partial"
+        except ArchiveMiss as miss:
+            _not_from_archive(entry, ref, miss)
         except bngsim.SimulationTimeout:
             entry["status"] = "too_slow"
             entry["error"] = (
@@ -1194,11 +1387,14 @@ def _worker(
     entry["timing"]["bngsim"] = bn_timing
     try:
         t0 = time.perf_counter()
-        rr_times, rr_arr, rr_names, rr_timing = rc.rr_ssa(
-            xml, 0.0, t_end, n_steps + 1, n, seed_base
+        rr_times, rr_arr, rr_names, rr_timing = ref.ssa(xml, 0.0, t_end, n_steps + 1, n, seed_base)
+        entry["elapsed_sec_rr"] = (
+            ref.elapsed_sec(t_end) if replay else round(time.perf_counter() - t0, 3)
         )
-        entry["elapsed_sec_rr"] = round(time.perf_counter() - t0, 3)
         entry["timing"]["roadrunner"] = rr_timing
+    except ArchiveMiss as miss:
+        q.put(_not_from_archive(entry, ref, miss))
+        return
     except Exception as exc:
         entry["status"] = "error"
         entry["error"] = f"roadrunner: {type(exc).__name__}: {exc}"[:300]
@@ -1248,7 +1444,11 @@ def _worker(
                 max_failures,
                 min_mean_count,
                 REP_WALL_CAP,
+                rr_ssa=ref.ssa,
             )
+        except ArchiveMiss as miss:
+            q.put(_not_from_archive(entry, ref, miss))
+            return
         except Exception:
             ext = None
         if ext is not None:
@@ -1301,9 +1501,13 @@ def _worker(
                 mean_z_tol,
                 min_mean_count,
                 self_z_tol,
+                rr_ode=ref.ode,
             )
             entry["diff_attribution"] = attrib
             entry["status"] = attrib["status"]
+        except ArchiveMiss as miss:
+            # Leave the fail red rather than guess its fault.
+            entry["diff_attribution"] = {"status": "fail", "reason": f"unattributed: {miss}"}
         except Exception as exc:
             entry["diff_attribution"] = {
                 "status": "fail",
@@ -1552,7 +1756,7 @@ def _print_progress(finished: int, total: int, res: dict) -> None:
             )
             if w:
                 extra += f" worst={w.get('species')}"
-    elif st in ("error", "too_slow", "skip"):
+    elif st in ("error", "too_slow", "skip", "archive_stale", "archive_unreplayable"):
         extra = f" {res.get('error', '')[:70]}"
     print(f"  [{finished}/{total}] {tag} {res['name']} ({res['source']}){extra}", flush=True)
 
@@ -1599,9 +1803,29 @@ def main() -> int:
         default=DEFAULT_CORE_OUT,
         help="Shared _core-schema report path (default runs/ssa_report.json, gitignored).",
     )
+    p.add_argument(
+        "--write-reference-archive",
+        default="",
+        metavar="DIR",
+        help="Also record every RoadRunner result to DIR (one .npz per model, issue "
+        "#805), for a later --reference-archive run.",
+    )
+    p.add_argument(
+        "--reference-archive",
+        default="",
+        metavar="DIR",
+        help="Replay RoadRunner's side from DIR instead of running RoadRunner. A model "
+        "whose entry no longer matches it (archive_stale), or that needs a RoadRunner "
+        "result the recorded run never produced (archive_unreplayable), is not compared.",
+    )
     args = p.parse_args()
+    if args.reference_archive and args.write_reference_archive:
+        p.error("--reference-archive replays an archive; --write-reference-archive records one")
 
     specs = _build_corpus(args)
+    for s in specs:
+        s["reference_archive"] = args.reference_archive or None
+        s["write_reference_archive"] = args.write_reference_archive or None
     n_rt = sum(1 for s in specs if s["source"] == "roundtrip")
     n_bm = sum(1 for s in specs if s["source"] == "biomodels")
 
@@ -1641,7 +1865,8 @@ def main() -> int:
     too_slow_models = sorted(c["name"] for c in cases if c["status"] == "too_slow")
     error_models = sorted(c["name"] for c in cases if c["status"] == "error")
     skip_models = sorted(c["name"] for c in cases if c["status"] == "skip")
-    n_compared_models = sum(1 for c in cases if c["status"] not in ("too_slow", "error", "skip"))
+    not_compared = ("too_slow", "error", "skip", "archive_stale", "archive_unreplayable")
+    n_compared_models = sum(1 for c in cases if c["status"] not in not_compared)
     total_lowcount_skips = sum(int(c.get("n_skipped_lowcount", 0)) for c in cases)
     # DIFF attribution (GH #107 follow-up): each surviving cross-engine fail is
     # attributed against each engine's own ODE. ``diff_not_bngsim`` / ``rr_known``
@@ -1726,6 +1951,11 @@ def main() -> int:
             "mean_z_tol": args.mean_z_tol,
             "min_mean_count": args.min_mean_count,
             "biomodels_sbml_dir": str(BIOMODELS_SBML_DIR),
+            "reference_source": (
+                f"archive:{args.reference_archive}"
+                if args.reference_archive
+                else "roadrunner (live)"
+            ),
         },
         "summary": {"total": len(cases), **by_status, "elapsed_sec": round(elapsed, 2)},
         "coverage": {

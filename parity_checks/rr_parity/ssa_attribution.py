@@ -75,6 +75,11 @@ STATUS_TO_OUTCOME: dict[str, Outcome] = {
     "extended": Outcome.DIFF,
     "attribution_incomplete": Outcome.DIFF,
     "too_slow": Outcome.TIMEOUT,
+    # A replay from a reference archive (issue #805) that could not stand in for
+    # RoadRunner: the entry no longer matches the model, or the model needs an
+    # adjudication that runs RoadRunner live. Never compared; the refusal names it.
+    "archive_stale": Outcome.REFERENCE_FAILED,
+    "archive_unreplayable": Outcome.REFERENCE_FAILED,
     "error": Outcome.EXCEPTION,
     "skip": Outcome.SKIP,
 }
@@ -220,6 +225,9 @@ def _comment(case: dict, status: str) -> str:
             "'time is not treated continuously in a gillespie simulation') — RR cannot anchor "
             f"this model and is not used as the reference; {body}"
         )
+    elif status in ("archive_stale", "archive_unreplayable"):
+        why = str(case.get("error") or "").split(f"{status}: ", 1)[-1]
+        parts.append(f"not compared: the reference archive cannot stand in for RoadRunner ({why})")
     elif status == "attribution_incomplete":
         parts.append(
             "SSA ensembles diverged, but the deterministic-ODE oracle that assigns fault "
@@ -310,9 +318,11 @@ def case_to_job_result(
     ):
         subclass = "vacuous_lowcount"
     reference_refusal = None
+    if status in ("archive_stale", "archive_unreplayable"):
+        reference_refusal = status
     if status == "error":
         outcome, reference_refusal = _classify_error(str(case.get("error") or ""))
-    compared = "max_mean_z" in case
+    compared = "max_mean_z" in case and status not in ("archive_stale", "archive_unreplayable")
     return JobResult(
         model_id=case["name"],
         method=METHOD,
