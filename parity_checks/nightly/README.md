@@ -48,9 +48,16 @@ A night alerts on:
   evaluations, Jacobian evaluations, from `Result.solver_stats`) grew past x1.25
   (with an absolute floor), or a counter's corpus total grew past x1.05, or bngsim's
   total wall time grew past x2 on the same runner CPU model (x4 across models) and
-  by more than 30 s. The floor is for the stochastic legs, whose bngsim time is only
-  the model load and totals well under a second, so a fixed cost of a few
-  milliseconds per model reads there as a x50 blowup. The
+  by more than 30 s. bngsim's wall time is the sum of `BNGSIM_PHASES` in
+  `verdicts.py`: an ODE row's load, Jacobian, compile and first solve, and a
+  stochastic row's load and its base ensemble (`ensemble_sec`, plus on bng_nf each
+  replicate's `NfsimSession.initialize`; the replicates an escalation adds are not
+  timed). Before #901 the stochastic legs summed the
+  load alone, well under a second, and a fixed cost of a few milliseconds per model
+  read there as a x50 blowup; the 30 s floor is from then. A verdict file records
+  the phases it sums, and two that sum different ones are not compared on wall
+  time: against the committed baseline that alerts until the baseline is
+  re-extracted, and night to night it is only reported. The
   counters are deterministic for a given model, build and platform -- two runs on
   different runner hardware matched exactly -- so they catch the algorithmic
   slowdowns (a Jacobian falling back to finite differences, step-size control, an

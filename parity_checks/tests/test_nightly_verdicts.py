@@ -361,8 +361,10 @@ def test_extract_core_reads_outcome_work_wall_and_backend(tmp_path):
 def test_extract_counts_a_stochastic_ensemble(tmp_path):
     """Issue #901: a stochastic row's simulation is its ``ensemble_sec``, which
     the wall check did not count. bng_nf summed the session's construction
-    alone, 0.012 s beside 4004.5 s of NFsim. The per-replicate statistics are
-    views of the same time and are not summed."""
+    alone, 0.012 s beside 4004.5 s of NFsim. Each replicate's
+    ``NfsimSession.initialize`` is timed apart from its run, and recorded only
+    as a mean, so it counts ``n_rep`` times: 452 s of bng_nf's 4126 s. The other
+    per-replicate statistics are views of ``ensemble_sec`` and are not summed."""
     timing = {
         "bngsim": {
             "io_sec": 0.0,
@@ -378,25 +380,52 @@ def test_extract_counts_a_stochastic_ensemble(tmp_path):
     path = tmp_path / "report.json"
     write_report(path, [_jr("M1", "PASS", method="stochastic", timing=timing)])
     obj = V.extract("core", path, "bng_nf")
-    assert obj["cases"]["M1|stochastic"]["bngsim_sec"] == pytest.approx(1.2)
+    assert obj["cases"]["M1|stochastic"]["bngsim_sec"] == pytest.approx(0.9 + 0.3 + 3.6)
+    assert "setup_sec" in obj["bngsim_phases_seen"]
 
 
-def test_a_slower_ensemble_alerts():
-    """With the ensemble counted, a 2x slower NFsim on the same CPU clears both
-    the ratio and the absolute floor, at bng_nf's scale (about 4000 s over
-    235 cases)."""
-    base = _on(core({f"m{i}|stochastic": rec("PASS", sec=17.0) for i in range(235)}), "EPYC 9V45")
-    fresh = _on(core({f"m{i}|stochastic": rec("PASS", sec=34.5) for i in range(235)}), "EPYC 9V45")
-    r = V.diff(base, fresh)
-    assert r["alerts"]["wall"] == 1 and r["wall"]["same_cpu"]
-    same = _on(core({f"m{i}|stochastic": rec("PASS", sec=18.0) for i in range(235)}), "EPYC 9V45")
-    assert V.diff(base, same)["alerts"]["wall"] == 0
+def test_an_ssa_row_has_no_setup_phase(tmp_path):
+    """A replicate with no initialize of its own (SSA's reset and run) adds
+    nothing, and neither does a mean the runner could not take."""
+    ssa = {"bngsim": {"load_sec": 0.2, "n_rep": 10, "ensemble_sec": 5.0}}
+    nf = {"bngsim": {"load_sec": 0.2, "n_rep": 0, "setup_per_rep_sec": None}}
+    path = tmp_path / "report.json"
+    write_report(
+        path,
+        [
+            _jr("S", "PASS", method="stochastic", timing=ssa),
+            _jr("N", "PASS", method="stochastic", timing=nf),
+        ],
+    )
+    obj = V.extract("core", path, "bng_ssa")
+    assert obj["cases"]["S|stochastic"]["bngsim_sec"] == pytest.approx(5.2)
+    assert obj["cases"]["N|stochastic"]["bngsim_sec"] == pytest.approx(0.2)
+    assert "setup_sec" not in obj["bngsim_phases_seen"]
+
+
+STOCH_SEEN = {"io_sec", "load_sec", "ensemble_sec", "setup_sec"}
 
 
 def _phased(obj, seen, counted=None):
     out = dict(obj, bngsim_phases_seen=sorted(seen))
     out["bngsim_phases"] = list(counted if counted is not None else V.BNGSIM_PHASES)
     return out
+
+
+def test_a_slower_ensemble_alerts():
+    """With the ensemble counted, a 2x slower NFsim on the same CPU clears both
+    the ratio and the absolute floor, at bng_nf's scale (about 4100 s over
+    235 cases), between two files that both record the phases they sum."""
+
+    def night(sec):
+        cases = {f"m{i}|stochastic": rec("PASS", sec=sec) for i in range(235)}
+        return _phased(_on(core(cases), "EPYC 9V45"), STOCH_SEEN)
+
+    base = night(17.0)
+    r = V.diff(base, night(34.5))
+    assert r["wall"]["same_phases"] and r["wall"]["same_cpu"]
+    assert r["alerts"]["wall"] == 1 and r["n_alerts"] == 1
+    assert V.diff(base, night(18.0))["n_alerts"] == 0
 
 
 def test_a_load_phase_is_not_compared_with_an_ensemble():
@@ -409,10 +438,46 @@ def test_a_load_phase_is_not_compared_with_an_ensemble():
         _on(core({f"m{i}|stochastic": rec("PASS", sec=10.0) for i in range(50)}), "EPYC"),
         {"load_sec", "ensemble_sec"},
     )
-    r = V.diff(base, fresh)
+    r = V.diff(base, fresh, phases_may_differ=True)
     assert r["alerts"]["wall"] == 0 and r["n_alerts"] == 0
     assert r["wall"]["same_phases"] is False
-    assert "not compared" in V.render_md(r, "")
+    md = V.render_md(r, "")
+    assert "not compared" in md and "ALERT" not in md
+
+
+def test_a_baseline_that_sums_other_phases_alerts():
+    """Against the committed baseline, the same mismatch alerts: the wall check
+    would otherwise stay off, silently, until someone re-extracted it, which is
+    how #893's floor blinded these legs. Here the baseline was extracted before
+    ``setup_sec`` was counted, and tonight's NF rows time it."""
+    before_setup = [p for p in V.BNGSIM_PHASES if p != "setup_sec"]
+    base = _phased(
+        _on(core({f"m{i}|stochastic": rec("PASS", sec=17.0) for i in range(50)}), "EPYC"),
+        {"load_sec", "ensemble_sec"},
+        before_setup,
+    )
+    fresh = _phased(
+        _on(core({f"m{i}|stochastic": rec("PASS", sec=19.0) for i in range(50)}), "EPYC"),
+        STOCH_SEEN,
+    )
+    r = V.diff(base, fresh)
+    assert r["wall"]["same_phases"] is False
+    assert r["alerts"]["wall_phases"] == 1 and r["n_alerts"] == 1
+    assert "re-extract the baseline" in V.render_md(r, "")
+    assert V.diff(base, fresh, phases_may_differ=True)["n_alerts"] == 0
+
+
+def test_a_phase_added_later_is_not_read_as_legacy():
+    """A file that does not say what it summed summed the phases from before
+    #901, and only those: ``setup_sec``, counted later, is not one of them."""
+    assert set(V.LEGACY_BNGSIM_PHASES) < set(V.BNGSIM_PHASES)
+    assert not {"ensemble_sec", "setup_sec"} & set(V.LEGACY_BNGSIM_PHASES)
+    base = _on(core({f"m{i}|stochastic": rec("PASS", sec=17.0) for i in range(50)}), "EPYC")
+    fresh = _phased(
+        _on(core({f"m{i}|stochastic": rec("PASS", sec=19.0) for i in range(50)}), "EPYC"),
+        {"load_sec", "setup_sec"},
+    )
+    assert V.diff(base, fresh, phases_may_differ=True)["wall"]["same_phases"] is False
 
 
 def test_an_ode_leg_compares_across_the_change():
@@ -426,7 +491,7 @@ def test_an_ode_leg_compares_across_the_change():
     )
     r = V.diff(base, fresh)
     assert r["wall"]["same_phases"] is True
-    assert r["alerts"]["wall"] == 1
+    assert r["alerts"]["wall"] == 1 and r["alerts"]["wall_phases"] == 0
 
 
 def test_extract_records_the_phases_it_summed(tmp_path):
@@ -440,13 +505,19 @@ def test_extract_records_the_phases_it_summed(tmp_path):
 
 def test_the_stochastic_baselines_count_their_ensembles():
     """The committed bng_nf and bng_ssa baselines were extracted with the
-    ensemble counted (issue #901), so tonight's extract is compared like for
-    like and does not read about 4000 s against 0.012 s."""
-    for suite, at_least in (("bng_nf", 1000.0), ("bng_ssa", 100.0)):
+    ensemble, and on bng_nf each replicate's setup, counted (issue #901), so
+    tonight's extract is compared like for like and does not read about 4100 s
+    against 0.012 s. A baseline that sums fewer phases than tonight's extract
+    alerts every night, so they record the current BNGSIM_PHASES."""
+    for suite, at_least, seen in (
+        ("bng_nf", 1000.0, {"ensemble_sec", "setup_sec"}),
+        ("bng_ssa", 100.0, {"ensemble_sec"}),
+    ):
         obj = json.loads((BASELINES / f"{suite}.json").read_text())
         total = sum(c.get("bngsim_sec") or 0.0 for c in obj["cases"].values())
         assert total > at_least, suite
-        assert "ensemble_sec" in obj["bngsim_phases_seen"], suite
+        assert seen <= set(obj["bngsim_phases_seen"]), suite
+        assert obj["bngsim_phases"] == list(V.BNGSIM_PHASES), suite
 
 
 def test_multi_segment_backend_wins_over_the_replay_label(tmp_path):
