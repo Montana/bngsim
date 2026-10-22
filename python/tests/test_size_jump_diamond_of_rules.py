@@ -12,6 +12,10 @@ rules ``r_i := sin(r_{i-1}) + cos(r_{i-2})``, exponential in its depth:
 * **A piecewise at the bottom of one.** ``r0 := piecewise(S, S > 3, 2*S)``
   under the diamond, ``cv := 1 + 1e-6*r_{n-1}``: no rule above r0 holds the
   same value on both sides, so none could be read by name.
+* **Two relations over one,** ``piecewise(1, r21 > 1.4, 3, r21 < 1.1, 2)`` or
+  ``piecewise(1, r21 > 1.2 && S > 3, 2)``: their differences were cancelled
+  against each other, to see whether they share a root, and the And was put
+  together by its constructor, each a walk of the tree.
 
 The condition now reads its rules by name, and what the sides share is read
 through functions of their own.
@@ -22,8 +26,11 @@ keeps its amount, so [Sn] = 5·V(0)/V(t).
 
 from __future__ import annotations
 
+import time
+
 import bngsim
 import numpy as np
+import pytest
 
 _M = 'xmlns="http://www.w3.org/1998/Math/MathML"'
 
@@ -49,17 +56,34 @@ def _doc(n, shape):
         (f"r{i}", _ap("plus", _ap("sin", _ci(f"r{i - 1}")), _ap("cos", _ci(f"r{i - 2}"))))
         for i in range(2, n)
     ]
-    if shape == "condition":
+    last = _ci(f"r{n - 1}")
+    if shape in ("condition", "two", "and"):
         rules = [("r0", _ci("S")), ("r1", _ap("plus", _ci("S"), _cn(1))), *nonlinear]
-        rules.append(("cv", _pw(_cn(1), _ap("gt", _ci(f"r{n - 1}"), _cn(0.5)), _cn(2))))
+        if shape == "condition":
+            cv = _pw(_cn(1), _ap("gt", last, _cn(0.5)), _cn(2))
+        elif shape == "two":
+            two = f"<piece>{_cn(3)}{_ap('lt', last, _cn(1.1))}</piece>"
+            cv = _pw(_cn(1), _ap("gt", last, _cn(1.4)), _cn(2)).replace(
+                "<otherwise>", two + "<otherwise>"
+            )
+        else:
+            cv = _pw(
+                _cn(1), _ap("and", _ap("gt", last, _cn(1.2)), _ap("gt", _ci("S"), _cn(3))), _cn(2)
+            )
+        rules.append(("cv", cv))
     else:
         bottom = _pw(_ci("S"), _ap("gt", _ci("S"), _cn(3)), _ap("times", _cn(2), _ci("S")))
         rules = [("r0", bottom), ("r1", _ap("plus", _ci("r0"), _cn(1))), *nonlinear]
         rules.append(("cv", _ap("plus", _cn(1), _ap("times", _cn(1e-6), _ci(f"r{n - 1}")))))
+    return _sbml(rules)
+
+
+def _sbml(rules):
+    """S decays at k = 0.5 in c; Sn sits in cv, which the last rule sizes."""
     rule_xml = "".join(
         f'<assignmentRule variable="{v}"><math {_M}>{b}</math></assignmentRule>' for v, b in rules
     )
-    params = "".join(f'<parameter id="r{i}" constant="false"/>' for i in range(n))
+    params = "".join(f'<parameter id="{v}" constant="false"/>' for v, _ in rules if v != "cv")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
 <listOfCompartments><compartment id="c" size="1" constant="true"/>
@@ -89,16 +113,34 @@ def _size(t, n, shape):
     s = 10 * np.exp(-0.5 * t)
     if shape == "condition":
         return np.where(_diamond(s, s + 1, n) > 0.5, 1.0, 2.0)
+    if shape == "two":
+        r = _diamond(s, s + 1, n)
+        return np.where(r > 1.4, 1.0, np.where(r < 1.1, 3.0, 2.0))
+    if shape == "and":
+        return np.where((_diamond(s, s + 1, n) > 1.2) & (s > 3), 1.0, 2.0)
     r0 = np.where(s > 3, s, 2 * s)
     return 1 + 1e-6 * _diamond(r0, r0 + 1, n)
 
 
+def _away(v):
+    """Rows not within a step of a crossing, which would test where the root
+    lands."""
+    away = np.ones_like(v, dtype=bool)
+    away[1:] &= v[1:] == v[:-1]
+    away[:-1] &= v[:-1] == v[1:]
+    return away
+
+
 def _run(n, shape, times):
     model = bngsim.Model.from_sbml_string(_doc(n, shape))
+    return model, _sn(model, times)
+
+
+def _sn(model, times, seed=None):
     result = bngsim.Simulator(model, method="ode", jacobian="fd").run(
-        sample_times=list(times), rtol=1e-10, atol=1e-12
+        sample_times=list(times), rtol=1e-10, atol=1e-12, seed=seed
     )
-    return model, np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    return np.asarray(result.species)[:, list(result.species_names).index("Sn")]
 
 
 def test_a_condition_over_a_diamond_reads_its_rules_by_name():
@@ -107,10 +149,7 @@ def test_a_condition_over_a_diamond_reads_its_rules_by_name():
     n = 20
     times = np.linspace(0.0, 4.0, 41)
     v = _size(times, n, "condition")
-    # Rows within a step of a crossing would test where the root lands.
-    away = np.ones_like(times, dtype=bool)
-    away[1:] &= v[1:] == v[:-1]
-    away[:-1] &= v[:-1] == v[1:]
+    away = _away(v)
     model, sn = _run(n, "condition", times)
     assert model._core.event_trigger_sources() == ["(r19 > 0.5)", "(r19 <= 0.5)"]
     assert not [f for f in model.function_names if f.startswith("_szj_")]
@@ -130,3 +169,46 @@ def test_a_piecewise_under_a_diamond_reads_the_sides_through_functions():
 def test_a_short_diamond_is_written_out_as_before():
     model, _ = _run(6, "bottom", [0.0, 4.0])
     assert not [f for f in model.function_names if f.startswith("_szj_")]
+
+
+def test_a_condition_that_reads_a_piecewise_rule_is_read_as_its_relations():
+    """``r := piecewise(S, S > 3, 2*S)`` under ``cv := piecewise(A, r > 5, B)``,
+    with A and B piecewise on S > 3 too. Put together as it was, ``r > 5``
+    jumped at S = 3 itself, and its root fired there beside S > 3's: two
+    rescales at the instant, the one drawn last kept, and [Sn] at t = 2.5 was
+    25/6 for 10/3 on half the seeds. Its pair's own constructor reads it as S > 5
+    and 2*S > 5, each continuous, and S > 3's root alone fires at S = 3."""
+    r = _pw(_ci("S"), _ap("gt", _ci("S"), _cn(3)), _ap("times", _cn(2), _ci("S")))
+    a = _pw(_cn(1), _ap("gt", _ci("S"), _cn(3)), _cn(1.5))
+    b = _pw(_cn(2), _ap("gt", _ci("S"), _cn(3)), _cn(2.5))
+    rules = [("r", r), ("cv", _pw(a, _ap("gt", _ci("r"), _cn(5)), b))]
+    times = np.array([0.0, 1.0, 2.0, 2.5, 3.0, 4.0])
+    s = 10 * np.exp(-0.5 * times)
+    v = np.where(
+        np.where(s > 3, s, 2 * s) > 5, np.where(s > 3, 1.0, 1.5), np.where(s > 3, 2.0, 2.5)
+    )
+    for seed in range(8):
+        model = bngsim.Model.from_sbml_string(_sbml(rules))
+        assert not [t for t in model._core.event_trigger_sources() if "if(" in t]
+        sn = _sn(model, times, seed=seed)
+        np.testing.assert_allclose(sn, 5 * v[0] / v, rtol=1e-8, err_msg=f"seed {seed}")
+
+
+@pytest.mark.parametrize("shape", ["two", "and"])
+def test_two_relations_over_a_diamond_load_in_linear_time(shape):
+    """``piecewise(1, r21 > 1.4, 3, r21 < 1.1, 2)`` and ``piecewise(1, r21 > 1.2
+    && S > 3, 2)``. Whether two relations share a root was asked of
+    ``cancel``, and the And was put together by its constructor, which sorts
+    its arguments by their size as trees: 1.1 and 0.55 s to load at 18 rules,
+    x2.6 for every two more. Two long differences are now read at two points
+    first, and the And is put together as it is."""
+    n = 22
+    times = np.linspace(0.0, 4.0, 81)
+    v = _size(times, n, shape)
+    assert len(set(v)) > 1
+    began = time.perf_counter()
+    model = bngsim.Model.from_sbml_string(_doc(n, shape))
+    assert time.perf_counter() - began < 2.0
+    assert f"(r{n - 1} > {1.4 if shape == 'two' else 1.2})" in model._core.event_trigger_sources()
+    away = _away(v)
+    np.testing.assert_allclose(_sn(model, times)[away], (5 * v[0] / v)[away], rtol=1e-8)

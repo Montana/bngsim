@@ -8185,6 +8185,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         import re as _re
 
         import sympy as _sp
+        from sympy.functions.elementary.piecewise import ExprCondPair as _ExprCondPair
 
         from bngsim._codegen import _PY_KEYWORD_PARAM_NAMES, _alias_keyword_param
         from bngsim._jacobian import _TIME_SYM, _exprtk_to_sympy, sympy_to_exprtk
@@ -8607,32 +8608,53 @@ def _build_model_from_sbml_doc_in_context(doc):
                     if inner is None:
                         return None
                     subs[s] = inner
-            if not subs:
-                return g
-            # g.xreplace(subs), with a Piecewise and its pieces put together as
-            # they are: sympy's own constructors read the condition through
-            # (`has`), and a condition over a diamond of rules (`r21 > 0.5`) is
+            return _xreplace_once(g, subs)
+
+        def _rebuilt(e, args):
+            # e.func(*args), with a Piecewise and its pieces put together
+            # without the constructors' walk of each condition (`replace`,
+            # `has`): a condition over a diamond of rules (`r21 > 0.5`) is
             # exponentially longer as a tree than in memory (issue #1124, item
-            # 6). The pieces were a Piecewise's already, so they need no check.
-            done: dict[int, object] = {}
-
-            def go(e):
-                if id(e) not in done:
-                    if e in subs:
-                        done[id(e)] = subs[e]
-                    else:
-                        args = tuple(go(a) for a in e.args)
-                        if not any(a is not b for a, b in zip(args, e.args, strict=True)):
-                            done[id(e)] = e
-                        elif isinstance(
-                            e, (_sp.Piecewise, _sp.functions.elementary.piecewise.ExprCondPair)
-                        ):
-                            done[id(e)] = _sp.Basic.__new__(type(e), *args)
-                        else:
-                            done[id(e)] = e.func(*args)
-                return done[id(e)]
-
-            return go(g)
+            # 6). A piece whose condition is false is dropped, and one whose
+            # condition is true ends it, as the constructor has them. Except a
+            # condition that reads a piecewise: the pair's own constructor
+            # folds it into relations of their own (`r > 5` under `r :=
+            # piecewise(S, S > 3, 2*S)` into S > 5 and 2*S > 5), each
+            # continuous. Left as it was, `r > 5` jumped at S = 3 itself, and
+            # its root fired there beside S > 3's: two rescales at one instant,
+            # the one drawn last kept. And so are an And and an Or, whose
+            # constructor sorts their arguments by their size as trees
+            # (`ordered`): an argument that decides it decides it, and one
+            # that cannot is dropped, as there.
+            if isinstance(e, (_sp.And, _sp.Or)):
+                kept: dict = {}
+                for a in args:
+                    if a is e.zero:
+                        return a
+                    if a is not e.identity:
+                        kept.update(dict.fromkeys(a.args if a.func is e.func else (a,)))
+                if len(kept) < 2:
+                    return next(iter(kept), e.identity)
+                obj = _sp.Basic.__new__(e.func, *kept)
+                obj._argset = frozenset(kept)
+                return obj
+            if isinstance(e, _ExprCondPair):
+                if any(isinstance(x, _sp.Piecewise) for x in _subexpressions(args[1])):
+                    return e.func(*args)
+                return _sp.Basic.__new__(_ExprCondPair, *args)
+            if isinstance(e, _sp.Piecewise):
+                pieces = []
+                for p in args:
+                    if p.cond is _sp.false:
+                        continue
+                    pieces.append(p)
+                    if p.cond is _sp.true:
+                        break
+                if pieces and pieces[0].cond is _sp.true:
+                    return pieces[0].expr
+                if pieces:
+                    return _sp.Basic.__new__(_sp.Piecewise, *pieces)
+            return e.func(*args)
 
         def _xreplace_once(expr, rule: dict):
             # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
@@ -8647,7 +8669,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                     else:
                         args = tuple(go(a) for a in e.args)
                         changed = any(a is not b for a, b in zip(args, e.args, strict=True))
-                        done[id(e)] = e.func(*args) if changed else e
+                        done[id(e)] = _rebuilt(e, args) if changed else e
                 return done[id(e)]
 
             return go(expr)
@@ -8709,7 +8731,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             for e in order:  # each node after its arguments
                 args = tuple(built[id(a)] for a in e.args)
                 changed = any(a is not b for a, b in zip(args, e.args, strict=True))
-                new = e.func(*args) if changed else e
+                new = _rebuilt(e, args) if changed else e
                 if (
                     refs.get(id(e), 0) > 1
                     and size[id(e)] >= 16
@@ -8723,6 +8745,33 @@ def _build_model_from_sbml_doc_in_context(doc):
                     new = _sp.Symbol(name)
                 built[id(e)] = new
             return [built[id(e)] for e in exprs], helpers
+
+        def _ratio_of(d, d0):
+            # d / d0 where that is a nonzero number, else None. `cancel` walks
+            # the tree, which a relation over a diamond of rules makes
+            # exponential (issue #1124, item 6): `r17 > 0.5` beside `r17 <
+            # -0.5`, or beside `S > 3`, took a second to load at 18 rules, x2.6
+            # for every two more. So two long differences are first read at
+            # two points, to 30 digits, and only a pair whose ratio is the same
+            # at both is cancelled; one read that is not a number, or a d0
+            # near 0 there, leaves the pair to `cancel` too.
+            if _tree_size(d) + _tree_size(d0) > _JUMP_TEXT_NODES:
+                names = sorted(
+                    {e for x in (d, d0) for e in _subexpressions(x) if e.is_Symbol}, key=str
+                )
+                seen = []
+                for step in (0.6180339887, 0.4142135624):
+                    at = {
+                        s: _sp.Float(0.25 + ((k + 1) * step) % 1, 30) for k, s in enumerate(names)
+                    }
+                    a, b = _xreplace_once(d, at), _xreplace_once(d0, at)
+                    if not all(v.is_Float or v.is_Rational for v in (a, b)) or abs(b) < 1e-8:
+                        break
+                    seen.append(a / b)
+                if len(seen) == 2 and abs(seen[0] - seen[1]) > 1e-12 * max(1, abs(seen[0])):
+                    return None
+            ratio = _sp.cancel(d / d0)
+            return ratio if ratio.is_number and ratio != 0 else None
 
         # compartment -> the concentrations its size's jump conditions read
         _cond_reads: dict[str, set[str]] = {}
@@ -8772,8 +8821,8 @@ def _build_model_from_sbml_doc_in_context(doc):
             for r in sorted(relations, key=_sp.default_sort_key):
                 d = r.lhs - r.rhs
                 for d0, rels in roots:
-                    ratio = _sp.cancel(d / d0)
-                    if ratio.is_number and ratio != 0:
+                    ratio = _ratio_of(d, d0)
+                    if ratio is not None:
                         rels.append((r, ratio))
                         break
                 else:
