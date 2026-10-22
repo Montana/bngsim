@@ -1005,7 +1005,9 @@ def test_two_jumps_a_few_ulp_apart_rescale_once(t1, t2, codegen):
         np.testing.assert_allclose(sn, 5 / (1 + (times >= t1) + (times >= t2)), rtol=1e-8)
 
 
-def test_three_jumps_on_one_instant_rescale_once():
+def test_three_jumps_a_few_ulp_apart_rescale_once():
+    """Steps 0, 1 and 2 ulp past t = 2: one instant to the run, which no run
+    constant relates (three on one root are #1132's, above)."""
     size, params = _steps(("t1", 2.0), ("t2", _ulps_past(2.0)), ("t3", _ulps_past(2.0, 2)))
     times = np.array([0.0, 1.9, 2.5])
     got = _sn_at(bngsim.Model.from_sbml_string(_doc([("cv", size)], params=params)), times)
