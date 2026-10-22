@@ -10,7 +10,7 @@ By default all paths share **one** convergence criterion, matching BNG2.pl's
 `run_network -c`: the parity residual `||f(y)||_2 / n_species < tol`. This is
 the same quantity `run(steady_state=True)` checks (see below). The opt-in
 `criterion="scaled"` asks every path a test in the model's own units instead
-(see [Convergence in the model's units](#convergence-in-the-model-s-units)).
+(see [Convergence in the model's units](#convergence-in-the-models-units)).
 
 **`method="integration"` (default)**: CVODE BDF integration that marches
 forward one step at a time and stops when the parity residual
