@@ -8433,9 +8433,18 @@ class Simulator:
         .net and non-AR models, and for any rule whose source block this run did
         not produce — that row stays ``NaN``, which is the honest answer and is
         already exempt from the refusal in :meth:`_warn_about_ss_sensitivity`.
+        On every AR model it records the rule targets on the result, which is how
+        :meth:`SteadyStateResult.output_sensitivities` tells them from the species
+        the caller's ``mask=`` left out (issue #1124, item 10).
         """
         model = model or self._model
         amap = getattr(model, "_ar_report_map", None)
+        if amap:
+            # Left out of the solve by _ss_mask_excluding_ar_species, not by the
+            # caller's mask, so a refusal must not blame mask= for them.
+            result._rule_target_species = [
+                i for i in result.excluded_species if result._species_names[i] in amap
+            ]
         if not amap or result._sensitivity is None or result._sensitivity.size == 0:
             return
         sens = np.array(result._sensitivity, dtype=np.float64, copy=True)
@@ -8692,14 +8701,17 @@ class Simulator:
             # above it says so). Every other row still has to be finite.
             for i in result.excluded_species:
                 finite_rows[i] = True
-            if result.excluded_species:
+            masked = result._caller_masked_species()
+            if masked:
                 logger.warning(
                     "Steady-state dY_ss/dp: %d species were excluded from the "
                     "convergence test by mask=, so they have no steady value and "
-                    "their rows are NaN (first: %s). Any observable or expression "
-                    "sensitivity summing one of them is NaN for the same reason.",
-                    len(result.excluded_species),
-                    ", ".join(result.species_names[i] for i in list(result.excluded_species)[:3]),
+                    "their rows are NaN (first: %s). output_sensitivities refuses "
+                    "an output that reads one of them, by name; the sensitivity "
+                    "tensor and the observable and expression blocks keep their "
+                    "NaN rows.",
+                    len(masked),
+                    ", ".join(masked[:3]),
                 )
             if np.all(finite_rows):
                 return
@@ -10805,6 +10817,7 @@ class SteadyStateResult:
         "_expression_sens_missing",
         "_observable_values",
         "_expression_values",
+        "_rule_target_species",
     )
 
     def __init__(self, core) -> None:
@@ -10828,6 +10841,9 @@ class SteadyStateResult:
         # Issue #74 — what the convergence test covered, and why it failed.
         self.n_residual_species = getattr(core, "n_residual_species", len(self._species_names))
         self.excluded_species = list(getattr(core, "excluded_species", []))
+        # The assignment-rule targets among them, which the solve leaves out by
+        # itself (GH #247); Simulator._apply_ss_ar_sensitivity_map fills it in.
+        self._rule_target_species: list[int] = []
         self.unconverged_pure_sinks = list(getattr(core, "unconverged_pure_sinks", []))
         # Issue #78 — the linear-stability verdict on a Newton root, and how many
         # candidate roots were thrown out for failing it.
@@ -11106,7 +11122,74 @@ class SteadyStateResult:
         if not meta:
             return np.empty((0, n_params), dtype=np.float64)
         rows = [self._output_sensitivity_row(m) for m in meta]
+        for m, row in zip(meta, rows, strict=True):
+            self._raise_if_masked_out(m, row)
         return np.stack(rows, axis=0)
+
+    def _caller_masked_species(self) -> list[str]:
+        """The species the caller's ``mask=`` left out of the solve: the excluded
+        ones less the assignment-rule targets the solve leaves out by itself."""
+        targets = set(self._rule_target_species)
+        return [self._species_names[i] for i in self.excluded_species if i not in targets]
+
+    def _raise_if_masked_out(self, meta: dict[str, Any], row: np.ndarray) -> None:
+        """Refuse, by name, an output whose row is not finite (issue #1124, item 10).
+
+        A species ``mask=`` left out of the solve has no steady value, so neither
+        has anything that reads it, and its row is NaN by construction (issue
+        #74). Returned here, the NaN reached a fitter as a row, and the only word
+        of it was the warning at the solve. The mask is named only for an output
+        that reads a species the caller's mask left out: an assignment-rule
+        target is left out of the solve too, by the solve itself and with its
+        rule's row (GH #247), and an expression can have no finite derivative
+        for a reason of its own, such as ``log10(L)`` at L = 0. The
+        :attr:`sensitivity` tensor and the two blocks keep their NaN rows.
+        """
+        if np.all(np.isfinite(row)):
+            return
+        kind = meta["kind"]
+        values = self._expression_values if kind == "expression" else self._observable_values
+        if kind != "species" and meta["index"] < values.size:
+            value = float(values[meta["index"]])
+            if not np.isfinite(value):
+                # Every partial of a non-finite value is NaN, so the solve's
+                # record names the first row-less species whether it is read or
+                # not: the value is the reason, not the mask.
+                raise ValueError(
+                    f"output_sensitivities: {meta['selector']!r} has no steady-state "
+                    f"derivative: its value at the steady state is {value}, which is "
+                    "not finite."
+                )
+        masked = self._caller_masked_species()
+        if kind == "species":
+            named = [meta["name"]] if meta["name"] in masked else []
+        elif kind == "expression" and meta["index"] < len(self._expression_sens_missing):
+            # The first species with no row that its derivative read, as the
+            # solve recorded it (function_sens_missing_species).
+            missing = self._expression_sens_missing[meta["index"]]
+            named = [missing] if missing in masked else []
+        else:
+            # Which species an observable sums is not recorded here, so every
+            # species the mask left out is named.
+            named = masked
+        if not named:
+            raise ValueError(
+                f"output_sensitivities: {meta['selector']!r} has no finite "
+                "steady-state derivative: its row is not finite, and it reads no "
+                "species mask= left out of the solve."
+            )
+        if kind == "species":
+            reads = f"is {named[0]}, which"
+        elif len(named) == 1:
+            reads = f"reads {named[0]}, which"
+        else:
+            reads = f"reads one or more of {', '.join(named)}, which"
+        raise ValueError(
+            f"output_sensitivities: {meta['selector']!r} has no steady-state "
+            f"derivative: it {reads} mask= left out of the solve, so it has no "
+            "steady value (issue #74). Select outputs that do not read it, or keep "
+            "it in the mask."
+        )
 
     def _resolve_one_output(self, selector: str) -> dict[str, Any]:
         """Resolve one selector to its metadata dict via the shared resolver."""
