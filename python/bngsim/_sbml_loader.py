@@ -8472,6 +8472,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                 )
             }
 
+        # compartment -> the concentrations its size's jump conditions read
+        _cond_reads: dict[str, set[str]] = {}
         for comp, vdot in _comp_vdot.items():
             if vdot is None:
                 continue
@@ -8494,6 +8496,11 @@ def _build_model_from_sbml_doc_in_context(doc):
                 names = {str(s) for s in c.free_symbols}
                 if not names & _moving:
                     continue
+                _cond_reads.setdefault(comp, set()).update(
+                    _species_alias[n]
+                    for n in names
+                    if n in _species_alias and _diluted(_species_alias[n])
+                )
                 if names & _event_targets:
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where "
@@ -8575,29 +8582,35 @@ def _build_model_from_sbml_doc_in_context(doc):
                 leaf for leaf in _comp_rated[a] if _diluted(leaf) and species_comp[leaf] == b
             )
 
-        _needs = {
-            comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
-            for comp, rated in _comp_rated.items()
-            if rated
-        }
-        _state: dict[str, int] = {}  # 1 on the walk, 2 finished
-        _ring: list[str] = []
-        for start in sorted(_needs):
-            if _state.get(start) or _ring:
-                continue
-            path, walk = [start], [iter(_needs[start])]
-            _state[start] = 1
-            while walk and not _ring:
-                nxt = next(walk[-1], None)
-                if nxt is None:
-                    _state[path.pop()] = 2
-                    walk.pop()
-                elif _state.get(nxt) == 1:
-                    _ring = path[path.index(nxt) :] + [nxt]
-                elif not _state.get(nxt) and nxt in _needs:
-                    _state[nxt] = 1
-                    path.append(nxt)
-                    walk.append(iter(_needs[nxt]))
+        def _first_ring(needs: dict[str, list[str]]) -> list[str]:
+            # The first ring of compartments, each needing the next, as a path
+            # that ends where it starts; [] where there is none.
+            state: dict[str, int] = {}  # 1 on the walk, 2 finished
+            for start in sorted(needs):
+                if state.get(start):
+                    continue
+                path, walk = [start], [iter(needs[start])]
+                state[start] = 1
+                while walk:
+                    nxt = next(walk[-1], None)
+                    if nxt is None:
+                        state[path.pop()] = 2
+                        walk.pop()
+                    elif state.get(nxt) == 1:
+                        return path[path.index(nxt) :] + [nxt]
+                    elif not state.get(nxt) and nxt in needs:
+                        state[nxt] = 1
+                        path.append(nxt)
+                        walk.append(iter(needs[nxt]))
+            return []
+
+        _ring = _first_ring(
+            {
+                comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
+                for comp, rated in _comp_rated.items()
+                if rated
+            }
+        )
         if len(_ring) == 2:  # a compartment reading its own concentration
             c = _ring[0]
             _refusals.append(
@@ -8615,6 +8628,38 @@ def _build_model_from_sbml_doc_in_context(doc):
                     for a, b in zip(_ring, _ring[1:], strict=False)
                 )
                 + "), so the sizes define each other, and bngsim does not solve that"
+            )
+        # The same ring through the sizes' jump conditions alone (issue #1124,
+        # item 3). Each size's condition reads the next one's concentration,
+        # which that size's own jump moves: where a jump flips them, the sizes
+        # after it may be read more than one way (all jumped, or none), each
+        # consistent with the concentrations it leaves, and nothing in the
+        # model says which. libRoadRunner refuses the model.
+        # bngsim kept the sizes from before the instant, with no word of it.
+        # (A ring with a link through a size's value as well is ordered by
+        # that link, and runs.)
+        _cond_ring = _first_ring(
+            {
+                comp: sorted({species_comp[leaf] for leaf in read} - {comp})
+                for comp, read in _cond_reads.items()
+                if {species_comp[leaf] for leaf in read} - {comp}
+            }
+        )
+
+        def _cond_reads_in(a: str, b: str) -> list[str]:
+            return sorted(leaf for leaf in _cond_reads[a] if species_comp[leaf] == b)
+
+        if _cond_ring:
+            _refusals.append(
+                "the sizes of compartments "
+                + ", ".join(f"{c} ({_size_text(c)})" for c in _cond_ring[:-1])
+                + " each jump on a condition that reads a concentration in the next ("
+                + "; ".join(
+                    f"{a} reads {', '.join(_cond_reads_in(a, b))} in {b}"
+                    for a, b in zip(_cond_ring, _cond_ring[1:], strict=False)
+                )
+                + "), so where a jump flips those conditions the sizes after it can be read "
+                "more than one way, and bngsim does not choose"
             )
         if _refusals:
             from bngsim._exceptions import ModelError

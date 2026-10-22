@@ -658,6 +658,65 @@ def test_a_ring_through_a_condition():
         np.testing.assert_allclose(sw, _jump_to(2, 3, 1.5)(t), rtol=1e-5, atol=1e-8)
 
 
+def _on_or_after_2(read, above):
+    # piecewise(1, t < 2 || [read] > above, 5): 1 until t = 2, and on after it
+    # while [read] stays above *above*
+    return _step(
+        _cn(1), f"<apply><or/>{BEFORE_2}{_rel('gt', _ci(read), _cn(above))}</apply>", _cn(5)
+    )
+
+
+def test_a_ring_through_conditions_alone_is_refused():
+    """Issue #1124, item 3. cv jumps at t = 2 unless [Sw] > 2, and cw unless
+    [Sn] > 2. Both staying at 1 ([Sn] 5, [Sw] 3) and both going to 5 ([Sn] 1,
+    [Sw] 0.6) are consistent after t = 2. bngsim kept both at 1, with no word
+    of it; libRoadRunner refuses the pair as a recursive assignment rule."""
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [("cv", _on_or_after_2("Sw", 2)), ("cw", _on_or_after_2("Sn", 2))],
+    )
+    with pytest.raises(
+        bngsim.ModelError,
+        match=r"cv reads Sw in cw; cw reads Sn in cv\), so where a jump flips those "
+        r"conditions the sizes after it can be read more than one way",
+    ):
+        bngsim.Model.from_sbml_string(xml)
+
+
+def test_a_ring_of_three_through_conditions_is_refused():
+    xml = _sized_doc(
+        ["cu", "cv", "cw"],
+        [("Su", "cu", 8), ("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cu", _on_or_after_2("Sw", 2)),
+            ("cv", _on_or_after_2("Su", 2)),
+            ("cw", _on_or_after_2("Sn", 2)),
+        ],
+    )
+    with pytest.raises(
+        bngsim.ModelError, match=r"cu reads Sw in cw; cw reads Sn in cv; cv reads Su in cu"
+    ):
+        bngsim.Model.from_sbml_string(xml)
+
+
+def test_a_condition_read_one_way_is_no_ring():
+    """Control: cw's condition reads [Sn], and cv's reads nothing of cw. cv
+    goes to 5 at t = 2, [Sn] to 1, and cw follows: [Sw] 3 -> 0.6."""
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [("cv", _step(_cn(1), BEFORE_2, _cn(5))), ("cw", _on_or_after_2("Sn", 2))],
+    )
+    for seed in range(4):
+        result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+            t_span=(0.0, 4.0), n_points=17, seed=seed
+        )
+        t = np.asarray(result.time)
+        sw = np.asarray(result.species)[:, list(result.species_names).index("Sw")]
+        np.testing.assert_allclose(sw, _jump_to(2, 3, 0.6)(t), rtol=1e-5, atol=1e-8)
+
+
 @pytest.mark.parametrize(
     "xml, param, match",
     [
