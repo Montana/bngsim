@@ -628,7 +628,14 @@ def _compact_inlined(expr: str, func_map: dict[str, str]) -> str | None:
             stack.extend((a, False) for a in node.args if id(a) not in size)
     if size[id(top)] * 4 > _INLINE_TEXT_LIMIT:
         return None
-    return sympy_to_exprtk(top)
+    # The law keeps its own form (no derivative rewrites), and is used only where
+    # it is much shorter than the text: a law just past the limit whose terms do
+    # not collect (BIOMD0000000628, 21,041 characters written out) printed longer
+    # than that, and paid the parse and print on top for nothing.
+    printed = sympy_to_exprtk(top, rewrites=False)
+    if printed is None or 2 * len(printed) > predicted:
+        return None
+    return printed
 
 
 def _inline_functions(
@@ -2488,9 +2495,16 @@ def _folds_nonfinite(rewritten) -> bool:
     return bool(rewritten.has(sp.zoo, sp.oo, -sp.oo, sp.nan))
 
 
-def sympy_to_exprtk(expr) -> str | None:
+def sympy_to_exprtk(expr, *, rewrites: bool = True) -> str | None:
     """Emit a sympy expression as an ExprTk string, or ``None`` if it contains
-    a construct the emitter cannot represent."""
+    a construct the emitter cannot represent.
+
+    ``rewrites=False`` prints the expression as it stands, without
+    :func:`_emitter_rewrites`. Those are for a derivative about to be evaluated;
+    a rate law printed back for its consumers to parse and differentiate again
+    (:func:`_compact_inlined`) has to keep its own form, or a Hill term
+    ``S^n/(K^n + S^n)`` comes back as ``1/(K^n/S^n + 1)``, 0/0 at S = 0, and
+    its derivative there is NaN (issue #1124, item 5)."""
     try:
         import sympy as sp  # noqa: F401
     except ImportError:
@@ -2498,10 +2512,11 @@ def sympy_to_exprtk(expr) -> str | None:
     expr = _normalize_booleans(expr)
     if not _is_emittable(expr):
         return None
-    try:
-        expr = _emitter_rewrites(expr)
-    except Exception:
-        return None
+    if rewrites:
+        try:
+            expr = _emitter_rewrites(expr)
+        except Exception:
+            return None
     if _folds_nonfinite(expr):
         return None
     if not _printer_cache:
