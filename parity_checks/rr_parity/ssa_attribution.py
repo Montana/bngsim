@@ -75,6 +75,11 @@ STATUS_TO_OUTCOME: dict[str, Outcome] = {
     "extended": Outcome.DIFF,
     "attribution_incomplete": Outcome.DIFF,
     "too_slow": Outcome.TIMEOUT,
+    # A replay from a reference archive (issue #805) that could not stand in for
+    # RoadRunner: the entry no longer matches the model, or the model needs an
+    # adjudication that runs RoadRunner live. Never compared; the refusal names it.
+    "archive_stale": Outcome.REFERENCE_FAILED,
+    "archive_unreplayable": Outcome.REFERENCE_FAILED,
     "error": Outcome.EXCEPTION,
     "skip": Outcome.SKIP,
 }
@@ -220,6 +225,9 @@ def _comment(case: dict, status: str) -> str:
             "'time is not treated continuously in a gillespie simulation') — RR cannot anchor "
             f"this model and is not used as the reference; {body}"
         )
+    elif status in ("archive_stale", "archive_unreplayable"):
+        why = str(case.get("error") or "").split(f"{status}: ", 1)[-1]
+        parts.append(f"not compared: the reference archive cannot stand in for RoadRunner ({why})")
     elif status == "attribution_incomplete":
         parts.append(
             "SSA ensembles diverged, but the deterministic-ODE oracle that assigns fault "
@@ -310,9 +318,11 @@ def case_to_job_result(
     ):
         subclass = "vacuous_lowcount"
     reference_refusal = None
+    if status in ("archive_stale", "archive_unreplayable"):
+        reference_refusal = status
     if status == "error":
         outcome, reference_refusal = _classify_error(str(case.get("error") or ""))
-    compared = "max_mean_z" in case
+    compared = "max_mean_z" in case and status not in ("archive_stale", "archive_unreplayable")
     return JobResult(
         model_id=case["name"],
         method=METHOD,
@@ -324,7 +334,7 @@ def case_to_job_result(
         exception=str(case.get("error") or ""),
         wall_sec=_wall_sec(case),
         timestamp=timestamp,
-        versions=dict(versions or {}),
+        versions=_row_versions(case, versions),
         comment=_comment(case, status),
         reference_refusal=reference_refusal,
         subclass=subclass,
@@ -335,6 +345,16 @@ def case_to_job_result(
         # instead of a cold/warm-reuse split) — the renderer keys off the shape.
         timing=case.get("timing"),
     )
+
+
+def _row_versions(case: dict, versions: dict | None) -> dict:
+    """The run's versions, with RoadRunner's taken from the reference archive on a
+    replayed row: the RoadRunner that ran here (if any) made none of its results."""
+    out = dict(versions or {})
+    rr = (case.get("timing") or {}).get("roadrunner") or {}
+    if rr.get("replayed_from_archive"):
+        out["roadrunner"] = rr.get("reference_version")
+    return out
 
 
 def _versions_of(machine: dict) -> dict:
