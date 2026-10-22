@@ -289,7 +289,7 @@ The archive is one `.npz` per job. It holds:
   - the inputs, before the network is read: the BNGL file's and any injected action block's sha256, and the tolerances forced on both engines;
   - the spec derived from them: interval, steps, tolerances, and single- or multi-segment mode.
 
-An entry matching neither is never compared. The row is REFERENCE_FAILED, `archive_stale`. On six fast models, one of them carry-over, a replay with no BNG2.pl or run_network reachable gave the live run's outcome, value and comment on every job.
+An entry matching neither is never compared. The row is REFERENCE_FAILED, `archive_stale`; an entry that cannot be read is `archive_unreadable`, the same row. Beside the identity an entry records the reference engine's version and the harness's git revision at recording; a replayed row reports the archived version in `versions.bng`. `ARCHIVE_FORMAT` must be bumped when the harness's own network rules change (the state prefix, the netgen caps, an injected `generate_network`), because the archived `.net` was made under the recording run's rules. On six fast models, one of them carry-over, a replay with no BNG2.pl or run_network reachable gave the live run's outcome, value and comment on every job.
 
 ## Stochastic timing + parity matrix (`bng_stoch_run.py` → `generate_bng_matrix.py`)
 

@@ -359,7 +359,14 @@ def _compare_ode_multiseg(bn, rn, *, atol=None) -> tuple[str, float, str, str, f
 # file's and any injected action block's sha256, the forced tolerances), and the
 # spec derived from them after (interval, steps, tolerances, segment mode). An
 # entry that matches neither the job nor its spec is stale and never compared:
-# the row is REFERENCE_FAILED, ``archive_stale``.
+# the row is REFERENCE_FAILED, ``archive_stale``; one that cannot be read at all
+# is ``archive_unreadable``, the same row, rather than a worker death blamed on
+# bngsim. Beside the identity, an entry records the reference engine's version
+# (``reference_version``, #805's item 1) and the harness's git revision when it
+# was recorded; a replayed row reports the archived version as the reference's.
+# ARCHIVE_FORMAT is bumped where the harness's own network rules change (the
+# state prefix, the netgen caps, an injected generate_network), since the
+# archived ``.net`` was made under the rules of the recording run.
 ARCHIVE_FORMAT = 1
 
 
@@ -486,7 +493,16 @@ def _worker(spec: dict, q) -> None:
     archived, archived_rn = (None, None)
     record: dict = {}
     if replay:
-        archived, archived_rn = archive_load(replay, spec)
+        try:
+            archived, archived_rn = archive_load(replay, spec)
+        except Exception as exc:  # a corrupt or foreign file: the archive's fault
+            res["status"] = "reference_failed"
+            res["exception"] = (
+                f"run_network (archive): archive_unreadable: {type(exc).__name__}: {exc}"[:400]
+            )
+            res["comment"] = "The archived reference could not be read; re-record it."
+            q.put(res)
+            return
         want = archive_input_identity(spec, bngl_text)
         stale = ["entry"] if archived is None else _stale_fields(archived, want)
         if stale:
@@ -504,6 +520,8 @@ def _worker(spec: dict, q) -> None:
             return
     elif record_to:
         record = archive_input_identity(spec, bngl_text)
+        record["reference_version"] = versions.bng_version(spec.get("bng2_pl"))
+        record["harness_git_rev"] = git_rev(str(HERE))
 
     # GH #177/#179: the pre-representative setParameter/setConcentration state. A
     # dirty_carryover model (representative inherits a prior simulate's end state) is
@@ -731,8 +749,15 @@ def _worker(spec: dict, q) -> None:
         if record_to:
             record.update(spec=spec_id, exception=rn_exc, timing=rn_timing)
             archive_save(record_to, spec, record, rn)
-        if replay and rn_timing is not None:
-            rn_timing = {**rn_timing, "replayed_from_archive": True}
+        if replay:
+            res["reference_version"] = archived.get("reference_version")
+            if rn_timing is not None:
+                rn_timing = {
+                    **rn_timing,
+                    "replayed_from_archive": True,
+                    "reference_version": archived.get("reference_version"),
+                    "recorded_by_harness": archived.get("harness_git_rev"),
+                }
 
         res["wall_sec"] = round(netgen_sec + bn_wall + rn_wall, 3)
         if rn is not None:
@@ -1066,7 +1091,12 @@ def main() -> int:
                 exception=r.get("exception", ""),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "bng": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 subclass=r.get("subclass"),
                 timing=timing,

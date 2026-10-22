@@ -168,3 +168,152 @@ def test_a_replay_without_bng_reproduces_the_live_verdicts(tmp_path):
     stale = _run(tmp_path, models, "--reference-archive", str(arch), "--rtol", "1e-7", env=env)
     assert {r["outcome"] for r in stale.values()} == {"REFERENCE_FAILED"}
     assert all("archive_stale: the job's rtol changed" in r["exception"] for r in stale.values())
+
+
+# ─── The worker's replay, with the tools faked (runs where BNG2.pl is absent) ──
+#
+# A one-species network, A -> 0 at k1 = 1 from 10, so the truth is 10·e^(−t).
+# The recording run has `generate_network` faked to write that ``.net`` and
+# `run_network_ode` faked to bngsim's own run of it; the replay has both faked
+# to raise, so a replay that reaches either fails loudly.
+
+_NET = (
+    "# Created by BioNetGen 2.9.3\nbegin parameters\n    1 k1    1  # Constant\n"
+    "end parameters\nbegin species\n    1 A() 10\nend species\n"
+    "begin reactions\n    1 1 0 k1 #R_decay\nend reactions\n"
+    "begin groups\n    1 A_tot 1\nend groups\n"
+)
+_BNGL = 'simulate({method=>"ode",t_end=>10,n_steps=>50,rtol=>1e-8,atol=>1e-8})\n'
+
+
+class _Queue:
+    def __init__(self):
+        self.rows = []
+
+    def put(self, row):
+        self.rows.append(row)
+
+
+def _spec(tmp_path, **changes):
+    bngl = tmp_path / "m.bngl"
+    if not bngl.exists():
+        bngl.write_text(_BNGL)
+    return {
+        "key": "fast/x/m.bngl:ode",
+        "model_id": "fast/x/m.bngl",
+        "method": "ode",
+        "metric": "max_rel_err",
+        "tol": 1e-4,
+        "bngl": str(bngl),
+        "rtol": 1e-8,
+        "atol": 1e-8,
+        "cap": 120.0,
+        "sub_timeout": 120.0,
+        "settings": None,
+        "bng2_pl": None,
+        "run_network_bin": None,
+        "inject": None,
+        "codegen": False,
+        **changes,
+    }
+
+
+def _worker_row(spec):
+    q = _Queue()
+    B._worker(spec, q)
+    return q.rows[0]
+
+
+def _record(tmp_path, monkeypatch, scale=1.0, failure=None):
+    """A live run with the tools faked; returns the archive directory."""
+    arch = tmp_path / "arch"
+
+    def generate_network(
+        bngl_text, bng2_pl, workdir, timeout=None, gen_network=None, state_prefix=""
+    ):
+        out = Path(workdir) / "model.net"
+        out.write_text(_NET)
+        return out, 0.01, ""
+
+    def run_network_ode(net_path, run_network_bin, t_start, t_end, n_steps, rtol, atol, **kw):
+        if failure is not None:
+            raise RuntimeError(failure)
+        t, v, n, timing = B.bc.bn_ode_net(net_path, t_start, t_end, int(n_steps) + 1, rtol, atol)
+        return t, v * scale, n, {**timing, "engine": "faked run_network"}
+
+    monkeypatch.setattr(B.bc, "generate_network", generate_network)
+    monkeypatch.setattr(B.bc, "run_network_ode", run_network_ode)
+    monkeypatch.setattr(B.versions, "bng_version", lambda bng2_pl=None: "2.9.3-test")
+    live = _worker_row(_spec(tmp_path, write_reference_archive=str(arch)))
+    return arch, live
+
+
+def _block_tools(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a BNG tool was called during a replay")
+
+    monkeypatch.setattr(B.bc, "generate_network", boom)
+    monkeypatch.setattr(B.bc, "run_network_ode", boom)
+    monkeypatch.setattr(B.bc, "native_protocol_oracle", boom)
+
+
+def test_a_replay_reproduces_the_live_verdict_without_the_tools(tmp_path, monkeypatch):
+    arch, live = _record(tmp_path, monkeypatch)
+    assert live["status"] == "pass"
+    _block_tools(monkeypatch)
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch)))
+    assert (row["status"], row["value"], row["comment"]) == (
+        live["status"],
+        live["value"],
+        live["comment"],
+    )
+    rn = row["timing"]["run_network"]
+    assert rn["replayed_from_archive"] is True
+    assert rn["reference_version"] == "2.9.3-test"
+    assert row["reference_version"] == "2.9.3-test"
+    assert row["timing"]["spec"]["mode"] == "single_segment"
+
+
+def test_a_replay_can_still_fail(tmp_path, monkeypatch):
+    """A reference 10 % high is a diff on replay as it would be live."""
+    arch, live = _record(tmp_path, monkeypatch, scale=1.1)
+    assert live["status"] == "diff"
+    _block_tools(monkeypatch)
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch)))
+    assert row["status"] == "diff" and row["value"] == pytest.approx(live["value"])
+
+
+def test_a_recorded_reference_failure_replays_as_one(tmp_path, monkeypatch):
+    arch, live = _record(tmp_path, monkeypatch, failure="run_network: ABORT")
+    assert live["status"] == "reference_failed"
+    _block_tools(monkeypatch)
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch)))
+    assert row["status"] == "reference_failed"
+    assert "run_network: ABORT" in row["exception"]
+
+
+def test_a_stale_or_missing_entry_is_never_compared(tmp_path, monkeypatch):
+    arch, _live = _record(tmp_path, monkeypatch)
+    _block_tools(monkeypatch)
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch), rtol=1e-7))
+    assert row["status"] == "reference_failed"
+    assert "archive_stale: the job's rtol changed" in row["exception"]
+    (tmp_path / "m.bngl").write_text(_BNGL + "# edited\n")
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch)))
+    assert "archive_stale: the job's bngl_sha256 changed" in row["exception"]
+    row = _worker_row(
+        _spec(tmp_path, reference_archive=str(arch), key="other:ode", model_id="other")
+    )
+    assert "archive_stale: no entry for this job" in row["exception"]
+
+
+def test_an_unreadable_entry_is_the_archive_s_fault(tmp_path, monkeypatch):
+    """A corrupt file used to raise out of the worker, which died, and the row
+    was EXCEPTION, blamed on bngsim. It is REFERENCE_FAILED, archive_unreadable."""
+    arch, _live = _record(tmp_path, monkeypatch)
+    _block_tools(monkeypatch)
+    B._archive_file(arch, "fast/x/m.bngl:ode").write_bytes(b"not an npz")
+    row = _worker_row(_spec(tmp_path, reference_archive=str(arch)))
+    assert row["status"] == "reference_failed"
+    assert "archive_unreadable" in row["exception"]
+    assert "value" in row and row["value"] is None
