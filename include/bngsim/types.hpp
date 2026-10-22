@@ -1165,12 +1165,15 @@ struct SteadyStateOptions {
     // the state to the root, -J^-1·f(y) on the system with the conserved
     // totals taken out, is within rtol·|y_i| + atol_i of every species, with
     // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
-    // initial concentration the test covers. No unit of concentration or of
-    // time is in it. Above 512 unknowns the step is not taken and the
-    // residual test applies.
+    // initial concentration the test covers (where every species starts at
+    // 0, the largest species of the state or of the root it steps to). No
+    // unit of concentration or of time is in it. Above 512 unknowns the step
+    // is not taken and the solve is the residual one, `tol` and all.
     std::string criterion = "residual";
-    // Set by find_steady_state from the initial state, for "scaled".
+    // Set by find_steady_state from the initial state, for "scaled": the
+    // floor (0 where nothing starts above 0), and whether the step is taken.
     double criterion_floor = 1.0;
+    bool criterion_by_distance = false;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
     double atol = 1e-8;    // CVODE absolute tolerance
@@ -1291,9 +1294,10 @@ struct SteadyStateResult {
     double residual = 0.0; // max|f(y)| at convergence
     // Issue #1001: the largest |δ_i| over rtol·|y_i| + atol_i at the returned
     // state, δ the Newton step to the root (SteadyStateOptions::criterion).
-    // At most 1 is within tolerance of a steady state. Measured whatever the
-    // criterion, for a system of up to 512 unknowns; NaN above that, and +inf
-    // where the reduced Jacobian is singular there.
+    // At most 1 is within tolerance of a steady state. Measured under
+    // "scaled" only, for a system of up to 512 unknowns; NaN under "residual"
+    // and above that, and +inf where the reduced Jacobian is singular at a
+    // state that is not a root.
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
     std::string criterion;   // the criterion `converged` was decided by
     std::string method_used; // "integration" or "newton"

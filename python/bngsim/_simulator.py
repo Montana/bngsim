@@ -7290,7 +7290,8 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
-            Read under ``criterion="residual"`` only.
+            Under ``criterion="scaled"`` it is read only above 512 unknowns,
+            where that criterion falls back to it.
         criterion : str
             What ``converged`` asks of a state (issue #1001).
 
@@ -7302,10 +7303,13 @@ class Simulator:
               the root is within every species' own tolerance,
               ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
               rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration). Units do
-              not change the answer. Above 512 unknowns the step is not taken
-              and the residual test applies. Where neither ``atol`` nor
-              :meth:`set_tolerances` gives one, the march takes
+              floor is the smallest positive initial concentration; where
+              every species starts at 0, the largest species of the state or
+              of the root it steps to). Units do not change the answer. A
+              state where the reduced Jacobian is singular is not accepted
+              unless ``f`` is 0 there. Above 512 unknowns the step is not
+              taken and the solve is the residual one. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, the march takes
               ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
               small units.
 
@@ -9291,15 +9295,17 @@ class Simulator:
 
     # ─── Solver configuration (ODE) ────────────────────────────────
 
-    def set_tolerances(self, rtol: float = 1e-8, atol: AtolLike = 1e-8) -> None:
+    def set_tolerances(self, rtol: float = 1e-8, atol: AtolLike | None = None) -> None:
         """Set ODE solver tolerances for every subsequent call.
 
         Parameters
         ----------
         rtol : float
             Relative tolerance.
-        atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol
-            Absolute tolerance. A float is the scalar tolerance
+        atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol, optional
+            Absolute tolerance; omitted, the scalar ``1e-8``, and a
+            ``steady_state(criterion="scaled")`` march then takes its own (see
+            :meth:`steady_state`). A float is the scalar tolerance
             (``CVodeSStolerances``). A sequence of ``n_species`` values,
             ordered like :attr:`Model.species_names`, is a per-species
             tolerance (``CVodeSVtolerances``, issue #196); ``"auto"`` derives
@@ -9322,7 +9328,13 @@ class Simulator:
             a tracking ceiling).
         """
         self._rtol = rtol
-        self._atol_set = True
+        # Issue #1001: an atol this call was given, and not the default it
+        # falls back to. set_tolerances(rtol=...) alone took the scaled
+        # criterion's march off atol="auto" and onto 1e-8, which runs a species
+        # of 1e-9 through zero (x = -21.8 for 1).
+        self._atol_set = atol is not None
+        if atol is None:
+            atol = 1e-8
         if isinstance(atol, str) and atol == _ATOL_TRACKING:
             atol = TrackingAtol()
         if isinstance(atol, TrackingAtol):
@@ -9837,7 +9849,7 @@ class SteadyStateResult:
         species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
         is within it (issue #1001). NaN under ``criterion="residual"``, which
         does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular there.
+        Jacobian is singular at a state that is not a root.
     criterion : str
         The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``.
     method_used : str
