@@ -706,6 +706,7 @@ class Simulator:
         # `_atol_vec`: the tracking spec carries its own (already resolved)
         # ceiling, so keeping both would leave two answers to "which vector".
         "_atol_track",
+        "_atol_set",
         "_max_steps",
         "_stop_conditions",
         # Interactive simulation state
@@ -1079,6 +1080,9 @@ class Simulator:
         self._atol = 1e-8
         self._atol_vec: list[float] | None = None
         self._atol_track: TrackingAtol | None = None
+        # Whether set_tolerances gave an atol: where it did not, the "scaled"
+        # steady-state criterion marches at atol="auto" (issue #1001).
+        self._atol_set = False
         self._max_steps = 10000
         self._jacobian = jacobian
         self._ode_jacobian_fell_back = False
@@ -4366,6 +4370,19 @@ class Simulator:
             )
         return vec
 
+    def _steady_state_atol(self, atol: AtolLike | None, criterion: str) -> AtolLike | None:
+        """The march's ``atol`` for a steady-state solve (issue #1001).
+
+        Under ``criterion="scaled"`` a state is accepted within each species'
+        own tolerance, the one ``atol="auto"`` derives; a march at the scalar
+        default of 1e-8 cannot reach that for a model in small units (it runs
+        through zero first), so where neither the call nor
+        :meth:`set_tolerances` gave an ``atol`` the march takes ``"auto"``.
+        """
+        if atol is None and criterion == "scaled" and not self._atol_set:
+            return "auto"
+        return atol
+
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
         """Resolve one call's ``atol`` into scalar / per-species / tracking depth.
 
@@ -7292,6 +7309,7 @@ class Simulator:
         max_steps=None,
         sensitivity_params=None,
         mask=None,
+        criterion: str = "residual",
     ):
         """Find the steady state of the ODE system f(y) = 0.
 
@@ -7347,6 +7365,31 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
+            Under ``criterion="scaled"`` it is read only above 512 unknowns,
+            where that criterion falls back to it.
+        criterion : str
+            What ``converged`` asks of a state (issue #1001).
+
+            - ``"residual"`` (default): ``||f(y)||_2 / n_species < tol``, the
+              BNG2.pl parity test. The norm is in the model's units of
+              concentration per unit time, so a model in molar units, or a
+              slow one, passes it far from its steady state.
+            - ``"scaled"``: the Newton step ``δ = −J⁻¹f`` from the state to
+              the root is within every species' own tolerance,
+              ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
+              rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
+              floor is the smallest positive initial concentration; where
+              every species starts at 0, the largest species of the state or
+              of the root it steps to). Units do not change the answer. A
+              state where the reduced Jacobian is singular is not accepted
+              unless ``f`` is 0 there. Above 512 unknowns the step is not
+              taken and the solve is the residual one. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, the march takes
+              ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
+              small units.
+
+            Under ``"scaled"`` the step is reported as
+            :attr:`SteadyStateResult.newton_distance`.
         max_time : float
             Max integration time for the integration path. Default 1e6.
         method : str
@@ -7496,11 +7539,14 @@ class Simulator:
 
         opts = SteadyStateOptions()
         opts.tol = tol
+        opts.criterion = criterion
         opts.max_time = max_time
         opts.method = method
         opts.rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — scalar, per-species, or tracking for the march.
-        self._resolve_atol(atol, opts.rtol, where="steady_state(atol=...)").apply_to(opts)
+        self._resolve_atol(
+            self._steady_state_atol(atol, criterion), opts.rtol, where="steady_state(atol=...)"
+        ).apply_to(opts)
         opts.max_steps = max_steps if max_steps is not None else self._max_steps
         # A previous solve on this Simulator already proved the closed-form
         # Jacobian makes CVODE give up on this model, and paid a doomed march to
@@ -8690,6 +8736,7 @@ class Simulator:
         n_workers=None,
         mask=None,
         newton_burst: bool = True,
+        criterion: str = "residual",
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8719,6 +8766,9 @@ class Simulator:
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
+        criterion : str
+            ``"residual"`` (default) or ``"scaled"``, as in
+            :meth:`steady_state` (issue #1001).
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
             may be a per-species vector or ``"auto"`` (issue #196), resolved
@@ -8787,7 +8837,11 @@ class Simulator:
         eff_rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — resolved once, applied to every entry (see
         # run_batch).
-        eff_atol_spec = self._resolve_atol(atol, eff_rtol, where="steady_state_batch(atol=...)")
+        eff_atol_spec = self._resolve_atol(
+            self._steady_state_atol(atol, criterion),
+            eff_rtol,
+            where="steady_state_batch(atol=...)",
+        )
         eff_max_steps = max_steps if max_steps is not None else self._max_steps
 
         # The laws are found here, once, and each entry's clone starts from
@@ -8807,6 +8861,7 @@ class Simulator:
             )
             opts = SteadyStateOptions()
             opts.tol = tol
+            opts.criterion = criterion
             opts.max_time = max_time
             opts.method = method
             opts.newton_burst = newton_burst
@@ -9573,15 +9628,17 @@ class Simulator:
 
     # ─── Solver configuration (ODE) ────────────────────────────────
 
-    def set_tolerances(self, rtol: float = 1e-8, atol: AtolLike = 1e-8) -> None:
+    def set_tolerances(self, rtol: float = 1e-8, atol: AtolLike | None = None) -> None:
         """Set ODE solver tolerances for every subsequent call.
 
         Parameters
         ----------
         rtol : float
             Relative tolerance.
-        atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol
-            Absolute tolerance. A float is the scalar tolerance
+        atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol, optional
+            Absolute tolerance; omitted, the scalar ``1e-8``, and a
+            ``steady_state(criterion="scaled")`` march then takes its own (see
+            :meth:`steady_state`). A float is the scalar tolerance
             (``CVodeSStolerances``). A sequence of ``n_species`` values,
             ordered like :attr:`Model.species_names`, is a per-species
             tolerance (``CVodeSVtolerances``, issue #196); ``"auto"`` derives
@@ -9604,6 +9661,13 @@ class Simulator:
             a tracking ceiling).
         """
         self._rtol = rtol
+        # Issue #1001: an atol this call was given, and not the default it
+        # falls back to. set_tolerances(rtol=...) alone took the scaled
+        # criterion's march off atol="auto" and onto 1e-8, which runs a species
+        # of 1e-9 through zero (x = -21.8 for 1).
+        self._atol_set = atol is not None
+        if atol is None:
+            atol = 1e-8
         if isinstance(atol, str) and atol == _ATOL_TRACKING:
             atol = TrackingAtol()
         if isinstance(atol, TrackingAtol):
@@ -10388,6 +10452,14 @@ class SteadyStateResult:
         Species names.
     residual : float
         ``max|f(y)|`` at convergence.
+    newton_distance : float
+        The Newton step from the state returned to the root, in each
+        species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
+        is within it (issue #1001). NaN under ``criterion="residual"``, which
+        does not take the step, and above 512 unknowns; ``inf`` where the
+        Jacobian is singular at a state that is not a root.
+    criterion : str
+        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool
@@ -10669,6 +10741,8 @@ class SteadyStateResult:
         "_species_names",
         "_name_to_idx",
         "residual",
+        "newton_distance",
+        "criterion",
         "method_used",
         "converged",
         "n_steps",
@@ -10740,6 +10814,11 @@ class SteadyStateResult:
         self._species_names = list(core.species_names)
         self._name_to_idx = {n: i for i, n in enumerate(self._species_names)}
         self.residual = core.residual
+        # Issue #1001 — the Newton step from the state returned to the root, in
+        # each species' tolerance (at most 1 is within it; NaN where it was not
+        # taken, as under "residual"), and the test `converged` was decided by.
+        self.newton_distance = getattr(core, "newton_distance", float("nan"))
+        self.criterion = getattr(core, "criterion", "residual")
         self.method_used = core.method_used
         self.converged = core.converged
         self.n_steps = core.n_steps
