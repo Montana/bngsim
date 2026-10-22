@@ -204,6 +204,72 @@ def test_a_grain_inside_two_decades_of_the_own_step_is_returned(tmp_path):
     assert sens[1, 0] == pytest.approx(1 / (0.21 * 0.5), rel=1e-6)
 
 
+ALL_GRAIN = """begin parameters
+    1 s   {s!r}
+    2 k1  {k1!r}
+    3 k2  {k2!r}
+    4 kd  {kd!r}
+    5 sg  {big!r}
+    6 dg  1.0
+    7 C   2.0
+    8 K   {k!r}
+end parameters
+begin functions
+    1 grain() C*((K+Xo)-K)
+end functions
+begin species
+    1 X() 0
+    2 D() 0
+    3 E() 0
+    4 G() {big!r}
+end species
+begin reactions
+    1 0 1 s
+    2 1 0 k1
+    3 1,1 2 k2
+    4 2 0 kd
+    5 0 3 grain
+    6 3 0 kd
+    7 0 4 sg
+    8 4 0 dg
+end reactions
+begin groups
+    1 Xo 1
+end groups
+"""
+
+
+@pytest.mark.parametrize("big, k", [(1e8, 1e8), (1e10, 1e10), (1e8, 1e10)])
+def test_a_row_the_own_step_sees_nothing_of_does_not_hide_a_column_it_decides(tmp_path, big, k):
+    """The issue's model with one reaction added, E made at ``C·((K + X) − K)``
+    with K at 1e8 or more: the grain of K + X is wider than 64 of X's own
+    steps, so that row reads 0 at the own step and C at the floored one.
+    Taken whole or not at all, X's column was not taken, nothing was
+    compared, and dX*/ds came back 0.202 (44% off) and 0.00454 (99% off)
+    with no error, the very columns the check exists to refuse. A column is
+    taken where any entry of it is; the second matrix is only compared
+    with, never returned, so a mixed column can only refuse."""
+    path = tmp_path / "grain_row.net"
+    path.write_text(ALL_GRAIN.format(s=S, k1=K1, k2=K2, kd=KD, big=float(big), k=float(k)))
+    model = bngsim.Model.from_net(path)
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        _steady(model, jacobian="fd")
+    # The entry furthest apart is E's: 0.81 at the floored step against the
+    # closed form 2·dX*/ds/kd = 1.4475 at X's own step.
+    assert "with X() stepped by 1.5e-8 of itself" in str(err.value)
+    assert "1.44752" in str(err.value)
+
+
+def test_a_grain_row_beside_a_column_both_steps_agree_on_is_returned(tmp_path):
+    """Control. With K = 1 there is no grain, and at G = 30 no column is
+    taken again: the floored answer is returned."""
+    path = tmp_path / "grain_row.net"
+    path.write_text(ALL_GRAIN.format(s=S, k1=K1, k2=K2, kd=KD, big=30.0, k=1.0))
+    out = _steady(bngsim.Model.from_net(path), jacobian="fd")
+    assert out.sens_fd_disagree_species is None
+    assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-4)
+
+
 # ─── A function's sensitivity ────────────────────────────────────────────────
 
 
@@ -214,6 +280,26 @@ def test_a_function_the_step_decides_is_refused_at_the_default_settings(tmp_path
     came back 85% off at the default settings."""
     with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
         _steady(_model(tmp_path, 1e8, functions=("xsq",)))
+    assert "dxsq/ds" in str(err.value)
+
+
+@pytest.mark.parametrize("functions", [("xsq", "big"), ("big", "xsq")])
+def test_a_compiled_function_does_not_hide_a_declined_one_the_step_decides(tmp_path, functions):
+    """``big = 1e8 + X`` has a compiled derivative and ``xsq = abs(X)·X`` has
+    not. The own step moves ``1e8 + X`` by its last bit or not at all, so
+    that row is not taken; taken whole or not at all, X's column was not,
+    and d(xsq)/ds came back 1.17 for 0.633 (85% off) with no error beside
+    G = 1e8, where alone it is refused. Each function's state-chain term is
+    its own sum, and a row another function vetoes is no reason to skip it."""
+    text = NET.format(s=S, k1=K1, k2=K2, kd=KD, big=1e8)
+    lines = {"xsq": "    1 xsq() abs(Xo)*Xo\n", "big": "    2 big() 1e8+Xo\n"}
+    block = "".join(lines[name] for name in functions)
+    text = text.replace("    1 xsq() abs(Xo)*Xo\n    2 weak() 1e-3*Xo\n", block)
+    path = tmp_path / "mixed.net"
+    path.write_text(text)
+    model = bngsim.Model.from_net(path)
+    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
+        _steady(model)
     assert "dxsq/ds" in str(err.value)
 
 

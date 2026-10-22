@@ -117,13 +117,20 @@ inline double state_probe_scale(const double *y, int ns, const std::vector<int> 
 //   count of the row's own last bits;
 // - it is further from the first quotient than twice what it is known to.
 //
-// And a column is taken whole or not at all: where an entry of it is not taken
-// and its two quotients are more than kFdRefineRtol apart, the column stays the
-// first. A column of secants at one step keeps what the right-hand side keeps
-// (rows that add up to nothing add up to nothing in it); a column with one
-// entry at the own step and the same term's other entry at the floored one
-// does not, and a solve with the matrix answers for the difference
-// (MODEL1911130007 went from 0.4% of a column's largest off to 43%).
+// A column is taken where any entry of it is. The second matrix is never
+// returned, only compared with: a column with one entry at the own step and
+// the same term's other entry at the floored one is not a column of secants
+// at one step (rows that add up to nothing in the right-hand side need not in
+// it, and MODEL1911130007's solve with such a matrix was 43% off), so a solve
+// with it can disagree where the floored one is right, which refuses. It
+// cannot agree the floored answer into being returned where that is wrong,
+// which is what taking a column whole or not at all did: a row the own step
+// sees nothing of, `C·((K + X) − K)` with the grain of K + X wider than
+// kFdRefineRatio own steps, vetoed the column, and the curvature in another
+// row of it, `k·X²`, came back 44% off with no error, on the issue's own
+// model with that one reaction added; and a function the compiled evaluator
+// answered, `1e8 + X`, vetoed the column for one it declined beside it,
+// `abs(X)·X`, 85% off with no error.
 //
 // A row's rounding is taken as eps of its value and of each entry times its
 // species, a small species' entry at its own step: the floored quotient, a
@@ -247,26 +254,23 @@ inline std::vector<int> fd_own_step_columns(Eval &&eval, const double *y, int ns
             continue;
         }
         const double *col = D + static_cast<std::size_t>(small[s]) * um;
-        bool whole = true;
         bool any = false;
-        for (std::size_t i = 0; i < um && whole; ++i) {
+        for (std::size_t i = 0; i < um; ++i) {
             const double q = own[s * um + i];
             take[i] = 0;
             const double apart = std::abs(wide[s * um + i] - q);
             const double noise = kFdNoise * rounding[i] / step[s];
             const double size = std::abs(q);
             const double gap = std::abs(q - col[i]);
+            // (A quotient that is no number is not taken: nothing is that near
+            // an infinity.)
             if (moved[s * um + i] != 0 && resolved[s * um + i] != 0 && noise <= kFdSettled * size &&
                 apart <= kFdSettled * size && gap > 2.0 * (kFdRefineRtol * size + noise + apart)) {
                 take[i] = 1;
                 any = true;
-            } else if (!(gap <= kFdRefineRtol * size)) {
-                // (A quotient that is no number comes here: nothing is that
-                // near an infinity.)
-                whole = false;
             }
         }
-        if (!whole || !any) {
+        if (!any) {
             continue;
         }
         double *out = D_own + static_cast<std::size_t>(small[s]) * um;
