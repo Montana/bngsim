@@ -3811,8 +3811,11 @@ def _coarse_sawtooth(core, asked: _EngineCondition, phase, lo: float, hi: float)
     `100*mod(1.1e12 + time(), 0.0048828125)` over (0, 20.2), each on its
     wrap, X was 0.0826 for 4.685, where main, with no stop, has it right. Two
     stops to the wrap held for X(0) = 0 and not for X(0) = 1e4. So the scan's
-    stops are not placed for it, and it is left as on main, until that is
-    fixed in the run.
+    stops are not placed for it, and it is left as on main. The run now looks
+    inside such a stretch before it takes it in one step (issue #998), which
+    makes a stop on every wrap add every period for X(0) = 0; whether to place
+    them again, and what to do where the dose is small against the tolerance,
+    is issue #1018.
 
     How long a flat stretch it takes depends on the rate and the tolerances,
     not on the run: at a clock of 1e6, `frac((3e9 + time())/0.0009765625)`
@@ -3882,7 +3885,7 @@ def _engine_scan_stop_times(
     lo, hi = float(t_start) + shift, float(t_end) + shift
     sawtooth = _sawtooth_of_a_line(asked, scope)
     if sawtooth is not None and _coarse_sawtooth(core, asked, sawtooth, lo, hi):
-        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#998)", cond)
+        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#1018)", cond)
         return None
 
     class Unreadable(Exception):
