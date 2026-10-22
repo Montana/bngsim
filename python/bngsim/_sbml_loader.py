@@ -2435,6 +2435,12 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
     return resolver
 
 
+# Past this many nodes, the texts of a size's jump (its condition both ways and
+# the size on either side) read what more than one path reaches through
+# functions of their own (issue #1124, item 6). About 20,000 characters.
+_JUMP_TEXT_NODES = 5_000
+
+
 # ── Periodic floor()/modulo dosing-discontinuity resolution (GH #88) ──────
 #
 # The #72 machinery above registers a CVODE root for every inequality that
@@ -8179,6 +8185,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         import re as _re
 
         import sympy as _sp
+        from sympy.functions.elementary.piecewise import ExprCondPair as _ExprCondPair
 
         from bngsim._codegen import _PY_KEYWORD_PARAM_NAMES, _alias_keyword_param
         from bngsim._jacobian import _TIME_SYM, _exprtk_to_sympy, sympy_to_exprtk
@@ -8601,7 +8608,66 @@ def _build_model_from_sbml_doc_in_context(doc):
                     if inner is None:
                         return None
                     subs[s] = inner
-            return g.xreplace(subs)
+            return _xreplace_once(g, subs)
+
+        def _lattice(func, args):
+            # And(*args) or Or(*args), put together as they are: the
+            # constructor sorts its arguments by their size as trees
+            # (`ordered`). An argument that decides it decides it, and one
+            # that cannot is dropped, as there.
+            kept: dict = {}
+            for a in args:
+                if a is func.zero:
+                    return a
+                if a is not func.identity:
+                    kept.update(dict.fromkeys(a.args if a.func is func else (a,)))
+            if len(kept) < 2:
+                return next(iter(kept), func.identity)
+            obj = _sp.Basic.__new__(func, *kept)
+            obj._argset = frozenset(kept)
+            return obj
+
+        def _rebuilt(e, args):
+            # e.func(*args), with a Piecewise and its pieces put together
+            # without the constructors' walk of each condition (`replace`,
+            # `has`): a condition over a diamond of rules (`r21 > 0.5`) is
+            # exponentially longer as a tree than in memory (issue #1124, item
+            # 6). As the constructor has them, a piece whose condition is false
+            # is dropped, one whose condition is true ends it, and pieces in a
+            # row that read alike are one, on either condition: `piecewise(r0,
+            # S > 3, r1)` with r0 and r1 both S is S, and its S > 3 no root.
+            # Except a condition that reads a piecewise: the pair's own
+            # constructor folds it into relations of their own (`r > 5` under
+            # `r := piecewise(S, S > 3, 2*S)` into S > 5 and 2*S > 5), each
+            # continuous. Left as it was, `r > 5` jumped at S = 3 itself, and
+            # its root fired there beside S > 3's: two rescales at one instant,
+            # the one drawn last kept.
+            if isinstance(e, (_sp.And, _sp.Or)):
+                return _lattice(e.func, args)
+            if isinstance(e, _ExprCondPair):
+                if any(isinstance(x, _sp.Piecewise) for x in _subexpressions(args[1])):
+                    return e.func(*args)
+                return _sp.Basic.__new__(_ExprCondPair, *args)
+            if isinstance(e, _sp.Piecewise):
+                pieces = []
+                for p in args:
+                    if p.cond is _sp.false:
+                        continue
+                    last = pieces[-1].expr if pieces else None
+                    if last is not None and (
+                        last is p.expr or (hash(last) == hash(p.expr) and last == p.expr)
+                    ):
+                        p = _rebuilt(p, (last, _lattice(_sp.Or, (pieces[-1].cond, p.cond))))
+                        pieces[-1] = p
+                    else:
+                        pieces.append(p)
+                    if p.cond is _sp.true:
+                        break
+                if pieces and pieces[0].cond is _sp.true:
+                    return pieces[0].expr
+                if pieces:
+                    return _sp.Basic.__new__(_sp.Piecewise, *pieces)
+            return e.func(*args)
 
         def _xreplace_once(expr, rule: dict):
             # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
@@ -8616,7 +8682,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                     else:
                         args = tuple(go(a) for a in e.args)
                         changed = any(a is not b for a, b in zip(args, e.args, strict=True))
-                        done[id(e)] = e.func(*args) if changed else e
+                        done[id(e)] = _rebuilt(e, args) if changed else e
                 return done[id(e)]
 
             return go(expr)
@@ -8636,6 +8702,100 @@ def _build_model_from_sbml_doc_in_context(doc):
                     for e in _subexpressions(full)
                 )
             }
+
+        def _names_in(expr) -> set[str]:
+            # free_symbols, each distinct node visited once: sympy's walks the
+            # tree, which a size read through shared rules makes exponential.
+            return {str(e) for e in _subexpressions(expr) if e.is_Symbol}
+
+        def _through_functions(exprs: list, prefix: str) -> tuple[list, list[tuple[str, object]]]:
+            # ``exprs`` with each large node that more than one path reaches read
+            # through a function of its own, and those functions, each after the
+            # ones it reads, as (name, body) (issue #1124, item 6). A jump's
+            # condition and sizes are written from the size through its rules,
+            # and a diamond of rules under a condition, or a condition under a
+            # diamond, was written out once per path: exponential in the depth.
+            # Only where the texts would be long; only numbers, for a function
+            # returns one, so a condition stays where it is read.
+            size: dict[int, int] = {}
+            refs: dict[int, int] = {}
+            order: list = []
+            seen: set[int] = set()
+            for root in exprs:
+                refs[id(root)] = refs.get(id(root), 0) + 1
+                stack = [(root, False)]
+                while stack:
+                    e, expanded = stack.pop()
+                    if expanded:
+                        size[id(e)] = 1 + sum(size[id(a)] for a in e.args)
+                        order.append(e)
+                        continue
+                    if id(e) in seen:
+                        continue
+                    seen.add(id(e))
+                    for a in e.args:
+                        refs[id(a)] = refs.get(id(a), 0) + 1
+                    stack.append((e, True))
+                    stack.extend((a, False) for a in e.args if id(a) not in seen)
+            if sum(size[id(e)] for e in exprs) <= _JUMP_TEXT_NODES:
+                return list(exprs), []
+            helpers: list[tuple[str, object]] = []
+            built: dict[int, object] = {}
+            for e in order:  # each node after its arguments
+                args = tuple(built[id(a)] for a in e.args)
+                changed = any(a is not b for a, b in zip(args, e.args, strict=True))
+                new = _rebuilt(e, args) if changed else e
+                if (
+                    refs.get(id(e), 0) > 1
+                    and size[id(e)] >= 16
+                    and isinstance(e, _sp.Expr)  # a number; a relation or an And is not one
+                ):
+                    name = f"{prefix}{len(helpers)}"
+                    helpers.append((name, new))
+                    new = _sp.Symbol(name)
+                built[id(e)] = new
+            return [built[id(e)] for e in exprs], helpers
+
+        def _ratio_of(d, d0):
+            # d / d0 where that is a nonzero number, else None. `cancel` walks
+            # the tree, which a relation over a diamond of rules makes
+            # exponential (issue #1124, item 6): `r17 > 0.5` beside `r17 <
+            # -0.5`, or beside `S > 3`, took a second to load at 18 rules, x2.6
+            # for every two more. So two long differences are first compared
+            # term by term, as relations that share a root are written (`r21 >
+            # 1.4` beside `2*r21 < 2.8`), then read at two points, to 30
+            # digits, and only a pair whose ratio is the same at both is
+            # cancelled; a read that is not a number, or raises, or a d0 near 0
+            # there, leaves the pair to `cancel` too.
+            if _tree_size(d) + _tree_size(d0) > _JUMP_TEXT_NODES:
+                terms: list[dict] = [{}, {}]
+                for x, out in zip((d, d0), terms, strict=True):
+                    for t in _sp.Add.make_args(x):
+                        k, m = t.as_coeff_Mul()
+                        out[m] = out.get(m, 0) + k
+                if terms[0].keys() == terms[1].keys() and all(terms[1].values()):
+                    qs = [terms[0][m] / terms[1][m] for m in terms[1]]
+                    if qs[0] != 0 and all(abs(q - qs[0]) <= 1e-12 * abs(qs[0]) for q in qs):
+                        return qs[0]
+                names = sorted(
+                    {e for x in (d, d0) for e in _subexpressions(x) if e.is_Symbol}, key=str
+                )
+                seen = []
+                for step in (0.6180339887, 0.4142135624):
+                    at = {
+                        s: _sp.Float(0.25 + ((k + 1) * step) % 1, 30) for k, s in enumerate(names)
+                    }
+                    try:
+                        a, b = _xreplace_once(d, at), _xreplace_once(d0, at)
+                    except Exception:  # Max of a complex number raises
+                        break
+                    if not all(v.is_Float or v.is_Rational for v in (a, b)) or abs(b) < 1e-8:
+                        break
+                    seen.append(a / b)
+                if len(seen) == 2 and abs(seen[0] - seen[1]) > 1e-12 * max(1, abs(seen[0])):
+                    return None
+            ratio = _sp.cancel(d / d0)
+            return ratio if ratio.is_number and ratio != 0 else None
 
         # compartment -> the concentrations its size's jump conditions read
         _cond_reads: dict[str, set[str]] = {}
@@ -8658,7 +8818,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             relations: set = set()
             for c in conds:
-                names = {str(s) for s in c.free_symbols}
+                names = _names_in(c)
                 if not names & _moving:
                     continue
                 _cond_reads.setdefault(comp, set()).update(
@@ -8677,16 +8837,16 @@ def _build_model_from_sbml_doc_in_context(doc):
                     continue
                 relations |= {
                     r
-                    for r in c.atoms(_sp.core.relational.Relational)
-                    if {str(s) for s in r.free_symbols} & _moving
+                    for r in _subexpressions(c)
+                    if isinstance(r, _sp.core.relational.Relational) and _names_in(r) & _moving
                 }
             # (difference, [(relation, its difference over that one)])
             roots: list[tuple[object, list]] = []
             for r in sorted(relations, key=_sp.default_sort_key):
                 d = r.lhs - r.rhs
                 for d0, rels in roots:
-                    ratio = _sp.cancel(d / d0)
-                    if ratio.is_number and ratio != 0:
+                    ratio = _ratio_of(d, d0)
+                    if ratio is not None:
                         rels.append((r, ratio))
                         break
                 else:
@@ -8708,21 +8868,53 @@ def _build_model_from_sbml_doc_in_context(doc):
                 syms = [s for s in d.free_symbols if str(s) in _moving]
                 return _sp.expand(d).as_independent(*syms, as_Add=True)[1]
 
+            def _moving_terms(d):
+                # d's terms that read the run, {term over its coefficient:
+                # coefficient}, and the rest of d, a run constant
+                moving: dict = {}
+                rest = []
+                for t in _sp.Add.make_args(d):
+                    if _names_in(t) & _moving:
+                        k, m = t.as_coeff_Mul()
+                        moving[m] = moving.get(m, 0) + k
+                    else:
+                        rest.append(t)
+                return moving, _sp.Add(*rest)
+
+            def _sibling(d1, d0):
+                # (scale, rest) where d1 = scale*d0 + rest, with scale a nonzero
+                # number, else None. Past _JUMP_TEXT_NODES, `expand`, `cancel`
+                # and `free_symbols` walk the tree, which a relation over a
+                # diamond of rules makes exponential (issue #1124, item 6), so
+                # the two are compared term by term, as `_ratio_of` does.
+                if _tree_size(d0) + _tree_size(d1) > _JUMP_TEXT_NODES:
+                    (m1, c1), (m0, c0) = _moving_terms(d1), _moving_terms(d0)
+                    if not m0 or m1.keys() != m0.keys() or not all(m0.values()):
+                        return None
+                    qs = [m1[m] / m0[m] for m in m0]
+                    if qs[0] == 0 or any(abs(q - qs[0]) > 1e-12 * abs(qs[0]) for q in qs):
+                        return None
+                    return qs[0], c1 - qs[0] * c0
+                scale = _sp.cancel(_moving_part(d1) / _moving_part(d0))
+                if not scale.is_number or scale == 0:
+                    return None
+                return scale, _sp.expand(d1 - scale * d0)
+
             def _siblings(d0, roots=roots) -> list[tuple[list, object, object]]:
                 out = []
-                m0 = _moving_part(d0)
                 for d1, rels1 in roots:
                     if d1 is d0:
                         continue
-                    scale = _sp.cancel(_moving_part(d1) / m0)
-                    if not scale.is_number or scale == 0:
-                        continue
-                    rest = _sp.expand(d1 - scale * d0)
-                    if not rest.is_number and not {str(s) for s in rest.free_symbols} & _moving:
-                        out.append((rels1, scale, rest))
+                    got = _sibling(d1, d0)
+                    if (
+                        got is not None
+                        and not got[1].is_number
+                        and not _names_in(got[1]) & _moving
+                    ):
+                        out.append((rels1, *got))
                 return out
 
-            for d0, rels in roots:
+            for k_root, (d0, rels) in enumerate(roots):
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
                 # equality holds at the root alone, so it reads false on both.
@@ -8746,9 +8938,9 @@ def _build_model_from_sbml_doc_in_context(doc):
                             # Piecewise this costs sympy a canonicalisation per
                             # sibling, which a size of many roots pays N² times
                             subs[r] = (
-                                _sp.Or(_sp.Eq(rest, 0), r)
+                                _lattice(_sp.Or, (_sp.Eq(rest, 0), r))
                                 if r.func(rq * scale * side, 0)
-                                else _sp.And(_sp.Ne(rest, 0), r)
+                                else _lattice(_sp.And, (_sp.Ne(rest, 0), r))
                             )
                     return _xreplace_once(g, subs)
 
@@ -8759,13 +8951,23 @@ def _build_model_from_sbml_doc_in_context(doc):
                 v_false, v_true = (
                     min((v, _xreplace_once(v, by_name)), key=_tree_size) for v in (v_false, v_true)
                 )
-                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
-                if any(t is None for t in texts):
+                # And so does the condition (issue #1124, item 6): `r21 > 0.5`
+                # under a diamond of rules was printed written out in full.
+                c_read = min((c, _xreplace_once(c, by_name)), key=_tree_size)
+                written, helpers = _through_functions(
+                    [c_read, _sp.Not(c_read), v_false, v_true],
+                    f"_szj_{_safe_name(comp)}_{k_root}_",
+                )
+                helper_texts = [(name, sympy_to_exprtk(body)) for name, body in helpers]
+                texts = [sympy_to_exprtk(e) for e in written]
+                if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
-                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c_read} "
                         "flips, and bngsim cannot write the size on either side"
                     )
                     continue
+                for name, text in helper_texts:
+                    builder.add_function(name, _unalias(text))
                 rises, falls, v_false, v_true = (_unalias(t) for t in texts)
                 _jump_species[comp] = [
                     s for s, sc in species_comp.items() if sc == comp and _diluted(s)
