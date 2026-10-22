@@ -1012,6 +1012,20 @@ def test_three_jumps_on_one_instant_rescale_once():
     np.testing.assert_allclose(got, [5, 5, 5 / 4], rtol=1e-8)
 
 
+def test_a_step_up_and_a_step_down_on_one_instant_leave_the_size():
+    """`1 + piecewise(0, t < t1, 1) + piecewise(1, t < t2, 0)` with t2 one ulp
+    past t1 is 2 throughout, and [Sn] stays 5; it went to 7.5."""
+    up = _pw((_cn(0), _rel("lt", T, _ci("t1"))), otherwise=_cn(1))
+    down = _pw((_cn(1), _rel("lt", T, _ci("t2"))), otherwise=_cn(0))
+    params = (
+        '<parameter id="t1" value="2.0" constant="true"/>'
+        f'<parameter id="t2" value="{_ulps_past(2.0)!r}" constant="true"/>'
+    )
+    times = np.array([0.0, 1.9, 2.5, 3.5])
+    xml = _doc([("cv", _plus(_plus(_cn(1), up), down))], params=params)
+    np.testing.assert_allclose(_sn_at(bngsim.Model.from_sbml_string(xml), times), 5, rtol=1e-8)
+
+
 def test_a_scaled_clock_beside_a_plain_one_rescales_once():
     """`time/s < tm` with s = 60 and tm = 2/60 crosses where 60·tm rounds to,
     a few ulp from `time < t1`; no number relates the two at load."""
