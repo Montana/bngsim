@@ -1262,14 +1262,16 @@ def test_a_held_slide_prints_nothing(tmp_path):
 
 def _batch_ends_between(path, hold, start, stop):
     """The times CVODE logs a batch ending at, between ``start`` and ``stop``,
-    in a run of ``path`` with holding on or off; in a subprocess, as above."""
+    in a run of ``path`` with holding on or off; in a subprocess, as above.
+    A spent batch is logged only under BNGSIM_LOG_SPENT_BATCHES=1 (issue #1124,
+    item 13), which leaves SUNDIALS' handler, and the hold's mute, as they were."""
     script = textwrap.dedent(f"""
         import bngsim
         m = bngsim.Model.from_net({str(path)!r})
         bngsim.Simulator(m).run(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8,
                                 max_step=0.05, max_steps=20)
     """)
-    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold)
+    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold, BNGSIM_LOG_SPENT_BATCHES="1")
     done = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
     )

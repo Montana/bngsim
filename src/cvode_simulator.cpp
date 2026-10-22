@@ -29,6 +29,7 @@
 #include <cvodes/cvodes.h>
 #include <nvector/nvector_serial.h>
 #include <sundials/sundials_context.h>
+#include <sundials/sundials_errors.h>
 #include <sundials/sundials_logger.h>
 #include <sunlinsol/sunlinsol_dense.h>
 #include <sunmatrix/sunmatrix_dense.h>
@@ -68,6 +69,31 @@ namespace bngsim {
 // SPARSE_THRESHOLD / SPARSE_DENSITY_MAX and the dense-vs-sparse decision they
 // gate now live in bngsim/sparse_jacobian.hpp, shared with the steady-state
 // march (issue #128) — see route_to_sparse_linear_solver there.
+
+// CVode's "mxstep steps taken before reaching tout" is the CV_TOO_MUCH_WORK
+// return that retry_while_advancing resumes from: max_steps is a batch, not a
+// ceiling, and a stall is raised by name there. SUNDIALS logs it all the same,
+// once a batch: 110 lines from a sensitivity run at rtol 1e-11 that succeeded
+// (issue #1124, item 13). So the context's handler drops that one message and
+// passes every other one on to the logger, as before. BNGSIM_LOG_SPENT_BATCHES=1
+// keeps SUNDIALS' own handler, and the message with it.
+static void log_all_but_a_batch_spent(int line, const char *func, const char *file, const char *msg,
+                                      SUNErrCode err_code, void *err_user_data, SUNContext sunctx) {
+    if (err_code == CV_TOO_MUCH_WORK && func != nullptr && std::strcmp(func, "CVode") == 0) {
+        return;
+    }
+    SUNLogErrHandlerFn(line, func, file, msg, err_code, err_user_data, sunctx);
+}
+
+static void drop_spent_batch_errors(SUNContext ctx) {
+    const char *keep = std::getenv("BNGSIM_LOG_SPENT_BATCHES");
+    if (keep != nullptr && *keep != '\0' && std::strcmp(keep, "0") != 0) {
+        return;
+    }
+    if (ctx != nullptr && SUNContext_ClearErrHandlers(ctx) == SUN_SUCCESS) {
+        SUNContext_PushErrHandler(ctx, log_all_but_a_batch_spent, nullptr);
+    }
+}
 
 // Retry a CV_TOO_MUCH_WORK return, but only while the integrator is still
 // getting somewhere (issue #54).
@@ -3475,6 +3501,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         if (!w.ctx) {
             throw std::runtime_error("SUNContext_Create failed");
         }
+        drop_spent_batch_errors(w.ctx);
 
         w.y = NVectorGuard(N_VNew_Serial(ns, w.ctx));
         if (!w.y) {
@@ -3841,6 +3868,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     if (!ctx) {
         throw std::runtime_error("SUNContext_Create failed");
     }
+    drop_spent_batch_errors(ctx);
 
     y = NVectorGuard(N_VNew_Serial(ns, ctx));
     if (!y) {
