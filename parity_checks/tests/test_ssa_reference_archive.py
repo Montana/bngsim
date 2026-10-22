@@ -133,6 +133,12 @@ def test_an_archive_refusal_is_an_uncompared_reference_failure(status):
     assert "the model's rtol changed" in r.comment
 
 
+def test_two_names_that_sanitize_alike_get_their_own_files(tmp_path):
+    """``a/b`` and ``a_b`` shared one entry file; the second model's recording
+    overwrote the first's, which then replayed as stale for good."""
+    assert SS._archive_file(tmp_path, "a/b") != SS._archive_file(tmp_path, "a_b")
+
+
 # ── The worker itself, in-process, with bngsim's own SSA (other seeds) standing in
 # for RoadRunner's gillespie: no RoadRunner and no corpus needed.
 

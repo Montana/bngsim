@@ -317,3 +317,12 @@ def test_an_unreadable_entry_is_the_archive_s_fault(tmp_path, monkeypatch):
     assert row["status"] == "reference_failed"
     assert "archive_unreadable" in row["exception"]
     assert "value" in row and row["value"] is None
+
+
+def test_two_keys_that_sanitize_alike_get_their_own_files(tmp_path):
+    """The file name was the key with every other character made ``_``, so
+    ``a/b.bngl:ode`` and ``a_b.bngl:ode`` shared one file and the second
+    recording overwrote the first."""
+    one, two = B._archive_file(tmp_path, "a/b.bngl:ode"), B._archive_file(tmp_path, "a_b.bngl:ode")
+    assert one != two
+    assert one.name.startswith("a_b.bngl_ode-") and one.suffix == ".npz"

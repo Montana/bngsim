@@ -5040,7 +5040,12 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                     if (dfm_dxi == 0.0) {
                         continue; // func_m does not read x_i
                     }
-                    if (!has_row && result.function_sens_missing_species[m] < 0) {
+                    // A function whose own value is not finite has a NaN partial
+                    // for every species, read or not (-inf - -inf), so it would
+                    // record the first species with no row whatever it reads.
+                    // Its row is NaN for its value, not for a missing row.
+                    if (!has_row && result.function_sens_missing_species[m] < 0 &&
+                        std::isfinite(f0[m])) {
                         result.function_sens_missing_species[m] = i;
                     }
                     func_term_scale[static_cast<size_t>(m)] += std::abs(dfm_dxi * y_ss[i]);

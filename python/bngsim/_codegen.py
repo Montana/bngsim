@@ -299,7 +299,9 @@ _compile_counter = itertools.count()
 # v42: lanl/bngsim #540 — a condition with an if() in it parses to the ITE
 # chain without sympy's set theory, so its emitted text changes (to the same
 # values), and a law that ran past the derivation budget on it now derives.
-# A cached v41 .so would keep the old text, or no derivative. Invalidate v41.
+# The bump was not needed: _jacobian is in _CODEGEN_SOURCE_MODULES, so the
+# source digest already left every v41 .so behind. It stays, since undoing it
+# would leave every v42 .so behind instead.
 _CODEGEN_VERSION = "42"
 
 
