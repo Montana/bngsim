@@ -8443,7 +8443,9 @@ class Simulator:
         self._ss_jacobian_fell_back = True
 
     @staticmethod
-    def _warn_about_pure_sinks(result: SteadyStateResult) -> None:
+    def _warn_about_pure_sinks(
+        result: SteadyStateResult, n_entries: tuple[int, int] | None = None
+    ) -> None:
         """Name the structural cause of a failed solve (issue #74).
 
         ``converged=False`` on its own reads as "needs more time", which is the
@@ -8455,14 +8457,16 @@ class Simulator:
         if result.converged or not sinks:
             return
         shown = ", ".join(sinks[:4]) + (", ..." if len(sinks) > 4 else "")
+        where = "" if n_entries is None else f" in {n_entries[0]} of {n_entries[1]} batch entries"
         logger.warning(
-            "Steady state FAILED for a structural reason, not a numerical one: "
+            "Steady state FAILED%s for a structural reason, not a numerical one: "
             "%d write-only accumulator species (produced by some reaction, "
             "consumed by none) carry a non-zero derivative at the returned state, "
             "so ||f(y)||_2/n cannot reach tol however long the solve integrates. "
             "Species: %s. Exclude them from the convergence test to solve on the "
             "subspace that does have a steady state: "
             "sim.steady_state(mask=~model.is_pure_sink()).",
+            where,
             len(sinks),
             shown,
         )
@@ -8706,7 +8710,6 @@ class Simulator:
             self._apply_ss_ar_sensitivity_map(result, clone)
             self._apply_ss_varvol_report_maps(result, clone)
             self._note_ss_jacobian_retry(result)
-            self._warn_about_pure_sinks(result)
             return result
 
         if n_workers is not None and n_workers > 1:
@@ -8721,6 +8724,11 @@ class Simulator:
         else:
             results = [_run_one(i) for i in range(len(params))]
 
+        # Once for the batch: an entry each was the same advice 200 times over
+        # for steady_states() on a model with an accumulator.
+        stuck = [r for r in results if not r.converged and r.unconverged_pure_sinks]
+        if stuck:
+            self._warn_about_pure_sinks(stuck[0], n_entries=(len(stuck), len(results)))
         return results
 
     def steady_states(
@@ -8748,18 +8756,24 @@ class Simulator:
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
         is complete. Completeness for polynomial mass-action systems is what
-        homotopy continuation offers (#502).
+        homotopy continuation offers (#502). Nor is a continuum of steady
+        states a list of roots: where one root's spectrum holds a zero
+        eigenvalue (SIR's line of disease-free states), each start lands
+        somewhere on it and comes back as a root of its own. A write-only
+        accumulator makes Newton's system singular at every start; exclude it
+        with ``mask=~model.is_pure_sink()``.
 
-        Sampling: each independent species of the conservation laws, and each
-        species in no law, is drawn log-uniformly from ``decades`` decades below
-        its bound up to it. A species in a law is bounded by that law's total
-        over its coefficient; one in none by ``upper``, which defaults to ten
-        times the largest of 1, any initial concentration, any law's total and
-        any species of the steady state an ordinary :meth:`steady_state` solve
-        reaches (one solve, for the scale). The dependent species are then
-        solved from the laws, at the model's own totals, and a start with a
-        negative one is drawn again. A species ``mask`` leaves out keeps its
-        initial value.
+        Sampling: each species a start moves is drawn log-uniformly from
+        ``decades`` decades below a bound up to it. For a species in no
+        conservation law the bound is ``upper``, which defaults to ten times the
+        largest of 1, any concentration of the model's state, any law's total,
+        and any such species of the steady state an ordinary
+        :meth:`steady_state` solve reaches (one solve, for the scale). The
+        species in a law are drawn the same way below the largest total and then
+        moved onto the laws together, at the totals the model's state holds: to
+        the point that satisfies them nearest the draw in relative entropy,
+        which keeps every species positive however many a law holds. A
+        ``$``-fixed species, and one ``mask`` leaves out, keeps its value.
 
         Parameters
         ----------
@@ -8769,16 +8783,19 @@ class Simulator:
             Seed for the sampling, so a call is reproducible.
         upper : float or array-like, optional
             The sampling bound for a species in no conservation law: a scalar
-            or one value per species.
+            or one value per species. Unused when every species a start moves
+            is in a law.
         decades : float
             How many decades below its bound a species is drawn from. Wider
             reaches roots near zero and spends more starts where Newton
-            diverges: on the Gardner toggle, 6 decades lost 75 of 200 starts
-            and 2 found one of its three roots; 4 found all three and lost 45.
+            diverges: on the Gardner toggle, 6 decades lost 95 of 200 starts
+            and 2 found one of its three roots; 4 found all three and lost 52.
         dedupe_rtol : float
             Two roots are the same when every species agrees to within
             ``dedupe_rtol`` of the larger magnitude (plus ``tol`` as an
-            absolute floor).
+            absolute floor). A species in a conservation law agrees, too,
+            within ``dedupe_rtol`` of its smallest law's scale, ``Σ|L·y|``:
+            the solve places it no closer than that.
         tol, n_workers, mask :
             As in :meth:`steady_state_batch`.
 
@@ -8788,25 +8805,22 @@ class Simulator:
         """
         if n_starts < 1:
             raise ValueError("n_starts must be at least 1")
-        if upper is None:
+        y0, L, held, in_law = _manifold_partition(self._model, mask)
+        alone = ~held & ~in_law
+        if upper is None and alone.any():
             # The scale of the model's own steady state, from one ordinary
             # solve: a model in no conservation law that starts at zero has no
             # other (the Gardner toggle's roots sit at 53 and 144; a bound of
-            # 10 from its initial state found two of three roots).
+            # 10 from its initial state found two of three roots). Read off the
+            # species `upper` bounds, and not off an accumulator: nothing
+            # settles it, so it ends wherever max_time leaves it, and a scale
+            # from there puts every start decades above the roots.
             try:
-                reached = np.abs(np.asarray(self.steady_state(tol=tol).concentrations))
+                reached = np.asarray(self.steady_state(tol=tol, mask=mask).concentrations)
+                reached = reached[alone & ~self._model.is_pure_sink()]
             except Exception:  # noqa: BLE001 - only a scale; the default stands
                 reached = np.zeros(0)
-            cl = self._model.conservation_laws
-            scale = max(
-                [
-                    1.0,
-                    *np.abs(np.asarray(self._model.get_state(), float)).tolist(),
-                    *np.abs(np.asarray(cl["constants"], float)).tolist(),
-                    *reached[np.isfinite(reached)].tolist(),
-                ]
-            )
-            upper = 10.0 * scale
+            upper = _default_sampling_bound(y0, L, reached)
         starts = _sample_on_conservation_manifold(
             self._model, n_starts, np.random.default_rng(seed), upper, mask, decades
         )
@@ -8819,7 +8833,7 @@ class Simulator:
             mask=mask,
         )
         return SteadyStates.cluster(
-            results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol
+            results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol, laws=L
         )
 
     # ─── Stop conditions ────────────────────────────────────────────
@@ -9919,13 +9933,15 @@ def _ss_output_sens_block(core: Any, attr: str) -> np.ndarray:
     return np.empty((0, 0))
 
 
-def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) -> np.ndarray:
-    """``n`` starting states on ``model``'s conservation manifold (issue #524).
+def _manifold_partition(model, mask):
+    """What the starts of issue #524 move, and the laws they move on.
 
-    Independent species and species in no law are drawn log-uniformly from
-    ``[b·10^-decades, b]``, ``b`` the species' bound (a law's total over its coefficient,
-    or ``upper``); the dependents are solved from the laws at the model's own
-    totals, and a draw that makes one negative is drawn again.
+    Returns ``(y0, L, held, in_law)``: the model's live state, its laws'
+    coefficients, shape ``(n_laws, n_species)``, the species every start keeps
+    at ``y0``, and the species among the rest that a law constrains. A
+    ``$``-fixed species is held, and so is one ``mask`` leaves out: neither is
+    an unknown of the solve, so a value drawn for it would change the system
+    being solved rather than where the solve starts.
     """
     y0 = np.asarray(model.get_state(), dtype=float)
     ns = y0.size
@@ -9936,44 +9952,133 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
         if n_laws
         else np.zeros((0, ns))
     )
-    totals = np.asarray(cl["constants"], dtype=float) if n_laws else np.zeros(0)
-    dep = [int(i) for i in cl["dependent"]] if n_laws else []
-    keep = np.zeros(ns, dtype=bool)
-    if mask is not None:
-        sel = _resolve_ss_mask(mask, model)
-        included = np.asarray(sel, dtype=bool) if sel is not None else np.ones(ns, bool)
-        keep = ~included
+    held = np.asarray(model._core.species_is_fixed, dtype=bool)
+    sel = _resolve_ss_mask(mask, model)
+    if sel is not None:
+        held = held | ~np.asarray(sel, dtype=bool)
+    in_law = (L != 0).any(axis=0) & ~held
+    return y0, L, held, in_law
+
+
+def _default_sampling_bound(y0, L, reached=()) -> float:
+    """``upper``'s default (issue #524): ten times the largest of 1, any
+    concentration of ``y0``, any law's total there, and any finite value of
+    ``reached``."""
+    reached = np.abs(np.asarray(reached, dtype=float))
+    return 10.0 * max(
+        [
+            1.0,
+            *np.abs(y0).tolist(),
+            *np.abs(L @ y0).tolist(),
+            *reached[np.isfinite(reached)].tolist(),
+        ]
+    )
+
+
+def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) -> np.ndarray:
+    """``n`` starting states on ``model``'s conservation manifold (issue #524).
+
+    Each species a start moves gets a weight ``w = b·10^u``, ``u`` uniform on
+    ``[-decades, 0]``. A species in no law takes its weight as its value, ``b``
+    being ``upper``. The species in a law move onto the laws together, at the
+    totals the model's live state holds (what the solve recomputes them from):
+    to ``y = w·exp(Lᵀλ)``, the point of ``{L·y = totals, y > 0}`` nearest the
+    weights in relative entropy (:func:`_project_onto_laws`), ``b`` being the
+    largest total. That lands on the laws however many members a law has and
+    however the laws overlap.
+
+    What it replaced drew each member below its law's total over its coefficient,
+    solved the dependents from the rest, and drew again while one came out
+    negative. A law of more than a few members almost never came out
+    non-negative, so 17 of the 53 tracked ODE nets ran out of draws, among them
+    kinetic_proofreading's 9 species. The laws are row-reduced, so a total can be
+    a difference and a coefficient negative, and a member of a law whose total
+    was not positive was pinned at 0. The totals were the loaded ones, not those
+    of a state set since.
+    """
+    y0, L, held, in_law = _manifold_partition(model, mask)
+    ns = y0.size
+    moved = ~held
+    # A law over held species alone constrains nothing a start moves.
+    A = L[:, in_law]
+    A = A[(A != 0).any(axis=1)]
+    totals = A @ y0[in_law]
     if upper is None:
-        scale = max([1.0, *np.abs(y0).tolist(), *np.abs(totals).tolist()])
-        upper_v = np.full(ns, 10.0 * scale)
-    else:
-        upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,)).copy()
-    bound = upper_v.copy()
-    for k in range(n_laws):
-        for i in np.nonzero(L[k] > 0)[0]:
-            bound[i] = min(bound[i], totals[k] / L[k, i]) if totals[k] > 0 else 0.0
-    free = [i for i in range(ns) if i not in dep and not keep[i]]
-    out = np.empty((n, ns))
-    for row in range(n):
-        for _attempt in range(10_000):
-            y = y0.copy()
-            for i in free:
-                b = bound[i]
-                y[i] = 0.0 if b <= 0 else b * 10.0 ** rng.uniform(-decades, 0.0)
-            if n_laws:
-                others = [i for i in range(ns) if i not in dep]
-                rhs = totals - L[:, others] @ y[others]
-                y[dep] = np.linalg.solve(L[:, dep], rhs)
-            if np.all(y >= 0.0):
-                out[row] = y
-                break
-        else:
-            raise SimulationError(
-                "steady_states(): no starting state with every species non-negative "
-                "after 10000 draws; pass a smaller upper= for the species in no "
-                "conservation law"
-            )
+        upper = _default_sampling_bound(y0, L)
+    upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
+    law_scale = max([1.0, *np.abs(totals).tolist()])
+    scale = np.where(in_law, law_scale, upper_v)[moved]
+    out = np.tile(y0, (n, 1))
+    out[:, moved] = scale * 10.0 ** rng.uniform(-decades, 0.0, size=(n, int(moved.sum())))
+    if A.shape[0]:
+        cols = np.flatnonzero(in_law)
+        for row in out:
+            y = _project_onto_laws(row[cols], A, totals)
+            if y is None:
+                raise SimulationError(
+                    "steady_states(): the conservation laws admit no state with every "
+                    f"species positive at the totals this model's state holds ({totals})"
+                )
+            row[cols] = y
     return out
+
+
+def _project_onto_laws(w, A, b, max_iter=200):
+    """The point of ``{y > 0 : A·y = b}`` nearest ``w`` in relative entropy (issue #524).
+
+    It is ``y = w·exp(Aᵀλ)`` at the minimum of the convex dual
+    ``F(λ) = Σ y(λ) − b·λ``, whose gradient is ``A·y − b`` and Hessian
+    ``A·diag(y)·Aᵀ``: damped Newton on ``λ``, one entry per law. A total that
+    forces its members to zero has no minimum, only an infimum. Where one law
+    of non-negative coefficients does it (nfkb has five laws of one member at
+    a total of 0) its members are set to 0 first. Where only a combination of
+    laws does, the iterates approach it by a factor ``e`` a step and the
+    floor below takes them there. ``None`` when no step decreases ``F``: the
+    laws admit no positive point.
+    """
+    ref = max(float(np.abs(b).max()), float((np.abs(A) @ w).max()))
+    out = np.array(w, dtype=float)
+    live = np.ones(out.size, dtype=bool)
+    rows = np.ones(A.shape[0], dtype=bool)
+    while True:
+        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * ref)
+        if not pin.any():
+            break
+        live &= ~(A[pin] != 0.0).any(axis=0)
+        rows &= ~pin & (A[:, live] != 0.0).any(axis=1)
+    out[~live] = 0.0
+    if not rows.any():
+        return out
+    A, b, w = A[np.ix_(rows, live)], b[rows], out[live]
+    logw = np.log(w)
+    lam = np.zeros(A.shape[0])
+    y = w
+    floor = 1e-15 * ref
+    for _ in range(max_iter):
+        g = A @ y - b
+        if np.all(np.abs(g) <= 1e-12 * np.maximum(np.abs(b), np.abs(A) @ y) + floor):
+            out[live] = y
+            return out
+        # Jacobi-scaled: a law whose members are heading for 0 has a Hessian
+        # row 1e15 below the rest, and an unscaled least-squares solve drops it.
+        H = (A * y) @ A.T
+        s = 1.0 / np.sqrt(np.maximum(np.diag(H), 1e-300))
+        d = s * np.linalg.lstsq(H * np.outer(s, s), -s * g, rcond=None)[0]
+        f, slope, t = y.sum() - b @ lam, g @ d, 1.0
+        # Near the minimum the decrease a step earns is below F's round-off, so
+        # a step that stays within that is taken: the gradient decides when to stop.
+        slack = 1e-13 * (y.sum() + abs(b @ lam))
+        while t > 1e-12:
+            z = logw + A.T @ (lam + t * d)
+            if z.max() < 700.0:
+                y_t = np.exp(z)
+                if y_t.sum() - b @ (lam + t * d) <= f + 1e-4 * t * slope + slack:
+                    break
+            t *= 0.5
+        else:
+            return None
+        lam, y = lam + t * d, y_t
+    return None
 
 
 class SteadyStates:
@@ -10023,7 +10128,25 @@ class SteadyStates:
     species_names: list[str]
 
     @classmethod
-    def cluster(cls, results, species_names, *, dedupe_rtol: float, atol: float):
+    def cluster(cls, results, species_names, *, dedupe_rtol: float, atol: float, laws=None):
+        """Group converged ``results`` into distinct roots.
+
+        ``laws``, shape ``(n_laws, n_species)``: a species in a conservation
+        law is told apart only to ``dedupe_rtol`` of the smallest of its laws'
+        scales, ``Σ_j |L_kj·y_j|``. A law's dependent species is rebuilt from
+        the rest of the law, so it carries the law's round-off rather than its
+        own: egfr_path's EGF, 5e-8 in a law over 1.8e5, came back from 40
+        starts at 34 values, and each counted as a root of its own.
+        """
+        L = np.zeros((0, len(species_names))) if laws is None else np.abs(laws)
+        member = L != 0
+
+        def same(y, rep):
+            mag = np.maximum(np.abs(y), np.abs(rep))
+            floor = np.where(member, (L @ mag)[:, None], np.inf).min(axis=0, initial=np.inf)
+            floor = np.where(np.isfinite(floor), dedupe_rtol * floor, 0.0)
+            return np.all(np.abs(y - rep) <= dedupe_rtol * mag + floor + atol)
+
         reps: list[np.ndarray] = []
         stab: list[str] = []
         eig: list[np.ndarray] = []
@@ -10035,9 +10158,7 @@ class SteadyStates:
                 continue
             y = np.asarray(r.concentrations, dtype=float)
             for k, rep in enumerate(reps):
-                if np.all(
-                    np.abs(y - rep) <= dedupe_rtol * np.maximum(np.abs(y), np.abs(rep)) + atol
-                ):
+                if same(y, rep):
                     basins[j] = k
                     mult[k] += 1
                     if r.residual < res[k]:

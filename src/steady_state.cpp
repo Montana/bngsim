@@ -1569,7 +1569,7 @@ static std::vector<int> ss_unknown_species(const NetworkModel &model, const Cons
 static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rhs,
                                          const SteadyStateOptions &opts,
                                          const ResidualSubspace &sub,
-                                         bool *linsolv_failed = nullptr) {
+                                         bool *linsolv_failed = nullptr, int max_iters = 200) {
 
     if (linsolv_failed) {
         *linsolv_failed = false;
@@ -1698,7 +1698,7 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
 
     KINSetFuncNormTol(kin_mem, opts.tol);
     KINSetScaledStepTol(kin_mem, 1e-15); // allow very small steps
-    KINSetNumMaxIters(kin_mem, 200);
+    KINSetNumMaxIters(kin_mem, max_iters);
     // Set max Newton step large enough for the problem scale
     double max_newton_step = 0.0;
     for (int i = 0; i < n_ind; ++i) {
@@ -1822,9 +1822,9 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
 static SteadyStateResult ss_newton_from(NetworkModel &model, SteadyStateRhs &rhs,
                                         const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                         const std::vector<double> &seed,
-                                        bool *linsolv_failed = nullptr) {
+                                        bool *linsolv_failed = nullptr, int max_iters = 200) {
     model.set_state_from(seed.data());
-    return solve_by_newton(model, rhs, opts, sub, linsolv_failed);
+    return solve_by_newton(model, rhs, opts, sub, linsolv_failed, max_iters);
 }
 
 // ── Is a polished root one the dynamics can actually rest on? (issue #78) ────
@@ -1878,29 +1878,45 @@ static const char *root_stability_name(RootStability s) {
 // nothing else. Converged only on a finite, physical root under `tol`; the
 // stability certificate's verdict and spectrum are reported on it, never acted
 // on: enumerating roots wants the saddles too. The model's state is restored.
+//
+// A throw is not caught. The ladder below may treat one as a failed attempt
+// because integration answers after it; here nothing does, and what throws is a
+// rate law refusing (issue #589) or KINSOL not building, on every start alike.
+// Caught, it came back as a result with no state, which find_steady_state then
+// read past the end of: the mratio refusal crashed the interpreter.
 static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyStateRhs &rhs,
                                                     const SteadyStateOptions &opts,
                                                     const ResidualSubspace &sub) {
     const int ns = model.n_species();
     std::vector<double> start(ns);
     model.get_state_into(start.data());
-    SteadyStateResult r;
-    try {
-        r = ss_newton_from(model, rhs, opts, sub, start);
-    } catch (...) {
-        r = SteadyStateResult{};
-        r.converged = false;
-        r.method_used = "newton";
-    }
-    if (r.converged && !(r.residual < opts.tol && ss_state_is_physical(r.concentrations))) {
-        r.converged = false;
-    }
+    struct Restore {
+        NetworkModel &model;
+        const std::vector<double> &state;
+        ~Restore() { model.set_state_from(state.data()); }
+    } restore{model, start};
+    // solve_by_newton already demotes a non-finite, unphysical or over-tol root.
+    SteadyStateResult r = ss_newton_from(model, rhs, opts, sub, start);
     if (r.converged) {
+        // KINSOL stops at the first iterate under tol, and along a slow mode
+        // that can be well off the root: from 40 starts each, Haugh2b, nfkb and
+        // four more nets with one steady state clustered as 2 to 5, the copies
+        // 1e-5 to 0.26 off it in some species. Newton converges quadratically
+        // from there, so a few more steps place the root; they are kept when
+        // they leave the residual no larger, which round-off can prevent.
+        SteadyStateOptions polish = opts;
+        polish.tol = opts.tol * 1e-3;
+        SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, r.concentrations, nullptr, 3);
+        if (p.residual <= r.residual && ss_state_is_physical(p.concentrations)) {
+            p.converged = true;
+            p.n_steps += r.n_steps;
+            p.n_rhs_evals += r.n_rhs_evals;
+            r = std::move(p);
+        }
         RootCertificate cert = certify_root_stability(model, rhs, opts, sub, r.concentrations);
         r.root_stability = root_stability_name(cert.verdict);
         r.eigenvalues = std::move(cert.eigenvalues);
     }
-    model.set_state_from(start.data());
     return r;
 }
 

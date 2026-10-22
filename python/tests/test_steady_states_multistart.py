@@ -10,6 +10,7 @@ dose); the bivalent ligand / receptor model has two conservation laws.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import bngsim
@@ -145,3 +146,162 @@ def test_params_and_states_pair_up_row_by_row():
     )
     assert out[0].root_stability == "stable"
     assert out[1].root_stability == "unstable"
+
+
+# ── Review of PR #1165 ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "kinetic_proofreading.net",  # a law of 8 members
+        "metapop_sir_100.net",  # one law of 300
+        "egfr_net.net",  # 5 overlapping laws
+        "Haugh2b.net",  # a row-reduced law with a negative total
+        "nfkb.net",  # laws of one member at a total of 0
+        "catalysis.net",  # $-fixed species
+    ],
+)
+def test_samples_hold_the_laws_of_a_network(name):
+    """Drawing each member below its law's total and redrawing while a
+    dependent came out negative ran out of draws on 17 of the 53 tracked ODE
+    nets, the first three here among them. It pinned at 0 a member of a law
+    whose row-reduced total was not positive, and it drew the boundary species
+    a solve holds fixed."""
+    model = bngsim.Model.from_net(_net(name))
+    y0 = np.asarray(model.get_state(), float)
+    cl = model.conservation_laws
+    L = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], model.n_species)
+    fixed = np.asarray(model._core.species_is_fixed, bool)
+    starts = _sample_on_conservation_manifold(model, 30, np.random.default_rng(0), None, None)
+    totals = L @ y0
+    np.testing.assert_allclose(
+        starts @ L.T, np.tile(totals, (30, 1)), rtol=1e-9, atol=1e-9 * np.abs(totals).max()
+    )
+    assert np.all(starts >= 0)
+    np.testing.assert_array_equal(starts[:, fixed], np.tile(y0[fixed], (30, 1)))
+    # A law of non-negative coefficients at a total of 0 holds its members at 0;
+    # every other species a start moves is drawn.
+    zero_laws = np.all(L >= 0, axis=1) & (np.abs(totals) == 0)
+    held_at_zero = (L[zero_laws] != 0).any(axis=0)
+    for i in np.flatnonzero(~fixed):
+        column = starts[:, i]
+        if held_at_zero[i]:
+            assert np.all(column == 0), model.species_names[i]
+        else:
+            assert np.unique(column).size == 30, model.species_names[i]
+
+
+def test_samples_keep_the_totals_of_the_state_the_model_holds():
+    """The solve recomputes a law's total from the state it starts in. The
+    samples kept the totals the model was loaded with, so after a set_state
+    they lay on another manifold than the one steady_state() solves on."""
+    model = bngsim.Model.from_net(_net("blbr.net"))
+    y = np.asarray(model.get_state(), float)
+    y[0] *= 2.0
+    model.set_state(y)
+    cl = model.conservation_laws
+    L = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], model.n_species)
+    assert not np.allclose(L @ y, cl["constants"])
+    starts = _sample_on_conservation_manifold(model, 20, np.random.default_rng(0), None, None)
+    np.testing.assert_allclose(starts @ L.T, np.tile(L @ y, (20, 1)), rtol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "name", ["Haugh2b.net", "nfkb.net", "wofsy_goldstein.net", "egfr_path.net"]
+)
+def test_a_one_root_network_comes_back_as_one_root(name):
+    """KINSOL stops at the first iterate under tol, which along a slow mode sat
+    1e-5 to 0.26 off the root in some species. A law's dependent species
+    carries the law's round-off: egfr_path's EGF, 5e-8 in a law over 1.8e5.
+    From 40 starts these four came back as 4, 5, 3 and 34 stable roots."""
+    model = bngsim.Model.from_net(_net(name))
+    sim = bngsim.Simulator(model, method="ode")
+    roots = sim.steady_states(n_starts=40, seed=0)
+    assert len(roots) == 1, roots
+    ref = sim.steady_state(method="newton")
+    assert ref.converged
+    ref_y = np.asarray(ref.concentrations)
+    np.testing.assert_allclose(roots.states[0], ref_y, rtol=1e-5, atol=1e-6 * np.abs(ref_y).max())
+
+
+_REFUSING_NET = """begin parameters
+    1 a 2.0
+    2 b 2.5
+    3 zz -30.0
+end parameters
+begin functions
+    1 law() mratio(a,b,zz)
+end functions
+begin species
+    1 A() 1
+end species
+begin reactions
+    1 1 0 law #_R1
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+def test_a_refusal_in_a_burst_free_solve_is_raised(tmp_path):
+    """A rate law that refuses (issue #589; mratio(2, 2.5, -30) does). The
+    burst-free solve caught the refusal and returned a result holding no state,
+    and find_steady_state read past its end: the interpreter died."""
+    path = tmp_path / "refusing.net"
+    path.write_text(_REFUSING_NET, encoding="utf-8")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode", codegen=False)
+    with pytest.raises(bngsim.SimulationError, match="mratio.*not reliable"):
+        sim.steady_state_batch(states=[[1.0]], method="newton", newton_burst=False)
+
+
+_SINK_TOGGLE_NET = """begin parameters
+    1 alpha_1     156.25
+    2 alpha_2     53.526315789473685
+    3 beta        2.5
+    4 gamma       1.0
+    5 k_deg       1.0
+    6 k_s         1.0
+end parameters
+begin functions
+    1 syn_R1() alpha_1/(1+(Obs_Tot_R2^beta))
+    2 syn_R2() alpha_2/(1+(Obs_Tot_R1^gamma))
+end functions
+begin species
+    1 R1() 0
+    2 R2() 0
+    3 S() 0
+end species
+begin reactions
+    1 0 1 syn_R1 #_R1
+    2 0 2 syn_R2 #_R2
+    3 1 0 k_deg #_R3
+    4 2 0 k_deg #_R4
+    5 0 3 k_s #_R5
+end reactions
+begin groups
+    1 Obs_Tot_R1           1
+    2 Obs_Tot_R2           2
+end groups
+"""
+
+
+def test_an_accumulator_sets_neither_the_scale_nor_the_log(tmp_path, caplog):
+    """The toggle at the saddle dose with an accumulator S beside it. Its
+    remedy is mask=~model.is_pure_sink(), but the scale probe ignored the mask,
+    integrated S to max_time and drew every start below 1e7: one root of three.
+    Unmasked, each failed start logged the same warning, 201 lines for 200."""
+    path = tmp_path / "sink_toggle.net"
+    path.write_text(_SINK_TOGGLE_NET, encoding="utf-8")
+    model = bngsim.Model.from_net(str(path))
+    sim = bngsim.Simulator(model, method="ode")
+    roots = sim.steady_states(n_starts=200, seed=0, mask=~model.is_pure_sink())
+    assert len(roots) == 3, roots
+    _row(roots, np.append(_SADDLE, 0.0))
+    with caplog.at_level(logging.WARNING, logger="bngsim"):
+        none = sim.steady_states(n_starts=50, seed=0)
+    assert len(none) == 0 and none.n_failed == 50
+    # The probe's own solve, and one line for the batch.
+    assert caplog.text.count("structural reason") == 2
+    assert caplog.text.count("in 50 of 50 batch entries") == 1
