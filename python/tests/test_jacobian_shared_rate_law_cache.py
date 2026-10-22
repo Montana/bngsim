@@ -309,13 +309,14 @@ def test_reactions_sharing_a_rate_law_spend_the_budget_once(tmp_path, monkeypatc
 
 def test_a_shared_rate_law_that_declines_still_says_why(tmp_path, monkeypatch):
     _clear_env(monkeypatch)
-    text = _NET_SHARED.replace("k*A_tot*B_tot*exp(-C_tot)/(Km+A_tot)", "k*sign(A_tot)").replace(
-        "fOther() k*C_tot/(1+D_tot)", "fOther() k*sign(A_tot)"
+    law = "k*mratio(A_tot, 1, 2)"  # no closed form in its first argument (issue #457)
+    text = _NET_SHARED.replace("k*A_tot*B_tot*exp(-C_tot)/(Km+A_tot)", law).replace(
+        "fOther() k*C_tot/(1+D_tot)", f"fOther() {law}"
     )
     m = _load("net", tmp_path, text)
     assert m.prepare_analytical_jacobian() is False
     assert m.analytical_jacobian_status.startswith(
-        "declined: rate law 'k*sign(A_tot)' applies sign"
+        f"declined: the derivative of rate law '{law}' with respect to A_tot"
     )
 
 

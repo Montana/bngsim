@@ -1425,6 +1425,34 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 if (sv.ssa_live_volume_idx0 >= 0 && sv.ssa_live_volume_idx0 < ns)
                     nv[a] *= conc[sv.ssa_live_volume_idx0] / sv.volume_factor;
             }
+            auto is_ode_only = [&](size_t a) {
+                return a < ev.assignment_ode_only.size() && ev.assignment_ode_only[a];
+            };
+            auto is_resize_rescale = [&](size_t a) {
+                return a < ev.assignment_rescale_size_expr.size() &&
+                       ev.assignment_rescale_size_expr[a] >= 0;
+            };
+            // A resize's rescale of a species that is no count (a rule target;
+            // a count's is ODE-only, below) is formed here as the ODE forms it
+            // (issue #936): base·(size before)/(size after the event's other
+            // assignments), the base being the event's own value for the
+            // species or else the species' value at execution. Read from its
+            // expression, frozen at the trigger with the event's other values,
+            // it overwrote what an event of higher priority at the same instant
+            // had just written to the species ([S] 0.867 for 1.867), and 0/0 at
+            // a resize to 0 of a species at 0 was refused as nan.
+            std::vector<std::pair<size_t, double>> rescales;
+            for (size_t a = 0; a < assigns.size(); ++a) {
+                if (is_ode_only(a) || !is_resize_rescale(a))
+                    continue;
+                const int sp = assigns[a].first;
+                if (sp < 0 || sp >= ns)
+                    continue;
+                const int b = ev.assignment_rescale_base[a];
+                const double base = b >= 0 ? nv[static_cast<size_t>(b)] : conc[sp];
+                rescales.emplace_back(a,
+                                      base * eval_ref.evaluate(ev.assignment_rescale_size_expr[a]));
+            }
             for (size_t a = 0; a < assigns.size(); ++a) {
                 // GH #81 (Tier 1): skip ODE-only assignments under SSA. The
                 // SBML loader marks the per-species `s := s·V_old/V_new`
@@ -1434,7 +1462,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 // rescale must not run (it would corrupt molecule counts). The
                 // compartment's own resize assignment is NOT ode_only, so the
                 // live volume the propensity correction reads still updates.
-                if (a < ev.assignment_ode_only.size() && ev.assignment_ode_only[a])
+                if (is_ode_only(a) || is_resize_rescale(a))
                     continue;
                 int sp_idx0 = assigns[a].first;
                 if (sp_idx0 >= 0 && sp_idx0 < ns) {
@@ -1453,6 +1481,28 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                             "; an event assignment must be a finite number");
                     store_value(sp_idx0, nv[a]);
                     sp_vec_ref[sp_idx0].concentration = conc[sp_idx0];
+                }
+            }
+            if (!rescales.empty()) {
+                model.update_observables(conc.data());
+                model.evaluate_functions(t_now);
+                for (const auto &[a, num] : rescales) {
+                    const double size = eval_ref.evaluate(ev.assignment_rescale_size_expr[a]);
+                    // An amount in no volume has no concentration: refuse it by
+                    // name, as the ODE does, rather than carry an inf (or
+                    // 0·inf) into the trajectory.
+                    if (num != 0.0 && !(std::isfinite(size) && size != 0.0)) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof buf, "' at t=%g resizes a compartment to %g",
+                                      t_now, size);
+                        throw std::runtime_error(
+                            std::string(use_psa ? "PSA" : "SSA") + ": event '" + ev.id + buf +
+                            " while a species in it holds a nonzero amount, whose concentration "
+                            "is then undefined");
+                    }
+                    const int sp = assigns[a].first;
+                    store_value(sp, num == 0.0 ? 0.0 : num / size);
+                    sp_vec_ref[sp].concentration = conc[sp];
                 }
             }
             any_fired = true;
@@ -1888,6 +1938,22 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         // continuous loop), and the trigger sweep and every event path sync
         // first.
         return t_event;
+    };
+    // Whether an output row at ts, less than sample_event_tol below a change
+    // the probe placed, comes before the change: every trigger that reads the
+    // clock still reads its recorded truth at ts itself, the discrete state
+    // held where the probe found it. The bisection places a change only to its
+    // own precision, so a row that close to it was always deferred to record
+    // the state after the event. That is right where the trigger already holds
+    // at the row (`time >= 2.5` at a row at 2.5, which fires there) and wrong
+    // where it does not yet: `time > 2.5` is false at 2.5, and ODE and
+    // libRoadRunner record that row before the event.
+    auto row_before_time_change = [&](double ts) -> bool {
+        model.evaluate_functions(ts);
+        for (int ei : time_triggers)
+            if ((eval_ref.evaluate(events[ei].trigger_expr_idx) > 0.5) != trigger_was_true[ei])
+                return false;
+        return true;
     };
 
     // Wall-clock check is hoisted out of the per-reaction hot loop with a
@@ -2539,6 +2605,30 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             ++next_output;
         };
 
+        // The triggers the panel's probe watches: with rate rules any trigger
+        // may read a target that moves; without, only one that reads the clock
+        // can change between firings.
+        std::vector<int> all_triggers;
+        if (m > 0)
+            for (int ei = 0; ei < n_events; ++ei)
+                all_triggers.push_back(ei);
+        const std::vector<int> &watched = m > 0 ? all_triggers : time_triggers;
+        // Whether row tk = tp + th·hh, less than sample_event_tol below an event
+        // the probe placed, comes before it: every watched trigger still reads
+        // its recorded truth at tk, on the dense y (row_before_time_change,
+        // for this loop).
+        auto row_before_event = [&](double th, double tk) -> bool {
+            if (m > 0) {
+                dense_y(th, ytmp.data());
+                load_y(ytmp.data());
+            }
+            sync_state(tk);
+            for (int ei : watched)
+                if ((eval_ref.evaluate(events[ei].trigger_expr_idx) > 0.5) != trigger_was_true[ei])
+                    return false;
+            return true;
+        };
+
         auto draw_exp = [&]() {
             double r1 = next_u01();
             while (r1 == 0.0)
@@ -2847,12 +2937,6 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 probe_prev.assign(trigger_was_true.begin(), trigger_was_true.end());
                 probe_cur.assign(static_cast<std::size_t>(n_events), 0);
                 double th_prev = th0;
-                // With rate rules any trigger may read a target that moves.
-                std::vector<int> all_triggers;
-                if (m > 0)
-                    for (int ei = 0; ei < n_events; ++ei)
-                        all_triggers.push_back(ei);
-                const std::vector<int> &watched = m > 0 ? all_triggers : time_triggers;
                 for (int q = 1; q <= 4 && th_ev > 1.0; ++q) {
                     const double thq = q == 4 ? 1.0 : th0 + (1.0 - th0) * 0.25 * q;
                     if (m > 0) {
@@ -2888,11 +2972,14 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             const double s_cut = th_cut >= 1.0 ? s1 : tp + th_cut * hh;
 
             // Rows strictly before the change (a row within bisection precision
-            // of an event records the post-event state, as the old loop did).
+            // of an event records the post-event state, as the old loop did,
+            // unless no trigger has changed at the row yet).
             while (next_output < n_out) {
                 const double tk = t_out[next_output];
-                const bool before = event_first ? tk < s_cut - sample_event_tol(s_cut)
-                                                : (fire_first ? tk < s_cut : tk <= s1);
+                const bool before = event_first
+                                        ? tk < s_cut - sample_event_tol(s_cut) ||
+                                              (tk < s_cut && row_before_event((tk - tp) / hh, tk))
+                                        : (fire_first ? tk < s_cut : tk <= s1);
                 if (!before)
                     break;
                 record_at(tk, (tk - tp) / hh);
@@ -3057,9 +3144,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     // Only the time: the batch is taken from every trigger below.
                     const double t_event_idle = probe_events_in_window(t, t_lim);
                     if (std::isfinite(t_event_idle) && t_event_idle <= t_lim) {
-                        // Record any samples strictly before t_event_idle.
-                        while (next_output < n_out && t_event_idle > t_out[next_output] &&
-                               t_out[next_output] < t_event_idle - sample_event_tol(t_event_idle)) {
+                        // Record any samples strictly before t_event_idle, a
+                        // row within the tolerance below it as step 5 below
+                        // decides.
+                        while (
+                            next_output < n_out && t_event_idle > t_out[next_output] &&
+                            (t_out[next_output] < t_event_idle - sample_event_tol(t_event_idle) ||
+                             row_before_time_change(t_out[next_output]))) {
                             const double *cc = conc.data();
                             model.update_observables(cc);
                             for (int j = 0; j < n_obs; ++j) {
@@ -3172,9 +3263,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             //    defer that sample so it records post-event state on the next
             //    iteration — matches ODE rootfind semantics. The tolerance is
             //    several orders wider than bisect_tol so a legitimate sample
-            //    strictly before t_event is still recorded pre-event.
+            //    strictly before t_event is still recorded pre-event. A sample
+            //    within it at which no trigger has changed yet is before the
+            //    event all the same (row_before_time_change).
             while (next_output < n_out && t_advance >= t_out[next_output]) {
-                if (event_wins && t_out[next_output] >= t_event - sample_event_tol(t_event))
+                const double ts = t_out[next_output];
+                if (event_wins && ts >= t_event - sample_event_tol(t_event) &&
+                    !(ts < t_event && row_before_time_change(ts)))
                     break;
                 const double *cc = conc.data();
                 model.update_observables(cc);

@@ -345,15 +345,17 @@ TOL_OVERRIDES: dict[str, dict] = {
     # Verified per model: n_real(sweep) > 0, n_real(1e-10/1e-16) == 0. The
     # documented `eco_coevolution_host_parasite` analog from bng_parity.
     "BIOMD0000000374:ode": {
-        "rtol": 1e-10,
+        "rtol": 1e-12,
         "atol": 1e-16,
         "reason": (
             "Tolerance artifact (both engines converge when tightened). At the "
             "shared sweep tol the calcium oscillator's 'n'/'V_membrane' diverge "
-            "~9% peak-relative (worst reldiv 0.093); at 1e-10/1e-16 (applied to "
-            "BOTH engines) the divergence collapses below the gate (zero real "
-            "columns) -> PASS. Property of the stiff limit-cycle IVP, not a "
-            "loader divergence."
+            "~9% peak-relative (worst reldiv 0.093). At 1e-10/1e-16 that is gone "
+            "from the magnitude gates, but one spike of 'n' (t=36240) still differs "
+            "by 1.2e-2 of its range, past the #873 movement ceiling: RoadRunner is "
+            "1.0e-2 off its own 1e-12 run there, bngsim 1.4e-3. At 1e-12/1e-16 (both "
+            "engines) the worst cell is 2.2e-4 of the range -> PASS. Property of the "
+            "stiff limit-cycle IVP, not a loader divergence."
         ),
     },
     "BIOMD0000000876:ode": {

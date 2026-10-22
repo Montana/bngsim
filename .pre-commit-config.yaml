@@ -134,14 +134,22 @@ repos:
         # that hasn't run `uv sync` yet gets a clear uv error, not a cryptic one.
         #
         # ci/pre_push_pytest.py runs the whole of python/tests under pytest-xdist,
-        # one file per worker: 44m29s serially, 4m42s on 12 workers, same result
+        # work stealing: 44m29s serially, under 5 minutes on 12 workers, same result
         # (2026-10-18). From a worktree it uses the main checkout's test cache.
         # BNGSIM_PREPUSH_WORKERS=0 runs it serially; the script's docstring has
         # the rest.
+        #
+        # A push that changes only files the suite never reads (changelog.d/,
+        # LICENSE and a few others, listed in the script) skips the suite. The
+        # script decides that from the pushed range, not `files:`/`exclude:`
+        # here: pre-commit drops deleted paths before it matches a hook's
+        # patterns, and the top-level exclude hides third_party/ from every
+        # hook, so a pattern here would let "delete a test file, add a
+        # fragment" or a re-vendor skip the suite. Hence `always_run`.
         entry: uv run --no-sync python ci/pre_push_pytest.py
         language: system
         pass_filenames: false
-        files: ^.
+        always_run: true
         stages: [pre-push]
 
       # ─── Manual-stage local-CI hooks ─────────────────────────────────

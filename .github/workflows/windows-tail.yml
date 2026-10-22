@@ -253,6 +253,7 @@ jobs:
             python/tests/test_compartment_size_write.py \
             python/tests/test_codegen_cache_key.py \
             python/tests/test_codegen_structural_key.py \
+            python/tests/test_codegen_key_stream.py \
             python/tests/test_codegen_shard_compile.py \
             python/tests/test_codegen_sens_obs_func.py \
             python/tests/test_codegen_sens_term_scale.py \

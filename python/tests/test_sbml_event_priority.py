@@ -87,3 +87,20 @@ def test_fractional_vs_integer_priority_orders_correctly():
         _event("Elo", '<cn type="integer">2</cn>', 20) + _event("Ehi", "<cn>2.5</cn>", 10)
     )
     assert _final_w(sbml) == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [
+        ('<cn type="e-notation">1<sep/>10</cn>', '<cn type="e-notation">2<sep/>10</cn>'),
+        ('<cn type="e-notation">-3<sep/>9</cn>', '<cn type="integer">0</cn>'),
+        ('<cn type="integer">0</cn>', '<cn type="e-notation">1<sep/>308</cn>'),
+    ],
+    ids=["1e10 and 2e10", "-3e9 and 0", "0 and 1e308"],
+)
+def test_an_integer_priority_past_a_c_int_orders_correctly(low, high):
+    """An integer priority past a C int took the int field and failed the load
+    with pybind11's "incompatible function arguments". It is a double now, as a
+    fractional one is: Ehi executes first, Elo last, w = 20."""
+    sbml = _sbml(_event("Elo", low, 20) + _event("Ehi", high, 10))
+    assert _final_w(sbml) == pytest.approx(20.0)

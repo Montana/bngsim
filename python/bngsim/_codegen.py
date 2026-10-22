@@ -296,7 +296,11 @@ _compile_counter = itertools.count()
 # a singular power that has no comoving case (bngsim_codegen_edge_without_case),
 # and the solver refuses their columns. A cached v40 .so does not say, and such
 # a column would keep coming back plain, up to 12% off. Invalidate v40.
-_CODEGEN_VERSION = "41"
+# v42: lanl/bngsim #540 — a condition with an if() in it parses to the ITE
+# chain without sympy's set theory, so its emitted text changes (to the same
+# values), and a law that ran past the derivation budget on it now derives.
+# A cached v41 .so would keep the old text, or no derivative. Invalidate v41.
+_CODEGEN_VERSION = "42"
 
 
 # Modules whose *source* determines the emitted C. ``_codegen`` holds the
@@ -1164,6 +1168,9 @@ def _shard_value_lines(
 # ─── Expression scanning ────────────────────────────────────────────────
 
 
+_PAREN = re.compile(r"[()]")
+
+
 def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     """Return the index of the ')' that matches '(' at ``expr[open_pos]``,
     or -1 if the parens are unbalanced.
@@ -1173,18 +1180,19 @@ def _find_close_paren_strict(expr: str, open_pos: int) -> int:
     unbalanced input so the caller can keep slicing. The callers here (the
     derived-expression and switch-condition parsers, the JAX translator) need to
     fail loudly instead, hence the separate function.
+
+    It visits the parentheses alone: an inlined min() of two assignment rules
+    runs to 11k characters, and a visit per character cost the state-switch
+    scan 45 ms on BIOMD0000000385 (issue #1068).
     """
     depth = 1
-    i = open_pos + 1
-    while i < len(expr):
-        c = expr[i]
-        if c == "(":
+    for m in _PAREN.finditer(expr, open_pos + 1):
+        if m.group() == "(":
             depth += 1
-        elif c == ")":
+        else:
             depth -= 1
             if depth == 0:
-                return i
-        i += 1
+                return m.start()
     return -1
 
 
@@ -8204,7 +8212,10 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "Forward sensitivity: %s, so the analytic sensitivity RHS is declined for "
         "this model and CVODES' internal difference quotient is used instead "
         "(correct, but slower, where every rate law is continuous in the state along "
-        "the run. A time course is refused for the jumps that are found in the rate "
+        "the run, though a column can still be wrong where a min(), max(), abs() or "
+        "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
+        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
+        "for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -11341,10 +11352,13 @@ def _analyze_output_sens(model) -> dict:
     loudly rather than silently dropping the term).
 
     Returns a dict with ``decline`` (non-None ⇒ the whole codegen is declined,
-    mirroring :func:`generate_outputs_from_model`'s rateOf / embedded-tfun /
-    no-function declines), ``func_infos`` (per-function ``{name, supported,
-    reason, partials}`` in declaration order), and the emitter context. **Treat
-    the returned dict as read-only** — every caller now shares one instance.
+    mirroring :func:`generate_outputs_from_model`'s embedded-tfun / no-function
+    declines), ``func_infos`` (per-function ``{name, supported, reason,
+    partials}`` in declaration order), and the emitter context. **Treat the
+    returned dict as read-only** — every caller now shares one instance.
+
+    A function that reads ``rateOf`` is unsupported on its own, and so is one
+    that depends on it; the rest of the model is not declined (issue #787).
 
     Memoized on the model (GH #97) for cost *and* for correctness. Both callers
     above run it, so a sensitivity workflow paid it twice — 85.7 s twice on the
@@ -11426,15 +11440,14 @@ def _compute_output_sens_analysis(model, core) -> dict:
 
     if n_func == 0:
         return {"decline": "model has no global functions", "func_infos": [], **base}
-    # rateOf needs the live dx/dt buffer the RHS's probe passes publish; an
-    # output-point evaluation has none — the value codegen declines here too, so
-    # the internal obs[]/func[] recomputation cannot be emitted standalone.
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
-        return {
-            "decline": "model uses rateOf (live derivatives unavailable at an output point)",
-            "func_infos": [],
-            **base,
-        }
+    # rateOf needs the live dx/dt buffer the RHS's probe passes publish, and an
+    # output-point evaluation has none. That is a fact about the functions that
+    # read a rate, not about the model, so only they are unsupported (below),
+    # with every function that depends on them. A whole-model decline took the
+    # rest with them: the §8c dilution term of a concentration in a compartment
+    # whose size an assignment rule moves reads the rate of what the rule reads
+    # (issue #1052), so `C := 1 + P` with a concentration in C had no
+    # sensitivity for any expression, C's own size included (issue #787).
 
     # Whole-body tfun functions dispatch through data->tfun_eval (a *value*
     # callback only; table functions are intentionally not differentiated, so
@@ -11565,6 +11578,17 @@ def _compute_output_sens_analysis(model, core) -> dict:
                     "status": "unsupported",
                     "reason": "table-function output sensitivities are not supported "
                     "(table functions are not differentiated)",
+                    "partials": None,
+                }
+            )
+            continue
+        if _RATEOF_PREFIX in f["expression"]:
+            func_infos.append(
+                {
+                    "name": name,
+                    "status": "unsupported",
+                    "reason": "it reads rateOf, and the live derivatives it needs are "
+                    "not available at an output point",
                     "partials": None,
                 }
             )
@@ -11757,9 +11781,12 @@ def generate_output_sens_from_model(model) -> str | None:
     and value never diverge.
 
     Returns ``None`` (⇒ no symbol; expression selectors raise) when
-    :func:`_analyze_output_sens` declines (no functions / rateOf / embedded tfun).
+    :func:`_analyze_output_sens` declines (no functions / embedded tfun).
     Unsupported functions are emitted with a ``NaN`` sentinel so a result is never
-    silently wrong; the Result raises the targeted reason at selection time.
+    silently wrong; the Result raises the targeted reason at selection time. A
+    function that reads ``rateOf`` is one of them: its value is recomputed here
+    with each rate read as ``NAN``, since there is no live derivative to read,
+    and no supported function reads that value (issue #787).
     """
     analysis = _analyze_output_sens(model)
     if analysis["decline"] is not None:
@@ -11786,12 +11813,21 @@ def generate_output_sens_from_model(model) -> str | None:
 
     av_factor, av_param = _amount_volume_factors(species)
 
-    # Value recomputation (same emitters as the RHS / value codegen).
+    # Value recomputation (same emitters as the RHS / value codegen). A rate
+    # (rateOf) is read as NAN: the function that reads one is unsupported, and
+    # so is every function whose derivative would read its value, so the NAN
+    # reaches no row that is not NaN already. Left as it is, the token is an
+    # undeclared name in C.
     obs_value_lines = (
         _emit_observable_lines(observables, av_factor, av_param) if observables else []
     )
+    no_rates = (
+        {f"{_RATEOF_PREFIX}{s['name']}": "NAN" for s in species}
+        if any(_RATEOF_PREFIX in f["expression"] for f in functions)
+        else None
+    )
     func_value_lines = _emit_function_lines(
-        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, None
+        functions, tfun_call_by_name, param_map, species_map, obs_map, func_map, no_rates
     )
 
     # Parameter-axis contributions, grouped by the differentiated parameter index
@@ -12042,7 +12078,7 @@ def _canon_update(h, obj) -> None:
         raise TypeError(f"codegen cache key cannot serialize {type(obj).__name__}")
 
 
-# The value the model-based cache key deliberately drops. Everything else
+# The values the model-based cache key deliberately drops. Everything else
 # codegen_data() carries is structure the emitters read; a parameter's current
 # VALUE is not — the whole design of the generated C is that parameters are read
 # from the runtime ``p[]`` array rather than baked as literals (see this module's
@@ -12050,10 +12086,52 @@ def _canon_update(h, obj) -> None:
 # Dropping it is what makes the key stable across a parameter scan; the one path
 # by which a value *can* still reach the emitted source — the issue #68
 # switch-condition gate — is carried as a verdict by switch_gate_cache_digest.
-_CODEGEN_KEY_DROPPED_PARAM_FIELDS = ("value",)
 # A declared initialAmount is exported for make_subset_model; no emitter reads
 # it, and as a value it would split one source into a key per initial condition.
+#
+# The core's ``codegen_key_stream`` leaves the same two out (issue #820); these
+# are what :func:`_codegen_key_stream_reference` leaves out, and the test that
+# holds the two streams equal holds the two lists equal.
+_CODEGEN_KEY_DROPPED_PARAM_FIELDS = ("value",)
 _CODEGEN_KEY_DROPPED_SPECIES_FIELDS = ("initial_amount",)
+
+
+class _ByteSink:
+    """A stand-in for a hasher that keeps what it is fed."""
+
+    __slots__ = ("parts",)
+
+    def __init__(self) -> None:
+        self.parts: list[bytes] = []
+
+    def update(self, b: bytes) -> None:
+        self.parts.append(bytes(b))
+
+
+def _codegen_key_stream_reference(core) -> bytes:
+    """The bytes the structural key hashes for the model's structure, made by
+    walking the accessors' Python dicts (the key's own route before issue #820).
+
+    The core writes the same bytes from its own walk (``codegen_key_stream``),
+    about 30 times faster on a large model (0.1 s against 3.4 s at 58k
+    reactions; this walk is slower than the key's own was, since it keeps the
+    bytes rather than feeding a hasher), and this is kept as what
+    that is checked against; it is also the key's route on a core without it.
+    """
+    data = dict(core.codegen_data())
+    data["parameters"] = [
+        {k: v for k, v in p.items() if k not in _CODEGEN_KEY_DROPPED_PARAM_FIELDS}
+        for p in data["parameters"]
+    ]
+    data["species"] = [
+        {k: v for k, v in sp.items() if k not in _CODEGEN_KEY_DROPPED_SPECIES_FIELDS}
+        for sp in data["species"]
+    ]
+    sink = _ByteSink()
+    _canon_update(sink, data)
+    _canon_update(sink, core.codegen_jacobian_plan())
+    _canon_update(sink, core.functional_jacobian_context())
+    return b"".join(sink.parts)
 
 
 def compute_model_codegen_hash(
@@ -12101,32 +12179,30 @@ def compute_model_codegen_hash(
     from bngsim._switch_sensitivity import switch_gate_cache_digest
 
     core = model._core if hasattr(model, "_core") else model
-    data = dict(core.codegen_data())
-    data["parameters"] = [
-        {k: v for k, v in p.items() if k not in _CODEGEN_KEY_DROPPED_PARAM_FIELDS}
-        for p in data["parameters"]
-    ]
-    data["species"] = [
-        {k: v for k, v in sp.items() if k not in _CODEGEN_KEY_DROPPED_SPECIES_FIELDS}
-        for sp in data["species"]
-    ]
-    ctx = core.functional_jacobian_context()
-    plan = core.codegen_jacobian_plan()
+    # Written by the core from the walk that builds the three accessors' dicts
+    # (issue #820), so a field of theirs the generator reads cannot be missing
+    # from it. Walking the dicts here instead cost ~40 Python-level steps a
+    # reaction. A throw from the core is not caught here: the callers key on the
+    # generated source instead (#174's fallback).
+    key_stream = getattr(core, "codegen_key_stream", None)
+    stream = key_stream() if key_stream is not None else _codegen_key_stream_reference(core)
 
     # RESOLVED decisions, not the raw hatches: BNGSIM_NO_CODEGEN_JAC changes
     # nothing for a model whose analytical Jacobian is not complete anyway, and
     # a chunking threshold changes nothing for a model below it. Folding the raw
     # env in would split those into two keys for one source — a cache miss, not a
-    # collision, but a free one to avoid.
-    want_jac = bool(plan["available"]) and os.environ.get("BNGSIM_NO_CODEGEN_JAC") != "1"
-    chunk = _should_chunk(len(data["reactions"]))
+    # collision, but a free one to avoid. (The plan's ``available`` is
+    # ``analytical_jacobian_complete``, and codegen_data() has a reaction per
+    # reaction.)
+    want_jac = (
+        bool(core.analytical_jacobian_complete) and os.environ.get("BNGSIM_NO_CODEGEN_JAC") != "1"
+    )
+    chunk = _should_chunk(core.n_reactions)
 
     h = hashlib.sha256()
     h.update(_CODEGEN_CACHE_KEY.encode())
     h.update(b"\0model_structural_v1\0")
-    _canon_update(h, data)
-    _canon_update(h, plan)
-    _canon_update(h, ctx)
+    h.update(stream)
     # Two booleans, not one. Until #217 they could be collapsed into the single
     # conjunction ``emit and enabled``, because "nobody asked" and "the GH #67
     # hatch is set" both emitted the same source: no Functional ∂f/∂p, and an
@@ -12147,7 +12223,7 @@ def compute_model_codegen_hash(
             _chunk_block_size() if chunk else None,
         ),
     )
-    _canon_update(h, switch_gate_cache_digest(core, ctx))
+    _canon_update(h, switch_gate_cache_digest(core))
     return h.hexdigest()[:16]
 
 

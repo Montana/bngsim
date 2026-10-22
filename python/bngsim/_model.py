@@ -111,6 +111,7 @@ class Model:
         "_varvol_amount_map",
         "_varvol_ar_conc_map",
         "_varvol_ar_amount_map",
+        "_varvol_target_amount_map",
         "_varvol_event_resize_map",
         "_periodic_disc_max_step",
         "_time_disc_conditions",
@@ -268,12 +269,22 @@ class Model:
         # conc·V_live(t); the concentration column is already correct. Empty for
         # .net, static, and AR-compartment-free models. See _sbml_loader.py.
         self._varvol_ar_amount_map: dict[str, str] = {}
+        # Populated by the SBML loader (issue #728): a concentration species that
+        # a rate rule or an assignment rule sets, in a compartment a rate rule, an
+        # assignment rule or an event sizes, mapped to ``(kind, column)``: where
+        # its live size is read, ``"species"``, ``"expression"`` or
+        # ``"observable"``. Its column holds the rule's concentration under every
+        # method, so its amount is that times V_live(t).
+        # Simulator._apply_varvol_target_amount_map records V_live(t) for
+        # Result.as_roadrunner's bare-id selector.
+        self._varvol_target_amount_map: dict[str, tuple[str, str]] = {}
         # Populated by the SBML loader (GH #131): maps a mangled species name in
         # an EVENT-RESIZED compartment to ``(comp_obs_name, V_static, hOSU)``.
         # Simulator._apply_varvol_event_resize_map applies the report-time
         # concentration correction ``× V_static/V_live`` — for every hOSU=true
         # species (both ODE and SSA) and for hOSU=false species under SSA only —
-        # reading V_live from the compartment's same-named observable column.
+        # reading V_live from the compartment's same-named observable column. A
+        # concentration species a rule sets is left to _varvol_target_amount_map.
         # Empty for .net, static, and event-resize-free models. See _sbml_loader.py.
         self._varvol_event_resize_map: dict[str, tuple[str, float, bool]] = {}
         # Populated by the SBML loader (GH #88): a recommended integrator
@@ -1006,7 +1017,10 @@ class Model:
         times the state decides, so no stop can be placed at them before the
         run. :meth:`Simulator.run` registers each one as a CVODE root instead,
         which stops the step at the crossing rather than letting it span a
-        narrow window and miss it.
+        narrow window and miss it. A step or bend call over state, such as
+        ``floor(T/100)`` or ``max(0, 1 - abs(T-50)/w)``, is rooted where it
+        jumps or bends, since it spells the same pulse with no comparison
+        (issue #1068).
 
         The crossings :meth:`time_discontinuity_conditions` already covers are
         left out, and so is every condition in a function that no rate law
@@ -1031,7 +1045,10 @@ class Model:
                 try:
                     from bngsim._switch_sensitivity import state_switch_root_conditions
 
-                    roots = state_switch_root_conditions(self._core, covered=covered)
+                    roots, guards = state_switch_root_conditions(
+                        self._core, covered=covered, with_guards=True
+                    )
+                    _remember(self._state_switch_root_memo, ("guards", covered), guards)
                 except Exception as e:  # pragma: no cover - defensive
                     # Detection is best-effort: without it a model keeps the
                     # stepping it had before issue #897, which is correct
@@ -1049,6 +1066,58 @@ class Model:
             self._state_switch_root_conditions = roots
             self._state_switch_root_covered = covered
         return self._state_switch_root_conditions
+
+    def _state_switch_guards_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """Parallel to :meth:`_state_switch_roots_beside`: for each root, the
+        ``if()`` branches it switches a rate law in, as an expression that reads
+        1 where one of them is on, or ``""`` where it switches one outside any
+        branch (issue #1147). A plain run steps on through a crossing whose
+        every branch is off."""
+        roots = self._state_switch_roots_beside(covered)
+        guards = self._state_switch_root_memo.get(("guards", covered))
+        if guards is None and roots:
+            # The memo is shared with clones and cleared whole at its cap
+            # (_remember), which can take the guards while this model still
+            # holds its roots. Every later run would then restart at the
+            # crossings the guards step through, so derive them again.
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                again, guards = state_switch_root_conditions(
+                    self._core, covered=covered, with_guards=True
+                )
+            except Exception:  # pragma: no cover - defensive, as for the roots
+                guards = None
+            else:
+                if tuple(again) == tuple(roots):
+                    _remember(self._state_switch_root_memo, ("guards", covered), guards)
+                else:
+                    guards = None
+        if guards is None or len(guards) != len(roots):
+            return ("",) * len(roots)
+        return guards
+
+    def _state_switch_stops_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """The roots :meth:`_state_switch_roots_beside` has for step and bend
+        calls, which a run with sensitivities adds as stops (issue #1068).
+        Kept in the same memo, beside the same ``covered``."""
+        key = ("calls", covered)
+        stops = self._state_switch_root_memo.get(key)
+        if stops is None:
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                stops = state_switch_root_conditions(self._core, covered=covered, calls_only=True)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "State-switch root detection failed (%s); a rate law with a step or bend "
+                    "call over model state will be integrated with sensitivities and "
+                    "without a root where the call jumps or bends (issue #1068).",
+                    e,
+                )
+                stops = ()
+            _remember(self._state_switch_root_memo, key, stops)
+        return stops
 
     def table_function_breaks(self) -> list:
         """Where the model's table functions break (issue #709): for each table
@@ -1244,6 +1313,7 @@ class Model:
         m._varvol_amount_map = dict(self._varvol_amount_map)
         m._varvol_ar_conc_map = dict(self._varvol_ar_conc_map)
         m._varvol_ar_amount_map = dict(self._varvol_ar_amount_map)
+        m._varvol_target_amount_map = dict(self._varvol_target_amount_map)
         m._varvol_event_resize_map = dict(self._varvol_event_resize_map)
         m._periodic_disc_max_step = self._periodic_disc_max_step
         m._time_disc_conditions = self._time_disc_conditions

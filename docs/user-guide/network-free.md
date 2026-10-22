@@ -150,10 +150,21 @@ NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
 one when the simulator or session is built, naming the function (issue #862).
 Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
 NFsim runs a table function indexed by time, on **time elapsed since
-`t_start`**, as BNG2.pl's `simulate_nf` does, and refreshes its value only when
-a reaction fires. So a rate that is 0 at the start, or that changes while
-nothing fires, is not seen until something does, and until then the run is flat
-(issue #892).
+`t_start`**, as BNG2.pl's `simulate_nf` does. It reads the table again at each
+of the table's x values, whether or not a reaction has fired, and draws the next
+waiting time from there. That is exact for a step table (`method=>"step"`): a
+rate that is 0 at the start turns on at the step that turns it on (issue #892).
+A linear table changes between those reads, and NFsim would hold the value it
+last read, so where little fires the run would lag the ramp: with 100 `X(p~1)`
+leaving at a rate that rises from 0 at t = 0 to 10 at t = 1, none would have
+left by t = 1, where about 70 have left by t = 0.5. So `method="nf"` refuses a
+model whose rate laws read a linear table indexed by time, directly or through
+the functions they call, and names the tables (issue #1179). Use `method="rm"`,
+which integrates the ramp, or `method="ssa"` on the generated network. To stay
+on NFsim, make the table a step on a grid fine enough for the ramp, each step
+holding the ramp's value at its middle: steps of a tenth of the ramp matched the
+exact mean within sampling noise. A linear table that no rate law reads is
+not refused; NFsim reads it correctly at each output time.
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
@@ -221,6 +232,21 @@ it dropped a `Hill` rule silently, and it stops the load on `Sat`. Energy
 patterns with no `Arrhenius` rule change no rate and still run. Simulate such a
 model's generated network with `method="ode"` or `method="ssa"`.
 
+### Compartment models
+
+NFsim refuses a model that declares compartments, naming them. Its compartment
+support ran such models wrong without an error, in ways no check of the XML can
+bound: it ignored a species-level compartment on a pattern (`@EC:A()` matched
+every compartment, RuleWorld/nfsim#106); applied no volume factor to a rule with
+two or more reactants or to synthesis spanning compartments (#108); gave no
+compartment to a molecule a rule creates with none written (#109); put every
+molecule of a seed complex in the species' compartment, bound molecules in
+compartments that do not touch, and moved a whole complex on `MoveConnected`
+(#110). BNG2.pl's `writeXML` also drops `NumberPerQuantityUnit`
+(RuleWorld/bionetgen#348), so even a careful check could not see it. Issue #1067
+lifts the refusal once the fixes are vendored; until then simulate a compartment
+model's generated network with `method="ode"` or `method="ssa"`.
+
 ### Functions that read an observable outside their argument
 
 In `fA(x) = k*(1+AC(x))*(1+0.01*MAB)`, `AC(x)` is read through the function's
@@ -276,12 +302,11 @@ On both, a result's `solver_stats["n_steps"]` counts the events since
 `initialize`, not the segment's alone.
 
 On NFsim, a `set_param` reaches every rate constant, Michaelis-Menten `kcat` and
-`Km`, and function, before or after `initialize()`, but not a compartment's
-size. BioNetGen writes the size into the XML as a number, so a write to the
-parameter behind it (`Vc` in `c 3 Vc`) changes `get_parameter('Vc')` and leaves
-the model at the old volume: a zero-order synthesis into `c` keeps its old rate
-(issue #1061, waiting on RuleWorld/bionetgen#347 and RuleWorld/nfsim#105). To
-change a volume, regenerate the XML from BNGL at the new value.
+`Km`, and function, before or after `initialize()`. NFsim refuses a compartment
+model (see "Compartment models" above); once that refusal is lifted, note that
+a write to a compartment-size parameter does not reach the model either, since
+BioNetGen writes the size into the XML as a number (issue #1061, waiting on
+RuleWorld/bionetgen#347 and RuleWorld/nfsim#105).
 
 **PyBNF integration**: When `bngsim` is installed, `method=>"nf"` / `"nfsim"`
 routes through the in-process NFsim backend, and `method=>"rm"` / `"rulemonkey"`

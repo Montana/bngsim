@@ -241,26 +241,6 @@ class NetworkModel {
     // Empty when event_trigger_residual_expr() is -1.
     const std::vector<int> &event_trigger_residual_species(int event_idx0) const;
 
-    // What that residual reads, with a rateOf accessor kept apart from the
-    // species it names: `species_out` the species named (directly, through an
-    // observable, or through the function or expression behind a parameter),
-    // `rateof_out` the species whose rateOf is read. Where
-    // event_trigger_residual_species() answers "every species" for a rateOf
-    // accessor, this says which one. False when the residual reads something
-    // that is none of these, or when event_trigger_residual_expr() is -1: the
-    // caller must then assume every species.
-    bool event_trigger_residual_reads(int event_idx0, std::vector<int> &species_out,
-                                      std::vector<int> &rateof_out) const;
-
-    // For each species, the species whose rateOf its derivative reads, through
-    // the rate laws of the reactions that change it (a rate rule is one). The
-    // Jacobian's pattern has no entry for these: `S' = rateOf(A); A' = B` has
-    // none for S against B. Null when that cannot be said of some rate law, or
-    // of something else the model evaluates, and the caller must assume that
-    // any derivative reads any rateOf. Empty lists throughout in a model with
-    // no rateOf.
-    const std::vector<std::vector<int>> *derivative_rateof_reads() const;
-
     // How deep rateOf is nested, over the species whose rateOf is read at
     // all: 0 where none of their derivatives reads a rateOf, 1 for
     // `S' = rateOf(A)` with a rateOf(S) somewhere, and so on (a few where it
@@ -396,6 +376,13 @@ class NetworkModel {
     // event_trigger_reads_time takes (issue #908)? Never by probing values: a
     // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
     bool state_switch_reads_time(const StateSwitch &sw) const;
+
+    // The evaluator expression id of *expression_src*, compiled into this
+    // model's evaluator the first time it is asked for and the same id after
+    // (issue #1147: a run's state-switch guards, compiled on every run, grew the
+    // evaluator by one expression per guard per run). Cached by source text and,
+    // like state_switch(), NOT copied by clone(). Throws as compile() does.
+    int compiled_expression(const std::string &expression_src) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
@@ -928,8 +915,8 @@ class NetworkModel {
     // species its reaction does not change takes nothing of the rate
     // (compute_derivs_core).
     void refresh_rateof_derivs_once_(double t, const double *conc);
-    // Fills, once and under a mutex, what derivative_rateof_reads(),
-    // rateof_nesting() and rateof_flow_nesting() answer from.
+    // Fills, once and under a mutex, what rateof_nesting() and
+    // rateof_flow_nesting() answer from.
     void ensure_rateof_reads_() const;
     // What the expressions `groups[k]` read between them, for each k: the
     // species named and the species whose rateOf is read. `known[k]` false

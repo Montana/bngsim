@@ -1126,6 +1126,7 @@ def make_subset_model(
         "_varvol_amount_map",
         "_varvol_ar_conc_map",
         "_varvol_ar_amount_map",
+        "_varvol_target_amount_map",
         "_varvol_event_resize_map",
     ):
         setattr(sub, attr, dict(getattr(m, attr, {}) or {}))
