@@ -151,7 +151,7 @@ def test_a_diamond_over_a_hill_term_at_zero_attaches_its_jacobian(tmp_path):
     path = tmp_path / "hill_diamond.net"
     path.write_text(_HILL_NET.format(functions="\n".join(lines)))
     model = bngsim.Model.from_net(str(path))
-    func_map = dict(zip(model._core.function_names, model._core.function_expressions))
+    func_map = dict(zip(model._core.function_names, model._core.function_expressions, strict=True))
     assert J._inlined_length(func_map["rate"], func_map) > J._INLINE_TEXT_LIMIT
     assert model.prepare_analytical_jacobian() is True, model.analytical_jacobian_status
     for s in (0.0, 0.5, 2.0):
@@ -160,7 +160,9 @@ def test_a_diamond_over_a_hill_term_at_zero_attaches_its_jacobian(tmp_path):
         fd = (np.asarray(model.rhs(y + h)) - np.asarray(model.rhs(np.maximum(y - h, 0.0)))) / (
             h + min(h, s)
         )
-        np.testing.assert_allclose(np.asarray(model.jacobian(y))[0, 0], fd[0], rtol=1e-5, atol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(model.jacobian(y))[0, 0], fd[0], rtol=1e-5, atol=1e-12
+        )
 
 
 def test_a_law_past_the_limit_that_prints_no_shorter_keeps_the_text():
@@ -172,7 +174,11 @@ def test_a_law_past_the_limit_that_prints_no_shorter_keeps_the_text():
 
     path = Path(__file__).resolve().parents[2] / "benchmarks/sbml_events/BIOMD0000000628.xml"
     model = bngsim.Model.from_sbml(str(path))
-    func_map = dict(zip(model._core.function_names, model._core.function_expressions))
-    over = [b for b in func_map.values() if (J._inlined_length(b, func_map) or 0) > J._INLINE_TEXT_LIMIT]
+    func_map = dict(zip(model._core.function_names, model._core.function_expressions, strict=True))
+    over = [
+        b
+        for b in func_map.values()
+        if (J._inlined_length(b, func_map) or 0) > J._INLINE_TEXT_LIMIT
+    ]
     assert over
     assert all(J._compact_inlined(body, func_map) is None for body in over)
