@@ -338,6 +338,14 @@ def humanize_comment(result: dict) -> str:
         )
         if m:
             n_sp, n_fail, n_cells, n_hard, _n_soft, n_forg = (int(x) for x in m.groups())
+            if "NO SIGNAL" in part and outcome == "PASS":
+                # Issue #873: a frozen engine would have matched it too. On a DIFF
+                # the tallies below are the news, and there was no agreement.
+                out.append(
+                    "No species moves in either engine, so agreement says nothing "
+                    "about the dynamics."
+                )
+                continue
             if n_fail == 0 and outcome == "PASS":
                 continue  # clean pass — say nothing
             seg = (

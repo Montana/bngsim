@@ -1134,6 +1134,13 @@ struct SensitivityOptions {
     // jump the pre-#763 test reads, and that the listed reactions do not account
     // for, is judged as before: the list has missed a reaction.
     std::vector<std::vector<int>> state_switch_reactions;
+    // Issue #959: conditions over model state that a plain run watches for a
+    // state pinned on their surface (issue #928) without rooting on them. An
+    // SBML model's thresholds are rooted by the loader's discontinuity
+    // triggers, so they are not state_switch_conditions, and a run that could
+    // neither cross one nor pass it took batches of steps until its wall clock
+    // ran out. Read only by a run without sensitivity columns.
+    std::vector<std::string> stall_watch_conditions;
 
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event

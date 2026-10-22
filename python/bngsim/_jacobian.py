@@ -34,6 +34,7 @@ falls back to the finite-difference Jacobian — exactly the pre-#76 behavior.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -589,19 +590,20 @@ def _inline_functions(
 # Derived rather than listed by hand: differentiate every name in
 # _SYMPY_FUNC_TO_EXPRTK the way differentiate_rate_law does (between
 # _prepare_kinks and _finish_kinks, issue #507) and keep the ones whose result
-# neither printer spells. Three do: ceiling / floor / sign come back as an
-# unevaluated Derivative, which is not a Function at all and needed
-# _is_emittable's own fix above. Abs / Min / Max were here too — sympy
+# neither printer spells. None does now. Abs / Min / Max were here — sympy
 # differentiates them to re()/im()/Heaviside — until the two kink steps gave
-# Abs the derivative sign(a)·a' and spelled Heaviside as if().
+# Abs the derivative sign(a)·a' and spelled Heaviside as if(). ceiling / floor /
+# sign were here — sympy leaves their derivative as an unevaluated Derivative,
+# which is not a Function at all and needed _is_emittable's own fix above —
+# until the step twins of issue #1128 gave them their derivative of 0.
 #
 # Catching the three before ``sp.diff`` is a build-time saving, not a behaviour
 # change: the model declines either way. The saving was not marginal when Abs was
 # still in the set — sympy is worst at exactly these constructs, and
 # BIOMD0000000385's three Abs over its differentiation variables cost **138 s**
 # discovering a decline against a 20 s budget, unbounded by it because one
-# ``sp.diff`` cannot be interrupted — and the pre-check stays for the names that
-# remain.
+# ``sp.diff`` cannot be interrupted — and the pre-check stays for a name the
+# emitter map gains that derives to nothing printable.
 #
 # Matched on the type name during one traversal, because Min/Max are Application
 # but *not* Function subclasses, so ``atoms(sp.Function)`` misses them.
@@ -613,7 +615,7 @@ def _inline_functions(
 # pre-declined for cases that work. ``mratio`` is the first function on either
 # count — closed form in its third argument only, and only in C (issue #457) — so
 # it is deliberately absent. test_jacobian_symbolic.py re-derives the whole set.
-_NONDIFFERENTIABLE_EMITTER_FUNCS = frozenset({"ceiling", "floor", "sign"})
+_NONDIFFERENTIABLE_EMITTER_FUNCS: frozenset[str] = frozenset()
 
 
 def _nondifferentiable_over(expr, targets: set[str]) -> str | None:
@@ -732,6 +734,92 @@ def _finish_kinks(deriv):
         lambda n: sp.Piecewise((sp.Integer(1), n.args[0] >= 0), (sp.Integer(0), True)),
     )
     return deriv.replace(lambda n: isinstance(n, absval), lambda n: sp.Abs(n.args[0]))
+
+
+# ─── Issue #1128: a rounding call over the state ──────────────────────────
+#
+# ``ceiling``, ``floor`` and ``sign`` step and are flat between their steps, so
+# their derivative is 0 wherever they have one, as ``if()``'s branches are
+# differentiated with the jump between them left out. They were declined over
+# a differentiation variable (GH #250) while nothing located their steps in the
+# state. Since #1068 each one is rooted where it jumps (and SBML's by its GH #244
+# trigger), so a step between two of them is smooth and a jump is a restart.
+#
+# The decline cost more than the analytical Jacobian. On CVODE's difference
+# quotient, a run that starts on a step -- ``0.01*ceil(0.4*X)*X`` from X = 10 --
+# perturbs X across it and reads a slope of -7e5 for -0.04. Newton's updates
+# under that matrix are too small to fail, so the corrector kept the predictor
+# for as long as CVODE kept the matrix, and X came back 5 % off with no error.
+#
+# Hence twins, as for ``abs`` and the zero base: before ``sp.diff`` each call
+# over a target becomes one whose ``fdiff`` is 0, and afterwards it goes back,
+# so a value factor prints as the call it is.
+_step_sympy_cache: dict = {}
+
+
+def _step_bindings(sp) -> dict:
+    """``{name: (call, twin)}`` for each rounding call, the twin's derivative 0
+    and *call* what it goes back to (issue #1128). ``sgn`` is the engine's
+    spelling of ``sign``, which sympy parses as a function no emitter prints, so
+    it goes back as ``sign``. Built once, for the reason
+    :func:`engine_sympy_bindings` gives."""
+    bindings = _step_sympy_cache.get("bindings")
+    if bindings is None:
+
+        def twin(name: str):
+            return type(name, (sp.Function,), {"nargs": 1, "fdiff": lambda self, i=1: sp.S.Zero})
+
+        calls = {"ceiling": sp.ceiling, "floor": sp.floor, "sign": sp.sign, "sgn": sp.sign}
+        bindings = {name: (call, twin(f"step{name}")) for name, call in calls.items()}
+        _step_sympy_cache["bindings"] = bindings
+    return bindings
+
+
+def _prepare_steps(expr, targets: set[str]):
+    """Before differentiation (issue #1128): every ``ceiling``, ``floor``,
+    ``sign`` and ``sgn`` over a differentiation variable becomes its twin of
+    :func:`_step_bindings`. The condition half of every ``Piecewise`` pair is
+    left as it is, for the reason :func:`_nondifferentiable_over` gives."""
+    try:
+        import sympy as sp
+    except ImportError:
+        return expr
+    twins = _step_bindings(sp)
+
+    def walk(node):
+        if isinstance(node, sp.Piecewise):
+            return sp.Piecewise(*[(walk(value), cond) for value, cond in node.args])
+        if not node.args:
+            return node
+        new_args = [walk(arg) for arg in node.args]
+        if any(n is not o for n, o in zip(new_args, node.args, strict=True)):
+            node = node.func(*new_args)
+        pair = twins.get(type(node).__name__)
+        if (
+            pair is not None
+            and len(node.args) == 1
+            and {str(s) for s in node.free_symbols} & targets
+        ):
+            return pair[1](*node.args)
+        return node
+
+    return walk(expr)
+
+
+def _finish_steps(deriv):
+    """After differentiation (issue #1128): each twin goes back to its call.
+
+    One ``has`` and at most one ``replace``, as in :func:`_finish_zero_bases`:
+    a ``replace`` per twin, asked of every derivative, cost BIOMD0000000628 1.7 s
+    of its 20 s derivation budget, on a model with no rounding call at all."""
+    try:
+        import sympy as sp
+    except ImportError:
+        return deriv
+    back = {twin: call for call, twin in _step_bindings(sp).values()}
+    if not deriv.has(*back):
+        return deriv
+    return deriv.replace(lambda n: type(n) in back, lambda n: back[type(n)](*n.args))
 
 
 # ─── Issue #541: a power whose base is exactly zero ────────────────────────
@@ -950,6 +1038,8 @@ def differentiate_rate_law(
     # Issue #507: an Abs over a differentiation variable gets a derivative the
     # emitters print (sign(a)·a'); Max / Min get theirs spelled after the fact.
     sym_expr = _prepare_kinks(sym_expr, targets)
+    # Issue #1128: a rounding call over the state is flat between its rooted steps.
+    sym_expr = _prepare_steps(sym_expr, targets)
     # Issue #541: a power with a zero base is a step in its exponent, not a nan.
     sym_expr = _prepare_zero_bases(sym_expr, targets, allowed - set(obs_alias) - {_TIME_SYM})
 
@@ -982,7 +1072,9 @@ def differentiate_rate_law(
             # GH #95: bail out of an over-budget derivation mid-rate-law so a
             # single law coupling many observables cannot blow the budget.
             raise _DerivationBudgetExceeded
-        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(alias))))
+        deriv = _finish_steps(
+            _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(alias))))
+        )
         if deriv == 0:
             continue
         reason = _non_emittable_reason(deriv)
@@ -2739,12 +2831,17 @@ def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> 
     return None
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def has_condition_construct(body: str) -> bool:
     """True when *body* carries a construct from the conditional class.
 
     The cheap pre-check that decides whether a caller needs to build the
     switch-condition scope at all — same table, so it cannot drift from what
     ``allow_conditions`` actually waives.
+
+    Kept by text: the structural codegen key asks it of every function body on
+    each ``Simulator`` construction, which a solve per call on a fresh clone
+    paid in full every call (issue #919), and the answer is the text's alone.
     """
     return any(
         pat.search(body) for pat, _name, conditional in _UNSUPPORTED_EXPR_CONSTRUCTS if conditional

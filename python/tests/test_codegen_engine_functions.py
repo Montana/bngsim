@@ -175,13 +175,28 @@ def test_the_crossed_bounds_clamp_follows_the_engine(tmp_path, a0, expect):
 # ── The sensitivity run, which is where the issue was reported ───────────────
 
 
-@pytest.mark.parametrize("body", ["k*sign(A+1)", "k*sgn(A+1)"])
+def test_a_sensitivity_run_beside_a_sign_on_the_state(tmp_path):
+    """``sign`` steps where its argument crosses zero, which a run roots on
+    (issue #1068), and is flat elsewhere, so its derivative is 0 (issue #1128)
+    and the analytic right-hand side is not declined. A + 1 does not reach zero
+    here: A = 5 exp(-k t), and dA/dk = -5 t exp(-k t)."""
+    m = _model(tmp_path, "k*sign(A+1)")
+    run = bngsim.Simulator(m, method="ode", sensitivity_params=["k"]).run(
+        t_span=(0.0, 4.0), n_points=9, rtol=1e-10, atol=1e-12
+    )
+    t = np.asarray(run.time)
+    expected = -5.0 * t * np.exp(-0.1 * t)
+    np.testing.assert_allclose(np.asarray(run.sensitivities)[:, 0, 0], expected, rtol=1e-6)
+
+
+@pytest.mark.parametrize("body", ["k*sgn(A+1)"])
 def test_a_sensitivity_run_beside_a_step_on_the_state_is_refused(tmp_path, body):
-    """``sign`` steps where its argument crosses zero, and outside a condition
-    nothing locates that. The rate law compiles, the analytic right-hand side
-    is declined, and the run on the difference quotient is refused by name
-    (issue #938), where it used to be let through: A + 1 does not reach zero in
-    this model, and that is not known before the run."""
+    """``sgn`` is ``sign`` to the engine, and its derivative in the state is 0
+    as ``sign``'s is (issue #1128), but its derivative in ``k`` is ``sgn(A+1)``
+    itself, which no emitter spells. The analytic right-hand side is declined,
+    and the run on the difference quotient is refused by name (issue #938),
+    where it used to be let through: A + 1 does not reach zero in this model,
+    and that is not known before the run."""
     m = _model(tmp_path, body)
     sim = bngsim.Simulator(m, method="ode", sensitivity_params=["k"])
     with pytest.raises(bngsim.SensitivityUnsupportedError, match="#938") as caught:
