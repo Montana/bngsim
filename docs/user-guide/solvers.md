@@ -462,8 +462,7 @@ What this does not cover:
   a `mod` or `frac` used as a number whose argument is coarser than the clock
   (an offset more than about 64 times the time, as in `frac(1e6 + time())`)
   gets no stop on its wraps from this reading: it is integrated as before,
-  with the error test finding each wrap, until a stop on a rate that is flat
-  where the run restarts is safe (issue #998).
+  with the error test finding each wrap (issue #1018).
 - **More than 1,000,000 switches in one run.** A repeating schedule or a
   sinusoid that is the only thing in the model that switches is then integrated
   under a step bound of half its shorter stretch. Anything else is refused with
@@ -484,6 +483,33 @@ that adds up: a quantity of order `n_stops × atol` is integrated to no better
 than that. `mod(time(), 0.0003)` over 10 time units (33,000 stops) accumulates
 1.5e-3, which the default `atol` of 1e-8 does not resolve and `atol=1e-14`
 does to 2e-8. Tighten `atol` where a run has many stops and small quantities.
+
+Where the rate law is flat at a restart, the integrator's first step has
+nothing to measure its error by, and the steps after it grow as far as the
+integrator lets them (10,000 times the first, then ten times each) until one
+takes most of the stretch to the next stop at once. That step reads the law at
+its end alone, and on the stop a law that repeats reads there what it read at
+the restart, so the step passes with nothing added for the stretch. So, until
+a stretch has been looked at, a run watches its steps, and before one that
+grew with nothing measured and would take half or more of what is left, it
+reads the right-hand side where that step ends, against what the integrator's
+own history predicts there. Where the step's error there is well past what the
+integrator's error test allows, nothing is done: it fails the step and walks
+the stretch itself. Otherwise the step is read at a quarter, a half and three
+quarters of its length, and where a step would fail at one of them the run
+restarts there, so the step ends on it (issue #998). Before, a dose train that
+begins each period flat lost every period from about the 72nd stop on, and
+with output rows inside the periods from the first, with no error. A run with
+sensitivity columns steps as before.
+
+What this does not see, and can still step over (issue #1192): a pulse that
+is nothing at both ends of a step and at the three places inside it; steps
+the integrator takes on its way to an output row, where a step that would
+cross the row fails and is retried; a stretch while a delayed event is
+waiting to fire; the stretch after a stop that restarts nothing (a table
+function's breakpoint); and, in a model with a stiff species, a step the look
+takes for one that fails. For these, as for a narrow pulse in a run with no
+stops, pass `max_step` no larger than the pulse.
 
 In a run with sensitivity columns the same stops are placed for a condition
 that reads none of the requested parameters, and for a pulse that only bends.
