@@ -77,6 +77,14 @@ namespace bngsim {
 // (issue #1124, item 13). So the context's handler drops that one message and
 // passes every other one on to the logger, as before. BNGSIM_LOG_SPENT_BATCHES=1
 // keeps SUNDIALS' own handler, and the message with it.
+//
+// The handler stack is cleared before one is pushed because SUNHandleErrWithMsg
+// calls every handler on it: pushed on top of SUNDIALS' default, this one would
+// drop the message and the default would log it anyway. And it is chosen on
+// every run, not only where the persistent objects are (re)built, so that the
+// variable set between two runs on one Simulator takes effect on the next: the
+// warm path keeps its context across rebuilds, and a filter installed once
+// stayed on it whatever the variable said (#1142's review).
 static void log_all_but_a_batch_spent(int line, const char *func, const char *file, const char *msg,
                                       SUNErrCode err_code, void *err_user_data, SUNContext sunctx) {
     if (err_code == CV_TOO_MUCH_WORK && func != nullptr && std::strcmp(func, "CVode") == 0) {
@@ -85,13 +93,12 @@ static void log_all_but_a_batch_spent(int line, const char *func, const char *fi
     SUNLogErrHandlerFn(line, func, file, msg, err_code, err_user_data, sunctx);
 }
 
-static void drop_spent_batch_errors(SUNContext ctx) {
+static void select_spent_batch_handler(SUNContext ctx) {
     const char *keep = std::getenv("BNGSIM_LOG_SPENT_BATCHES");
-    if (keep != nullptr && *keep != '\0' && std::strcmp(keep, "0") != 0) {
-        return;
-    }
+    const bool log_them = keep != nullptr && *keep != '\0' && std::strcmp(keep, "0") != 0;
     if (ctx != nullptr && SUNContext_ClearErrHandlers(ctx) == SUN_SUCCESS) {
-        SUNContext_PushErrHandler(ctx, log_all_but_a_batch_spent, nullptr);
+        SUNContext_PushErrHandler(ctx, log_them ? SUNLogErrHandlerFn : log_all_but_a_batch_spent,
+                                  nullptr);
     }
 }
 
@@ -3601,7 +3608,6 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         if (!w.ctx) {
             throw std::runtime_error("SUNContext_Create failed");
         }
-        drop_spent_batch_errors(w.ctx);
 
         w.y = NVectorGuard(N_VNew_Serial(ns, w.ctx));
         if (!w.y) {
@@ -3671,6 +3677,8 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
             throw std::runtime_error("CVodeReInit failed: " + std::to_string(flag));
         }
     }
+    // Every run, reused context or not (see select_spent_batch_handler).
+    select_spent_batch_handler(w.ctx);
 
     // GH #132: restart the adaptive BLAS-dense factor-count gate for this run.
     // The warm path reuses one persistent dense solver across run()s, so without
@@ -3968,7 +3976,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     if (!ctx) {
         throw std::runtime_error("SUNContext_Create failed");
     }
-    drop_spent_batch_errors(ctx);
+    select_spent_batch_handler(ctx);
 
     y = NVectorGuard(N_VNew_Serial(ns, ctx));
     if (!y) {
@@ -4126,9 +4134,14 @@ void CvodeSimulator::Impl::setup_forward_sensitivities(
     // produced analytically by bngsim_dfdp via a sentinel iP that hits
     // its `default: → zero` arm).
     if (n_sens_ic > 0 && !user_data.codegen_sens_fn) {
-        throw std::runtime_error("sensitivity_ic requires codegen sensitivity RHS, but no "
-                                 "codegen .so is loaded. Build the model with codegen enabled "
-                                 "(or pass codegen=True / a net_path with mass-action kinetics).");
+        // Simulator refuses this by name at construction and after a rebuild
+        // (#1124 item 7); this is the backstop for a caller that reaches the
+        // C++ with an artifact that has no analytic sensitivity RHS.
+        throw std::runtime_error(
+            "sensitivity_ic needs the analytic sensitivity RHS, and the loaded codegen has "
+            "none: either codegen declined it for this model (a rate law it could not "
+            "differentiate), or the artifact was built for a plain run. CVODES' difference "
+            "quotient has no parameter to perturb for an initial value.");
     }
     const auto &species = model.species();
     for (const auto &sname : opts.sensitivity.ic_species_names) {
