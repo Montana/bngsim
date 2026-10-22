@@ -82,6 +82,14 @@ _BACKENDS = {
 }
 
 
+def _function_elements(root: ET.Element) -> list[ET.Element]:
+    return [
+        el
+        for el in root.iter()
+        if el.tag.endswith("Function") and not el.tag.endswith("ListOfFunctions")
+    ]
+
+
 def _functions(xml_path: str | Path) -> list[ET.Element] | None:
     """Every ``<Function>`` element in *xml_path*, or ``None`` when the file
     cannot be parsed: the backend then reports its own parse error, which is
@@ -90,17 +98,40 @@ def _functions(xml_path: str | Path) -> list[ET.Element] | None:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
         return None
-    return [
-        el
-        for el in root.iter()
-        if el.tag.endswith("Function") and not el.tag.endswith("ListOfFunctions")
-    ]
+    return _function_elements(root)
 
 
-def _reads_time(func: ET.Element) -> bool:
-    return any(
-        expr.tag.endswith("Expression") and _TIME_REF.search(expr.text or "") for expr in func
-    )
+def _reads_time(func: ET.Element, clock: re.Pattern[str] = _TIME_REF) -> bool:
+    return any(expr.tag.endswith("Expression") and clock.search(expr.text or "") for expr in func)
+
+
+def rulemonkey_symbols(root: ET.Element) -> set[str]:
+    """The names RuleMonkey binds in an expression ahead of its clock:
+    parameters and functions by id, observables by name (init_eval_layout in
+    third_party/rulemonkey/cpp/rulemonkey/engine.cpp)."""
+    names: set[str] = set()
+    for el in root.iter():
+        tag = _local(el.tag)
+        if tag in ("Parameter", "Function"):
+            names.add(el.get("id", ""))
+        elif tag == "Observable":
+            names.add(el.get("name", ""))
+    return names
+
+
+def rulemonkey_clock_ref(symbols: set[str]) -> re.Pattern[str]:
+    """The clock as RuleMonkey reads it in an expression of a model with these
+    *symbols* (init_eval_layout and strip_layout_call_args in engine.cpp, issue
+    #87 there): ``time()`` always; a bare or spaced ``time``, and the alias
+    ``t`` or ``t()``, unless the model has a symbol of that name, which RuleMonkey
+    reads instead. BNG2.pl writes an observable named ``time`` but never the
+    alias, which only hand-written XML has."""
+    clock = [r"time\(\)"]
+    if "time" not in symbols:
+        clock.append(r"time(?:\s*\(\s*\))?")
+    if "t" not in symbols:
+        clock.append(r"t(?:\s*\(\s*\))?")
+    return re.compile(rf"(?<![A-Za-z0-9_])(?:{'|'.join(clock)})(?![A-Za-z0-9_(])")
 
 
 def _indexed_by_time(func: ET.Element) -> bool:
@@ -122,13 +153,18 @@ def time_indexed_table_functions(xml_path: str | Path) -> list[str]:
 
 
 def clock_readers(xml_path: str | Path) -> list[str]:
-    """The ids of the functions in *xml_path* that read the clock, through
-    ``time()``, a bare ``time``, or a table indexed by time. Empty when the file
-    cannot be parsed."""
+    """The ids of the functions in *xml_path* that read the clock as RuleMonkey
+    does (:func:`rulemonkey_clock_ref`), or through a table indexed by time.
+    Empty when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    clock = rulemonkey_clock_ref(rulemonkey_symbols(root))
     return [
         f.get("id", "?")
-        for f in _functions(xml_path) or ()
-        if _reads_time(f) or _indexed_by_time(f)
+        for f in _function_elements(root)
+        if _reads_time(f, clock) or _indexed_by_time(f)
     ]
 
 

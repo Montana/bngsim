@@ -146,6 +146,12 @@ initial state at t = 5, and `time()` reads 5 there. RuleMonkey integrates a rate
 that reads the clock between events, so a rate such as `if(time()>=6, k, 0)`,
 which is 0 at the start, turns on at t = 6 (issue #1022).
 
+RuleMonkey reads the clock as `time()`, a bare `time`, or its alias `t` (or
+`t()`). A bare `time` or `t` that names a parameter, observable or function is
+that symbol instead: BNG2.pl accepts an observable named `time`, and `k*time`
+then reads its count, while `time()` is still the clock. bngsim reads a model
+the same way when it decides whether the model reads the clock.
+
 NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
 one when the simulator or session is built, naming the function (issue #862).
 Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
@@ -169,9 +175,9 @@ not refused; NFsim reads it correctly at each output time.
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
 times small at a large `t_start`. So does a one-shot `method="rm"` run of a
-model that reads the clock through `time()`: it reads the clock as `time()`
-plus the run's `t_start`, and its events are placed on elapsed time (issue
-#1063). Before that its waiting times were rounded once the total propensity
+model that reads the clock in its functions: wherever RuleMonkey reads the
+clock, it reads `time()` plus the run's `t_start`, and its events are placed on
+elapsed time (issue #1063). Before that its waiting times were rounded once the total propensity
 times |t| neared 1e15, and from t = 1e12 the run was biased with no error.
 
 A `RuleMonkeySession`, and any run of a model with a table indexed by time,

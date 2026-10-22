@@ -17,11 +17,13 @@ BNG-generated .net, and one-shot runs against sessions under the same seed.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import bngsim
 import numpy as np
 import pytest
+from bngsim._rulemonkey_clock import OFFSET_PARAM as OFFSET
 
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
 NF = DATA / "nfsim"
@@ -414,45 +416,139 @@ def test_an_output_function_reports_on_model_time():
     np.testing.assert_allclose(r.expressions["f"], 0.02 * np.array([5.0, 6.0, 7.0]), rtol=1e-12)
 
 
-def test_the_clock_is_offset_in_every_spelling():
-    from bngsim._rulemonkey_clock import OFFSET_PARAM, offset_clock_text
-
+def _variant(tmp_path: Path, edits: dict[str, str], *extra: str) -> str:
+    """SWITCH with each of *edits* made and the *extra* functions added."""
     xml = SWITCH.read_text(encoding="utf-8")
-    bare = xml.replace("if(time()>=6,k,0)", "if(time>=6,k,0)*1")
-    for text in (xml, bare):
-        out = offset_clock_text(text, SWITCH.parent)
-        assert f"if((time()+{OFFSET_PARAM})>=6,k,0)" in out
-        assert f'<Parameter id="{OFFSET_PARAM}" type="Constant" value="0" expr="0"/>' in out
+    for old, new in edits.items():
+        assert old in xml
+        xml = xml.replace(old, new)
+    xml = xml.replace("</ListOfFunctions>", "".join(extra) + "</ListOfFunctions>")
+    path = tmp_path / "v.xml"
+    path.write_text(xml, encoding="utf-8")
+    return str(path)
 
 
-def test_a_model_that_names_the_offset_is_refused():
-    from bngsim._rulemonkey_clock import OFFSET_PARAM, offset_clock_text
+def _output(fid: str, body: str) -> str:
+    return f'<Function id="{fid}"><Expression> {body} </Expression></Function>\n    '
 
-    xml = SWITCH.read_text(encoding="utf-8").replace('id="k"', f'id="{OFFSET_PARAM}"')
-    with pytest.raises(bngsim.ModelError, match=OFFSET_PARAM):
+
+@pytest.mark.parametrize("spelling", ["time", "time( )", "t", "t()"])
+@pytest.mark.parametrize("beside", [False, True], ids=["alone", "beside_time_call"])
+def test_every_spelling_of_the_clock_reads_model_time(tmp_path, spelling, beside):
+    """RuleMonkey reads the clock as time(), a bare or spaced time, and its alias
+    t or t() (engine.cpp). Each is offset: an output h() of the spelling reports
+    5, 6, 7 from t_start = 5, and f() = if(<spelling> >= 6, k, 0) switches on at
+    6. Before, t was missed: alone, the model ran as if it read no clock, and
+    beside a time() it read elapsed time once the run moved there (issue #1063);
+    either way h was 0, 1, 2 and nothing fired by 7."""
+    extra = [_output("h", spelling)] + ([_output("g", "time()")] if beside else [])
+    xml = _variant(tmp_path, {"if(time()>=6,k,0)": f"if({spelling}>=6,k,0)"}, *extra)
+    rows = [_rm(xml, seed, t_span=(5.0, 7.0), n_points=3) for seed in range(1, 6)]
+    np.testing.assert_array_equal(rows[0].expressions["h"], [5.0, 6.0, 7.0])
+    q = _switch_survival(np.array([5.0, 6.0, 7.0]))
+    _assert_mean([r.observables["A0"] for r in rows], 20000 * q, 20000 * q * (1 - q))
+
+
+@pytest.mark.parametrize("spelling", ["t", "t()"])
+def test_a_session_reads_the_alias_t_on_model_time(tmp_path, spelling):
+    """A session decides its clock by the same reading: a model that reads the
+    clock only through t starts at t_start, so h() = t is the model time."""
+    xml = _variant(tmp_path, {"if(time()>=6,k,0)": f"if({spelling}>=6,k,0)"}, _output("h", "t"))
+    with bngsim.RuleMonkeySession(xml) as s:
+        s.initialize(seed=1, t_start=5.0)
+        r = s.simulate(5.0, 7.0, n_points=3)
+    np.testing.assert_array_equal(r.expressions["h"], [5.0, 6.0, 7.0])
+
+
+@pytest.mark.parametrize("symbol", ["time", "t"])
+@pytest.mark.parametrize("beside", [False, True], ids=["alone", "beside_time_call"])
+def test_a_symbol_named_like_the_clock_is_read_as_the_symbol(tmp_path, symbol, beside):
+    """BNG2.pl accepts an observable named time. RuleMonkey reads a bare time,
+    or t, that names a symbol as the symbol, and only time() as the clock. Here
+    the observable counts A(s~0) and f() = k * <symbol> / 20000: f reports
+    k * count / 20000 on every row, and the count follows the closed form
+    20000 / (1 + k t) of dN/dt = -k N^2 / 20000. The rewrite once turned the
+    observable into the clock, and f read 0.5 * 0 / 20000 at t = 0 while the
+    count stayed at 20000."""
+    extra = [_output("g", "time()")] if beside else []
+    edits = {'name="A0"': f'name="{symbol}"', "if(time()>=6,k,0)": f"k*{symbol}/20000"}
+    xml = _variant(tmp_path, edits, *extra)
+    rows = [_rm(xml, seed, t_span=(0.0, 2.0), n_points=3) for seed in range(1, 6)]
+    for r in rows:
+        np.testing.assert_allclose(r.expressions["f"], 0.5 * r.observables[symbol] / 20000)
+    if beside:
+        np.testing.assert_array_equal(rows[0].expressions["g"], [0.0, 1.0, 2.0])
+    mean = np.mean([r.observables[symbol][-1] for r in rows])
+    assert abs(mean - 20000 / (1 + 0.5 * 2.0)) < 300, mean
+
+
+def test_the_rewrite_reads_the_clock_where_rulemonkey_does():
+    """The text of the copy: every clock read is offset, a bare time that names
+    an observable is not, and a self-closing function is left alone."""
+    from bngsim._rulemonkey_clock import offset_clock_text
+
+    t0 = f"(time()+{OFFSET})"
+    xml = SWITCH.read_text(encoding="utf-8")
+    out = offset_clock_text(xml, SWITCH.parent)
+    assert f"if({t0}>=6,k,0)" in out
+    assert f'<Parameter id="{OFFSET}" type="Constant" value="0" expr="0"/>' in out
+
+    named = xml.replace('name="A0"', 'name="time"').replace(
+        "if(time()>=6,k,0)", "if(time()>=6,k,0)*time + time ( )"
+    )
+    named = named.replace("<ListOfFunctions>", '<ListOfFunctions>\n      <Function id="z"/>')
+    out = offset_clock_text(named, SWITCH.parent)
+    assert f"if({t0}>=6,k,0)*time + time ( )" in out
+    assert '<Function id="z"/>' in out
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [('id="k"', f'id="{OFFSET}"'), ('name="A0"', f'name="{OFFSET}"')],
+    ids=["parameter", "observable"],
+)
+def test_a_model_that_names_the_offset_is_refused(old, new):
+    """An observable is a RuleMonkey symbol by its name, and would take the
+    offset's place in every rewritten function."""
+    from bngsim._rulemonkey_clock import offset_clock_text
+
+    xml = SWITCH.read_text(encoding="utf-8").replace(old, new)
+    with pytest.raises(bngsim.ModelError, match=OFFSET):
         offset_clock_text(xml, SWITCH.parent)
 
 
-def test_a_table_indexed_by_the_clock_is_not_offset():
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_a_table_indexed_by_the_clock_is_not_offset(tmp_path, quote):
     """Its counter would have to be a function, and RuleMonkey 3.11.0 recurses
     without end evaluating such a table. The model runs on model time, as the
-    late-start test of #892 above checks."""
-    from bngsim._rulemonkey_clock import offsettable
-
-    assert not offsettable(TFUN.read_text(encoding="utf-8"))
-    assert offsettable(SWITCH.read_text(encoding="utf-8"))
+    late-start test of #892 above checks, however its attributes are quoted: in
+    single quotes the table was once missed, and the run went to elapsed time,
+    where the table reads the elapsed clock."""
+    text = TFUN.read_text(encoding="utf-8")
+    tag = re.search(r'<Function [^>]*type="TFUN"[^>]*>', text).group(0)
+    xml = tmp_path / "v.xml"
+    xml.write_text(text.replace(tag, tag.replace('"', quote)), encoding="utf-8")
+    m = bngsim.Model.from_net(str(DATA / "simple_decay.net"))
+    sim = bngsim.Simulator(m, method="rm", xml_path=str(xml))
+    assert not sim._rm_clock_offset
+    r = sim.run(t_span=(1.0, 1.5), n_points=3, seed=3)
+    np.testing.assert_array_equal(
+        np.asarray(r.observables),
+        np.asarray(_rm(TFUN, 3, t_span=(1.0, 1.5), n_points=3).observables),
+    )
 
 
 def test_a_table_file_is_found_from_the_copy(tmp_path):
     """The copy is written elsewhere, so a table's data file named relative to
-    the original XML is made absolute."""
-    from bngsim._rulemonkey_clock import offset_clock_text
-
-    (tmp_path / "x.tfun").write_text("0 1\n1 2\n")
-    xml = SWITCH.read_text(encoding="utf-8").replace(
-        "</ListOfFunctions>",
+    the original XML is made absolute, and escaped: here the directory's name
+    has characters XML must escape. g() = 1 + A0 / 10000 by its table."""
+    here = tmp_path / "a&b'c"
+    here.mkdir()
+    (here / "x.tfun").write_text("0 1\n30000 4\n")
+    table = (
         '<Function id="g" type="TFUN" ctrName="A0" file="x.tfun" method="linear">'
-        "<Expression> __TFUN_VAL__ </Expression></Function>\n    </ListOfFunctions>",
+        "<Expression> __TFUN_VAL__ </Expression></Function>\n    "
     )
-    out = offset_clock_text(xml, tmp_path)
-    assert f'file="{(tmp_path / "x.tfun").resolve()}"' in out
+    xml = _variant(here, {}, table)
+    r = _rm(xml, 1, t_span=(5.0, 7.0), n_points=3)
+    np.testing.assert_allclose(r.expressions["g"], 1 + r.observables["A0"] / 10000)

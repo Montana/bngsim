@@ -695,7 +695,6 @@ class Simulator:
         "_requested_method",
         "_sim",
         "_rm_clock_offset",
-        "_rm_clock_dir",
         "_rtol",
         "_atol",
         # Issue #196 — per-species absolute tolerance, or None for the scalar
@@ -837,7 +836,6 @@ class Simulator:
         self._canonical_method = canonical
         self._xml_path = xml_path
         self._rm_clock_offset = False
-        self._rm_clock_dir = None
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
@@ -1048,6 +1046,7 @@ class Simulator:
                 clock_readers,
                 refuse_rulemonkey_compartments,
                 refuse_rulemonkey_energy_misreads,
+                time_indexed_table_functions,
             )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
@@ -1060,16 +1059,16 @@ class Simulator:
             # RuleMonkey's waiting times round away there. A table indexed by the
             # clock cannot be offset (bngsim/_rulemonkey_clock.py), and a model
             # with one runs on model time as before.
-            from bngsim._rulemonkey_clock import offset_clock_xml, offsettable
-
             reads_clock = bool(clock_readers(xml_path))
-            self._rm_clock_offset = reads_clock and offsettable(
-                Path(xml_path).read_text(encoding="utf-8")
-            )
-            rm_xml = xml_path
+            self._rm_clock_offset = reads_clock and not time_indexed_table_functions(xml_path)
             if self._rm_clock_offset:
-                rm_xml, self._rm_clock_dir = offset_clock_xml(xml_path)
-            self._sim = RuleMonkeySimulator(rm_xml)
+                from bngsim._rulemonkey_clock import offset_clock_xml
+
+                # RuleMonkey reads the copy and its table files here, once.
+                with offset_clock_xml(xml_path) as rm_xml:
+                    self._sim = RuleMonkeySimulator(rm_xml)
+            else:
+                self._sim = RuleMonkeySimulator(xml_path)
             warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
             self._sim.set_reads_clock(reads_clock and not self._rm_clock_offset)
             if gml is not None:
