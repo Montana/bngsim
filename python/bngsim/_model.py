@@ -927,6 +927,17 @@ class Model:
                     )
 
                     def spelled(c: str) -> str:
+                        # A condition reached through a function definition is
+                        # spelled `(time())` where the same one written directly
+                        # reads `time()`, and the loader registers one spelling
+                        # for both (issue #1082); compared on its key, so the
+                        # one registered covers the other, which the recovery
+                        # otherwise added again as a stop. Only an SBML model
+                        # registers, and only its loader needs libsbml.
+                        if self._time_disc_conditions:
+                            from bngsim._sbml_loader import _condition_key
+
+                            c = _condition_key(c)
                         return _strip_redundant_parens(c).replace(" ", "")
 
                     registered = {spelled(c) for c in self._time_disc_conditions}

@@ -25,14 +25,14 @@ NEAR = [("near", "lambda(x, c, w, abs(x - c) < w)")]
 PEAK = [("peak", "lambda(s, sin(s) >= 1)")]
 
 
-def _model(tmp_path, law, trigger, functions=(), species_rate=None):
+def _model(tmp_path, law, trigger, functions=(), species_rate=None, rule=None):
     doc = libsbml.SBMLDocument(3, 1)
     m = doc.createModel()
     c = m.createCompartment()
     c.setId("C")
     c.setSize(1)
     c.setConstant(True)
-    for sid in ("Y", "Z", "A"):
+    for sid in ("Y", "Z", "A", "W"):
         s = m.createSpecies()
         s.setId(sid)
         s.setCompartment("C")
@@ -53,6 +53,10 @@ def _model(tmp_path, law, trigger, functions=(), species_rate=None):
         p.setStoichiometry(1)
         p.setConstant(True)
         r.createKineticLaw().setMath(libsbml.parseL3Formula(rate))
+    if rule is not None:
+        ar = m.createAssignmentRule()
+        ar.setVariable("W")
+        ar.setMath(libsbml.parseL3Formula(rule))
     e = m.createEvent()
     e.setId("E")
     e.setUseValuesFromTriggerTime(True)
@@ -110,6 +114,33 @@ def test_the_run_is_what_it_was(tmp_path, case):
         )
     ]
     np.testing.assert_array_equal(np.asarray(runs[0].species), np.asarray(runs[1].species))
+
+
+@pytest.mark.parametrize(
+    "law, rule",
+    [
+        (DIRECT["window"], CASES["window"][0]),
+        (CASES["window"][0], DIRECT["window"]),
+    ],
+    ids=["law direct, rule through", "law through, rule direct"],
+)
+def test_the_recovery_reads_the_registered_spelling_as_its_own(tmp_path, law, rule):
+    """One spelling registered, the other in a rate law or an assignment rule
+    the recovery reads: it compared text with the outer parentheses dropped
+    only, found no match, and added the whole window again as a stop. The
+    run then took 127 steps for 14 and Z moved by 4e-8. Compared on the
+    loader's key, as the loader registers, the recovery finds it covered."""
+    through = _model(tmp_path, law, "abs(time - 2.5) < 0.005", NEAR, rule=rule)
+    direct = _model(tmp_path, DIRECT["window"], "abs(time - 2.5) < 0.005", rule=DIRECT["window"])
+    assert len(through.time_discontinuity_conditions()) == len(
+        direct.time_discontinuity_conditions()
+    )
+    assert through._derived_time_disc_conditions == ()
+    runs = [
+        bngsim.Simulator(m, method="ode").run(t_span=(0, 5), n_points=2) for m in (through, direct)
+    ]
+    np.testing.assert_array_equal(np.asarray(runs[0].species), np.asarray(runs[1].species))
+    assert runs[0].solver_stats["n_steps"] == runs[1].solver_stats["n_steps"]
 
 
 def test_a_state_window_is_untouched(tmp_path):
