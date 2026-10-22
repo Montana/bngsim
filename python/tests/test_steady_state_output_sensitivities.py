@@ -913,3 +913,55 @@ def test_an_observable_of_a_masked_species_is_refused_by_name():
     np.testing.assert_allclose(ss.output_sensitivities("observable:A")[0], [2, -4], rtol=1e-7)
     with pytest.raises(ValueError, match=r"'observable:B'.*reads B, which mask= left out"):
         ss.output_sensitivities(["observable:A", "observable:B"])
+
+
+def test_an_expression_names_the_one_masked_species_it_reads():
+    """Issue #1124, item 10. Two pure sinks, ``B`` and ``C``, are masked; ``h``
+    reads ``B`` alone. The expression block records the first species with no
+    row that each expression reads, so the refusal names ``B``, not "one or
+    more of B, C"."""
+    m = bngsim.Model.from_antimony_string(
+        "species A = 1; species B = 0; species C = 0; k1 = 1; k2 = 0.5;\n"
+        "J0: -> A; k1; J1: A -> B; k2*A; J2: A -> C; 0.1*A; h := B + 1;"
+    )
+    ss = bngsim.Simulator(m, method="ode").steady_state(
+        sensitivity_params=["k1", "k2"], mask=~np.asarray(m.is_pure_sink()), **_TIGHT
+    )
+    with pytest.raises(ValueError, match=r"'expression:h'.*reads B, which mask= left out"):
+        ss.output_sensitivities("expression:h")
+
+
+def test_a_rule_target_beside_a_mask_is_not_named_as_masked():
+    """Issue #1124, item 10. ``T := 2*A`` is a species set by a rule, which the
+    solve leaves out by itself (GH #247) and gives its rule's row, (4, -8). Only
+    ``B`` is left out by ``mask=``, so B's refusal names B alone; it named "one
+    or more of B, T"."""
+    m = bngsim.Model.from_antimony_string(
+        "species A = 1; species B = 0; species T = 0; k1 = 1; k2 = 0.5;\n"
+        "J0: -> A; k1; J1: A -> B; k2*A;\nT := 2*A;"
+    )
+    ss = bngsim.Simulator(m, method="ode").steady_state(
+        sensitivity_params=["k1", "k2"], mask=~np.asarray(m.is_pure_sink()), **_TIGHT
+    )
+    np.testing.assert_allclose(ss.output_sensitivities("observable:T")[0], [4, -8], rtol=1e-7)
+    with pytest.raises(ValueError, match=r"'observable:B'.*: it reads B, which mask= left out"):
+        ss.output_sensitivities("observable:B")
+
+
+@pytest.mark.parametrize("sink", ["", "B masked"], ids=["no mask", "B masked"])
+def test_an_output_with_no_finite_value_is_refused_without_blaming_the_mask(sink):
+    """``logL := log10(L)`` with L held at 0 (it only decays, from 0) is -inf at
+    the steady state, so it has no derivative there, whatever the mask. Every
+    partial of -inf is NaN, so with ``B`` masked the solve's record named B, and
+    the refusal said logL reads B. It is refused for its value."""
+    text = "species A = 1; species L = 0; k1 = 1; k2 = 0.5; kL = 1;\n"
+    if sink:
+        text += "species B = 0; J0: -> A; k1; J1: A -> B; k2*A;"
+    else:
+        text += "J0: -> A; k1; J1: A -> ; k2*A;"
+    m = bngsim.Model.from_antimony_string(text + " JL: L -> ; kL*L;\nlogL := log10(L);")
+    kw = {"mask": ~np.asarray(m.is_pure_sink())} if sink else {}
+    ss = bngsim.Simulator(m, method="ode").steady_state(sensitivity_params=["k1", "k2"], **kw)
+    np.testing.assert_allclose(ss.output_sensitivities("observable:A")[0], [2, -4], rtol=1e-6)
+    with pytest.raises(ValueError, match=r"'expression:logL'.*value at the steady state is -inf"):
+        ss.output_sensitivities("expression:logL")
