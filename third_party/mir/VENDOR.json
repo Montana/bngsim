@@ -71,6 +71,7 @@
   },
   "guardrails": {
     "jit_source_must_be_header_free": "c2mir's bundled preprocessor cannot parse the platform SDK <math.h>/<stdlib.h> (they use compiler-specific extensions; on macOS it reports 'Unsupported compiler detected'). The JIT path therefore strips system #includes from the generated C and prepends extern declarations for the libc/libm symbols it calls (pow, exp, sqrt, log, fabs, fmax, fmin, memset, ...). MIR resolves those externals at link time via the import resolver (dlsym(RTLD_DEFAULT, name)). See bngsim/include/bngsim/mir_jit.hpp.",
+    "imports_limited_to_the_prelude": "c2mir accepts a call to an undeclared function as an implicit `int name()` (the C89 rule) where cc refuses it, so a bare call the emitter has no C for reaches MIR_link as an import. MIR reports an unresolved import through its default error function, which exit()s the process, and dlsym would bind any name some loaded library happens to export. MirJit therefore refuses, before MIR_link, every import outside the prelude's table (detail::mir_prelude_address). Re-check on a pin bump that MIR_link still resolves imports only through the resolver.",
     "api_find_func_by_iteration": "MIR_get_global_item is declared in mir.h but not defined in this commit; locate the JIT'd function by scanning module->items for a MIR_func_item whose name matches (the version-stable approach c2mir-driver uses).",
     "single_maintainer_upstream": "MIR is effectively single-maintainer. Pinned to an immutable commit; refresh deliberately."
   },

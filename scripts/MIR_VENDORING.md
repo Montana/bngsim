@@ -197,6 +197,14 @@ These behaviors are required by `mir_jit.hpp` and recorded under
   declarations for the libc/libm symbols the RHS can call (`pow`, `exp`, `sqrt`,
   `log`, `fabs`, `fmax`, `fmin`, `memset`, …). MIR resolves those externals at
   link time via the import resolver (`dlsym(RTLD_DEFAULT, name)`).
+- **Imports are limited to the prelude.** c2mir accepts a call to an undeclared
+  function as an implicit `int name()` where `cc` refuses it, so a bare call the
+  emitter has no C for reaches `MIR_link` as an import. MIR reports an unresolved
+  import by `exit()`ing the process, and `dlsym` binds any name a loaded library
+  happens to export (on macOS a private framework loaded into the Python process
+  has an `equal`). `MirJit` refuses every import outside the prelude's table
+  before linking; re-check on a pin bump that `MIR_link` still resolves imports
+  only through the resolver.
 - **Find the JIT'd function by iteration.** `MIR_get_global_item` is declared in
   `mir.h` but not defined at the pinned commit; `MirJit` locates the function by
   scanning `module->items` for the matching `MIR_func_item` (the version-stable

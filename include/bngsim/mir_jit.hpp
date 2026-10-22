@@ -20,7 +20,7 @@
 #include <string>
 
 #if defined(BNGSIM_HAS_MIR)
-#include <cmath> // libm addresses for the Windows import table (GH #3)
+#include <cmath> // libm addresses for the prelude's import table (GH #3)
 #include <cstddef>
 #include <cstdio>  // open_memstream/tmpfile, FILE, fflush, fclose, stderr
 #include <cstdlib> // free
@@ -40,23 +40,17 @@ namespace bngsim {
 #if defined(BNGSIM_HAS_MIR)
 namespace detail {
 
-// Import resolver for MIR_link: maps an external symbol name (libc/libm
-// functions the generated RHS calls — pow, exp, sqrt, memset, ...) to its
-// runtime address. Must have C linkage / no captures.
+// The libc/libm functions jit_prelude() declares, by name, with their
+// addresses: the whole import surface a generated source is meant to have.
+// Keep it in step with jit_prelude() below. Taking &std::pow (etc.) yields a
+// valid out-of-line address on every ABI.
 //
-// POSIX: RTLD_DEFAULT searches every globally-loaded symbol, which includes
-// libSystem/libm already resident in this process, so dlsym resolves the whole
-// libm/libc surface the codegen can emit.
-//
-// Windows/MSVC (GH #3): there is no dlsym/RTLD_DEFAULT. We resolve against a
-// static table of exactly the libm/libc functions the codegen can emit — which
-// is complete by construction: the JIT source can only *call* functions that
-// jit_prelude() forward-declares, so the set of MIR import symbols is a subset
-// of the prelude set. Taking &std::pow (etc.) yields a valid out-of-line
-// address on every ABI, so the table needs no OS symbol lookup at all. Keep it
-// in step with jit_prelude() below.
-#ifdef _WIN32
-inline void *mir_import_resolver(const char *name) {
+// It is not the surface a source *can* have. c2mir takes a call to an
+// undeclared function as an implicit `int name()`, the C89 rule, where cc
+// refuses it; so a rate law that calls an engine function the emitter has no C
+// for (frac, inrange, a table function's name) reaches MIR_link as one more
+// import. MirJit::compile refuses those by name before linking (see there).
+inline void *mir_prelude_address(const char *name) {
     struct Entry {
         const char *name;
         void *addr;
@@ -120,8 +114,24 @@ inline void *mir_import_resolver(const char *name) {
     }
     return nullptr;
 }
+
+// Import resolver for MIR_link: maps a name jit_prelude() declares to its
+// runtime address, and every other name to nullptr. Must have C linkage / no
+// captures.
+//
+// POSIX: dlsym(RTLD_DEFAULT) searches every globally-loaded symbol, which
+// includes libSystem/libm already resident in this process. It is asked only
+// about the prelude's names: any other name it found would be some unrelated
+// global of the same spelling, called through an implicit `int name()`.
+//
+// Windows/MSVC (GH #3): there is no dlsym/RTLD_DEFAULT, so the table above is
+// the resolver.
+#ifdef _WIN32
+inline void *mir_import_resolver(const char *name) { return mir_prelude_address(name); }
 #else
-inline void *mir_import_resolver(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+inline void *mir_import_resolver(const char *name) {
+    return mir_prelude_address(name) != nullptr ? dlsym(RTLD_DEFAULT, name) : nullptr;
+}
 #endif
 
 // Portable capture of c2mir's diagnostic stream into a std::string. POSIX has
@@ -310,8 +320,9 @@ class MirJit {
     // compiler detected"). Since bngsim *generates* the C it JITs, the JIT path
     // strips the system #includes and prepends extern declarations for the
     // libc/libm symbols the RHS can call; MIR resolves them at link time via the
-    // import resolver (dlsym on POSIX; a static libm/libc table on Windows — see
-    // detail::mir_import_resolver). The RHS *body* — everything that affects
+    // import resolver (dlsym on POSIX, for the prelude's names only; a static
+    // libm/libc table on Windows — see detail::mir_import_resolver). The RHS
+    // *body* — everything that affects
     // numerics — is byte-identical to what the cc-subprocess backend compiles.
     // Only the header preamble differs.
     static std::string make_jit_source(const std::string &src) {
@@ -479,6 +490,20 @@ class MirJit {
             MIR_load_module(ctx_, m);
         }
 
+        // An import the resolver cannot answer is a call c2mir declared
+        // implicitly (see detail::mir_prelude_address). MIR_link reports it
+        // through MIR's default error function, which exit()s the process, so
+        // refuse it here, while it is still an exception, as cc refuses it.
+        std::string unresolved = first_unresolved_import(ctx_);
+        if (!unresolved.empty()) {
+            close();
+            throw std::runtime_error(
+                "MirJit: the generated source refers to " + unresolved +
+                ", which it does not define and which is not one of the libc/libm functions "
+                "the JIT prelude declares (c2mir accepts a call to an undeclared function; "
+                "the cc backend refuses it)");
+        }
+
         MIR_gen_init(ctx_);
         gen_inited_ = true;
         if (opt_level < 0)
@@ -487,6 +512,22 @@ class MirJit {
             opt_level = 3;
         MIR_gen_set_optimize_level(ctx_, static_cast<unsigned>(opt_level));
         MIR_link(ctx_, MIR_set_gen_interface, detail::mir_import_resolver);
+    }
+
+    // The first import across the loaded modules that the import resolver has no
+    // address for, or "" if every one resolves.
+    static std::string first_unresolved_import(MIR_context_t ctx) {
+        for (MIR_module_t m = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx)); m != nullptr;
+             m = DLIST_NEXT(MIR_module_t, m)) {
+            for (MIR_item_t it = DLIST_HEAD(MIR_item_t, m->items); it != nullptr;
+                 it = DLIST_NEXT(MIR_item_t, it)) {
+                if (it->item_type == MIR_import_item &&
+                    detail::mir_import_resolver(it->u.import_id) == nullptr) {
+                    return it->u.import_id;
+                }
+            }
+        }
+        return {};
     }
 
     // Find a JIT'd function item by name across loaded modules and return its

@@ -35,6 +35,13 @@ Two levels, because the end-to-end one only bites where the JIT actually runs:
 * :class:`TestTheGeneratedSourceCompiles` puts each of the three through a real
   ``Simulator``: a formality under ``cc``, the actual #85 reproducer under
   ``BNGSIM_CODEGEN_JIT=mir``.
+
+The prelude also bounds the other direction: it is the whole list of libc/libm
+names a JIT'd source may import. c2mir accepts a call to an undeclared function
+(an implicit ``int name()``) where cc refuses it, so a bare call the emitter has
+no C for used to reach MIR_link, and either ended the process or was bound to an
+unrelated global of the same name. :class:`TestACallThePreludeDoesNotDeclareIsRefused`
+pins the refusal ``MirJit`` now makes instead.
 """
 
 from __future__ import annotations
@@ -42,6 +49,8 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import bngsim
@@ -407,3 +416,89 @@ class TestTheGeneratedSourceCompiles:
         # The NaN sentinel lives in the *function* sensitivities, which this
         # selector does not return; the state sensitivities are always real.
         assert np.isfinite(sens).all()
+
+
+# ─── a call the prelude does not declare ───────────────────────────────────
+#
+# The emitter writes some ExprTk functions through as bare calls it has no C for
+# (frac, inrange, iclamp, roundn, root, logn, sinc, equal, a table function's
+# name). cc refuses such a source as a call to an undeclared function, and codegen
+# falls back or refuses by name. c2mir instead takes the call as an implicit
+# ``int name()``, the C89 rule, so on the JIT backend the name reached MIR_link as
+# an import of its own. One the resolver could not find, MIR's default error
+# function reported by exit(1), which ended the Python process mid-run. One dlsym
+# could find was bound to whatever global has that spelling: on macOS a private
+# framework loaded into the Python process exports an ``equal``, and a run of
+# ``k*(1 + equal(k, 0.5))`` came back with B(1) = 0.787 where the answer is 1.264,
+# with no warning. MirJit now refuses every import outside the prelude's table
+# before it links.
+
+_UNDECLARED_NET = """begin parameters
+    1 k 0.5
+end parameters
+begin species
+    1 A() 2.0
+    2 B() 0
+end species
+begin functions
+    1 f() {law}
+end functions
+begin reactions
+    1 1 2 f #_R1
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+# name -> a rate law that calls it where the call decides the rate all run long.
+_UNDECLARED_LAWS = {
+    "equal": "k*(1 + equal(k, 0.5))",
+    "frac": "k*(1 + frac(k + 2))",
+}
+
+# Run in a child: before the fix the frac case exit(1)ed, which would have taken
+# the pytest worker with it rather than failing this test.
+_RUN_IN_A_CHILD = """
+import sys
+import bngsim
+sim = bngsim.Simulator(bngsim.Model.from_net(sys.argv[1]), method="ode", codegen=True)
+try:
+    sim.run(t_span=(0.0, 5.0), n_points=6)
+except Exception as e:
+    print(f"refused: {e}")
+else:
+    print("ran")
+"""
+
+
+class TestACallThePreludeDoesNotDeclareIsRefused:
+    @pytest.mark.parametrize("name", list(_UNDECLARED_LAWS))
+    def test_the_emitter_still_writes_it_as_a_bare_call(self, tmp_path, prelude, name):
+        """Keeps the end-to-end case honest: it covers the hole only while the
+        emitted source calls ``name`` without defining it, and the prelude does
+        not declare it. If the codegen learns C for one, pick another name."""
+        model = _model(tmp_path, _UNDECLARED_NET.format(law=_UNDECLARED_LAWS[name]))
+        code = _COMMENTS.sub(" ", cg.prepare_model_codegen_source(model))
+        call = rf"(?<![A-Za-z0-9_]){re.escape(name)}\s*\("
+        assert re.search(call, code), f"the emitted source no longer calls {name}()"
+        assert not re.search(rf"\b(?:double|int)\s+{re.escape(name)}\s*\(", code)
+        assert not re.search(call, prelude)
+
+    @pytest.mark.skipif(
+        not getattr(bngsim, "HAS_MIR", False),
+        reason="bngsim built without the MIR backend (configure with -DBNGSIM_ENABLE_MIR=ON)",
+    )
+    @pytest.mark.parametrize("name", list(_UNDECLARED_LAWS))
+    def test_the_jit_refuses_it_by_name(self, tmp_path, name):
+        net = tmp_path / "m.net"
+        net.write_text(_UNDECLARED_NET.format(law=_UNDECLARED_LAWS[name]))
+        child = subprocess.run(
+            [sys.executable, "-c", _RUN_IN_A_CHILD, str(net)],
+            env={**os.environ, "BNGSIM_CODEGEN_JIT": "mir"},
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert child.returncode == 0, child.stderr[-2000:]
+        assert f"refers to {name}," in child.stdout, child.stdout + child.stderr[-2000:]
