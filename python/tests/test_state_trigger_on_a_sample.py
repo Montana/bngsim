@@ -122,7 +122,7 @@ def test_a_clock_trigger_a_double_after_the_sample_is_after_it(ulps):
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="#1124: fixed for plain runs only. A sensitivity run's fire needs a located "
+    reason="#1182: #1124 is fixed for plain runs only. A sensitivity run's fire needs a located "
     "crossing for its jump, so it still records the row at 2.5 before the event (S = 3).",
 )
 def test_a_sensitivity_run_agrees_with_a_plain_run_at_the_row():
