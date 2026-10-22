@@ -450,13 +450,34 @@ def _piecewise_of_if(sp):
     without them. This builds that chain (``ITE(c1, b1, ITE(c2, b2, ...))``,
     relationals made canonical, as the rewrite returns it), so ``ExprCondPair``
     finds no ``Piecewise`` to rewrite. A fold with no default is left to sympy.
+
+    A branch of the fold is a truth value only where the condition compared an
+    ``if()``. Where the condition is the ``if()`` itself, ``if(if(F != 1, F, 0),
+    a, b)``, its branches are numbers, which ExprTk reads as true where they are
+    nonzero. ``ITE`` would take a bare ``F`` as a Boolean atom and simplify it
+    against ``F != 1`` (``ITE(Ne(F, 1), F, False)`` became ``F``, true at F = 1
+    where ExprTk reads the inner ``if()`` as 0), and refuse any other number,
+    which sympy's rewrite only escaped where its sets cut that branch off. So
+    a branch that is not already a comparison or a logical form of them is
+    written as ExprTk reads it, ``Ne(value, 0)``.
     """
     built = _piecewise_of_if_cache.get("built")
     if built is not None:
         return built
-    from sympy.core.relational import _canonical
+    from sympy.core.relational import Relational
     from sympy.functions.elementary.piecewise import piecewise_fold
-    from sympy.logic.boolalg import ITE
+    from sympy.logic.boolalg import ITE, BooleanAtom, BooleanFunction
+
+    def _truth(value):
+        if isinstance(value, (BooleanAtom, Relational, BooleanFunction)):
+            return value
+        return sp.Ne(value, 0)
+
+    def _canonical(cond):
+        # sympy.core.relational._canonical, spelled out: that name is private,
+        # and this runs from _build_local_dict, outside _exprtk_to_sympy's try,
+        # so a sympy that renamed it would fail the load instead of declining.
+        return cond.xreplace({r: r.canonical for r in cond.atoms(Relational)})
 
     def _without_piecewise(cond):
         folded = piecewise_fold(cond)
@@ -465,9 +486,9 @@ def _piecewise_of_if(sp):
         pairs = list(folded.args)
         if pairs[-1].cond != sp.true:
             return cond
-        last = pairs[-1].expr
+        last = _truth(pairs[-1].expr)
         for branch, c in reversed(pairs[:-1]):
-            last = ITE(c, branch, last)
+            last = ITE(c, _truth(branch), last)
         return _canonical(last)
 
     def piecewise(*pairs, **options):
