@@ -1082,6 +1082,7 @@ class Model:
             # crossings the guards step through, so derive them again.
             try:
                 from bngsim._switch_sensitivity import state_switch_root_conditions
+
                 again, guards = state_switch_root_conditions(
                     self._core, covered=covered, with_guards=True
                 )
