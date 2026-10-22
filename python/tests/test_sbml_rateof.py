@@ -1975,3 +1975,125 @@ def test_an_event_that_calls_a_function_reading_rateof():
     )
     p2 = np.asarray(result.state)[:, list(result.state_names).index("p2")]
     np.testing.assert_allclose(p2, [7.0, -5 * np.exp(-0.5), -5 * np.exp(-0.5)], rtol=1e-7)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    ("read", "funcs"),
+    [
+        ("<apply><ci>h</ci><ci>S</ci></apply>", ("h",)),
+        ("<apply><ci>f</ci><ci>S</ci></apply>", ("f",)),
+        ("<apply><ci>rateOf</ci><ci>S</ci></apply>", ()),
+        (f"<apply>{_RATEOF_CSYMBOL}<ci>S</ci></apply>", ()),
+    ],
+    ids=["idiom-in-function", "csymbol-in-function", "idiom", "csymbol"],
+)
+def test_an_event_delay_and_priority_that_read_rateof(read, funcs, codegen):
+    """E triggers at t = 1 with delay rateOf(S) + 6 = 6 - 5·e^(-1/2) there, so
+    p2 = 1 from t ≈ 3.967; its priority reads rateOf(S) as well. The idiom's
+    load-time fold gave NaN: the delay was refused as "nan", and the priority
+    failed in ExprTk (issue #1124)."""
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><geq/>{_TIME_CSYMBOL}'
+        f"<cn>1</cn></apply></math></trigger><delay>{m}<apply><plus/>{read}<cn>6</cn>"
+        f"</apply></math></delay><priority>{m}{read}</math></priority>"
+        f'<listOfEventAssignments><eventAssignment variable="p2">{m}<cn>1</cn></math>'
+        "</eventAssignment></listOfEventAssignments></event></listOfEvents>"
+    )
+    xml = _sbml(
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", funcs).replace(
+            "</model>", event + "</model>"
+        )
+    )
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", codegen=codegen
+    ).run(t_span=(0.0, 5.0), n_points=501, rtol=1e-10, atol=1e-12)
+    t = np.asarray(result.time)
+    p2 = np.asarray(result.state)[:, list(result.state_names).index("p2")]
+    np.testing.assert_array_equal(p2, np.where(t > 7.0 - 5.0 * np.exp(-0.5), 1.0, 7.0))
+
+
+_L2_STOICHIOMETRY_RATEOF = """<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+  <model id="m">
+    <listOfFunctionDefinitions>
+      <functionDefinition id="rateOf"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>a</ci></bvar><notanumber/></lambda></math></functionDefinition>
+      <functionDefinition id="h"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>y</ci></bvar><apply><ci>rateOf</ci><ci>y</ci></apply></lambda>
+      </math></functionDefinition>
+      <functionDefinition id="h2"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>z</ci></bvar><apply><times/><cn>2</cn>
+        <apply><ci>h</ci><ci>z</ci></apply></apply></lambda></math></functionDefinition>
+    </listOfFunctionDefinitions>
+    <listOfCompartments><compartment id="c" size="1"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="10"/>
+      <species id="R" compartment="c" initialAmount="0" boundaryCondition="true"/>
+    </listOfSpecies>
+    <listOfParameters><parameter id="k" value="0.5"/></listOfParameters>
+    <listOfRules>
+      <rateRule variable="R"><math xmlns="http://www.w3.org/1998/Math/MathML"><cn>3</cn>
+      </math></rateRule>
+    </listOfRules>
+    <listOfReactions>
+      <reaction id="deg" reversible="false">
+        <listOfReactants><speciesReference species="S"><stoichiometryMath>
+          <math xmlns="http://www.w3.org/1998/Math/MathML">CALL</math>
+        </stoichiometryMath></speciesReference></listOfReactants>
+        <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+          <apply><times/><ci>k</ci><ci>S</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>
+"""
+
+
+@pytest.mark.parametrize(("fid", "stoichiometry"), [("h", 3.0), ("h2", 6.0)], ids=["h", "h2"])
+def test_a_stoichiometry_math_that_calls_a_function_reading_rateof(fid, stoichiometry):
+    """Level 2: S's stoichiometry in deg is h(R) = rateOf(R) = 3 (R's rate
+    rule), or h2(R) twice that, so S = 10·e^(-0.5·n·t). Neither the write-out
+    nor the check saw a stoichiometryMath, and the inliner read the rate of h's
+    own parameter: n = 0 and S held at 10."""
+    xml = _L2_STOICHIOMETRY_RATEOF.replace("CALL", f"<apply><ci>{fid}</ci><ci>R</ci></apply>")
+    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+        t_span=(0.0, 2.0), n_points=5, rtol=1e-10, atol=1e-12
+    )
+    t = np.asarray(result.time)
+    s = np.asarray(result.state)[:, list(result.state_names).index("S")]
+    np.testing.assert_allclose(s, 10.0 * np.exp(-0.5 * stoichiometry * t), rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    ("read", "funcs"),
+    [("<apply><ci>u</ci><ci>S</ci></apply>", ("u",)), (_RATEOF_CSYMBOL, ())],
+    ids=["through-a-function", "csymbol"],
+)
+def test_a_rateof_of_an_undeclared_name_in_an_event_is_refused_by_name(read, funcs):
+    """rateOf(q), q declared nowhere, in an event assignment (directly, or
+    written out from u(S)): ExprTk refused `rate_of__q`, which names nothing in
+    the model. The undefined-symbol check covers only rules and
+    initialAssignments."""
+    if not funcs:
+        read = f"<apply>{read}<ci>q</ci></apply>"
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><geq/>{_TIME_CSYMBOL}'
+        "<cn>1</cn></apply></math></trigger><listOfEventAssignments>"
+        f'<eventAssignment variable="p2">{m}{read}</math></eventAssignment>'
+        "</listOfEventAssignments></event></listOfEvents>"
+    )
+    xml = _sbml(
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", funcs).replace(
+            "</model>", event + "</model>"
+        )
+    )
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(xml)
+    msg = str(exc.value)
+    assert "rateOf(q) [event:E:assignment:p2]: q is declared nowhere in the model" in msg
+    assert "rate_of__" not in msg

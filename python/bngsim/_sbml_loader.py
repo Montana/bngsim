@@ -398,27 +398,25 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     return False
 
 
-def _rated_functions(func_defs: dict) -> set[str]:
+def _rated_functions(func_defs: dict) -> dict[str, set[str]]:
     """The functionDefinitions whose body reads ``rateOf``, through the COPASI
-    idiom or the csymbol, directly or through another they call."""
+    idiom or the csymbol, directly or through another they call, each with the
+    ones of them it calls."""
     idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
     rated: set[str] = set()
-    calls: dict[str, set[str]] = {}  # what each of the others calls
+    calls: dict[str, set[str]] = {}
     for fid, (_p, body) in func_defs.items():
         if body is _RATEOF_FUNCDEF:
             continue
-        called = set()
+        calls[fid] = set()
         for n in _iter_ast_subtree(body):
             t = n.getType()
             if t == libsbml.AST_FUNCTION_RATE_OF or (
                 t == libsbml.AST_FUNCTION and n.getName() in idiom_names
             ):
                 rated.add(fid)
-                break
-            if t == libsbml.AST_FUNCTION:
-                called.add(n.getName())
-        else:
-            calls[fid] = called
+            elif t == libsbml.AST_FUNCTION:
+                calls[fid].add(n.getName())
     grew = True
     while grew:
         grew = False
@@ -426,10 +424,10 @@ def _rated_functions(func_defs: dict) -> set[str]:
             if fid not in rated and not called.isdisjoint(rated):
                 rated.add(fid)
                 grew = True
-    return rated
+    return {fid: calls[fid] & rated for fid in rated}
 
 
-def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: set[str]) -> None:
+def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: dict[str, set[str]]) -> None:
     """Write each call to a functionDefinition whose body reads ``rateOf`` out
     in place, with the caller's arguments put in for the parameters (issue
     #1124, item 8). ``rated`` is :func:`_rated_functions` of ``func_defs``.
@@ -449,17 +447,9 @@ def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: set[str]) -
     """
     if not rated:
         return
-    calls = {
-        fid: {
-            n.getName()
-            for n in _iter_ast_subtree(func_defs[fid][1])
-            if n.getType() == libsbml.AST_FUNCTION and n.getName() in rated
-        }
-        for fid in rated
-    }
     recursive = set()
     for fid in rated:
-        todo, seen = list(calls[fid]), set()
+        todo, seen = list(rated[fid]), set()
         while todo:
             callee = todo.pop()
             if callee == fid:
@@ -467,7 +457,7 @@ def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: set[str]) -
                 break
             if callee not in seen:
                 seen.add(callee)
-                todo.extend(calls[callee])
+                todo.extend(rated[callee])
 
     def is_rated_call(n) -> bool:
         return n.getType() == libsbml.AST_FUNCTION and n.getName() in rated
@@ -484,11 +474,10 @@ def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: set[str]) -
         # is not replaced again: sw(x, S) = rateOf(x)*S called as sw(S, k) is
         # rateOf(S)*k, where one parameter at a time gave rateOf(k)*k. Only a
         # <ci> is a parameter, as for the inliner (_substitute_ast); the time
-        # csymbol is not, whatever its text.
+        # csymbol is not, whatever its text. The body reads rateOf, so it is not
+        # a bare parameter, and the root is never replaced.
         params, body = func_defs[call.getName()]
         args = {p: call.getChild(j) for j, p in enumerate(params)}
-        if body.getType() == libsbml.AST_NAME and body.getName() in args:
-            return args[body.getName()].deepCopy()
         out = body.deepCopy()
         reads = [
             (n, j)
@@ -541,7 +530,7 @@ def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: set[str]) -
         )
 
 
-def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: set[str]) -> None:
+def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: dict[str, set[str]]) -> None:
     """Refuse, by name, a ``rateOf`` that the model has no value for.
 
     One check before either the initial-value fold or the emitter runs, for the
@@ -567,6 +556,10 @@ def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: set[str]) ->
     * ``rateOf`` of anything but a single symbol (rule 10223 for the
       csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
       for NaN, and a rule read either as 0 with a warning.
+    * ``rateOf(q)`` of a ``q`` the model declares nowhere. An initialAssignment
+      or rule is refused before this (``_check_undefined_symbols``); in a
+      kinetic law or an event, ExprTk refused the ``rate_of__q`` accessor,
+      which names nothing in the model.
     * a call to a functionDefinition whose body reads ``rateOf``, directly or
       through another it calls (``rated_funcs``, :func:`_rated_functions`),
       that is still there. :func:`_expand_rated_function_calls` writes every
@@ -619,6 +612,7 @@ def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: set[str]) ->
 
     # (what is read, location) → why the model has no value for it, in model order
     offenders: dict[tuple[str, str], str] = {}
+    declared: dict[str, bool] = {}  # an argument's name → whether the model has it
     for math, where in _iter_model_math(sbml_model):
         shadowed = law_locals.get(where, ())
         for n in _iter_ast_subtree(math):
@@ -646,7 +640,11 @@ def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: set[str]) ->
             name = arg.getName()
             if name in shadowed:
                 continue
-            if name in ar_rules:
+            if name not in declared:
+                declared[name] = _model_declares_symbol(sbml_model, name)
+            if not declared[name]:
+                offenders[(f"rateOf({name})", where)] = f"{name} is declared nowhere in the model"
+            elif name in ar_rules:
                 offenders[(f"rateOf({name})", where)] = (
                     f"{name} is set by the assignmentRule {_rule_text(name)} "
                     "(validation rule 10224)"
@@ -1002,9 +1000,9 @@ def _model_declares_symbol(sbml_model, name: str) -> bool:
 
 def _iter_model_math(sbml_model):
     """Yield ``(math_node, location)`` for every MathML container that feeds the
-    integrated system: rules, kinetic laws, initial assignments, and every
-    event trigger / delay / priority / assignment. ``location`` is a short
-    human-readable tag used in diagnostics."""
+    integrated system: rules, kinetic laws, Level 2 stoichiometryMath, initial
+    assignments, and every event trigger / delay / priority / assignment.
+    ``location`` is a short human-readable tag used in diagnostics."""
     for holder, where in _iter_math_holders(sbml_model):
         yield holder.getMath(), where
 
@@ -1029,6 +1027,17 @@ def _iter_math_holders(sbml_model):
         kl = rxn.getKineticLaw()
         if kl is not None and kl.isSetMath():
             yield kl, f"reaction:{rxn.getId()}"
+        # Level 2's <stoichiometryMath>, which libSBML keeps on the
+        # speciesReference (modifiers carry no stoichiometry).
+        for getter, n_refs in (
+            (rxn.getReactant, rxn.getNumReactants()),
+            (rxn.getProduct, rxn.getNumProducts()),
+        ):
+            for j in range(n_refs):
+                sr = getter(j)
+                sm = sr.getStoichiometryMath() if sr.isSetStoichiometryMath() else None
+                if sm is not None and sm.isSetMath():
+                    yield sm, f"reaction:{rxn.getId()}:stoichiometryMath:{sr.getSpecies()}"
     for i in range(sbml_model.getNumInitialAssignments()):
         ia = sbml_model.getInitialAssignment(i)
         if ia.isSetMath():
@@ -2139,16 +2148,15 @@ def _eval_ast_numeric(
             # COPASI rateOf idiom (GH #106): the instantaneous dx/dt. When a
             # resolver is supplied (the section-0 IA/AR fold), resolve the call's
             # bare-symbol argument to its initial derivative; otherwise the value
-            # is unknown at fold time, so return NaN as it did pre-#106 (matches
-            # the funcDef's NaN body — no numerically-folded context relied on it).
+            # is unknown at fold time, so None, as for the csymbol above. (It was
+            # the funcDef's NaN body, which an event delay folded to "delay nan"
+            # and a priority emitted as an undefined `nan`, issue #1124.)
             if body is _RATEOF_FUNCDEF:
                 if rateof_resolver is not None and nc >= 1:
                     arg = node.getChild(0)
                     if arg.getType() == libsbml.AST_NAME and arg.getName():
-                        r = rateof_resolver(arg.getName(), ctx)
-                        if r is not None:
-                            return r
-                return float("nan")
+                        return rateof_resolver(arg.getName(), ctx)
+                return None
             args = [_c(i) for i in range(nc)]
             if any(a is None for a in args):
                 return None
