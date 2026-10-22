@@ -1,0 +1,138 @@
+"""Run a clock-reading model on RuleMonkey on elapsed time (issue #1063).
+
+Since #1022, ``method="rm"`` runs a model that reads the clock (``time()``, a
+bare ``time``, or a table function indexed by time) on absolute model time, as
+``ode`` and ``ssa`` do. RuleMonkey places each event at ``t + tau`` in doubles,
+so from a large ``t_start`` the waiting times round away once the total
+propensity times |t| nears 1e15, and the run is biased with no error: from
+``t_start = 1e12``, ``A(s~0) -> A(s~1)`` at 0.5 from 1e5 copies left 22743 at
+``1e12 + 2`` against the binomial mean 36788 (z = -291). A model that reads no
+clock runs on elapsed time and is exact (#1060).
+
+So a model that reads the clock through ``time()`` runs on elapsed time too,
+and gets absolute time back through the model. :func:`offset_clock_xml` writes
+a copy of the BNG XML in which every function reads the clock as
+``(time()+__bngsim_t0)``, and the caller sets ``__bngsim_t0`` to the run's
+``t_start`` before it runs. RuleMonkey resolves a parameter from the model's
+parameter table wherever an expression names it (``<ListOfReferences>`` lists
+only observables for it). Output functions are evaluated through the same
+rewritten expressions, so they report on absolute time as before.
+
+The clock is rewritten wherever RuleMonkey reads it and nowhere else
+(:func:`~bngsim._network_free_checks.rulemonkey_clock_ref`): ``time()``, a bare
+``time``, and its alias ``t``, except that a bare ``time`` or ``t`` that names a
+model symbol reads the symbol. BNG2.pl accepts an observable named ``time``, and
+turning that into the clock changed the rates of a model that reads no clock.
+
+A table function indexed by the clock is not rewritten, and a model with one
+runs on model time as before (the caller checks
+:func:`~bngsim._network_free_checks.time_indexed_table_functions`). Its counter
+would have to be a function that reads ``time()+__bngsim_t0``, and RuleMonkey
+3.11.0 recurses without end evaluating a table whose counter is a function:
+rebuild_eval_vars reads the counter through update_eval_vars, whose generation
+stamp is set only after the rebuild (engine.cpp), and the run fails with a
+stack overflow (richardposner/RuleMonkey#111). Offset such a table too once
+that is fixed and vendored.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import re
+import tempfile
+import xml.etree.ElementTree as ET
+from collections.abc import Iterator
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+from bngsim._exceptions import ModelError
+from bngsim._network_free_checks import (
+    _function_elements,
+    _indexed_by_time,
+    rulemonkey_clock_ref,
+    rulemonkey_symbols,
+)
+
+# The parameter the run's t_start is written to.
+OFFSET_PARAM = "__bngsim_t0"
+
+# A <Function> element with a body; a self-closing one has nothing to rewrite.
+_FUNCTION = re.compile(r"<Function\b(?P<attrs>[^>]*)(?<!/)>(?P<body>.*?)</Function>", re.DOTALL)
+_EXPRESSION = re.compile(r"(<Expression>)(.*?)(</Expression>)", re.DOTALL)
+_ID = re.compile(r"""\bid\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_FILE = re.compile(r"""\bfile\s*=\s*(?:"[^"]*"|'[^']*')""")
+
+
+def _table_file(xml_dir: str, file_attr: str) -> str:
+    """The table's data file as RuleMonkey finds it beside the original XML
+    (``<xml_dir>/<file>``, then ``<xml_dir>/../<file>``, each normalized
+    lexically, as load_model in simulator.cpp does), made absolute so the copy
+    written elsewhere finds the same one."""
+    if os.path.isabs(file_attr):
+        return file_attr
+    first = os.path.normpath(os.path.join(xml_dir, file_attr))
+    second = os.path.normpath(os.path.join(xml_dir, "..", file_attr))
+    return second if not os.path.exists(first) and os.path.exists(second) else first
+
+
+def offset_clock_text(xml: str, xml_dir: str | Path) -> str:
+    """*xml* with the model's clock read as ``time()+__bngsim_t0``, its table
+    files found from *xml_dir*. No table function in *xml* may be indexed by the
+    clock."""
+    root = ET.fromstring(xml.encode("utf-8", "surrogateescape"))
+    symbols = rulemonkey_symbols(root)
+    if OFFSET_PARAM in symbols:
+        raise ModelError(
+            f"the BNG XML already has a symbol named {OFFSET_PARAM!r}, which bngsim "
+            "uses to run a model that reads the clock on RuleMonkey (issue #1063). "
+            "Rename it."
+        )
+    functions = {f.get("id", ""): f for f in _function_elements(root)}
+    if any(_indexed_by_time(f) for f in functions.values()):
+        raise ValueError("a table function indexed by the clock is not rewritten")
+    clock = rulemonkey_clock_ref(symbols)
+    offset = f"(time()+{OFFSET_PARAM})"
+    xml_dir = os.path.abspath(xml_dir)
+
+    def function(m: re.Match[str]) -> str:
+        attrs, body = m.group("attrs"), m.group("body")
+        fid = _ID.search(attrs)
+        el = functions.get(fid.group(1) or fid.group(2)) if fid else None
+        file_attr = "" if el is None else (el.get("file") or "").strip()
+        if file_attr and el is not None and (el.get("type") or "").lower() == "tfun":
+            # The copy is written elsewhere: its data file, where RuleMonkey
+            # found it beside the original.
+            path = escape(_table_file(xml_dir, file_attr), {'"': "&quot;"})
+            attrs = _FILE.sub(lambda _: f'file="{path}"', attrs, count=1)
+        body = _EXPRESSION.sub(
+            lambda e: e.group(1) + clock.sub(offset, e.group(2)) + e.group(3), body
+        )
+        return f"<Function{attrs}>{body}</Function>"
+
+    xml = _FUNCTION.sub(function, xml)
+
+    parameter = f'<Parameter id="{OFFSET_PARAM}" type="Constant" value="0" expr="0"/>'
+    if "<ListOfParameters>" in xml:
+        xml = xml.replace("<ListOfParameters>", f"<ListOfParameters>\n      {parameter}", 1)
+    elif "<ListOfParameters/>" in xml:
+        listed = f"<ListOfParameters>\n      {parameter}\n    </ListOfParameters>"
+        xml = xml.replace("<ListOfParameters/>", listed, 1)
+    else:
+        raise ModelError("the BNG XML has no <ListOfParameters> to add the clock's offset to")
+    return xml
+
+
+@contextlib.contextmanager
+def offset_clock_xml(xml_path: str | Path) -> Iterator[str]:
+    """The path of :func:`offset_clock_text` of *xml_path*, written to a
+    temporary directory that is removed on exit. RuleMonkey reads the XML and
+    its table files once, when it is built, so build it inside the block."""
+    source = Path(xml_path)
+    # Undecodable bytes pass through as they are; RuleMonkey reads bytes.
+    text = source.read_bytes().decode("utf-8", "surrogateescape")
+    text = offset_clock_text(text, os.path.dirname(os.path.abspath(source)))
+    with tempfile.TemporaryDirectory(prefix="bngsim-rm-clock-") as tmp:
+        out = Path(tmp) / source.name
+        out.write_bytes(text.encode("utf-8", "surrogateescape"))
+        yield str(out)
