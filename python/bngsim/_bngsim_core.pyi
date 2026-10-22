@@ -227,6 +227,10 @@ class NetworkModel:
         """
         The one-sided finite-difference Jacobian of compute_derivs at (t, conc) as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, stepped by the steady-state solver's own rule. Issue #523.
         """
+    def fill_dense_fd_jacobian_own_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
+        """
+        The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale taken at their own step where the rules of fd_own_step_columns allow, and the species (0-based) whose columns that changed. Issue #1002.
+        """
     def fill_sparse_analytical_jacobian(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> numpy.typing.NDArray[numpy.float64]:
         """
         The analytical Jacobian at (t, conc) as the float64 value array (nnz,) of the CSC pattern jacobian_sparsity describes. Same completeness caveat as fill_dense_analytical_jacobian. Issue #523.
@@ -1329,6 +1333,33 @@ class SteadyStateResultCore:
         ...
     @property
     def sens_dfdp_source(self) -> str:
+        ...
+    @property
+    def sens_fd_disagree_function(self) -> int:
+        ...
+    @property
+    def sens_fd_disagree_param(self) -> int:
+        ...
+    @property
+    def sens_fd_disagree_species(self) -> int:
+        ...
+    @property
+    def sens_fd_floored(self) -> float:
+        ...
+    @property
+    def sens_fd_function_floored(self) -> float:
+        ...
+    @property
+    def sens_fd_function_own_step(self) -> float:
+        ...
+    @property
+    def sens_fd_function_param(self) -> int:
+        ...
+    @property
+    def sens_fd_own_step(self) -> float:
+        ...
+    @property
+    def sens_fd_own_step_species(self) -> list[int]:
         ...
     @property
     def sens_jacobian_rcond(self) -> float:

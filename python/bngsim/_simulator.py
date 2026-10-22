@@ -7534,6 +7534,7 @@ class Simulator:
         self._warn_about_pure_sinks(result)
         self._warn_about_ss_sensitivity(result)
         self._raise_if_not_an_isolated_root(result, max_time, mask is not None)
+        self._raise_if_the_step_decides(result)
         return result
 
     @staticmethod
@@ -7714,6 +7715,68 @@ class Simulator:
     #: leaves wherever something asked for made it in a way the rule did not
     #: look at, and lifted that one model of 791 (issue #961).
     _SS_ROOT_GROWTH_MAX = 0.01
+
+    @staticmethod
+    def _raise_if_the_step_decides(result: SteadyStateResult) -> None:
+        """Refuse ``dY_ss/dp``, and a function's ``d/dp``, where a difference
+        quotient of the state gives two answers at two steps (issue #1002).
+
+        A species of the Jacobian's difference quotient is stepped by 1.5e-8 of
+        the state's largest concentration, which keeps a small species out of
+        the cancellation noise of the rows that read it. Beside a species at
+        1e8, one at 0.87 is stepped by 1.5, and a term of second order in it is
+        read as a secant across twice the species: dX*/ds came back 0.2025 for
+        0.3619. Stepped by 1.5e-8 of itself, the species has the opposite
+        failure: a term that reads it through a sum with something much larger,
+        ``C*((K + X) - K)`` or a total minus what is bound, answers in steps of
+        that sum's last bit, and the small step does not see it at all.
+        Nothing in a row tells the two apart in every case. So the columns are
+        solved with both, and returned where they agree, as the first gives
+        them; where they are further apart than 1e-4 of a column's largest
+        entry they are refused. Curvature moves the first answer and rounding
+        grain the second, so one both give is neither.
+        """
+        time_course = (
+            "a time course with forward sensitivities run to the steady state, "
+            "Simulator(model, sensitivity_params=[...]).run(...), reading "
+            "result.sensitivities at the last time point"
+        )
+        why = (
+            "A species far below the state's scale is stepped by many times itself at "
+            "the first, which reads a term of second order in it as a secant across it, "
+            "and the second misses a term that reads it through a sum with something "
+            "much larger (a total minus what is bound): which of the two is right is not "
+            'known. A closed-form Jacobian has neither failure; jacobian="auto" uses it '
+            'where the model has one, which jacobian="fd" does not. Otherwise take the '
+            f"columns from {time_course}."
+        )
+        stepped = ", ".join(result.sens_fd_own_step_species[:5])
+        if len(result.sens_fd_own_step_species) > 5:
+            stepped += f" and {len(result.sens_fd_own_step_species) - 5} more"
+        opening = (
+            "steady_state(sensitivity_params=...) does not return {what} for this model at "
+            "this steady state (issue #1002): the Jacobian is a difference quotient, and "
+            "the answer depends on its step. "
+        )
+        if result.sens_fd_disagree_species is not None:
+            raise SimulationError(
+                opening.format(what="dY_ss/dp")
+                + f"d{result.sens_fd_disagree_species}/d{result.sens_fd_disagree_param} is "
+                f"{result.sens_fd_floored:.6g} with every species stepped by 1.5e-8 of the "
+                f"state's largest concentration, and {result.sens_fd_own_step:.6g} with "
+                f"{stepped} stepped by 1.5e-8 of itself, more than 1e-4 of the column's "
+                f"largest entry apart. {why}"
+            )
+        if result.sens_fd_disagree_function is not None:
+            raise SimulationError(
+                opening.format(what="the function sensitivities")
+                + f"d{result.sens_fd_disagree_function}/d{result.sens_fd_function_param} "
+                f"is {result.sens_fd_function_floored:.6g} with every species stepped by "
+                "1.5e-8 of the state's largest concentration in the function's partials "
+                f"over the state, and {result.sens_fd_function_own_step:.6g} with the "
+                "species far below that scale stepped by 1.5e-8 of themselves, more than "
+                f"1e-4 of the largest function sensitivity in that column apart. {why}"
+            )
 
     def _raise_if_not_an_isolated_root(
         self,
@@ -10052,6 +10115,24 @@ class SteadyStateResult:
     sens_root_column_param, sens_root_hold_param : str or None
     sens_root_relaxation_param : str or None
         The parameter whose column each of those is read at.
+    sens_fd_own_step_species : list of str
+        Where ``sens_jacobian_source`` is ``"finite-difference"``: the species
+        far below the state's scale whose columns of the Jacobian were taken
+        again at their own step, for the columns to be solved a second time
+        with (issue #1002). Empty where there is none, or the Jacobian is in
+        closed form.
+    sens_fd_disagree_species, sens_fd_disagree_param : str or None
+    sens_fd_floored, sens_fd_own_step : float
+        The entry of ``dY_ss/dp`` where the two solves are furthest apart, by
+        more than 1e-4 of the column's largest entry, and its two values: the
+        one with every species stepped against the state's scale, which is
+        what ``sensitivity`` holds, and the one with those species at their own
+        step. ``steady_state`` raises where there is one. None where the two
+        agree.
+    sens_fd_disagree_function, sens_fd_function_param : str or None
+    sens_fd_function_floored, sens_fd_function_own_step : float
+        The same for a function sensitivity whose state-chain term was
+        differenced (``sens_output_source`` not ``"codegen"``).
 
     Notes
     -----
@@ -10127,6 +10208,15 @@ class SteadyStateResult:
         "sens_root_hold_param",
         "sens_mask_held_species",
         "sens_mask_reader_species",
+        "sens_fd_own_step_species",
+        "sens_fd_disagree_species",
+        "sens_fd_disagree_param",
+        "sens_fd_floored",
+        "sens_fd_own_step",
+        "sens_fd_disagree_function",
+        "sens_fd_function_param",
+        "sens_fd_function_floored",
+        "sens_fd_function_own_step",
         "_sensitivity",
         "_sens_param_names",
         "_observable_names",
@@ -10224,6 +10314,24 @@ class SteadyStateResult:
         self.sens_root_relaxation_param = _named(
             columns, getattr(core, "sens_root_relaxation_param", -1)
         )
+        # Issue #1002 — whether the step of a differenced Jacobian decides the
+        # columns.
+        self.sens_fd_own_step_species = [
+            species[i] for i in getattr(core, "sens_fd_own_step_species", ())
+        ]
+        self.sens_fd_disagree_species = _named(
+            species, getattr(core, "sens_fd_disagree_species", -1)
+        )
+        self.sens_fd_disagree_param = _named(columns, getattr(core, "sens_fd_disagree_param", -1))
+        self.sens_fd_floored = getattr(core, "sens_fd_floored", 0.0)
+        self.sens_fd_own_step = getattr(core, "sens_fd_own_step", 0.0)
+        self.sens_fd_disagree_function = _named(
+            list(getattr(core, "raw_expression_names", ())),
+            getattr(core, "sens_fd_disagree_function", -1),
+        )
+        self.sens_fd_function_param = _named(columns, getattr(core, "sens_fd_function_param", -1))
+        self.sens_fd_function_floored = getattr(core, "sens_fd_function_floored", 0.0)
+        self.sens_fd_function_own_step = getattr(core, "sens_fd_function_own_step", 0.0)
 
         self._sensitivity: np.ndarray | None
         if core.n_sens_params > 0:

@@ -503,6 +503,14 @@ class NetworkModel {
     // Fixed-species rows come out zero because compute_derivs zeroes them.
     void fill_dense_fd_jacobian(double t, const double *conc, double *jac);
 
+    // The same matrix with the columns of species far below the state's scale
+    // taken at their own step where bngsim/fd_jacobian.hpp's rules allow
+    // (fd_own_step_columns, issue #1002), into `jac`, from the floored matrix
+    // `floored` that fill_dense_fd_jacobian wrote at the same point. Returns the
+    // species (0-based) whose columns differ; empty where none does.
+    std::vector<int> fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                     const double *floored, double *jac);
+
     // (species_idx0, param_idx0) pairs for species whose initial
     // concentration is set directly by a parameter (.net "begin species"
     // entries with a parameter name in the IC column). Used by forward

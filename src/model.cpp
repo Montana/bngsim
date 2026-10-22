@@ -3612,6 +3612,16 @@ void NetworkModel::fill_dense_fd_jacobian(double t, const double *conc, double *
         n_species(), kNoExcluded, jac);
 }
 
+std::vector<int> NetworkModel::fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                               const double *floored, double *jac) {
+    static const std::vector<int> kNoExcluded;
+    const int ns = n_species();
+    std::vector<double> f0(static_cast<size_t>(ns));
+    compute_derivs(t, conc, f0.data());
+    return fd_own_step_columns([this, t](const double *y, double *f) { compute_derivs(t, y, f); },
+                               conc, ns, ns, kNoExcluded, f0.data(), floored, jac);
+}
+
 void NetworkModel::fill_sparse_analytical_jacobian(double t, const double *conc, double *vals) {
     // Sparse mirror of fill_dense_analytical_jacobian: identical math, written by
     // CSC data index instead of (col·n + row). This is the canonical sparse
