@@ -8735,10 +8735,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 if (
                     refs.get(id(e), 0) > 1
                     and size[id(e)] >= 16
-                    and isinstance(e, _sp.Expr)
-                    and not isinstance(
-                        e, (_sp.core.relational.Relational, _sp.logic.boolalg.Boolean)
-                    )
+                    and isinstance(e, _sp.Expr)  # a number; a relation or an And is not one
                 ):
                     name = f"{prefix}{len(helpers)}"
                     helpers.append((name, new))
@@ -8751,11 +8748,22 @@ def _build_model_from_sbml_doc_in_context(doc):
             # the tree, which a relation over a diamond of rules makes
             # exponential (issue #1124, item 6): `r17 > 0.5` beside `r17 <
             # -0.5`, or beside `S > 3`, took a second to load at 18 rules, x2.6
-            # for every two more. So two long differences are first read at
-            # two points, to 30 digits, and only a pair whose ratio is the same
-            # at both is cancelled; one read that is not a number, or a d0
-            # near 0 there, leaves the pair to `cancel` too.
+            # for every two more. So two long differences are first compared
+            # term by term, as relations that share a root are written (`r21 >
+            # 1.4` beside `2*r21 < 2.8`), then read at two points, to 30
+            # digits, and only a pair whose ratio is the same at both is
+            # cancelled; one read that is not a number, or a d0 near 0 there,
+            # leaves the pair to `cancel` too.
             if _tree_size(d) + _tree_size(d0) > _JUMP_TEXT_NODES:
+                terms: list[dict] = [{}, {}]
+                for x, out in zip((d, d0), terms, strict=True):
+                    for t in _sp.Add.make_args(x):
+                        k, m = t.as_coeff_Mul()
+                        out[m] = out.get(m, 0) + k
+                if terms[0].keys() == terms[1].keys() and all(terms[1].values()):
+                    qs = [terms[0][m] / terms[1][m] for m in terms[1]]
+                    if qs[0] != 0 and all(abs(q - qs[0]) <= 1e-12 * abs(qs[0]) for q in qs):
+                        return qs[0]
                 names = sorted(
                     {e for x in (d, d0) for e in _subexpressions(x) if e.is_Symbol}, key=str
                 )
@@ -8863,7 +8871,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 texts = [sympy_to_exprtk(e) for e in written]
                 if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
-                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c_read} "
                         "flips, and bngsim cannot write the size on either side"
                     )
                     continue

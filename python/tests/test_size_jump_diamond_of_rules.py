@@ -57,12 +57,16 @@ def _doc(n, shape):
         for i in range(2, n)
     ]
     last = _ci(f"r{n - 1}")
-    if shape in ("condition", "two", "and"):
+    if shape in ("condition", "two", "pair", "and"):
         rules = [("r0", _ci("S")), ("r1", _ap("plus", _ci("S"), _cn(1))), *nonlinear]
         if shape == "condition":
             cv = _pw(_cn(1), _ap("gt", last, _cn(0.5)), _cn(2))
-        elif shape == "two":
-            two = f"<piece>{_cn(3)}{_ap('lt', last, _cn(1.1))}</piece>"
+        elif shape in ("two", "pair"):
+            # `pair`: the second relation shares the first one's root
+            below = _ap("lt", last, _cn(1.1))
+            if shape == "pair":
+                below = _ap("lt", _ap("times", _cn(2), last), _cn(2.8))
+            two = f"<piece>{_cn(3)}{below}</piece>"
             cv = _pw(_cn(1), _ap("gt", last, _cn(1.4)), _cn(2)).replace(
                 "<otherwise>", two + "<otherwise>"
             )
@@ -116,6 +120,9 @@ def _size(t, n, shape):
     if shape == "two":
         r = _diamond(s, s + 1, n)
         return np.where(r > 1.4, 1.0, np.where(r < 1.1, 3.0, 2.0))
+    if shape == "pair":
+        r = _diamond(s, s + 1, n)
+        return np.where(r > 1.4, 1.0, np.where(2 * r < 2.8, 3.0, 2.0))
     if shape == "and":
         return np.where((_diamond(s, s + 1, n) > 1.2) & (s > 3), 1.0, 2.0)
     r0 = np.where(s > 3, s, 2 * s)
@@ -194,14 +201,15 @@ def test_a_condition_that_reads_a_piecewise_rule_is_read_as_its_relations():
         np.testing.assert_allclose(sn, 5 * v[0] / v, rtol=1e-8, err_msg=f"seed {seed}")
 
 
-@pytest.mark.parametrize("shape", ["two", "and"])
-def test_two_relations_over_a_diamond_load_in_linear_time(shape):
-    """``piecewise(1, r21 > 1.4, 3, r21 < 1.1, 2)`` and ``piecewise(1, r21 > 1.2
-    && S > 3, 2)``. Whether two relations share a root was asked of
-    ``cancel``, and the And was put together by its constructor, which sorts
-    its arguments by their size as trees: 1.1 and 0.55 s to load at 18 rules,
-    x2.6 for every two more. Two long differences are now read at two points
-    first, and the And is put together as it is."""
+@pytest.mark.parametrize(("shape", "roots"), [("two", 2), ("pair", 1), ("and", 2)])
+def test_two_relations_over_a_diamond_load_in_linear_time(shape, roots):
+    """``piecewise(1, r21 > 1.4, 3, r21 < 1.1, 2)``, the same with ``2*r21 <
+    2.8``, which shares r21 > 1.4's root, and ``piecewise(1, r21 > 1.2 && S > 3,
+    2)``. Whether two relations share a root was asked of ``cancel``, and the
+    And was put together by its constructor, which sorts its arguments by their
+    size as trees: 1.1 and 0.55 s to load at 18 rules, x2.6 for every two more.
+    Two long differences are now compared term by term, then read at two
+    points, and the And is put together as it is."""
     n = 22
     times = np.linspace(0.0, 4.0, 81)
     v = _size(times, n, shape)
@@ -209,6 +217,8 @@ def test_two_relations_over_a_diamond_load_in_linear_time(shape):
     began = time.perf_counter()
     model = bngsim.Model.from_sbml_string(_doc(n, shape))
     assert time.perf_counter() - began < 2.0
-    assert f"(r{n - 1} > {1.4 if shape == 'two' else 1.2})" in model._core.event_trigger_sources()
+    triggers = model._core.event_trigger_sources()
+    assert f"(r{n - 1} > {1.2 if shape == 'and' else 1.4})" in triggers
+    assert len(triggers) == 2 * roots
     away = _away(v)
     np.testing.assert_allclose(_sn(model, times)[away], (5 * v[0] / v)[away], rtol=1e-8)
