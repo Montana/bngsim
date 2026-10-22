@@ -162,6 +162,15 @@ def test_an_epidemic_that_burns_out_is_refused(tmp_path):
     assert "pure_sink_species" in message
 
 
+def test_under_the_default_criterion_the_refusal_says_rtol(tmp_path):
+    """The same epidemic under the default criterion (issue #1001), which does
+    not read tol: what solves nearer is rtol, and the refusal says so."""
+    sim = bngsim.Simulator(_net(tmp_path, SIR), method="ode")
+    with pytest.raises(bngsim.SimulationError, match=r"#995.*a smaller rtol") as caught:
+        sim.steady_state(sensitivity_params=["g", "I0"], criterion="scaled")
+    assert "smaller tol" not in str(caught.value)
+
+
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_the_same_with_the_sink_masked_out_is_refused(tmp_path, method):
     """With R masked out the solve had one unknown, I, with S following from

@@ -7362,10 +7362,10 @@ class Simulator:
         ``"integration"`` is the default. Two things still argue for
         ``"newton"``:
 
-        - **A much tighter root.** The polish lands near a residual of ~1e-13
-          where integration stops the moment it crosses ``tol`` (~1e-9) — worth
+        - **A much tighter root.** The polish lands well inside the test,
+          where integration stops the moment it passes it — worth
           having when the steady state feeds a stiff downstream solve.
-        - **A tight ``max_time`` budget.** Newton reaches ``tol`` from a
+        - **A tight ``max_time`` budget.** Newton passes the test from a
           *looser* burst than integration needs on its own, so when ``max_time``
           is cut well below the default it can converge where integration runs
           out of time. At the default ``max_time=1e6`` this does not happen on
@@ -7387,25 +7387,29 @@ class Simulator:
               1. The Newton step ``δ = −J⁻¹f`` from the state to the root is
                  within every species' own tolerance,
                  ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-                 rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-                 floor is the smallest positive initial concentration of a
-                 species that is not ``$``-fixed; where none starts above 0,
-                 the largest species of the state or of the root it steps to).
-                 A species that starts at 0 is held to ``rtol`` times the
-                 floor, so one whose steady state is smaller than that is
-                 within tolerance of 0, as under ``atol="auto"``.
-              2. A run taken on from the state for ``max_time``, kicked by half
-                 of each species' tolerance, moves no species by more than its
-                 tolerance. It is what tells a state the system rests at from an
-                 unstable root (the cubic's 0.3, from which nothing moves an
-                 unkicked run), from a rate with a floor at a kink, and from a
-                 slow drift.
+                 rtol·max(|y⁰_i|, floor)`` as ``atol="auto"`` derives it from
+                 ``y⁰``, the state the solve starts from. The floor is the
+                 smallest positive initial concentration the model declares of
+                 a species that is not ``$``-fixed (where none is above 0, the
+                 smallest of ``y⁰``; where that is 0 too, the largest species
+                 of the state or of the root it steps to). A species that
+                 starts at 0 is held to ``rtol`` times the floor, so one whose
+                 steady state is smaller than that is within tolerance of 0.
+              2. A run taken on from the state for ``max_time`` moves no
+                 species by more than its tolerance, and one from it kicked by
+                 a millionth of each species moves none, in its tolerance, by
+                 more than twice the kick. It is what tells a state the system
+                 rests at from an unstable root (the cubic's 0.3, from which
+                 nothing moves an unkicked run), from a rate with a floor at a
+                 kink, and from a slow drift.
 
-              Where the step cannot be taken, at a singular reduced Jacobian
-              (a continuum of steady states, an epidemic that has burnt out)
+              Where there is no step to take, at a singular reduced Jacobian
               or above 512 unknowns, where the march stops by ``tol``, the
-              second test decides alone. A differenced Jacobian that straddles
-              a jump in a rate law takes no step either. ``mask`` says which
+              runs decide alone, taken on until a drift too slow to show in
+              ``max_time`` would move a species four tolerances. A
+              differenced Jacobian that straddles a jump in a rate law, or a
+              state on a continuum of steady states (singular but for
+              rounding), certifies nothing. ``mask`` says which
               species are measured, not which move: the step and the run move
               every species but a ``$``-fixed one and a masked one that nothing
               reads or that reads nothing (a counter), which is held. Where
@@ -7424,18 +7428,22 @@ class Simulator:
             :attr:`SteadyStateResult.newton_distance` and
             :attr:`SteadyStateResult.continued_run_distance`.
         max_time : float
-            Max integration time for the integration path. Default 1e6.
+            Max integration time for the integration path, and how long the
+            runs of ``criterion="scaled"``'s second test are taken on for.
+            Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
         rtol : float, optional
-            Relative tolerance for the CVODE march. Default ``1e-8``.
+            Relative tolerance for the CVODE march, and under
+            ``criterion="scaled"`` for the test of having arrived. Default
+            ``1e-8``.
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the CVODE march — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
             :meth:`run` for the contract. This is the accuracy the march is
-            held to on the way to the root; ``tol`` above is the separate test
-            for having arrived, and stays a single norm over all species.
+            held to on the way to the root; the test of having arrived takes
+            its own, as ``atol="auto"`` does.
         max_steps : int, optional
             Max CVODE internal steps per output point.
         sensitivity_params : list[str], optional
@@ -7990,6 +7998,10 @@ class Simulator:
             "steady_state(sensitivity_params=...) does not return dY_ss/dp for this model "
             "at this steady state (issue #995): "
         )
+        # Issue #1001: what solves nearer the root is the criterion's own
+        # tolerance, tol for the residual test and rtol for the default.
+        residual_test = result.criterion == "residual"
+        tighter = "a smaller tol" if residual_test else "a smaller rtol"
         not_isolated = (
             f"{opening}the steady state is not an isolated root of the equations the "
             "columns are solved on"
@@ -8027,7 +8039,7 @@ class Simulator:
                     "(it is one of a continuum, or a root of higher order, which a species "
                     "nears as 1/t), or a rate law is discontinuous between the two states, "
                     "or the returned state is far from the steady state for the size of "
-                    "its rates, which solving again with a smaller tol settles. "
+                    f"its rates, which solving again with {tighter} settles. "
                 )
             else:
                 # Negative, or above the upper limit.
@@ -8035,8 +8047,13 @@ class Simulator:
                     "a determinant that changes sign or grows so is not that of one matrix "
                     "at two states close together. A rate law is discontinuous between "
                     "the two, or the returned state is far from the steady state for the "
-                    "size of its rates (tol bounds the residual and not the distance to "
-                    "the root: solve again with a smaller tol), or the determinant is what "
+                    "size of its rates ("
+                    + (
+                        "tol bounds the residual and not the distance to the root: "
+                        if residual_test
+                        else ""
+                    )
+                    + f"solve again with {tighter}), or the determinant is what "
                     "rounding leaves of a zero, and the Jacobian is singular whatever the "
                     "state. "
                 )
@@ -8113,9 +8130,14 @@ class Simulator:
                 "step leaves where it is, with its columns. The columns are solved again a "
                 "Newton step on, and where they or the state move the state is stepped "
                 f"again, up to ten times: after the last, {moved}. The returned state is "
-                "far from a root for the size of its rates (tol bounds the residual "
-                "||f(y)||/n and not the distance to the root: this solve stopped at "
-                f"{result.residual:.1e}, and a smaller tol starts the steps nearer), or the "
+                "far from a root for the size of its rates ("
+                + (
+                    "tol bounds the residual ||f(y)||/n and not the distance to the root: "
+                    f"this solve stopped at {result.residual:.1e}, and "
+                    if residual_test
+                    else ""
+                )
+                + f"{tighter} starts the steps nearer), or the "
                 "steady state is not an isolated root, or a species runs out through a "
                 "rate that has no value at nothing, so that it cannot be shown to be at a "
                 f"zero. The columns are those of {time_course}."
@@ -8159,7 +8181,7 @@ class Simulator:
                 f"{away} from that root in {result.sens_root_hold_species}, of what that "
                 f"species is taken over (the limit is "
                 f"{self._SS_ROOT_HOLD_SHIFT_MAX:.0%}). The solver stopped beside a root "
-                "the system leaves, or between two. Solve again with a smaller tol, or "
+                f"the system leaves, or between two. Solve again with {tighter}, or "
                 f"take the columns from {time_course}."
             )
         if not held <= self._SS_ROOT_HOLD_SHIFT_MAX or short:
@@ -8218,11 +8240,15 @@ class Simulator:
                     )
             raise SimulationError(
                 f"{opening}the state the solve returned is not one a run stays at. {moved} "
-                "An integration stops at the first state whose residual ||f(y)||/n is "
-                "under tol, which says where the run is and not where it is going, and a "
-                "root can be one the system leaves, where "
+                + (
+                    "An integration stops at the first state whose residual ||f(y)||/n is "
+                    "under tol, which says where the run is and not where it is going, and a "
+                    if residual_test
+                    else "A "
+                )
+                + "root can be one the system leaves, where "
                 "-J⁻¹·∂f/∂p is how the root moves and not where a run ends. Solve again "
-                "with a smaller tol, or from a state that is not on such a root, or take "
+                f"with {tighter}, or from a state that is not on such a root, or take "
                 f"the columns from {time_course}."
             )
         if not relaxation <= self._SS_ROOT_RELAXATION_MAX:
@@ -10555,14 +10581,15 @@ class SteadyStateResult:
         species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
         is within it (issue #1001). NaN under ``criterion="residual"``, which
         does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular at a state that is not a root.
+        Jacobian is singular at a state that is not a root, or a differenced
+        one straddles a jump.
     continued_run_distance : float
         The second test of ``criterion="scaled"``: the largest move of a
-        measured species, over its tolerance, across a run taken on from the
-        state returned for ``max_time``; at most 1 passes (issue #1001).
-        ``inf`` where the run could not be taken to its time; NaN where it
-        was not taken (under ``"residual"``, where the Newton step already
-        refused, and for a burst-free Newton solve).
+        measured species, over its tolerance, across the runs taken on from
+        the state returned (the kicked one's over 1 + twice its kick); at
+        most 1 passes (issue #1001). ``inf`` where a run could not be taken
+        to its time; NaN where none was taken (under ``"residual"``, where
+        the Newton step already refused, and for a burst-free Newton solve).
     criterion : str
         The test ``converged`` was decided by, ``"scaled"`` or ``"residual"``.
     method_used : str
