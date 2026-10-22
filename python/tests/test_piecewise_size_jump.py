@@ -225,6 +225,35 @@ def test_two_jumps_on_one_species_threshold(a, b):
     np.testing.assert_allclose(got, 5 / (1 + (s <= a) + (s <= b)), rtol=1e-8)
 
 
+@pytest.mark.parametrize(
+    ("on", "scaled"),
+    [("time", 4.0), ("time", 5.0), ("species", 10.0), ("species", 8.0)],
+    ids=["time, together", "time, apart", "species, together", "species, apart"],
+)
+def test_two_jumps_a_scale_puts_on_one_instant(on, scaled):
+    """`2*t < t2` beside `t < t1` with t2 = 2·t1, or `2*S > b` beside `S > a`
+    with b = 2a: the roots coincide, but the differences are not ± each other,
+    and [Sn] went to 5·2/3 for 5/3."""
+    reads = T if on == "time" else _ci("S")
+    first, op, second = (("t1", 2.0), "lt", "t2") if on == "time" else (("a", 5.0), "gt", "b")
+    size = _plus(
+        _plus(_cn(1), _step_at(first[0], on=on)),
+        _pw((_cn(0), _rel(op, _times(_cn(2), reads), _ci(second))), otherwise=_cn(1)),
+    )
+    params = "".join(
+        f'<parameter id="{n}" value="{v!r}" constant="true"/>'
+        for n, v in (first, (second, scaled))
+    )
+    times = np.array([0.0, 1.0, 1.5, 1.9, 2.5, 3.5])
+    got = _sn_at(bngsim.Model.from_sbml_string(_doc([("cv", size)], params=params)), times)
+    if on == "time":
+        size_then = 1 + (times >= first[1]) + (2 * times >= scaled)
+    else:
+        s = _s(times)
+        size_then = 1 + (s <= first[1]) + (2 * s <= scaled)
+    np.testing.assert_allclose(got, 5 / size_then, rtol=1e-8)
+
+
 def _set_sn_at_2(priority):
     return (
         '<event id="e" useValuesFromTriggerTime="true">'

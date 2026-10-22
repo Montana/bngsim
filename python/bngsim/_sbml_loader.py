@@ -8529,19 +8529,25 @@ def _build_model_from_sbml_doc_in_context(doc):
             # rescales by the whole instant, every coinciding condition read on
             # the side it leaves and the side it reaches, and a sibling whose
             # root is elsewhere is read as it stands, as before. A sibling's
-            # difference is ±this one's plus a run constant, which is 0 where
-            # they coincide; read at the run, so a set_param moves it.
-            def _siblings(d0, roots=roots) -> list[tuple[list, int, object]]:
+            # difference is this one's times a number plus a run constant, which
+            # is 0 where they coincide (`2*time < t2` sits on `time < t1` where t2
+            # = 2·t1); read at the run, so a set_param moves it.
+            def _moving_part(d):
+                syms = [s for s in d.free_symbols if str(s) in _moving]
+                return _sp.expand(d).as_independent(*syms, as_Add=True)[1]
+
+            def _siblings(d0, roots=roots) -> list[tuple[list, object, object]]:
                 out = []
+                m0 = _moving_part(d0)
                 for d1, rels1 in roots:
                     if d1 is d0:
                         continue
-                    for sigma in (1, -1):
-                        rest = _sp.expand(d1 - sigma * d0)
-                        if not {str(s) for s in rest.free_symbols} & _moving:
-                            if rest != 0 and not rest.is_number:
-                                out.append((rels1, sigma, rest))
-                            break
+                    scale = _sp.cancel(_moving_part(d1) / m0)
+                    if not scale.is_number or scale == 0:
+                        continue
+                    rest = _sp.expand(d1 - scale * d0)
+                    if not rest.is_number and not {str(s) for s in rest.free_symbols} & _moving:
+                        out.append((rels1, scale, rest))
                 return out
 
             for d0, rels in roots:
@@ -8562,10 +8568,15 @@ def _build_model_from_sbml_doc_in_context(doc):
 
                 def _at(side, siblings=siblings, rels=rels, g=g):
                     subs = {r: r.func(rq * side, 0) for r, rq in rels}
-                    for rels1, sigma, rest in siblings:
+                    for rels1, scale, rest in siblings:
                         for r, rq in rels1:
-                            subs[r] = _sp.Piecewise(
-                                (r.func(rq * sigma * side, 0), _sp.Eq(rest, 0)), (r, True)
+                            # its side where rest = 0, else as it stands; as a
+                            # Piecewise this costs sympy a canonicalisation per
+                            # sibling, which a size of many roots pays N² times
+                            subs[r] = (
+                                _sp.Or(_sp.Eq(rest, 0), r)
+                                if r.func(rq * scale * side, 0)
+                                else _sp.And(_sp.Ne(rest, 0), r)
                             )
                     return _xreplace_once(g, subs)
 
