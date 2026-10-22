@@ -7383,9 +7383,10 @@ class Simulator:
               largest species of the state or of the root it steps to). Units
               do not change the answer. A state where the reduced Jacobian is
               singular is not accepted unless ``f`` is 0 there, nor one where
-              a differenced Jacobian straddles a jump in a rate law. A species
-              ``mask`` leaves out moves with its conservation laws, by its own
-              equation, and is held only where it is in none. A species that
+              a differenced Jacobian straddles a jump in a rate law. ``mask``
+              says which species are measured, not which move: the step moves
+              every species by its own equation but a ``$``-fixed one and a
+              masked one nothing reads, which is held. A species that
               starts at 0 is held to ``rtol`` times the floor, so one whose
               steady state is smaller than that is within tolerance of 0, as
               under ``atol="auto"``. Above

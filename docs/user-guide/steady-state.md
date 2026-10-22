@@ -87,8 +87,9 @@ The floor is the smallest positive initial concentration of a species that is
 not `$`-fixed, or, where none starts above 0, the largest species of the state
 or of the root it steps to. A species that starts at 0 is held to `rtol` times
 the floor, as under `atol="auto"`: one whose steady state is smaller than that is
-within tolerance of 0. A species `mask=` leaves out is not measured, but it moves
-with its conservation laws, by its own equation; only one in no law is held.
+within tolerance of 0. `mask=` says which species are measured, not which move:
+the step moves every species by its own equation but a `$`-fixed one and a
+masked one nothing reads (a write-only sink), which is held.
 Neither side has a unit of concentration or of time in it. The
 march, the bursts, the KINSOL polish and the test at the start all ask it.
 Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes

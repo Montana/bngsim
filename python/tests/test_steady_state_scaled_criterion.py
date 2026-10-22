@@ -22,9 +22,9 @@ tolerance, which reads the same in any units. These tests cover:
 - above 512 unknowns the solve is the residual one, step for step;
 - a march that stops between the steps the criterion is asked at is asked
   where it stops (a corpus model);
-- a species the mask leaves out moves with its laws, so the species the mask
-  keeps are stepped (A -> S under the pure-sink mask), whatever the species
-  order;
+- a mask says which species are measured, not which move: A -> S under the
+  pure-sink mask is stepped, A -> B and A -> C converge, a masked C that
+  drains steps the A and B it feeds, whatever the species order;
 - a differenced Jacobian across a rate law's jump certifies nothing;
 - a $-fixed species does not set the floor;
 - a batch entry at another scale marches at its own "auto" atol.
@@ -181,20 +181,26 @@ end reactions
 
 def _numpy_newton_distance(model, y, rtol, mask=None):
     """The step the criterion measures, by NumPy, and without choosing which
-    species each law is solved for: the Newton step on the conservation
-    manifold, every species in a law moving by its own equation (a masked one
-    too) and a masked species in no law held; over each kept species'
-    rtol·|y| + rtol·max(|y|, floor). The system has to determine the step."""
+    species each law is solved for. Every species moves by its own equation
+    but a $-fixed one and a masked one nothing reads (an empty column of the
+    Jacobian's pattern), which is held; the laws are cut down to the ones no
+    such species is in; the step is solved on all of it, with a rank check.
+    Its size is taken over each kept species' rtol·|y| + rtol·max(|y|, floor)."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
     fixed = np.asarray(model._core.species_is_fixed, bool)
     kept = (np.ones(ns, bool) if mask is None else np.asarray(mask, bool)) & ~fixed
-    moves = (kept | np.any(laws != 0, axis=0)) & ~fixed
+    pattern = model.jacobian(np.asarray(model.get_state(), float), sparse=True).tocsc()
+    unread = ~kept & ~fixed & (np.diff(pattern.indptr) == 0)
+    if unread.any() and len(laws):
+        u, sv, _ = np.linalg.svd(laws[:, unread])
+        laws = u[:, int(np.sum(sv > 1e-12 * sv[0])) :].T @ laws
+    moves = ~fixed & ~unread
     f = np.asarray(model.rhs(y), float)
     jac = np.asarray(model.jacobian(y), float)
     lhs = np.vstack([laws[:, moves], jac[moves][:, moves]])
-    rhs = np.concatenate([np.zeros(cl["n_laws"]), -f[moves]])
+    rhs = np.concatenate([np.zeros(len(laws)), -f[moves]])
     step, _, rank, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
     assert rank == moves.sum()
     assert np.allclose(lhs @ step, rhs, rtol=0, atol=1e-9 * np.max(np.abs(rhs)))
@@ -410,7 +416,7 @@ end reactions
 
 @pytest.mark.parametrize("order", sorted(DECAY_NETS))
 @pytest.mark.parametrize("method", ["integration", "newton"])
-def test_a_masked_law_member_moves_with_its_law(tmp_path, order, method):
+def test_a_masked_sink_takes_up_its_law(tmp_path, order, method):
     # The solvers hold S where integration left it; with A the law's dependent,
     # nothing moved A, and A first was accepted where it started, [1, 0].
     path = tmp_path / "decay.net"
@@ -607,3 +613,127 @@ def test_two_masked_members_of_a_law_do_not_depend_on_species_order(tmp_path, or
     ss = sim.steady_state(criterion="scaled", method=method, mask=mask)
     assert ss.converged
     assert abs(ss.concentrations[a]) < 1e-8
+
+
+# A -> B at 1 and A -> C at 2: one law A + B + C, B and C write-only sinks.
+BRANCH_NETS = {
+    "A first": """begin parameters
+    1 k1 1.0
+    2 k2 2.0
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0
+    3 C() 0
+end species
+begin reactions
+    1 1 2 k1
+    2 1 3 k2
+end reactions
+""",
+    "A last": """begin parameters
+    1 k1 1.0
+    2 k2 2.0
+end parameters
+begin species
+    1 B() 0
+    2 C() 0
+    3 A() 1.0
+end species
+begin reactions
+    1 3 1 k1
+    2 3 2 k2
+end reactions
+""",
+}
+
+
+@pytest.mark.parametrize("order", sorted(BRANCH_NETS))
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_two_sinks_of_one_law_converge(tmp_path, order, method):
+    # Moving both sinks left no equation for how A's loss splits between them,
+    # and the matrix was singular at every state: never converged.
+    path = tmp_path / "branch.net"
+    path.write_text(BRANCH_NETS[order])
+    model = bngsim.Model.from_net(str(path))
+    a = model.species_names.index("A()")
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", method=method, mask=~model.is_pure_sink()
+    )
+    assert ss.converged
+    assert abs(ss.concentrations[a]) < 1e-8
+
+
+# A + B <-> C, C -> D: two laws as found, D (a sink) in both; C drains.
+DRAIN_NET = """begin parameters
+    1 kf 2.0
+    2 kr 0.3
+    3 kd 0.7
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0.5
+    3 C() 0
+    4 D() 0
+end species
+begin reactions
+    1 1,2 3 kf
+    2 3 1,2 kr
+    3 3 4 kd
+end reactions
+"""
+
+
+@pytest.mark.parametrize("keep", ["AB", "ABC", "A"])
+def test_a_masked_species_that_feeds_kept_ones_is_stepped(tmp_path, keep):
+    # Holding C, as the solvers hold a masked species, stepped A and B as if
+    # C did not drain; dropping both laws D is in lost B + C - A.
+    path = tmp_path / "drain.net"
+    path.write_text(DRAIN_NET)
+    model = bngsim.Model.from_net(str(path))
+    mask = [name[0] in keep for name in model.species_names]
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", max_time=2.0, mask=mask
+    )
+    assert not ss.converged
+    want = _numpy_newton_distance(
+        bngsim.Model.from_net(str(path)), np.asarray(ss.concentrations), 1e-8, mask
+    )
+    assert ss.newton_distance == pytest.approx(want, rel=1e-6)
+
+
+# X' = if(X < 1e-9, 1e-6, 1e3): positive everywhere. Y, settled at 1 beside it,
+# makes the difference-quotient step 1.5e-8, past X's switch.
+NEAR_ZERO_JUMP_NET = """begin parameters
+    1 x0 {x0!r}
+    2 one 1.0
+end parameters
+begin species
+    1 X() x0
+    2 Y() 1.0
+end species
+begin reactions
+    1 0 1 fr
+    2 0 2 one
+    3 2 0 one
+end reactions
+begin groups
+    1 Xobs 1
+end groups
+begin functions
+    1 fr() if(Xobs<1e-9,1e-6,1e3)
+end functions
+"""
+
+
+@pytest.mark.parametrize("x0", [0.0, 2.5e-10, 9e-10])
+@pytest.mark.parametrize("jacobian", ["fd", "auto"])
+def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, x0, jacobian):
+    # The backward probe would go below 0; keeping the forward quotient let
+    # the jump through. The secant to 0 reads the law's own slope, 0.
+    path = tmp_path / "near_zero.net"
+    path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0))
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+    ).steady_state(criterion="scaled")
+    assert not ss.converged

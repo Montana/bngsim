@@ -1182,9 +1182,9 @@ struct SteadyStateOptions {
     // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
     // initial concentration of a species the test steps, $-fixed ones aside
     // (where none starts above 0, the largest species of the state or of the
-    // root it steps to). A species the mask leaves out moves with its
-    // conservation laws, by its own equation, and is held only where it is in
-    // none. No unit of
+    // root it steps to). The mask says which species are measured, not which
+    // move: every species moves by its own equation but a $-fixed one and a
+    // masked one nothing reads, which is held. No unit of
     // concentration or of time is in it. Above 512 unknowns the step is not
     // taken and the solve is the residual one, `tol` and all.
     std::string criterion = "residual";
