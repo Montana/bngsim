@@ -562,6 +562,38 @@ def test_a_switch_the_tolerance_does_place_after_the_event_runs(rtol):
     assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
 
 
+# The same two models run from t = -3, with the event at t = 0.
+EARLY_TIMES = [t - 3.0 for t in EVENT_TIMES]
+SWITCH_BETWEEN_EARLY = SWITCH_BETWEEN.replace("tau = 3;", "tau = 0;")
+
+
+@pytest.mark.parametrize(
+    "text, param, rtol",
+    [
+        (SWITCH_BETWEEN_EARLY, "tau", 2e-6),
+        (SWITCH_BETWEEN_EARLY, "tau", 5e-7),
+        (EVENT_BETWEEN, "c", 3e-7),
+        (EVENT_BETWEEN, "c", 2e-7),
+    ],
+    ids=["switch, 2e-6", "switch, 5e-7", "event, 3e-7", "event, 2e-7"],
+)
+def test_a_run_that_starts_off_0_counts_its_error_from_its_start(text, param, rtol):
+    """The error that has added up is counted over the run's time so far. Read
+    as |t|, a run from t = -3 had next to none at the event at 0, and these
+    came back dW/dtau = -1.05 and dW/dc = 9.45 again, with no error."""
+    _refused(text, [param], 945, EARLY_TIMES, rtol=rtol, atol=1e-9)
+
+
+def test_a_run_that_starts_off_0_runs_where_its_tolerance_places_the_two():
+    """Control: from t = -3 at rtol 1e-8 the switch is placed after the event."""
+    model = bngsim.Model.from_antimony_string(SWITCH_BETWEEN_EARLY)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EARLY_TIMES, rtol=1e-8, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
+
+
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
     """``at (V > U·e³)`` reads V, which the switch reads, and U. It fires
     where U says, not where V is on its way through 6: the two are not on one

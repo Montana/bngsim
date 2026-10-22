@@ -2878,6 +2878,9 @@ struct CvodeSimulator::Impl {
     double run_rtol = 0.0;
     double run_atol = 0.0;
     std::vector<double> run_atol_vec;
+    // Where the run under way started: its time so far is counted from here,
+    // not from t = 0.
+    double run_t_start = 0.0;
     // The event fires and the state crossings of the run so far, the latest
     // of each last: one is asked about against every one of the other within
     // its reach, not the last alone, so that a fire or a crossing that comes
@@ -6045,7 +6048,10 @@ double CvodeSimulator::Impl::residual_allowed(void *cvode_mem, double t, int ns,
     }
     model.compute_derivs(t - back, x_back.data(), f_back.data());
     sync_model_at(t, x.data(), ns);
-    const double run_time = std::max(std::fabs(t), step);
+    // The run's time so far. Read as |t| alone, a run from t = -3 had next to
+    // none at an event at 0, and the two cases this reach exists for came back
+    // wrong with no error. The larger of the two never shrinks the reach.
+    const double run_time = std::max({std::fabs(t - run_t_start), std::fabs(t), step});
     double allowed = 0.0;
     for (int j : support) {
         const auto uj = static_cast<std::size_t>(j);
@@ -11706,6 +11712,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     impl_->run_rtol = rtol;
     impl_->run_atol = atol;
     impl_->run_atol_vec = atol_v;
+    impl_->run_t_start = times.t_start;
 
     // Dense vs sparse (KLU) matrix, including the two force flags (GH #102,
     // GH #29) — see Impl::choose_use_sparse.
