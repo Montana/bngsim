@@ -157,7 +157,9 @@ NUMBER_CONDITIONS = [
     # it before reading it; the chain built here reads it, so the parse failed.
     (
         "if(if(((x<=3) || (x>=0)), if(((if((y>=0), y, x))<0), 1, x), (x)*2), a, b)",
-        lambda v: v["a"] if ((1 if (v["y"] if v["y"] >= 0 else v["x"]) < 0 else v["x"])) != 0 else v["b"],
+        lambda v: v["a"]
+        if (1 if (v["y"] if v["y"] >= 0 else v["x"]) < 0 else v["x"]) != 0
+        else v["b"],
     ),
 ]
 
@@ -175,9 +177,9 @@ def test_a_number_used_as_a_condition_is_read_as_exprtk_reads_it(law, exprtk):
                 assert float(sp.N(parsed.xreplace(sub))) == exprtk(point), point
 
 
-NUMBER_NET = NET.replace("3 rate() if((d()>0),k*d(),0)", "3 rate() if(if((F!=1),F,0),k*d(),g*d())").replace(
-    "2 g 0.2", "2 g 0.2\n    3 F 1"
-)
+NUMBER_NET = NET.replace(
+    "3 rate() if((d()>0),k*d(),0)", "3 rate() if(if((F!=1),F,0),k*d(),g*d())"
+).replace("2 g 0.2", "2 g 0.2\n    3 F 1")
 
 
 def test_a_number_used_as_a_condition_attaches_a_jacobian_that_matches_fd(tmp_path, monkeypatch):
