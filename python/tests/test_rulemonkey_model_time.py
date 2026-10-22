@@ -17,11 +17,13 @@ BNG-generated .net, and one-shot runs against sessions under the same seed.
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import bngsim
 import numpy as np
 import pytest
+from bngsim._rulemonkey_clock import OFFSET_PARAM as OFFSET
 
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
 NF = DATA / "nfsim"
@@ -336,23 +338,33 @@ def test_a_span_that_is_not_finite_is_refused(xml):
 
 def test_a_clock_too_coarse_to_integrate_over_is_refused():
     """At t = 1e13 the doubles are 0.002 apart, and a span of 2 has integration
-    panels of 0.002: RuleMonkey fired nothing where a constant rate written
-    through time() should have left 135 of 1000. A longer span, or one nearer
-    0, runs."""
-    with pytest.raises(bngsim.SimulationError, match="too coarse") as err:
-        _rm(f"{RAMP}.xml", 1, t_span=(1e13, 1e13 + 2.0), n_points=3)
-    assert "to 10000000000002" in str(err.value)
+    panels of 0.002: on model time RuleMonkey fired nothing where a constant rate
+    written through time() should have left 135 of 1000. A model with a table
+    indexed by time still runs on model time, and refuses such a span, one-shot
+    and in a session. A longer span, or one nearer 0, runs.
+
+    A model that reads the clock through its functions integrates on elapsed
+    time since issue #1063, one-shot and in a session, and reads the clock as
+    time() + t_start: 0.02 * 1e13 per molecule clears all 1000 in the first
+    instant, as the closed form exp(-0.02 * (t^2 - t0^2) / 2) does."""
+    span = (1e13, 1e13 + 2.0)
+    a = np.asarray(_rm(f"{RAMP}.xml", 1, t_span=span, n_points=3).observables["A0"])
+    np.testing.assert_array_equal(a, [1000, 0, 0])
     with bngsim.RuleMonkeySession(f"{RAMP}.xml") as s:
-        s.initialize(seed=1, t_start=1e13)
+        s.initialize(seed=1, t_start=span[0])
+        a = np.asarray(s.simulate(*span, n_points=3).observables["A0"])
+    np.testing.assert_array_equal(a, [1000, 0, 0])
+
+    with pytest.raises(bngsim.SimulationError, match="too coarse"):
+        _rm(TFUN, 1, t_span=span, n_points=3)
+    with bngsim.RuleMonkeySession(str(TFUN)) as s:
+        s.initialize(seed=1, t_start=span[0])
         with pytest.raises(bngsim.SimulationError, match="too coarse"):
-            s.simulate(1e13, 1e13 + 2.0, n_points=3)
+            s.simulate(*span, n_points=3)
         with pytest.raises(bngsim.SimulationError, match="too coarse"):
-            s.step_to(1e13 + 2.0)
+            s.step_to(span[1])
     # A model that reads no clock runs on elapsed time there (test_network_free_t_start).
-    assert (
-        _rm(str(NF / "first_order_switch.xml"), 1, t_span=(1e13, 1e13 + 2.0), n_points=3).n_times
-        == 3
-    )
+    assert _rm(str(NF / "first_order_switch.xml"), 1, t_span=span, n_points=3).n_times == 3
 
 
 def test_a_session_steps_finely_on_a_clock_far_from_zero():
@@ -385,3 +397,226 @@ def test_a_session_of_a_clock_free_model_starts_at_zero_whatever_its_start():
         r = s.simulate(1e12, 1e12 + 2.0, n_points=3)
     np.testing.assert_array_equal(r.time, [1e12, 1e12 + 1.0, 1e12 + 2.0])
     np.testing.assert_array_equal(np.asarray(r.observables), np.asarray(one_shot.observables))
+
+
+# ── #1063: a model that reads the clock, from a large t_start ───────────────
+
+
+def test_a_late_start_keeps_its_waiting_times():
+    """RuleMonkey places each event at t + tau. From t = 1e12, where the doubles
+    are 1.2e-4 apart, the waiting times of 20000 molecules at 0.5 (1e-4 each)
+    rounded away, and the survival at 1e12 + 2 came back 10.8 standard errors
+    under exp(-1) over 10 seeds (z = -291 at 1e5 molecules in the issue). A model
+    that reads the clock runs on elapsed time now and reads the clock as
+    time() + t_start. The span is long enough for model time's own refusal."""
+    T = [1e12, 1e12 + 2.0, 1e12 + 1.3e5]
+    rows = [_rm(SWITCH, seed, sample_times=T) for seed in range(1, 11)]
+    np.testing.assert_array_equal(rows[0].time, T)
+    q = np.exp(-0.5 * (np.asarray(T) - T[0]))
+    _assert_mean([r.observables["A0"] for r in rows], 20000 * q, 20000 * q * (1 - q))
+
+
+def test_an_output_function_reports_on_model_time():
+    """The function the ramp's rate reads, f() = 0.02 * time(), at t = 5, 6, 7:
+    the rewritten clock is the model's, not the run's elapsed time."""
+    r = _rm(f"{RAMP}.xml", 1, t_span=(5.0, 7.0), n_points=3)
+    np.testing.assert_allclose(r.expressions["f"], 0.02 * np.array([5.0, 6.0, 7.0]), rtol=1e-12)
+
+
+def _variant(tmp_path: Path, edits: dict[str, str], *extra: str) -> str:
+    """SWITCH with each of *edits* made and the *extra* functions added."""
+    xml = SWITCH.read_text(encoding="utf-8")
+    for old, new in edits.items():
+        assert old in xml
+        xml = xml.replace(old, new)
+    xml = xml.replace("</ListOfFunctions>", "".join(extra) + "</ListOfFunctions>")
+    path = tmp_path / "v.xml"
+    path.write_text(xml, encoding="utf-8")
+    return str(path)
+
+
+def _output(fid: str, body: str) -> str:
+    return f'<Function id="{fid}"><Expression> {body} </Expression></Function>\n    '
+
+
+@pytest.mark.parametrize("spelling", ["time", "time( )", "t", "t()"])
+@pytest.mark.parametrize("beside", [False, True], ids=["alone", "beside_time_call"])
+def test_every_spelling_of_the_clock_reads_model_time(tmp_path, spelling, beside):
+    """RuleMonkey reads the clock as time(), a bare or spaced time, and its alias
+    t or t() (engine.cpp). Each is offset: an output h() of the spelling reports
+    5, 6, 7 from t_start = 5, and f() = if(<spelling> >= 6, k, 0) switches on at
+    6. Before, t was missed: alone, the model ran as if it read no clock, and
+    beside a time() it read elapsed time once the run moved there (issue #1063);
+    either way h was 0, 1, 2 and nothing fired by 7."""
+    extra = [_output("h", spelling)] + ([_output("g", "time()")] if beside else [])
+    xml = _variant(tmp_path, {"if(time()>=6,k,0)": f"if({spelling}>=6,k,0)"}, *extra)
+    rows = [_rm(xml, seed, t_span=(5.0, 7.0), n_points=3) for seed in range(1, 6)]
+    np.testing.assert_array_equal(rows[0].expressions["h"], [5.0, 6.0, 7.0])
+    q = _switch_survival(np.array([5.0, 6.0, 7.0]))
+    _assert_mean([r.observables["A0"] for r in rows], 20000 * q, 20000 * q * (1 - q))
+
+
+@pytest.mark.parametrize("spelling", ["t", "t()"])
+def test_a_session_reads_the_alias_t_on_model_time(tmp_path, spelling):
+    """A session decides its clock by the same reading: a model that reads the
+    clock only through t starts at t_start, so h() = t is the model time."""
+    xml = _variant(tmp_path, {"if(time()>=6,k,0)": f"if({spelling}>=6,k,0)"}, _output("h", "t"))
+    with bngsim.RuleMonkeySession(xml) as s:
+        s.initialize(seed=1, t_start=5.0)
+        r = s.simulate(5.0, 7.0, n_points=3)
+    np.testing.assert_array_equal(r.expressions["h"], [5.0, 6.0, 7.0])
+
+
+@pytest.mark.parametrize("symbol", ["time", "t"])
+@pytest.mark.parametrize("beside", [False, True], ids=["alone", "beside_time_call"])
+def test_a_symbol_named_like_the_clock_is_read_as_the_symbol(tmp_path, symbol, beside):
+    """BNG2.pl accepts an observable named time. RuleMonkey reads a bare time,
+    or t, that names a symbol as the symbol, and only time() as the clock. Here
+    the observable counts A(s~0) and f() = k * <symbol> / 20000: f reports
+    k * count / 20000 on every row, and the count follows the closed form
+    20000 / (1 + k t) of dN/dt = -k N^2 / 20000. The rewrite once turned the
+    observable into the clock, and f read 0.5 * 0 / 20000 at t = 0 while the
+    count stayed at 20000."""
+    extra = [_output("g", "time()")] if beside else []
+    edits = {'name="A0"': f'name="{symbol}"', "if(time()>=6,k,0)": f"k*{symbol}/20000"}
+    xml = _variant(tmp_path, edits, *extra)
+    rows = [_rm(xml, seed, t_span=(0.0, 2.0), n_points=3) for seed in range(1, 6)]
+    for r in rows:
+        np.testing.assert_allclose(r.expressions["f"], 0.5 * r.observables[symbol] / 20000)
+    if beside:
+        np.testing.assert_array_equal(rows[0].expressions["g"], [0.0, 1.0, 2.0])
+    mean = np.mean([r.observables[symbol][-1] for r in rows])
+    assert abs(mean - 20000 / (1 + 0.5 * 2.0)) < 300, mean
+
+
+def test_the_rewrite_reads_the_clock_where_rulemonkey_does():
+    """The text of the copy: every clock read is offset, a bare time that names
+    an observable is not, and a self-closing function is left alone."""
+    from bngsim._rulemonkey_clock import offset_clock_text
+
+    t0 = f"(time()+{OFFSET})"
+    xml = SWITCH.read_text(encoding="utf-8")
+    out = offset_clock_text(xml, SWITCH.parent)
+    assert f"if({t0}>=6,k,0)" in out
+    assert f'<Parameter id="{OFFSET}" type="Constant" value="0" expr="0"/>' in out
+
+    named = xml.replace('name="A0"', 'name="time"').replace(
+        "if(time()>=6,k,0)", "if(time()>=6,k,0)*time + time ( )"
+    )
+    named = named.replace("<ListOfFunctions>", '<ListOfFunctions>\n      <Function id="z"/>')
+    out = offset_clock_text(named, SWITCH.parent)
+    assert f"if({t0}>=6,k,0)*time + time ( )" in out
+    assert '<Function id="z"/>' in out
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [('id="k"', f'id="{OFFSET}"'), ('name="A0"', f'name="{OFFSET}"')],
+    ids=["parameter", "observable"],
+)
+def test_a_model_that_names_the_offset_is_refused(old, new):
+    """An observable is a RuleMonkey symbol by its name, and would take the
+    offset's place in every rewritten function."""
+    from bngsim._rulemonkey_clock import offset_clock_text
+
+    xml = SWITCH.read_text(encoding="utf-8").replace(old, new)
+    with pytest.raises(bngsim.ModelError, match=OFFSET):
+        offset_clock_text(xml, SWITCH.parent)
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_a_table_indexed_by_the_clock_is_not_offset(tmp_path, quote):
+    """Its counter would have to be a function, and RuleMonkey 3.11.0 recurses
+    without end evaluating such a table. The model runs on model time, as the
+    late-start test of #892 above checks, however its attributes are quoted: in
+    single quotes the table was once missed, and the run went to elapsed time,
+    where the table reads the elapsed clock."""
+    text = TFUN.read_text(encoding="utf-8")
+    tag = re.search(r'<Function [^>]*type="TFUN"[^>]*>', text).group(0)
+    xml = tmp_path / "v.xml"
+    xml.write_text(text.replace(tag, tag.replace('"', quote)), encoding="utf-8")
+    m = bngsim.Model.from_net(str(DATA / "simple_decay.net"))
+    sim = bngsim.Simulator(m, method="rm", xml_path=str(xml))
+    assert not sim._rm_clock_offset
+    r = sim.run(t_span=(1.0, 1.5), n_points=3, seed=3)
+    np.testing.assert_array_equal(
+        np.asarray(r.observables),
+        np.asarray(_rm(TFUN, 3, t_span=(1.0, 1.5), n_points=3).observables),
+    )
+
+
+def test_a_table_file_is_found_from_the_copy(tmp_path):
+    """The copy is written elsewhere, so a table's data file named relative to
+    the original XML is made absolute, and escaped: here the directory's name
+    has characters XML must escape. g() = 1 + A0 / 10000 by its table."""
+    here = tmp_path / "a&b'c"
+    here.mkdir()
+    (here / "x.tfun").write_text("0 1\n30000 4\n")
+    table = (
+        '<Function id="g" type="TFUN" ctrName="A0" file="x.tfun" method="linear">'
+        "<Expression> __TFUN_VAL__ </Expression></Function>\n    "
+    )
+    xml = _variant(here, {}, table)
+    r = _rm(xml, 1, t_span=(5.0, 7.0), n_points=3)
+    np.testing.assert_allclose(r.expressions["g"], 1 + r.observables["A0"] / 10000)
+
+
+# ── #1063: a session of a model that reads the clock, from a large start ────
+
+
+def test_a_late_session_keeps_its_waiting_times():
+    """The session half of test_a_late_start_keeps_its_waiting_times: on model
+    time a session from t = 1e12 came back 10.8 standard errors under exp(-1) at
+    1e12 + 2 over these 10 seeds. It runs on elapsed time now, and is the
+    one-shot run seed for seed."""
+    T = [1e12, 1e12 + 2.0, 1e12 + 1.3e5]
+    rows = []
+    for seed in range(1, 11):
+        with bngsim.RuleMonkeySession(str(SWITCH)) as s:
+            s.initialize(seed=seed, t_start=T[0])
+            r = s.simulate(sample_times=T)
+        np.testing.assert_array_equal(r.time, T)
+        one_shot = _rm(SWITCH, seed, sample_times=T)
+        np.testing.assert_array_equal(r.observables["A0"], one_shot.observables["A0"])
+        rows.append(r.observables["A0"])
+    q = np.exp(-0.5 * (np.asarray(T) - T[0]))
+    _assert_mean(rows, 20000 * q, 20000 * q * (1 - q))
+
+
+def test_a_late_session_reads_and_reports_model_time():
+    """Every time a session takes or gives is the model's, though its events are
+    placed on elapsed time: current_time, the clock and f() = 0.02 * time() read
+    through evaluate, a segment's rows and its functions, step_to, and a second
+    initialize. An override of t is the override."""
+    t0 = 1e12
+    with bngsim.RuleMonkeySession(f"{RAMP}.xml") as s:
+        s.initialize(seed=4, t_start=t0)
+        assert s.current_time == s.evaluate("time()") == s.evaluate("t") == t0
+        assert s.evaluate("f") == pytest.approx(0.02 * t0, rel=1e-12)
+        assert s.evaluate("t", {"t": 3.0}) == 3.0
+        r = s.simulate(t0, t0 + 2.0, n_points=3)
+        np.testing.assert_array_equal(r.time, [t0, t0 + 1.0, t0 + 2.0])
+        np.testing.assert_allclose(r.expressions["f"], 0.02 * (t0 + np.arange(3.0)), rtol=1e-12)
+        assert s.current_time == t0 + 2.0
+        s.step_to(t0 + 3.0)
+        assert s.current_time == s.evaluate("time()") == t0 + 3.0
+        s.initialize(seed=4, t_start=5.0)
+        assert s.current_time == s.evaluate("time()") == 5.0
+
+
+def test_a_late_session_saves_and_loads_on_model_time(tmp_path):
+    """A snapshot holds the model's time, as one saved on model time does, and a
+    session that loads it restarts its elapsed clock there: it continues as the
+    session that saved it does, seed for seed."""
+    t0, path = 1e12, tmp_path / "state"
+    with bngsim.RuleMonkeySession(str(SWITCH)) as a:
+        a.initialize(seed=9, t_start=t0)
+        a.simulate(t0, t0 + 1.0, n_points=2)
+        a.save_state(path)
+        kept = a.simulate(t0 + 1.0, t0 + 2.0, n_points=3)
+    assert float(path.read_text().split("\n")[2]) == t0 + 1.0
+    with bngsim.RuleMonkeySession(str(SWITCH)) as b:
+        b.load_state(path)
+        assert b.current_time == b.evaluate("time()") == t0 + 1.0
+        loaded = b.simulate(t0 + 1.0, t0 + 2.0, n_points=3)
+    np.testing.assert_array_equal(loaded.observables["A0"], kept.observables["A0"])

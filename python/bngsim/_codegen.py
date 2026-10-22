@@ -296,7 +296,11 @@ _compile_counter = itertools.count()
 # a singular power that has no comoving case (bngsim_codegen_edge_without_case),
 # and the solver refuses their columns. A cached v40 .so does not say, and such
 # a column would keep coming back plain, up to 12% off. Invalidate v40.
-_CODEGEN_VERSION = "41"
+# v42: lanl/bngsim #540 — a condition with an if() in it parses to the ITE
+# chain without sympy's set theory, so its emitted text changes (to the same
+# values), and a law that ran past the derivation budget on it now derives.
+# A cached v41 .so would keep the old text, or no derivative. Invalidate v41.
+_CODEGEN_VERSION = "42"
 
 
 # Modules whose *source* determines the emitted C. ``_codegen`` holds the
@@ -12074,7 +12078,7 @@ def _canon_update(h, obj) -> None:
         raise TypeError(f"codegen cache key cannot serialize {type(obj).__name__}")
 
 
-# The value the model-based cache key deliberately drops. Everything else
+# The values the model-based cache key deliberately drops. Everything else
 # codegen_data() carries is structure the emitters read; a parameter's current
 # VALUE is not — the whole design of the generated C is that parameters are read
 # from the runtime ``p[]`` array rather than baked as literals (see this module's
@@ -12082,10 +12086,52 @@ def _canon_update(h, obj) -> None:
 # Dropping it is what makes the key stable across a parameter scan; the one path
 # by which a value *can* still reach the emitted source — the issue #68
 # switch-condition gate — is carried as a verdict by switch_gate_cache_digest.
-_CODEGEN_KEY_DROPPED_PARAM_FIELDS = ("value",)
 # A declared initialAmount is exported for make_subset_model; no emitter reads
 # it, and as a value it would split one source into a key per initial condition.
+#
+# The core's ``codegen_key_stream`` leaves the same two out (issue #820); these
+# are what :func:`_codegen_key_stream_reference` leaves out, and the test that
+# holds the two streams equal holds the two lists equal.
+_CODEGEN_KEY_DROPPED_PARAM_FIELDS = ("value",)
 _CODEGEN_KEY_DROPPED_SPECIES_FIELDS = ("initial_amount",)
+
+
+class _ByteSink:
+    """A stand-in for a hasher that keeps what it is fed."""
+
+    __slots__ = ("parts",)
+
+    def __init__(self) -> None:
+        self.parts: list[bytes] = []
+
+    def update(self, b: bytes) -> None:
+        self.parts.append(bytes(b))
+
+
+def _codegen_key_stream_reference(core) -> bytes:
+    """The bytes the structural key hashes for the model's structure, made by
+    walking the accessors' Python dicts (the key's own route before issue #820).
+
+    The core writes the same bytes from its own walk (``codegen_key_stream``),
+    about 30 times faster on a large model (0.1 s against 3.4 s at 58k
+    reactions; this walk is slower than the key's own was, since it keeps the
+    bytes rather than feeding a hasher), and this is kept as what
+    that is checked against; it is also the key's route on a core without it.
+    """
+    data = dict(core.codegen_data())
+    data["parameters"] = [
+        {k: v for k, v in p.items() if k not in _CODEGEN_KEY_DROPPED_PARAM_FIELDS}
+        for p in data["parameters"]
+    ]
+    data["species"] = [
+        {k: v for k, v in sp.items() if k not in _CODEGEN_KEY_DROPPED_SPECIES_FIELDS}
+        for sp in data["species"]
+    ]
+    sink = _ByteSink()
+    _canon_update(sink, data)
+    _canon_update(sink, core.codegen_jacobian_plan())
+    _canon_update(sink, core.functional_jacobian_context())
+    return b"".join(sink.parts)
 
 
 def compute_model_codegen_hash(
@@ -12133,32 +12179,30 @@ def compute_model_codegen_hash(
     from bngsim._switch_sensitivity import switch_gate_cache_digest
 
     core = model._core if hasattr(model, "_core") else model
-    data = dict(core.codegen_data())
-    data["parameters"] = [
-        {k: v for k, v in p.items() if k not in _CODEGEN_KEY_DROPPED_PARAM_FIELDS}
-        for p in data["parameters"]
-    ]
-    data["species"] = [
-        {k: v for k, v in sp.items() if k not in _CODEGEN_KEY_DROPPED_SPECIES_FIELDS}
-        for sp in data["species"]
-    ]
-    ctx = core.functional_jacobian_context()
-    plan = core.codegen_jacobian_plan()
+    # Written by the core from the walk that builds the three accessors' dicts
+    # (issue #820), so a field of theirs the generator reads cannot be missing
+    # from it. Walking the dicts here instead cost ~40 Python-level steps a
+    # reaction. A throw from the core is not caught here: the callers key on the
+    # generated source instead (#174's fallback).
+    key_stream = getattr(core, "codegen_key_stream", None)
+    stream = key_stream() if key_stream is not None else _codegen_key_stream_reference(core)
 
     # RESOLVED decisions, not the raw hatches: BNGSIM_NO_CODEGEN_JAC changes
     # nothing for a model whose analytical Jacobian is not complete anyway, and
     # a chunking threshold changes nothing for a model below it. Folding the raw
     # env in would split those into two keys for one source — a cache miss, not a
-    # collision, but a free one to avoid.
-    want_jac = bool(plan["available"]) and os.environ.get("BNGSIM_NO_CODEGEN_JAC") != "1"
-    chunk = _should_chunk(len(data["reactions"]))
+    # collision, but a free one to avoid. (The plan's ``available`` is
+    # ``analytical_jacobian_complete``, and codegen_data() has a reaction per
+    # reaction.)
+    want_jac = (
+        bool(core.analytical_jacobian_complete) and os.environ.get("BNGSIM_NO_CODEGEN_JAC") != "1"
+    )
+    chunk = _should_chunk(core.n_reactions)
 
     h = hashlib.sha256()
     h.update(_CODEGEN_CACHE_KEY.encode())
     h.update(b"\0model_structural_v1\0")
-    _canon_update(h, data)
-    _canon_update(h, plan)
-    _canon_update(h, ctx)
+    h.update(stream)
     # Two booleans, not one. Until #217 they could be collapsed into the single
     # conjunction ``emit and enabled``, because "nobody asked" and "the GH #67
     # hatch is set" both emitted the same source: no Functional ∂f/∂p, and an
@@ -12179,7 +12223,7 @@ def compute_model_codegen_hash(
             _chunk_block_size() if chunk else None,
         ),
     )
-    _canon_update(h, switch_gate_cache_digest(core, ctx))
+    _canon_update(h, switch_gate_cache_digest(core))
     return h.hexdigest()[:16]
 
 

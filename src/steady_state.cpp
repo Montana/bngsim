@@ -32,6 +32,7 @@
 #include "bngsim/dense_eigenvalues.hpp"
 #include "bngsim/dynamic_library.hpp"
 #include "bngsim/fd_jacobian.hpp"
+#include "bngsim/function_columns.hpp"
 #include "bngsim/mir_jit.hpp"
 #include "bngsim/model.hpp"
 #include "bngsim/types.hpp"
@@ -1648,7 +1649,7 @@ static std::vector<int> ss_distance_unknowns(const NetworkModel &model,
 static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rhs,
                                          const SteadyStateOptions &opts,
                                          const ResidualSubspace &sub,
-                                         bool *linsolv_failed = nullptr) {
+                                         bool *linsolv_failed = nullptr, int max_iters = 200) {
 
     if (linsolv_failed) {
         *linsolv_failed = false;
@@ -1781,7 +1782,7 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
     KINSetFuncNormTol(kin_mem,
                       opts.criterion_by_distance ? std::numeric_limits<double>::min() : opts.tol);
     KINSetScaledStepTol(kin_mem, 1e-15); // allow very small steps
-    KINSetNumMaxIters(kin_mem, 200);
+    KINSetNumMaxIters(kin_mem, max_iters);
     // Set max Newton step large enough for the problem scale
     double max_newton_step = 0.0;
     for (int i = 0; i < n_ind; ++i) {
@@ -1906,9 +1907,9 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
 static SteadyStateResult ss_newton_from(NetworkModel &model, SteadyStateRhs &rhs,
                                         const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                         const std::vector<double> &seed,
-                                        bool *linsolv_failed = nullptr) {
+                                        bool *linsolv_failed = nullptr, int max_iters = 200) {
     model.set_state_from(seed.data());
-    return solve_by_newton(model, rhs, opts, sub, linsolv_failed);
+    return solve_by_newton(model, rhs, opts, sub, linsolv_failed, max_iters);
 }
 
 // ── Is a polished root one the dynamics can actually rest on? (issue #78) ────
@@ -1956,6 +1957,52 @@ static const char *root_stability_name(RootStability s) {
     default:
         return "undetermined";
     }
+}
+
+// Issue #524: KINSOL from the state the model holds, on the reduced system, and
+// nothing else. Converged only on a finite, physical root under `tol`; the
+// stability certificate's verdict and spectrum are reported on it, never acted
+// on: enumerating roots wants the saddles too. The model's state is restored.
+//
+// A throw is not caught. The ladder below may treat one as a failed attempt
+// because integration answers after it; here nothing does, and what throws is a
+// rate law refusing (issue #589) or KINSOL not building, on every start alike.
+// Caught, it came back as a result with no state, which find_steady_state then
+// read past the end of: the mratio refusal crashed the interpreter.
+static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyStateRhs &rhs,
+                                                    const SteadyStateOptions &opts,
+                                                    const ResidualSubspace &sub) {
+    const int ns = model.n_species();
+    std::vector<double> start(ns);
+    model.get_state_into(start.data());
+    struct Restore {
+        NetworkModel &model;
+        const std::vector<double> &state;
+        ~Restore() { model.set_state_from(state.data()); }
+    } restore{model, start};
+    // solve_by_newton already demotes a non-finite, unphysical or over-tol root.
+    SteadyStateResult r = ss_newton_from(model, rhs, opts, sub, start);
+    if (r.converged) {
+        // KINSOL stops at the first iterate under tol, and along a slow mode
+        // that can be well off the root: from 40 starts each, Haugh2b, nfkb and
+        // four more nets with one steady state clustered as 2 to 5, the copies
+        // 1e-5 to 0.26 off it in some species. Newton converges quadratically
+        // from there, so a few more steps place the root; they are kept when
+        // they leave the residual no larger, which round-off can prevent.
+        SteadyStateOptions polish = opts;
+        polish.tol = opts.tol * 1e-3;
+        SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, r.concentrations, nullptr, 3);
+        if (p.residual <= r.residual && ss_state_is_physical(p.concentrations)) {
+            p.converged = true;
+            p.n_steps += r.n_steps;
+            p.n_rhs_evals += r.n_rhs_evals;
+            r = std::move(p);
+        }
+        RootCertificate cert = certify_root_stability(model, rhs, opts, sub, r.concentrations);
+        r.root_stability = root_stability_name(cert.verdict);
+        r.eigenvalues = std::move(cert.eigenvalues);
+    }
+    return r;
 }
 
 static SteadyStateResult solve_by_newton_two_tier(NetworkModel &model, SteadyStateRhs &rhs,
@@ -4135,6 +4182,75 @@ static void ss_measure_root(SteadyStateRhs &rhs, SteadyStateResult &result, cons
     rhs.eval(0.0, y_ss, f.data());
 }
 
+// How far apart the columns from the two difference-quotient matrices of issue
+// #1002 may be, as a part of the column's largest entry, before they are not
+// the same answer.
+static constexpr double kFdAnswersAgree = 1e-4;
+
+// Issue #1002: a Jacobian that is a difference quotient is stepped at the
+// floored step (bngsim/fd_jacobian.hpp), which reads a term of second order in
+// a species far below the state's scale as a secant across it. The species'
+// own step reads it, and misses a term that answers in the grain of a sum with
+// something larger. So the columns are solved again with the second matrix,
+// the first's with those species' columns at their own step
+// (fd_own_step_columns), and where the two answers are further apart than
+// kFdAnswersAgree of a column's largest, the entry that is furthest is put on
+// the result, which steady_state() refuses. Where they agree, the columns are
+// the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
+// solve that gave result.sensitivity, at the state result.concentrations.
+template <class Solve>
+static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResult &result,
+                                           const double *J, int ns, int np,
+                                           const ResidualSubspace &sub, Solve &&solve_columns) {
+    if (result.sens_jacobian_source != "finite-difference") {
+        return;
+    }
+    const double *y_ss = result.concentrations.data();
+    std::vector<double> f0(static_cast<size_t>(ns));
+    rhs.eval(0.0, y_ss, f0.data());
+    std::vector<double> J_own(static_cast<size_t>(ns) * ns);
+    result.sens_fd_own_step_species =
+        fd_own_step_columns([&](const double *yy, double *f) { rhs.eval(0.0, yy, f); }, y_ss, ns,
+                            ns, sub.excluded, f0.data(), J, J_own.data());
+    // The caches as an evaluation at the state leaves them.
+    rhs.eval(0.0, y_ss, f0.data());
+    if (result.sens_fd_own_step_species.empty()) {
+        return;
+    }
+    std::vector<double> own(result.sensitivity.size(), 0.0);
+    solve_columns(J_own.data(), own, nullptr);
+    double worst = 0.0;
+    for (int p = 0; p < np; ++p) {
+        double largest = 0.0;
+        for (const int i : sub.included) {
+            const double v = result.sensitivity[static_cast<size_t>(i) * np + p];
+            if (std::isfinite(v)) {
+                largest = std::max(largest, std::abs(v));
+            }
+        }
+        for (const int i : sub.included) {
+            const size_t k = static_cast<size_t>(i) * np + p;
+            if (!std::isfinite(result.sensitivity[k])) {
+                continue; // no answer to confirm
+            }
+            const double apart = std::abs(own[k] - result.sensitivity[k]);
+            if (apart <= kFdAnswersAgree * largest) {
+                continue;
+            }
+            const double share = largest > 0.0 && std::isfinite(apart)
+                                     ? apart / largest
+                                     : std::numeric_limits<double>::infinity();
+            if (result.sens_fd_disagree_species < 0 || share > worst) {
+                worst = share;
+                result.sens_fd_disagree_species = i;
+                result.sens_fd_disagree_param = p;
+                result.sens_fd_floored = result.sensitivity[k];
+                result.sens_fd_own_step = own[k];
+            }
+        }
+    }
+}
+
 static void
 compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResult &result,
                        const std::vector<std::string> &param_names,
@@ -4352,18 +4468,6 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
         }
         const int n_ind = static_cast<int>(solve_idx.size());
 
-        // The reduced Jacobian (n_ind × n_ind), projected through the
-        // conservation-law reconstruction — see ss_reduce_jacobian, which the
-        // stability certificate shares.
-        std::vector<double> J_red;
-        ss_reduce_jacobian(J.data(), ns, cl, solve_idx, J_red);
-
-        // Build reduced df/dp
-        std::vector<double> dfdp_red(n_ind * np, 0.0);
-        for (int p = 0; p < np; ++p)
-            for (int i = 0; i < n_ind; ++i)
-                dfdp_red[p * n_ind + i] = dfdp[p * ns + solve_idx[i]];
-
         // Issue #704: a conserved total is set by the state the solve starts
         // from, T_k = Σ_i L[k,i]·x_i(0), so it moves with a parameter that sets
         // an initial amount: dT_k/dp = Σ_i L[k,i]·∂x_i(0)/∂p. The reduction
@@ -4405,21 +4509,6 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
                 totals_move = totals_move || total != 0.0;
             }
         }
-        if (totals_move) {
-            for (int p = 0; p < np; ++p) {
-                for (int k = 0; k < cl.n_laws; ++k) {
-                    const double m = moved[static_cast<size_t>(k) * np + p];
-                    if (m == 0.0) {
-                        continue;
-                    }
-                    const double *Jcol_dep = J.data() + static_cast<size_t>(cl.dependent[k]) * ns;
-                    for (int i = 0; i < n_ind; ++i) {
-                        dfdp_red[p * n_ind + i] += Jcol_dep[solve_idx[i]] * m;
-                    }
-                }
-            }
-        }
-
         // A fixed species is no unknown and is in no law, and stays where it
         // started: where a parameter sets that, `$A() A0`, its row is the
         // seed, and it forces the unknowns through ∂f/∂x_fixed. Both were
@@ -4429,86 +4518,124 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
             if (!model.species()[static_cast<size_t>(i)].fixed) {
                 continue;
             }
-            bool seeded = false;
             for (int p = 0; p < np; ++p) {
-                const double seed = dx0[static_cast<size_t>(i) * np + p];
-                if (seed == 0.0) {
-                    continue;
+                if (dx0[static_cast<size_t>(i) * np + p] != 0.0) {
+                    set_by_a_parameter.push_back(i);
+                    break;
                 }
-                seeded = true;
-                const double *Jcol = J.data() + static_cast<size_t>(i) * ns;
-                for (int r = 0; r < n_ind; ++r) {
-                    dfdp_red[p * n_ind + r] += Jcol[solve_idx[r]] * seed;
-                }
-            }
-            if (seeded) {
-                set_by_a_parameter.push_back(i);
             }
         }
 
-        // Solve J_red * sens_ind = -dfdp_red using SUNDIALS with RAII guards.
-        //
-        // ONE factorization for all np right-hand sides. The loop used to re-copy
-        // J_red into A and re-run SUNLinSolSetup on every parameter, paying np
-        // dense n_ind³ LU factorizations of the SAME matrix — on a 1276-wide
-        // reduced system that is the dominant cost of the whole assembly. Dense
-        // LU solve does not modify the stored factors, so hoisting is a pure win.
-        SunContextGuard ctx;
-        SUNMatrixGuard A_guard(SUNDenseMatrix(n_ind, n_ind, ctx));
-        NVectorGuard bv(N_VNew_Serial(n_ind, ctx));
-        NVectorGuard xv(N_VNew_Serial(n_ind, ctx));
-        SUNLinSolGuard LS_guard(ss_make_dense_linsol(xv, A_guard, ctx, model, n_ind));
+        // The columns from a Jacobian `Jm`, into `sens` (species-major, ns×np),
+        // and the pivot ratio of its factorization into `rcond` where that is
+        // not null. A function of the matrix so that issue #1002's check can
+        // solve them again with another (ss_confirm_differenced_columns).
+        const auto solve_columns = [&](const double *Jm, std::vector<double> &sens, double *rcond) {
+            // The reduced Jacobian (n_ind × n_ind), projected through the
+            // conservation-law reconstruction — see ss_reduce_jacobian, which the
+            // stability certificate shares.
+            std::vector<double> J_red;
+            ss_reduce_jacobian(Jm, ns, cl, solve_idx, J_red);
 
-        sunrealtype *A_data = SUNDenseMatrix_Data(A_guard);
-        std::memcpy(A_data, J_red.data(), static_cast<size_t>(n_ind) * n_ind * sizeof(double));
-        // A zero pivot stops the factorization where it is and leaves the rest
-        // of the pivot array unset, and a solve through it reads and writes
-        // wherever those entries point: MODEL1601050000 (2,047 species)
-        // faulted there. There is no solution to report, so the columns are
-        // NaN, which the caller refuses as it did the non-finite values such a
-        // solve returned when it returned.
-        const bool factored = SUNLinSolSetup(LS_guard, A_guard) == 0;
-        result.sens_jacobian_rcond = factored ? lu_diag_rcond(A_data, n_ind) : 0.0;
+            // Build reduced df/dp
+            std::vector<double> dfdp_red(n_ind * np, 0.0);
+            for (int p = 0; p < np; ++p)
+                for (int i = 0; i < n_ind; ++i)
+                    dfdp_red[p * n_ind + i] = dfdp[p * ns + solve_idx[i]];
 
-        for (int p = 0; p < np; ++p) {
-            double *b_data = N_VGetArrayPointer(bv);
-            for (int i = 0; i < n_ind; ++i)
-                b_data[i] = -dfdp_red[p * n_ind + i];
-            double *x_data = N_VGetArrayPointer(xv);
-            if (factored) {
-                SUNLinSolSolve(LS_guard, A_guard, xv, bv, 0.0);
-            } else {
-                std::fill(x_data, x_data + n_ind, std::numeric_limits<double>::quiet_NaN());
+            if (totals_move) {
+                for (int p = 0; p < np; ++p) {
+                    for (int k = 0; k < cl.n_laws; ++k) {
+                        const double m = moved[static_cast<size_t>(k) * np + p];
+                        if (m == 0.0) {
+                            continue;
+                        }
+                        const double *Jcol_dep = Jm + static_cast<size_t>(cl.dependent[k]) * ns;
+                        for (int i = 0; i < n_ind; ++i) {
+                            dfdp_red[p * n_ind + i] += Jcol_dep[solve_idx[i]] * m;
+                        }
+                    }
+                }
             }
-
-            // Fill the solved species' sensitivity
-            for (int i = 0; i < n_ind; ++i)
-                result.sensitivity[solve_idx[i] * np + p] = x_data[i];
             for (const int i : set_by_a_parameter) {
-                result.sensitivity[static_cast<size_t>(i) * np + p] =
-                    dx0[static_cast<size_t>(i) * np + p];
+                for (int p = 0; p < np; ++p) {
+                    const double seed = dx0[static_cast<size_t>(i) * np + p];
+                    if (seed == 0.0) {
+                        continue;
+                    }
+                    const double *Jcol = Jm + static_cast<size_t>(i) * ns;
+                    for (int r = 0; r < n_ind; ++r) {
+                        dfdp_red[p * n_ind + r] += Jcol[solve_idx[r]] * seed;
+                    }
+                }
             }
 
-            // Reconstruct dependent species sensitivity from conservation:
-            // Σ L[k,i] * dy_i/dp = dT_k/dp →
-            // dy_dep/dp = (dT_k/dp - Σ_{i≠dep} L[k,i] * dy_i/dp) / L[k,dep]
-            // (issue #704: the total's own derivative used to be taken as 0).
-            for (int k = 0; k < cl.n_laws; ++k) {
-                int dep = cl.dependent[k];
-                double cd = cl.coefficients[k][dep];
-                if (std::abs(cd) < 1e-15)
-                    continue;
-                double s = 0.0;
-                for (int i = 0; i < ns; ++i)
-                    if (i != dep)
-                        s += cl.coefficients[k][i] * result.sensitivity[i * np + p];
-                // Written as it was where the total does not move, so that such
-                // a column is the same to the last bit, the sign of a 0 included.
-                const double moved_total = dT[static_cast<size_t>(k) * np + p];
-                result.sensitivity[dep * np + p] =
-                    moved_total != 0.0 ? (moved_total - s) / cd : -s / cd;
+            // Solve J_red * sens_ind = -dfdp_red using SUNDIALS with RAII guards.
+            //
+            // ONE factorization for all np right-hand sides. The loop used to re-copy
+            // J_red into A and re-run SUNLinSolSetup on every parameter, paying np
+            // dense n_ind³ LU factorizations of the SAME matrix — on a 1276-wide
+            // reduced system that is the dominant cost of the whole assembly. Dense
+            // LU solve does not modify the stored factors, so hoisting is a pure win.
+            SunContextGuard ctx;
+            SUNMatrixGuard A_guard(SUNDenseMatrix(n_ind, n_ind, ctx));
+            NVectorGuard bv(N_VNew_Serial(n_ind, ctx));
+            NVectorGuard xv(N_VNew_Serial(n_ind, ctx));
+            SUNLinSolGuard LS_guard(ss_make_dense_linsol(xv, A_guard, ctx, model, n_ind));
+
+            sunrealtype *A_data = SUNDenseMatrix_Data(A_guard);
+            std::memcpy(A_data, J_red.data(), static_cast<size_t>(n_ind) * n_ind * sizeof(double));
+            // A zero pivot stops the factorization where it is and leaves the rest
+            // of the pivot array unset, and a solve through it reads and writes
+            // wherever those entries point: MODEL1601050000 (2,047 species)
+            // faulted there. There is no solution to report, so the columns are
+            // NaN, which the caller refuses as it did the non-finite values such a
+            // solve returned when it returned.
+            const bool factored = SUNLinSolSetup(LS_guard, A_guard) == 0;
+            if (rcond != nullptr) {
+                *rcond = factored ? lu_diag_rcond(A_data, n_ind) : 0.0;
             }
-        }
+
+            for (int p = 0; p < np; ++p) {
+                double *b_data = N_VGetArrayPointer(bv);
+                for (int i = 0; i < n_ind; ++i)
+                    b_data[i] = -dfdp_red[p * n_ind + i];
+                double *x_data = N_VGetArrayPointer(xv);
+                if (factored) {
+                    SUNLinSolSolve(LS_guard, A_guard, xv, bv, 0.0);
+                } else {
+                    std::fill(x_data, x_data + n_ind, std::numeric_limits<double>::quiet_NaN());
+                }
+
+                // Fill the solved species' sensitivity
+                for (int i = 0; i < n_ind; ++i)
+                    sens[solve_idx[i] * np + p] = x_data[i];
+                for (const int i : set_by_a_parameter) {
+                    sens[static_cast<size_t>(i) * np + p] = dx0[static_cast<size_t>(i) * np + p];
+                }
+
+                // Reconstruct dependent species sensitivity from conservation:
+                // Σ L[k,i] * dy_i/dp = dT_k/dp →
+                // dy_dep/dp = (dT_k/dp - Σ_{i≠dep} L[k,i] * dy_i/dp) / L[k,dep]
+                // (issue #704: the total's own derivative used to be taken as 0).
+                for (int k = 0; k < cl.n_laws; ++k) {
+                    int dep = cl.dependent[k];
+                    double cd = cl.coefficients[k][dep];
+                    if (std::abs(cd) < 1e-15)
+                        continue;
+                    double s = 0.0;
+                    for (int i = 0; i < ns; ++i)
+                        if (i != dep)
+                            s += cl.coefficients[k][i] * sens[i * np + p];
+                    // Written as it was where the total does not move, so that such
+                    // a column is the same to the last bit, the sign of a 0 included.
+                    const double moved_total = dT[static_cast<size_t>(k) * np + p];
+                    sens[dep * np + p] = moved_total != 0.0 ? (moved_total - s) / cd : -s / cd;
+                }
+            }
+        };
+        solve_columns(J.data(), result.sensitivity, &result.sens_jacobian_rcond);
+        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, solve_columns);
 
         // Issue #995: whether this was an isolated root, and the state on it,
         // asked of the same system. The totals and the fixed species force the
@@ -4553,32 +4680,38 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
         // RAII guards handle cleanup
     } else {
         // Full-space solve (no conservation laws, still using RAII guards)
-        SunContextGuard ctx;
-        SUNMatrixGuard A_guard(SUNDenseMatrix(ns, ns, ctx));
-        sunrealtype *A_data = SUNDenseMatrix_Data(A_guard);
-        std::memcpy(A_data, J.data(), ns * ns * sizeof(double));
+        const auto solve_columns = [&](const double *Jm, std::vector<double> &sens, double *rcond) {
+            SunContextGuard ctx;
+            SUNMatrixGuard A_guard(SUNDenseMatrix(ns, ns, ctx));
+            sunrealtype *A_data = SUNDenseMatrix_Data(A_guard);
+            std::memcpy(A_data, Jm, ns * ns * sizeof(double));
 
-        NVectorGuard b(N_VNew_Serial(ns, ctx));
-        NVectorGuard x(N_VNew_Serial(ns, ctx));
-        SUNLinSolGuard LS_guard(ss_make_dense_linsol(x, A_guard, ctx, model, ns));
-        // One factorization, np solves — see the note on the reduced branch,
-        // and on a factorization that stops at a zero pivot.
-        const bool factored = SUNLinSolSetup(LS_guard, A_guard) == 0;
-        result.sens_jacobian_rcond = factored ? lu_diag_rcond(A_data, ns) : 0.0;
-
-        for (int p = 0; p < np; ++p) {
-            double *b_data = N_VGetArrayPointer(b);
-            for (int i = 0; i < ns; ++i)
-                b_data[i] = -dfdp[p * ns + i];
-            double *x_data = N_VGetArrayPointer(x);
-            if (factored) {
-                SUNLinSolSolve(LS_guard, A_guard, x, b, 0.0);
-            } else {
-                std::fill(x_data, x_data + ns, std::numeric_limits<double>::quiet_NaN());
+            NVectorGuard b(N_VNew_Serial(ns, ctx));
+            NVectorGuard x(N_VNew_Serial(ns, ctx));
+            SUNLinSolGuard LS_guard(ss_make_dense_linsol(x, A_guard, ctx, model, ns));
+            // One factorization, np solves — see the note on the reduced branch,
+            // and on a factorization that stops at a zero pivot.
+            const bool factored = SUNLinSolSetup(LS_guard, A_guard) == 0;
+            if (rcond != nullptr) {
+                *rcond = factored ? lu_diag_rcond(A_data, ns) : 0.0;
             }
-            for (int i = 0; i < ns; ++i)
-                result.sensitivity[i * np + p] = x_data[i];
-        }
+
+            for (int p = 0; p < np; ++p) {
+                double *b_data = N_VGetArrayPointer(b);
+                for (int i = 0; i < ns; ++i)
+                    b_data[i] = -dfdp[p * ns + i];
+                double *x_data = N_VGetArrayPointer(x);
+                if (factored) {
+                    SUNLinSolSolve(LS_guard, A_guard, x, b, 0.0);
+                } else {
+                    std::fill(x_data, x_data + ns, std::numeric_limits<double>::quiet_NaN());
+                }
+                for (int i = 0; i < ns; ++i)
+                    sens[i * np + p] = x_data[i];
+            }
+        };
+        solve_columns(J.data(), result.sensitivity, &result.sens_jacobian_rcond);
+        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, solve_columns);
 
         // Issue #995: whether this was an isolated root, and the state on it.
         std::vector<int> every_species(static_cast<size_t>(ns));
@@ -4865,8 +4998,12 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             // that does read a species with no row keeps the NaN, which is the
             // honest answer, and the first such species is recorded for it so
             // that a refusal can name it (function_sens_missing_species).
+            //
+            // The partials are kept, column-major (n_func × ns), for issue
+            // #1002's check below.
             const double y_scale = state_probe_scale(y_ss, ns, result.excluded_species);
             std::vector<double> func_term_scale(static_cast<size_t>(n_func), 0.0);
+            std::vector<double> D_func(static_cast<size_t>(n_func) * ns, 0.0);
             for (int i = 0; i < ns; ++i) {
                 std::memcpy(y_pert.data(), y_ss, ns * sizeof(double));
                 const double h = fd_probe(y_ss[i], state_fd_step(y_ss[i], y_scale), &y_pert[i]);
@@ -4881,6 +5018,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                         continue;
                     }
                     const double dfm_dxi = (f1[m] - f0[m]) / h;
+                    D_func[static_cast<size_t>(i) * n_func + m] = dfm_dxi;
                     if (dfm_dxi == 0.0) {
                         continue; // func_m does not read x_i
                     }
@@ -4943,6 +5081,67 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                         dfm_dp = (f_wide[m] - f0[m]) / h_wide;
                     }
                     result.function_sensitivity[static_cast<size_t>(m) * np + p] += dfm_dp;
+                }
+            }
+
+            // Issue #1002: the state-chain term again, with the partials of
+            // species far below the state's scale at their own step
+            // (fd_own_step_columns). Where the two totals are further apart
+            // than kFdAnswersAgree of the largest function sensitivity in the
+            // column, the furthest is put on the result, which steady_state()
+            // refuses. The values returned are the floored ones either way.
+            std::vector<double> D_own(D_func.size());
+            const std::vector<int> retaken = fd_own_step_columns(
+                [&](const double *yy, double *g) {
+                    model.update_observables(yy);
+                    model.evaluate_functions(0.0);
+                    const std::vector<double> &cache = model.function_value_cache();
+                    std::copy(cache.begin(), cache.begin() + n_func, g);
+                },
+                y_ss, ns, n_func, result.excluded_species, f0.data(), D_func.data(), D_own.data());
+            // A rate law BNG2.pl wrote as a function (`_rateLawN`) is not among
+            // the function sensitivities a result returns.
+            std::vector<uint8_t> asked(static_cast<size_t>(n_func), 0);
+            for (int m = 0; m < n_func; ++m) {
+                asked[static_cast<size_t>(m)] =
+                    need_fd[m] && !is_auto_rate_law(result.function_names[static_cast<size_t>(m)]);
+            }
+            double worst = 0.0;
+            for (int p = 0; p < np && !retaken.empty(); ++p) {
+                double largest = 0.0;
+                for (int m = 0; m < n_func; ++m) {
+                    const double v = result.function_sensitivity[static_cast<size_t>(m) * np + p];
+                    if (asked[static_cast<size_t>(m)] && std::isfinite(v)) {
+                        largest = std::max(largest, std::abs(v));
+                    }
+                }
+                for (int m = 0; m < n_func; ++m) {
+                    const double v = result.function_sensitivity[static_cast<size_t>(m) * np + p];
+                    if (!asked[static_cast<size_t>(m)] || !std::isfinite(v)) {
+                        continue;
+                    }
+                    double change = 0.0;
+                    for (const int i : retaken) {
+                        const size_t k = static_cast<size_t>(i) * n_func + m;
+                        const double dxi = result.sensitivity[static_cast<size_t>(i) * np + p];
+                        if (std::isfinite(dxi)) {
+                            change += (D_own[k] - D_func[k]) * dxi;
+                        }
+                    }
+                    const double apart = std::abs(change);
+                    if (apart <= kFdAnswersAgree * largest) {
+                        continue;
+                    }
+                    const double share = largest > 0.0 && std::isfinite(apart)
+                                             ? apart / largest
+                                             : std::numeric_limits<double>::infinity();
+                    if (result.sens_fd_disagree_function < 0 || share > worst) {
+                        worst = share;
+                        result.sens_fd_disagree_function = m;
+                        result.sens_fd_function_param = p;
+                        result.sens_fd_function_floored = v;
+                        result.sens_fd_function_own_step = v + change;
+                    }
                 }
             }
         }
@@ -5089,6 +5288,9 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // the old Newton-first ordering returned spurious / non-finite roots.
         // Opt in for the tighter residual the polish delivers; it costs more
         // wall clock than plain integration (GH #28).
+        if (!o.newton_burst) {
+            return solve_by_newton_from_state(model, rhs, o, sub);
+        }
         return solve_by_newton_two_tier(model, rhs, o, sub, &integrator_failed);
     };
 

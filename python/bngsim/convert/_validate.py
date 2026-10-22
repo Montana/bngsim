@@ -269,9 +269,11 @@ _ABS_TOL_FILE = 1e-9  # absolute term scaled by the file-wide peak (sub-scale co
 _NEAR_ZERO_FLOOR_REL = 1e-12  # denom floor for the reported relative diff
 _HARD_REL_CEILING = 0.05  # a magnitude-carrying column past this is a real divergence
 _SIGNIF_FLOOR = 1e-3  # column peak below this fraction of the file peak is sub-scale
+_MOVE_CEILING = 1e-2  # error past this part of a moving column's range is a fail (#873)
+_MOVE_ATOL_FACTOR = 10.0  # a difference within this many atol is solver noise (#873)
 
 
-def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
+def _scale_aware_verdict(a: np.ndarray, b: np.ndarray, *, atol: float | None = None) -> dict:
     """Verdict for two aligned deterministic trajectories ``a`` vs ``b``.
 
     ``a``/``b`` are ``(n_time, n_var)`` arrays in a shared column order. The
@@ -281,6 +283,15 @@ def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
     file-peak) or never diverges past the relative ceiling at its own peak scale
     is forgiven, matching the #214 scale-aware verdict. A cell where exactly one
     side is non-finite is an unconditional hard fail.
+
+    The movement gate of issue #873 holds every column that moves, on either
+    side, to ``_MOVE_CEILING`` of its range over time, so a conversion that
+    freezes the dynamics (or makes a species move that the source holds still)
+    fails even where a clamped reservoir or a large baseline sets the magnitude
+    scales and the gate above forgives every moving column. A cell no further
+    apart than ``_MOVE_ATOL_FACTOR`` times ``atol`` (the integration tolerance
+    both runs used) cannot fail it, since the solver does not resolve that
+    difference.
     """
     import numpy as np
 
@@ -320,7 +331,37 @@ def _scale_aware_verdict(a: np.ndarray, b: np.ndarray) -> dict:
     col_is_real = (col_reldiv_peak > _HARD_REL_CEILING) & col_significant
 
     below_dyn_range = fail_mask & (~col_is_real)[np.newaxis, :] & ~one_side_nonfinite
-    effective_fail = (fail_mask & ~below_dyn_range) | one_side_nonfinite
+
+    # Movement gate (issue #873), as in differ: each column's range over time on
+    # whichever side moves more; a column moves past REL_TOL of its peak, and is
+    # significant past SIGNIF_FLOOR of the largest moving range.
+    def _range_and_peak(x):
+        fin = np.isfinite(x)
+        if not x.shape[0]:
+            return np.zeros(x.shape[1]), np.zeros(x.shape[1])
+        hi = np.where(fin, x, -np.inf).max(axis=0)
+        lo = np.where(fin, x, np.inf).min(axis=0)
+        peak = np.where(fin, np.abs(x), 0.0).max(axis=0)
+        return np.where(fin.any(axis=0), hi - lo, 0.0), peak
+
+    range_a, peak_a = _range_and_peak(a)
+    range_b, peak_b = _range_and_peak(b)
+    col_range = np.maximum(range_a, range_b)
+    col_moves = col_range > _REL_TOL * np.maximum(peak_a, peak_b)
+    move_scale = float(col_range[col_moves].max()) if col_moves.any() else 0.0
+    col_moves_sig = col_moves & (col_range > _SIGNIF_FLOOR * move_scale)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        err_over_move = np.where(
+            col_moves_sig[np.newaxis, :],
+            absd_clean / np.where(col_range > 0.0, col_range, 1.0)[np.newaxis, :],
+            0.0,
+        )
+    move_exempt = (colmag < zero_floor) & ~one_side_nonfinite
+    if atol is not None:
+        move_exempt |= absd_clean <= _MOVE_ATOL_FACTOR * float(atol)
+    move_fail = (err_over_move > _MOVE_CEILING) & ~move_exempt
+
+    effective_fail = (fail_mask & ~below_dyn_range) | move_fail | one_side_nonfinite
     n_fail = int(np.sum(effective_fail))
 
     max_rel = float(np.max(reld_peak[effective_fail])) if n_fail else 0.0
@@ -1037,14 +1078,15 @@ def _check_l2(source_model: Model, back_model: Model, *, rhs_tol: float) -> Leve
     )
 
 
-def _simulate_species(model: Model, t_span, n_points) -> np.ndarray:
+def _simulate_species(model: Model, t_span, n_points) -> tuple[np.ndarray, float]:
+    """The species trajectory, and the scalar atol the run integrated at."""
     import numpy as np
 
     import bngsim
 
     sim = bngsim.Simulator(model, method="ode")
     result = sim.run(t_span=t_span, n_points=n_points)
-    return np.asarray(result.species, dtype=float)
+    return np.asarray(result.species, dtype=float), float(sim._atol)
 
 
 def _check_l3(source_model: Model, target_model: Model, *, t_span, n_points) -> LevelResult:
@@ -1057,8 +1099,8 @@ def _check_l3(source_model: Model, target_model: Model, *, t_span, n_points) -> 
     apples-to-apples quantity.
     """
     try:
-        a = _simulate_species(source_model, t_span, n_points)
-        b = _simulate_species(target_model, t_span, n_points)
+        a, atol_a = _simulate_species(source_model, t_span, n_points)
+        b, atol_b = _simulate_species(target_model, t_span, n_points)
     except Exception as exc:  # integration blew up on one side → genuine failure
         return LevelResult(
             "L3",
@@ -1079,7 +1121,7 @@ def _check_l3(source_model: Model, target_model: Model, *, t_span, n_points) -> 
             {},
         )
 
-    verdict = _scale_aware_verdict(a, b)
+    verdict = _scale_aware_verdict(a, b, atol=max(atol_a, atol_b))
     metrics = {
         "max_rel": verdict["max_rel"],
         "max_abs": verdict["max_abs"],

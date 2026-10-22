@@ -5267,13 +5267,27 @@ def _bend_branches(atom: str) -> list[str]:
     return [piece + atom[cursor:] for piece in out]
 
 
+def _call_turn_pieces(call: str) -> list[str]:
+    """The roots that stand for a step or bend *call*: each of its
+    :func:`_turn_atoms`, cut at its own edges or unfolded into its bend's
+    branches (issue #1068). What :func:`state_switch_root_conditions` roots
+    and :func:`state_switch_reactions` reads, so the two cannot drift apart."""
+    return [
+        piece
+        for atom in _turn_atoms(call)
+        for piece in (_monotone_pieces(atom) or _bend_branches(atom) or [atom])
+    ]
+
+
 def _iter_step_calls(
     expr: str,
     outermost: bool = False,
     pattern: re.Pattern | None = None,
     skip: Sequence[tuple[int, int]] = (),
+    with_start: bool = False,
 ):
-    """``(call, argument)`` for every :data:`_STEP_CALL` outside an ``if()`` condition.
+    """``(call, argument)`` for every :data:`_STEP_CALL` outside an ``if()`` condition,
+    and the call's offset in *expr* after them with *with_start*.
 
     One inside a condition is that condition's business: its atom is scanned
     whole, floor and all, so reporting the call again would only repeat it.
@@ -5298,7 +5312,42 @@ def _iter_step_calls(
             continue
         if outermost:
             covered = close_paren
-        yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
+        if with_start:
+            yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren], m.start()
+        else:
+            yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
+
+
+def _branch_guard(expr: str, pos: int) -> str | None:
+    """Whether the ``if()`` branches enclosing offset *pos* of *expr* are on, as
+    an expression that reads 1 where they all are and 0 where one is not:
+    ``((c)!=0)`` for a then-branch and ``((c)==0)`` for an else-branch,
+    multiplied. ``None`` where no ``if()`` branch encloses it (issue #1147).
+
+    A condition is ExprTk's to read, and ExprTk takes a branch wherever its
+    condition is nonzero, not only where it is a comparison's 1: ``if(F, ...)``
+    with ``F = 0.3`` runs its then-branch, and ``(c)`` read against ``> 0.5``
+    called that branch off and stepped over its kink."""
+    factors: list[str] = []
+    for m in _IF_CALL.finditer(expr):
+        open_paren = m.end() - 1
+        if open_paren >= pos:
+            break
+        close_paren = _find_close_paren_strict(expr, open_paren)
+        if close_paren < 0 or close_paren <= pos:
+            continue
+        args = _split_top_level_commas(expr[open_paren + 1 : close_paren])
+        if len(args) != 3:
+            return None  # not the form read here: no guard to give
+        then_start = open_paren + 1 + len(args[0]) + 1
+        else_start = then_start + len(args[1]) + 1
+        if then_start <= pos < else_start - 1:
+            factors.append(f"(({args[0]})!=0)")
+        elif pos >= else_start:
+            factors.append(f"(({args[0]})==0)")
+        else:
+            return None  # in the condition itself
+    return "*".join(factors) if factors else None
 
 
 def _fixed_clock_step(arg_flat: str, scope: SwitchConditionScope) -> bool:
@@ -7693,7 +7742,10 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     """For each condition, the 0-based functional reactions whose rate law reads it.
 
     Parallel to ``conditions`` (the list :func:`state_switch_conditions`
-    returns), for ``SolverOptions.set_state_switch_reactions``. The solver asks
+    returns, and the stops a run with sensitivities adds for step and bend
+    calls), for ``SolverOptions.set_state_switch_reactions``. A law reads a stop
+    when it holds a step call rooted there; a bend lists no law, since it does
+    not jump. The solver asks
     whether a crossing is continuous of these reactions' flux alone (issue
     #763). Asked of every species' whole dx/dt, a species the switch never
     touches decided it: one whose rate law cancels internally (``0.3*P -
@@ -7746,14 +7798,23 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
         return out
     for rxn in ctx["functional_reactions"]:
         flat = inline(str(rxn.get("rate_expr", "")))
-        if not _IF_CALL.search(flat):
-            continue
         hit: set[int] = set()
-        for written in _iter_condition_atoms(flat):
-            for whole in _split_logical_atoms(written):
-                # The edges a turning residual is rooted at (issue #904) are
-                # read by the rate law that reads the whole atom.
-                for atom in (whole, *_monotone_pieces(whole)):
+        if _IF_CALL.search(flat):
+            for written in _iter_condition_atoms(flat):
+                for whole in _split_logical_atoms(written):
+                    # The edges a turning residual is rooted at (issue #904) are
+                    # read by the rate law that reads the whole atom.
+                    for atom in (whole, *_monotone_pieces(whole)):
+                        hit.update(wanted.get(surface(atom) or "", ()))
+        # A step call jumps the law that holds it at the roots that stand for
+        # it (issue #1068). sign() over the state has an analytic sensitivity
+        # right-hand side since issue #1128, so the solver applies that jump, and
+        # it reads it from the laws listed here. Unlisted, the jump was read
+        # against the largest |dx/dt| anywhere: a 1e8-molecule pool turning over
+        # beside it took the saltation term away, and dX/dk came back 96% off.
+        if _STEP_CALL.search(flat):
+            for call, _arg in _iter_step_calls(flat):
+                for atom in _call_turn_pieces(call):
                     hit.update(wanted.get(surface(atom) or "", ()))
         for i in hit:
             out[i].append(int(rxn["rxn_idx"]))
@@ -7761,8 +7822,13 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
 
 
 def state_switch_root_conditions(
-    core, covered: Sequence[str] = (), ctx=None, *, calls_only: bool = False
-) -> tuple[str, ...]:
+    core,
+    covered: Sequence[str] = (),
+    ctx=None,
+    *,
+    calls_only: bool = False,
+    with_guards: bool = False,
+):
     """Rate-law conditions over model state that a run without sensitivities roots on (#897).
 
     Inside each branch of ``if((time() >= onset) && (time() < onset + w), k, 0)``
@@ -7808,6 +7874,13 @@ def state_switch_root_conditions(
     :func:`state_switch_conditions` jumps. It is this set with the comparisons
     taken out, deduplicated as here.
 
+    With *with_guards*, returns ``(conditions, guards)``: for each condition,
+    the ``if()`` branches its step or bend calls stand in, as an expression
+    that reads 1 where one of them is on, or ``""`` where any of its readings
+    stands in no branch (issue #1147). A crossing whose every branch is off
+    changes nothing, and a plain run steps on through it rather than restart.
+    Those branches' own conditions are rooted, so they cannot turn at it.
+
     Equalities are skipped for the reason :func:`state_switch_conditions` gives.
     Deduplicated by residual, read through :func:`_surface_key`, so one crossing
     written two ways is one root. Empty for a model with no conditional rate
@@ -7816,7 +7889,7 @@ def state_switch_root_conditions(
     from bngsim._jacobian import _IDENT_RE, _inline_functions
 
     if core.n_functions == 0:
-        return ()
+        return ((), ()) if with_guards else ()
 
     # The raw texts gate first, as in time_discontinuity_conditions: inlining
     # cannot introduce an `if(` or a comparison that none of them spells, and
@@ -7834,7 +7907,7 @@ def state_switch_root_conditions(
         )
 
     if not any(switches(t) for t in (*core.function_expressions, *core.param_expressions)):
-        return ()
+        return ((), ()) if with_guards else ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
     func_map = dict(ctx["function_map"])
@@ -7860,9 +7933,6 @@ def state_switch_root_conditions(
     # A covered step or bend call of a clock (issue #869) is stopped on at each
     # of its jumps, and covers the roots that stand for them and for the calls
     # inside it (issue #1068).
-    def pieces(atom: str) -> list[str]:
-        return _monotone_pieces(atom) or _bend_branches(atom) or [atom]
-
     def is_call(text: str) -> bool:
         return bool(_STEP_CALL.match(text) or _BEND_CALL.match(text)) and (
             _find_close_paren_strict(text, text.index("(")) == len(text) - 1
@@ -7871,7 +7941,7 @@ def state_switch_root_conditions(
     def call_atoms(text: str) -> list[str]:
         if not is_call(text):
             return []
-        return [p for atom in _turn_atoms(text) for p in pieces(atom)]
+        return _call_turn_pieces(text)
 
     # One atom is met again from every rate law and function that reads it, and
     # a min() of two inlined assignment rules has a residual 11k characters
@@ -7909,13 +7979,24 @@ def state_switch_root_conditions(
             pending.extend(n for n in _IDENT_RE.findall(func_map[name]) if n in func_map)
 
     conditions: list[str] = []
+    # Each kept condition's surface, and the branches its readings stand in:
+    # None once one reading stands in none (issue #1147).
+    kept_keys: list[str] = []
+    branches: dict[str, list[str] | None] = {}
 
-    def admit(atom: str, keep: bool = True) -> None:
+    def admit(atom: str, keep: bool = True, guard: str | None = None) -> None:
         key = surface(atom)
-        if key is not None and key not in seen:
+        if key is None:
+            return
+        if key not in seen:
             seen.add(key)
             if keep:
                 conditions.append(atom)
+                kept_keys.append(key)
+                branches[key] = None if guard is None else [guard]
+        elif key in branches:
+            had = branches[key]
+            branches[key] = None if had is None or guard is None else [*had, guard]
 
     for text in (*rate_laws, *(func_map[name] for name in reached)):
         if not switches(text):
@@ -7944,10 +8025,19 @@ def state_switch_root_conditions(
             for start in (m.start() for m in re.finditer(re.escape(atom), text))
         ]
         for pattern in (_STEP_CALL, _BEND_CALL):
-            for call, _arg in _iter_step_calls(text, pattern=pattern, skip=spans):
+            for call, _arg, start in _iter_step_calls(
+                text, pattern=pattern, skip=spans, with_start=True
+            ):
+                guard = _branch_guard(text, start)
                 for atom in call_atoms(inline(call)):
-                    admit(atom)
-    return tuple(conditions)
+                    admit(atom, guard=None if guard is None else inline(guard))
+    if not with_guards:
+        return tuple(conditions)
+    guards = []
+    for key in kept_keys:
+        on = branches[key]
+        guards.append("" if not on else (on[0] if len(on) == 1 else f"max({', '.join(on)})"))
+    return tuple(conditions), tuple(guards)
 
 
 # ExprTk spellings Python's parser reads differently or not at all. `if` is a
