@@ -417,6 +417,73 @@ class TestTheGeneratedSourceCompiles:
         # selector does not return; the state sensitivities are always real.
         assert np.isfinite(sens).all()
 
+    @pytest.mark.parametrize("base", [10, 2], ids=["M_LN10", "M_LN2"])
+    def test_a_log_parameterised_rate_constant_has_its_sensitivity(self, tmp_path, base):
+        """``k = base^logk``, the usual fitting parameterisation. sympy writes
+        dk/dlogk as ``pow(base, logk)*M_LN10`` (``M_LN2``), and no generated
+        source defined either, so under ``BNGSIM_CODEGEN_JIT=mir`` c2mir stopped
+        at "undeclared identifier M_LN10". A(t) = A0 exp(-k t) gives the oracle:
+        dA/dlogk = -A0 t k ln(base) exp(-k t)."""
+        model = _model(tmp_path, LOG_PARAMETERISED.format(base=base))
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["logk"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        k = float(base) ** -0.3
+        exact = -2.0 * k * np.log(base) * np.exp(-k)
+        got = np.asarray(run.sensitivities)[-1, 0, 0]
+        assert got == pytest.approx(exact, rel=1e-5)
+
+
+# The model for the test above: one first-order decay at k = base^logk.
+LOG_PARAMETERISED = """\
+begin parameters
+    1 logk -0.3
+    2 k    {base}^logk
+end parameters
+begin species
+    1 A() 2.0
+    2 B() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+class TestEachSourceDefinesEveryConstantSympyCanPrint:
+    """Text-level, so it holds on every backend. M_PI and M_E were the only
+    constants a source defined (GH #470), but sympy's C printer has a dozen
+    (``sympy.printing.c.get_math_macros``) and the sensitivity source is printed
+    by it. Each standalone source has to define every one, with the double
+    <math.h> would have given."""
+
+    @pytest.mark.parametrize(
+        ("name", "net_text", "generate"),
+        STANDALONE_SOURCES,
+        ids=[s[0] for s in STANDALONE_SOURCES],
+    )
+    def test_with_the_value_math_h_gives(self, tmp_path, name, net_text, generate):
+        sympy = pytest.importorskip("sympy")
+        from sympy.printing.c import get_math_macros
+
+        # Several expressions map to one macro, and the sympy.codegen spellings
+        # (Sqrt(2)) do not evaluate; any one that does gives the value.
+        exact = {}
+        for expr, macro in get_math_macros().items():
+            value = sympy.N(expr, 40)
+            if value.is_real:
+                exact.setdefault(macro, value)
+        assert set(exact) == set(get_math_macros().values())
+        c_source = generate(None, _model(tmp_path, net_text, name="constants.net"))
+        for macro, value in exact.items():
+            found = re.search(rf"^\s*#\s*define\s+{macro}\s+(\S+)", c_source, re.M)
+            assert found, f"{name} does not define {macro}, which sympy's C printer writes"
+            assert float(found.group(1)) == float(value), (
+                f"{name} defines {macro} as {found.group(1)}, not the double nearest {value}"
+            )
+
 
 # ─── a call the prelude does not declare ───────────────────────────────────
 #

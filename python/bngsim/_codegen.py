@@ -516,6 +516,34 @@ _SHARD_UNIT_BLOCKS = 8
 # BNGSIM_CODEGEN_MEM_PER_JOB.
 _DEFAULT_SHARD_MEM_MB = 512
 
+# The <math.h> constants a generated source can name, with <math.h>'s own digits
+# so the value is the same double whichever header defines it. M_PI and M_E come
+# from a rate law over the engine's _pi / _e; the rest from sympy's C printer,
+# which writes d/dp 10^p as pow(10, p)*M_LN10 and likewise for the other entries
+# of sympy.printing.c.get_math_macros(). <math.h> is not a dependable supplier:
+# MSVC defines none of them without _USE_MATH_DEFINES, glibc hides them in strict
+# C mode, and the MIR JIT strips the include outright, so each source that
+# stands alone defines all of them, #ifndef-guarded (GH #470).
+_MATH_CONSTANT_DEFINES = tuple(
+    line
+    for name, value in (
+        ("M_E", "2.7182818284590452354"),
+        ("M_LOG2E", "1.4426950408889634074"),
+        ("M_LOG10E", "0.43429448190325182765"),
+        ("M_LN2", "0.69314718055994530942"),
+        ("M_LN10", "2.30258509299404568402"),
+        ("M_PI", "3.14159265358979323846"),
+        ("M_PI_2", "1.57079632679489661923"),
+        ("M_PI_4", "0.78539816339744830962"),
+        ("M_1_PI", "0.31830988618379067154"),
+        ("M_2_PI", "0.63661977236758134308"),
+        ("M_2_SQRTPI", "1.12837916709551257390"),
+        ("M_SQRT2", "1.41421356237309504880"),
+        ("M_SQRT1_2", "0.70710678118654752440"),
+    )
+    for line in (f"#ifndef {name}", f"#define {name} {value}", "#endif")
+)
+
 # Portable codegen prelude, emitted once per translation unit. Each macro is
 # #ifndef-guarded so the RHS + sensitivity + jacobian + output sources
 # concatenated into one shared library don't redefine it:
@@ -3677,20 +3705,16 @@ def _emit_sens_rhs_body(
     _emit("#include <math.h>")
     _emit("#include <string.h>")
     _emit("")
-    # The same block the two RHS sources open with. A rate constant written over
+    # The same block the RHS source opens with. A rate constant written over
     # the engine's _pi or _e reaches this source as M_PI/M_E (see
-    # _BUILTIN_CONSTANT_VALUES), and <math.h> is not a reliable source for
-    # either: MSVC defines neither without _USE_MATH_DEFINES, and glibc hides
-    # both in strict C mode. On the MIR JIT backend every "#include <...>" line
-    # is stripped before c2mir sees the source, so these two defines are the
-    # only place the names come from at all — which is what the prelude comment
-    # in include/bngsim/mir_jit.hpp says is supposed to be happening here.
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    # _BUILTIN_CONSTANT_VALUES), and sympy writes the chain rule through 10^p as
+    # M_LN10 (see _MATH_CONSTANT_DEFINES). On the MIR JIT backend every
+    # "#include <...>" line is stripped before c2mir sees the source, so these
+    # defines are the only place the names come from at all — which is what the
+    # prelude comment in include/bngsim/mir_jit.hpp says is supposed to be
+    # happening here.
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     _emit(f"#define N_SPECIES {n_sp}")
     _emit(f"#define N_PARAMS  {n_params}")
@@ -6545,12 +6569,8 @@ def generate_rhs_from_model(model) -> str:
     _emit("#include <stdlib.h>")
     _emit("#include <string.h>")
     _emit("")
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     # Layout MUST match CodegenUserDataForSO in cvode_simulator.cpp —
     # tfun_eval is invoked from this RHS for any tfun-backed function.
