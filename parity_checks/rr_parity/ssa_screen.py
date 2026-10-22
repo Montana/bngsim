@@ -1092,15 +1092,18 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
         workers=1,
         timeout_of=lambda _s: cap if cap else 1e9,
     )
-    for rs, tev in zip(rspecs, results, strict=False):
+    for rs, tev in zip(rspecs, results, strict=True):
         c = by_name[rs["key"]]
-        if tev.get("status") == "timeout":
-            c["revalidation"] = "timeout"
+        # The worker's classification stands wherever the re-validation gave no
+        # verdict; the row says why (a cap overrun, a child that died, an error
+        # the child reported), so a tail that never validates is not silent.
+        if tev.get("status") in ("timeout", "dead"):
+            c["revalidation"] = tev["status"]
             continue
-        if "error" in tev or tev.get("status") not in (
-            "rr_time_event",
-            "rr_time_event_unverified",
-        ):
+        if "error" in tev:
+            c["revalidation"] = f"error: {tev['error']}"[:300]
+            continue
+        if tev.get("status") not in ("rr_time_event", "rr_time_event_unverified"):
             continue  # keep the worker's rr_time_event / no-signal classification
         c["status"] = tev["status"]
         for k in ("n_compared", "bn_tracks_own_ode", "extended_horizon", "bngsim_ode_worst"):

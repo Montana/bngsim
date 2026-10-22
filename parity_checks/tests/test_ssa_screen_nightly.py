@@ -119,6 +119,29 @@ def test_the_tail_is_capped_and_an_overrun_keeps_the_classification(monkeypatch)
     assert fast["status"] == "rr_time_event_unverified" and fast["n_compared"] == 3
 
 
+def test_a_child_that_dies_or_errors_is_recorded_on_the_row(monkeypatch):
+    """A re-validation that died (a segfault in the child) or reported an error
+    kept the worker's classification with nothing on the row to say the tail
+    never validated it; the cap overrun was the only case recorded."""
+
+    def fake_schedule(specs, target, *, workers, timeout_of, on_done=None):
+        return [
+            {"key": "died", "status": "dead", "exitcode": -11},
+            {"key": "raised", "error": "RuntimeError: no signal"},
+        ]
+
+    monkeypatch.setattr(S.rc, "schedule", fake_schedule)
+    cases = [_case("died"), _case("raised")]
+    args = argparse.Namespace(
+        n=8, seed_base=1, min_mean_count=1.0, self_z_tol=4.0, revalidate_timeout=120.0
+    )
+    S._revalidate_time_events(cases, [_spec("died"), _spec("raised")], args)
+    died, raised = cases
+    assert died["status"] == "rr_time_event" and died["revalidation"] == "dead"
+    assert raised["status"] == "rr_time_event"
+    assert raised["revalidation"] == "error: RuntimeError: no signal"
+
+
 @pytest.mark.parametrize("flag", ["--present-only", "--revalidate-timeout"])
 def test_the_screen_takes_the_nightly_flags(flag):
     src = Path(S.__file__).read_text()
