@@ -12078,7 +12078,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 int guard_idx = -1;
                 if (c < guard_texts.size() && !guard_texts[c].empty()) {
                     try {
-                        guard_idx = model.evaluator().compile(guard_texts[c]);
+                        // Once per model and text: compile() appends, and a
+                        // model run many times kept a copy per run.
+                        guard_idx = model.compiled_expression(guard_texts[c]);
                     } catch (const std::exception &) {
                         guard_idx = -1;
                     }

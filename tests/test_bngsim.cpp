@@ -3066,6 +3066,40 @@ int test_compute_propensities_ssa_convention() {
     return 0;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #1147: a run compiles its state-switch guards into the model's evaluator.
+// Compiled per run, a model run N times held N copies of each guard, so a fit's
+// model grew without bound. Once per model and text, the second run adds none.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int test_state_switch_guard_compiled_once_per_model() {
+    auto model = bngsim::NetworkModel::from_net(data_path("guarded_bend_root.net"));
+    bngsim::CvodeSimulator sim(model);
+    bngsim::TimeSpec times{0.0, 30.0, 31};
+    bngsim::SolverOptions opts;
+    opts.sensitivity.state_switch_conditions = {"(Sobs)<(0.001)"};
+    opts.sensitivity.state_switch_guards = {"((F>0.5)!=0)"};
+
+    const auto *eval = dynamic_cast<const bngsim::ExprTkEvaluator *>(&model.evaluator());
+    CHECK(eval != nullptr, "the model's evaluator is ExprTk's");
+
+    auto first = sim.run(times, opts);
+    const int after_first = eval->n_expressions();
+    for (int i = 0; i < 5; ++i) {
+        model.reset();
+        auto again = sim.run(times, opts);
+        CHECK_CLOSE(again.species_data().back(), first.species_data().back(), 0.0,
+                    "a repeated run is the same run");
+    }
+    CHECK(eval->n_expressions() == after_first,
+          "a repeated run compiles no guard again (" << eval->n_expressions()
+                                                     << " expressions, " << after_first
+                                                     << " after the first run)");
+    CHECK(model.compiled_expression("((F>0.5)!=0)") == model.compiled_expression("((F>0.5)!=0)"),
+          "one text, one expression id");
+    return 0;
+}
+
 int main() {
     std::cout << "bngsim Phase A tests" << std::endl;
     std::cout << "====================" << std::endl;
@@ -3165,6 +3199,9 @@ int main() {
     // Issue #523: the public evaluators.
     RUN_TEST(test_fd_jacobian_matches_analytical);
     RUN_TEST(test_compute_propensities_ssa_convention);
+
+    // Issue #1147: a run's state-switch guards are compiled once per model.
+    RUN_TEST(test_state_switch_guard_compiled_once_per_model);
 
     std::cout << std::endl;
     std::cout << tests_passed << "/" << tests_run << " tests passed." << std::endl;

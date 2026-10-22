@@ -470,6 +470,9 @@ struct NetworkModel::Impl {
     // source text. Holds an evaluator expression id, so clone() leaves it empty,
     // as it does state_switch_cache.
     std::unordered_map<std::string, int> clock_expression_cache;
+    // Memo for NetworkModel::compiled_expression(), keyed by source text
+    // (issue #1147). Holds evaluator expression ids, so clone() leaves it empty.
+    std::unordered_map<std::string, int> compiled_expression_cache;
     // The variable `bngsim_scan_shift_` those expressions may read, defined in
     // the evaluator at the first call. A clone's evaluator is its own, so the
     // flag is not copied.

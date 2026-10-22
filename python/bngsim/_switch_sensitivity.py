@@ -5321,8 +5321,13 @@ def _iter_step_calls(
 def _branch_guard(expr: str, pos: int) -> str | None:
     """Whether the ``if()`` branches enclosing offset *pos* of *expr* are on, as
     an expression that reads 1 where they all are and 0 where one is not:
-    ``(c)`` for a then-branch and ``(1-(c))`` for an else-branch, multiplied.
-    ``None`` where no ``if()`` branch encloses it (issue #1147)."""
+    ``((c)!=0)`` for a then-branch and ``((c)==0)`` for an else-branch,
+    multiplied. ``None`` where no ``if()`` branch encloses it (issue #1147).
+
+    A condition is ExprTk's to read, and ExprTk takes a branch wherever its
+    condition is nonzero, not only where it is a comparison's 1: ``if(F, ...)``
+    with ``F = 0.3`` runs its then-branch, and ``(c)`` read against ``> 0.5``
+    called that branch off and stepped over its kink."""
     factors: list[str] = []
     for m in _IF_CALL.finditer(expr):
         open_paren = m.end() - 1
@@ -5337,9 +5342,9 @@ def _branch_guard(expr: str, pos: int) -> str | None:
         then_start = open_paren + 1 + len(args[0]) + 1
         else_start = then_start + len(args[1]) + 1
         if then_start <= pos < else_start - 1:
-            factors.append(f"({args[0]})")
+            factors.append(f"(({args[0]})!=0)")
         elif pos >= else_start:
-            factors.append(f"(1-({args[0]}))")
+            factors.append(f"(({args[0]})==0)")
         else:
             return None  # in the condition itself
     return "*".join(factors) if factors else None

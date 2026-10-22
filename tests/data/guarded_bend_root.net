@@ -1,0 +1,18 @@
+# Issue #1147: a bend call inside an if() branch, the rulehub division guard.
+# S decays through Sobs = 0.001, where max() bends, with the branch on (F > 0.5).
+begin parameters
+    1 k 0.5
+    2 F 1
+end parameters
+begin species
+    1 S() 2
+end species
+begin functions
+    1 r() if(F>0.5, k*Sobs/max(Sobs,0.001), 0)
+end functions
+begin reactions
+    1 1 0 r #_R1
+end reactions
+begin groups
+    1 Sobs 1
+end groups

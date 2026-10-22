@@ -1075,6 +1075,23 @@ class Model:
         every branch is off."""
         roots = self._state_switch_roots_beside(covered)
         guards = self._state_switch_root_memo.get(("guards", covered))
+        if guards is None and roots:
+            # The memo is shared with clones and cleared whole at its cap
+            # (_remember), which can take the guards while this model still
+            # holds its roots. Every later run would then restart at the
+            # crossings the guards step through, so derive them again.
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+                again, guards = state_switch_root_conditions(
+                    self._core, covered=covered, with_guards=True
+                )
+            except Exception:  # pragma: no cover - defensive, as for the roots
+                guards = None
+            else:
+                if tuple(again) == tuple(roots):
+                    _remember(self._state_switch_root_memo, ("guards", covered), guards)
+                else:
+                    guards = None
         if guards is None or len(guards) != len(roots):
             return ("",) * len(roots)
         return guards
