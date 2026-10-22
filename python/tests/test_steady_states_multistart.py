@@ -305,3 +305,124 @@ def test_an_accumulator_sets_neither_the_scale_nor_the_log(tmp_path, caplog):
     # The probe's own solve, and one line for the batch.
     assert caplog.text.count("structural reason") == 2
     assert caplog.text.count("in 50 of 50 batch entries") == 1
+
+
+_FIXED_NET = """begin parameters
+    1 k   2.0
+    2 kd  0.5
+end parameters
+begin species
+    1 $A() 1
+    2 B() 0
+end species
+begin reactions
+    1 1 1,2 k #_R1
+    2 2 0 kd #_R2
+end reactions
+begin groups
+    1 Btot 2
+end groups
+"""
+
+
+@pytest.mark.parametrize("which", ["minimal", "catalysis.net"])
+def test_a_fixed_species_is_no_unknown_of_the_solve(tmp_path, which):
+    """A $-fixed species has a zero row in Newton's system, and the unmasked
+    solve keeps it an unknown, so every burst-free start failed on the singular
+    matrix (catalysis, localfunc, gene_expr_3stage, Motivating_example). The
+    two-tier solver never showed it: it answers from integration."""
+    if which == "minimal":
+        path = tmp_path / "fixed.net"
+        path.write_text(_FIXED_NET, encoding="utf-8")
+        model = bngsim.Model.from_net(str(path))
+    else:
+        model = bngsim.Model.from_net(_net(which))
+    sim = bngsim.Simulator(model, method="ode")
+    roots = sim.steady_states(n_starts=40, seed=0)
+    assert len(roots) == 1 and roots.n_failed < 40, roots
+    ref = np.asarray(sim.steady_state().concentrations)
+    np.testing.assert_allclose(roots.states[0], ref, rtol=1e-6, atol=1e-9 * np.abs(ref).max())
+
+
+class _Converged:
+    def __init__(self, y, residual=1e-12):
+        self.converged = True
+        self.concentrations = np.asarray(y, float)
+        self.residual = residual
+        self.root_stability = "stable"
+        self.eigenvalues = np.array([-1.0])
+
+
+@pytest.mark.parametrize("total", [1e3, 1e8, 1e9])
+def test_distinct_roots_sharing_a_large_law_stay_distinct(total):
+    """The toggle's three roots beside a pool P with R1 + R2 + P conserved. A
+    floor of dedupe_rtol (1e-6) of the law's scale was 100 at a pool of 1e8,
+    and the saddle merged into an attractor."""
+    roots = [_SADDLE, _ATTRACTOR_R2, np.array([144.3734, 0.3682])]
+    results = [_Converged([*y, total - y.sum()]) for y in roots]
+    out = bngsim.SteadyStates.cluster(
+        results, ["R1", "R2", "P"], dedupe_rtol=1e-6, atol=1e-9, laws=np.array([[1.0, 1.0, 1.0]])
+    )
+    assert len(out) == 3
+
+
+def test_a_root_is_grouped_the_same_whatever_the_residual_order():
+    """Points 0.9e-6 apart at rtol 1e-6. Compared with the lowest-residual
+    member so far, the representative drifted along the chain: one root when
+    the residuals fell along it, two when they rose."""
+    xs = [1.0, 1.0 + 0.9e-6, 1.0 + 1.8e-6, 1.0 + 2.7e-6]
+    falling = [_Converged([x], 10.0 ** -(10 + k)) for k, x in enumerate(xs)]
+    rising = [_Converged([x], 10.0 ** -(13 - k)) for k, x in enumerate(xs)]
+    a = bngsim.SteadyStates.cluster(falling, ["x"], dedupe_rtol=1e-6, atol=0.0)
+    b = bngsim.SteadyStates.cluster(rising, ["x"], dedupe_rtol=1e-6, atol=0.0)
+    np.testing.assert_array_equal(a.basins, b.basins)
+
+
+_SCALED_TOGGLE_NET = """begin parameters
+    1 alpha_1     156.25
+    2 alpha_2     53.526315789473685
+    3 beta        2.5
+    4 gamma       1.0
+    5 k_deg       1.0
+    6 s           1e-11
+end parameters
+begin functions
+    1 syn_R1() s*alpha_1/(1+((Obs_Tot_R2/s)^beta))
+    2 syn_R2() s*alpha_2/(1+((Obs_Tot_R1/s)^gamma))
+end functions
+begin species
+    1 R1() 0
+    2 R2() 0
+end species
+begin reactions
+    1 0 1 syn_R1 #_R1
+    2 0 2 syn_R2 #_R2
+    3 1 0 k_deg #_R3
+    4 2 0 k_deg #_R4
+end reactions
+begin groups
+    1 Obs_Tot_R1           1
+    2 Obs_Tot_R2           2
+end groups
+"""
+
+
+def test_a_model_under_tol_everywhere_is_refused(tmp_path):
+    """The toggle at 1e-11 of its concentrations: the absolute tol=1e-9 is
+    above ||f|| at every state, so all 200 starts "converged" where they began
+    and clustered as one unstable root that is no root at all."""
+    path = tmp_path / "scaled_toggle.net"
+    path.write_text(_SCALED_TOGGLE_NET, encoding="utf-8")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    with pytest.raises(bngsim.SimulationError, match="above the residual"):
+        sim.steady_states()
+
+
+def test_the_default_bound_follows_a_small_model_down():
+    """A floor of 1 drew every start of a model at 1e-11 ten decades above its
+    roots."""
+    from bngsim._simulator import _default_sampling_bound
+
+    y0 = np.array([2e-12, 5e-11])
+    assert _default_sampling_bound(y0, np.zeros((0, 2))) == pytest.approx(5e-10)
+    assert _default_sampling_bound(np.zeros(2), np.zeros((0, 2))) == 10.0

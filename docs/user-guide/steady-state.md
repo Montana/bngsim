@@ -423,14 +423,16 @@ roots.basins          # root index per start, -1 where Newton did not converge
 
 **Sampling.** Each species a start moves is drawn log-uniformly from `decades` (default 4) decades below a bound up to it:
 
-- A species in no conservation law is bounded by `upper`. Its default is ten times the largest of 1, any concentration of the model's state, any law's total, and the steady state one ordinary solve reaches.
-- The species in a law are drawn below the largest total, then moved onto the laws together, at the totals the model's state holds. They go to the point that satisfies the laws nearest the draw in relative entropy, which keeps every species positive however many species a law holds.
+- A species in no conservation law is bounded by `upper`. Its default is ten times the largest concentration of the model's state, law total, and value of the steady state one ordinary solve reaches (10 when all of them are 0).
+- The species in a law are drawn below the largest total, then moved onto the laws together, at the totals the model's state holds. They go to the point that satisfies the laws nearest the draw in relative entropy, which keeps every species positive however many species a law holds. The members of a law start within about `decades` decades of each other, so a root where one sits further below its law's total is reached only if Newton walks there; widen `decades` for it.
 
-A `$`-fixed species, and one `mask=` leaves out, keeps its value: neither is an unknown of the solve.
+A `$`-fixed species, and one `mask=` leaves out, keeps its value in every start and is not an unknown of the solve, though a law's dependent species is rebuilt from the law as the others move.
+
+**Scale.** `tol` is absolute, as in `steady_state()`. A model at so small a scale that most starts are under `tol` before Newton moves them is refused, since any state would pass there. At law totals above about `1e7`, the law's round-off alone can exceed `tol`, and a root is then counted as a failed start.
 
 **Failed starts.** Newton does not converge from every start (52 of 200 on the toggle, most of them near zero, where its Hill terms turn NaN). Those starts are counted in `n_failed` and have basin -1. A write-only accumulator fails every start, since it makes Newton's system singular; exclude it with `mask=~model.is_pure_sink()`.
 
-**Distinct roots.** Each root is polished with a few more Newton steps after KINSOL first gets under `tol`. Two roots are the same when every species agrees to `dedupe_rtol` (default `1e-6`) of its magnitude, or, for a species in a conservation law, of its smallest law's scale `Σ|L·y|`, which is as close as the solve places it. A continuum of steady states (a zero eigenvalue in each root's spectrum, as on SIR's line of disease-free states) is not a set of isolated roots: each start lands somewhere on it and is reported as a root of its own.
+**Distinct roots.** Each root is polished with a few more Newton steps after KINSOL first gets under `tol`. Two roots are the same when every species agrees to `dedupe_rtol` (default `1e-6`) of its magnitude, or, for a species in a conservation law, to `1e-9` of its smallest law's scale `Σ|L·y|`, which is as close as the solve places it. A continuum of steady states (a zero eigenvalue in each root's spectrum, as on SIR's line of disease-free states) is not a set of isolated roots: each start lands somewhere on it and is reported as a root of its own.
 
 **Building block.** `steady_state_batch(states=..., method="newton", newton_burst=False)` runs the same burst-free solves from starting states of your own, paired row by row with `params=` when both are given.
 
