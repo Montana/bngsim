@@ -540,19 +540,32 @@ static bool ss_accepts(NetworkModel &model, SteadyStateRhs &rhs, const SteadySta
 // any non-finite or clearly-negative concentration. The negativity floor is
 // relative to the largest concentration so a root that lands a near-zero species
 // at -1e-9 (roundoff around a true zero, e.g. simple decay's A*≈0) still passes.
-static bool ss_state_is_physical(const std::vector<double> &y) {
+//
+// `slack` widens it to an absolute size below which a species counts as nothing
+// (ss_negative_slack). Where every species heads to 0 the largest is itself
+// roundoff: a burst-free Newton solve of the issue #1001 cubic at a scale of
+// 1e-9 reached its root at 0 as -5.9e-24, within 6e-5 of its tolerance, and was
+// thrown out as negative.
+static bool ss_state_is_physical(const std::vector<double> &y, double slack = 0.0) {
     double maxabs = 0.0;
     for (double v : y) {
         if (!std::isfinite(v))
             return false;
         maxabs = std::max(maxabs, std::abs(v));
     }
-    const double neg_floor = -1e-7 * std::max(maxabs, 1e-300);
+    const double neg_floor = -std::max(1e-7 * std::max(maxabs, 1e-300), slack);
     for (double v : y) {
         if (v < neg_floor)
             return false;
     }
     return true;
+}
+
+// The size below which the "scaled" criterion counts a species as nothing
+// (issue #1001): its tolerance at 0, rtol·floor. None under "residual", and
+// none where nothing starts above 0, whose floor is the state's own.
+static double ss_negative_slack(const SteadyStateOptions &opts) {
+    return opts.criterion_by_distance ? opts.rtol * opts.criterion_floor : 0.0;
 }
 
 // Do two candidate steady states agree to AGREE_RTOL? Used by the two-tier
@@ -1858,7 +1871,7 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
     // passes as a converged steady state.
     result.residual = compute_residual(rhs, result.concentrations.data(), ns, sub);
     if (!ss_accepts(model, rhs, opts, sub, result.concentrations.data(), result.residual) ||
-        !ss_state_is_physical(result.concentrations)) {
+        !ss_state_is_physical(result.concentrations, ss_negative_slack(opts))) {
         result.converged = false;
     }
 
@@ -1992,7 +2005,12 @@ static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyS
         SteadyStateOptions polish = opts;
         polish.tol = opts.tol * 1e-3;
         SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, r.concentrations, nullptr, 3);
-        if (p.residual <= r.residual && ss_state_is_physical(p.concentrations)) {
+        // Under "scaled" (issue #1001) the polished state is kept only if it
+        // passes that test too: a residual no larger is not a step no larger.
+        if (p.residual <= r.residual &&
+            ss_state_is_physical(p.concentrations, ss_negative_slack(opts)) &&
+            (!opts.criterion_by_distance ||
+             ss_accepts(model, rhs, opts, sub, p.concentrations.data(), p.residual))) {
             p.converged = true;
             p.n_steps += r.n_steps;
             p.n_rhs_evals += r.n_rhs_evals;
@@ -2022,7 +2040,7 @@ static SteadyStateResult solve_by_newton_two_tier(NetworkModel &model, SteadySta
     auto accept = [&](const SteadyStateResult &r) {
         return r.converged && r.method_used == "newton" &&
                ss_accepts(model, rhs, opts, sub, r.concentrations.data(), r.residual) &&
-               ss_state_is_physical(r.concentrations);
+               ss_state_is_physical(r.concentrations, ss_negative_slack(opts));
     };
 
     // How many burst-seeded roots the stability certificate turned down, carried

@@ -319,3 +319,21 @@ def test_a_march_that_stalls_between_asks_is_asked_where_it_stops():
     )
     assert ss.converged
     assert ss.newton_distance <= 1.0
+
+
+@pytest.mark.parametrize("s", [1.0, 1e-9])
+def test_burst_free_starts_find_the_same_roots_at_any_scale(tmp_path, s):
+    # The solve steady_states() runs from each start (issue #524). At 1e-9 the
+    # residual test calls most starts roots where they stand; the scaled one
+    # finds the cubic's three roots, as at 1. The one at 0 is reached as
+    # -5.9e-24, which the negativity check, relative to the largest species
+    # and so to itself, threw out until it was given the species' tolerance.
+    sim = bngsim.Simulator(_cubic(tmp_path, s, 0.5), method="ode")
+    starts = (np.linspace(0.01, 1.6, 40) * s)[:, None]
+    out = sim.steady_state_batch(
+        states=starts, method="newton", newton_burst=False, criterion="scaled"
+    )
+    converged = [r for r in out if r.converged]
+    assert all(r.newton_distance <= 1.0 for r in converged)
+    roots = sorted({round(r.concentrations[0] / s, 6) + 0.0 for r in converged})
+    assert roots == [0.0, 0.3, 1.0]
