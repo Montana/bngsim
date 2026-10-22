@@ -1183,6 +1183,7 @@ class SteadyStateOptions:
     force_sparse_linear_solver: bool
     jacobian: str
     method: str
+    newton_burst: bool
     def __init__(self) -> None:
         ...
     def set_ic_param_sens(self, triples: collections.abc.Sequence[tuple[typing.SupportsInt | typing.SupportsIndex, typing.SupportsInt | typing.SupportsIndex, typing.SupportsFloat | typing.SupportsIndex]]) -> None:

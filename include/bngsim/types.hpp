@@ -1198,6 +1198,12 @@ struct SteadyStateOptions {
     // "integration" (default; CVODE parity early-stop), "newton" (two-tier
     // integrate-then-polish), or "kinsol" (alias for newton).
     std::string method = "integration";
+    // Issue #524: false makes "newton" solve from the state it is given, with
+    // no integration burst first, and report the stability certificate's verdict
+    // instead of rejecting an unstable root. What enumerating roots from many
+    // starting states needs: a burst carries every start into an attractor's
+    // basin, and a saddle is discarded on purpose. Ignored by "integration".
+    bool newton_burst = true;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —

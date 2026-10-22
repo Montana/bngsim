@@ -105,7 +105,8 @@ Stop conditions:
 
 Steady-state (`method` ∈ `"integration"` (default), `"newton"`, `"kinsol"` alias):
 - **`steady_state(*, tol, max_time, method, rtol, atol, max_steps, sensitivity_params, mask)`** → `SteadyStateResult`
-- **`steady_state_batch(params, *, tol, max_time, method, rtol, atol, max_steps, n_workers, mask)`** → `list[SteadyStateResult]`
+- **`steady_state_batch(params=None, *, states, tol, max_time, method, rtol, atol, max_steps, n_workers, mask, newton_burst)`** → `list[SteadyStateResult]`. `states` starts each entry from a state of its own, paired row by row with `params`; `newton_burst=False` with `method="newton"` solves from that state with no integration burst and reports an unstable root instead of rejecting it (issue #524)
+- **`steady_states(*, n_starts, seed, upper, decades, dedupe_rtol, tol, n_workers, mask)`** → `SteadyStates`: every steady state multistart Newton finds from starts sampled on the conservation manifold, each with its stability (issue #524). See the user guide's steady-state page
 - Both raise `SimulationError` for a model with an event, or one that reads the time (issue #710): the solvers read the right-hand side at `t = 0` and fire no event. `run(steady_state=True)` integrates such a model to the end of its span and does not stop early.
 
   `mask` (issue #74): which species enter the convergence norm — a boolean array of length `n_species`, or the species names to keep. Default `None` tests every species (BNG2.pl parity). It also restricts the KINSOL unknown set and the `dY_ss/dp` system to the same subspace; excluded species get a NaN `dY_ss/dp` row. See `Model.is_pure_sink()`.
