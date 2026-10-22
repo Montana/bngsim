@@ -24,6 +24,7 @@ from typing import IO
 import libsbml
 
 from bngsim import _sbml_unsupported
+from bngsim._switch_sensitivity import _ATOMIC_TOKEN, _condition_key, _fully_parenthesised
 
 logger = logging.getLogger("bngsim")
 
@@ -175,80 +176,6 @@ def _atomic(expr: str) -> str:
     if _ATOMIC_TOKEN.fullmatch(expr) or _fully_parenthesised(expr):
         return expr
     return f"({expr})"
-
-
-_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
-
-
-def _fully_parenthesised(expr: str) -> bool:
-    """Whether the opening ``(`` of *expr* is closed by its last character."""
-    if not (expr.startswith("(") and expr.endswith(")")):
-        return False
-    depth = 0
-    for i, ch in enumerate(expr):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i == len(expr) - 1
-    return False
-
-
-def _condition_key(cond: str) -> str:
-    """The text of a condition with the parentheses ``_atomic`` adds around a
-    call dropped, and those around a lone name or number, so that one crossing
-    reached two ways has one key (issue #1082).
-
-    A function-definition formal bound to ``time()`` is spliced into the body
-    as ``(time())``, so ``near(time, 2.5, 0.005)`` with ``near := abs(x - c) <
-    w`` and ``abs(time - 2.5) < 0.005`` written directly gave two spellings of
-    each edge, and two roots. A group that is a call's own argument list is
-    left alone, and so is any group with an operator in it.
-    """
-    prev = None
-    while prev != cond:
-        prev = cond
-        out: list[str] = []
-        i = 0
-        n = len(cond)
-        while i < n:
-            ch = cond[i]
-            # An opening parenthesis that is not a call's own (no name before it).
-            if ch == "(" and not (out and (out[-1][-1:].isalnum() or out[-1][-1:] == "_")):
-                close = _matching_paren(cond, i)
-                inner = cond[i + 1 : close] if close is not None else ""
-                if close is not None and _is_name_or_call(inner):
-                    out.append(inner)
-                    i = close + 1
-                    continue
-            out.append(ch)
-            i += 1
-        cond = "".join(out)
-    return cond
-
-
-def _matching_paren(text: str, start: int) -> int | None:
-    """The index of the ``)`` that closes the ``(`` at *start*."""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    return None
-
-
-def _is_name_or_call(text: str) -> bool:
-    """A lone name or number, or a name applied to one parenthesised group."""
-    if _ATOMIC_TOKEN.fullmatch(text):
-        return True
-    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
-    if m is None:
-        return False
-    return _fully_parenthesised(text[m.end() :])
 
 
 def _ia_value_changed(new: float, old: float | None) -> bool:
@@ -2448,7 +2375,9 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         )
         # (Not where the reactions do nothing to it: 0 is 0 at any factor, and
         # a factor that reads this rate, `cf := 1 + rateOf(S3)` with S3 in no
-        # reaction, had no value for it, issue #1124 item 9.)
+        # reaction, had no value for it, issue #1124 item 9. `!= 0.0` on
+        # purpose: a NaN sum, an unevaluable law, is not 0 and still reads the
+        # factor and fails as before; do not tighten this to `> 0`.)
         if cf_id and amt_rate != 0.0:
             # A factor with no value yet fails the fold: the initialAssignment
             # or rule that gives it one refolds this on a later pass, and C2c
@@ -3593,11 +3522,31 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     # matter here, and the reactions are scanned only for those.
     read = set().union(*reads.values(), *law_reads.values())
     candidates = {sp.getId() for sp in species if not sp.getConstant()} & read
+    # A species a reaction changes: listed with a net stoichiometry that is not
+    # 0. A catalyst written as reactant and product, `S3 -> S3`, is left as it
+    # was, and its rate is 0 (the load-time fold skips such a reaction too);
+    # `cf := 1 + rateOf(S3)` beside one was refused as moving, where
+    # libRoadRunner runs it with cf = 1 (#1138's review). A stoichiometry that
+    # is not a plain finite number (set by math, by a rule, or not constant) is
+    # taken as moving the species, as before.
     changed_by_reaction: set[str] = set()
     for j in range(sbml_model.getNumReactions() if candidates - sources else 0):
         rxn = sbml_model.getReaction(j)
-        for lst in (rxn.getListOfReactants(), rxn.getListOfProducts()):
-            changed_by_reaction |= {lst.get(k).getSpecies() for k in range(lst.size())}
+        net: dict[str, float] = {}
+        for lst, sign in ((rxn.getListOfReactants(), -1.0), (rxn.getListOfProducts(), 1.0)):
+            for k in range(lst.size()):
+                sr = lst.get(k)
+                sid = sr.getSpecies()
+                stoich = sr.getStoichiometry()
+                if (
+                    sr.isSetStoichiometryMath()
+                    or not sr.getConstant()
+                    or not _math.isfinite(stoich)
+                ):
+                    changed_by_reaction.add(sid)
+                    continue
+                net[sid] = net.get(sid, 0.0) + sign * stoich
+        changed_by_reaction |= {sid for sid, v in net.items() if v != 0.0}
     sources |= {
         sp.getId()
         for sp in species
@@ -9051,10 +9000,11 @@ def _build_model_from_sbml_doc_in_context(doc):
         # A concentration the size reads in a compartment whose own size reads a
         # rate: each compartment's rate needs the next one's, so a ring of them
         # (a compartment reading its own concentration is one) has no first.
-        def _reads_in(a: str, b: str) -> list[str]:
-            return sorted(
-                leaf for leaf in _comp_rated[a] if _diluted(leaf) and species_comp[leaf] == b
-            )
+        def _reads_in(a: str, b: str, reads: dict[str, set[str]] | None = None) -> list[str]:
+            # The diluted concentrations in compartment b that a's rate (or, over
+            # `reads`, a's conditions) reads.
+            source = _comp_rated if reads is None else reads
+            return sorted(leaf for leaf in source[a] if _diluted(leaf) and species_comp[leaf] == b)
 
         def _first_ring(needs: dict[str, list[str]]) -> list[str]:
             # The first ring of compartments, each needing the next, as a path
@@ -9120,16 +9070,13 @@ def _build_model_from_sbml_doc_in_context(doc):
             }
         )
 
-        def _cond_reads_in(a: str, b: str) -> list[str]:
-            return sorted(leaf for leaf in _cond_reads[a] if species_comp[leaf] == b)
-
         if _cond_ring:
             _refusals.append(
                 "the sizes of compartments "
                 + ", ".join(f"{c} ({_size_text(c)})" for c in _cond_ring[:-1])
                 + " each jump on a condition that reads a concentration in the next ("
                 + "; ".join(
-                    f"{a} reads {', '.join(_cond_reads_in(a, b))} in {b}"
+                    f"{a} reads {', '.join(_reads_in(a, b, _cond_reads))} in {b}"
                     for a, b in zip(_cond_ring, _cond_ring[1:], strict=False)
                 )
                 + "), so where a jump flips those conditions the sizes after it can be read "
@@ -11230,12 +11177,17 @@ def _build_model_from_sbml_doc_in_context(doc):
     # the stops a subset of the roots.
     # ...and, beside the roots, the trigger equalities, which are stops alone.
     # Both in the spelling registered (issue #1082).
+    # An equality reached through a function definition beside the same one
+    # written directly is one stop too, in the first spelling met (#1106's review).
+    registered_eq: dict[str, str] = {}
+    for eq in trigger_equalities:
+        registered_eq.setdefault(_condition_key(eq), eq)
     model._time_disc_conditions = tuple(
-        sorted(set(registered_disc.values()) | set(trigger_equalities))
+        sorted(set(registered_disc.values()) | set(registered_eq.values()))
     )
     model._event_disc_conditions = frozenset(
         {registered_disc[k] for k in map(_condition_key, event_disc) if k in registered_disc}
-        | set(trigger_equalities)
+        | set(registered_eq.values())
     )
 
     # AR-target species report map. An AssignmentRule target species is
