@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 import pytest
+import ssa_attribution as SA
 import ssa_screen as S
 
 
@@ -96,7 +97,13 @@ def _spec(name):
     return {"name": name, "sbml_path": f"{name}.xml", "t_end": 10.0, "n_steps": 10}
 
 
-def test_the_tail_is_capped_and_an_overrun_keeps_the_classification(monkeypatch):
+def _tail_args(cap=120.0):
+    return argparse.Namespace(
+        n=8, seed_base=1, min_mean_count=1.0, self_z_tol=4.0, revalidate_timeout=cap
+    )
+
+
+def test_the_tail_is_capped_and_an_overrun_is_unverified(monkeypatch):
     seen = {}
 
     def fake_schedule(specs, target, *, workers, timeout_of, on_done=None):
@@ -104,25 +111,23 @@ def test_the_tail_is_capped_and_an_overrun_keeps_the_classification(monkeypatch)
         seen["caps"] = [timeout_of(s) for s in specs]
         return [
             {"key": "slow", "status": "timeout"},
-            {"key": "fast", "status": "rr_time_event_unverified", "n_compared": 3},
+            {"key": "fast", "status": "rr_time_event", "n_compared": 3, "bn_tracks_own_ode": True},
         ]
 
     monkeypatch.setattr(S.rc, "schedule", fake_schedule)
     cases = [_case("slow"), _case("fast")]
-    args = argparse.Namespace(
-        n=8, seed_base=1, min_mean_count=1.0, self_z_tol=4.0, revalidate_timeout=120.0
-    )
-    S._revalidate_time_events(cases, [_spec("slow"), _spec("fast")], args)
+    S._revalidate_time_events(cases, [_spec("slow"), _spec("fast")], _tail_args())
     assert seen == {"workers": 1, "caps": [120.0, 120.0]}  # serial, each capped
     slow, fast = cases
-    assert slow["status"] == "rr_time_event" and slow["revalidation"] == "timeout"
-    assert fast["status"] == "rr_time_event_unverified" and fast["n_compared"] == 3
+    # An overrun validated nothing: bngsim is neither confirmed nor faulted.
+    assert slow["status"] == "rr_time_event_unverified" and slow["revalidation"] == "timeout"
+    assert fast["status"] == "rr_time_event" and fast["n_compared"] == 3
 
 
-def test_a_child_that_dies_or_errors_is_recorded_on_the_row(monkeypatch):
-    """A re-validation that died (a segfault in the child) or reported an error
-    kept the worker's classification with nothing on the row to say the tail
-    never validated it; the cap overrun was the only case recorded."""
+def test_a_child_that_dies_or_raises_is_a_bngsim_error(monkeypatch):
+    """A re-validation whose child died (a segfault in bngsim) or raised kept
+    the worker's ``rr_time_event``, which reads as validated and green. Both are
+    bngsim errors, reported as the worker reports a bngsim raise."""
 
     def fake_schedule(specs, target, *, workers, timeout_of, on_done=None):
         return [
@@ -132,14 +137,61 @@ def test_a_child_that_dies_or_errors_is_recorded_on_the_row(monkeypatch):
 
     monkeypatch.setattr(S.rc, "schedule", fake_schedule)
     cases = [_case("died"), _case("raised")]
-    args = argparse.Namespace(
-        n=8, seed_base=1, min_mean_count=1.0, self_z_tol=4.0, revalidate_timeout=120.0
-    )
-    S._revalidate_time_events(cases, [_spec("died"), _spec("raised")], args)
+    S._revalidate_time_events(cases, [_spec("died"), _spec("raised")], _tail_args())
     died, raised = cases
-    assert died["status"] == "rr_time_event" and died["revalidation"] == "dead"
-    assert raised["status"] == "rr_time_event"
-    assert raised["revalidation"] == "error: RuntimeError: no signal"
+    assert died["status"] == "error" and died["revalidation"] == "dead"
+    assert died["error"] == "bngsim: the time-event re-validation died (exit -11)"
+    assert raised["status"] == "error" and raised["revalidation"] == "error"
+    assert raised["error"] == "bngsim: RuntimeError: no signal"
+    assert SA.case_to_job_result(died).outcome == "EXCEPTION"
+    assert SA.case_to_job_result(raised).outcome == "EXCEPTION"
+
+
+def test_a_tail_that_gave_no_verdict_never_reads_as_validated(monkeypatch):
+    """The baseline from the PR's own run has seven rr_time_event rows that read
+    "tracks its own ODE on all 0 above-floor cells (validated)": nothing was
+    compared on them. The comment says validated only where the re-validation
+    ran and bngsim tracked its ODE."""
+    validated = {**_case("ok"), "n_compared": 5, "bn_tracks_own_ode": True}
+    assert "(validated)" in SA.case_to_job_result(validated).comment
+    # A row the tail never reached (the worker's tag, untouched).
+    untouched = _case("none")
+    c = SA.case_to_job_result(untouched).comment
+    assert "(validated)" not in c and "gave no verdict" in c
+    # A row the cap stopped.
+    timed_out = {**_case("slow"), "status": "rr_time_event_unverified", "revalidation": "timeout"}
+    r = SA.case_to_job_result(timed_out)
+    assert r.outcome == "DIFF" and r.subclass == "rr_time_event_unverified"
+    assert "(validated)" not in r.comment and "(timeout)" in r.comment
+
+
+def test_bngsim_timing_out_while_growing_the_horizon_is_unverified(monkeypatch):
+    """Inside the verdict itself, a bngsim timeout while the horizon grew for
+    signal returned ``rr_time_event`` with nothing compared: validated on 0 cells."""
+    import bngsim
+
+    def no_ensemble(*a, **kw):
+        raise bngsim.SimulationTimeout("too slow")
+
+    monkeypatch.setattr(S.rc, "bn_ssa_replicates", no_ensemble)
+    out = S._time_event_verdict(
+        xml="unused.xml",
+        t_end=10.0,
+        n_steps=10,
+        n=8,
+        seed_base=1,
+        min_mean_count=1.0,
+        self_z_tol=4.0,
+        rep_timeout=2.0,
+    )
+    assert out["status"] == "rr_time_event_unverified" and out["n_compared"] == 0
+    assert out["bn_tracks_own_ode"] is None and "timed out" in out["revalidation"]
+    # The tail carries the reason onto the row.
+    monkeypatch.setattr(S.rc, "schedule", lambda specs, target, **kw: [{"key": "m", **out}])
+    cases = [_case("m")]
+    S._revalidate_time_events(cases, [_spec("m")], _tail_args())
+    assert cases[0]["status"] == "rr_time_event_unverified"
+    assert "timed out" in SA.case_to_job_result(cases[0]).comment
 
 
 @pytest.mark.parametrize("flag", ["--present-only", "--revalidate-timeout"])

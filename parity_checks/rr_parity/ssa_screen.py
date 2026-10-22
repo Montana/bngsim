@@ -134,12 +134,17 @@ SUITE_SSA = Path(
     os.environ.get("SUITE_SSA_JSON", BNGSIM_DIR / "benchmarks" / "_dev" / "suite_ssa.json")
 )
 BIOMODELS_MANIFEST = Path(os.environ.get("SSA_CANDIDATES_JSON", HERE / "ssa_candidates.json"))
-# Where a BioModels candidate's SBML is read from (issue #806), first match:
+# Where a BioModels candidate's SBML is read from (issue #806). ONE source for
+# the whole run, chosen once at import:
 #   1. $BIOMODELS_SBML_DIR/<name>.xml, when the variable is set;
-#   2. the flat directory this screen was first run from, when it exists;
-#   3. the rr_parity materialization (models/<id>/..., the path ode_jobs.json
-#      gives), which the nightly restores from the corpus job's cache. 269 of the
-#      306 candidates are there; the other 37 have no pinned provenance.
+#   2. else the flat directory this screen was first run from, when it exists;
+#   3. else the rr_parity materialization (models/<id>/..., the path
+#      ode_jobs.json gives), which the nightly restores from the corpus job's
+#      cache. 269 of the 306 candidates are there; the other 37 have no pinned
+#      provenance.
+# A candidate missing from the chosen source is reported absent (--present-only
+# drops it) and is never looked up in another source, so one run never mixes
+# SBML of two provenances.
 _BIOMODELS_SBML_ENV = os.environ.get("BIOMODELS_SBML_DIR")
 LEGACY_BIOMODELS_SBML_DIR = Path(
     os.path.expanduser("~/Code/ssys/biomodels_batch/data/sbml_downloads")
@@ -164,7 +169,9 @@ def _materialized_sbml() -> dict[str, Path]:
 
 
 def biomodels_sbml_path(name: str, materialized: dict[str, Path] | None = None) -> Path:
-    """Where candidate ``name``'s SBML is read from; see BIOMODELS_SBML_DIR."""
+    """Where candidate ``name``'s SBML is read from: the run's one source, see
+    BIOMODELS_SBML_DIR. ``materialized`` is consulted only when no directory was
+    chosen for the run."""
     if BIOMODELS_SBML_DIR is not None:
         return BIOMODELS_SBML_DIR / f"{name}.xml"
     found = (materialized if materialized is not None else _materialized_sbml()).get(name)
@@ -970,11 +977,14 @@ def _time_event_verdict(
             )
         except bngsim.SimulationTimeout:
             # bngsim itself grew intractable while hunting for signal — stop.
+            # Nothing was compared, so this is not a validation: bngsim is
+            # neither confirmed nor faulted (``rr_time_event`` reads as validated).
             return {
-                "status": "rr_time_event",
+                "status": "rr_time_event_unverified",
                 "n_compared": 0,
                 "extended_horizon": round(h, 6),
                 "bn_tracks_own_ode": None,
+                "revalidation": "bngsim timed out while growing the horizon for signal",
                 "timing": {"bngsim": last_timing} if last_timing else {},
             }
         last_timing = btiming
@@ -1039,9 +1049,13 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     propensity-codegen compile complete (under parallel contention they overrun a
     per-rep cap and falsely report no signal). Mutates each case in place: fills
     ``bn_tracks_own_ode`` / ``n_compared`` / ``extended_horizon`` and sets the status
-    to ``rr_time_event`` (bngsim validated against its own ODE) or
-    ``rr_time_event_unverified`` (mean-vs-ODE gap from nonlinearity/heavy tails, or
-    no signal — explicitly NOT a bngsim defect). GH #190."""
+    to ``rr_time_event`` (bngsim validated against its own ODE),
+    ``rr_time_event_unverified`` (mean-vs-ODE gap from nonlinearity/heavy tails, no
+    signal, or a re-validation that did not finish under the cap — explicitly NOT a
+    bngsim defect; ``revalidation`` says why when it did not finish) or ``error``
+    (the child died or bngsim raised on the model: a bngsim defect, as the worker
+    reports one). A row is never left reading as validated when nothing was
+    compared. GH #190, #806."""
     spec_by_name = {s["name"]: s for s in specs}
     todo = [
         c
@@ -1060,8 +1074,8 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     # One at a time, as before, and each in a child under a wall cap (issue #806):
     # the tail used to have none, so one model whose ensemble kept growing could
     # hold the run past a job's time limit (30 s per replicate x replicates x up
-    # to EXTENDED_MAX_MULTIPLE horizons). On overrun the worker's classification
-    # stands and the row says the re-validation timed out.
+    # to EXTENDED_MAX_MULTIPLE horizons). On overrun the row becomes
+    # ``rr_time_event_unverified`` and says the re-validation timed out.
     rspecs = []
     for c in todo:
         spec = spec_by_name.get(c["name"])
@@ -1094,19 +1108,39 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     )
     for rs, tev in zip(rspecs, results, strict=True):
         c = by_name[rs["key"]]
-        # The worker's classification stands wherever the re-validation gave no
-        # verdict; the row says why (a cap overrun, a child that died, an error
-        # the child reported), so a tail that never validates is not silent.
-        if tev.get("status") in ("timeout", "dead"):
-            c["revalidation"] = tev["status"]
+        st = tev.get("status")
+        # A re-validation that gave no verdict validated nothing, so the row must
+        # not keep the worker's ``rr_time_event`` (it renders as "tracks its own
+        # ODE ... (validated)", green). A child that died is a bngsim crash on the
+        # model: ``error`` (EXCEPTION) naming the exit code, as the worker reports
+        # a bngsim raise; so is an exception the child reported, under the
+        # worker's own ``bngsim:`` prefix so it classifies the same way. A cap
+        # overrun leaves bngsim neither confirmed nor faulted:
+        # ``rr_time_event_unverified``, with the reason on the row.
+        if st == "dead":
+            c["status"] = "error"
+            c["error"] = f"bngsim: the time-event re-validation died (exit {tev.get('exitcode')})"
+            c["revalidation"] = "dead"
+            continue
+        if st == "timeout":
+            c["status"] = "rr_time_event_unverified"
+            c["revalidation"] = "timeout"
             continue
         if "error" in tev:
-            c["revalidation"] = f"error: {tev['error']}"[:300]
+            c["status"] = "error"
+            c["error"] = f"bngsim: {tev['error']}"[:300]
+            c["revalidation"] = "error"
             continue
-        if tev.get("status") not in ("rr_time_event", "rr_time_event_unverified"):
+        if st not in ("rr_time_event", "rr_time_event_unverified"):
             continue  # keep the worker's rr_time_event / no-signal classification
-        c["status"] = tev["status"]
-        for k in ("n_compared", "bn_tracks_own_ode", "extended_horizon", "bngsim_ode_worst"):
+        c["status"] = st
+        for k in (
+            "n_compared",
+            "bn_tracks_own_ode",
+            "extended_horizon",
+            "bngsim_ode_worst",
+            "revalidation",
+        ):
             if k in tev:
                 c[k] = tev[k]
 

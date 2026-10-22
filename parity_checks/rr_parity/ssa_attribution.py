@@ -207,10 +207,19 @@ def _comment(case: dict, status: str) -> str:
     elif status in ("rr_time_event", "rr_time_event_unverified"):
         h = case.get("extended_horizon")
         n_cmp = int(case.get("n_compared", 0) or 0)
-        if status == "rr_time_event":
+        reval = case.get("revalidation")
+        # "validated" only where the re-validation ran and bngsim tracked its ODE:
+        # a row whose re-validation never finished (or never ran) compared nothing.
+        if status == "rr_time_event" and case.get("bn_tracks_own_ode") is True:
             hs = f" over t=0→{h:g}" if isinstance(h, (int, float)) else ""
             body = (
                 f"bngsim SSA tracks its own ODE on all {n_cmp} above-floor cells{hs} (validated)"
+            )
+        elif reval or status == "rr_time_event":
+            why = f" ({reval})" if reval else ""
+            body = (
+                f"the bngsim-vs-own-ODE re-validation gave no verdict{why}, so bngsim is "
+                "neither confirmed nor faulted here"
             )
         elif n_cmp == 0:
             body = "bngsim was quiet at every tried horizon, so it could not be validated either"
