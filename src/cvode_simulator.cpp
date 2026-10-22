@@ -8485,7 +8485,7 @@ static constexpr double kStateSwitchTauAgreeTol = 1e-4;
 // logged "Illegal value for t" (issue #1064). Against any finite residual,
 // up to DBL_MAX (2^1024), 2^-49 keeps that ratio at 2^-1073, twice the
 // smallest subnormal.
-static const double kStateSwitchZeroHold = std::ldexp(1.0, -49);
+static constexpr double kStateSwitchZeroHold = 0x1p-49;
 
 // How many bands the restart test asks a crossing to clear: 10 sqrt(N), because
 // the WRMS error test lets a single component carry sqrt(N) of the tolerance.

@@ -1278,7 +1278,9 @@ def _scaled_slide(tmp_path, H, cond, hold):
         print("RUN", r.solver_stats["n_steps"], float(r.species[-1][0]).hex())
     """)
     env = dict(os.environ)
-    if hold is not None:
+    if hold is None:  # the default, whatever the caller's shell sets
+        env.pop("BNGSIM_STATE_SWITCH_HOLD", None)
+    else:
         env["BNGSIM_STATE_SWITCH_HOLD"] = hold
     done = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
