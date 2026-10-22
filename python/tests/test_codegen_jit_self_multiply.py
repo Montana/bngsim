@@ -3,8 +3,8 @@
 ``x = x * x`` reaches MIR's register allocator as the three-operand
 ``dmul r, r, r``. When ``r`` is spilled, ``try_spilled_reg_mem`` (mir-gen.c)
 rewrites every operand naming it into a memory operand and records the rewritten
-indices in ``int op_nums[MAX_INSN_RELOAD_MEM_OPS]`` — a **two**-element array,
-bounded upstream by ``gen_assert`` alone. ``gen_assert`` is ``assert``, so
+indices in ``int op_nums[MAX_INSN_RELOAD_MEM_OPS]`` — upstream, a **two**-element
+array bounded by ``gen_assert`` alone. ``gen_assert`` is ``assert``, so
 ``-DNDEBUG`` — every release build, including bngsim's — deletes it, and the
 third match stores past the end of the array. glibc's stack protector catches
 that as ``*** stack smashing detected ***`` and raises SIGABRT, which no
@@ -13,10 +13,11 @@ leaves that frame unguarded corrupts it silently instead. **The platforms that
 passed were never evidence of safety** — macOS and Windows simply lay the frame
 out differently.
 
-The fix is a bounds check carried locally in ``third_party/mir/mir-gen.c``; it
-declines the memory operand once the table is full, which is the same fallback
-the function already takes when ``target_insn_ok_p`` rejects the rewrite. See
-``VENDOR.json`` → ``local_carries`` and ``test_mir_vendoring.py``.
+The fix is a bounds check in ``third_party/mir/mir-gen.c``; it declines the
+memory operand once the table is full, which is the same fallback the function
+already takes when ``target_insn_ok_p`` rejects the rewrite. BNGsim carried it
+locally until upstream merged it as vnmakarov/mir#468; see
+``test_mir_vendoring.py`` and MIR_VENDORING.md, "Past carries".
 
 Two things this file is careful about, both learned from the investigation:
 

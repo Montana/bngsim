@@ -62,7 +62,7 @@ from bngsim._exceptions import (
     StopConditionMet,
 )
 from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
-from bngsim._model import Model
+from bngsim._model import _STEP_DECIDES_WHY, Model
 from bngsim._result import Result, _as_selector_list, _resolve_output_selector
 from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
 from bngsim._ssa_validation import validate_for_ssa
@@ -1346,15 +1346,7 @@ class Simulator:
             # codegen built the model but declined that RHS (a dilution term that
             # reads a rate, issue #1124 item 7), the run failed with "no codegen
             # .so is loaded", which a codegen=True does nothing for.
-            if self._sensitivity_ic and not self._codegen_provides_sens_rhs():
-                reason = self.sens_rhs_decline_reason
-                raise SensitivityUnsupportedError(
-                    "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
-                    "difference quotient has no parameter to perturb for an initial "
-                    "value. Codegen built this model but declined that RHS"
-                    + (f" ({str(reason).rstrip('.')})" if reason else "")
-                    + ", so the initial-value columns cannot be computed for this model."
-                )
+            self._refuse_sensitivity_ic_without_sens_rhs()
 
         # Validate and store sensitivity method
         if sensitivity_method not in ("staggered", "simultaneous"):
@@ -3402,6 +3394,23 @@ class Simulator:
             pass
         return unrooted
 
+    def _refuse_sensitivity_ic_without_sens_rhs(self) -> None:
+        """Refuse ``sensitivity_ic`` where the attached codegen has no analytic
+        sensitivity RHS (issue #1124, item 7). Asked at construction, and again
+        after :meth:`_build_codegen_again`, since a rebuild (issue #708) can
+        decline what the first build had; otherwise the run reached the C++
+        backstop with a message about the artifact, not the model."""
+        if not self._sensitivity_ic or self._codegen_provides_sens_rhs():
+            return
+        reason = self.sens_rhs_decline_reason
+        raise SensitivityUnsupportedError(
+            "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
+            "difference quotient has no parameter to perturb for an initial "
+            "value. Codegen built this model but declined that RHS"
+            + (f" ({str(reason).rstrip('.')})" if reason else "")
+            + ", so the initial-value columns cannot be computed for this model."
+        )
+
     def _build_codegen_again(self) -> None:
         """Drop the artifact and build one for the model as it is."""
         model = self._model
@@ -3427,6 +3436,8 @@ class Simulator:
             # Back on the analytic right-hand side: nothing to watch for.
             self._codegen_watch_gate = False
             self._codegen_built_for(model)
+        # The rebuilt artifact may have declined what the first build had.
+        self._refuse_sensitivity_ic_without_sens_rhs()
 
     def _expression_sens_support(self) -> dict[str, str | None]:
         """Memoized ``{function_name: unsupported_reason_or_None}`` for GH #198
@@ -7378,12 +7389,22 @@ class Simulator:
               the root is within every species' own tolerance,
               ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
               rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration; where
-              every species starts at 0, the largest species of the state or
-              of the root it steps to). Units do not change the answer. A
-              state where the reduced Jacobian is singular is not accepted
-              unless ``f`` is 0 there. Above 512 unknowns the step is not
-              taken and the solve is the residual one. Where neither ``atol``
+              floor is the smallest positive initial concentration of a
+              species that is not ``$``-fixed; where none starts above 0, the
+              largest species of the state or of the root it steps to). Units
+              do not change the answer. A state where the reduced Jacobian is
+              singular is not accepted unless ``f`` is 0 there, nor one where
+              a differenced Jacobian straddles a jump in a rate law. ``mask``
+              says which species are measured, not which move: the step moves
+              every species by its own equation but a ``$``-fixed one and a
+              masked one that nothing reads or that reads nothing (a counter),
+              which is held. A species that
+              starts at 0 is held to ``rtol`` times the floor, so one whose
+              steady state is smaller than that is within tolerance of 0, as
+              under ``atol="auto"``. Above
+              512 unknowns the step is not taken, the solve is the residual
+              one, and :attr:`SteadyStateResult.criterion` says
+              ``"residual"``. Where neither ``atol``
               nor :meth:`set_tolerances` gives one, the march takes
               ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
               small units.
@@ -7823,13 +7844,9 @@ class Simulator:
             "result.sensitivities at the last time point"
         )
         why = (
-            "A species far below the state's scale is stepped by many times itself at "
-            "the first, which reads a term of second order in it as a secant across it, "
-            "and the second misses a term that reads it through a sum with something "
-            "much larger (a total minus what is bound): which of the two is right is not "
-            'known. A closed-form Jacobian has neither failure; jacobian="auto" uses it '
-            'where the model has one, which jacobian="fd" does not. Otherwise take the '
-            f"columns from {time_course}."
+            f"{_STEP_DECIDES_WHY} A closed-form Jacobian has neither failure; "
+            'jacobian="auto" uses it where the model has one, which jacobian="fd" does '
+            f"not. Otherwise take the columns from {time_course}."
         )
         stepped = ", ".join(result.sens_fd_own_step_species[:5])
         if len(result.sens_fd_own_step_species) > 5:
@@ -8784,7 +8801,9 @@ class Simulator:
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
             may be a per-species vector or ``"auto"`` (issue #196), resolved
-            once and applied identically to every entry.
+            once and applied identically to every entry. The ``"auto"``
+            ``criterion="scaled"`` takes when no ``atol`` is given is each
+            entry's own, from its starting state.
         n_workers : int, optional
             Number of parallel threads.
         mask : array-like of bool, or sequence of str, optional
@@ -8848,9 +8867,13 @@ class Simulator:
 
         eff_rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — resolved once, applied to every entry (see
-        # run_batch).
+        # run_batch). Issue #1001: except the "auto" that criterion="scaled"
+        # takes when no atol is given, which is each entry's own. Taken from
+        # this model, an entry whose parameters put it at 1e-9 of this one
+        # marched at this one's tolerance and ran through zero (x = -3.7).
+        own_auto = self._steady_state_atol(atol, criterion) is not atol
         eff_atol_spec = self._resolve_atol(
-            self._steady_state_atol(atol, criterion),
+            None if own_auto else atol,
             eff_rtol,
             where="steady_state_batch(atol=...)",
         )
@@ -8878,7 +8901,11 @@ class Simulator:
             opts.method = method
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
-            eff_atol_spec.apply_to(opts)
+            if own_auto:
+                own = [float(v) for v in derive_atol(clone.get_state(), eff_rtol)]
+                _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
+            else:
+                eff_atol_spec.apply_to(opts)
             opts.max_steps = eff_max_steps
             # Read (and, below, set) the same memo `steady_state()` keeps, so a
             # sweep over a model whose closed-form Jacobian CVODE cannot use pays
@@ -10471,7 +10498,9 @@ class SteadyStateResult:
         does not take the step, and above 512 unknowns; ``inf`` where the
         Jacobian is singular at a state that is not a root.
     criterion : str
-        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``.
+        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``:
+        ``"residual"`` for a ``"scaled"`` request above 512 unknowns, which
+        that test falls back to.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool
@@ -11122,8 +11151,15 @@ class SteadyStateResult:
         if not meta:
             return np.empty((0, n_params), dtype=np.float64)
         rows = [self._output_sensitivity_row(m) for m in meta]
-        for m, row in zip(meta, rows, strict=True):
-            self._raise_if_masked_out(m, row)
+        # Every selector without a derivative is named at once, so a caller
+        # fixes its selection in one pass rather than one refusal at a time.
+        reasons = [
+            reason
+            for m, row in zip(meta, rows, strict=True)
+            if (reason := self._no_derivative_reason(m, row)) is not None
+        ]
+        if reasons:
+            raise ValueError("\n".join(reasons))
         return np.stack(rows, axis=0)
 
     def _caller_masked_species(self) -> list[str]:
@@ -11132,8 +11168,9 @@ class SteadyStateResult:
         targets = set(self._rule_target_species)
         return [self._species_names[i] for i in self.excluded_species if i not in targets]
 
-    def _raise_if_masked_out(self, meta: dict[str, Any], row: np.ndarray) -> None:
-        """Refuse, by name, an output whose row is not finite (issue #1124, item 10).
+    def _no_derivative_reason(self, meta: dict[str, Any], row: np.ndarray) -> str | None:
+        """Why an output's row is not finite, by name, or None where it is (issue
+        #1124, item 10). :meth:`output_sensitivities` refuses with every reason.
 
         A species ``mask=`` left out of the solve has no steady value, so neither
         has anything that reads it, and its row is NaN by construction (issue
@@ -11146,16 +11183,15 @@ class SteadyStateResult:
         :attr:`sensitivity` tensor and the two blocks keep their NaN rows.
         """
         if np.all(np.isfinite(row)):
-            return
+            return None
         kind = meta["kind"]
         values = self._expression_values if kind == "expression" else self._observable_values
         if kind != "species" and meta["index"] < values.size:
             value = float(values[meta["index"]])
             if not np.isfinite(value):
-                # Every partial of a non-finite value is NaN, so the solve's
-                # record names the first row-less species whether it is read or
-                # not: the value is the reason, not the mask.
-                raise ValueError(
+                # A non-finite value has no derivative, whatever it reads: the
+                # value is the reason, not the mask.
+                return (
                     f"output_sensitivities: {meta['selector']!r} has no steady-state "
                     f"derivative: its value at the steady state is {value}, which is "
                     "not finite."
@@ -11173,7 +11209,7 @@ class SteadyStateResult:
             # species the mask left out is named.
             named = masked
         if not named:
-            raise ValueError(
+            return (
                 f"output_sensitivities: {meta['selector']!r} has no finite "
                 "steady-state derivative: its row is not finite, and it reads no "
                 "species mask= left out of the solve."
@@ -11184,7 +11220,7 @@ class SteadyStateResult:
             reads = f"reads {named[0]}, which"
         else:
             reads = f"reads one or more of {', '.join(named)}, which"
-        raise ValueError(
+        return (
             f"output_sensitivities: {meta['selector']!r} has no steady-state "
             f"derivative: it {reads} mask= left out of the solve, so it has no "
             "steady value (issue #74). Select outputs that do not read it, or keep "

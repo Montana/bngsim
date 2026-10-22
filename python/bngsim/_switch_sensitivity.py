@@ -97,6 +97,62 @@ _TIME_SYMBOLS = frozenset({"time", "time()"})
 _CLOCK_SLOPE = 1.0
 
 
+_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
+
+
+def _fully_parenthesised(expr: str) -> bool:
+    """Whether the opening ``(`` of *expr* is closed by its last character."""
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return False
+    return _find_close_paren_strict(expr, 0) == len(expr) - 1
+
+
+def _is_name_or_call(text: str) -> bool:
+    """A lone name or number, or a name applied to one parenthesised group."""
+    if _ATOMIC_TOKEN.fullmatch(text):
+        return True
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    if m is None:
+        return False
+    return _fully_parenthesised(text[m.end() :])
+
+
+def _condition_key(cond: str) -> str:
+    """The text of a condition with the parentheses the SBML loader's
+    ``_atomic`` adds around a call dropped, and those around a lone name or
+    number, so that one crossing reached two ways has one key (issue #1082).
+
+    A function-definition formal bound to ``time()`` is spliced into the body
+    as ``(time())``, so ``near(time, 2.5, 0.005)`` with ``near := abs(x - c) <
+    w`` and ``abs(time - 2.5) < 0.005`` written directly gave two spellings of
+    each edge, and two roots. A group that is a call's own argument list is
+    left alone, and so is any group with an operator in it. Lives here, beside
+    :func:`_strip_redundant_parens`, so the loader that registers conditions
+    and the recovery in ``Model.time_discontinuity_conditions`` compare on one
+    form without the loader (and libsbml) being imported for it.
+    """
+    prev = None
+    while prev != cond:
+        prev = cond
+        out: list[str] = []
+        i = 0
+        n = len(cond)
+        while i < n:
+            ch = cond[i]
+            # An opening parenthesis that is not a call's own (no name before it).
+            if ch == "(" and not (out and (out[-1][-1:].isalnum() or out[-1][-1:] == "_")):
+                close = _find_close_paren_strict(cond, i)
+                inner = cond[i + 1 : close] if close >= 0 else ""
+                if close >= 0 and _is_name_or_call(inner):
+                    out.append(inner)
+                    i = close + 1
+                    continue
+            out.append(ch)
+            i += 1
+        cond = "".join(out)
+    return cond
+
+
 def _strip_redundant_parens(s: str) -> str:
     """Drop fully-enclosing parentheses: ``((a+b))`` → ``a+b``."""
     s = s.strip()

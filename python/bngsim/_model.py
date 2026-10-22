@@ -932,6 +932,7 @@ class Model:
             if derived is None:
                 try:
                     from bngsim._switch_sensitivity import (
+                        _condition_key,
                         _monotone_pieces,
                         _strip_redundant_parens,
                         time_discontinuity_conditions,
@@ -941,15 +942,10 @@ class Model:
                         # A condition reached through a function definition is
                         # spelled `(time())` where the same one written directly
                         # reads `time()`, and the loader registers one spelling
-                        # for both (issue #1082); compared on its key, so the
-                        # one registered covers the other, which the recovery
-                        # otherwise added again as a stop. Only an SBML model
-                        # registers, and only its loader needs libsbml.
-                        if self._time_disc_conditions:
-                            from bngsim._sbml_loader import _condition_key
-
-                            c = _condition_key(c)
-                        return _strip_redundant_parens(c).replace(" ", "")
+                        # for both (issue #1082); compared on the same key, so
+                        # the one registered covers the other, which the
+                        # recovery otherwise added again as a stop.
+                        return _strip_redundant_parens(_condition_key(c)).replace(" ", "")
 
                     registered = {spelled(c) for c in self._time_disc_conditions}
                     # The loader registers a turning comparison as its two
@@ -2525,11 +2521,8 @@ class Model:
             f"Model.jacobian(): the entry d(rate of {names[i]})/d{names[j]} of this "
             f"difference quotient is {dense[i, j]:.6g} with {names[j]} stepped by 1.5e-8 of "
             f"the state's largest concentration, and {own[i, j]:.6g} stepped by 1.5e-8 of "
-            "itself, more than 1e-4 of its column's largest entry apart (issue #1002). A "
-            "species far below the state's scale is stepped by many times itself at the "
-            "first, which reads a term of second order in it as a secant across it, and the "
-            "second misses a term that reads it through a sum with something much larger: "
-            "which of the two is right is not known. The first is returned. "
+            "itself, more than 1e-4 of its column's largest entry apart (issue #1002). "
+            f"{_STEP_DECIDES_WHY} The first is returned. "
             "steady_state(sensitivity_params=...) refuses columns solved with such a matrix.",
             UserWarning,
             stacklevel=3,
@@ -2932,6 +2925,15 @@ class Model:
             f"observables={self.n_observables}, parameters={self.n_parameters})"
         )
 
+
+# Why a difference quotient's step can decide its answer (issue #1002), said
+# once for the Model.jacobian() warning and the steady-state refusal alike.
+_STEP_DECIDES_WHY = (
+    "A species far below the state's scale is stepped by many times itself at the "
+    "first, which reads a term of second order in it as a secant across it, and the "
+    "second misses a term that reads it through a sum with something much larger "
+    "(a total minus what is bound): which of the two is right is not known."
+)
 
 # How many recoveries a model and its clones keep in each of the issue #726
 # memos. Each is one parameter-dependent verdict and a model has few, so a full

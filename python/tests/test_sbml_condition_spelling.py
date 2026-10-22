@@ -19,7 +19,7 @@ import pytest
 
 libsbml = pytest.importorskip("libsbml")
 import bngsim  # noqa: E402
-from bngsim._sbml_loader import _condition_key  # noqa: E402
+from bngsim._switch_sensitivity import _condition_key  # noqa: E402
 
 NEAR = [("near", "lambda(x, c, w, abs(x - c) < w)")]
 PEAK = [("peak", "lambda(s, sin(s) >= 1)")]
@@ -207,3 +207,47 @@ def test_different_conditions_keep_different_keys(a, b):
 def test_a_group_with_an_operator_keeps_its_parentheses():
     """``(a+b)*c`` and ``a+b*c`` are not one condition."""
     assert _condition_key("((a+b))*c<1") == "((a+b))*c<1"
+
+
+def _two_equalities(tmp_path, through_function):
+    doc = libsbml.SBMLDocument(3, 1)
+    m = doc.createModel()
+    c = m.createCompartment()
+    c.setId("C")
+    c.setSize(1)
+    c.setConstant(True)
+    sp = m.createSpecies()
+    sp.setId("Y")
+    sp.setCompartment("C")
+    sp.setInitialConcentration(0)
+    sp.setHasOnlySubstanceUnits(False)
+    sp.setBoundaryCondition(False)
+    sp.setConstant(False)
+    f = m.createFunctionDefinition()
+    f.setId("at2")
+    f.setMath(libsbml.parseL3Formula("lambda(x, x == 2)"))
+    triggers = ["time == 2", "at2(time)" if through_function else "time == 2"]
+    for i, trigger in enumerate(triggers):
+        e = m.createEvent()
+        e.setId(f"E{i}")
+        e.setUseValuesFromTriggerTime(True)
+        t = e.createTrigger()
+        t.setMath(libsbml.parseL3Formula(trigger))
+        t.setInitialValue(False)
+        t.setPersistent(True)
+        a = e.createEventAssignment()
+        a.setVariable("Y")
+        a.setMath(libsbml.parseL3Formula("Y + 1"))
+    path = tmp_path / f"eq{int(through_function)}.xml"
+    path.write_text(libsbml.writeSBMLToString(doc))
+    return bngsim.Model.from_sbml(str(path))
+
+
+def test_an_equality_reached_through_a_function_definition_is_one_stop(tmp_path):
+    """A trigger equality is a stop, not a root. `at2(time)` with `at2 := x == 2`
+    beside `time == 2` written directly gave two spellings of one stop; they
+    are keyed as the roots are (#1106's review)."""
+    direct = _two_equalities(tmp_path, through_function=False)
+    through = _two_equalities(tmp_path, through_function=True)
+    assert len(through._time_disc_conditions) == len(direct._time_disc_conditions)
+    assert len(through._event_disc_conditions) == len(direct._event_disc_conditions)

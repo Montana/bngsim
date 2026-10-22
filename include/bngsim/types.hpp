@@ -1180,10 +1180,14 @@ struct SteadyStateOptions {
     // the state to the root, -J^-1·f(y) on the system with the conserved
     // totals taken out, is within rtol·|y_i| + atol_i of every species, with
     // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
-    // initial concentration the test covers (where every species starts at
-    // 0, the largest species of the state or of the root it steps to). No
-    // unit of concentration or of time is in it. Above 512 unknowns the step
-    // is not taken and the solve is the residual one, `tol` and all.
+    // initial concentration of a species the test steps, $-fixed ones aside
+    // (where none starts above 0, the largest species of the state or of the
+    // root it steps to). The mask says which species are measured, not which
+    // move: every species moves by its own equation but a $-fixed one and a
+    // masked one that nothing reads or that reads nothing, which is held. No
+    // unit of
+    // concentration or of time is in it. Above 512 unknowns the step is not
+    // taken and the solve is the residual one, `tol` and all.
     std::string criterion = "residual";
     // Set by find_steady_state from the initial state, for "scaled": the
     // floor (0 where nothing starts above 0), and whether the step is taken.
@@ -1321,6 +1325,7 @@ struct SteadyStateResult {
     // state that is not a root.
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
     std::string criterion;   // the criterion `converged` was decided by
+                             // ("residual" for "scaled" above 512 unknowns)
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations

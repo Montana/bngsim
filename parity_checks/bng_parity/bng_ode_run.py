@@ -367,11 +367,15 @@ def _compare_ode_multiseg(bn, rn, *, atol=None) -> tuple[str, float, str, str, f
 # ARCHIVE_FORMAT is bumped where the harness's own network rules change (the
 # state prefix, the netgen caps, an injected generate_network), since the
 # archived ``.net`` was made under the rules of the recording run.
-ARCHIVE_FORMAT = 1
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
 
 
 def _archive_file(directory: str | Path, key: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", key) + ".npz")
+    # The readable part is sanitized, so the hash keeps keys such as a/b and a_b apart.
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', key)}-{digest}.npz"
 
 
 def _sha256(text: str | None) -> str | None:

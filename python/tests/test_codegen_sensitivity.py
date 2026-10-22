@@ -287,8 +287,8 @@ class TestDerivedQuotientChainRule:
     """
 
     def test_dfdp_emits_quotient_partial(self):
-        """Generated dfdp must reference ``-5/pow(p[idx_MEK], 2)``-style
-        partial in the case branch for MEK."""
+        """Generated dfdp must reference ``-5.0/pow(p[idx_MEK], 2.0)``-style
+        partial in the case branch for MEK (integers print as doubles)."""
         net = _get_derived_quotient_net()
         code = _sens_c(net)
         assert code is not None
@@ -299,8 +299,8 @@ class TestDerivedQuotientChainRule:
         case_match = re.search(rf"    case {mek_idx}:.*?break;", code, re.DOTALL)
         assert case_match, "MEK case missing from generated dfdp switch"
         snippet = case_match.group(0)
-        assert f"pow(p[{mek_idx}], 2)" in snippet, (
-            f"chain rule -5/pow(p[{mek_idx}], 2) not emitted; got:\n{snippet}"
+        assert f"pow(p[{mek_idx}], 2.0)" in snippet, (
+            f"chain rule -5.0/pow(p[{mek_idx}], 2.0) not emitted; got:\n{snippet}"
         )
 
     def test_quotient_chain_rule_matches_fd(self):
