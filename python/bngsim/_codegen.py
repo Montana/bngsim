@@ -296,7 +296,11 @@ _compile_counter = itertools.count()
 # a singular power that has no comoving case (bngsim_codegen_edge_without_case),
 # and the solver refuses their columns. A cached v40 .so does not say, and such
 # a column would keep coming back plain, up to 12% off. Invalidate v40.
-_CODEGEN_VERSION = "41"
+# v42: lanl/bngsim #540 — a condition with an if() in it parses to the ITE
+# chain without sympy's set theory, so its emitted text changes (to the same
+# values), and a law that ran past the derivation budget on it now derives.
+# A cached v41 .so would keep the old text, or no derivative. Invalidate v41.
+_CODEGEN_VERSION = "42"
 
 
 # Modules whose *source* determines the emitted C. ``_codegen`` holds the

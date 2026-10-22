@@ -430,6 +430,81 @@ def _preprocess_exprtk(expr: str) -> str:
     return _coerce_booleans_used_as_numbers(s)
 
 
+_piecewise_of_if_cache: dict = {}
+
+
+def _piecewise_of_if(sp):
+    """The ``Piecewise`` an ``if()`` parses to, built without sympy's set
+    theory for a condition that has an ``if()`` in it (issue #540).
+
+    sympy will not keep a ``Piecewise`` in a condition: ``ExprCondPair`` folds
+    the condition into one and rewrites that as an ``ITE`` chain, and the
+    rewrite computes ``as_set()`` of every inner condition
+    (``solve_univariate_inequality``, ``periodicity``, ``simplify``). That was
+    about 2 s for each of 12 rate laws of ``mt_music_sequencer``, whose
+    ``if(ds1() > 0, ...)`` reads a ``ds1()`` of nested chord ``if()`` chains, and
+    the model declined on its derivation budget after 8 of 14 reactions.
+
+    The sets are only used to find a condition the ones before it leave
+    nothing past, and cut the chain there; with a final ``(b, True)``, which
+    the fold of a translated ``if()`` always has, the chain is complete
+    without them. This builds that chain (``ITE(c1, b1, ITE(c2, b2, ...))``,
+    relationals made canonical, as the rewrite returns it), so ``ExprCondPair``
+    finds no ``Piecewise`` to rewrite. A fold with no default is left to sympy.
+
+    A branch of the fold is a truth value only where the condition compared an
+    ``if()``. Where the condition is the ``if()`` itself, ``if(if(F != 1, F, 0),
+    a, b)``, its branches are numbers, which ExprTk reads as true where they are
+    nonzero. ``ITE`` would take a bare ``F`` as a Boolean atom and simplify it
+    against ``F != 1`` (``ITE(Ne(F, 1), F, False)`` became ``F``, true at F = 1
+    where ExprTk reads the inner ``if()`` as 0), and refuse any other number,
+    which sympy's rewrite only escaped where its sets cut that branch off. So
+    a branch that is not already a comparison or a logical form of them is
+    written as ExprTk reads it, ``Ne(value, 0)``.
+    """
+    built = _piecewise_of_if_cache.get("built")
+    if built is not None:
+        return built
+    from sympy.core.relational import Relational
+    from sympy.functions.elementary.piecewise import piecewise_fold
+    from sympy.logic.boolalg import ITE, BooleanAtom, BooleanFunction
+
+    def _truth(value):
+        if isinstance(value, (BooleanAtom, Relational, BooleanFunction)):
+            return value
+        return sp.Ne(value, 0)
+
+    def _canonical(cond):
+        # sympy.core.relational._canonical, spelled out: that name is private,
+        # and this runs from _build_local_dict, outside _exprtk_to_sympy's try,
+        # so a sympy that renamed it would fail the load instead of declining.
+        return cond.xreplace({r: r.canonical for r in cond.atoms(Relational)})
+
+    def _without_piecewise(cond):
+        folded = piecewise_fold(cond)
+        if not isinstance(folded, sp.Piecewise):
+            return folded
+        pairs = list(folded.args)
+        if pairs[-1].cond != sp.true:
+            return cond
+        last = _truth(pairs[-1].expr)
+        for branch, c in reversed(pairs[:-1]):
+            last = ITE(c, _truth(branch), last)
+        return _canonical(last)
+
+    def piecewise(*pairs, **options):
+        fixed = []
+        for pair in pairs:
+            expr, cond = pair
+            if isinstance(cond, sp.Basic) and cond.has(sp.Piecewise):
+                cond = _without_piecewise(cond)
+            fixed.append((expr, cond))
+        return sp.Piecewise(*fixed, **options)
+
+    _piecewise_of_if_cache["built"] = piecewise
+    return piecewise
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -457,7 +532,7 @@ def _build_local_dict(preprocessed: str, sp):
         # model may name a parameter after one, so there is nothing to lose a
         # tie with.
         **engine_sympy_bindings(sp),
-        "Piecewise": sp.Piecewise,
+        "Piecewise": _piecewise_of_if(sp),
         "Not": sp.Not,
         "And": sp.And,
         "Or": sp.Or,
