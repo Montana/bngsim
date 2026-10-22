@@ -180,15 +180,20 @@ _U = "(time - floor(time))"
     "event, t_end",
     [
         ("at (time >= 50.5): X = 0", 100.0),
-        ("at (X >= 30): X = 0", 100.0),
-        ("at (Y >= 40): X = X + 5, Y = 0", 200.0),
+        ("at (X >= 29.5): X = 0", 100.0),
+        ("at (Y >= 39.5): X = X + 5, Y = 0", 200.0),
     ],
     ids=["at-a-time", "on-the-state", "on-another-species"],
 )
 def test_events_beside_the_stops_see_every_period(event, t_end):
     """An SBML dose train into X and Y, with an event that resets one of them.
     The oracle is the same model under `max_step=0.01`, which cannot step over
-    a period. On main X ends at 22.0 for 50.0, 12.0 for 10.0, and 78.0 for 225.0."""
+    a period. On main X ends at 22.0 for 50.0, 13.0 for 11.5, and 78.0 for 225.0.
+
+    The state thresholds are crossed inside a period. A period adds exactly 1,
+    so a threshold of 40 is reached on a period's last instant, and when the
+    event fires there (and what Y reads at t = 200) is decided by rounding:
+    the oracle itself read 1.4e-3 on macOS and 1.6e-5 on Linux."""
     text = f"model m\n X = 0; Y = 0\n J1: -> X; 9*{_U}^8\n J2: -> Y; 9*{_U}^8\n E1: {event}\nend"
 
     def run(**kw):
