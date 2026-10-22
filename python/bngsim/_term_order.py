@@ -377,7 +377,9 @@ _printers: dict = {}
 
 
 def ccode(expr) -> str:
-    """``sympy.ccode(expr)``, in this module's orders."""
+    """``sympy.ccode(expr)``, in this module's orders, with an integer printed
+    as a double literal (``2.0``) and an integer exponent that is not exactly a
+    double refused."""
     if "c99" not in _printers:
         from sympy.printing.c import C99CodePrinter
 
@@ -393,6 +395,23 @@ def ccode(expr) -> str:
 
             def _print_Or(self, expr):
                 return self._joined(expr, "or")
+
+            def _print_Integer(self, expr):
+                # A double literal, as sympy_to_c in _jacobian.py writes one.
+                # sympy's own is a bare integer literal, and one past 2^64 (the
+                # dk/dp of k = p*10^20) is a build error under cc and was read
+                # by c2mir as the 64-bit maximum, a silently wrong derivative.
+                return f"{int(expr)}.0"
+
+            def _print_Pow(self, expr):
+                # An integer exponent that is not exactly a double is rounded
+                # to one, and its parity with it: d/dp p^(10^20) at p = -1 is
+                # printed with pow(p, 1e20), +1 where (-1)^(10^20 - 1) is -1.
+                # Refuse it, so the derivative is declined, not printed wrong.
+                n = expr.exp
+                if n.is_Integer and float(int(n)) != int(n):
+                    raise ValueError(f"integer exponent {int(n)} is not exactly a double")
+                return super()._print_Pow(expr)
 
             def _joined(self, expr, operator):
                 # sympy's own shape, its arguments sorted by key.

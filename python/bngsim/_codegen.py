@@ -2976,7 +2976,8 @@ def _direct_derived_partials(
         # sp.ccode skipped: d(E^n)/dn printed as pow(E,n)*log(E) and d(E^n)/dE
         # as n*pow(E,n)/E, both NaN at E = 0, so every sensitivity run on such
         # a model was refused while the same law written inline in a Functional
-        # rate was right (issue #720). The printing itself stays sp.ccode.
+        # rate was right (issue #720). The printing itself is sp.ccode's, but
+        # for integers, which print as double literals (_term_order.ccode).
         deriv = _guard_zero_base(deriv)
         try:
             # sp.ccode, with a sum's terms in an order that does not follow the

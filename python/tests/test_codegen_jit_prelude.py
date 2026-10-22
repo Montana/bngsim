@@ -432,8 +432,50 @@ class TestTheGeneratedSourceCompiles:
         got = np.asarray(run.sensitivities)[-1, 0, 0]
         assert got == pytest.approx(exact, rel=1e-5)
 
+    @pytest.mark.parametrize(("base", "power"), [(10, 20), (6, 30)])
+    def test_an_integer_past_64_bits_in_a_derivative_is_a_double(self, tmp_path, base, power):
+        """``k = p*base^power`` with ``p = base^-power``: sympy prints dk/dp as
+        the integer base^power, which is past 2^64. Printed as a bare integer
+        literal, cc refused to build the source and c2mir read it as the 64-bit
+        maximum, so dA/dp came back 82% (10^20) or 99.99% (6^30) small with no
+        warning. k = 1, so dA/dp = -A0 t base^power exp(-t)."""
+        text = LOG_PARAMETERISED.replace("logk -0.3", f"p {float(base) ** -power!r}")
+        text = text.replace("{base}^logk", f"p*{base}^{power}")
+        model = _model(tmp_path, text)
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["p"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        exact = -2.0 * float(base) ** power * np.exp(-1.0)
+        assert np.asarray(run.sensitivities)[-1, 0, 0] == pytest.approx(exact, rel=1e-5)
 
-# The model for the test above: one first-order decay at k = base^logk.
+    def test_an_integer_exponent_that_is_not_exactly_a_double_is_refused(self):
+        """A double literal would round such an exponent, and its parity with
+        it: d/dp p^(10^20) at p = -1 printed as pow(p, 1e20) is +1 where
+        (-1)^(10^20 - 1) is -1. The printer refuses it, which declines the
+        analytic derivative, rather than print it."""
+        from bngsim import _term_order
+
+        sympy = pytest.importorskip("sympy")
+        p = sympy.Symbol("p")
+        assert _term_order.ccode(p**1000) == "pow(p, 1000.0)"
+        assert _term_order.ccode(p ** (2**53)) == f"pow(p, {2**53}.0)"
+        for n in (2**53 + 1, 10**20 - 1):
+            with pytest.raises(ValueError, match="not exactly a double"):
+                _term_order.ccode(p**n)
+
+    def test_infinity_in_an_untaken_branch_compiles(self, tmp_path):
+        """sympy prints oo as ``INFINITY``, a <math.h> macro the JIT strips;
+        ``k = if(p > 1, p, p*abs(1/0))`` puts it in the branch not taken. k = p
+        = 2, so dA/dp = -A0 t exp(-2 t)."""
+        text = LOG_PARAMETERISED.replace("logk -0.3", "p 2.0")
+        text = text.replace("{base}^logk", "if(p>1,p,p*abs(1/0))")
+        model = _model(tmp_path, text)
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["p"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        exact = -2.0 * np.exp(-2.0)
+        assert np.asarray(run.sensitivities)[-1, 0, 0] == pytest.approx(exact, rel=1e-5)
+
+
+# The model for the tests above: one first-order decay at k = base^logk.
 LOG_PARAMETERISED = """\
 begin parameters
     1 logk -0.3

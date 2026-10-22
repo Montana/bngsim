@@ -376,7 +376,7 @@ class MirJit {
     // its own (GH #470).
     //
     // Stripping the headers also strips the *types and macros* they define, and
-    // the generated source names three of those (GH #85 — a missing one is a
+    // the generated source names four of those (GH #85 — a missing one is a
     // compile failure of the whole module, not a graceful decline):
     //
     //   size_t  the (size_t) index casts in bngsim_codegen_output_sens (#198).
@@ -386,6 +386,8 @@ class MirJit {
     //   NULL    the no-observables function-block call args (both the sens RHS
     //           and #198 pass NULL for `obs` when the model has no observables).
     //   NAN     the unsupported-function sentinel in the #198 block.
+    //   INFINITY sympy's C99 printer for oo, which can land in the untaken
+    //           branch of a printed derivative (k = if(p > 1, p, p*abs(1/0))).
     //
     // c2mir bundles its own <stddef.h> (it is in every target's
     // TARGET_STD_INCLUDES; only <math.h>/<stdlib.h>/<string.h> have no bundled
@@ -396,10 +398,10 @@ class MirJit {
     // width is what GH #3 needed, and this gets it by construction rather than
     // by mirroring c2mir/x86_64/mirc_x86_64_stddef.h from the outside.
     //
-    // NULL and NAN are defined here rather than taken from that header: c2mir's
-    // stddef.h omits NULL on macOS-x86_64 and Windows, and no bundled header
-    // defines NAN at all. Both are #ifndef-guarded so a target that does define
-    // them wins.
+    // NULL, NAN and INFINITY are defined here rather than taken from that
+    // header: c2mir's stddef.h omits NULL on macOS-x86_64 and Windows, and no
+    // bundled header defines NAN or INFINITY at all. All three are
+    // #ifndef-guarded so a target that does define them wins.
     static const char *jit_prelude() {
         return "/* bngsim MIR-JIT prelude (forward-declare libc/libm; resolved via the "
                "import resolver) */\n"
@@ -409,6 +411,9 @@ class MirJit {
                "#endif\n"
                "#ifndef NAN\n"
                "#define NAN (0.0 / 0.0)\n"
+               "#endif\n"
+               "#ifndef INFINITY\n"
+               "#define INFINITY (1.0 / 0.0)\n"
                "#endif\n"
                "extern double pow(double, double);\n"
                "extern double exp(double); extern double exp2(double); extern double "
