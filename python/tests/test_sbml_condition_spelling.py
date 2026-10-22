@@ -143,6 +143,27 @@ def test_the_recovery_reads_the_registered_spelling_as_its_own(tmp_path, law, ru
     assert runs[0].solver_stats["n_steps"] == runs[1].solver_stats["n_steps"]
 
 
+@pytest.mark.parametrize("first", ["written directly", "through the function"])
+def test_two_rate_laws_on_one_crossing_list_it_once(tmp_path, first):
+    """One rate law on ``near(time, 2.5, 0.005)`` and one on ``abs(time - 2.5)
+    < 0.005``, in either order. One spelling of each edge is registered, and
+    the recovery knew it by that spelling alone: it listed the other rate
+    law's again, whole, and the run took 134 steps where both written
+    directly take 15."""
+    direct, via = DIRECT["window"], CASES["window"][0]
+    laws = (direct, via) if first == "written directly" else (via, direct)
+    both = _model(tmp_path, laws[0], "time > 100", NEAR, species_rate=laws[1])
+    listed = both.time_discontinuity_conditions()
+    reference = _model(tmp_path, direct, "time > 100", species_rate=direct)
+    assert len(listed) == len(reference.time_discontinuity_conditions())
+    runs = [
+        bngsim.Simulator(m, method="ode").run(t_span=(0, 5), n_points=11)
+        for m in (both, reference)
+    ]
+    assert runs[0].solver_stats["n_steps"] == runs[1].solver_stats["n_steps"]
+    np.testing.assert_array_equal(np.asarray(runs[0].species), np.asarray(runs[1].species))
+
+
 def test_a_state_window_is_untouched(tmp_path):
     """Control. A plain name spells the same both ways, so ``near(A, 5,
     0.01)`` beside ``abs(A - 5) < 0.01`` registered 2 conditions before, and
