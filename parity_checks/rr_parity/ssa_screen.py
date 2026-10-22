@@ -1052,7 +1052,9 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
 # recorded run never produced — bngsim now walks a ladder rung the record did not
 # reach — is ``archive_unreplayable``. Neither is compared: both are
 # REFERENCE_FAILED rows, and re-recording clears them.
-ARCHIVE_FORMAT = 1
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
 
 
 class ArchiveMiss(Exception):
@@ -1060,7 +1062,9 @@ class ArchiveMiss(Exception):
 
 
 def _archive_file(directory, name: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".npz")
+    # The readable part is sanitized, so the hash keeps names such as a/b and a_b apart.
+    digest = hashlib.sha256(name.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', name)}-{digest}.npz"
 
 
 def archive_identity(spec: dict, n: int, seed_base: int) -> dict:
