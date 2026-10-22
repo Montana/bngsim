@@ -54,7 +54,10 @@ def _isomerization(tmp_path, a0="A0", extra=(), groups=()):
 
 
 def _columns(path, params, method, **kw):
+    # The residual test at a tol of 1e-12, by name (issue #1001): under the
+    # default the tol is not read, and the columns are good to rtol.
     sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode")
+    kw.setdefault("criterion", "residual")
     out = sim.steady_state(sensitivity_params=params, method=method, tol=1e-12, **kw)
     assert out.converged
     return np.asarray(out.sensitivity), out

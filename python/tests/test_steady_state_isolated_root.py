@@ -42,6 +42,27 @@ import bngsim
 import numpy as np
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _the_residual_test(monkeypatch):
+    """A solve here names the residual test unless it names another (issue
+    #1001). What is pinned is what dY_ss/dp makes of the state a solve returns,
+    and the residual test returns states short of a root, or beside one the
+    system leaves, which the default criterion marches past or does not call
+    converged before the columns are asked. Run both ways, no model here came
+    back with columns under the default where the residual test's were refused
+    but four, each at the state a run ends at and right there (two are below,
+    test_the_default_*)."""
+    for name in ("steady_state", "steady_state_batch"):
+        original = getattr(bngsim.Simulator, name)
+
+        def named(self, *args, _original=original, **kwargs):
+            kwargs.setdefault("criterion", "residual")
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(bngsim.Simulator, name, named)
+
+
 SIR = """begin parameters
     1 I0   1
     2 b    0.018
@@ -1416,6 +1437,17 @@ def test_a_root_the_solve_steps_to_and_the_system_leaves_is_refused(tmp_path):
         sim.steady_state(sensitivity_params=["s"], max_time=1e9)
 
 
+def test_the_default_marches_past_the_middle_root_to_where_a_run_ends(tmp_path):
+    """Under the default criterion the solve is not returned beside the middle
+    root: it marches on to X = 1, where a run ends, and the columns of s are
+    those of that root (dX*/ds = 0, dW*/ds = 1/kd)."""
+    sim = bngsim.Simulator(_net(tmp_path, BETWEEN_TWO_ROOTS), method="ode")
+    out = sim.steady_state(sensitivity_params=["s"], max_time=1e9, criterion="scaled")
+    assert out.converged
+    np.testing.assert_allclose(np.asarray(out.concentrations), [1.0, 2.0], rtol=1e-7)
+    np.testing.assert_allclose(np.asarray(out.sensitivity)[:, 0], [0.0, 1.0], atol=1e-7)
+
+
 def test_a_root_that_was_stepped_to_is_where_a_run_ends(tmp_path):
     """The same among 520 other species, with no eigenvalues. A run from
     where the model starts takes X to 1, and not to the 0.25 Newton stepped
@@ -2126,6 +2158,16 @@ def test_a_species_on_its_way_up_from_a_seed_is_not_stepped_down_to_nothing(tmp_
         bngsim.SimulationError, match=r"#995.*does not rest at.*real part of 0\.001 "
     ):
         sim.steady_state(sensitivity_params=["K", "r"])
+
+
+def test_the_default_marches_the_seed_to_where_it_grows(tmp_path):
+    """Under the default criterion the start is not a steady state, and the
+    solve marches N to K, where a run ends: dN*/dK = 1, dN*/dr = 0."""
+    sim = bngsim.Simulator(_net(tmp_path, SEEDED), method="ode")
+    out = sim.steady_state(sensitivity_params=["K", "r"], criterion="scaled")
+    assert out.converged
+    np.testing.assert_allclose(np.asarray(out.concentrations), [1e-6, 1.0], rtol=1e-7)
+    np.testing.assert_allclose(np.asarray(out.sensitivity)[0], [1.0, 0.0], atol=1e-7)
 
 
 def test_the_same_among_too_many_species_for_the_spectrum_is_refused_too(tmp_path):

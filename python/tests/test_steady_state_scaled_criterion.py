@@ -8,7 +8,7 @@ tolerance, which reads the same in any units. These tests cover:
 
 - the issue's cubic at scales 1e-9 and 1e-12 ends at its stable root, by both
   methods, from either side of it;
-- the default stays the residual test, which takes no step;
+- the default is the scaled test, and the residual test is kept by name;
 - a model with a conservation law converges to the residual test's answer;
 - an ``atol`` the caller gives is the one the march takes;
 - ``steady_state_batch`` passes the criterion on;
@@ -19,7 +19,8 @@ tolerance, which reads the same in any units. These tests cover:
   1 in its units;
 - a root at which the Jacobian is singular (a catalyst at 0) is converged;
 - ``set_tolerances(rtol=...)`` alone leaves the march its own ``atol``;
-- above 512 unknowns the solve is the residual one, step for step;
+- above 512 unknowns the solve is the residual one, step for step, and a
+  run taken on from it decides;
 - a march that stops between the steps the criterion is asked at is asked
   where it stops (a corpus model);
 - a mask says which species are measured, not which move: A -> S under the
@@ -33,6 +34,7 @@ tolerance, which reads the same in any units. These tests cover:
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import bngsim
@@ -70,28 +72,32 @@ def _cubic(tmp_path, s, x0):
 @pytest.mark.parametrize("s", [1e-9, 1e-12])
 @pytest.mark.parametrize("x0", [0.5, 0.9, 1.5])
 @pytest.mark.parametrize("method", ["integration", "newton"])
-def test_scaled_reaches_the_stable_root_at_any_scale(tmp_path, s, x0, method):
-    ss = bngsim.Simulator(_cubic(tmp_path, s, x0), method="ode").steady_state(
-        criterion="scaled", method=method
-    )
+@pytest.mark.parametrize("by_name", [False, True], ids=["default", "named"])
+def test_scaled_reaches_the_stable_root_at_any_scale(tmp_path, s, x0, method, by_name):
+    kw = {"criterion": "scaled"} if by_name else {}
+    ss = bngsim.Simulator(_cubic(tmp_path, s, x0), method="ode").steady_state(method=method, **kw)
     assert ss.converged
     assert ss.criterion == "scaled"
     assert ss.concentrations[0] / s == pytest.approx(1.0, rel=1e-6)
     assert ss.newton_distance <= 1.0
+    assert ss.continued_run_distance <= 1.0
 
 
-def test_default_is_the_residual_test(tmp_path):
+def test_the_residual_test_is_kept_by_name(tmp_path):
     # The parity test, unchanged: it takes no Newton step (a Jacobian more per
-    # solve), so it reports none.
-    at_one = bngsim.Simulator(_cubic(tmp_path, 1.0, 0.5), method="ode").steady_state()
+    # solve) and no run on, so it reports neither.
+    at_one = bngsim.Simulator(_cubic(tmp_path, 1.0, 0.5), method="ode").steady_state(
+        criterion="residual"
+    )
     assert at_one.criterion == "residual"
     assert at_one.converged
     assert at_one.concentrations[0] == pytest.approx(1.0, rel=1e-6)
     assert math.isnan(at_one.newton_distance)
+    assert math.isnan(at_one.continued_run_distance)
 
 
 # The issue's table: the residual test at a scale of 1e-9 accepts the cubic one
-# step from each start. Pinned so a change to the default path shows.
+# step from each start. Pinned so a change to the residual path shows.
 RESIDUAL_AT_1E_9 = {
     ("integration", 0.5): 0.893865,
     ("integration", 0.9): 1.003209,
@@ -103,20 +109,15 @@ RESIDUAL_AT_1E_9 = {
 
 
 @pytest.mark.parametrize("method,x0", sorted(RESIDUAL_AT_1E_9))
-def test_the_default_solve_is_the_residual_solve(tmp_path, method, x0):
-    out = {}
-    for criterion in (None, "residual"):
-        kw = {} if criterion is None else {"criterion": criterion}
-        out[criterion] = bngsim.Simulator(_cubic(tmp_path, 1e-9, x0), method="ode").steady_state(
-            method=method, **kw
-        )
-    default, residual = out[None], out["residual"]
-    assert default.criterion == "residual"
-    assert default.converged and default.n_steps == 1
-    assert default.concentrations[0] / 1e-9 == pytest.approx(
+def test_the_residual_solve_is_the_one_main_took(tmp_path, method, x0):
+    residual = bngsim.Simulator(_cubic(tmp_path, 1e-9, x0), method="ode").steady_state(
+        method=method, criterion="residual"
+    )
+    assert residual.criterion == "residual"
+    assert residual.converged and residual.n_steps == 1
+    assert residual.concentrations[0] / 1e-9 == pytest.approx(
         RESIDUAL_AT_1E_9[(method, x0)], rel=1e-5
     )
-    assert np.array_equal(default.concentrations, residual.concentrations)
 
 
 @pytest.mark.parametrize("method", ["integration", "newton"])
@@ -185,7 +186,9 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     but a $-fixed one and a masked one nothing reads (an empty column of the
     Jacobian's pattern), which is held; the laws are cut down to the ones no
     such species is in; the step is solved on all of it, with a rank check.
-    Its size is taken over each kept species' rtol·|y| + rtol·max(|y|, floor)."""
+    Its size is taken over each kept species' rtol·|y| + rtol·max(|y0|, floor),
+    y0 the state the solve started from (the model's, here) and the floor the
+    smallest of it above 0."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
@@ -208,7 +211,7 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     delta[moves] = step
     y0 = np.asarray(model.get_state(), float)
     floor = min(abs(v) for v, keep in zip(y0, kept, strict=True) if keep and v != 0)
-    scale = rtol * np.abs(y) + rtol * np.maximum(np.abs(y), floor)
+    scale = rtol * np.abs(y) + rtol * np.maximum(np.abs(y0), floor)
     return float(np.max(np.abs(delta[kept]) / scale[kept]))
 
 
@@ -330,9 +333,10 @@ def _wide_net(copies):
 
 
 def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
-    # The step is not taken there, and nothing else of "scaled" applies: with
-    # KINSOL's stopping rule left at the scaled one, the polish ran on past the
-    # residual's answer (BaruaBCR_2012 was never accepted, 18 s against 2 s).
+    # The step is not taken there, and the solve stops where the residual one
+    # does: with KINSOL's stopping rule left at the scaled one, the polish ran
+    # on past the residual's answer (BaruaBCR_2012 was never accepted, 18 s
+    # against 2 s). A run taken on from the state decides.
     path = tmp_path / "wide.net"
     path.write_text(_wide_net(260))
     out = {}
@@ -342,9 +346,9 @@ def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
         ).steady_state(criterion=criterion, method="newton", atol=1e-10)
     residual, scaled = out["residual"], out["scaled"]
     assert scaled.converged and scaled.method_used == "newton"
-    # The test `converged` was decided by.
-    assert scaled.criterion == "residual"
+    assert scaled.criterion == "scaled"
     assert math.isnan(scaled.newton_distance)
+    assert scaled.continued_run_distance <= 1.0
     assert scaled.n_steps == residual.n_steps
     assert np.array_equal(scaled.concentrations, residual.concentrations)
 
@@ -518,15 +522,40 @@ def test_a_differenced_jacobian_still_certifies_a_smooth_root(tmp_path, s, metho
     assert ss.concentrations[0] / s == pytest.approx(1.0, rel=1e-6)
 
 
-def test_the_retried_march_past_a_switch_still_converges(data_dir):
+def _ltype(tmp_path, data_dir, k_v_stim=None):
+    source = (data_dir / "ltype_calcium_discontinuous_jacobian.net").read_text()
+    if k_v_stim is not None:
+        source = re.sub(r"(16 k_v_stim\s+)\S+", rf"\g<1>{k_v_stim}", source)
+    path = tmp_path / f"ltype_{k_v_stim}.net"
+    path.write_text(source)
+    return bngsim.Model.from_net(str(path))
+
+
+def test_the_retried_march_past_a_switch_converges_away_from_it(tmp_path, data_dir):
     # GH #176's model: its closed-form Jacobian stops the march, the retry
-    # differences across the switch on the way, and its root is away from it.
-    ss = bngsim.Simulator(
-        bngsim.Model.from_net(str(data_dir / "ltype_calcium_discontinuous_jacobian.net")),
-        method="ode",
-    ).steady_state(criterion="scaled")
+    # differences across the switch on the way. Voltage relaxes to
+    # k_v_stim/k_v_leak; at 45 it rests 5 below the switch at 50.
+    ss = bngsim.Simulator(_ltype(tmp_path, data_dir, "45"), method="ode").steady_state()
     assert ss.converged
     assert ss.newton_distance <= 1.0
+    assert ss.continued_run_distance <= 1.0
+
+
+@pytest.mark.parametrize("k_v_stim", [None, "49.999999999998"])
+def test_a_state_on_its_switch_is_refused(tmp_path, data_dir, k_v_stim):
+    # As the model is, Voltage relaxes to 50, the switch's own threshold, and
+    # 2e-12 below it is within its tolerance of it: which side it rests on is
+    # rounding. The step is within tolerance, and a run kicked by a millionth
+    # goes on to the other side's state (Calcium at 188 for 958). The residual
+    # test returned it.
+    ss = bngsim.Simulator(_ltype(tmp_path, data_dir, k_v_stim), method="ode").steady_state()
+    assert ss.newton_distance <= 1.0
+    assert not ss.converged
+    assert not ss.continued_run_distance <= 1.0
+    residual = bngsim.Simulator(_ltype(tmp_path, data_dir, k_v_stim), method="ode").steady_state(
+        criterion="residual"
+    )
+    assert residual.converged
 
 
 # The synthesis of SYNTHESIS_NET written the BNGL way, from a $-fixed source.
@@ -855,3 +884,224 @@ def test_a_species_far_below_its_step_keeps_its_forward_column():
     ).steady_state(criterion="scaled")
     assert ss.converged
     assert ss.newton_distance <= 1.0
+
+
+# ─── The second test: runs taken on from the state (issue #1001) ─────────────
+
+
+@pytest.mark.parametrize("s", [1.0, 1e-9, 1e-12])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_the_unstable_root_is_not_converged(tmp_path, s, method):
+    # x = 0.3 is a root in floating point, and the step from it is within
+    # tolerance. A run from it stays: kicked by less than the integrator's own
+    # tolerance, the implicit method damps the mode it should follow. Kicked by
+    # a millionth it goes on to a stable root.
+    ss = bngsim.Simulator(_cubic(tmp_path, s, 0.3), method="ode").steady_state(method=method)
+    assert ss.newton_distance <= 1.0
+    assert not ss.converged
+    assert ss.continued_run_distance > 1.0
+    assert ss.concentrations[0] / s == pytest.approx(0.3, rel=1e-9)
+
+
+def test_a_burst_free_newton_solve_keeps_the_first_test(tmp_path):
+    # steady_states() enumerates roots, unstable ones with them, and says which
+    # are stable: no run is taken on.
+    sim = bngsim.Simulator(_cubic(tmp_path, 1.0, 0.3), method="ode")
+    [ss] = sim.steady_state_batch(states=[[0.3]], method="newton", newton_burst=False)
+    assert ss.converged
+    assert ss.root_stability == "unstable"
+    assert math.isnan(ss.continued_run_distance)
+
+
+# X' = 0.001 + 1e8·|X - 1|: positive everywhere, with a kink at 1.
+KINK_NET = """begin parameters
+    1 x0 0.5
+end parameters
+begin species
+    1 X() x0
+end species
+begin reactions
+    1 0 1 fr
+end reactions
+begin groups
+    1 Xobs 1
+end groups
+begin functions
+    1 fr() if(Xobs<1,0.001+1e8*(1-Xobs),0.001+1e8*(Xobs-1))
+end functions
+"""
+
+
+@pytest.mark.parametrize("jacobian", ["auto", "fd"])
+def test_a_rate_with_a_floor_at_its_kink_is_not_converged(tmp_path, jacobian):
+    # The march parks at the kink, and the step from there, 5e-12, is within
+    # tolerance: there is no root. Kicked past the kink the run grows.
+    path = tmp_path / "kink.net"
+    path.write_text(KINK_NET)
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+    ).steady_state(max_time=100.0)
+    assert ss.newton_distance <= 1.0
+    assert not ss.converged
+
+
+# 0 -> X at k, and nothing reads X: the reduced Jacobian is a zero.
+DRIFT_NET = """begin parameters
+    1 k {k!r}
+end parameters
+begin species
+    1 X() 1.0
+end species
+begin reactions
+    1 0 1 k
+end reactions
+"""
+
+
+@pytest.mark.parametrize("k", [1.0, 1e-12, 1e-20])
+@pytest.mark.parametrize("max_time", [1e-30, 1.0, 1e6])
+def test_a_drift_with_no_step_to_take_is_not_converged(tmp_path, k, max_time):
+    # With no step to take the runs decide alone, and they are taken on for as
+    # long as the drift takes to move X four tolerances: a run of max_time =
+    # 1e-30 saw nothing, and passed it.
+    path = tmp_path / "drift.net"
+    path.write_text(DRIFT_NET.format(k=k))
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        max_time=max_time
+    )
+    assert math.isinf(ss.newton_distance)
+    assert not ss.converged
+    assert ss.continued_run_distance > 3.9
+
+
+SIR_NET = """begin parameters
+    1 beta 0.5
+    2 gamma 0.2
+end parameters
+begin species
+    1 S() 0.99
+    2 I() 0.01
+    3 R() 0
+end species
+begin reactions
+    1 1,2 2,2 beta
+    2 2 3 gamma
+end reactions
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_an_epidemic_that_burns_out_is_converged(tmp_path, method):
+    # Every state with I = 0 is a steady state, and the run ends at the one
+    # with S = 0.1059, below gamma/beta: a kick of I dies away.
+    path = tmp_path / "sir.net"
+    path.write_text(SIR_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method
+    )
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0
+    s, i, _ = np.asarray(ss.concentrations)
+    assert s == pytest.approx(0.105894, rel=1e-4)
+    assert abs(i) < 1e-9
+
+
+def test_above_512_unknowns_the_runs_decide(tmp_path):
+    # The cubic at its root 0.3 among 520 unknowns: the residual test, which
+    # the solve stops by there, returns it where it starts, and the run kicked
+    # off it does not stay.
+    wide = _wide_net(260)
+    n = 2 * 260 + 1
+    text = (
+        wide.replace("end parameters", "    3 k3 1.0\n    4 k2 1.3\n    5 k1 0.3\nend parameters")
+        .replace("end species", f"    {n} X() 0.3\nend species")
+        .replace(
+            "end reactions",
+            f"    {4 * 260 + 1} {n},{n},{n} {n},{n} k3\n"
+            f"    {4 * 260 + 2} {n},{n} {n},{n},{n} k2\n"
+            f"    {4 * 260 + 3} {n} 0 k1\nend reactions",
+        )
+    )
+    path = tmp_path / "wide_cubic.net"
+    path.write_text(text)
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method="newton", atol=1e-10)
+    assert out["residual"].converged
+    assert math.isnan(out["scaled"].newton_distance)
+    assert not out["scaled"].converged
+    assert out["scaled"].continued_run_distance > 1.0
+
+
+def test_an_unstable_root_beside_a_larger_species_is_not_converged(tmp_path):
+    # The cubic at 1e-9, at its root 0.3 exactly, beside Y at 1, where Y
+    # stays. Each species is measured in its own tolerance: a kick measured in
+    # the largest's let X move by 2e-6, and grow to its other root unseen.
+    text = (
+        CUBIC_NET.format(s=1e-9, x0=0.3)
+        .replace("end species", "    2 Y() 1.0\nend species")
+        .replace("end reactions", "    4 0 2 k\n    5 2 0 k\nend reactions")
+    )
+    path = tmp_path / "cubic_beside.net"
+    path.write_text(text)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state()
+    assert ss.newton_distance <= 1.0
+    assert not ss.converged
+
+
+_B002 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000002/BIOMD0000000002_url.xml"
+)
+_B407 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000407/BIOMD0000000407_url.xml"
+)
+
+
+def _run_from(path, y, t_end):
+    model = bngsim.Model.from_sbml(str(path))
+    model._core.set_state(np.asarray(y, float))
+    bngsim.Simulator(model, method="ode").run(t_span=(0.0, t_end), n_points=2, atol="auto")
+    return np.asarray(model._core.get_state(), float)
+
+
+@pytest.mark.skipif(
+    not _B002.exists(), reason="rr_parity corpus model BIOMD0000000002 not present"
+)
+def test_biomd2_comes_out_as_a_run_does():
+    # The residual test accepted it 6% from its steady state in a species; a
+    # run of 1e6 from where it is returned now moves it by 1e-10 of itself.
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B002)), method="ode").steady_state()
+    assert ss.converged
+    y = np.asarray(ss.concentrations)
+    end = _run_from(_B002, y, 1e6)
+    assert np.max(np.abs(end - y) / (np.abs(y) + 1e-6 * np.abs(y).max())) < 1e-8
+    residual = bngsim.Simulator(bngsim.Model.from_sbml(str(_B002)), method="ode").steady_state(
+        criterion="residual"
+    )
+    y = np.asarray(residual.concentrations)
+    end = _run_from(_B002, y, 1e6)
+    assert np.max(np.abs(end - y) / (np.abs(y) + 1e-6 * np.abs(y).max())) > 0.05
+
+
+@pytest.mark.skipif(
+    not _B407.exists(), reason="rr_parity corpus model BIOMD0000000407 not present"
+)
+def test_biomd407_comes_out_as_a_run_does():
+    # The residual test accepted it one step from where it starts. A run is
+    # still moving at 1e6 and settles by 1e8: in max_time = 1e6 it is not
+    # converged, and in 1e9 it is, where the run ends.
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B407)), method="ode").steady_state()
+    assert not ss.converged
+    y0 = np.asarray(bngsim.Model.from_sbml(str(_B407))._core.get_state(), float)
+    ref = _run_from(_B407, y0, 1e10)
+    for method in ("integration", "newton"):
+        ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B407)), method="ode").steady_state(
+            method=method, max_time=1e9
+        )
+        assert ss.converged
+        y = np.asarray(ss.concentrations)
+        assert np.max(np.abs(y - ref) / (np.abs(ref) + 1e-6 * np.abs(ref).max())) < 1e-8

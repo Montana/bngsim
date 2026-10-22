@@ -1174,24 +1174,44 @@ struct SensitivityOptions {
 // one RHS evaluation per unknown per setup.
 struct SteadyStateOptions {
     double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
-    // What `converged` asks of a state (issue #1001). "residual": today's
-    // BNG2.pl parity test, ||f(y)||_2 / n_species < tol, a number in the
-    // model's units of concentration per time. "scaled": the Newton step from
-    // the state to the root, -J^-1·f(y) on the system with the conserved
-    // totals taken out, is within rtol·|y_i| + atol_i of every species, with
-    // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
-    // initial concentration of a species the test steps, $-fixed ones aside
-    // (where none starts above 0, the largest species of the state or of the
-    // root it steps to). The mask says which species are measured, not which
-    // move: every species moves by its own equation but a $-fixed one and a
-    // masked one that nothing reads or that reads nothing, which is held. No
-    // unit of
-    // concentration or of time is in it. Above 512 unknowns the step is not
-    // taken and the solve is the residual one, `tol` and all.
-    std::string criterion = "residual";
-    // Set by find_steady_state from the initial state, for "scaled": the
-    // floor (0 where nothing starts above 0), and whether the step is taken.
-    double criterion_floor = 1.0;
+    // What `converged` asks of a state (issue #1001). "scaled" (the default):
+    // two tests, with no unit of concentration or of time in either. First,
+    // the Newton step from the state to the root, -J^-1·f(y) on the system
+    // with the conserved totals taken out, is within rtol·|y_i| + atol_i of
+    // every species, with atol_i = rtol·max(|y_i|, floor) and the floor the
+    // smallest positive initial concentration of a species the test steps,
+    // $-fixed ones aside (where none starts above 0, the largest species of
+    // the state or of the root it steps to). The mask says which species are
+    // measured, not which move: every species moves by its own equation but a
+    // $-fixed one and a masked one that nothing reads or that reads nothing,
+    // which is held. Second, a run taken on from the state for max_time moves
+    // no species by more than its tolerance, and one from it kicked by a
+    // millionth of each species none by more, in its tolerance, than twice the
+    // kick: what tells a state the system rests at from an unstable root, a
+    // kink with a floor, or a slow drift. Where there is no step to take (a
+    // singular reduced Jacobian, or more than 512 unknowns, where the solve
+    // stops by the residual) the second test decides alone, its runs taken on
+    // for at least four times as long as the soonest species takes to move its
+    // tolerance at its rate. A burst-free Newton solve (newton_burst false),
+    // which reports unstable roots, takes the first only. "residual": BNG2.pl's
+    // parity test,
+    // ||f(y)||_2 / n_species < tol, a number in the model's units of
+    // concentration per time, kept for comparisons with run_network.
+    std::string criterion = "scaled";
+    // The state the "scaled" criterion's tolerances are taken from, one value
+    // per species, as atol="auto" takes them: atol_i = rtol·max(|scale_i|,
+    // floor), the floor the smallest initial concentration above 0 the model
+    // declares of a species the test steps (where none is, the smallest
+    // |scale_i| above 0). Empty, the default: the state the solve starts
+    // from, which the march's atol="auto" is taken from too. Taken from the
+    // state tested instead, a species decaying from 10 was held to 1e-17 at 0,
+    // which the march, at 1e-7 there, never reached (it crossed 0 to -6e-10).
+    // A caller that draws its own starts gives the model's state, as
+    // steady_states() does: its draws reach 1e-22 of a species.
+    std::vector<double> criterion_scale;
+    // Set by find_steady_state, for "scaled": the floor (0 where nothing in
+    // criterion_scale is above 0), and whether the step is taken.
+    double criterion_floor = 0.0;
     bool criterion_by_distance = false;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
@@ -1324,8 +1344,14 @@ struct SteadyStateResult {
     // and above that, and +inf where the reduced Jacobian is singular at a
     // state that is not a root.
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
+    // Issue #1001, the second test of "scaled": the largest move of a measured
+    // species over its tolerance, across the runs taken on from the returned
+    // state (the kicked one's over 1 + twice its kick); at most 1 passes. +inf
+    // where a run could not be taken to its time; NaN where none was taken
+    // (under "residual", where the Newton step already refused, and for a
+    // burst-free Newton solve).
+    double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
     std::string criterion;   // the criterion `converged` was decided by
-                             // ("residual" for "scaled" above 512 unknowns)
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
