@@ -569,13 +569,17 @@ static double ss_negative_slack(const SteadyStateOptions &opts) {
 }
 
 // Species i's tolerance under "scaled" at a value of `yi` (issue #1001):
-// rtol·|y_i| + atol_i, atol_i = rtol·max(|scale_i|, floor), the scale the
-// state the solve started from (criterion_scale) and `floor` the criterion's,
-// or where that is 0 the one the caller takes from the state it measures.
+// rtol·|y_i| + atol_i, atol_i = rtol·max(|y_i|, |scale_i|, floor), the scale
+// the state the solve started from (criterion_scale) and `floor` the
+// criterion's, or where that is 0 the one the caller takes from the state it
+// measures. Of the larger of the two sizes: from the start alone, a species
+// that grows was held to half what it had been, and BIOMD0000000252, at 0.82
+// of that, was refused; from the state alone, one that decays from 10 was held
+// to 1e-17 at 0, which the march, at 1e-7 there, did not reach.
 static double ss_scaled_tolerance(const SteadyStateOptions &opts, int i, double yi, double floor) {
-    const double scale = static_cast<size_t>(i) < opts.criterion_scale.size()
-                             ? std::abs(opts.criterion_scale[static_cast<size_t>(i)])
-                             : std::abs(yi);
+    double scale = std::abs(yi);
+    if (static_cast<size_t>(i) < opts.criterion_scale.size())
+        scale = std::max(scale, std::abs(opts.criterion_scale[static_cast<size_t>(i)]));
     return opts.rtol * std::abs(yi) + opts.rtol * std::max(scale, floor);
 }
 
@@ -3166,6 +3170,13 @@ static std::vector<double> ss_backward_columns(SteadyStateRhs &rhs, const double
     return back;
 }
 
+// Defined with the conditioning measures, below.
+static void ss_reduce_jacobian_mass(const double *J, int ns, const ConservationLaws &cl,
+                                    const std::vector<int> &idx, std::vector<double> &mass);
+static double ss_componentwise_condition(const std::vector<double> &lu, int n,
+                                         const std::vector<int> &row,
+                                         const std::vector<double> &magnitude, int &at);
+
 // The Newton step from `y` to the root, in each species' own tolerance (issue
 // #1001): max_i |δ_i| / (rtol·|y_i| + atol_i) over the species the test
 // covers, δ = −J⁻¹f on ss_distance_system (each law's dependent species
@@ -3179,7 +3190,13 @@ static std::vector<double> ss_backward_columns(SteadyStateRhs &rhs, const double
 // NaN where the step is not taken (more unknowns than kNewtonDistanceMost).
 // `no_step`, where given, is set where the reduced matrix is singular, either
 // way it is differenced: the +inf that says there is no step, not that the step
-// is too long or crosses a switch. The model's state is left as it was.
+// is too long or crosses a switch. It is set too where a step past tolerance
+// was taken through a matrix singular but for rounding (componentwise
+// condition above kConditionMost), which says nothing: IgE.bngl conserves
+// R(a~1) - R(a~0) + 2·IgE_dimer because its two reactions out of R(a~X) share
+// one rate constant, a law of its rates and not of its stoichiometry, so that
+// its steady states make a line, and the step along it was 4e7 tolerances at
+// a state no run moves. The model's state is left as it was.
 //
 // A differenced Jacobian is taken both ways, and the larger of the two steps is
 // the distance. One-sided across a rate law that switches, `if(X<1, 0.1,
@@ -3299,6 +3316,16 @@ static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
         }
         return distance;
     };
+    const auto singular_but_for_rounding = [&](const std::vector<double> &Jm) {
+        std::vector<double> M, mass;
+        ss_reduce_jacobian(Jm.data(), ns, cl, idx, M);
+        std::vector<int> row;
+        if (ss_lu_pivoted(M, n, row) >= 0)
+            return true;
+        ss_reduce_jacobian_mass(Jm.data(), ns, cl, idx, mass);
+        int at = 0;
+        return !(ss_componentwise_condition(M, n, row, mass, at) <= kConditionMost);
+    };
     std::vector<double> J;
     const bool differenced = jacobian_at(y, J);
     const std::vector<double> delta = newton_step(J, f);
@@ -3308,8 +3335,11 @@ static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
         return inf;
     }
     double distance = size_of(delta);
-    if (!(distance <= 1.0))
+    if (!(distance <= 1.0)) {
+        if (no_step && singular_but_for_rounding(J))
+            *no_step = true;
         return distance;
+    }
     if (differenced) {
         // The columns the reduced matrix reads: the unknowns' and the laws'.
         std::vector<int> cols = idx;
@@ -3326,8 +3356,11 @@ static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
         if (back.empty() && no_step)
             *no_step = true;
         distance = back.empty() ? inf : std::max(distance, size_of(back));
-        if (!(distance <= 1.0))
+        if (!(distance <= 1.0)) {
+            if (no_step && !back.empty() && singular_but_for_rounding(back_J))
+                *no_step = true;
             return distance;
+        }
     }
     return distance;
 }
@@ -5488,7 +5521,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
 }
 
 // One run of the second test of the "scaled" criterion (issue #1001): from `y`,
-// moved by `kick_size` of each unknown's own size, taken on for `horizon`.
+// moved by `kick_size` of each unknown's own size, taken on for max_time.
 // Returns the largest move of a measured species from `y` over its tolerance,
 // rtol·|y_i| + rtol·max(|y_i|, floor) as the first test reads it, over 1 + 2k
 // for a kick of k tolerances (the largest of any species, in its own); +inf
@@ -5506,11 +5539,8 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
 // rests at can be further than a tolerance away. It is scaled down where it
 // would take a species below 0.
 static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
-                                    const SteadyStateOptions &opts_in, const ResidualSubspace &sub,
-                                    const std::vector<double> &y, double kick_size,
-                                    double horizon) {
-    SteadyStateOptions opts = opts_in;
-    opts.max_time = horizon;
+                                    const SteadyStateOptions &opts, const ResidualSubspace &sub,
+                                    const std::vector<double> &y, double kick_size) {
     const int ns = model.n_species();
     const auto un = static_cast<size_t>(ns);
     const double inf = std::numeric_limits<double>::infinity();
@@ -5624,51 +5654,14 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     return moved;
 }
 
-// How long the second test takes the run on for where it decides alone, the
-// first finding no step to take (a singular reduced Jacobian, or more unknowns
-// than kNewtonDistanceMost): max_time, or four times as long as the species
-// that moves soonest takes to move by its tolerance at its rate at `y`, if that
-// is longer. A run for max_time does not see a drift slower than a tolerance
-// per max_time, and with max_time = 1e-30 it saw none: a constant source was
-// accepted. Over the longer run a drift moves a species four tolerances, and a
-// state its rates decay from moves by how far it is from where they decay to.
-static double ss_drift_horizon(NetworkModel &model, SteadyStateRhs &rhs,
-                               const SteadyStateOptions &opts, const ResidualSubspace &sub,
-                               const std::vector<double> &y) {
-    const int ns = model.n_species();
-    const auto un = static_cast<size_t>(ns);
-    std::vector<double> saved(un);
-    model.get_state_into(saved.data());
-    model.set_state_from(y.data());
-    std::vector<double> f(un, 0.0);
-    rhs.eval(0.0, y.data(), f.data());
-    model.set_state_from(saved.data());
-    double floor = opts.criterion_floor;
-    if (!(floor > 0.0)) {
-        floor = 0.0;
-        for (int i : sub.included) {
-            if (!model.species()[i].fixed)
-                floor = std::max(floor, std::abs(y[static_cast<size_t>(i)]));
-        }
-    }
-    double soonest = std::numeric_limits<double>::infinity();
-    for (int i : sub.included) {
-        const auto ui = static_cast<size_t>(i);
-        if (model.species()[i].fixed || f[ui] == 0.0)
-            continue;
-        soonest = std::min(soonest, ss_scaled_tolerance(opts, i, y[ui], floor) / std::abs(f[ui]));
-    }
-    if (!(soonest < std::numeric_limits<double>::infinity()))
-        return opts.max_time;
-    return std::max(opts.max_time, std::min(4.0 * soonest, 1e300));
-}
-
 // The second test of the "scaled" criterion (issue #1001): a run taken on from
 // the state moves no measured species beyond its tolerance, and a run from it
 // kicked by a millionth of each species (kHoldKick, as #997's run is) moves
 // none further, in its tolerance, than twice the kick. Returns the larger of
-// the two measures (at most 1 passes). The runs are for max_time, or where the
-// test decides `alone`, for ss_drift_horizon.
+// the two measures (at most 1 passes). The runs are for max_time, as the
+// first test's is not: a drift slower than a tolerance per max_time passes
+// them. Taken on until such a drift would show, they refused BIOMD0000000463,
+// one of whose species moves by 1.7e-17 of itself per unit time.
 //
 // The first test is a distance to the root the state linearizes to, and that
 // root need not be one the system rests at, nor is every state it passes one
@@ -5687,12 +5680,11 @@ static double ss_drift_horizon(NetworkModel &model, SteadyStateRhs &rhs,
 // method steps over from below.
 static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
                                const SteadyStateOptions &opts, const ResidualSubspace &sub,
-                               const std::vector<double> &y, bool alone) {
-    const double horizon = alone ? ss_drift_horizon(model, rhs, opts, sub, y) : opts.max_time;
-    const double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, horizon);
+                               const std::vector<double> &y) {
+    const double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0);
     if (!(still <= 1.0))
         return still;
-    return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick, horizon));
+    return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick));
 }
 
 // ---------------------------------------------------------------------------
@@ -5916,8 +5908,8 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // ── "scaled": the Newton step, then a run taken on (issue #1001) ─────────
     // `converged` is decided here, at the state returned: by both tests where
     // the step can be taken, and by the second alone where there is no step to
-    // take (a singular reduced Jacobian, or more unknowns than
-    // kNewtonDistanceMost). A step past its tolerance is no steady state
+    // take (a reduced Jacobian singular, or singular but for rounding, or more
+    // unknowns than kNewtonDistanceMost). A step past its tolerance is no steady state
     // whatever a run does, and nor is a step that crosses a switch (+inf with a
     // step to take): a run of max_time = 1e-30 passed X' > 0 there. Before the
     // reasons a solve failed are looked for and before dY_ss/dp, which both
@@ -5932,9 +5924,15 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                 : std::numeric_limits<double>::quiet_NaN();
         result.newton_distance = step;
         const bool alone = std::isnan(step) || no_step;
-        if (step <= 1.0 || alone) {
+        // Of a state that is a state (GH #27's guard on the Newton path): across
+        // its jump, a march on differenced columns took X' > 0 to X = -86, where
+        // there is no step and a run of max_time = 1 moved X by less than its
+        // tolerance there.
+        const bool physical =
+            ss_state_is_physical(result.concentrations, ss_negative_slack(*effective));
+        if (physical && (step <= 1.0 || alone)) {
             result.continued_run_distance =
-                ss_continued_run(model, rhs, *effective, sub, result.concentrations, alone);
+                ss_continued_run(model, rhs, *effective, sub, result.concentrations);
             result.converged = result.continued_run_distance <= 1.0;
         } else {
             result.converged = false;

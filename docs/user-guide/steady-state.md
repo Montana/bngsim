@@ -83,14 +83,15 @@ two tests, neither with a unit of concentration or of time in it.
 `δ = −J⁻¹f` on the system with the conserved totals taken out, is within each
 species' own tolerance:
 
-`|δ_i| ≤ rtol·|y_i| + atol_i`, with `atol_i = rtol·max(|y⁰_i|, floor)`
+`|δ_i| ≤ rtol·|y_i| + atol_i`, with `atol_i = rtol·max(|y_i|, |y⁰_i|, floor)`
 
 `y⁰` is the state the solve starts from, and the floor is the smallest positive
 initial concentration the model declares of a species that is not `$`-fixed
 (where none is above 0, the smallest of `y⁰`; where that is 0 too, the largest
-species of the state or of the root it steps to). These are the tolerances
-`atol="auto"` gives the march, which takes them where neither `atol=` nor
-`set_tolerances` gives an `atol`. A species that starts at 0 is held to `rtol`
+species of the state or of the root it steps to). `atol="auto"` gives the
+march the same tolerances from `y⁰`, and the march takes them where neither
+`atol=` nor `set_tolerances` gives an `atol`; a species that has grown since
+is held to its own size. A species that starts at 0 is held to `rtol`
 times the floor: one whose steady state is smaller than that is within
 tolerance of 0. `mask=` says which species are measured, not which move: the
 step moves every species by its own equation but a `$`-fixed one and a masked
@@ -110,11 +111,19 @@ millionth it goes on to 0 or 1. And the step can pass where there is no root:
 5e-12.
 
 Where there is no step to take the runs decide alone: a reduced Jacobian that
-is singular (a species nothing reads, made at a constant rate), or more than
-512 unknowns, where the step is not taken and the solve stops by the residual
-test, `tol` and all. There the runs are taken on for at least four times as
-long as the species that moves soonest takes to move its tolerance at its
-rate, so that a drift too slow to show in `max_time` shows.
+is singular (a species nothing reads, made at a constant rate), or singular but
+for rounding (a componentwise condition number above 1e13), where a step past
+tolerance says nothing, or more than 512 unknowns, where the step is not taken
+and the solve stops by the residual test, `tol` and all. The second is a
+continuum of steady states: IgE.bngl conserves `R(a~1) - R(a~0) + 2·IgE_dimer`
+because its two reactions out of `R(a~X)` share one rate constant, a law of its
+rates and not of its stoichiometry, so that its steady states make a line; the
+step along it is 4e7 tolerances at a state no run moves. The runs are taken on
+for `max_time`, and a drift too slow to move a species its tolerance in that
+time passes them: what is asked is that the state stay over the time the
+solve was given. Where there is no step, then, a `max_time` too short to see a
+drift certifies one: `X' = 1e-6` with nothing reading `X` passes at
+`max_time=1e-30`, and is refused at 1.
 
 ```python
 ss = sim.steady_state()
@@ -125,11 +134,6 @@ ss.continued_run_distance  # test 2: the runs' largest move in those units; at m
 
 What it does not do:
 
-- **A state on a continuum of steady states is not certified.** The reduced
-  Jacobian there is singular but for rounding, and the step along the continuum
-  is far past tolerance (2.7e8 tolerances on a law across two compartment
-  sizes). Across the corpus a least-squares step at such states accepted states
-  that a run moves by more than 1%.
 - **A differenced Jacobian across a jump** in a rate law (an `if()` the state
   sits on) certifies nothing: the quotient there is the jump over the step.
 - **A state within its tolerance of a switch** is not converged where a kick

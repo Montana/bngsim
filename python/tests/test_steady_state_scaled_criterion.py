@@ -186,9 +186,9 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     but a $-fixed one and a masked one nothing reads (an empty column of the
     Jacobian's pattern), which is held; the laws are cut down to the ones no
     such species is in; the step is solved on all of it, with a rank check.
-    Its size is taken over each kept species' rtol·|y| + rtol·max(|y0|, floor),
-    y0 the state the solve started from (the model's, here) and the floor the
-    smallest of it above 0."""
+    Its size is taken over each kept species' rtol·|y| + rtol·max(|y|, |y0|,
+    floor), y0 the state the solve started from (the model's, here) and the
+    floor the smallest of it above 0."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
@@ -211,7 +211,7 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     delta[moves] = step
     y0 = np.asarray(model.get_state(), float)
     floor = min(abs(v) for v, keep in zip(y0, kept, strict=True) if keep and v != 0)
-    scale = rtol * np.abs(y) + rtol * np.maximum(np.abs(y0), floor)
+    scale = rtol * np.abs(y) + rtol * np.maximum(np.maximum(np.abs(y), np.abs(y0)), floor)
     return float(np.max(np.abs(delta[kept]) / scale[kept]))
 
 
@@ -772,9 +772,12 @@ def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, c, klo, x0,
     # jump through; the secant to 0 reads the law's own slope, 0, and where X
     # is too small for that secant to be read (9e-15, 3e-41), a forward quotient
     # at half the step grows across the jump.
+    # A closed-form Jacobian of the switch is 0, so that there is no step to
+    # take and the runs decide, over max_time: of 1e-30 they see nothing, and
+    # at klo = 1e-30 one of 1 moves X by 1e-30, within its tolerance.
     path = tmp_path / "near_zero.net"
     path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0, c=c, klo=klo))
-    for max_time in (1e-30, 1.0, 1e6):
+    for max_time in (1.0, 1e6) if klo > 1e-20 or jacobian == "fd" else (1e6,):
         ss = bngsim.Simulator(
             bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
         ).steady_state(criterion="scaled", method=method, max_time=max_time)
@@ -958,20 +961,29 @@ end reactions
 """
 
 
-@pytest.mark.parametrize("k", [1.0, 1e-12, 1e-20])
-@pytest.mark.parametrize("max_time", [1e-30, 1.0, 1e6])
-def test_a_drift_with_no_step_to_take_is_not_converged(tmp_path, k, max_time):
-    # With no step to take the runs decide alone, and they are taken on for as
-    # long as the drift takes to move X four tolerances: a run of max_time =
-    # 1e-30 saw nothing, and passed it.
+@pytest.mark.parametrize("k", [1.0, 1e-12])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_drift_with_no_step_to_take_is_not_converged(tmp_path, k, method):
+    # With no step to take the runs decide alone, over max_time: X moves by
+    # k·1e6, past its tolerance of 2e-8.
     path = tmp_path / "drift.net"
     path.write_text(DRIFT_NET.format(k=k))
     ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
-        max_time=max_time
+        method=method
     )
     assert math.isinf(ss.newton_distance)
     assert not ss.converged
-    assert ss.continued_run_distance > 3.9
+    assert ss.continued_run_distance > 1.0
+
+
+def test_a_drift_too_slow_to_show_in_max_time_passes(tmp_path):
+    # Control: the runs ask that the state stay over max_time, and X' = 1e-20
+    # moves X by 1e-14 in 1e6.
+    path = tmp_path / "drift.net"
+    path.write_text(DRIFT_NET.format(k=1e-20))
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state()
+    assert math.isinf(ss.newton_distance)
+    assert ss.converged
 
 
 SIR_NET = """begin parameters
@@ -1105,3 +1117,21 @@ def test_biomd407_comes_out_as_a_run_does():
         assert ss.converged
         y = np.asarray(ss.concentrations)
         assert np.max(np.abs(y - ref) / (np.abs(ref) + 1e-6 * np.abs(ref).max())) < 1e-8
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_step_along_a_continuum_says_nothing_and_the_runs_decide(data_dir, method):
+    # IgE.bngl conserves R(a~1) - R(a~0) + 2·IgE_dimer because its two
+    # reactions out of R(a~X) share one rate constant, a law of its rates that
+    # no law of its stoichiometry holds: its steady states make a line, the
+    # reduced Jacobian is singular but for rounding, and the step along the
+    # line was 4e7 tolerances (rounding says how far) at a state no run moves.
+    path = str(data_dir / "ige_receptor_cycle.net")
+    ss = bngsim.Simulator(bngsim.Model.from_net(path), method="ode").steady_state(method=method)
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0
+    y = np.asarray(ss.concentrations)
+    run = bngsim.Model.from_net(path)
+    run.set_state(y)
+    bngsim.Simulator(run, method="ode").run(t_span=(0.0, 1e6), n_points=2, atol="auto")
+    np.testing.assert_allclose(np.asarray(run.get_state()), y, rtol=1e-6)

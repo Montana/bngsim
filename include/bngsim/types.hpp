@@ -1190,21 +1190,20 @@ struct SteadyStateOptions {
     // kick: what tells a state the system rests at from an unstable root, a
     // kink with a floor, or a slow drift. Where there is no step to take (a
     // singular reduced Jacobian, or more than 512 unknowns, where the solve
-    // stops by the residual) the second test decides alone, its runs taken on
-    // for at least four times as long as the soonest species takes to move its
-    // tolerance at its rate. A burst-free Newton solve (newton_burst false),
+    // stops by the residual) the second test decides alone. A burst-free
+    // Newton solve (newton_burst false),
     // which reports unstable roots, takes the first only. "residual": BNG2.pl's
     // parity test,
     // ||f(y)||_2 / n_species < tol, a number in the model's units of
     // concentration per time, kept for comparisons with run_network.
     std::string criterion = "scaled";
     // The state the "scaled" criterion's tolerances are taken from, one value
-    // per species, as atol="auto" takes them: atol_i = rtol·max(|scale_i|,
-    // floor), the floor the smallest initial concentration above 0 the model
-    // declares of a species the test steps (where none is, the smallest
-    // |scale_i| above 0). Empty, the default: the state the solve starts
-    // from, which the march's atol="auto" is taken from too. Taken from the
-    // state tested instead, a species decaying from 10 was held to 1e-17 at 0,
+    // per species, as atol="auto" takes them: atol_i = rtol·max(|y_i|,
+    // |scale_i|, floor) at a state y, the floor the smallest initial
+    // concentration above 0 the model declares of a species the test steps
+    // (where none is, the smallest |scale_i| above 0). Empty, the default: the
+    // state the solve starts from, which the march's atol="auto" is taken from
+    // too. Without it, a species decaying from 10 was held to 1e-17 at 0,
     // which the march, at 1e-7 there, never reached (it crossed 0 to -6e-10).
     // A caller that draws its own starts gives the model's state, as
     // steady_states() does: its draws reach 1e-22 of a species.

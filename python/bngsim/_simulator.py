@@ -7387,8 +7387,9 @@ class Simulator:
               1. The Newton step ``δ = −J⁻¹f`` from the state to the root is
                  within every species' own tolerance,
                  ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-                 rtol·max(|y⁰_i|, floor)`` as ``atol="auto"`` derives it from
-                 ``y⁰``, the state the solve starts from. The floor is the
+                 rtol·max(|y_i|, |y⁰_i|, floor)``: as ``atol="auto"`` derives
+                 it from ``y⁰``, the state the solve starts from, or from the
+                 state, whichever is larger. The floor is the
                  smallest positive initial concentration the model declares of
                  a species that is not ``$``-fixed (where none is above 0, the
                  smallest of ``y⁰``; where that is 0 too, the largest species
@@ -7403,13 +7404,13 @@ class Simulator:
                  nothing moves an unkicked run), from a rate with a floor at a
                  kink, and from a slow drift.
 
-              Where there is no step to take, at a singular reduced Jacobian
-              or above 512 unknowns, where the march stops by ``tol``, the
-              runs decide alone, taken on until a drift too slow to show in
-              ``max_time`` would move a species four tolerances. A
-              differenced Jacobian that straddles a jump in a rate law, or a
-              state on a continuum of steady states (singular but for
-              rounding), certifies nothing. ``mask`` says which
+              Where there is no step to take, at a reduced Jacobian singular
+              or singular but for rounding (a continuum of steady states) or
+              above 512 unknowns, where the march stops by ``tol``, the runs
+              decide alone. They are taken on for ``max_time``, and a drift too
+              slow to move a species its tolerance in that time passes them. A
+              differenced Jacobian that straddles a jump in a rate law
+              certifies nothing. ``mask`` says which
               species are measured, not which move: the step and the run move
               every species but a ``$``-fixed one and a masked one that nothing
               reads or that reads nothing (a counter), which is held. Where
@@ -10582,7 +10583,8 @@ class SteadyStateResult:
         is within it (issue #1001). NaN under ``criterion="residual"``, which
         does not take the step, and above 512 unknowns; ``inf`` where the
         Jacobian is singular at a state that is not a root, or a differenced
-        one straddles a jump.
+        one straddles a jump. Past 1 through a Jacobian singular but for
+        rounding it decides nothing, and the runs do.
     continued_run_distance : float
         The second test of ``criterion="scaled"``: the largest move of a
         measured species, over its tolerance, across the runs taken on from

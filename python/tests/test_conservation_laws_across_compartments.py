@@ -702,8 +702,10 @@ def test_a_continuum_across_sizes_is_refused():
     model = bngsim.Model.from_antimony_string(CONTINUUM.format(v2=2.3))
     np.testing.assert_allclose(_law(model), [1, 2.3 / 0.7, 2.3 / 0.7, 1, 2.3 / 0.7, 1], rtol=1e-12)
     sim = bngsim.Simulator(model, method="ode")
-    # The residual test, by name (issue #1001): the default does not certify a
-    # state on a continuum, whose step along it is 1e8 tolerances (below).
+    # The residual test, by name (issue #1001), and the default below: there
+    # the step along the continuum, 2.7e8 tolerances through a matrix singular
+    # but for rounding, is no step, and a run from the state stays. Either way
+    # the columns are refused.
     for name in ("kp", "k1"):
         with pytest.raises(
             bngsim.SimulationError,
@@ -714,7 +716,12 @@ def test_a_continuum_across_sizes_is_refused():
     out = sim.steady_state(tol=1e-10, criterion="residual")  # where a run ends
     assert out.converged and abs(np.asarray(out.concentrations)[1]) < 1e-8
     model.reset()
-    assert not sim.steady_state().converged
+    out = sim.steady_state()
+    assert out.converged and out.newton_distance > 1e6
+    assert out.continued_run_distance <= 1.0
+    model.reset()
+    with pytest.raises(bngsim.SimulationError, match=r"#995.*not an isolated root"):
+        sim.steady_state(sensitivity_params=["kp"])
 
 
 def test_a_zero_pivot_beside_a_law_across_sizes_is_refused_as_having_no_gradient():
