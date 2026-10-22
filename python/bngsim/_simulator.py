@@ -1337,6 +1337,20 @@ class Simulator:
         # this single-shot path exactly.
         if (self._sensitivity_params or self._sensitivity_ic) and dispatch == "ode":
             self._auto_codegen_for_sensitivity(jit_backend=jit_backend)
+            # A column of an initial value has no ∂f/∂p for CVODES' difference
+            # quotient to perturb, so it needs the analytic sensitivity RHS. Where
+            # codegen built the model but declined that RHS (a dilution term that
+            # reads a rate, issue #1124 item 7), the run failed with "no codegen
+            # .so is loaded", which a codegen=True does nothing for.
+            if self._sensitivity_ic and not self._codegen_provides_sens_rhs():
+                reason = self.sens_rhs_decline_reason
+                raise SensitivityUnsupportedError(
+                    "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
+                    "difference quotient has no parameter to perturb for an initial "
+                    "value. Codegen built this model but declined that RHS"
+                    + (f" ({str(reason).rstrip('.')})" if reason else "")
+                    + ", so the initial-value columns cannot be computed for this model."
+                )
 
         # Validate and store sensitivity method
         if sensitivity_method not in ("staggered", "simultaneous"):
