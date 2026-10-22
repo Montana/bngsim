@@ -377,6 +377,13 @@ class NetworkModel {
     // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
     bool state_switch_reads_time(const StateSwitch &sw) const;
 
+    // The evaluator expression id of *expression_src*, compiled into this
+    // model's evaluator the first time it is asked for and the same id after
+    // (issue #1147: a run's state-switch guards, compiled on every run, grew the
+    // evaluator by one expression per guard per run). Cached by source text and,
+    // like state_switch(), NOT copied by clone(). Throws as compile() does.
+    int compiled_expression(const std::string &expression_src) const;
+
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
     const std::vector<StoichEntry> &stoichiometry() const;

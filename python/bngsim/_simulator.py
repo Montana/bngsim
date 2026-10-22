@@ -2839,17 +2839,19 @@ class Simulator:
         :meth:`_apply_crossing_stops` returned for this run. A no-op for a model
         with no such condition, which leaves its root set and stepping untouched.
         """
-        conditions = (
-            model.state_switch_root_conditions()
-            if covered is None
-            else model._state_switch_roots_beside(covered)
-        )
+        if covered is None:
+            covered = model.time_discontinuity_conditions()
+        conditions = model._state_switch_roots_beside(covered)
         if conditions:
             logger.debug(
                 "State-switch roots for a plain run (issue #897): %s",
                 ", ".join(repr(c) for c in conditions),
             )
             opts.set_state_switch_conditions(list(conditions))
+            # Issue #1147: the if() branches each root switches a rate law in.
+            guards = model._state_switch_guards_beside(covered)
+            if any(guards):
+                opts.set_state_switch_guards(list(guards))
         # Issue #959: an SBML model's thresholds are rooted by the loader's
         # discontinuity triggers, so they are covered here and are no state
         # switch, and a run pinned on one, unable to cross or pass, was not put

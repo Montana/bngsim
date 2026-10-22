@@ -924,6 +924,10 @@ class SolverOptions:
         """
         Set the rate-law conditions that read model state, as source text — one relational atom per entry, `Virus<1` (issue #150). Such a condition flips a branch of f at a crossing whose time moves with every parameter through the trajectory, so dx/dθ is DISCONTINUOUS there by the saltation term (f⁻−f⁺)·dt*/dθ — a term neither the analytic sensitivity RHS nor CVODES' difference quotient carries. run() resolves each through NetworkModel.state_switch_residual, registers that residual as a CVODE root so the crossing is located, and applies the jump there. A run without sensitivities roots the residuals it is given and applies no jump; it restarts at a crossing only where the flow clearly carries the state across (issue #897). Empty (the default) leaves the root set untouched.
         """
+    def set_state_switch_guards(self, guards: collections.abc.Sequence[str]) -> None:
+        """
+        Parallel to set_state_switch_conditions (issue #1147): for each, the if() branches its step or bend calls switch a rate law in, as an expression that reads 1 where one of them is on, or an empty string where one of its readings stands in no branch. A plain run steps on through a crossing whose every branch is off rather than restart.
+        """
     def set_state_switch_reactions(self, reactions: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]]) -> None:
         """
         Parallel to set_state_switch_conditions: the 0-based reactions whose rate law reads each condition. The sensitivity jump reads what a crossing changes from these reactions' flux alone, so no other species can hide or fake a jump (issue #763). A condition with no entry is judged over the whole right-hand side, as before; an empty entry means no listed rate law reads it, so the crossing is continuous. A jump the listed reactions do not account for is judged as before.

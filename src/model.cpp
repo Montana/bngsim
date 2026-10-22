@@ -1315,6 +1315,18 @@ const NetworkModel::StateSwitch *NetworkModel::state_switch(const std::string &c
     return &it->second.first;
 }
 
+int NetworkModel::compiled_expression(const std::string &expression_src) const {
+    auto it = impl_->compiled_expression_cache.find(expression_src);
+    if (it == impl_->compiled_expression_cache.end()) {
+        // A text that does not compile throws here and is not cached; compile()
+        // appends nothing for it, so asking again costs a compile, not memory.
+        it = impl_->compiled_expression_cache
+                 .emplace(expression_src, impl_->evaluator->compile(expression_src))
+                 .first;
+    }
+    return it->second;
+}
+
 const std::vector<int> &NetworkModel::event_trigger_residual_species(int event_idx0) const {
     static const std::vector<int> kEmpty;
     if (event_trigger_residual_expr(event_idx0) < 0) {
