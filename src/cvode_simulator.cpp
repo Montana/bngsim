@@ -14015,6 +14015,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         return wrote;
     };
 
+    // The state half a root tolerance past an output (issue #1124), read into
+    // one buffer for the run rather than one allocated for each row.
+    NVectorGuard row_ahead;
+
     for (int i = 1; i < n_out; ++i) {
         // Loop until we've reached t_out[i] (within numerical tolerance).
         while (true) {
@@ -15664,6 +15668,78 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             if (fire_rises_on_stop(t_out[i], past ? static_cast<double>(t_now) : t_out[i]) &&
                 !past) {
                 t_now = static_cast<sunrealtype>(t_out[i]);
+            }
+        } else if (n_events > 0 && sens.n_total == 0 && static_cast<double>(t_now) == t_out[i]) {
+            // An output CVODE interpolated to, from a step that went past it,
+            // with a trigger on the state that crosses within CVODE's root
+            // tolerance after it (issue #1124, item 2). `q' = 1; at q >= 2.5`
+            // with a sample at 2.5: q there is 2.4999999999999982 on [0, 2.5]
+            // (2.4999999999999996 on [0, 1, 2, 2.5, 3]), the trigger
+            // reads false, the root is found a few doubles later, and the row
+            // held the state from before the event (RR and SSA: after). The
+            // root search places that crossing no closer than its tolerance,
+            // so it is not after the row by anything the run can tell.
+            //
+            // So the triggers are read with the state CVODE gives half a root
+            // tolerance ahead, and the clock at the row: a trigger that rises
+            // there fires before the row is taken. Only the state is moved. A
+            // trigger on the clock is exact (`time >= tau` with tau a double
+            // after the row is after it, issue #950), and reads as before.
+            sunrealtype t_step_end = t_now;
+            CVodeGetCurrentTime(cvode_mem, &t_step_end);
+            sunrealtype h_last = 0.0;
+            CVodeGetLastStep(cvode_mem, &h_last);
+            // Half of CVODE's own root tolerance. CVodeGetDky reads a whole
+            // one past the end of the step, which is often the row itself (a
+            // step stopped on it): half is inside that by more than rounding.
+            const double t_ahead = t_out[i] + 50.0 * std::numeric_limits<double>::epsilon() *
+                                                  (std::fabs(static_cast<double>(t_step_end)) +
+                                                   std::fabs(static_cast<double>(h_last)));
+            if (!row_ahead) {
+                row_ahead = NVectorGuard(N_VClone(y));
+            }
+            // Where CVODE stands on a restart at the row and has taken no step
+            // from it (a stop on the sample), its history is the one from
+            // before the restart: q reset to 1 and the first derivative of the
+            // old state. An event on that stop that wrote the state left that
+            // derivative behind (`at time >= 2.5: k = -1` turned q back, and
+            // read ahead on q' = +1 it crossed 2.5 and fired a trigger that
+            // never rises). So the state ahead is a step of f at the row's own
+            // state there.
+            bool read_ahead = true;
+            if (h_last == 0.0) {
+                std::vector<double> f_row(static_cast<size_t>(ns), 0.0);
+                for (int si = 0; si < ns; ++si) {
+                    sp_vec_outer[si].concentration = y_data[si];
+                }
+                model.compute_derivs(t_out[i], y_data, f_row.data());
+                double *x_step = row_ahead.data();
+                for (int si = 0; si < ns; ++si) {
+                    x_step[si] = y_data[si] + (t_ahead - t_out[i]) * f_row[static_cast<size_t>(si)];
+                }
+            } else {
+                read_ahead = CVodeGetDky(cvode_mem, static_cast<sunrealtype>(t_ahead), 0,
+                                         row_ahead) == CV_SUCCESS;
+            }
+            if (read_ahead) {
+                const double *x_ahead = row_ahead.data();
+                impl_->sync_model_at(t_out[i], x_ahead, ns);
+                bool rises = false;
+                for (int ei = 0; ei < n_events && !rises; ++ei) {
+                    rises = !trigger_was_true[ei] && event_dormant[ei] == 0 &&
+                            read_trigger(ei, t_out[i]);
+                }
+                if (rises) {
+                    // The run goes on from the state ahead, within rounding
+                    // of the row's: the root is then behind it, and is not
+                    // found again.
+                    const std::vector<double> x_row(y_data, y_data + ns);
+                    std::copy(x_ahead, x_ahead + ns, y_data);
+                    if (!fire_rises_on_stop(t_out[i], t_out[i])) {
+                        std::copy(x_row.begin(), x_row.end(), y_data);
+                    }
+                }
+                impl_->sync_model_at(t_out[i], y_data, ns);
             }
         }
 
