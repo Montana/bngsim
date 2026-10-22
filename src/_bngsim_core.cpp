@@ -3689,8 +3689,6 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("tol", &bngsim::SteadyStateOptions::tol)
         // Issue #1001 — what `converged` asks: "residual" or "scaled".
         .def_readwrite("criterion", &bngsim::SteadyStateOptions::criterion)
-        // Issue #1001 — the state "scaled" takes its tolerances from; empty: the start.
-        .def_readwrite("criterion_scale", &bngsim::SteadyStateOptions::criterion_scale)
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
         // Issue #524 — "newton" from the given state, no burst, stability reported.
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)

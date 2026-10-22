@@ -5791,21 +5791,16 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // nanomolar product held that product to 1e-8, and the issue's
         // synthesis written `$Src -> $Src + X` was accepted at 0.73 of its
         // root after one step.
-        if (opts.criterion_scale.empty()) {
-            opts.criterion_scale.resize(static_cast<size_t>(ns));
-            for (int i = 0; i < ns; ++i)
-                opts.criterion_scale[static_cast<size_t>(i)] = model.species()[i].concentration;
-        } else if (static_cast<int>(opts.criterion_scale.size()) != ns) {
-            throw std::invalid_argument("criterion_scale has " +
-                                        std::to_string(opts.criterion_scale.size()) +
-                                        " values for " + std::to_string(ns) + " species");
-        }
+        opts.criterion_scale.resize(static_cast<size_t>(ns));
+        for (int i = 0; i < ns; ++i)
+            opts.criterion_scale[static_cast<size_t>(i)] = model.species()[i].concentration;
         // The floor is the model's, from the initial concentrations it declares
         // (what reset() returns to), and only where none is above 0 from the
         // state the solve starts at. Taken from that state, a solve seeded
         // with SHP2_base_model's own answer was refused at it (a step of 7.7e3
         // tolerances where it had been accepted at 0.195): its species that
-        // decay to nothing set the floor.
+        // decay to nothing set the floor. So did steady_states()' draws, which
+        // reach 1e-22 of a species, and no start of egfr_path's was accepted.
         const auto smallest = [&](const auto &value) {
             double floor = std::numeric_limits<double>::infinity();
             for (int i : sub.included) {
@@ -5816,10 +5811,6 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
             }
             return floor;
         };
-        for (int i : sub.included) {
-            if (!std::isfinite(opts.criterion_scale[static_cast<size_t>(i)]))
-                throw std::invalid_argument("criterion_scale is not finite");
-        }
         double floor = smallest([&](int i) { return model.species()[i].initial_conc; });
         if (!std::isfinite(floor))
             floor = smallest([&](int i) { return opts.criterion_scale[static_cast<size_t>(i)]; });

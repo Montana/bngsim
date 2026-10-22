@@ -8863,41 +8863,6 @@ class Simulator:
         shared source, per solve — so a dose-response sweep pays that per entry
         rather than once for the batch. ``r.rhs_backend`` reports what ran.
         """
-        return self._steady_state_batch(
-            params,
-            states=states,
-            tol=tol,
-            max_time=max_time,
-            method=method,
-            rtol=rtol,
-            atol=atol,
-            max_steps=max_steps,
-            n_workers=n_workers,
-            mask=mask,
-            newton_burst=newton_burst,
-            criterion=criterion,
-        )
-
-    def _steady_state_batch(
-        self,
-        params,
-        *,
-        states,
-        tol,
-        max_time,
-        method,
-        rtol,
-        atol,
-        max_steps,
-        n_workers,
-        mask,
-        newton_burst,
-        criterion,
-        criterion_scale=None,
-    ):
-        """:meth:`steady_state_batch`, with the state ``criterion="scaled"``
-        takes its tolerances from given rather than each entry's start (issue
-        #1001): :meth:`steady_states` draws its starts, and gives the model's."""
         if self._method != "ode":
             raise ValueError(
                 "steady_state_batch() is only supported for "
@@ -8971,8 +8936,6 @@ class Simulator:
             opts = SteadyStateOptions()
             opts.tol = tol
             opts.criterion = criterion
-            if criterion_scale is not None:
-                opts.criterion_scale = criterion_scale
             opts.max_time = max_time
             opts.method = method
             opts.newton_burst = newton_burst
@@ -9163,23 +9126,13 @@ class Simulator:
         # A $-fixed one has a zero row there, and the unmasked solve keeps it
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
-        # Issue #1001: the criterion's tolerances are taken from the model's
-        # own state, as from the state a solve starts at. A draw's went to
-        # 1e-22, and no start of egfr_path's passed.
-        results = self._steady_state_batch(
-            None,
+        results = self.steady_state_batch(
             states=starts,
-            tol=tol,
-            max_time=1e6,
             method="newton",
-            rtol=None,
-            atol=None,
-            max_steps=None,
+            newton_burst=False,
+            tol=tol,
             n_workers=n_workers,
             mask=~held if held.any() else None,
-            newton_burst=False,
-            criterion="scaled",
-            criterion_scale=[float(v) for v in y0],
         )
         return SteadyStates.cluster(
             results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol, laws=L

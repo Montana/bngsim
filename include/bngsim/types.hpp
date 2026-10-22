@@ -1197,19 +1197,15 @@ struct SteadyStateOptions {
     // ||f(y)||_2 / n_species < tol, a number in the model's units of
     // concentration per time, kept for comparisons with run_network.
     std::string criterion = "scaled";
-    // The state the "scaled" criterion's tolerances are taken from, one value
-    // per species, as atol="auto" takes them: atol_i = rtol·max(|y_i|,
-    // |scale_i|, floor) at a state y, the floor the smallest initial
-    // concentration above 0 the model declares of a species the test steps
-    // (where none is, the smallest |scale_i| above 0). Empty, the default: the
-    // state the solve starts from, which the march's atol="auto" is taken from
-    // too. Without it, a species decaying from 10 was held to 1e-17 at 0,
-    // which the march, at 1e-7 there, never reached (it crossed 0 to -6e-10).
-    // A caller that draws its own starts gives the model's state, as
-    // steady_states() does: its draws reach 1e-22 of a species.
+    // Set by find_steady_state, for "scaled" (issue #1001): the state its
+    // tolerances are taken from, the one the solve starts at, as atol="auto"
+    // takes the march's: atol_i = rtol·max(|y_i|, |scale_i|, floor) at a state
+    // y. Without it, a species decaying from 10 was held to 1e-17 at 0, which
+    // the march, at 1e-7 there, never reached (it crossed 0 to -6e-10). The
+    // floor is the smallest initial concentration above 0 the model declares
+    // of a species the test steps (where none is, the smallest |scale_i| above
+    // 0; where none is either, 0). And whether the step is taken.
     std::vector<double> criterion_scale;
-    // Set by find_steady_state, for "scaled": the floor (0 where nothing in
-    // criterion_scale is above 0), and whether the step is taken.
     double criterion_floor = 0.0;
     bool criterion_by_distance = false;
     double max_time = 1e6; // max integration time for the integration path

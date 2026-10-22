@@ -515,7 +515,7 @@ roots.basins          # root index per start, -1 where Newton did not converge
 
 A `$`-fixed species, and one `mask=` leaves out, keeps its value in every start and is not an unknown of the solve, though a law's dependent species is rebuilt from the law as the others move.
 
-**Scale.** A root is accepted by the default criterion's first test, with the tolerances of the model's own state rather than of the start it was reached from: draws reach 1e-22 of a species, and held to tolerances from there no start of `egfr_path` was accepted. A model at so small a scale that most starts are under `tol` before Newton moves them is refused, since the residual is no guide to where the roots are there.
+**Scale.** A root is accepted by the default criterion's first test, whose floor is the model's, the smallest initial concentration it declares: draws reach 1e-22 of a species, and with the floor taken there no start of `egfr_path` was accepted. A model at so small a scale that most starts are under `tol` before Newton moves them is refused, since the residual is no guide to where the roots are there.
 
 **Failed starts.** Newton does not converge from every start (52 of 200 on the toggle, most of them near zero, where its Hill terms turn NaN). Those starts are counted in `n_failed` and have basin -1. A write-only accumulator fails every start, since it makes Newton's system singular; exclude it with `mask=~model.is_pure_sink()`.
 

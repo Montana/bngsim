@@ -1135,3 +1135,22 @@ def test_a_step_along_a_continuum_says_nothing_and_the_runs_decide(data_dir, met
     run.set_state(y)
     bngsim.Simulator(run, method="ode").run(t_span=(0.0, 1e6), n_points=2, atol="auto")
     np.testing.assert_allclose(np.asarray(run.get_state()), y, rtol=1e-6)
+
+
+_SHP2 = Path(__file__).resolve().parents[2] / "benchmarks/models/net/ode/SHP2_base_model.net"
+
+
+@pytest.mark.skipif(not _SHP2.exists(), reason="benchmark net SHP2_base_model not present")
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_solve_seeded_with_its_own_answer_converges_again(method):
+    # The floor is the model's, from what it declares. Taken from the state a
+    # solve starts at, the species SHP2 drains to nothing set it, and a solve
+    # seeded with its own answer was refused there (a step of 7.7e3).
+    model = bngsim.Model.from_net(str(_SHP2))
+    sim = bngsim.Simulator(model, method="ode")
+    first = sim.steady_state(method="integration")
+    assert first.converged
+    model.set_state(np.asarray(first.concentrations))
+    again = sim.steady_state(method=method)
+    assert again.converged
+    assert again.newton_distance <= 1.0
