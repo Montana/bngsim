@@ -254,6 +254,8 @@ def test_a_refusal_in_a_burst_free_solve_is_raised(tmp_path):
     sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode", codegen=False)
     with pytest.raises(bngsim.SimulationError, match="mratio.*not reliable"):
         sim.steady_state_batch(states=[[1.0]], method="newton", newton_burst=False)
+    with pytest.raises(bngsim.SimulationError, match="mratio.*not reliable"):
+        sim.steady_states(n_starts=5)
 
 
 _SINK_TOGGLE_NET = """begin parameters
@@ -426,3 +428,14 @@ def test_the_default_bound_follows_a_small_model_down():
     y0 = np.array([2e-12, 5e-11])
     assert _default_sampling_bound(y0, np.zeros((0, 2))) == pytest.approx(5e-10)
     assert _default_sampling_bound(np.zeros(2), np.zeros((0, 2))) == 10.0
+
+
+def test_the_building_block_leaves_a_fixed_species_out_too(tmp_path):
+    """steady_state_batch(newton_burst=False) from a state of the caller's own,
+    with no mask: the fixed species' zero row made the solve fail in one step."""
+    path = tmp_path / "fixed.net"
+    path.write_text(_FIXED_NET, encoding="utf-8")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    (r,) = sim.steady_state_batch(states=[[1.0, 3.0]], method="newton", newton_burst=False)
+    assert r.converged, r
+    np.testing.assert_allclose(r.concentrations, [1.0, 4.0], rtol=1e-9)

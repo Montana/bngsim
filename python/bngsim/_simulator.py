@@ -8592,7 +8592,9 @@ class Simulator:
             directly, with no integration burst first, and reports the root's
             stability (``root_stability``, ``eigenvalues``) instead of rejecting
             an unstable one: what :meth:`steady_states` enumerates roots with.
-            Default ``True``, the two-tier solver of :meth:`steady_state`.
+            A ``$``-fixed species is then left out of the unknowns, whose
+            Newton system it would make singular. Default ``True``, the
+            two-tier solver of :meth:`steady_state`.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
@@ -8646,6 +8648,15 @@ class Simulator:
         self._raise_if_no_steady_state_to_solve_for("steady_state_batch()")
 
         mask_selector = _resolve_ss_mask(mask, self._model)
+        # Issue #524 — the unmasked Newton system keeps a $-fixed species as an
+        # unknown with a zero row. The two-tier solver answers from integration
+        # when that factorization fails; a burst-free one has nothing to fall
+        # back on, so the species leaves the unknowns.
+        if not newton_burst and method in ("newton", "kinsol"):
+            fixed = np.asarray(self._model._core.species_is_fixed, dtype=bool)
+            if fixed.any() and not fixed.all():
+                base = mask_selector if mask_selector is not None else [1] * fixed.size
+                mask_selector = [0 if f else v for v, f in zip(base, fixed, strict=True)]
 
         from bngsim._bngsim_core import (
             SteadyStateOptions,
@@ -8782,7 +8793,9 @@ class Simulator:
         ``tol`` is absolute, as in :meth:`steady_state`. A model at so small a
         scale that most starts are already under it is refused; at law totals
         above about ``1e7`` the law's round-off alone can exceed it, and a
-        root is then reported as a failed start.
+        root is then reported as a failed start. Below concentrations of about
+        ``1e-9``, KINSOL's step limits are absolute too, and most starts fail
+        even with a ``tol`` scaled to match.
 
         Parameters
         ----------
@@ -8838,12 +8851,15 @@ class Simulator:
         # concentrations "converged" from all 200 starts, in 0 or 1 steps, to
         # 200 states that are not roots, and clustered them as one.
         probe = self._model.clone()
-        before = np.array(
-            [
-                np.linalg.norm(np.asarray(probe.rhs(y))[~held]) / max(int((~held).sum()), 1)
-                for y in starts
-            ]
-        )
+        try:
+            before = np.array(
+                [
+                    np.linalg.norm(np.asarray(probe.rhs(y))[~held]) / max(int((~held).sum()), 1)
+                    for y in starts
+                ]
+            )
+        except RuntimeError as e:  # a rate law refusing (issue #589), as the batch reports it
+            raise SimulationError(f"steady_states(): {e}") from e
         if np.mean(before < tol) > 0.5:
             raise SimulationError(
                 f"steady_states(): tol={tol:g} is above the residual ||f||/n at "
