@@ -702,7 +702,7 @@ def test_a_masked_species_that_feeds_kept_ones_is_stepped(tmp_path, keep):
     assert ss.newton_distance == pytest.approx(want, rel=1e-6)
 
 
-# X' = if(X < 1e-9, 1e-6, 1e3): positive everywhere. Y, settled at 1 beside it,
+# X' = if(X < c, klo, 1e3): positive everywhere. Y, settled at 1 beside it,
 # makes the difference-quotient step 1.5e-8, past X's switch.
 NEAR_ZERO_JUMP_NET = """begin parameters
     1 x0 {x0!r}
@@ -721,19 +721,137 @@ begin groups
     1 Xobs 1
 end groups
 begin functions
-    1 fr() if(Xobs<1e-9,1e-6,1e3)
+    1 fr() if(Xobs<{c!r},{klo!r},1e3)
 end functions
 """
 
 
-@pytest.mark.parametrize("x0", [0.0, 2.5e-10, 9e-10])
+@pytest.mark.parametrize(
+    "c,klo,x0",
+    [
+        (1e-9, 1e-6, 0.0),
+        (1e-9, 1e-6, 2.5e-10),
+        (1e-9, 1e-6, 9e-10),
+        (1e-12, 1e-6, 0.0),
+        (1e-20, 1e-30, 5e-21),
+    ],
+)
 @pytest.mark.parametrize("jacobian", ["fd", "auto"])
-def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, x0, jacobian):
-    # The backward probe would go below 0; keeping the forward quotient let
-    # the jump through. The secant to 0 reads the law's own slope, 0.
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, c, klo, x0, jacobian, method):
+    # The backward probe would go below 0. Keeping the forward quotient let the
+    # jump through; the secant to 0 reads the law's own slope, 0, and where X
+    # is too small for that secant to be read (9e-15, 3e-41), a forward quotient
+    # at half the step grows across the jump.
     path = tmp_path / "near_zero.net"
-    path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0))
+    path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0, c=c, klo=klo))
+    for max_time in (1e-30, 1.0, 1e6):
+        ss = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+        ).steady_state(criterion="scaled", method=method, max_time=max_time)
+        assert not ss.converged, max_time
+
+
+# A in a 1 mL medium taken up into a 1 fL cell: A -> S, S a write-only sink.
+# The law weighs S by the volume ratio, A + 1e-12·S.
+UPTAKE_SBML = """<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">
+  <model id="uptake">
+    <listOfCompartments>
+      <compartment id="medium" size="{medium!r}" constant="true" spatialDimensions="3"/>
+      <compartment id="cell" size="1e-15" constant="true" spatialDimensions="3"/>
+    </listOfCompartments>
+    <listOfSpecies>
+      <species id="A" compartment="medium" initialConcentration="1"
+               hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="S" compartment="cell" initialConcentration="0"
+               hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="k" value="1" constant="true"/>
+    </listOfParameters>
+    <listOfReactions>
+      <reaction id="uptake" reversible="false">
+        <listOfReactants>
+          <speciesReference species="A" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <listOfProducts>
+          <speciesReference species="S" stoichiometry="1" constant="true"/>
+        </listOfProducts>
+        <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+          <apply><times/><ci>k</ci><ci>A</ci><ci>medium</ci></apply>
+        </math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>"""
+
+
+@pytest.mark.parametrize("medium", [1e-3, 1.0])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_sink_in_a_small_compartment_takes_up_its_law(medium, method):
+    # Its coefficient, 1e-12 of A's (1e-15 at 1 L), read as rounding: the law
+    # kept A for its dependent, and A was accepted where it started.
+    model = bngsim.Model.from_sbml_string(UPTAKE_SBML.format(medium=medium))
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", method=method, mask=~model.is_pure_sink()
+    )
+    assert ss.converged
+    assert abs(ss.concentrations[0]) < 1e-8
+
+
+# A -> B with a rate that reads a counter t, run at 1 from 0: t has no root.
+COUNTER_NET = """begin parameters
+    1 k1  0.1
+    2 one 1.0
+end parameters
+begin species
+    1 A() 100
+    2 B() 0
+    3 t() 0
+end species
+begin functions
+    1 _rateLaw1() k1*(1+0*t)
+end functions
+begin reactions
+    1 1 2 _rateLaw1
+    2 0 3 one
+end reactions
+begin groups
+    1 A_tot  1
+    2 B_tot  2
+    3 t      3
+end groups
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_masked_counter_is_held(tmp_path, method):
+    # Its row reads no state, so stepped it made the matrix singular at every
+    # state, and A never converged.
+    path = tmp_path / "counter.net"
+    path.write_text(COUNTER_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        criterion="scaled", method=method, mask=[True, False, False], max_time=2000.0
+    )
+    assert ss.converged
+    assert ss.concentrations[0] < 1e-6
+
+
+_B358 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000358/BIOMD0000000358_url.xml"
+)
+
+
+@pytest.mark.skipif(
+    not _B358.exists(), reason="rr_parity corpus model BIOMD0000000358 not present"
+)
+def test_a_species_far_below_its_step_keeps_its_forward_column():
+    # A species at 1.7e-44: its secant to 0 moves the rows by less than their
+    # rounding, the column lost its entries, and the root was refused.
     ss = bngsim.Simulator(
-        bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+        bngsim.Model.from_sbml(str(_B358)), method="ode", jacobian="fd"
     ).steady_state(criterion="scaled")
-    assert not ss.converged
+    assert ss.converged
+    assert ss.newton_distance <= 1.0

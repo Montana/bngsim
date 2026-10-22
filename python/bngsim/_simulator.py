@@ -7386,7 +7386,8 @@ class Simulator:
               a differenced Jacobian straddles a jump in a rate law. ``mask``
               says which species are measured, not which move: the step moves
               every species by its own equation but a ``$``-fixed one and a
-              masked one nothing reads, which is held. A species that
+              masked one that nothing reads or that reads nothing (a counter),
+              which is held. A species that
               starts at 0 is held to ``rtol`` times the floor, so one whose
               steady state is smaller than that is within tolerance of 0, as
               under ``atol="auto"``. Above

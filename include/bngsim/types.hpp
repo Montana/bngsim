@@ -1184,7 +1184,8 @@ struct SteadyStateOptions {
     // (where none starts above 0, the largest species of the state or of the
     // root it steps to). The mask says which species are measured, not which
     // move: every species moves by its own equation but a $-fixed one and a
-    // masked one nothing reads, which is held. No unit of
+    // masked one that nothing reads or that reads nothing, which is held. No
+    // unit of
     // concentration or of time is in it. Above 512 unknowns the step is not
     // taken and the solve is the residual one, `tol` and all.
     std::string criterion = "residual";

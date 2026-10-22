@@ -1641,11 +1641,13 @@ static std::vector<int> ss_unknown_species(const NetworkModel &model, const Cons
 // the unknowns, stepped by their own equations, and the laws the rest follow
 // from. A mask says which species are measured, not which move: the step is
 // the system's own. A $-fixed species is not stepped, and neither is a masked
-// species that nothing reads (an empty column of the Jacobian's pattern, the
-// write-only accumulator of NetworkModel::pure_sink_species): it is held, and
-// takes up the change of one law it is in, the laws being reduced so that no
-// other one holds it. Since nothing reads it, no other step depends on how the
-// change falls among such species. Every other species moves.
+// species with no step of its own to take: one nothing reads (an empty column
+// of the Jacobian's pattern, the write-only accumulator of
+// NetworkModel::pure_sink_species), or one whose rate reads nothing (an empty
+// row: a counter run at a constant rate, which has no root, and with which the
+// matrix was singular at every state). It is held, and takes up the change of
+// one law it is in, the laws being reduced so that no other one holds it.
+// Every other species moves.
 //
 // Holding masked species, as the solvers do, left a kept dependent of a law
 // with nothing to move it: A -> S under mask=~model.is_pure_sink() (S the
@@ -1671,14 +1673,19 @@ static SsDistanceSystem ss_distance_system(const NetworkModel &model, const Resi
     const auto &species = model.species();
     const int ns = model.n_species();
     const auto un = static_cast<size_t>(ns);
-    std::vector<char> unread(un, 0);
+    std::vector<char> unread(un, 0); // held: masked, and no step of its own
     bool any_unread = false;
     const auto &sp = model.jacobian_sparsity();
     if (sp.n == ns && sp.col_ptrs.size() == un + 1) {
+        std::vector<char> reads(un, 0); // a nonempty row of the pattern
+        for (const auto i : sp.row_indices) {
+            if (i >= 0 && i < ns)
+                reads[static_cast<size_t>(i)] = 1;
+        }
         for (int j = 0; j < ns; ++j) {
             const auto uj = static_cast<size_t>(j);
-            unread[uj] =
-                !sub.includes(j) && !species[j].fixed && sp.col_ptrs[uj + 1] == sp.col_ptrs[uj];
+            unread[uj] = !sub.includes(j) && !species[j].fixed &&
+                         (sp.col_ptrs[uj + 1] == sp.col_ptrs[uj] || !reads[uj]);
             any_unread = any_unread || unread[uj];
         }
     }
@@ -1699,7 +1706,28 @@ static SsDistanceSystem ss_distance_system(const NetworkModel &model, const Resi
         return s;
     }
 
+    // Each species' column is scaled to its largest coefficient, so that a
+    // tolerance read off a row tells rounding from a coefficient that is
+    // merely small: a law weighted by compartment size (issue #758) holds a
+    // species in a 1 fL cell beside one in 1 mL at 1e-12, and a tolerance of
+    // 1e-12 of the row took the sink of A -> S for no member of its law, which
+    // was then accepted where it started.
+    std::vector<double> col_scale(un, 0.0);
+    for (const auto &row : cl.coefficients) {
+        for (size_t i = 0; i < un; ++i) {
+            col_scale[i] = std::max(col_scale[i], std::abs(row[i]));
+        }
+    }
+    for (auto &c : col_scale) {
+        if (!(c > 0.0))
+            c = 1.0;
+    }
     std::vector<std::vector<double>> rows = cl.coefficients;
+    for (auto &row : rows) {
+        for (size_t i = 0; i < un; ++i) {
+            row[i] /= col_scale[i];
+        }
+    }
     const auto eliminate = [&](size_t r, size_t col) {
         for (size_t o = 0; o < rows.size(); ++o) {
             if (o == r || rows[o][col] == 0.0)
@@ -1769,6 +1797,7 @@ static SsDistanceSystem ss_distance_system(const NetworkModel &model, const Resi
             if (std::abs(rows[r][i]) > 1e-12 * big) {
                 if (pivot[i])
                     p = i;
+                rows[r][i] *= col_scale[i];
             } else {
                 rows[r][i] = 0.0;
             }
@@ -3053,37 +3082,53 @@ static void ss_lu_solve(const std::vector<double> &lu, int n, const std::vector<
     b.swap(x);
 }
 
+// Below this fraction of the probe step, a species' secant to 0 is not taken.
+static constexpr double kSecantResolvable = 1e-4;
+
 // The differenced Jacobian `J` (forward quotients, f(y) = `f0`) with the
 // columns `cols` taken backwards instead, at the same step, or to 0 where the
-// step would take the species below it (issue #1001). A column of a species at
-// 0, or whose backward probe leaves the right-hand side non-finite, keeps its
-// forward quotient.
+// step would take the species below it (issue #1001). A column whose backward
+// probe leaves the right-hand side non-finite keeps its forward quotient.
+//
+// Where the step to 0 is below kSecantResolvable of the probe it moves the rows
+// by less than their rounding (a species at 1.7e-44 in BIOMD0000000358 lost
+// its column, and a root was refused), and a species at 0 has no other side.
+// There the column is taken forwards again at half the step. Across a jump
+// within the step the quotient is the jump over the step, and grows as the
+// step shrinks; a smooth law's holds or, where its slope is 0, shrinks with it
+// (a dimerization near 0). A quotient that grows by half, by more than the
+// row's rounding (kFdNoise·eps of its terms, |f| and each |J·y|), sets
+// `*straddles`: `if(X<1e-12, 1e-6, 1e3)` with X at 9e-15 and a species of 1
+// beside it was accepted on the forward column alone.
 static std::vector<double> ss_backward_columns(SteadyStateRhs &rhs, const double *y,
                                                const std::vector<double> &f0,
                                                const std::vector<double> &J, int ns,
                                                const ResidualSubspace &sub,
-                                               const std::vector<int> &cols) {
+                                               const std::vector<int> &cols, bool *straddles) {
     const auto un = static_cast<size_t>(ns);
     std::vector<double> back = J;
+    *straddles = false;
     const double y_scale = state_probe_scale(y, ns, sub.excluded);
+    std::vector<double> terms(un, 0.0);
+    for (size_t i = 0; i < un; ++i) {
+        double t = std::abs(f0[i]);
+        for (size_t j = 0; j < un; ++j)
+            t += std::abs(J[j * un + i] * y[j]);
+        terms[i] = t;
+    }
     std::vector<double> y_pert(y, y + ns), f1(un), col(un);
     for (int j : cols) {
         const auto uj = static_cast<size_t>(j);
-        const double h = fd_probe(y[j], -state_fd_step(y[j], y_scale), &y_pert[uj]);
-        double step = h;
+        double step = fd_probe(y[j], -state_fd_step(y[j], y_scale), &y_pert[uj]);
+        bool halved = false;
         if (y[j] >= 0.0 && y_pert[uj] < 0.0) {
-            // Below 0 is no side a concentration is on (a dimerization's
-            // secant to -h/2 is about 0, and refused a root at h/2), so the
-            // secant is taken to 0. Keeping the forward quotient instead let a
-            // jump within a step above 0 through: if(X<1e-9, 1e-6, 1e3), with
-            // a species of 1 beside it to set the step, was accepted. At 0
-            // there is no other side.
-            if (!(y[j] > 0.0)) {
-                y_pert[uj] = y[j];
-                continue;
+            if (y[j] >= kSecantResolvable * std::abs(step)) {
+                y_pert[uj] = 0.0;
+                step = -y[j];
+            } else {
+                step = fd_probe(y[j], 0.5 * std::abs(step), &y_pert[uj]);
+                halved = true;
             }
-            y_pert[uj] = 0.0;
-            step = -y[j];
         }
         rhs.eval(0.0, y_pert.data(), f1.data());
         y_pert[uj] = y[j];
@@ -3092,9 +3137,20 @@ static std::vector<double> ss_backward_columns(SteadyStateRhs &rhs, const double
             col[i] = (f1[i] - f0[i]) / step;
             finite = finite && std::isfinite(col[i]);
         }
-        if (finite) {
-            std::copy(col.begin(), col.end(), back.begin() + static_cast<std::ptrdiff_t>(uj * un));
+        if (!finite)
+            continue;
+        if (halved) {
+            for (size_t i = 0; i < un; ++i) {
+                const double forward = J[uj * un + i];
+                if (std::abs(col[i]) > 1.5 * std::abs(forward) &&
+                    std::abs(col[i] - forward) * std::abs(step) >
+                        kFdNoise * std::numeric_limits<double>::epsilon() * terms[i]) {
+                    *straddles = true;
+                    return back;
+                }
+            }
         }
+        std::copy(col.begin(), col.end(), back.begin() + static_cast<std::ptrdiff_t>(uj * un));
     }
     return back;
 }
@@ -3245,8 +3301,12 @@ static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
             if (!model.species()[dep].fixed)
                 cols.push_back(dep);
         }
-        const std::vector<double> back =
-            newton_step(ss_backward_columns(rhs, y, f, J, ns, sub, cols), f);
+        bool straddles = false;
+        const std::vector<double> back_J =
+            ss_backward_columns(rhs, y, f, J, ns, sub, cols, &straddles);
+        if (straddles)
+            return inf;
+        const std::vector<double> back = newton_step(back_J, f);
         distance = back.empty() ? inf : std::max(distance, size_of(back));
         if (!(distance <= 1.0))
             return distance;

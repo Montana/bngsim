@@ -89,7 +89,8 @@ or of the root it steps to. A species that starts at 0 is held to `rtol` times
 the floor, as under `atol="auto"`: one whose steady state is smaller than that is
 within tolerance of 0. `mask=` says which species are measured, not which move:
 the step moves every species by its own equation but a `$`-fixed one and a
-masked one nothing reads (a write-only sink), which is held.
+masked one that nothing reads (a write-only sink) or that reads nothing (a
+counter run at a constant rate), which is held.
 Neither side has a unit of concentration or of time in it. The
 march, the bursts, the KINSOL polish and the test at the start all ask it.
 Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes
