@@ -1,7 +1,7 @@
 # MIR (vendored) — in-process micro-JIT for the codegen RHS
 
 This is a pruned vendor copy of [MIR](https://github.com/vnmakarov/mir) by
-Vladimir Makarov, pinned at commit `99c65079` (MIT-licensed; see `LICENSE`).
+Vladimir Makarov, pinned at commit `439a90a2` (MIT-licensed; see `LICENSE`).
 MIR's own `README.md` is preserved alongside this file.
 
 ## Why it's here (GH #78)
