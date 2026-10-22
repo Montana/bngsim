@@ -1043,10 +1043,9 @@ class Simulator:
                 )
             from bngsim._bngsim_core import RuleMonkeySimulator
             from bngsim._network_free_checks import (
-                clock_readers,
                 refuse_rulemonkey_compartments,
                 refuse_rulemonkey_energy_misreads,
-                time_indexed_table_functions,
+                rulemonkey_clock,
             )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
@@ -1059,8 +1058,9 @@ class Simulator:
             # RuleMonkey's waiting times round away there. A table indexed by the
             # clock cannot be offset (bngsim/_rulemonkey_clock.py), and a model
             # with one runs on model time as before.
-            reads_clock = bool(clock_readers(xml_path))
-            self._rm_clock_offset = reads_clock and not time_indexed_table_functions(xml_path)
+            readers, tables = rulemonkey_clock(xml_path)
+            reads_clock = bool(readers)
+            self._rm_clock_offset = reads_clock and not tables
             if self._rm_clock_offset:
                 from bngsim._rulemonkey_clock import offset_clock_xml
 

@@ -207,9 +207,15 @@ Session control:
   reads the clock (`time()` or a table function indexed by time) that raises
   `SimulationError`. `solver_stats["n_steps"]` counts the events since
   `initialize`, as an `NfsimSession`'s does.
-- **`step_to(time, *, timeout)`** — Advance without recording output;
-  honors the same `timeout` semantics as `simulate(...)`.
+- **`step_to(time, *, timeout)`** — Advance to `time` on the model's clock
+  without recording output; honors the same `timeout` semantics as
+  `simulate(...)`.
 - **`destroy()`** — Release the live RuleMonkey session
+
+Every time a session takes or reports (`current_time`, the clock read through
+`evaluate`, a `save_state` snapshot) is model time. A model that reads the
+clock in its functions has its events placed on time elapsed since the
+session's start, which keeps a late start's waiting times (issue #1063).
 
 Parameters and counts:
 - **`set_param(name, value)`** — Set a parameter before initialization

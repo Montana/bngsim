@@ -156,16 +156,22 @@ def clock_readers(xml_path: str | Path) -> list[str]:
     """The ids of the functions in *xml_path* that read the clock as RuleMonkey
     does (:func:`rulemonkey_clock_ref`), or through a table indexed by time.
     Empty when the file cannot be parsed."""
+    return rulemonkey_clock(xml_path)[0]
+
+
+def rulemonkey_clock(xml_path: str | Path) -> tuple[list[str], list[str]]:
+    """:func:`clock_readers` of *xml_path*, and the ids of those that are
+    tables indexed by time, from one parse."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
-        return []
+        return [], []
     clock = rulemonkey_clock_ref(rulemonkey_symbols(root))
-    return [
-        f.get("id", "?")
-        for f in _function_elements(root)
-        if _reads_time(f, clock) or _indexed_by_time(f)
-    ]
+    functions = _function_elements(root)
+    return (
+        [f.get("id", "?") for f in functions if _reads_time(f, clock) or _indexed_by_time(f)],
+        [f.get("id", "?") for f in functions if _indexed_by_time(f)],
+    )
 
 
 # The rate-law types the vendored NFsim implements (NFinput.cpp,

@@ -50,6 +50,7 @@ from bngsim._exceptions import ModelError
 from bngsim._network_free_checks import (
     _function_elements,
     _indexed_by_time,
+    _local,
     rulemonkey_clock_ref,
     rulemonkey_symbols,
 )
@@ -121,6 +122,61 @@ def offset_clock_text(xml: str, xml_dir: str | Path) -> str:
     else:
         raise ModelError("the BNG XML has no <ListOfParameters> to add the clock's offset to")
     return xml
+
+
+def evaluate_symbols(xml_path: str | Path) -> set[str]:
+    """The names RuleMonkey's ``evaluate_expression`` binds ahead of its clock
+    in *xml_path*: a parameter, observable or function of the name, except that
+    a parameter named ``t`` leaves ``t`` the clock there, since the engine binds
+    the clock's alias after the parameters (Engine::evaluate_expression in
+    engine.cpp)."""
+    root = ET.parse(str(xml_path)).getroot()
+    symbols = rulemonkey_symbols(root)
+    if not any(
+        (el.get("name") if _local(el.tag) == "Observable" else el.get("id")) == "t"
+        for el in root.iter()
+        if _local(el.tag) in ("Observable", "Function")
+    ):
+        symbols.discard("t")  # a parameter t, if any, does not hide the clock here
+    return symbols
+
+
+# A RuleMonkey state file: its format marker, then the molecule-type schema's
+# fingerprint, then the clock (Engine::write_state in engine.cpp).
+_STATE_MARKER = "RM_STATE_V2"
+_STATE_CLOCK_LINE = 2
+
+
+def state_to_model_time(path: str | Path, t0: float) -> None:
+    """Write the clock of the state file at *path*, saved on time elapsed since
+    *t0*, as the model's time, as a session on model time saves it."""
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8", errors="surrogateescape").split("\n")
+    if len(lines) <= _STATE_CLOCK_LINE or lines[0].strip() != _STATE_MARKER:
+        raise RuntimeError(f"unexpected RuleMonkey state file format in {path}")
+    lines[_STATE_CLOCK_LINE] = repr(t0 + float(lines[_STATE_CLOCK_LINE]))
+    path.write_text("\n".join(lines), encoding="utf-8", errors="surrogateescape")
+
+
+@contextlib.contextmanager
+def state_at_elapsed_zero(path: str | Path) -> Iterator[tuple[str, float]]:
+    """The state file at *path*, with its clock moved to 0 in a temporary copy,
+    and the model time it held: a session loads the copy on elapsed time from
+    there. A file this cannot read is handed through as it is, at 0, for
+    RuleMonkey to reject in its own words."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="surrogateescape").split("\n")
+        if len(lines) <= _STATE_CLOCK_LINE or lines[0].strip() != _STATE_MARKER:
+            raise ValueError
+        t0 = float(lines[_STATE_CLOCK_LINE])
+    except (OSError, ValueError):
+        yield str(path), 0.0
+        return
+    lines[_STATE_CLOCK_LINE] = "0"
+    with tempfile.TemporaryDirectory(prefix="bngsim-rm-state-") as tmp:
+        out = Path(tmp) / "state"
+        out.write_text("\n".join(lines), encoding="utf-8", errors="surrogateescape")
+        yield str(out), t0
 
 
 @contextlib.contextmanager

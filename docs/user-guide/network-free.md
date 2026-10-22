@@ -174,22 +174,23 @@ not refused; NFsim reads it correctly at each output time.
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
-times small at a large `t_start`. So does a one-shot `method="rm"` run of a
-model that reads the clock in its functions: wherever RuleMonkey reads the
-clock, it reads `time()` plus the run's `t_start`, and its events are placed on
-elapsed time (issue #1063). Before that its waiting times were rounded once the total propensity
-times |t| neared 1e15, and from t = 1e12 the run was biased with no error.
+times small at a large `t_start`. So does a `method="rm"` run or a
+`RuleMonkeySession` of a model that reads the clock in its functions: wherever
+RuleMonkey reads the clock, it reads `time()` plus the run's or the session's
+start, and its events are placed on elapsed time, while every time it takes or
+reports is model time (issue #1063). Before that its waiting times were rounded
+once the total propensity times |t| neared 1e15, and from t = 1e12 a run or a
+session was biased with no error.
 
-A `RuleMonkeySession`, and any run of a model with a table indexed by time,
-still places its events on absolute time, so the same rounding applies there,
-as it does to `method="ssa"` on any model (issue #1059): keep such a run's times
-moderate. (Offsetting a table's clock would index it through a function, and
-RuleMonkey 3.11.0 recurses without end on a table whose counter is a function,
-richardposner/RuleMonkey#111.)
-RuleMonkey integrates a rate that reads the clock on panels of a thousandth of a
-span, so on absolute time `method="rm"` refuses a span too short for the
-doubles near its times to place them (a span of 2 at t = 1e13), rather than
-return a run that never fires.
+A model with a table indexed by time still places its events on absolute time,
+so the same rounding applies there, as it does to `method="ssa"` on any model
+(issue #1059): keep such a run's times moderate. (Offsetting a table's clock
+would index it through a function, and RuleMonkey 3.11.0 recurses without end on
+a table whose counter is a function, richardposner/RuleMonkey#111.) RuleMonkey
+integrates a rate that reads the clock on panels of a thousandth of a span, so
+on absolute time `method="rm"` refuses a span too short for the doubles near its
+times to place them (a span of 2 at t = 1e13), rather than return a run that
+never fires.
 
 ### Arrhenius (energy) rules
 
@@ -297,8 +298,11 @@ with RuleMonkeySession("model.xml") as rm:
     result = rm.simulate(0, 100, n_points=101)
 ```
 
-A RuleMonkey session's clock is model time. `initialize(seed, t_start=5)` puts
-the seed state at t = 5; left unset, the first `simulate` sets it from its own
+A RuleMonkey session's clock is model time: `current_time`, `step_to`, the
+clock read through `evaluate`, and the time a `save_state` snapshot holds are
+all model time, though its events are placed on elapsed time where the model
+allows (see "Rate laws that read `time()`" above). `initialize(seed,
+t_start=5)` puts the seed state at t = 5; left unset, the first `simulate` sets it from its own
 start for a model that reads the clock, provided nothing has moved the session
 first. A segment that starts at `current_time` runs on the clock. One that
 starts elsewhere continues from `current_time` and is labelled with the times
