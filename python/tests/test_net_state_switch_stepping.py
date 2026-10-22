@@ -1288,3 +1288,74 @@ def test_a_released_hold_logs_what_main_logs(tmp_path):
     path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
     assert _batch_ends_between(path, "0", 1.0, 2.4)
     assert _batch_ends_between(path, "1", 1.0, 2.4)
+
+
+# Issue #1064: a slide along S = 1 written over a scale H. Each spelling is the
+# same surface at every H.
+_SCALED_SLIDE_NET = """\
+begin parameters
+    1 H {H}
+    2 dlt 0.01
+end parameters
+begin functions
+    1 f() if({cond},1,-1)
+    2 up() dlt
+end functions
+begin species
+    1 S() 27.95
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def _scaled_slide(tmp_path, H, cond, hold):
+    """n_steps, S(29.5) to the bit, and what CVODE logged, in a subprocess as
+    above."""
+    path = tmp_path / f"scaled_{H}.net"
+    path.write_text(_SCALED_SLIDE_NET.format(H=H, cond=cond))
+    script = textwrap.dedent(f"""
+        import bngsim
+        m = bngsim.Model.from_net({str(path)!r})
+        r = bngsim.Simulator(m).run(sample_times=[0.0, 28.0, 29.5], rtol=1e-3, atol=1e-5)
+        print("RUN", r.solver_stats["n_steps"], float(r.species[-1][0]).hex())
+    """)
+    env = dict(os.environ)
+    if hold is None:  # the default, whatever the caller's shell sets
+        env.pop("BNGSIM_STATE_SWITCH_HOLD", None)
+    else:
+        env["BNGSIM_STATE_SWITCH_HOLD"] = hold
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
+    )
+    run = re.search(r"^RUN (\d+) (\S+)$", done.stdout, re.MULTILINE)
+    assert run is not None, done.stdout + done.stderr
+    return int(run.group(1)), run.group(2), done.stdout.replace(run.group(0), "") + done.stderr
+
+
+@pytest.mark.parametrize(
+    "cond, hold",
+    [("Sobs*H<H", "0"), ("Sobs*H<H+0*time()", None)],
+    ids=["every crossing tested", "reads the time"],
+)
+def test_a_residual_scaled_by_a_constant_steps_alike(tmp_path, cond, hold):
+    """A residual that reads exactly 0.0 while a run steps on past its root is
+    reported as a tiny value on the side it is held to (#897). That value was
+    DBL_MIN. CVODE's root search ranks a sign change by g(tmid) over
+    g(tmid) - g(tlo), and against a residual past ~9e15 that ratio underflowed
+    to 0: the search took the sign change for none, moved the wrong end of its
+    bracket, and asked for times outside the step. At H = 5.18e21 this run took
+    51,990 steps where H = 1 takes 55,002, and logged 105 "Illegal value for t"
+    errors; at 1e23, 47,424 and 280. The surface is the same at every H, so the
+    steps and the answer are too."""
+    reference = _scaled_slide(tmp_path, "1", cond, hold)
+    assert reference[2].strip() == ""
+    for H in ("5.18e21", "1e23", "1e100", "1e-20"):
+        steps, bits, log = _scaled_slide(tmp_path, H, cond, hold)
+        assert "Illegal value for t" not in log, H
+        assert (steps, bits) == reference[:2], H
