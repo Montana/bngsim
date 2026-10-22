@@ -82,12 +82,14 @@ def _doc(n, shape):
     return _sbml(rules)
 
 
-def _sbml(rules):
-    """S decays at k = 0.5 in c; Sn sits in cv, which the last rule sizes."""
+def _sbml(rules, constants=()):
+    """S decays at k = 0.5 in c; Sn sits in cv, which the last rule sizes.
+    ``constants`` are (id, value) parameters beside k."""
     rule_xml = "".join(
         f'<assignmentRule variable="{v}"><math {_M}>{b}</math></assignmentRule>' for v, b in rules
     )
     params = "".join(f'<parameter id="{v}" constant="false"/>' for v, _ in rules if v != "cv")
+    params += "".join(f'<parameter id="{p}" value="{x}" constant="true"/>' for p, x in constants)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
 <listOfCompartments><compartment id="c" size="1" constant="true"/>
@@ -260,3 +262,38 @@ def test_a_relation_that_cannot_be_read_at_a_point_is_left_to_cancel():
     rules.append(("cv", cv.replace("<otherwise>", below + "<otherwise>")))
     model = bngsim.Model.from_sbml_string(_sbml(rules))
     assert len(model._core.event_trigger_sources()) == 4
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_two_roots_a_run_constant_puts_on_one_instant_over_a_diamond(scale):
+    """``piecewise(1, r21 > a, 3, r21 > b, 2)`` with a = b = 1.4, and the same
+    with ``2*r21 > b`` and b = 2.8: two roots that run constants put on one
+    instant, which are rescaled as one (#1132). Whether they are is asked of
+    their differences; past 5,000 nodes that is answered term by term, as
+    ``expand`` and ``cancel`` walk the tree. Unanswered there, the two jumps
+    each rescaled, and [Sn] was off by up to 140x, as the seed drew them."""
+    n = 22
+    last = _ci(f"r{n - 1}")
+    second = last if scale == 1 else _ap("times", _cn(2), last)
+    below = f"<piece>{_cn(3)}{_ap('gt', second, _ci('b'))}</piece>"
+    cv = _pw(_cn(1), _ap("gt", last, _ci("a")), _cn(2))
+    nonlinear = [
+        (f"r{i}", _ap("plus", _ap("sin", _ci(f"r{i - 1}")), _ap("cos", _ci(f"r{i - 2}"))))
+        for i in range(2, n)
+    ]
+    rules = [("r0", _ci("S")), ("r1", _ap("plus", _ci("S"), _cn(1))), *nonlinear]
+    rules.append(("cv", cv.replace("<otherwise>", below + "<otherwise>")))
+    xml = _sbml(rules, [("a", 1.4), ("b", 1.4 * scale)])
+    times = np.linspace(0.0, 4.0, 81)
+    s = 10 * np.exp(-0.5 * times)
+    v = np.where(_diamond(s, s + 1, n) > 1.4, 1.0, 2.0)
+    assert len(set(v)) > 1
+    away = _away(v)
+    for seed in range(4):
+        began = time.perf_counter()
+        model = bngsim.Model.from_sbml_string(xml)
+        assert time.perf_counter() - began < 2.0
+        sn = _sn(model, times, seed=seed)
+        np.testing.assert_allclose(
+            sn[away], (5 * v[0] / v)[away], rtol=1e-8, err_msg=f"seed {seed}"
+        )

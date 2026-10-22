@@ -430,6 +430,81 @@ def _preprocess_exprtk(expr: str) -> str:
     return _coerce_booleans_used_as_numbers(s)
 
 
+_piecewise_of_if_cache: dict = {}
+
+
+def _piecewise_of_if(sp):
+    """The ``Piecewise`` an ``if()`` parses to, built without sympy's set
+    theory for a condition that has an ``if()`` in it (issue #540).
+
+    sympy will not keep a ``Piecewise`` in a condition: ``ExprCondPair`` folds
+    the condition into one and rewrites that as an ``ITE`` chain, and the
+    rewrite computes ``as_set()`` of every inner condition
+    (``solve_univariate_inequality``, ``periodicity``, ``simplify``). That was
+    about 2 s for each of 12 rate laws of ``mt_music_sequencer``, whose
+    ``if(ds1() > 0, ...)`` reads a ``ds1()`` of nested chord ``if()`` chains, and
+    the model declined on its derivation budget after 8 of 14 reactions.
+
+    The sets are only used to find a condition the ones before it leave
+    nothing past, and cut the chain there; with a final ``(b, True)``, which
+    the fold of a translated ``if()`` always has, the chain is complete
+    without them. This builds that chain (``ITE(c1, b1, ITE(c2, b2, ...))``,
+    relationals made canonical, as the rewrite returns it), so ``ExprCondPair``
+    finds no ``Piecewise`` to rewrite. A fold with no default is left to sympy.
+
+    A branch of the fold is a truth value only where the condition compared an
+    ``if()``. Where the condition is the ``if()`` itself, ``if(if(F != 1, F, 0),
+    a, b)``, its branches are numbers, which ExprTk reads as true where they are
+    nonzero. ``ITE`` would take a bare ``F`` as a Boolean atom and simplify it
+    against ``F != 1`` (``ITE(Ne(F, 1), F, False)`` became ``F``, true at F = 1
+    where ExprTk reads the inner ``if()`` as 0), and refuse any other number,
+    which sympy's rewrite only escaped where its sets cut that branch off. So
+    a branch that is not already a comparison or a logical form of them is
+    written as ExprTk reads it, ``Ne(value, 0)``.
+    """
+    built = _piecewise_of_if_cache.get("built")
+    if built is not None:
+        return built
+    from sympy.core.relational import Relational
+    from sympy.functions.elementary.piecewise import piecewise_fold
+    from sympy.logic.boolalg import ITE, BooleanAtom, BooleanFunction
+
+    def _truth(value):
+        if isinstance(value, (BooleanAtom, Relational, BooleanFunction)):
+            return value
+        return sp.Ne(value, 0)
+
+    def _canonical(cond):
+        # sympy.core.relational._canonical, spelled out: that name is private,
+        # and this runs from _build_local_dict, outside _exprtk_to_sympy's try,
+        # so a sympy that renamed it would fail the load instead of declining.
+        return cond.xreplace({r: r.canonical for r in cond.atoms(Relational)})
+
+    def _without_piecewise(cond):
+        folded = piecewise_fold(cond)
+        if not isinstance(folded, sp.Piecewise):
+            return folded
+        pairs = list(folded.args)
+        if pairs[-1].cond != sp.true:
+            return cond
+        last = _truth(pairs[-1].expr)
+        for branch, c in reversed(pairs[:-1]):
+            last = ITE(c, _truth(branch), last)
+        return _canonical(last)
+
+    def piecewise(*pairs, **options):
+        fixed = []
+        for pair in pairs:
+            expr, cond = pair
+            if isinstance(cond, sp.Basic) and cond.has(sp.Piecewise):
+                cond = _without_piecewise(cond)
+            fixed.append((expr, cond))
+        return sp.Piecewise(*fixed, **options)
+
+    _piecewise_of_if_cache["built"] = piecewise
+    return piecewise
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -457,7 +532,7 @@ def _build_local_dict(preprocessed: str, sp):
         # model may name a parameter after one, so there is nothing to lose a
         # tie with.
         **engine_sympy_bindings(sp),
-        "Piecewise": sp.Piecewise,
+        "Piecewise": _piecewise_of_if(sp),
         "Not": sp.Not,
         "And": sp.And,
         "Or": sp.Or,
@@ -531,6 +606,114 @@ def _exprtk_to_sympy(expr: str):
 # ─── Function inlining ─────────────────────────────────────────────────────
 
 
+# Past this many characters, the text written out function by function is read
+# through sympy instead, each function once (issue #1124, item 4 has the same
+# limit for an event's resize).
+_INLINE_TEXT_LIMIT = 20_000
+
+
+def _inlined_length(expr: str, func_map: dict[str, str]) -> int | None:
+    """How long ``expr`` written out by :func:`_inline_functions` would be, without
+    writing it, or ``None`` where its functions read each other in a cycle."""
+    length: dict[str, int] = {}
+    on_path: set[str] = set()
+
+    def of(text: str) -> int | None:
+        n = len(text)
+        for name in _IDENT_RE.findall(text):
+            if name not in func_map:
+                continue
+            if name in on_path:
+                return None
+            if name not in length:
+                on_path.add(name)
+                got = of(func_map[name])
+                on_path.discard(name)
+                if got is None:
+                    return None
+                length[name] = got
+            n += length[name] + 2 - len(name)
+        return n
+
+    try:
+        return of(expr)
+    except RecursionError:
+        return None
+
+
+def _compact_inlined(expr: str, func_map: dict[str, str]) -> str | None:
+    """``expr`` with its functions written in, as sympy prints the result, where
+    writing them in as text would pass :data:`_INLINE_TEXT_LIMIT`; else ``None``.
+
+    Written in as text, a function that more than one path reaches is copied
+    once per path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made a
+    rate law that reads the last one exponential in the depth: the first ODE run
+    took 1.2 s at 26 rules and a codegen run 2.8 s, spent tokenizing, parsing and
+    compiling the text and its derivatives (issue #1124, item 5). Here each
+    function is parsed once and put in by reference, and sympy's own arithmetic
+    collects what the paths share: that diamond is a sum of two terms. The
+    printed result is used where it is short; where it is not (a diamond that
+    does not collect, ``sin(r_{i-1}) + cos(r_{i-2})``), or anything in it cannot
+    be parsed or printed, the text is written out as before.
+    """
+    predicted = _inlined_length(expr, func_map)
+    if predicted is None or predicted <= _INLINE_TEXT_LIMIT:
+        return None
+    try:
+        import sympy as sp
+    except ImportError:
+        return None
+
+    def symbol_of(name: str):
+        alias = _alias_keyword_param(name) if name in _PY_KEYWORD_PARAM_NAMES else name
+        return sp.Symbol(alias)
+
+    built: dict[str, object] = {}
+
+    def parsed(text: str):
+        sym = _exprtk_to_sympy(text)
+        if sym is None:
+            return None
+        subs = {}
+        for name in set(_IDENT_RE.findall(text)) & set(func_map):
+            if name not in built:
+                built[name] = None  # under way: a cycle reads no value
+                built[name] = parsed(func_map[name])
+            if built[name] is None:
+                return None
+            subs[symbol_of(name)] = built[name]
+        return sym.xreplace(subs) if subs else sym
+
+    try:
+        top = parsed(expr)
+    except (RecursionError, Exception):  # noqa: BLE001 - any failure keeps the text path
+        return None
+    if top is None:
+        return None
+    # The printed tree, a shared node counted once per use, before printing it.
+    size: dict[int, int] = {}
+    stack = [(top, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if id(node) in size:
+            continue
+        if expanded:
+            size[id(node)] = 1 + sum(size[id(a)] for a in node.args)
+        else:
+            stack.append((node, True))
+            stack.extend((a, False) for a in node.args if id(a) not in size)
+    if size[id(top)] * 4 > _INLINE_TEXT_LIMIT:
+        return None
+    # The law keeps its own form (no derivative rewrites), and is used only where
+    # it is much shorter than the text: a law just past the limit whose terms do
+    # not collect (BIOMD0000000628, 21,041 characters written out) printed longer
+    # than that, and paid the parse and print on top for nothing.
+    printed = sympy_to_exprtk(top, rewrites=False)
+    if printed is None or 2 * len(printed) > predicted:
+        return None
+    return printed
+
+
 def _inline_functions(
     expr: str,
     func_map: dict[str, str],
@@ -557,6 +740,10 @@ def _inline_functions(
         _seen = frozenset()
     if _depth > 64:
         return None
+    if _depth == 0:
+        compact = _compact_inlined(expr, func_map)
+        if compact is not None:
+            return compact
 
     # Intersect the identifiers actually present in ``expr`` with ``func_map``,
     # rather than running a regex for every function name. ``func_map`` can hold
@@ -2475,9 +2662,16 @@ def _folds_nonfinite(rewritten) -> bool:
     return bool(rewritten.has(sp.zoo, sp.oo, -sp.oo, sp.nan))
 
 
-def sympy_to_exprtk(expr) -> str | None:
+def sympy_to_exprtk(expr, *, rewrites: bool = True) -> str | None:
     """Emit a sympy expression as an ExprTk string, or ``None`` if it contains
-    a construct the emitter cannot represent."""
+    a construct the emitter cannot represent.
+
+    ``rewrites=False`` prints the expression as it stands, without
+    :func:`_emitter_rewrites`. Those are for a derivative about to be evaluated;
+    a rate law printed back for its consumers to parse and differentiate again
+    (:func:`_compact_inlined`) has to keep its own form, or a Hill term
+    ``S^n/(K^n + S^n)`` comes back as ``1/(K^n/S^n + 1)``, 0/0 at S = 0, and
+    its derivative there is NaN (issue #1124, item 5)."""
     try:
         import sympy as sp  # noqa: F401
     except ImportError:
@@ -2485,10 +2679,11 @@ def sympy_to_exprtk(expr) -> str | None:
     expr = _normalize_booleans(expr)
     if not _is_emittable(expr):
         return None
-    try:
-        expr = _emitter_rewrites(expr)
-    except Exception:
-        return None
+    if rewrites:
+        try:
+            expr = _emitter_rewrites(expr)
+        except Exception:
+            return None
     if _folds_nonfinite(expr):
         return None
     if not _printer_cache:
