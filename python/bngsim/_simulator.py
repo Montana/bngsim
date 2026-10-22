@@ -1346,15 +1346,7 @@ class Simulator:
             # codegen built the model but declined that RHS (a dilution term that
             # reads a rate, issue #1124 item 7), the run failed with "no codegen
             # .so is loaded", which a codegen=True does nothing for.
-            if self._sensitivity_ic and not self._codegen_provides_sens_rhs():
-                reason = self.sens_rhs_decline_reason
-                raise SensitivityUnsupportedError(
-                    "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
-                    "difference quotient has no parameter to perturb for an initial "
-                    "value. Codegen built this model but declined that RHS"
-                    + (f" ({str(reason).rstrip('.')})" if reason else "")
-                    + ", so the initial-value columns cannot be computed for this model."
-                )
+            self._refuse_sensitivity_ic_without_sens_rhs()
 
         # Validate and store sensitivity method
         if sensitivity_method not in ("staggered", "simultaneous"):
@@ -3402,6 +3394,23 @@ class Simulator:
             pass
         return unrooted
 
+    def _refuse_sensitivity_ic_without_sens_rhs(self) -> None:
+        """Refuse ``sensitivity_ic`` where the attached codegen has no analytic
+        sensitivity RHS (issue #1124, item 7). Asked at construction, and again
+        after :meth:`_build_codegen_again`, since a rebuild (issue #708) can
+        decline what the first build had; otherwise the run reached the C++
+        backstop with a message about the artifact, not the model."""
+        if not self._sensitivity_ic or self._codegen_provides_sens_rhs():
+            return
+        reason = self.sens_rhs_decline_reason
+        raise SensitivityUnsupportedError(
+            "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
+            "difference quotient has no parameter to perturb for an initial "
+            "value. Codegen built this model but declined that RHS"
+            + (f" ({str(reason).rstrip('.')})" if reason else "")
+            + ", so the initial-value columns cannot be computed for this model."
+        )
+
     def _build_codegen_again(self) -> None:
         """Drop the artifact and build one for the model as it is."""
         model = self._model
@@ -3427,6 +3436,8 @@ class Simulator:
             # Back on the analytic right-hand side: nothing to watch for.
             self._codegen_watch_gate = False
             self._codegen_built_for(model)
+        # The rebuilt artifact may have declined what the first build had.
+        self._refuse_sensitivity_ic_without_sens_rhs()
 
     def _expression_sens_support(self) -> dict[str, str | None]:
         """Memoized ``{function_name: unsupported_reason_or_None}`` for GH #198

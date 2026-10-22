@@ -60,3 +60,20 @@ def test_an_initial_value_column_where_the_rhs_builds():
     t = np.asarray(result.time)
     col = np.asarray(result.sensitivities_ic)[:, 0, 0]
     np.testing.assert_allclose(col, np.exp(-0.2 * t), rtol=1e-6)
+
+
+def test_the_refusal_is_asked_again_after_a_codegen_rebuild(monkeypatch):
+    """The check ran at construction only. A rebuild of the sensitivity code
+    (issue #708) that declines the analytic RHS has to refuse the same way,
+    not reach the C++ backstop at run time."""
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(_READS_NO_RATE), method="ode", sensitivity_ic=["S"]
+    )
+    assert sim.has_analytic_sens_rhs
+    # The rebuilt artifact declines the RHS: the question is whether it is asked.
+    monkeypatch.setattr(bngsim.Simulator, "_codegen_provides_sens_rhs", lambda self: False)
+    with pytest.raises(
+        bngsim.SensitivityUnsupportedError,
+        match=r"sensitivity_ic needs the analytic sensitivity RHS",
+    ):
+        sim._build_codegen_again()
