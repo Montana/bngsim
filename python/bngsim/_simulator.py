@@ -62,7 +62,7 @@ from bngsim._exceptions import (
     StopConditionMet,
 )
 from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
-from bngsim._model import Model
+from bngsim._model import _STEP_DECIDES_WHY, Model
 from bngsim._result import Result, _as_selector_list, _resolve_output_selector
 from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
 from bngsim._ssa_validation import validate_for_ssa
@@ -7834,13 +7834,9 @@ class Simulator:
             "result.sensitivities at the last time point"
         )
         why = (
-            "A species far below the state's scale is stepped by many times itself at "
-            "the first, which reads a term of second order in it as a secant across it, "
-            "and the second misses a term that reads it through a sum with something "
-            "much larger (a total minus what is bound): which of the two is right is not "
-            'known. A closed-form Jacobian has neither failure; jacobian="auto" uses it '
-            'where the model has one, which jacobian="fd" does not. Otherwise take the '
-            f"columns from {time_course}."
+            f"{_STEP_DECIDES_WHY} A closed-form Jacobian has neither failure; "
+            'jacobian="auto" uses it where the model has one, which jacobian="fd" does '
+            f"not. Otherwise take the columns from {time_course}."
         )
         stepped = ", ".join(result.sens_fd_own_step_species[:5])
         if len(result.sens_fd_own_step_species) > 5:
@@ -11133,8 +11129,15 @@ class SteadyStateResult:
         if not meta:
             return np.empty((0, n_params), dtype=np.float64)
         rows = [self._output_sensitivity_row(m) for m in meta]
-        for m, row in zip(meta, rows, strict=True):
-            self._raise_if_masked_out(m, row)
+        # Every selector without a derivative is named at once, so a caller
+        # fixes its selection in one pass rather than one refusal at a time.
+        reasons = [
+            reason
+            for m, row in zip(meta, rows, strict=True)
+            if (reason := self._no_derivative_reason(m, row)) is not None
+        ]
+        if reasons:
+            raise ValueError("\n".join(reasons))
         return np.stack(rows, axis=0)
 
     def _caller_masked_species(self) -> list[str]:
@@ -11143,8 +11146,9 @@ class SteadyStateResult:
         targets = set(self._rule_target_species)
         return [self._species_names[i] for i in self.excluded_species if i not in targets]
 
-    def _raise_if_masked_out(self, meta: dict[str, Any], row: np.ndarray) -> None:
-        """Refuse, by name, an output whose row is not finite (issue #1124, item 10).
+    def _no_derivative_reason(self, meta: dict[str, Any], row: np.ndarray) -> str | None:
+        """Why an output's row is not finite, by name, or None where it is (issue
+        #1124, item 10). :meth:`output_sensitivities` refuses with every reason.
 
         A species ``mask=`` left out of the solve has no steady value, so neither
         has anything that reads it, and its row is NaN by construction (issue
@@ -11157,16 +11161,15 @@ class SteadyStateResult:
         :attr:`sensitivity` tensor and the two blocks keep their NaN rows.
         """
         if np.all(np.isfinite(row)):
-            return
+            return None
         kind = meta["kind"]
         values = self._expression_values if kind == "expression" else self._observable_values
         if kind != "species" and meta["index"] < values.size:
             value = float(values[meta["index"]])
             if not np.isfinite(value):
-                # Every partial of a non-finite value is NaN, so the solve's
-                # record names the first row-less species whether it is read or
-                # not: the value is the reason, not the mask.
-                raise ValueError(
+                # A non-finite value has no derivative, whatever it reads: the
+                # value is the reason, not the mask.
+                return (
                     f"output_sensitivities: {meta['selector']!r} has no steady-state "
                     f"derivative: its value at the steady state is {value}, which is "
                     "not finite."
@@ -11184,7 +11187,7 @@ class SteadyStateResult:
             # species the mask left out is named.
             named = masked
         if not named:
-            raise ValueError(
+            return (
                 f"output_sensitivities: {meta['selector']!r} has no finite "
                 "steady-state derivative: its row is not finite, and it reads no "
                 "species mask= left out of the solve."
@@ -11195,7 +11198,7 @@ class SteadyStateResult:
             reads = f"reads {named[0]}, which"
         else:
             reads = f"reads one or more of {', '.join(named)}, which"
-        raise ValueError(
+        return (
             f"output_sensitivities: {meta['selector']!r} has no steady-state "
             f"derivative: it {reads} mask= left out of the solve, so it has no "
             "steady value (issue #74). Select outputs that do not read it, or keep "

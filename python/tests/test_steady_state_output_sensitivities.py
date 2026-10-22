@@ -965,3 +965,35 @@ def test_an_output_with_no_finite_value_is_refused_without_blaming_the_mask(sink
     np.testing.assert_allclose(ss.output_sensitivities("observable:A")[0], [2, -4], rtol=1e-6)
     with pytest.raises(ValueError, match=r"'expression:logL'.*value at the steady state is -inf"):
         ss.output_sensitivities("expression:logL")
+
+
+def test_every_selector_without_a_derivative_is_named_at_once():
+    """Issue #1124, item 10. A selection with two outputs that read a masked
+    species was refused for the first alone, so the caller met the second only
+    after fixing the first. Both are named in one refusal, and an output with a
+    row is not."""
+    m = bngsim.Model.from_antimony_string(
+        "species A = 1; species B = 0; k1 = 1; k2 = 0.5;\nJ0: -> A; k1; J1: A -> B; k2*A;"
+    )
+    ss = bngsim.Simulator(m, method="ode").steady_state(
+        sensitivity_params=["k1", "k2"], mask=~np.asarray(m.is_pure_sink()), **_TIGHT
+    )
+    with pytest.raises(ValueError) as refusal:
+        ss.output_sensitivities(["observable:A", "observable:B", "species:B"])
+    message = str(refusal.value)
+    assert "'observable:B'" in message and "'species:B'" in message
+    assert "'observable:A'" not in message
+
+
+def test_the_solve_records_no_missing_species_for_a_value_that_is_not_finite():
+    """The FD sweep took any nonzero partial for a read, and every partial of
+    -inf is NaN, so ``logL := log10(L)`` at L = 0 recorded the masked ``B`` as
+    the species with no row it read. It reads none, and the record says so."""
+    m = bngsim.Model.from_antimony_string(
+        "species A = 1; species B = 0; species L = 0; k1 = 1; k2 = 0.5; kL = 1;\n"
+        "J0: -> A; k1; J1: A -> B; k2*A; JL: L -> ; kL*L;\nlogL := log10(L);"
+    )
+    ss = bngsim.Simulator(m, method="ode").steady_state(
+        sensitivity_params=["k1", "k2"], mask=~np.asarray(m.is_pure_sink())
+    )
+    assert ss._expression_sens_missing[ss.expression_names.index("logL")] is None
