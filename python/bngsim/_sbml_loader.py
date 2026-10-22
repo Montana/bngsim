@@ -8610,34 +8610,40 @@ def _build_model_from_sbml_doc_in_context(doc):
                     subs[s] = inner
             return _xreplace_once(g, subs)
 
+        def _lattice(func, args):
+            # And(*args) or Or(*args), put together as they are: the
+            # constructor sorts its arguments by their size as trees
+            # (`ordered`). An argument that decides it decides it, and one
+            # that cannot is dropped, as there.
+            kept: dict = {}
+            for a in args:
+                if a is func.zero:
+                    return a
+                if a is not func.identity:
+                    kept.update(dict.fromkeys(a.args if a.func is func else (a,)))
+            if len(kept) < 2:
+                return next(iter(kept), func.identity)
+            obj = _sp.Basic.__new__(func, *kept)
+            obj._argset = frozenset(kept)
+            return obj
+
         def _rebuilt(e, args):
             # e.func(*args), with a Piecewise and its pieces put together
             # without the constructors' walk of each condition (`replace`,
             # `has`): a condition over a diamond of rules (`r21 > 0.5`) is
             # exponentially longer as a tree than in memory (issue #1124, item
-            # 6). A piece whose condition is false is dropped, and one whose
-            # condition is true ends it, as the constructor has them. Except a
-            # condition that reads a piecewise: the pair's own constructor
-            # folds it into relations of their own (`r > 5` under `r :=
-            # piecewise(S, S > 3, 2*S)` into S > 5 and 2*S > 5), each
+            # 6). As the constructor has them, a piece whose condition is false
+            # is dropped, one whose condition is true ends it, and pieces in a
+            # row that read alike are one, on either condition: `piecewise(r0,
+            # S > 3, r1)` with r0 and r1 both S is S, and its S > 3 no root.
+            # Except a condition that reads a piecewise: the pair's own
+            # constructor folds it into relations of their own (`r > 5` under
+            # `r := piecewise(S, S > 3, 2*S)` into S > 5 and 2*S > 5), each
             # continuous. Left as it was, `r > 5` jumped at S = 3 itself, and
             # its root fired there beside S > 3's: two rescales at one instant,
-            # the one drawn last kept. And so are an And and an Or, whose
-            # constructor sorts their arguments by their size as trees
-            # (`ordered`): an argument that decides it decides it, and one
-            # that cannot is dropped, as there.
+            # the one drawn last kept.
             if isinstance(e, (_sp.And, _sp.Or)):
-                kept: dict = {}
-                for a in args:
-                    if a is e.zero:
-                        return a
-                    if a is not e.identity:
-                        kept.update(dict.fromkeys(a.args if a.func is e.func else (a,)))
-                if len(kept) < 2:
-                    return next(iter(kept), e.identity)
-                obj = _sp.Basic.__new__(e.func, *kept)
-                obj._argset = frozenset(kept)
-                return obj
+                return _lattice(e.func, args)
             if isinstance(e, _ExprCondPair):
                 if any(isinstance(x, _sp.Piecewise) for x in _subexpressions(args[1])):
                     return e.func(*args)
@@ -8647,7 +8653,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                 for p in args:
                     if p.cond is _sp.false:
                         continue
-                    pieces.append(p)
+                    last = pieces[-1].expr if pieces else None
+                    if last is not None and (
+                        last is p.expr or (hash(last) == hash(p.expr) and last == p.expr)
+                    ):
+                        p = _rebuilt(p, (last, _lattice(_sp.Or, (pieces[-1].cond, p.cond))))
+                        pieces[-1] = p
+                    else:
+                        pieces.append(p)
                     if p.cond is _sp.true:
                         break
                 if pieces and pieces[0].cond is _sp.true:
@@ -8752,8 +8765,8 @@ def _build_model_from_sbml_doc_in_context(doc):
             # term by term, as relations that share a root are written (`r21 >
             # 1.4` beside `2*r21 < 2.8`), then read at two points, to 30
             # digits, and only a pair whose ratio is the same at both is
-            # cancelled; one read that is not a number, or a d0 near 0 there,
-            # leaves the pair to `cancel` too.
+            # cancelled; a read that is not a number, or raises, or a d0 near 0
+            # there, leaves the pair to `cancel` too.
             if _tree_size(d) + _tree_size(d0) > _JUMP_TEXT_NODES:
                 terms: list[dict] = [{}, {}]
                 for x, out in zip((d, d0), terms, strict=True):
@@ -8772,7 +8785,10 @@ def _build_model_from_sbml_doc_in_context(doc):
                     at = {
                         s: _sp.Float(0.25 + ((k + 1) * step) % 1, 30) for k, s in enumerate(names)
                     }
-                    a, b = _xreplace_once(d, at), _xreplace_once(d0, at)
+                    try:
+                        a, b = _xreplace_once(d, at), _xreplace_once(d0, at)
+                    except Exception:  # Max of a complex number raises
+                        break
                     if not all(v.is_Float or v.is_Rational for v in (a, b)) or abs(b) < 1e-8:
                         break
                     seen.append(a / b)

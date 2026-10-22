@@ -180,11 +180,12 @@ def test_a_short_diamond_is_written_out_as_before():
 
 def test_a_condition_that_reads_a_piecewise_rule_is_read_as_its_relations():
     """``r := piecewise(S, S > 3, 2*S)`` under ``cv := piecewise(A, r > 5, B)``,
-    with A and B piecewise on S > 3 too. Put together as it was, ``r > 5``
-    jumped at S = 3 itself, and its root fired there beside S > 3's: two
+    with A and B piecewise on S > 3 too. The pair's own constructor reads
+    ``r > 5`` as S > 5 and 2*S > 5, each continuous, and S > 3's root alone
+    fires at S = 3; main does. Put together raw, as #1145 first had it, ``r >
+    5`` jumped at S = 3 itself, and its root fired there beside S > 3's: two
     rescales at the instant, the one drawn last kept, and [Sn] at t = 2.5 was
-    25/6 for 10/3 on half the seeds. Its pair's own constructor reads it as S > 5
-    and 2*S > 5, each continuous, and S > 3's root alone fires at S = 3."""
+    25/6 for 10/3 on half the seeds."""
     r = _pw(_ci("S"), _ap("gt", _ci("S"), _cn(3)), _ap("times", _cn(2), _ci("S")))
     a = _pw(_cn(1), _ap("gt", _ci("S"), _cn(3)), _cn(1.5))
     b = _pw(_cn(2), _ap("gt", _ci("S"), _cn(3)), _cn(2.5))
@@ -222,3 +223,40 @@ def test_two_relations_over_a_diamond_load_in_linear_time(shape, roots):
     assert len(triggers) == 2 * roots
     away = _away(v)
     np.testing.assert_allclose(_sn(model, times)[away], (5 * v[0] / v)[away], rtol=1e-8)
+
+
+def test_a_piecewise_whose_pieces_read_alike_has_no_root():
+    """``r := piecewise(r0, S > 3, r1)`` with r0 and r1 both S is S, as the
+    Piecewise constructor merges pieces in a row that read alike. Put together
+    raw, its S > 3 was a root, with two events that rescaled by 1."""
+    rules = [
+        ("r0", _ci("S")),
+        ("r1", _ci("S")),
+        ("r", _pw(_ci("r0"), _ap("gt", _ci("S"), _cn(3)), _ci("r1"))),
+        ("cv", _ap("plus", _cn(1), _ci("r"))),
+    ]
+    model = bngsim.Model.from_sbml_string(_sbml(rules))
+    assert model._core.event_trigger_sources() == []
+    times = np.linspace(0.0, 4.0, 9)
+    v = 1 + 10 * np.exp(-0.5 * times)
+    np.testing.assert_allclose(_sn(model, times), 5 * v[0] / v, rtol=1e-8)
+
+
+def test_a_relation_that_cannot_be_read_at_a_point_is_left_to_cancel():
+    """``max(sqrt(S - 0.9), r19) > 0.5`` beside ``S < 1``: the two are read at
+    a point before ``cancel`` is asked whether they share a root, and at S =
+    0.87 the square root is complex, which ``Max`` refuses by raising. The
+    model failed to load; main loads it."""
+    n = 20
+    last = _ci(f"r{n - 1}")
+    root = _ap("root", _cn(2), _ap("minus", _ci("S"), _cn(0.9)))
+    below = f"<piece>{_cn(3)}{_ap('lt', _ci('S'), _cn(1))}</piece>"
+    cv = _pw(_cn(1), _ap("gt", _ap("max", root, last), _cn(0.5)), _cn(2))
+    nonlinear = [
+        (f"r{i}", _ap("plus", _ap("sin", _ci(f"r{i - 1}")), _ap("cos", _ci(f"r{i - 2}"))))
+        for i in range(2, n)
+    ]
+    rules = [("r0", _ci("S")), ("r1", _ap("plus", _ci("S"), _cn(1))), *nonlinear]
+    rules.append(("cv", cv.replace("<otherwise>", below + "<otherwise>")))
+    model = bngsim.Model.from_sbml_string(_sbml(rules))
+    assert len(model._core.event_trigger_sources()) == 4
