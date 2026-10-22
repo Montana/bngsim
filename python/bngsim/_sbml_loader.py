@@ -8692,7 +8692,37 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     roots.append((d, [(r, _sp.Integer(1))]))
             by_name = _rules_by_name() if roots else {}
-            for _, rels in roots:
+
+            # Roots that a run constant puts on one instant (#1124): `time < t1`
+            # and `time < t2` with t1 = t2, or `S > a` and `S > b` with a = b. The
+            # two jump events read the state from their trigger time, so the last
+            # one's rescale is what stays, and each read the other's condition
+            # as already flipped: [Sn] kept 2/3 of itself for 1/3. Each now
+            # rescales by the whole instant, every coinciding condition read on
+            # the side it leaves and the side it reaches, and a sibling whose
+            # root is elsewhere is read as it stands, as before. A sibling's
+            # difference is this one's times a number plus a run constant, which
+            # is 0 where they coincide (`2*time < t2` sits on `time < t1` where t2
+            # = 2·t1); read at the run, so a set_param moves it.
+            def _moving_part(d):
+                syms = [s for s in d.free_symbols if str(s) in _moving]
+                return _sp.expand(d).as_independent(*syms, as_Add=True)[1]
+
+            def _siblings(d0, roots=roots) -> list[tuple[list, object, object]]:
+                out = []
+                m0 = _moving_part(d0)
+                for d1, rels1 in roots:
+                    if d1 is d0:
+                        continue
+                    scale = _sp.cancel(_moving_part(d1) / m0)
+                    if not scale.is_number or scale == 0:
+                        continue
+                    rest = _sp.expand(d1 - scale * d0)
+                    if not rest.is_number and not {str(s) for s in rest.free_symbols} & _moving:
+                        out.append((rels1, scale, rest))
+                return out
+
+            for d0, rels in roots:
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
                 # equality holds at the root alone, so it reads false on both.
@@ -8706,10 +8736,23 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     side_true = -1 if c.func(-q, 0) else 1
                     side_false = -side_true
-                v_false, v_true = (
-                    _xreplace_once(g, {r: r.func(rq * side, 0) for r, rq in rels})
-                    for side in (side_false, side_true)
-                )
+                siblings = _siblings(d0)
+
+                def _at(side, siblings=siblings, rels=rels, g=g):
+                    subs = {r: r.func(rq * side, 0) for r, rq in rels}
+                    for rels1, scale, rest in siblings:
+                        for r, rq in rels1:
+                            # its side where rest = 0, else as it stands; as a
+                            # Piecewise this costs sympy a canonicalisation per
+                            # sibling, which a size of many roots pays N² times
+                            subs[r] = (
+                                _sp.Or(_sp.Eq(rest, 0), r)
+                                if r.func(rq * scale * side, 0)
+                                else _sp.And(_sp.Ne(rest, 0), r)
+                            )
+                    return _xreplace_once(g, subs)
+
+                v_false, v_true = (_at(side) for side in (side_false, side_true))
                 # Written out in full, a size that reads shared rules is as
                 # exponential as the rates were; it reads those of its rules
                 # that hold no condition by name where that is shorter.

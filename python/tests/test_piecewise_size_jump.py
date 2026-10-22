@@ -166,6 +166,94 @@ def test_the_amount_is_kept_across_the_jump(case, codegen):
     np.testing.assert_allclose(sn, closed_form(t), rtol=1e-5, atol=1e-8)
 
 
+# ─── Two jumps a run constant puts on one instant (#1124) ──────────────────
+#
+# ``cv := 1 + piecewise(0, t < t1, 1) + piecewise(0, t < t2, 1)``: with t1 = t2
+# the size goes 1 -> 3 at once, and [Sn] to 5/3. The two jump events read the
+# state at their trigger time, so the last rescale is what stays, and each read
+# the other's condition as already flipped: [Sn] went to 5·2/3 = 3.33.
+
+
+def _step_at(threshold, *, on="time"):
+    reads = T if on == "time" else _ci("S")
+    op = "lt" if on == "time" else "gt"
+    return _pw((_cn(0), _rel(op, reads, _ci(threshold))), otherwise=_cn(1))
+
+
+def _two_steps(a, b, *, on="time"):
+    names = ("t1", "t2") if on == "time" else ("a", "b")
+    size = _plus(_plus(_cn(1), _step_at(names[0], on=on)), _step_at(names[1], on=on))
+    params = "".join(
+        f'<parameter id="{n}" value="{v!r}" constant="true"/>'
+        for n, v in zip(names, (a, b), strict=True)
+    )
+    return _doc([("cv", size)], params=params)
+
+
+def _sn_at(model, times):
+    result = bngsim.Simulator(model, method="ode").run(sample_times=times, rtol=1e-10, atol=1e-12)
+    return np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+
+
+@pytest.mark.parametrize(
+    ("t1", "t2"),
+    [(2.0, 2.0), (2.0, 3.0), (3.0, 2.0), (2.0, 2.0000000001)],
+    ids=["together", "apart", "apart, the other way", "a hair apart"],
+)
+def test_two_jumps_on_one_instant_rescale_once(t1, t2):
+    times = np.array([0.0, 1.9, 2.5, 3.5])
+    got = _sn_at(bngsim.Model.from_sbml_string(_two_steps(t1, t2)), times)
+    np.testing.assert_allclose(got, 5 / (1 + (times >= t1) + (times >= t2)), rtol=1e-8)
+
+
+@pytest.mark.parametrize(("t2", "now"), [(3.0, 2.0), (2.0, 3.0)], ids=["onto", "off"])
+def test_a_set_param_moves_one_jump_onto_the_other_or_off_it(t2, now):
+    model = bngsim.Model.from_sbml_string(_two_steps(2.0, t2))
+    model.set_param("t2", now)
+    times = np.array([0.0, 2.5, 3.5])
+    np.testing.assert_allclose(
+        _sn_at(model, times), 5 / (1 + (times >= 2.0) + (times >= now)), rtol=1e-8
+    )
+
+
+@pytest.mark.parametrize(("a", "b"), [(5.0, 5.0), (5.0, 4.0)], ids=["together", "apart"])
+def test_two_jumps_on_one_species_threshold(a, b):
+    """S = 10·e^(−t/2) passes 5 at t = 1.386 and 4 at t = 1.833."""
+    times = np.array([0.0, 1.0, 1.5, 2.0])
+    s = _s(times)
+    got = _sn_at(bngsim.Model.from_sbml_string(_two_steps(a, b, on="species")), times)
+    np.testing.assert_allclose(got, 5 / (1 + (s <= a) + (s <= b)), rtol=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("on", "scaled"),
+    [("time", 4.0), ("time", 5.0), ("species", 10.0), ("species", 8.0)],
+    ids=["time, together", "time, apart", "species, together", "species, apart"],
+)
+def test_two_jumps_a_scale_puts_on_one_instant(on, scaled):
+    """`2*t < t2` beside `t < t1` with t2 = 2·t1, or `2*S > b` beside `S > a`
+    with b = 2a: the roots coincide, but the differences are not ± each other,
+    and [Sn] went to 5·2/3 for 5/3."""
+    reads = T if on == "time" else _ci("S")
+    first, op, second = (("t1", 2.0), "lt", "t2") if on == "time" else (("a", 5.0), "gt", "b")
+    size = _plus(
+        _plus(_cn(1), _step_at(first[0], on=on)),
+        _pw((_cn(0), _rel(op, _times(_cn(2), reads), _ci(second))), otherwise=_cn(1)),
+    )
+    params = "".join(
+        f'<parameter id="{n}" value="{v!r}" constant="true"/>'
+        for n, v in (first, (second, scaled))
+    )
+    times = np.array([0.0, 1.0, 1.5, 1.9, 2.5, 3.5])
+    got = _sn_at(bngsim.Model.from_sbml_string(_doc([("cv", size)], params=params)), times)
+    if on == "time":
+        size_then = 1 + (times >= first[1]) + (2 * times >= scaled)
+    else:
+        s = _s(times)
+        size_then = 1 + (s <= first[1]) + (2 * s <= scaled)
+    np.testing.assert_allclose(got, 5 / size_then, rtol=1e-8)
+
+
 def _set_sn_at_2(priority):
     return (
         '<event id="e" useValuesFromTriggerTime="true">'
