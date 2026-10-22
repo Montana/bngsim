@@ -164,10 +164,25 @@ jobs:
       # other two legs must stay bare — see the header on lanl/bngsim#178.
       - name: Install liblapack-dev (LAPACK leg only)
         if: matrix.leg.apt != ''
+        # A hung apt-get sat in this step for 79 minutes with no output on
+        # lanl/bngsim#1198, and only the job's 90-minute limit would have ended
+        # it. Each apt-get call now has 3 minutes, a failed or hung attempt is
+        # tried once more, and the step as a whole has 15. apt itself waits up
+        # to 2 minutes for a dpkg lock (unattended-upgrades on a fresh runner)
+        # and retries a download 3 times before any of that applies.
+        timeout-minutes: 15
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.leg.apt }}
+          apt_install() {
+            local opts=(-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3)
+            timeout --kill-after=30 180 sudo apt-get "${opts[@]}" update &&
+              timeout --kill-after=30 180 sudo apt-get "${opts[@]}" install -y "$@"
+          }
+          apt_install ${{ matrix.leg.apt }} || {
+            echo "::warning::apt-get failed or hung; trying once more"
+            sleep 15
+            apt_install ${{ matrix.leg.apt }}
+          }
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
