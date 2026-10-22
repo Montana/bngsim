@@ -51,7 +51,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
+import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -344,6 +347,100 @@ def _compare_ode_multiseg(bn, rn, *, atol=None) -> tuple[str, float, str, str, f
 # --------------------------------------------------------------------------- #
 # Worker (module-level so it is picklable under the 'spawn' start method)
 # --------------------------------------------------------------------------- #
+# ─── The reference archive (issue #805) ─────────────────────────────────────
+#
+# A live run can record, per job, the network BNG2.pl generated and what the
+# reference (run_network, or the native BNG2.pl protocol for a carry-over model)
+# returned; a later run replays from that record with neither BNG2.pl nor
+# run_network installed. One ``.npz`` per job: the ``.net`` text (or the
+# network-generation failure), the reference's time grid, values and names (or
+# its exception), and a ``meta`` record of what the entry is the reference FOR.
+# Identity is checked twice: the inputs before the network is read (the BNGL
+# file's and any injected action block's sha256, the forced tolerances), and the
+# spec derived from them after (interval, steps, tolerances, segment mode). An
+# entry that matches neither the job nor its spec is stale and never compared:
+# the row is REFERENCE_FAILED, ``archive_stale``; one that cannot be read at all
+# is ``archive_unreadable``, the same row, rather than a worker death blamed on
+# bngsim. Beside the identity, an entry records the reference engine's version
+# (``reference_version``, #805's item 1) and the harness's git revision when it
+# was recorded; a replayed row reports the archived version as the reference's.
+# ARCHIVE_FORMAT is bumped where the harness's own network rules change (the
+# state prefix, the netgen caps, an injected generate_network), since the
+# archived ``.net`` was made under the rules of the recording run.
+ARCHIVE_FORMAT = 1
+
+
+def _archive_file(directory: str | Path, key: str) -> Path:
+    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", key) + ".npz")
+
+
+def _sha256(text: str | None) -> str | None:
+    return None if text is None else hashlib.sha256(text.encode()).hexdigest()
+
+
+def archive_input_identity(spec: dict, bngl_text: str) -> dict:
+    """The job's inputs an archived reference is valid for."""
+    return {
+        "format": ARCHIVE_FORMAT,
+        "model_id": spec["model_id"],
+        "method": spec["method"],
+        "bngl_sha256": _sha256(bngl_text),
+        "inject_sha256": _sha256(spec.get("inject")),
+        "rtol": float(spec["rtol"]),
+        "atol": float(spec["atol"]),
+    }
+
+
+def archive_spec_identity(ode: dict, dirty: bool) -> dict:
+    """The run the reference was made for, as derived from the network."""
+    return {
+        "t_start": float(ode["t_start"]),
+        "t_end": float(ode["t_end"]),
+        "n_steps": int(ode["n_steps"]),
+        "rtol": float(ode["rtol"]),
+        "atol": float(ode["atol"]),
+        "mode": "multi_segment" if dirty else "single_segment",
+    }
+
+
+def archive_save(directory, spec, record: dict, rn=None) -> Path:
+    """Write one job's archived reference (atomically). ``record`` holds the
+    identity, the network (``net_text`` or ``netgen_error``), the spec identity
+    where one was derived, and the reference's exception and timing."""
+    out = _archive_file(directory, spec["key"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {"meta": np.frombuffer(json.dumps(record).encode(), dtype=np.uint8)}
+    if rn is not None:
+        arrays["time"] = np.asarray(rn[0], dtype=float)
+        arrays["values"] = np.asarray(rn[1], dtype=float)
+        arrays["names"] = np.frombuffer(json.dumps(list(rn[2])).encode(), dtype=np.uint8)
+    tmp = out.with_name(out.name + ".tmp.npz")
+    np.savez_compressed(tmp, **arrays)
+    tmp.replace(out)
+    return out
+
+
+def archive_load(directory, spec) -> tuple[dict | None, tuple | None]:
+    """``(record, reference)`` for a job, or ``(None, None)`` with no entry."""
+    path = _archive_file(directory, spec["key"])
+    if not path.is_file():
+        return None, None
+    with np.load(path, allow_pickle=False) as z:
+        record = json.loads(bytes(z["meta"]).decode())
+        rn = None
+        if "time" in z:
+            rn = (
+                np.array(z["time"]),
+                np.array(z["values"]),
+                json.loads(bytes(z["names"]).decode()),
+            )
+    return record, rn
+
+
+def _stale_fields(recorded: dict | None, want: dict) -> list[str]:
+    return sorted(k for k in want if (recorded or {}).get(k) != want[k])
+
+
 def _worker(spec: dict, q) -> None:
     """Run the netgen → BNGsim → run_network pipeline for one job; result on ``q``.
 
@@ -351,7 +448,10 @@ def _worker(spec: dict, q) -> None:
     proof). Netgen failure is BAD_TEST (no input for either engine). A model with
     no resolvable ODE horizon is SKIP (not a parity signal).
     """
-    warmup = bc.measure_warmup(spec.get("run_network_bin"))
+    replay = spec.get("reference_archive")
+    record_to = spec.get("write_reference_archive")
+    # A replay needs neither BNG2.pl nor run_network (issue #805).
+    warmup = bc.measure_warmup(None if replay else spec.get("run_network_bin"))
 
     res = {k: spec[k] for k in ("key", "model_id", "method")}
     res.update(
@@ -390,6 +490,39 @@ def _worker(spec: dict, q) -> None:
     gen_network = bc.injected_gen_network(inject) or (
         None if inject is not None else bc._model_gen_network(bngl_text)
     )
+    archived, archived_rn = (None, None)
+    record: dict = {}
+    if replay:
+        try:
+            archived, archived_rn = archive_load(replay, spec)
+        except Exception as exc:  # a corrupt or foreign file: the archive's fault
+            res["status"] = "reference_failed"
+            res["exception"] = (
+                f"run_network (archive): archive_unreadable: {type(exc).__name__}: {exc}"[:400]
+            )
+            res["comment"] = "The archived reference could not be read; re-record it."
+            q.put(res)
+            return
+        want = archive_input_identity(spec, bngl_text)
+        stale = ["entry"] if archived is None else _stale_fields(archived, want)
+        if stale:
+            what = (
+                "no entry for this job"
+                if archived is None
+                else f"the job's {', '.join(stale)} changed"
+            )
+            res["status"] = "reference_failed"
+            res["exception"] = f"run_network (archive): archive_stale: {what}"
+            res["comment"] = (
+                "The archived reference is no reference for this job any more; re-record it."
+            )
+            q.put(res)
+            return
+    elif record_to:
+        record = archive_input_identity(spec, bngl_text)
+        record["reference_version"] = versions.bng_version(spec.get("bng2_pl"))
+        record["harness_git_rev"] = git_rev(str(HERE))
+
     # GH #177/#179: the pre-representative setParameter/setConcentration state. A
     # dirty_carryover model (representative inherits a prior simulate's end state) is
     # driven through the FULL protocol on BOTH engines below; a single-phase model bakes
@@ -403,14 +536,30 @@ def _worker(spec: dict, q) -> None:
         # 1. Network generation. A dirty_carryover model replays the protocol from the
         #    DECLARED IC (multi_segment_replay), so it needs a CLEAN .net; a single-phase
         #    model bakes the state prefix into the .net both engines then run.
-        net_path, netgen_sec, netgen_err = bc.generate_network(
-            bngl_text,
-            spec["bng2_pl"],
-            workdir,
-            timeout=spec["sub_timeout"],
-            gen_network=gen_network,
-            state_prefix=("" if dirty else state_prefix),
-        )
+        if replay:
+            # The network BNG2.pl generated when the archive was recorded.
+            netgen_sec = float(archived.get("netgen_sec") or 0.0)
+            netgen_err = archived.get("netgen_error") or ""
+            net_path = None
+            if archived.get("net_text") is not None:
+                net_path = workdir / "model.net"
+                net_path.write_text(archived["net_text"])
+        else:
+            net_path, netgen_sec, netgen_err = bc.generate_network(
+                bngl_text,
+                spec["bng2_pl"],
+                workdir,
+                timeout=spec["sub_timeout"],
+                gen_network=gen_network,
+                state_prefix=("" if dirty else state_prefix),
+            )
+            if record_to:
+                record["netgen_sec"] = round(netgen_sec, 6)
+                if net_path is None:
+                    record["netgen_error"] = netgen_err
+                    archive_save(record_to, spec, record)
+                else:
+                    record["net_text"] = Path(net_path).read_text()
         if net_path is None:
             res["status"] = "bad_test"
             res["comment"] = (
@@ -435,6 +584,8 @@ def _worker(spec: dict, q) -> None:
         if ode is None:
             o = bc.parse_ode_spec(horizon_text, net_params, atol=spec["atol"], rtol=spec["rtol"])
             if o is None:
+                if record_to:
+                    archive_save(record_to, spec, record)
                 res["status"] = "skip"
                 res["comment"] = (
                     "No runnable time-course (no simulate with a numeric t_end) — nothing to compare."
@@ -447,6 +598,19 @@ def _worker(spec: dict, q) -> None:
             ode = {**o, "dirty_carryover": False, "steps": None, "rep_index": None}
         dirty = bool(ode.get("dirty_carryover")) and ode.get("steps") is not None
         n_points = int(ode["n_steps"]) + 1
+        spec_id = archive_spec_identity(ode, dirty)
+        if replay:
+            stale = _stale_fields(archived.get("spec"), spec_id)
+            if stale:
+                res["status"] = "reference_failed"
+                res["exception"] = (
+                    f"run_network (archive): archive_stale: the run's {', '.join(stale)} changed"
+                )
+                res["comment"] = (
+                    "The archived reference is no reference for this job any more; re-record it."
+                )
+                q.put(res)
+                return
 
         bn = None
         bn_exc = ""
@@ -501,36 +665,43 @@ def _worker(spec: dict, q) -> None:
                 bn_exc = f"bngsim: {type(exc).__name__}: {exc}"[:400]
             # 3b. legacy: run the model's OWN protocol natively (BNG2.pl carries state across
             #     continue/save/reset), read the representative segment's species.
-            try:
-                t0 = time.perf_counter()
-                rn = bc.native_protocol_oracle(
-                    horizon_text,
-                    spec["bng2_pl"],
-                    workdir / "native",
-                    track="ode",
-                    rep_stmt_idx=ode["rep_stmt_idx"],
-                    timeout=spec["sub_timeout"],
+            if replay:
+                rn, rn_exc, rn_timing = (
+                    archived_rn,
+                    archived.get("exception", ""),
+                    archived.get("timing"),
                 )
-                rn_wall = time.perf_counter() - t0
-                rn_timing = {
-                    "integrate_sec": round(rn_wall, 6),
-                    "integrate_cold_sec": round(rn_wall, 6),
-                    "integrate_n_warm": 0,
-                    "init_cpu_sec": None,
-                    "propagation_cpu_sec": None,
-                    "total_cpu_sec": None,
-                    "total_clock_sec": round(rn_wall, 6),
-                    "n_calls": 1,
-                    "multi_segment": True,
-                    "config": {
-                        "codegen": "native BNG2.pl protocol",
-                        "jacobian": "CVODE default",
-                        "linear_solver": "run_network / BNG2.pl default",
-                        "cached": None,
-                    },
-                }
-            except Exception as exc:
-                rn_exc = f"native BNG2.pl protocol: {type(exc).__name__}: {exc}"[:400]
+            else:
+                try:
+                    t0 = time.perf_counter()
+                    rn = bc.native_protocol_oracle(
+                        horizon_text,
+                        spec["bng2_pl"],
+                        workdir / "native",
+                        track="ode",
+                        rep_stmt_idx=ode["rep_stmt_idx"],
+                        timeout=spec["sub_timeout"],
+                    )
+                    rn_wall = time.perf_counter() - t0
+                    rn_timing = {
+                        "integrate_sec": round(rn_wall, 6),
+                        "integrate_cold_sec": round(rn_wall, 6),
+                        "integrate_n_warm": 0,
+                        "init_cpu_sec": None,
+                        "propagation_cpu_sec": None,
+                        "total_cpu_sec": None,
+                        "total_clock_sec": round(rn_wall, 6),
+                        "n_calls": 1,
+                        "multi_segment": True,
+                        "config": {
+                            "codegen": "native BNG2.pl protocol",
+                            "jacobian": "CVODE default",
+                            "linear_solver": "run_network / BNG2.pl default",
+                            "cached": None,
+                        },
+                    }
+                except Exception as exc:
+                    rn_exc = f"native BNG2.pl protocol: {type(exc).__name__}: {exc}"[:400]
         else:
             # 3a. BNGsim single-segment (record status; do not short-circuit a generic raise).
             try:
@@ -550,23 +721,43 @@ def _worker(spec: dict, q) -> None:
                 bn_exc = f"bngsim: {type(exc).__name__}: {exc}"[:400]
 
             # 3b. run_network single-segment (the reference; always run).
-            try:
-                t0 = time.perf_counter()
-                t, v, n, rn_timing = bc.run_network_ode(
-                    net_path,
-                    spec["run_network_bin"],
-                    t_start=ode["t_start"],
-                    t_end=ode["t_end"],
-                    n_steps=int(ode["n_steps"]),
-                    rtol=ode["rtol"],
-                    atol=ode["atol"],
-                    out_prefix=str(workdir / "rn"),
-                    timeout=spec["sub_timeout"],
+            if replay:
+                rn, rn_exc, rn_timing = (
+                    archived_rn,
+                    archived.get("exception", ""),
+                    archived.get("timing"),
                 )
-                rn_wall = time.perf_counter() - t0
-                rn = (t, v, n)
-            except Exception as exc:
-                rn_exc = f"run_network: {type(exc).__name__}: {exc}"[:400]
+            else:
+                try:
+                    t0 = time.perf_counter()
+                    t, v, n, rn_timing = bc.run_network_ode(
+                        net_path,
+                        spec["run_network_bin"],
+                        t_start=ode["t_start"],
+                        t_end=ode["t_end"],
+                        n_steps=int(ode["n_steps"]),
+                        rtol=ode["rtol"],
+                        atol=ode["atol"],
+                        out_prefix=str(workdir / "rn"),
+                        timeout=spec["sub_timeout"],
+                    )
+                    rn_wall = time.perf_counter() - t0
+                    rn = (t, v, n)
+                except Exception as exc:
+                    rn_exc = f"run_network: {type(exc).__name__}: {exc}"[:400]
+
+        if record_to:
+            record.update(spec=spec_id, exception=rn_exc, timing=rn_timing)
+            archive_save(record_to, spec, record, rn)
+        if replay:
+            res["reference_version"] = archived.get("reference_version")
+            if rn_timing is not None:
+                rn_timing = {
+                    **rn_timing,
+                    "replayed_from_archive": True,
+                    "reference_version": archived.get("reference_version"),
+                    "recorded_by_harness": archived.get("harness_git_rev"),
+                }
 
         res["wall_sec"] = round(netgen_sec + bn_wall + rn_wall, 3)
         if rn is not None:
@@ -747,9 +938,27 @@ def main() -> int:
         "models bngsim would compile by default since #825. The compiled path is what every "
         "sensitivity run uses, and #689/#699 existed only there. Needs a C compiler (GH #702).",
     )
+    ap.add_argument(
+        "--write-reference-archive",
+        default="",
+        help="Also record each job's generated network and reference side here "
+        "(one .npz per job; issue #805).",
+    )
+    ap.add_argument(
+        "--reference-archive",
+        default="",
+        help="Replay the reference side, and the network BNG2.pl generated, from the archive "
+        "recorded here: neither BNG2.pl nor run_network is needed. An entry that no longer "
+        "matches its job is never compared (REFERENCE_FAILED, archive_stale).",
+    )
     args = ap.parse_args()
+    if args.reference_archive and args.write_reference_archive:
+        ap.error("--reference-archive replays an archive; --write-reference-archive records one")
 
-    bng2_pl, run_network_bin = _resolve_bng_tools()
+    if args.reference_archive:
+        bng2_pl, run_network_bin = None, None
+    else:
+        bng2_pl, run_network_bin = _resolve_bng_tools()
 
     jobs_path = Path(args.jobs).resolve()
     if not jobs_path.exists():
@@ -826,6 +1035,8 @@ def main() -> int:
                 "run_network_bin": run_network_bin,
                 "inject": bc.injected_action_block(j.overrides),
                 "codegen": bool(args.codegen),
+                "reference_archive": args.reference_archive or None,
+                "write_reference_archive": args.write_reference_archive or None,
             }
         )
 
@@ -880,7 +1091,12 @@ def main() -> int:
                 exception=r.get("exception", ""),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "bng": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 subclass=r.get("subclass"),
                 timing=timing,
@@ -896,6 +1112,12 @@ def main() -> int:
         "reference_engine": "bng",
         "reference_label": "run_network",
         "regime": "ode",
+        # Issue #805: where the reference side came from.
+        "reference_source": (
+            f"archive:{args.reference_archive}"
+            if args.reference_archive
+            else "run_network / BNG2.pl (live)"
+        ),
         "git_rev": git_rev(str(HERE)),
         "bngpath": os.environ.get("BNGPATH"),
         "run_network": run_network_bin,
