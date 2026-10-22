@@ -22,8 +22,9 @@ tolerance, which reads the same in any units. These tests cover:
 - above 512 unknowns the solve is the residual one, step for step;
 - a march that stops between the steps the criterion is asked at is asked
   where it stops (a corpus model);
-- a law with a species the mask leaves out is solved for that species, so the
-  species the mask keeps are stepped (A -> S under the pure-sink mask);
+- a species the mask leaves out moves with its laws, so the species the mask
+  keeps are stepped (A -> S under the pure-sink mask), whatever the species
+  order;
 - a differenced Jacobian across a rate law's jump certifies nothing;
 - a $-fixed species does not set the floor;
 - a batch entry at another scale marches at its own "auto" atol.
@@ -89,25 +90,33 @@ def test_default_is_the_residual_test(tmp_path):
     assert math.isnan(at_one.newton_distance)
 
 
-@pytest.mark.parametrize("method", ["integration", "newton"])
-def test_the_default_solve_is_the_residual_solve(tmp_path, method):
-    # Where the two tests part (the cubic at 1e-9, which the residual test
-    # accepts one step from its start), the default is the residual solve to
-    # the bit.
+# The issue's table: the residual test at a scale of 1e-9 accepts the cubic one
+# step from each start. Pinned so a change to the default path shows.
+RESIDUAL_AT_1E_9 = {
+    ("integration", 0.5): 0.893865,
+    ("integration", 0.9): 1.003209,
+    ("integration", 1.5): 0.130999,
+    ("newton", 0.5): 0.3,
+    ("newton", 0.9): 1.038462,
+    ("newton", 1.5): 1.214286,
+}
+
+
+@pytest.mark.parametrize("method,x0", sorted(RESIDUAL_AT_1E_9))
+def test_the_default_solve_is_the_residual_solve(tmp_path, method, x0):
     out = {}
     for criterion in (None, "residual"):
         kw = {} if criterion is None else {"criterion": criterion}
-        out[criterion] = bngsim.Simulator(_cubic(tmp_path, 1e-9, 0.5), method="ode").steady_state(
+        out[criterion] = bngsim.Simulator(_cubic(tmp_path, 1e-9, x0), method="ode").steady_state(
             method=method, **kw
         )
     default, residual = out[None], out["residual"]
     assert default.criterion == "residual"
-    assert default.n_steps == residual.n_steps
-    assert np.array_equal(default.concentrations, residual.concentrations)
-    scaled = bngsim.Simulator(_cubic(tmp_path, 1e-9, 0.5), method="ode").steady_state(
-        method=method, criterion="scaled"
+    assert default.converged and default.n_steps == 1
+    assert default.concentrations[0] / 1e-9 == pytest.approx(
+        RESIDUAL_AT_1E_9[(method, x0)], rel=1e-5
     )
-    assert not np.array_equal(scaled.concentrations, default.concentrations)
+    assert np.array_equal(default.concentrations, residual.concentrations)
 
 
 @pytest.mark.parametrize("method", ["integration", "newton"])
@@ -172,20 +181,22 @@ end reactions
 
 def _numpy_newton_distance(model, y, rtol, mask=None):
     """The step the criterion measures, by NumPy, and without choosing which
-    species each law is solved for: the Newton step on the species that move,
-    with every law kept (L·δ = 0) and every kept species' equation solved
-    (f + J·δ = 0 there), a masked species in no law held; over each kept
-    species' rtol·|y| + rtol·max(|y|, floor)."""
+    species each law is solved for: the Newton step on the conservation
+    manifold, every species in a law moving by its own equation (a masked one
+    too) and a masked species in no law held; over each kept species'
+    rtol·|y| + rtol·max(|y|, floor). The system has to determine the step."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
-    kept = np.ones(ns, bool) if mask is None else np.asarray(mask, bool)
-    moves = kept | np.any(laws != 0, axis=0)
+    fixed = np.asarray(model._core.species_is_fixed, bool)
+    kept = (np.ones(ns, bool) if mask is None else np.asarray(mask, bool)) & ~fixed
+    moves = (kept | np.any(laws != 0, axis=0)) & ~fixed
     f = np.asarray(model.rhs(y), float)
     jac = np.asarray(model.jacobian(y), float)
-    lhs = np.vstack([laws[:, moves], jac[kept][:, moves]])
-    rhs = np.concatenate([np.zeros(cl["n_laws"]), -f[kept]])
-    step, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    lhs = np.vstack([laws[:, moves], jac[moves][:, moves]])
+    rhs = np.concatenate([np.zeros(cl["n_laws"]), -f[moves]])
+    step, _, rank, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    assert rank == moves.sum()
     assert np.allclose(lhs @ step, rhs, rtol=0, atol=1e-9 * np.max(np.abs(rhs)))
     delta = np.zeros(ns)
     delta[moves] = step
@@ -399,7 +410,7 @@ end reactions
 
 @pytest.mark.parametrize("order", sorted(DECAY_NETS))
 @pytest.mark.parametrize("method", ["integration", "newton"])
-def test_a_law_with_a_masked_member_is_solved_for_it(tmp_path, order, method):
+def test_a_masked_law_member_moves_with_its_law(tmp_path, order, method):
     # The solvers hold S where integration left it; with A the law's dependent,
     # nothing moved A, and A first was accepted where it started, [1, 0].
     path = tmp_path / "decay.net"
@@ -554,3 +565,45 @@ def test_a_batch_entry_marches_at_its_own_auto_atol(tmp_path, method):
     ):
         assert out.converged
         assert out.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+
+
+# A -> S1 at 1, A + S1 -> S2 + S1 at 1e9 (S1 speeds A's loss to S2); one law
+# A + S1 + S2, and only A kept. A's one steady state is 0.
+CATALYZED_NET = """begin parameters
+    1 k1 1.0
+    2 k3 1e9
+end parameters
+begin species
+{species}
+end species
+begin reactions
+    1 {a} {s1} k1
+    2 {a},{s1} {s2},{s1} k3
+end reactions
+"""
+
+
+@pytest.mark.parametrize("order", [("A", "S1", "S2"), ("A", "S2", "S1")])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_two_masked_members_of_a_law_do_not_depend_on_species_order(tmp_path, order, method):
+    # Holding one masked member and moving the other made the step depend on
+    # which: listed A, S1, S2 the state was accepted where it started, A = 1.
+    start = {"A": 1.0, "S1": 0.0, "S2": 0.0}
+    index = {name: i + 1 for i, name in enumerate(order)}
+    path = tmp_path / "catalyzed.net"
+    path.write_text(
+        CATALYZED_NET.format(
+            species="\n".join(f"    {index[n]} {n}() {start[n]!r}" for n in order),
+            a=index["A"],
+            s1=index["S1"],
+            s2=index["S2"],
+        )
+    )
+    mask = [name == "A" for name in order]
+    a = order.index("A")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    early = sim.steady_state(criterion="scaled", method=method, mask=mask, max_time=1e-12)
+    assert not early.converged
+    ss = sim.steady_state(criterion="scaled", method=method, mask=mask)
+    assert ss.converged
+    assert abs(ss.concentrations[a]) < 1e-8

@@ -85,8 +85,10 @@ conserved totals taken out, is within each species' own tolerance:
 
 The floor is the smallest positive initial concentration of a species that is
 not `$`-fixed, or, where none starts above 0, the largest species of the state
-or of the root it steps to. A conservation law with a species `mask=` leaves out
-is solved for that species, so that the species the mask keeps are stepped.
+or of the root it steps to. A species that starts at 0 is held to `rtol` times
+the floor, as under `atol="auto"`: one whose steady state is smaller than that is
+within tolerance of 0. A species `mask=` leaves out is not measured, but it moves
+with its conservation laws, by its own equation; only one in no law is held.
 Neither side has a unit of concentration or of time in it. The
 march, the bursts, the KINSOL polish and the test at the start all ask it.
 Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes
@@ -107,6 +109,10 @@ What it does not do:
 - **A differenced Jacobian across a jump** in a rate law (an `if()` the state
   sits on) is not certified either: there the quotient is the jump over the
   step, and the step through it says nothing.
+- **A slope steep enough to hide a floor** can pass. The distance is first
+  order: `X' = 0.001 + 1e8·|X - 1|` has no root, but its slope at the kink makes
+  the step 5e-12, within tolerance. Checking the step on the right-hand side
+  refused that, and 63 corpus models' genuine roots with it.
 - **More than 512 unknowns** take no step, and the solve is the residual one,
   `tol` and all; `ss.criterion` then says `"residual"`.
 - **A root the dynamics leave** can still pass: the test is a distance to a

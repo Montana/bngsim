@@ -7383,9 +7383,12 @@ class Simulator:
               largest species of the state or of the root it steps to). Units
               do not change the answer. A state where the reduced Jacobian is
               singular is not accepted unless ``f`` is 0 there, nor one where
-              a differenced Jacobian straddles a jump in a rate law. A
-              conservation law with a species ``mask`` leaves out is solved
-              for that species, so the ones the mask keeps are stepped. Above
+              a differenced Jacobian straddles a jump in a rate law. A species
+              ``mask`` leaves out moves with its conservation laws, by its own
+              equation, and is held only where it is in none. A species that
+              starts at 0 is held to ``rtol`` times the floor, so one whose
+              steady state is smaller than that is within tolerance of 0, as
+              under ``atol="auto"``. Above
               512 unknowns the step is not taken, the solve is the residual
               one, and :attr:`SteadyStateResult.criterion` says
               ``"residual"``. Where neither ``atol``
