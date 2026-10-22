@@ -83,9 +83,15 @@ conserved totals taken out, is within each species' own tolerance:
 
 `|δ_i| ≤ rtol·|y_i| + atol_i`, with `atol_i = rtol·max(|y_i|, floor)`
 
-The floor is the smallest positive initial concentration, or, for a model that
-starts with every species at 0, the largest species of the state or of the root
-it steps to. Neither side has a unit of concentration or of time in it. The
+The floor is the smallest positive initial concentration of a species that is
+not `$`-fixed, or, where none starts above 0, the largest species of the state
+or of the root it steps to. A species that starts at 0 is held to `rtol` times
+the floor, as under `atol="auto"`: one whose steady state is smaller than that is
+within tolerance of 0. `mask=` says which species are measured, not which move:
+the step moves every species by its own equation but a `$`-fixed one and a
+masked one that nothing reads (a write-only sink) or that reads nothing (a
+counter run at a constant rate), which is held.
+Neither side has a unit of concentration or of time in it. The
 march, the bursts, the KINSOL polish and the test at the start all ask it.
 Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes
 `atol="auto"`.
@@ -102,8 +108,15 @@ What it does not do:
   state is singular, the state is accepted only if `f` is 0 there, and
   `newton_distance` is `inf` otherwise. Across the corpus a least-squares step
   at those states would have accepted states that a run moves by more than 1%.
+- **A differenced Jacobian across a jump** in a rate law (an `if()` the state
+  sits on) is not certified either: there the quotient is the jump over the
+  step, and the step through it says nothing.
+- **A slope steep enough to hide a floor** can pass. The distance is first
+  order: `X' = 0.001 + 1e8·|X - 1|` has no root, but its slope at the kink makes
+  the step 5e-12, within tolerance. Checking the step on the right-hand side
+  refused that, and 63 corpus models' genuine roots with it.
 - **More than 512 unknowns** take no step, and the solve is the residual one,
-  `tol` and all.
+  `tol` and all; `ss.criterion` then says `"residual"`.
 - **A root the dynamics leave** can still pass: the test is a distance to a
   root, not a run taken on from it.
 

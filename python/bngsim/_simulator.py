@@ -7389,12 +7389,22 @@ class Simulator:
               the root is within every species' own tolerance,
               ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
               rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration; where
-              every species starts at 0, the largest species of the state or
-              of the root it steps to). Units do not change the answer. A
-              state where the reduced Jacobian is singular is not accepted
-              unless ``f`` is 0 there. Above 512 unknowns the step is not
-              taken and the solve is the residual one. Where neither ``atol``
+              floor is the smallest positive initial concentration of a
+              species that is not ``$``-fixed; where none starts above 0, the
+              largest species of the state or of the root it steps to). Units
+              do not change the answer. A state where the reduced Jacobian is
+              singular is not accepted unless ``f`` is 0 there, nor one where
+              a differenced Jacobian straddles a jump in a rate law. ``mask``
+              says which species are measured, not which move: the step moves
+              every species by its own equation but a ``$``-fixed one and a
+              masked one that nothing reads or that reads nothing (a counter),
+              which is held. A species that
+              starts at 0 is held to ``rtol`` times the floor, so one whose
+              steady state is smaller than that is within tolerance of 0, as
+              under ``atol="auto"``. Above
+              512 unknowns the step is not taken, the solve is the residual
+              one, and :attr:`SteadyStateResult.criterion` says
+              ``"residual"``. Where neither ``atol``
               nor :meth:`set_tolerances` gives one, the march takes
               ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
               small units.
@@ -8791,7 +8801,9 @@ class Simulator:
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
             may be a per-species vector or ``"auto"`` (issue #196), resolved
-            once and applied identically to every entry.
+            once and applied identically to every entry. The ``"auto"``
+            ``criterion="scaled"`` takes when no ``atol`` is given is each
+            entry's own, from its starting state.
         n_workers : int, optional
             Number of parallel threads.
         mask : array-like of bool, or sequence of str, optional
@@ -8855,9 +8867,13 @@ class Simulator:
 
         eff_rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — resolved once, applied to every entry (see
-        # run_batch).
+        # run_batch). Issue #1001: except the "auto" that criterion="scaled"
+        # takes when no atol is given, which is each entry's own. Taken from
+        # this model, an entry whose parameters put it at 1e-9 of this one
+        # marched at this one's tolerance and ran through zero (x = -3.7).
+        own_auto = self._steady_state_atol(atol, criterion) is not atol
         eff_atol_spec = self._resolve_atol(
-            self._steady_state_atol(atol, criterion),
+            None if own_auto else atol,
             eff_rtol,
             where="steady_state_batch(atol=...)",
         )
@@ -8885,7 +8901,11 @@ class Simulator:
             opts.method = method
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
-            eff_atol_spec.apply_to(opts)
+            if own_auto:
+                own = [float(v) for v in derive_atol(clone.get_state(), eff_rtol)]
+                _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
+            else:
+                eff_atol_spec.apply_to(opts)
             opts.max_steps = eff_max_steps
             # Read (and, below, set) the same memo `steady_state()` keeps, so a
             # sweep over a model whose closed-form Jacobian CVODE cannot use pays
@@ -10478,7 +10498,9 @@ class SteadyStateResult:
         does not take the step, and above 512 unknowns; ``inf`` where the
         Jacobian is singular at a state that is not a root.
     criterion : str
-        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``.
+        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``:
+        ``"residual"`` for a ``"scaled"`` request above 512 unknowns, which
+        that test falls back to.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool

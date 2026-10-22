@@ -1637,18 +1637,181 @@ static std::vector<int> ss_unknown_species(const NetworkModel &model, const Cons
     return unknowns;
 }
 
-// The species the "scaled" criterion's Newton step is taken over (issue
-// #1001): the unknowns, held species dropped on every path, since a species
-// held is not stepped. find_steady_state counts them against
-// kNewtonDistanceMost with the same rule ss_newton_distance steps them by.
-static std::vector<int> ss_distance_unknowns(const NetworkModel &model,
-                                             const ResidualSubspace &sub) {
-    std::vector<int> idx;
-    for (int i : ss_unknown_species(model, model.conservation_laws(), sub)) {
-        if (!model.species()[i].fixed)
-            idx.push_back(i);
+// The system the "scaled" criterion's Newton step is taken on (issue #1001):
+// the unknowns, stepped by their own equations, and the laws the rest follow
+// from. A mask says which species are measured, not which move: the step is
+// the system's own. A $-fixed species is not stepped, and neither is a masked
+// species with no step of its own to take: one nothing reads (an empty column
+// of the Jacobian's pattern, the write-only accumulator of
+// NetworkModel::pure_sink_species), or one whose rate reads nothing (an empty
+// row: a counter run at a constant rate, which has no root, and with which the
+// matrix was singular at every state). It is held, and takes up the change of
+// one law it is in, the laws being reduced so that no other one holds it.
+// Every other species moves.
+//
+// Holding masked species, as the solvers do, left a kept dependent of a law
+// with nothing to move it: A -> S under mask=~model.is_pure_sink() (S the
+// sink, A the law's dependent) was accepted where it started, [1, 0], and
+// A <-> B with only A kept at A = 1 for a root at 1/3. Moving the unread ones
+// too left A -> B, A -> C with no equation for the split, a matrix singular
+// at every state; and holding a read one, C in A + B <-> C -> D, stepped A
+// and B as if C did not drain.
+//
+// What is left of the laws is reduced (Gauss-Jordan) over the species that
+// move, so the step is the Newton step on what remains of the conservation
+// manifold, whatever the species order. Without an unread masked species it
+// is the solvers' unmasked reduced system, unknown for unknown.
+// find_steady_state counts the unknowns against kNewtonDistanceMost with the
+// same rule.
+struct SsDistanceSystem {
+    std::vector<int> unknowns;
+    ConservationLaws laws;
+};
+
+static SsDistanceSystem ss_distance_system(const NetworkModel &model, const ResidualSubspace &sub) {
+    const auto &cl = model.conservation_laws();
+    const auto &species = model.species();
+    const int ns = model.n_species();
+    const auto un = static_cast<size_t>(ns);
+    std::vector<char> unread(un, 0); // held: masked, and no step of its own
+    bool any_unread = false;
+    const auto &sp = model.jacobian_sparsity();
+    if (sp.n == ns && sp.col_ptrs.size() == un + 1) {
+        std::vector<char> reads(un, 0); // a nonempty row of the pattern
+        for (const auto i : sp.row_indices) {
+            if (i >= 0 && i < ns)
+                reads[static_cast<size_t>(i)] = 1;
+        }
+        for (int j = 0; j < ns; ++j) {
+            const auto uj = static_cast<size_t>(j);
+            unread[uj] = !sub.includes(j) && !species[j].fixed &&
+                         (sp.col_ptrs[uj + 1] == sp.col_ptrs[uj] || !reads[uj]);
+            any_unread = any_unread || unread[uj];
+        }
     }
-    return idx;
+    SsDistanceSystem s;
+    if (!any_unread) {
+        s.laws = cl;
+        if (cl.empty()) {
+            for (int i = 0; i < ns; ++i) {
+                if (!species[i].fixed)
+                    s.unknowns.push_back(i);
+            }
+        } else {
+            for (int i : cl.independent) {
+                if (!species[i].fixed)
+                    s.unknowns.push_back(i);
+            }
+        }
+        return s;
+    }
+
+    // Each species' column is scaled to its largest coefficient, so that a
+    // tolerance read off a row tells rounding from a coefficient that is
+    // merely small: a law weighted by compartment size (issue #758) holds a
+    // species in a 1 fL cell beside one in 1 mL at 1e-12, and a tolerance of
+    // 1e-12 of the row took the sink of A -> S for no member of its law, which
+    // was then accepted where it started.
+    std::vector<double> col_scale(un, 0.0);
+    for (const auto &row : cl.coefficients) {
+        for (size_t i = 0; i < un; ++i) {
+            col_scale[i] = std::max(col_scale[i], std::abs(row[i]));
+        }
+    }
+    for (auto &c : col_scale) {
+        if (!(c > 0.0))
+            c = 1.0;
+    }
+    std::vector<std::vector<double>> rows = cl.coefficients;
+    for (auto &row : rows) {
+        for (size_t i = 0; i < un; ++i) {
+            row[i] /= col_scale[i];
+        }
+    }
+    const auto eliminate = [&](size_t r, size_t col) {
+        for (size_t o = 0; o < rows.size(); ++o) {
+            if (o == r || rows[o][col] == 0.0)
+                continue;
+            const double m = rows[o][col] / rows[r][col];
+            for (size_t i = 0; i < un; ++i) {
+                rows[o][i] -= m * rows[r][i];
+            }
+            rows[o][col] = 0.0;
+        }
+    };
+    const auto row_max = [&](size_t r) {
+        double big = 0.0;
+        for (size_t i = 0; i < un; ++i) {
+            if (!species[static_cast<int>(i)].fixed)
+                big = std::max(big, std::abs(rows[r][i]));
+        }
+        return big;
+    };
+    // Each unread species takes up one law, which leaves the others.
+    std::vector<char> used(rows.size(), 0);
+    for (size_t j = 0; j < un; ++j) {
+        if (!unread[j])
+            continue;
+        size_t best = rows.size();
+        double best_v = 0.0;
+        for (size_t r = 0; r < rows.size(); ++r) {
+            const double v = std::abs(rows[r][j]);
+            if (!used[r] && v > 1e-12 * row_max(r) && v > best_v) {
+                best = r;
+                best_v = v;
+            }
+        }
+        if (best < rows.size()) {
+            eliminate(best, j);
+            used[best] = 1;
+        }
+    }
+    // What is left is reduced on the species that move.
+    std::vector<char> pivot(un, 0);
+    s.laws.n_species = ns;
+    std::vector<size_t> kept_rows;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        if (used[r])
+            continue;
+        const double big = row_max(r);
+        size_t p = un;
+        double best_v = 1e-12 * big;
+        for (size_t i = 0; i < un; ++i) {
+            if (species[static_cast<int>(i)].fixed || unread[i] || pivot[i])
+                continue;
+            if (std::abs(rows[r][i]) > best_v) {
+                best_v = std::abs(rows[r][i]);
+                p = i;
+            }
+        }
+        if (p == un)
+            continue;
+        eliminate(r, p);
+        pivot[p] = 1;
+        kept_rows.push_back(r);
+    }
+    for (size_t r : kept_rows) {
+        const double big = row_max(r);
+        size_t p = un;
+        for (size_t i = 0; i < un; ++i) {
+            if (std::abs(rows[r][i]) > 1e-12 * big) {
+                if (pivot[i])
+                    p = i;
+                rows[r][i] *= col_scale[i];
+            } else {
+                rows[r][i] = 0.0;
+            }
+        }
+        s.laws.dependent.push_back(static_cast<int>(p));
+        s.laws.coefficients.push_back(rows[r]);
+    }
+    s.laws.n_laws = static_cast<int>(s.laws.dependent.size());
+    for (int i = 0; i < ns; ++i) {
+        const auto ui = static_cast<size_t>(i);
+        if (!species[i].fixed && !unread[ui] && !pivot[ui])
+            s.unknowns.push_back(i);
+    }
+    return s;
 }
 
 // `linsolv_failed`, when non-null, reports whether KINSOL failed because it
@@ -2919,103 +3082,234 @@ static void ss_lu_solve(const std::vector<double> &lu, int n, const std::vector<
     b.swap(x);
 }
 
+// Below this fraction of the probe step, a species' secant to 0 is not taken.
+static constexpr double kSecantResolvable = 1e-4;
+
+// The differenced Jacobian `J` (forward quotients, f(y) = `f0`) with the
+// columns `cols` taken backwards instead, at the same step, or to 0 where the
+// step would take the species below it (issue #1001). A column whose backward
+// probe leaves the right-hand side non-finite keeps its forward quotient.
+//
+// Where the step to 0 is below kSecantResolvable of the probe it moves the rows
+// by less than their rounding (a species at 1.7e-44 in BIOMD0000000358 lost
+// its column, and a root was refused), and a species at 0 has no other side.
+// There the column is taken forwards again at half the step. Across a jump
+// within the step the quotient is the jump over the step, and grows as the
+// step shrinks; a smooth law's holds or, where its slope is 0, shrinks with it
+// (a dimerization near 0). A quotient that grows by half, by more than the
+// row's rounding (kFdNoise·eps of its terms, |f| and each |J·y|), sets
+// `*straddles`: `if(X<1e-12, 1e-6, 1e3)` with X at 9e-15 and a species of 1
+// beside it was accepted on the forward column alone.
+static std::vector<double> ss_backward_columns(SteadyStateRhs &rhs, const double *y,
+                                               const std::vector<double> &f0,
+                                               const std::vector<double> &J, int ns,
+                                               const ResidualSubspace &sub,
+                                               const std::vector<int> &cols, bool *straddles) {
+    const auto un = static_cast<size_t>(ns);
+    std::vector<double> back = J;
+    *straddles = false;
+    const double y_scale = state_probe_scale(y, ns, sub.excluded);
+    std::vector<double> terms(un, 0.0);
+    for (size_t i = 0; i < un; ++i) {
+        double t = std::abs(f0[i]);
+        for (size_t j = 0; j < un; ++j)
+            t += std::abs(J[j * un + i] * y[j]);
+        terms[i] = t;
+    }
+    std::vector<double> y_pert(y, y + ns), f1(un), col(un);
+    for (int j : cols) {
+        const auto uj = static_cast<size_t>(j);
+        double step = fd_probe(y[j], -state_fd_step(y[j], y_scale), &y_pert[uj]);
+        bool halved = false;
+        if (y[j] >= 0.0 && y_pert[uj] < 0.0) {
+            if (y[j] >= kSecantResolvable * std::abs(step)) {
+                y_pert[uj] = 0.0;
+                step = -y[j];
+            } else {
+                step = fd_probe(y[j], 0.5 * std::abs(step), &y_pert[uj]);
+                halved = true;
+            }
+        }
+        rhs.eval(0.0, y_pert.data(), f1.data());
+        y_pert[uj] = y[j];
+        bool finite = true;
+        for (size_t i = 0; i < un; ++i) {
+            col[i] = (f1[i] - f0[i]) / step;
+            finite = finite && std::isfinite(col[i]);
+        }
+        if (!finite)
+            continue;
+        if (halved) {
+            for (size_t i = 0; i < un; ++i) {
+                const double forward = J[uj * un + i];
+                if (std::abs(col[i]) > 1.5 * std::abs(forward) &&
+                    std::abs(col[i] - forward) * std::abs(step) >
+                        kFdNoise * std::numeric_limits<double>::epsilon() * terms[i]) {
+                    *straddles = true;
+                    return back;
+                }
+            }
+        }
+        std::copy(col.begin(), col.end(), back.begin() + static_cast<std::ptrdiff_t>(uj * un));
+    }
+    return back;
+}
+
 // The Newton step from `y` to the root, in each species' own tolerance (issue
-// #1001): max_i |δ_i| / (rtol·|y_i| + atol_i), δ = −J⁻¹f on the system the
-// solvers solve (the unknowns, with a law's dependent species following from
-// them), atol_i = rtol·max(|y_i|, floor) as atol="auto" derives it. At most 1,
-// the state is within its tolerance of the root it linearizes to, whatever the
-// model's units: f and J scale together, and δ does not. 0 where f is 0 on the
-// unknowns, which is a root whatever J is there (a catalyst at 0 leaves J
-// singular at every state it holds still). +inf where J is singular at a state
-// that is not one (no step to take: over the corpus a least-squares step there
-// passed 8 states that a run moves by more than 1%). NaN where the step is not
-// taken (more unknowns than kNewtonDistanceMost). The model's state is left as
-// it was.
+// #1001): max_i |δ_i| / (rtol·|y_i| + atol_i) over the species the test
+// covers, δ = −J⁻¹f on ss_distance_system (each law's dependent species
+// following from the unknowns), atol_i = rtol·max(|y_i|, floor) as atol="auto"
+// derives it. At most 1, the state is within its tolerance of the root it
+// linearizes to, whatever the model's units: f and J scale together, and δ
+// does not. 0 where f is 0 on the unknowns, which is a root whatever J is there
+// (a catalyst at 0 leaves J singular at every state it holds still). +inf where
+// J is singular at a state that is not one (no step to take: over the corpus a
+// least-squares step there passed 8 states that a run moves by more than 1%).
+// NaN where the step is not taken (more unknowns than kNewtonDistanceMost).
+// The model's state is left as it was.
+//
+// A differenced Jacobian is taken both ways, and the larger of the two steps is
+// the distance. One-sided across a rate law that switches, `if(X<1, 0.1,
+// 100)`, the quotient is the jump over the step, and the step through it is
+// about the probe step: jacobian="fd" accepted that model, which has no steady
+// state, where the march stopped on its switch. A root within a step of a
+// switch (GH #176's model, whose state approaches its threshold) is within
+// tolerance by both.
+//
+// The distance is first order, and what it does not see is a slope so steep
+// that a rate with a floor reads as within tolerance of 0: X' = 0.001 +
+// 1e8·|X - 1| has no root, and a step of 5e-12 at its kink. Checking the step
+// on the right-hand side (each rate to fall by half, or to its rounding)
+// refused it, and 63 corpus roots with it, whose rates are rounding the
+// estimate does not see.
 static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
                                  const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                  const double *y) {
     const int ns = model.n_species();
-    const auto &cl = model.conservation_laws();
-    const std::vector<int> idx = ss_distance_unknowns(model, sub);
+    const auto un = static_cast<size_t>(ns);
+    const SsDistanceSystem system = ss_distance_system(model, sub);
+    const ConservationLaws &cl = system.laws;
+    const std::vector<int> &idx = system.unknowns;
     const int n = static_cast<int>(idx.size());
+    const double inf = std::numeric_limits<double>::infinity();
     if (n > kNewtonDistanceMost)
         return std::numeric_limits<double>::quiet_NaN();
     if (n == 0)
         return 0.0;
 
-    std::vector<double> saved(static_cast<size_t>(ns));
-    model.get_state_into(saved.data());
+    struct RestoreState {
+        NetworkModel &model;
+        std::vector<double> saved;
+        ~RestoreState() { model.set_state_from(saved.data()); }
+    } restore{model, std::vector<double>(un)};
+    model.get_state_into(restore.saved.data());
     model.set_state_from(y);
-    std::vector<double> f(static_cast<size_t>(ns), 0.0);
+    std::vector<double> f(un, 0.0);
     rhs.eval(0.0, y, f.data());
     bool at_root = true;
     for (int i : idx) {
         at_root = at_root && f[static_cast<size_t>(i)] == 0.0;
     }
     if (at_root) {
-        model.set_state_from(saved.data());
         return 0.0;
     }
-    std::vector<double> J(static_cast<size_t>(ns) * ns, 0.0);
-    ss_fill_state_jacobian(rhs, y, ns, sub, ss_want_analytical_jacobian(opts.jacobian), J.data());
-    model.set_state_from(saved.data());
 
-    std::vector<double> M;
-    ss_reduce_jacobian(J.data(), ns, cl, idx, M);
-    std::vector<int> row;
-    if (ss_lu_pivoted(M, n, row) >= 0)
-        return std::numeric_limits<double>::infinity();
-    std::vector<double> b(static_cast<size_t>(n));
-    for (int j = 0; j < n; ++j)
-        b[static_cast<size_t>(j)] = -f[static_cast<size_t>(idx[static_cast<size_t>(j)])];
-    ss_lu_solve(M, n, row, b);
-
-    // The step of every species: the unknowns' own, a law's dependent the
-    // change that keeps its total (in reconstruct_full's order), and 0 for a
-    // species held.
-    std::vector<double> delta(static_cast<size_t>(ns), 0.0);
-    for (int j = 0; j < n; ++j)
-        delta[static_cast<size_t>(idx[static_cast<size_t>(j)])] = b[static_cast<size_t>(j)];
-    for (int k = 0; k < cl.n_laws; ++k) {
-        const int dep = cl.dependent[k];
-        const double coeff_dep = cl.coefficients[k][dep];
-        if (std::abs(coeff_dep) < 1e-15)
-            continue;
-        double acc = 0.0;
-        for (int i = 0; i < ns; ++i) {
-            if (i != dep)
-                acc += cl.coefficients[k][i] * delta[static_cast<size_t>(i)];
+    const bool want_analytical = ss_want_analytical_jacobian(opts.jacobian);
+    // J at `at`, the model moved there for it; true where it was differenced.
+    const auto jacobian_at = [&](const double *at, std::vector<double> &Jm) {
+        Jm.assign(un * un, 0.0);
+        model.set_state_from(at);
+        return std::strcmp(ss_fill_state_jacobian(rhs, at, ns, sub, want_analytical, Jm.data()),
+                           "finite-difference") == 0;
+    };
+    // The Newton step for rates `fm` through `Jm`, every species' share of it:
+    // the unknowns' own, a law's dependent the change that keeps its total (in
+    // reconstruct_full's order), and 0 for a species held. Empty where the
+    // reduced matrix is singular.
+    const auto newton_step = [&](const std::vector<double> &Jm, const std::vector<double> &fm) {
+        std::vector<double> M;
+        ss_reduce_jacobian(Jm.data(), ns, cl, idx, M);
+        std::vector<int> row;
+        if (ss_lu_pivoted(M, n, row) >= 0)
+            return std::vector<double>();
+        std::vector<double> b(static_cast<size_t>(n));
+        for (int j = 0; j < n; ++j)
+            b[static_cast<size_t>(j)] = -fm[static_cast<size_t>(idx[static_cast<size_t>(j)])];
+        ss_lu_solve(M, n, row, b);
+        std::vector<double> delta(un, 0.0);
+        for (int j = 0; j < n; ++j)
+            delta[static_cast<size_t>(idx[static_cast<size_t>(j)])] = b[static_cast<size_t>(j)];
+        for (int k = 0; k < cl.n_laws; ++k) {
+            const int dep = cl.dependent[k];
+            const double coeff_dep = cl.coefficients[k][dep];
+            if (std::abs(coeff_dep) < 1e-15)
+                continue;
+            double acc = 0.0;
+            for (int i = 0; i < ns; ++i) {
+                if (i != dep)
+                    acc += cl.coefficients[k][i] * delta[static_cast<size_t>(i)];
+            }
+            delta[static_cast<size_t>(dep)] = -acc / coeff_dep;
         }
-        delta[static_cast<size_t>(dep)] = -acc / coeff_dep;
-    }
-
-    // A model that starts with every species at 0 has no size of its own to
-    // hold a species at 0 to, and 1 in its units is none: 0 -> X at 1e-9 per
-    // unit time, X -> 0 at 1, was accepted at x = 0.69e-9 after one step.
-    // The state and the root it steps to give it one, the largest species
-    // either has, as the largest initial concentration would.
-    double floor = opts.criterion_floor;
-    if (!(floor > 0.0)) {
-        floor = 0.0;
+        return delta;
+    };
+    // The step's size in each covered species' tolerance.
+    const auto size_of = [&](const std::vector<double> &delta) {
+        // A model that starts with every species at 0 has no size of its own
+        // to hold a species at 0 to, and 1 in its units is none: 0 -> X at
+        // 1e-9 per unit time, X -> 0 at 1, was accepted at x = 0.69e-9 after
+        // one step. The state and the root it steps to give it one, the
+        // largest species either has, as the largest initial concentration
+        // would.
+        double floor = opts.criterion_floor;
+        if (!(floor > 0.0)) {
+            floor = 0.0;
+            for (int i : sub.included) {
+                if (model.species()[i].fixed)
+                    continue;
+                const double d = delta[static_cast<size_t>(i)];
+                floor = std::max({floor, std::abs(y[i]), std::abs(y[i] + d)});
+            }
+        }
+        double distance = 0.0;
         for (int i : sub.included) {
             if (model.species()[i].fixed)
                 continue;
             const double d = delta[static_cast<size_t>(i)];
-            floor = std::max({floor, std::abs(y[i]), std::abs(y[i] + d)});
+            if (!std::isfinite(d))
+                return inf;
+            if (d == 0.0)
+                continue;
+            const double yi = std::abs(y[i]);
+            const double scale = opts.rtol * yi + opts.rtol * std::max(yi, floor);
+            distance = std::max(distance, std::abs(d) / scale);
         }
-    }
-    double distance = 0.0;
-    for (int i : sub.included) {
-        if (model.species()[i].fixed)
-            continue;
-        const double d = delta[static_cast<size_t>(i)];
-        if (!std::isfinite(d))
-            return std::numeric_limits<double>::infinity();
-        if (d == 0.0)
-            continue;
-        const double yi = std::abs(y[i]);
-        const double scale = opts.rtol * yi + opts.rtol * std::max(yi, floor);
-        distance = std::max(distance, std::abs(d) / scale);
+        return distance;
+    };
+    std::vector<double> J;
+    const bool differenced = jacobian_at(y, J);
+    const std::vector<double> delta = newton_step(J, f);
+    if (delta.empty())
+        return inf;
+    double distance = size_of(delta);
+    if (!(distance <= 1.0))
+        return distance;
+    if (differenced) {
+        // The columns the reduced matrix reads: the unknowns' and the laws'.
+        std::vector<int> cols = idx;
+        for (int dep : cl.dependent) {
+            if (!model.species()[dep].fixed)
+                cols.push_back(dep);
+        }
+        bool straddles = false;
+        const std::vector<double> back_J =
+            ss_backward_columns(rhs, y, f, J, ns, sub, cols, &straddles);
+        if (straddles)
+            return inf;
+        const std::vector<double> back = newton_step(back_J, f);
+        distance = back.empty() ? inf : std::max(distance, size_of(back));
+        if (!(distance <= 1.0))
+            return distance;
     }
     return distance;
 }
@@ -5275,17 +5569,21 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                     "'. Must be \"scaled\" or \"residual\".");
     }
     {
+        // Of the species the test steps: a $-fixed source of 1 beside a
+        // nanomolar product held that product to 1e-8, and the issue's
+        // synthesis written `$Src -> $Src + X` was accepted at 0.73 of its
+        // root after one step.
         double floor = std::numeric_limits<double>::infinity();
         for (int i : sub.included) {
             const double v = std::abs(model.species()[i].concentration);
-            if (v > 0.0 && v < floor) {
+            if (!model.species()[i].fixed && v > 0.0 && v < floor) {
                 floor = v;
             }
         }
         opts.criterion_floor = std::isfinite(floor) ? floor : 0.0;
         opts.criterion_by_distance =
             opts.criterion == "scaled" &&
-            static_cast<int>(ss_distance_unknowns(model, sub).size()) <= kNewtonDistanceMost;
+            static_cast<int>(ss_distance_system(model, sub).unknowns.size()) <= kNewtonDistanceMost;
     }
 
     // Resolve the RHS backend once for the whole solve: the codegen artifact is
@@ -5568,8 +5866,9 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // is no closed form, is not a cost of the parity path. Measured with the
     // Jacobian the answer came from: after the retry on differences, the
     // closed form that stopped the march read +inf at nn_xor.bngl's Newton
-    // root, which the differenced one had accepted.
-    result.criterion = opts.criterion;
+    // root, which the differenced one had accepted. Above kNewtonDistanceMost
+    // unknowns a "scaled" request was decided by the residual test, and says so.
+    result.criterion = opts.criterion_by_distance ? "scaled" : "residual";
     if (opts.criterion_by_distance && static_cast<int>(result.concentrations.size()) == ns) {
         result.newton_distance =
             ss_newton_distance(model, rhs, *effective, sub, result.concentrations.data());

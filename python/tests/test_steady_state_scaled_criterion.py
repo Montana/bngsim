@@ -21,7 +21,13 @@ tolerance, which reads the same in any units. These tests cover:
 - ``set_tolerances(rtol=...)`` alone leaves the march its own ``atol``;
 - above 512 unknowns the solve is the residual one, step for step;
 - a march that stops between the steps the criterion is asked at is asked
-  where it stops (a corpus model).
+  where it stops (a corpus model);
+- a mask says which species are measured, not which move: A -> S under the
+  pure-sink mask is stepped, A -> B and A -> C converge, a masked C that
+  drains steps the A and B it feeds, whatever the species order;
+- a differenced Jacobian across a rate law's jump certifies nothing;
+- a $-fixed species does not set the floor;
+- a batch entry at another scale marches at its own "auto" atol.
 """
 
 from __future__ import annotations
@@ -82,6 +88,35 @@ def test_default_is_the_residual_test(tmp_path):
     assert at_one.converged
     assert at_one.concentrations[0] == pytest.approx(1.0, rel=1e-6)
     assert math.isnan(at_one.newton_distance)
+
+
+# The issue's table: the residual test at a scale of 1e-9 accepts the cubic one
+# step from each start. Pinned so a change to the default path shows.
+RESIDUAL_AT_1E_9 = {
+    ("integration", 0.5): 0.893865,
+    ("integration", 0.9): 1.003209,
+    ("integration", 1.5): 0.130999,
+    ("newton", 0.5): 0.3,
+    ("newton", 0.9): 1.038462,
+    ("newton", 1.5): 1.214286,
+}
+
+
+@pytest.mark.parametrize("method,x0", sorted(RESIDUAL_AT_1E_9))
+def test_the_default_solve_is_the_residual_solve(tmp_path, method, x0):
+    out = {}
+    for criterion in (None, "residual"):
+        kw = {} if criterion is None else {"criterion": criterion}
+        out[criterion] = bngsim.Simulator(_cubic(tmp_path, 1e-9, x0), method="ode").steady_state(
+            method=method, **kw
+        )
+    default, residual = out[None], out["residual"]
+    assert default.criterion == "residual"
+    assert default.converged and default.n_steps == 1
+    assert default.concentrations[0] / 1e-9 == pytest.approx(
+        RESIDUAL_AT_1E_9[(method, x0)], rel=1e-5
+    )
+    assert np.array_equal(default.concentrations, residual.concentrations)
 
 
 @pytest.mark.parametrize("method", ["integration", "newton"])
@@ -145,28 +180,36 @@ end reactions
 
 
 def _numpy_newton_distance(model, y, rtol, mask=None):
-    """The step the criterion measures, by NumPy: the unknowns' Newton step on
-    the reduced system, each law's dependent following from it, over each
-    species' rtol·|y| + rtol·max(|y|, floor)."""
+    """The step the criterion measures, by NumPy, and without choosing which
+    species each law is solved for. Every species moves by its own equation
+    but a $-fixed one and a masked one nothing reads (an empty column of the
+    Jacobian's pattern), which is held; the laws are cut down to the ones no
+    such species is in; the step is solved on all of it, with a rank check.
+    Its size is taken over each kept species' rtol·|y| + rtol·max(|y|, floor)."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
-    included = np.ones(ns, bool) if mask is None else np.asarray(mask, bool)
-    unknowns = [i for i in cl["independent"] if included[i]]
-    lift = np.zeros((ns, len(unknowns)))
-    for j, u in enumerate(unknowns):
-        step = np.zeros(ns)
-        step[u] = 1.0
-        for k, dep in enumerate(cl["dependent"]):
-            step[dep] = -(laws[k] @ step - laws[k, dep] * step[dep]) / laws[k, dep]
-        lift[:, j] = step
+    fixed = np.asarray(model._core.species_is_fixed, bool)
+    kept = (np.ones(ns, bool) if mask is None else np.asarray(mask, bool)) & ~fixed
+    pattern = model.jacobian(np.asarray(model.get_state(), float), sparse=True).tocsc()
+    unread = ~kept & ~fixed & (np.diff(pattern.indptr) == 0)
+    if unread.any() and len(laws):
+        u, sv, _ = np.linalg.svd(laws[:, unread])
+        laws = u[:, int(np.sum(sv > 1e-12 * sv[0])) :].T @ laws
+    moves = ~fixed & ~unread
     f = np.asarray(model.rhs(y), float)
     jac = np.asarray(model.jacobian(y), float)
-    delta = lift @ np.linalg.solve((jac @ lift)[unknowns, :], -f[unknowns])
+    lhs = np.vstack([laws[:, moves], jac[moves][:, moves]])
+    rhs = np.concatenate([np.zeros(len(laws)), -f[moves]])
+    step, _, rank, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    assert rank == moves.sum()
+    assert np.allclose(lhs @ step, rhs, rtol=0, atol=1e-9 * np.max(np.abs(rhs)))
+    delta = np.zeros(ns)
+    delta[moves] = step
     y0 = np.asarray(model.get_state(), float)
-    floor = min(abs(v) for v, keep in zip(y0, included, strict=True) if keep and v != 0)
+    floor = min(abs(v) for v, keep in zip(y0, kept, strict=True) if keep and v != 0)
     scale = rtol * np.abs(y) + rtol * np.maximum(np.abs(y), floor)
-    return float(np.max(np.abs(delta[included]) / scale[included]))
+    return float(np.max(np.abs(delta[kept]) / scale[kept]))
 
 
 @pytest.mark.parametrize("a0,b0,c0", [(1.0, 1e-3, 0.0), (1e-9, 1e-12, 1e-10), (5.0, 2.0, 0.5)])
@@ -299,13 +342,17 @@ def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
         ).steady_state(criterion=criterion, method="newton", atol=1e-10)
     residual, scaled = out["residual"], out["scaled"]
     assert scaled.converged and scaled.method_used == "newton"
-    assert scaled.criterion == "scaled"
+    # The test `converged` was decided by.
+    assert scaled.criterion == "residual"
     assert math.isnan(scaled.newton_distance)
     assert scaled.n_steps == residual.n_steps
     assert np.array_equal(scaled.concentrations, residual.concentrations)
 
 
-_B252 = Path("parity_checks/rr_parity/models/BIOMD0000000252/BIOMD0000000252_url.xml")
+_B252 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000252/BIOMD0000000252_url.xml"
+)
 
 
 @pytest.mark.skipif(
@@ -337,3 +384,474 @@ def test_burst_free_starts_find_the_same_roots_at_any_scale(tmp_path, s):
     assert all(r.newton_distance <= 1.0 for r in converged)
     roots = sorted({round(r.concentrations[0] / s, 6) + 0.0 for r in converged})
     assert roots == [0.0, 0.3, 1.0]
+
+
+# A -> S, S a write-only sink, one law A + S. Listed A first, A is the law's
+# dependent species, which the pure-sink mask keeps while it leaves S out.
+DECAY_NETS = {
+    "A first": """begin parameters
+    1 k 1.0
+end parameters
+begin species
+    1 A() 1.0
+    2 S() 0
+end species
+begin reactions
+    1 1 2 k
+end reactions
+""",
+    "S first": """begin parameters
+    1 k 1.0
+end parameters
+begin species
+    1 S() 0
+    2 A() 1.0
+end species
+begin reactions
+    1 2 1 k
+end reactions
+""",
+}
+
+
+@pytest.mark.parametrize("order", sorted(DECAY_NETS))
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_masked_sink_takes_up_its_law(tmp_path, order, method):
+    # The solvers hold S where integration left it; with A the law's dependent,
+    # nothing moved A, and A first was accepted where it started, [1, 0].
+    path = tmp_path / "decay.net"
+    path.write_text(DECAY_NETS[order])
+    model = bngsim.Model.from_net(str(path))
+    a = model.species_names.index("A()")
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", method=method, mask=~model.is_pure_sink()
+    )
+    assert ss.converged
+    assert abs(ss.concentrations[a]) < 1e-8
+    assert ss.newton_distance <= 1.0
+
+
+@pytest.mark.parametrize("order", sorted(DECAY_NETS))
+def test_a_masked_law_member_follows_the_step(tmp_path, order):
+    # Short of the root, the step is A's own: f = -k·A, so δ_A = -A exactly,
+    # held to rtol·A + rtol·max(A, 1).
+    path = tmp_path / "decay.net"
+    path.write_text(DECAY_NETS[order])
+    model = bngsim.Model.from_net(str(path))
+    a = model.species_names.index("A()")
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", max_time=0.5, mask=~model.is_pure_sink()
+    )
+    assert not ss.converged
+    y = ss.concentrations[a]
+    assert ss.newton_distance == pytest.approx(y / (1e-8 * y + 1e-8 * max(y, 1.0)), rel=1e-6)
+
+
+# A <-> B, one law; a mask that keeps only A, the law's dependent.
+PAIR_NET = """begin parameters
+    1 kf 1.0
+    2 kr 0.5
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0
+end species
+begin reactions
+    1 1 2 kf
+    2 2 1 kr
+end reactions
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_kept_dependent_whose_partner_is_masked_is_stepped(tmp_path, method):
+    path = tmp_path / "pair.net"
+    path.write_text(PAIR_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        criterion="scaled", method=method, mask=[True, False]
+    )
+    assert ss.converged
+    assert ss.concentrations[0] == pytest.approx(1.0 / 3.0, rel=1e-6)
+
+
+# X' = if(X < 1, 0.1, 100): positive everywhere, no steady state.
+JUMP_NET = """begin parameters
+    1 klo 0.1
+    2 khi 100
+    3 x0 {x0!r}
+end parameters
+begin species
+    1 X() x0
+end species
+begin reactions
+    1 0 1 fr
+end reactions
+begin groups
+    1 Xobs 1
+end groups
+begin functions
+    1 fr() if(Xobs<1,klo,khi)
+end functions
+"""
+
+
+@pytest.mark.parametrize("jacobian", ["fd", "auto"])
+def test_a_differenced_jacobian_across_a_jump_certifies_nothing(tmp_path, jacobian):
+    # The march stops on the switch, and one-sided across it the quotient is
+    # the jump over the step: 20 of these 60 starts came back converged.
+    for i, x0 in enumerate(np.linspace(0.0, 0.999, 60)):
+        path = tmp_path / f"jump_{i}.net"
+        path.write_text(JUMP_NET.format(x0=float(x0)))
+        ss = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+        ).steady_state(criterion="scaled", max_time=100.0)
+        assert not ss.converged, x0
+
+
+@pytest.mark.parametrize("s", [1.0, 1e-9])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_differenced_jacobian_still_certifies_a_smooth_root(tmp_path, s, method):
+    ss = bngsim.Simulator(_cubic(tmp_path, s, 0.5), method="ode", jacobian="fd").steady_state(
+        criterion="scaled", method=method
+    )
+    assert ss.converged
+    assert ss.concentrations[0] / s == pytest.approx(1.0, rel=1e-6)
+
+
+def test_the_retried_march_past_a_switch_still_converges(data_dir):
+    # GH #176's model: its closed-form Jacobian stops the march, the retry
+    # differences across the switch on the way, and its root is away from it.
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(str(data_dir / "ltype_calcium_discontinuous_jacobian.net")),
+        method="ode",
+    ).steady_state(criterion="scaled")
+    assert ss.converged
+    assert ss.newton_distance <= 1.0
+
+
+# The synthesis of SYNTHESIS_NET written the BNGL way, from a $-fixed source.
+SOURCE_NET = """begin parameters
+    1 ksyn {ksyn!r}
+    2 kdeg 1.0
+end parameters
+begin species
+    1 $Src() 1
+    2 X() 0
+end species
+begin reactions
+    1 1 1,2 ksyn
+    2 2 0 kdeg
+end reactions
+"""
+
+
+@pytest.mark.parametrize("ksyn", [1e-9, 1e-12])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_fixed_species_does_not_set_the_floor(tmp_path, ksyn, method):
+    # $Src = 1 held X to 1e-8 against a root of 1e-9: 0.73 of it after a step.
+    path = tmp_path / "source.net"
+    path.write_text(SOURCE_NET.format(ksyn=ksyn))
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        criterion="scaled", method=method
+    )
+    assert ss.converged
+    assert ss.concentrations[1] / ksyn == pytest.approx(1.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_batch_entry_marches_at_its_own_auto_atol(tmp_path, method):
+    # Taken from the model at s = 1, the "auto" ran the entry at s = 1e-9
+    # through zero (x = -3.7).
+    sim = bngsim.Simulator(_cubic(tmp_path, 1.0, 0.5), method="ode")
+    for out in (
+        sim.steady_state_batch([{"s": 1e-9}], criterion="scaled", method=method)[0],
+        sim.steady_state_batch(
+            params=[{"s": 1e-9}], states=[[0.5e-9]], criterion="scaled", method=method
+        )[0],
+    ):
+        assert out.converged
+        assert out.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+
+
+# A -> S1 at 1, A + S1 -> S2 + S1 at 1e9 (S1 speeds A's loss to S2); one law
+# A + S1 + S2, and only A kept. A's one steady state is 0.
+CATALYZED_NET = """begin parameters
+    1 k1 1.0
+    2 k3 1e9
+end parameters
+begin species
+{species}
+end species
+begin reactions
+    1 {a} {s1} k1
+    2 {a},{s1} {s2},{s1} k3
+end reactions
+"""
+
+
+@pytest.mark.parametrize("order", [("A", "S1", "S2"), ("A", "S2", "S1")])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_two_masked_members_of_a_law_do_not_depend_on_species_order(tmp_path, order, method):
+    # Holding one masked member and moving the other made the step depend on
+    # which: listed A, S1, S2 the state was accepted where it started, A = 1.
+    start = {"A": 1.0, "S1": 0.0, "S2": 0.0}
+    index = {name: i + 1 for i, name in enumerate(order)}
+    path = tmp_path / "catalyzed.net"
+    path.write_text(
+        CATALYZED_NET.format(
+            species="\n".join(f"    {index[n]} {n}() {start[n]!r}" for n in order),
+            a=index["A"],
+            s1=index["S1"],
+            s2=index["S2"],
+        )
+    )
+    mask = [name == "A" for name in order]
+    a = order.index("A")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    early = sim.steady_state(criterion="scaled", method=method, mask=mask, max_time=1e-12)
+    assert not early.converged
+    ss = sim.steady_state(criterion="scaled", method=method, mask=mask)
+    assert ss.converged
+    assert abs(ss.concentrations[a]) < 1e-8
+
+
+# A -> B at 1 and A -> C at 2: one law A + B + C, B and C write-only sinks.
+BRANCH_NETS = {
+    "A first": """begin parameters
+    1 k1 1.0
+    2 k2 2.0
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0
+    3 C() 0
+end species
+begin reactions
+    1 1 2 k1
+    2 1 3 k2
+end reactions
+""",
+    "A last": """begin parameters
+    1 k1 1.0
+    2 k2 2.0
+end parameters
+begin species
+    1 B() 0
+    2 C() 0
+    3 A() 1.0
+end species
+begin reactions
+    1 3 1 k1
+    2 3 2 k2
+end reactions
+""",
+}
+
+
+@pytest.mark.parametrize("order", sorted(BRANCH_NETS))
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_two_sinks_of_one_law_converge(tmp_path, order, method):
+    # Moving both sinks left no equation for how A's loss splits between them,
+    # and the matrix was singular at every state: never converged.
+    path = tmp_path / "branch.net"
+    path.write_text(BRANCH_NETS[order])
+    model = bngsim.Model.from_net(str(path))
+    a = model.species_names.index("A()")
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", method=method, mask=~model.is_pure_sink()
+    )
+    assert ss.converged
+    assert abs(ss.concentrations[a]) < 1e-8
+
+
+# A + B <-> C, C -> D: two laws as found, D (a sink) in both; C drains.
+DRAIN_NET = """begin parameters
+    1 kf 2.0
+    2 kr 0.3
+    3 kd 0.7
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0.5
+    3 C() 0
+    4 D() 0
+end species
+begin reactions
+    1 1,2 3 kf
+    2 3 1,2 kr
+    3 3 4 kd
+end reactions
+"""
+
+
+@pytest.mark.parametrize("keep", ["AB", "ABC", "A"])
+def test_a_masked_species_that_feeds_kept_ones_is_stepped(tmp_path, keep):
+    # Holding C, as the solvers hold a masked species, stepped A and B as if
+    # C did not drain; dropping both laws D is in lost B + C - A.
+    path = tmp_path / "drain.net"
+    path.write_text(DRAIN_NET)
+    model = bngsim.Model.from_net(str(path))
+    mask = [name[0] in keep for name in model.species_names]
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", max_time=2.0, mask=mask
+    )
+    assert not ss.converged
+    want = _numpy_newton_distance(
+        bngsim.Model.from_net(str(path)), np.asarray(ss.concentrations), 1e-8, mask
+    )
+    assert ss.newton_distance == pytest.approx(want, rel=1e-6)
+
+
+# X' = if(X < c, klo, 1e3): positive everywhere. Y, settled at 1 beside it,
+# makes the difference-quotient step 1.5e-8, past X's switch.
+NEAR_ZERO_JUMP_NET = """begin parameters
+    1 x0 {x0!r}
+    2 one 1.0
+end parameters
+begin species
+    1 X() x0
+    2 Y() 1.0
+end species
+begin reactions
+    1 0 1 fr
+    2 0 2 one
+    3 2 0 one
+end reactions
+begin groups
+    1 Xobs 1
+end groups
+begin functions
+    1 fr() if(Xobs<{c!r},{klo!r},1e3)
+end functions
+"""
+
+
+@pytest.mark.parametrize(
+    "c,klo,x0",
+    [
+        (1e-9, 1e-6, 0.0),
+        (1e-9, 1e-6, 2.5e-10),
+        (1e-9, 1e-6, 9e-10),
+        (1e-12, 1e-6, 0.0),
+        (1e-20, 1e-30, 5e-21),
+    ],
+)
+@pytest.mark.parametrize("jacobian", ["fd", "auto"])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, c, klo, x0, jacobian, method):
+    # The backward probe would go below 0. Keeping the forward quotient let the
+    # jump through; the secant to 0 reads the law's own slope, 0, and where X
+    # is too small for that secant to be read (9e-15, 3e-41), a forward quotient
+    # at half the step grows across the jump.
+    path = tmp_path / "near_zero.net"
+    path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0, c=c, klo=klo))
+    for max_time in (1e-30, 1.0, 1e6):
+        ss = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+        ).steady_state(criterion="scaled", method=method, max_time=max_time)
+        assert not ss.converged, max_time
+
+
+# A in a 1 mL medium taken up into a 1 fL cell: A -> S, S a write-only sink.
+# The law weighs S by the volume ratio, A + 1e-12·S.
+UPTAKE_SBML = """<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1">
+  <model id="uptake">
+    <listOfCompartments>
+      <compartment id="medium" size="{medium!r}" constant="true" spatialDimensions="3"/>
+      <compartment id="cell" size="1e-15" constant="true" spatialDimensions="3"/>
+    </listOfCompartments>
+    <listOfSpecies>
+      <species id="A" compartment="medium" initialConcentration="1"
+               hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="S" compartment="cell" initialConcentration="0"
+               hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="k" value="1" constant="true"/>
+    </listOfParameters>
+    <listOfReactions>
+      <reaction id="uptake" reversible="false">
+        <listOfReactants>
+          <speciesReference species="A" stoichiometry="1" constant="true"/>
+        </listOfReactants>
+        <listOfProducts>
+          <speciesReference species="S" stoichiometry="1" constant="true"/>
+        </listOfProducts>
+        <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+          <apply><times/><ci>k</ci><ci>A</ci><ci>medium</ci></apply>
+        </math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>"""
+
+
+@pytest.mark.parametrize("medium", [1e-3, 1.0])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_sink_in_a_small_compartment_takes_up_its_law(medium, method):
+    # Its coefficient, 1e-12 of A's (1e-15 at 1 L), read as rounding: the law
+    # kept A for its dependent, and A was accepted where it started.
+    model = bngsim.Model.from_sbml_string(UPTAKE_SBML.format(medium=medium))
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        criterion="scaled", method=method, mask=~model.is_pure_sink()
+    )
+    assert ss.converged
+    assert abs(ss.concentrations[0]) < 1e-8
+
+
+# A -> B with a rate that reads a counter t, run at 1 from 0: t has no root.
+COUNTER_NET = """begin parameters
+    1 k1  0.1
+    2 one 1.0
+end parameters
+begin species
+    1 A() 100
+    2 B() 0
+    3 t() 0
+end species
+begin functions
+    1 _rateLaw1() k1*(1+0*t)
+end functions
+begin reactions
+    1 1 2 _rateLaw1
+    2 0 3 one
+end reactions
+begin groups
+    1 A_tot  1
+    2 B_tot  2
+    3 t      3
+end groups
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_masked_counter_is_held(tmp_path, method):
+    # Its row reads no state, so stepped it made the matrix singular at every
+    # state, and A never converged.
+    path = tmp_path / "counter.net"
+    path.write_text(COUNTER_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        criterion="scaled", method=method, mask=[True, False, False], max_time=2000.0
+    )
+    assert ss.converged
+    assert ss.concentrations[0] < 1e-6
+
+
+_B358 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000358/BIOMD0000000358_url.xml"
+)
+
+
+@pytest.mark.skipif(
+    not _B358.exists(), reason="rr_parity corpus model BIOMD0000000358 not present"
+)
+def test_a_species_far_below_its_step_keeps_its_forward_column():
+    # A species at 1.7e-44: its secant to 0 moves the rows by less than their
+    # rounding, the column lost its entries, and the root was refused.
+    ss = bngsim.Simulator(
+        bngsim.Model.from_sbml(str(_B358)), method="ode", jacobian="fd"
+    ).steady_state(criterion="scaled")
+    assert ss.converged
+    assert ss.newton_distance <= 1.0
