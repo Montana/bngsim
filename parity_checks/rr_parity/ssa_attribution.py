@@ -334,7 +334,7 @@ def case_to_job_result(
         exception=str(case.get("error") or ""),
         wall_sec=_wall_sec(case),
         timestamp=timestamp,
-        versions=dict(versions or {}),
+        versions=_row_versions(case, versions),
         comment=_comment(case, status),
         reference_refusal=reference_refusal,
         subclass=subclass,
@@ -345,6 +345,16 @@ def case_to_job_result(
         # instead of a cold/warm-reuse split) — the renderer keys off the shape.
         timing=case.get("timing"),
     )
+
+
+def _row_versions(case: dict, versions: dict | None) -> dict:
+    """The run's versions, with RoadRunner's taken from the reference archive on a
+    replayed row: the RoadRunner that ran here (if any) made none of its results."""
+    out = dict(versions or {})
+    rr = (case.get("timing") or {}).get("roadrunner") or {}
+    if rr.get("replayed_from_archive"):
+        out["roadrunner"] = rr.get("reference_version")
+    return out
 
 
 def _versions_of(machine: dict) -> dict:

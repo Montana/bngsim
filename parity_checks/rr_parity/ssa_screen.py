@@ -1094,6 +1094,8 @@ class Reference:
         self.ensembles: dict[str, tuple] = {}  # repr(horizon) -> (times, arr, names)
         self.rr_ode = None
         self.stale = ""
+        # Which RoadRunner made the record: kept beside the identity, not in it.
+        self.reference_version = None
         if replay:
             self._load()
 
@@ -1118,7 +1120,16 @@ class Reference:
                     raise bngsim.SimulationTimeout(run["error"])
                 raise type(run["error_type"], (RuntimeError,), {})(run["error"])
             times, arr, names = self.ensembles[key]
-            return times, arr, names, {**run["timing"], "replayed_from_archive": True}
+            return (
+                times,
+                arr,
+                names,
+                {
+                    **run["timing"],
+                    "replayed_from_archive": True,
+                    "reference_version": self.reference_version,
+                },
+            )
         t0 = time.perf_counter()
         try:
             times, arr, names, timing = rc.rr_ssa(xml, t_start, t_end, n_points, n, seed_base)
@@ -1139,7 +1150,7 @@ class Reference:
             if self.rr_ode is None:
                 raise ArchiveMiss(
                     "the replay needs RoadRunner's ODE to attribute a fail, and the "
-                    "recorded run had no fail to attribute"
+                    "archive holds none for this model"
                 )
             return self.rr_ode
         self.rr_ode = _rr_ode(xml, t_end, n_steps)
@@ -1151,7 +1162,13 @@ class Reference:
             return
         out = _archive_file(self.record_to, self.spec["name"])
         out.parent.mkdir(parents=True, exist_ok=True)
-        meta = {**archive_identity(self.spec, self.n, self.seed_base), "runs": {}}
+        if self.reference_version is None:
+            self.reference_version = versions.roadrunner_version()
+        meta = {
+            **archive_identity(self.spec, self.n, self.seed_base),
+            "reference_version": self.reference_version,
+            "runs": {},
+        }
         arrays = {}
         for i, (key, run) in enumerate(self.runs.items()):
             meta["runs"][key] = {**run, "index": i}
@@ -1172,24 +1189,35 @@ class Reference:
         if not path.is_file():
             self.stale = "no entry for this model"
             return
-        with np.load(path, allow_pickle=False) as z:
-            meta = json.loads(bytes(z["meta"]).decode())
-            want = archive_identity(self.spec, self.n, self.seed_base)
-            changed = [k for k in want if meta.get(k) != want[k]]
-            if changed:
-                self.stale = f"the model's {', '.join(changed)} changed"
-                return
-            for key, run in meta["runs"].items():
-                i = run.pop("index")
-                self.runs[key] = run
-                if f"arr_{i}" in z:
-                    self.ensembles[key] = (
-                        np.array(z[f"times_{i}"]),
-                        np.array(z[f"arr_{i}"]),
-                        json.loads(bytes(z[f"names_{i}"]).decode()),
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                meta = json.loads(bytes(z["meta"]).decode())
+                want = archive_identity(self.spec, self.n, self.seed_base)
+                changed = [k for k in want if meta.get(k) != want[k]]
+                if changed:
+                    self.stale = f"the model's {', '.join(changed)} changed"
+                    return
+                self.reference_version = meta.get("reference_version")
+                for key, run in meta["runs"].items():
+                    i = run.pop("index")
+                    self.runs[key] = run
+                    if f"arr_{i}" in z:
+                        self.ensembles[key] = (
+                            np.array(z[f"times_{i}"]),
+                            np.array(z[f"arr_{i}"]),
+                            json.loads(bytes(z[f"names_{i}"]).decode()),
+                        )
+                if "ode_arr" in z:
+                    self.rr_ode = (
+                        np.array(z["ode_arr"]),
+                        json.loads(bytes(z["ode_names"]).decode()),
                     )
-            if "ode_arr" in z:
-                self.rr_ode = (np.array(z["ode_arr"]), json.loads(bytes(z["ode_names"]).decode()))
+        except Exception as exc:
+            # An entry that cannot be read is no reference either. Refused like a
+            # stale one, rather than killing the worker, whose row would then read
+            # as a bngsim crash.
+            self.runs, self.ensembles, self.rr_ode = {}, {}, None
+            self.stale = f"the entry could not be read ({type(exc).__name__}: {exc})"[:300]
 
 
 def _not_from_archive(entry: dict, ref: Reference, miss: ArchiveMiss) -> dict:
@@ -1310,6 +1338,13 @@ def _worker(
                 entry["timing"].setdefault("bngsim", {}).update(_activity_block())
             q.put(entry)
             return
+
+    # A replay whose entry cannot stand in for RoadRunner is never compared, so
+    # bngsim's ensemble is not run for it. Only after the time-event branch,
+    # which needs no RoadRunner and so no entry.
+    if ref.stale:
+        q.put(_not_from_archive(entry, ref, ArchiveMiss(ref.stale)))
+        return
 
     # ── Try the FULL-horizon bngsim ensemble, BOUNDED per replicate. A blowup seed
     # (a runtime sign-indefinite rate explosion that never finishes on some seeds —

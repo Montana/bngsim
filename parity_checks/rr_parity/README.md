@@ -84,16 +84,22 @@ An entry holds every RoadRunner result the screen used for that model:
 
 The replay re-runs bngsim and walks the same ladders, so it reaches the same
 verdicts unless bngsim's own behaviour changed. In that case it may need a
-result the record does not hold: a rung the recorded run never reached, or an
-ODE for a fail the recorded run did not have. Such a row is
-`archive_unreplayable`. A fail it cannot attribute stays a red `fail`
-("unattributed"), so a regression is never hidden. The z-gate knobs
+gillespie result the record does not hold, a rung the recorded run never
+reached, and the row is `archive_unreplayable`. Which rungs a ladder walks
+depends on how fast bngsim finishes them, so a faster or slower machine can
+turn a recorded `partial` or `extended` row into `archive_unreplayable` too;
+read that as a reason to re-record, not as a regression. A fail whose
+RoadRunner ODE the record does not hold stays a red `fail` ("unattributed"),
+so a regression is never hidden. The z-gate knobs
 (`--mean-z-tol`, `--min-mean-count`, `--self-z-tol`) are not part of an entry,
 so a replay can rescore the same ensembles under new gates.
 
 An entry is used only while it still describes the model: the SBML's sha256,
-`t_end`, `n_steps`, `--n` and `--seed-base` must all match. Otherwise, or with
-no entry, the row is `archive_stale` and names what changed. Neither kind of row
+`t_end`, `n_steps`, `--n` and `--seed-base` must all match. Otherwise, with no
+entry, or with an entry that cannot be read, the row is `archive_stale` and
+names why, and bngsim is not run for it. Each entry also records the
+RoadRunner version that made it; a replayed row reports that version, not the
+one installed where the replay ran. Neither kind of row
 is compared; re-record to clear them. The two flags are mutually exclusive, and
 the native report's `config.reference_source` records which side was used.
 
