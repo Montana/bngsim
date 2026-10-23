@@ -77,7 +77,11 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
 
         ``"elementary"``
             ``rate_law`` is a parameter name; ``stat_factor`` carries a
-            ``<number>*`` prefix on it.
+            ``<number>*`` prefix on it. The prefix goes ahead of a typed rate
+            law too (``2*MM kcat Km``, ``2*Sat k K``, ``2*Hill V K h``, which
+            BNG2.pl writes for a substrate with equivalent sites), and comes
+            back as the ``"mm"`` or rewritten ``"functional"`` reaction's
+            ``stat_factor``, which multiplies the whole rate (issue #1230).
         ``"functional"``
             ``rate_law`` names a function in the ``functions`` block. A
             deprecated ``Sat`` or ``Hill`` rate law comes back as one of these,
