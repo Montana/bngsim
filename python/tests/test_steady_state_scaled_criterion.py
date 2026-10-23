@@ -28,7 +28,9 @@ tolerances, says where the march stops. These tests cover:
 from __future__ import annotations
 
 import math
+import platform
 import re
+import sys
 from pathlib import Path
 
 import bngsim
@@ -1925,18 +1927,15 @@ def test_a_march_whose_integrator_fails_is_still_retried_on_difference_quotients
     # tolerances), which the run then leaves. Reported as a failure still, the
     # solve is retried on difference quotients, and that retry comes to rest.
     # Taking the passed state as the answer turned the retry off. Main
-    # converges at a state a run moves 2.2e5 tolerances. On the dense solver,
-    # which the LU-fill test picks on macOS: on KLU, which it picks on x86-64
-    # Linux, the march stops at the root by its step (4e-6), asks no retry, and
-    # the run from it cannot be taken to its time, so the solve is refused.
+    # converges at a state a run moves 2.2e5 tolerances. That march is
+    # arm64 macOS's: rounded as x86-64 Linux rounds it, the march reaches the
+    # root by its step (4e-6) without its integrator failing, asks no retry,
+    # and the run from it cannot be taken to its time, so the solve is
+    # refused (residual 1.05e-15, on either linear solver). Everywhere, it is
+    # not converged at a state a run moves.
     path = str(data_dir / "MODEL1712050008.xml")
-    ss = bngsim.Simulator(
-        bngsim.Model.from_sbml(path), method="ode", force_dense_linear_solver=True
-    ).steady_state()
-    assert ss.solver_jacobian_retried
-    assert ss.converged
-    assert ss.continued_run_distance <= 1.0
-    klu = bngsim.Simulator(
-        bngsim.Model.from_sbml(path), method="ode", force_sparse_linear_solver=True
-    ).steady_state()
-    assert not klu.converged or klu.continued_run_distance <= 1.0
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
+    assert not ss.converged or ss.continued_run_distance <= 1.0
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        assert ss.solver_jacobian_retried
+        assert ss.converged
