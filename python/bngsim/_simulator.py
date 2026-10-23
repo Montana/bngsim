@@ -2202,6 +2202,9 @@ class Simulator:
         model = model if model is not None else self._model
         if sensitivities is None:
             sensitivities = bool(self._sensitivity_params or self._sensitivity_ic)
+        from bngsim._switch_sensitivity import say_what_was_read
+
+        say_what_was_read(False)  # what a run that never took its stops left
         conditions = model.time_discontinuity_conditions()
         # A table function read on the clock breaks at its breakpoints whether
         # or not any condition names it (issue #709).
@@ -2233,6 +2236,9 @@ class Simulator:
                 # high where main, its stops a double early, was 4% (at 1e-4 and
                 # tighter the moved stops were the more accurate in every case).
                 on_the_flip=not sensitivities and float(opts.rtol) <= _FLIP_LOOSEST_RTOL,
+                # Issue #1018: a law on a line far from zero that the scan
+                # refuses or leaves alone is read tread by tread.
+                by_tread=not sensitivities,
             )
             knots = (
                 table_function_stops(model._core, float(t_start), float(t_end), table_breaks)
@@ -2294,6 +2300,7 @@ class Simulator:
                 and model._core.n_events == 0
             )
             self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+        say_what_was_read(True)
         return conditions
 
     @staticmethod
@@ -2431,6 +2438,23 @@ class Simulator:
             )
 
         for item in over_budget:
+            if item.legs is not None:
+                # Read tread by tread (issue #1018), whatever step bound is
+                # passed: the law has a stop on each change or the run is
+                # refused. A bound in their place left `100*mod(1e12 + time(),
+                # 12u)` 0.4% off at the default tolerances, and 4.5% from
+                # X(0) = 1e4, where in legs that fit it is exact to rounding.
+                from bngsim._switch_sensitivity import _three_places_down
+
+                raise SimulationError(
+                    f"The rate law switches on {item.condition!r}, which, read once on each "
+                    "stretch of time its argument holds one double (issue #1018), changes "
+                    f"{item.changes} times between t={t_start!r} and t={t_end!r}. A run places "
+                    "at most 1,000,000 stops with its other switches, and without a stop on "
+                    "each change a step bound in their place need not keep the answer within "
+                    f"the tolerance. Run it in legs of {_three_places_down(item.legs)} or "
+                    "shorter (run_until): each then has a stop on every change."
+                )
             if item.flicker is not None:
                 # Whatever step bound is passed. One no wider than half the
                 # shortest stretch between two switches would stand for the
