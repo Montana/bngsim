@@ -578,6 +578,12 @@ static double ss_negative_slack(const SteadyStateOptions &opts) {
     return least;
 }
 
+// The finest rtol the "scaled" criterion asks for (issue #1001): a run taken
+// on for 1e6 does not tell a move finer than that from its own error. Asked for
+// 1e-12, the runs from egfr_net_red's, Kocieniewski_2012's, SHP2_base_model's
+// and Motivating_example's steady states moved them 3 to 5 tolerances.
+static constexpr double kCriterionRtolLeast = 1e-10;
+
 // Species i's tolerance under "scaled" at a value of `yi` (issue #1001):
 // rtol·|y_i| + atol_i, with the march's own tolerances, so that the test asks
 // of a state what the integrator resolves, but atol_i no more than rtol times
@@ -588,10 +594,11 @@ static double ss_negative_slack(const SteadyStateOptions &opts) {
 // species that starts at 0 beside one at 1e8 was held to 1 (X = 0.83 returned
 // for 0.874), and one that decays from 1e7 to 7e-4 to 0.1. Where every species
 // starts at 0 the start has no size, and without the cap 0 -> X at 1e-9, X -> 0
-// at 1 was returned at x = 0.69e-9.
+// at 1 was returned at x = 0.69e-9. The rtol is kCriterionRtolLeast at least.
 static double ss_scaled_tolerance(const SteadyStateOptions &opts, int i, double yi,
                                   double largest) {
-    return opts.rtol * std::abs(yi) + std::min(ss_species_atol(opts, i), opts.rtol * largest);
+    const double rtol = std::max(opts.rtol, kCriterionRtolLeast);
+    return rtol * std::abs(yi) + std::min(ss_species_atol(opts, i), rtol * largest);
 }
 
 // The largest species, measured or not, of `y` (and of `y + delta`, where
@@ -5569,13 +5576,26 @@ static constexpr double kRunHorizonMost = 1e6;
 // 200,000.
 static constexpr long kRunSteps = 50;
 
+// The tightest rtol the runs are integrated at, a caller's rtol being tight:
+// asked for 1e-12, the runs at 1e-14 and 1e-15 could not be taken to their
+// time, and Kocieniewski_2012 was refused after 10.7 s where main took 0.03.
+static constexpr double kRunRtolLeast = 1e-13;
+
+// The least move, in tolerances, that a run that does not halve it at a tenth
+// of the tolerances takes for a drift (ss_continued_run).
+static constexpr double kDriftAtLeast = 10.0;
+
 // One run of the run test of the "scaled" criterion (issue #1001): from `y`,
 // kicked by `kick_size` of each species' own size, taken on for max_time and
 // integrated at `tighter` times the criterion's tolerances, in kRunSteps
-// times max_steps at most. Returns the largest move of a measured species
-// from `y` over its tolerance (ss_scaled_tolerance), and for a kicked run that
-// over 10·(1 + 2k), a kick of k tolerances (the largest of any species, in its
-// own): what the kick may not grow to. +inf where the run cannot be taken to
+// times max_steps at most (at an rtol of kRunRtolLeast at least). Returns the
+// largest move of a measured species from `y` over its tolerance
+// (ss_scaled_tolerance), and for a kicked run that over 10·(1 + 2k): what the
+// kick may not grow to, k the larger of the species' own kick and the largest
+// of the unknowns', each in its own tolerances. Not the largest of any
+// species': a dependent cut to 500 of its tolerances, in a law that touched
+// nothing else, let every species move 1e4, and an unstable root beside it go
+// 5e3 to its next root. +inf where the run cannot be taken to
 // its time (the integrator gives up past kHoldRestarts restarts, or the steps
 // run out). The model's state is left as it was.
 //
@@ -5614,6 +5634,10 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
 
     const double largest = ss_largest_species(model, opts, y.data());
     std::vector<double> kick(un, 0.0);
+    // Each species' kick in its own tolerance, and the largest of the kicks
+    // chosen (the unknowns', not the dependents' that follow them).
+    std::vector<double> kicked(un, 0.0);
+    double chosen = 0.0;
     if (kick_size > 0.0) {
         const SsDistanceSystem system = ss_distance_system(model, sub);
         const ConservationLaws &cl = system.laws;
@@ -5685,21 +5709,22 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                 break;
             }
         }
-    }
-    double kicked = 0.0;
-    for (int i : sub.included) {
-        const auto ui = static_cast<size_t>(i);
-        if (!species[i].fixed && kick[ui] != 0.0)
-            kicked =
-                std::max(kicked, std::abs(kick[ui]) / ss_scaled_tolerance(opts, i, y[ui], largest));
+        for (int i : sub.included) {
+            const auto ui = static_cast<size_t>(i);
+            if (!species[i].fixed && kick[ui] != 0.0)
+                kicked[ui] = std::abs(kick[ui]) / ss_scaled_tolerance(opts, i, y[ui], largest);
+        }
+        for (int i : system.unknowns)
+            chosen = std::max(chosen, kicked[static_cast<size_t>(i)]);
     }
 
     SteadyStateOptions run_opts = opts;
     run_opts.max_time = std::min(opts.max_time, kRunHorizonMost);
-    run_opts.rtol = opts.rtol * tighter;
-    run_opts.atol = opts.atol * tighter;
+    const double by = std::max(tighter, std::min(1.0, kRunRtolLeast / opts.rtol));
+    run_opts.rtol = opts.rtol * by;
+    run_opts.atol = opts.atol * by;
     for (double &a : run_opts.atol_vec)
-        a *= tighter;
+        a *= by;
 
     std::vector<double> saved(un);
     for (size_t i = 0; i < un; ++i) {
@@ -5732,11 +5757,13 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                     moved = inf;
                     break;
                 }
-                if (d > 0.0)
-                    moved = std::max(moved, d / ss_scaled_tolerance(opts, i, y[ui], largest));
+                if (d > 0.0) {
+                    double m = d / ss_scaled_tolerance(opts, i, y[ui], largest);
+                    if (kick_size > 0.0)
+                        m /= 10.0 * (1.0 + 2.0 * std::max(kicked[ui], chosen));
+                    moved = std::max(moved, m);
+                }
             }
-            if (kick_size > 0.0)
-                moved /= 10.0 * (1.0 + 2.0 * kicked);
         }
     } catch (const std::exception &) {
         moved = inf;
@@ -5767,25 +5794,34 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
 // kicked across it the run chatters on to another state, Calcium at 188 for
 // 958.
 //
-// An unkicked run that moves the state is taken again at a tenth of its
-// tolerances: a drift is a drift at either, and the run's own error is not.
-// Above kNewtonDistanceMost unknowns it is not: there the run at a tenth
-// took multisite_phos (1026 species) 34 s, to main's whole solve's 0.8. The
-// kicked run, asked only that the kick not grow tenfold, is integrated at the
-// criterion's own tolerances. At a hundredth of the criterion's,
-// BIOMD0000000038 moved by 1.41 tolerances and by 0.46 at a thousandth;
-// BIOMD0000000211 by 194 at the criterion's own, and by 0.68 at a hundredth.
+// The unkicked run is taken at the criterion's own tolerances, and where it
+// moves the state, again at a tenth of them, and a tenth of that, and a tenth
+// of that up to kNewtonDistanceMost unknowns (above, a thousandth took
+// multisite_phos, 1026 species, 34 s to main's whole solve's 0.8): a drift
+// moves the state at every tolerance, and the run's own error shrinks with
+// them, though not always at each step. BIOMD0000000211 moved by 194
+// tolerances at the criterion's own, 15.7 at a tenth and 0.68 at a hundredth;
+// MODEL1510230005 by 84, 4.8, 6.9 and 0.03. A move of more than kDriftAtLeast
+// that does not halve at a tenth of the tolerances is a drift, and the runs
+// stop there: HIV_v1_1, which a run moves by 327 and 203, could not be taken
+// to its time at a hundredth in 150 s. The kicked run, asked only that the
+// kick not grow tenfold, is integrated at the criterion's own tolerances.
 static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
                                const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                const std::vector<double> &y) {
-    double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, 1e-2);
-    for (double tighter : {1e-3}) {
-        if (!opts.criterion_by_distance || !(still > 1.0) || !std::isfinite(still))
+    double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, 1.0);
+    double last = still;
+    for (double tighter : {1e-1, 1e-2, 1e-3}) {
+        if (!(still > 1.0) || !std::isfinite(still) ||
+            (tighter < 1e-2 && !opts.criterion_by_distance))
             break;
         const double again = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, tighter);
         if (!std::isfinite(again))
             break;
         still = std::min(still, again);
+        if (again > kDriftAtLeast && !(again <= 0.5 * last))
+            break;
+        last = again;
     }
     if (!(still <= 1.0))
         return still;
@@ -6016,9 +6052,8 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 polish.criterion_by_residual = true;
                 // Above kNewtonDistanceMost unknowns KINSOL stops by the
                 // residual test, which the state passes already: asked for a
-                // thousandth of tol, it takes multisite_phos (1026 species) to
-                // its root, where the runs, from 3.8 tolerances off it, had
-                // taken 246 s to settle the run's own error.
+                // thousandth of tol, it takes multisite_phos (1026 species)
+                // from 3.8 tolerances off its root to a residual of 8e-16.
                 if (!effective->criterion_by_distance)
                     polish.tol = effective->tol * 1e-3;
                 const double before_residual =
@@ -6059,6 +6094,25 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
             result.converged = result.continued_run_distance <= 1.0;
         } else {
             result.converged = false;
+        }
+        // A root the polish's eigenvalues show unstable (issue #78), which the
+        // solve returns only where it started, is not a state the system
+        // rests at, whatever the kicked run saw: X at its unstable root
+        // 0.99999, 500 tolerances from its next root, kicked by a millionth
+        // reached it before the kick had grown tenfold. Unless a species is at
+        // 0, which may be what the eigenvalues see grow: an absent invader is
+        // not kicked, and nothing makes it (SIR at I = 0).
+        if (result.root_stability == "unstable") {
+            bool absent = false;
+            for (int i : sub.included) {
+                if (!model.species()[i].fixed &&
+                    result.concentrations[static_cast<size_t>(i)] == 0.0) {
+                    absent = true;
+                    break;
+                }
+            }
+            if (!absent)
+                result.converged = false;
         }
     }
 

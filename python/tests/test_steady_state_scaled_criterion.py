@@ -1106,14 +1106,8 @@ def test_an_unstable_root_beside_a_larger_species_is_not_converged(tmp_path):
     assert not ss.converged
 
 
-_B002 = (
-    Path(__file__).resolve().parents[2]
-    / "parity_checks/rr_parity/models/BIOMD0000000002/BIOMD0000000002_url.xml"
-)
-_B407 = (
-    Path(__file__).resolve().parents[2]
-    / "parity_checks/rr_parity/models/BIOMD0000000407/BIOMD0000000407_url.xml"
-)
+_B002 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000002.xml"
+_B407 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000407.xml"
 
 
 def _run_from(path, y, t_end):
@@ -1123,9 +1117,6 @@ def _run_from(path, y, t_end):
     return np.asarray(model._core.get_state(), float)
 
 
-@pytest.mark.skipif(
-    not _B002.exists(), reason="rr_parity corpus model BIOMD0000000002 not present"
-)
 def test_biomd2_comes_out_as_a_run_does():
     # The residual test accepted it 6% from its steady state in a species; a
     # run of 1e6 from where it is returned now moves it by 1e-10 of itself.
@@ -1142,9 +1133,6 @@ def test_biomd2_comes_out_as_a_run_does():
     assert np.max(np.abs(end - y) / (np.abs(y) + 1e-6 * np.abs(y).max())) > 0.05
 
 
-@pytest.mark.skipif(
-    not _B407.exists(), reason="rr_parity corpus model BIOMD0000000407 not present"
-)
 def test_biomd407_comes_out_as_a_run_does():
     # The residual test accepted it one step from where it starts. A run is
     # still moving at 1e6 and settles by 1e8: in max_time = 1e6 it is not
@@ -1604,3 +1592,68 @@ def test_a_polish_that_loses_a_dependents_digits_is_not_kept(method):
     ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
     assert ss.converged
     np.testing.assert_array_equal(ss.concentrations, model.get_state())
+
+
+@pytest.mark.parametrize("x0", [0.5, 1.5])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_fixed_species_far_above_the_rest_does_not_coarsen_the_march(tmp_path, x0, method):
+    # The cubic at 1e-9 beside a $-fixed Y at 1e20. Counted in the march's atol
+    # floor, Y's double-precision resolution, 2e4, held X to the scalar 1e-8,
+    # and the march ran X to 9.6 and 29 times its root and refused.
+    text = CUBIC_NET.format(s=1e-9, x0=x0).replace("end species", "    2 $Y() 1e20\nend species")
+    path = tmp_path / "cubic_beside_fixed.net"
+    path.write_text(text)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method
+    )
+    assert ss.converged
+    assert ss.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+
+
+def _near_unstable_ant(a):
+    # X' = -1e4·X·(X - a)·(X - 1) at its unstable root a, beside A <-> B at
+    # 2^20 and 2^-20, balanced in floating point, which X does not touch.
+    return f"""model c
+  B = 9.5367431640625e-07
+  A = 1048576.0
+  X = {a!r}
+  J1: A -> B; kf*A
+  J2: B -> A; kr*B
+  J3: -> X; k2*X^2
+  J4: X -> ; k3*X^3 + k1*X
+  kf = 9.094947017729282e-13; kr = 1.0
+  k3 = 1e4; k2 = {1e4 * (1 + a)!r}; k1 = {1e4 * a!r}
+end"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_an_unrelated_lopsided_law_does_not_hide_an_unstable_root(method):
+    # B, the law's dependent, is kicked by 500 of its tolerances; measured
+    # against the largest kick of any species, every species was let move 1e4,
+    # and X went the 5e3 to its stable root at 1 unrefused.
+    model = bngsim.Model.from_antimony_string(_near_unstable_ant(0.9999))
+    ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
+    assert not ss.converged
+    assert ss.continued_run_distance > 1.0
+
+
+def test_a_root_the_eigenvalues_call_unstable_is_not_converged():
+    # At a = 0.99999 the kick reaches the stable root, 500 tolerances away,
+    # before it has grown tenfold, and the kicked run passes; the polish's
+    # eigenvalues say the root is unstable.
+    model = bngsim.Model.from_antimony_string(_near_unstable_ant(0.99999))
+    ss = bngsim.Simulator(model, method="ode").steady_state(method="newton")
+    assert ss.root_stability == "unstable"
+    assert ss.continued_run_distance <= 1.0
+    assert not ss.converged
+
+
+def test_a_tight_rtol_is_asked_no_finer_than_a_run_can_tell():
+    # Control: main converges. Asked for rtol 1e-12, the runs, at 1e-14 and
+    # 1e-15, could not be taken to their time and refused after 10.7 s; at
+    # 1e-13 they moved the state 3.9 tolerances of 1e-12, their own error.
+    path = Path(__file__).resolve().parents[2] / "benchmarks/models/net/ode/Kocieniewski_2012.net"
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        rtol=1e-12, atol=1e-14
+    )
+    assert ss.converged

@@ -93,20 +93,28 @@ the parity test **and** the run test:
   floating point.
 
 `atol_i` is the march's own absolute tolerance, never more than `rtol` times the
-largest species the solve starts with or reaches. Where neither `atol=` nor
+largest species the solve starts with or reaches. `rtol` here is 1e-10 at
+least: a run of 1e6 does not tell a finer move from its own error, and asked
+for 1e-12 the runs moved four benchmark models' steady states 3 to 5
+tolerances. Where neither `atol=` nor
 `set_tolerances` gives one, each species is marched at the smaller of what
 `atol="auto"` derives from the start and the scalar 1e-8: never looser than the
 parity test's march, and in a model in small units no coarser than the model.
 `"auto"`'s floor here is the smallest species the start holds that is not
 `$`-fixed, but not under double precision's resolution beside the largest, so
 that a species left at 1e-22 by a run does not hold every other at 0 to that.
-Where every species takes the scalar, the march is the parity test's own.
+Where every species takes the scalar, or every species that is not `$`-fixed
+starts at 0, the march takes the scalar and is the parity test's own.
 
-The unkicked run is integrated at a hundredth of those tolerances, and where
-it moves the state it is taken again at a thousandth (up to 512 unknowns): a
-drift moves the state at either, and the run's own error does not.
-BIOMD0000000211 moved by 194 tolerances at the criterion's own, and by 0.68 at
-a hundredth. The kicked run is integrated at the criterion's own. Its kick
+The unkicked run is integrated at those tolerances, and where it moves the
+state it is taken again at a tenth of them, a hundredth and (up to 512
+unknowns) a thousandth: a drift moves the state at every tolerance, and the
+run's own error shrinks with them. BIOMD0000000211 moved by 194 tolerances at
+the criterion's own, 15.7 at a tenth and 0.68 at a hundredth. A move of more
+than 10 tolerances that does not halve at a tenth of them is taken for a drift
+and refused there. The kicked run is integrated at the criterion's own, and
+each species may move ten times its own kick, or the largest kick of a species
+the solve chose to kick, whichever is more. Its kick
 keeps the conserved totals: a law's dependent that the kick would take below
 0 turns its law's kicks the other way, and one kicked by more than ten
 millionths of itself has them cut, so that one species does not stand in for
@@ -151,19 +159,25 @@ What it does not do:
   state with Calcium at 188, not 958.
 - **A kicked run that cannot be taken to its time** refuses, as on a neutral
   cycle, where the kick goes round for good.
+- **An unstable root within about twenty kicks of a stable one** can pass on
+  the integration path: at `X' = -1e4·X(X - a)(X - 1)` with `a = 0.99999` the
+  kick reaches the root at 1, 500 tolerances away, before it has grown tenfold.
+  `method="newton"` refuses it by its eigenvalues.
 - **An absent species that would invade** is not kicked, and the state is
   converged: SIR with `I = 0` and `beta·S/gamma > 1`, a disease-free state an
   infection would leave, is converged, as on main. The multistart's
   eigenvalues say whether such a state is stable.
 - **A species that starts at 0 and settles below `rtol` times the largest**
   counts as nothing: it is resolved to that, not to its own size.
-- **Where every species starts at 0** the start has no size, and the march
-  takes the scalar 1e-8; a model whose species settle far below that is
+- **Where every species that is not `$`-fixed starts at 0** the start has no
+  size, and the march takes the scalar 1e-8; a model whose species settle far below that is
   resolved only to it (a `$Src`-fed dimer at 1e-10 is marched through zero and
   refused).
 - **Above 512 unknowns** an unkicked run that its own error moves past
-  tolerance refuses: taken again at a thousandth of the tolerances it cost
-  multisite_phos 34 s.
+  tolerance refuses: multisite_phos (1026 species), polished to a residual of
+  8e-16, is refused at 1.58, where independent runs from it at rtol 1e-10 to
+  1e-12 move it 0.4 to 1.1 tolerances. Taken again at a thousandth of the
+  tolerances, the run cost 34 s.
 - **A burst-free Newton solve** (`steady_states()`, or `newton_burst=False`)
   takes no runs. KINSOL is taken to the root and the root accepted by the
   parity test, and `criterion` says `"residual"`; the multistart labels
@@ -487,8 +501,9 @@ ss.eigenvalues                # array([-0.863+0.j, -1.137+0.j]) — the spectrum
 - `"unstable"` is returned only when *your own initial condition* was already
   that root. There is nowhere to fall back to then — integration would return the
   same state — so the verdict is reported rather than acted on. Under the
-  default criterion the result is then `converged=False`: a run kicked off the
-  root leaves it.
+  default criterion the result is then `converged=False`, whatever a run kicked
+  off the root shows, unless a species is at 0: an absent invader is not
+  kicked, and SIR at `I = 0` is converged and labelled `"unstable"`.
 - `n_unstable_roots_rejected > 0` on a result whose `method_used` is
   `"integration"` explains why the polish did not answer.
 - `eigenvalues` is the spectrum the verdict was read off (issue #523): the
