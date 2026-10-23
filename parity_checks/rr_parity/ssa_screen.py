@@ -1539,7 +1539,7 @@ def _worker(
             incompatible = True  # fall through to the normal UNSUPPORTED path
         except Exception as exc:
             entry["status"] = "error"
-            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
             q.put(entry)
             return
         if not incompatible:
@@ -1576,7 +1576,7 @@ def _worker(
         full = False
     except Exception as exc:
         entry["status"] = "error"
-        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
         if NONFINITE_PROPENSITY in str(exc):
             # The red row first: RoadRunner's run can outlast the per-model cap, and
             # the parent recovers a killed worker's last row rather than marking it
