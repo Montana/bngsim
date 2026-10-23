@@ -477,7 +477,8 @@ static std::vector<ParsedFunction> parse_functions(std::ifstream &file) {
 
 // A reaction line is `<index> <reactants> <products> <rate law>`, and only a
 // Sat, Hill or MM rate law runs past one token, on its constants. run_network
-// refuses anything after the rate law ("Undefined rateLaw type"); this loader
+// refuses anything after the rate law ("Undefined rateLaw type", or for MM
+// "Incorrect number of rate constants"); this loader
 // read the line and dropped the rest, so `1 1 2 k delay=tau` loaded as an
 // undelayed reaction and `MM kcat Km delay=tau` as plain MM (issue #1231).
 static std::runtime_error tokens_after_rate_law(const std::string &line,
@@ -539,17 +540,24 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
         // Rate law
         std::string rate_token = tokens[3];
 
-        if (rate_token == "Sat") {
+        if (rate_token == "Sat" || rate_token == "Hill") {
             rxn.type = RateLawType::Functional;
             rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
+            for (size_t i = 4; i < tokens.size(); ++i) {
+                // Each constant is a parameter name; run_network looks every
+                // one up ("Undefined rate constant"). The counts are checked in
+                // rewrite_legacy_sat_hill_rate_laws, but Sat takes one constant
+                // per reactant, so with two reactants `Sat k Km 2` loaded with
+                // a literal 2 and `Sat k Km delay=tau` reached ExprTk (#1231).
+                if (!is_bare_identifier(tokens[i]))
+                    throw std::runtime_error(
+                        "reaction line '" + stripped + "' gives its " + rate_token +
+                        " rate law the constant '" + tokens[i] +
+                        "', which is not a parameter name; bngsim reads nothing after a "
+                        "rate law's constants, so a per-reaction modifier such as a delay "
+                        "is not supported");
                 rxn.legacy_rate_law_constants.push_back(tokens[i]);
-
-        } else if (rate_token == "Hill") {
-            rxn.type = RateLawType::Functional;
-            rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
-                rxn.legacy_rate_law_constants.push_back(tokens[i]);
+            }
 
         } else if (rate_token == "MM" && tokens.size() >= 5) {
             // `MM kcat Km`; run_network refuses any other count of constants. A
@@ -608,9 +616,10 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
             }
             if (tokens.size() > 4) {
                 // run_network reads more than one rate-law token as a type
-                // keyword and its constants. Two of its forms reach this branch,
-                // and both used to be refused only at build, as an unknown
-                // parameter named after the keyword.
+                // keyword and its constants. Two of its forms reach this branch.
+                // Both used to be refused at build, as an unknown parameter named
+                // after the keyword, or, in a model that declared a parameter of
+                // that name, loaded at it with the constants dropped.
                 if (param_name == "Ele")
                     throw std::runtime_error(
                         "reaction line '" + stripped +

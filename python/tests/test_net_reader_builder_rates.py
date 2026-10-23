@@ -349,6 +349,29 @@ class TestTokensAfterTheRateLaw:
         with pytest.raises(ModelError, match=message):
             bngsim.Model.from_net(str(net))
 
+    @pytest.mark.parametrize(
+        ("line", "law", "constant"),
+        [
+            ("1 1,2 1,3 Sat k Km delay=tau", "Sat", "delay=tau"),
+            ("1 1,2 1,3 Sat k Km 2", "Sat", "2"),
+            ("1 2 3 Hill V K delay=tau", "Hill", "delay=tau"),
+        ],
+        ids=["sat-delay", "sat-literal", "hill-delay"],
+    )
+    def test_a_sat_or_hill_constant_that_is_not_a_name_is_refused(
+        self, tmp_path: Path, line: str, law: str, constant: str
+    ) -> None:
+        """Sat takes one constant per reactant, so its token count cannot tell a
+        constant from a modifier; a constant is a parameter name, which run_network
+        looks up ("Undefined rate constant"). With two reactants `Sat k Km 2`
+        loaded with a literal 2, and `Sat k Km delay=tau` reached ExprTk."""
+        net = _one_reaction_net(tmp_path, line)
+        message = re.escape(f"gives its {law} rate law the constant '{constant}'")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
     def test_the_comment_is_not_read_as_tokens(self, tmp_path: Path) -> None:
         """What follows `#` is BNG2.pl's comment (`#_R1`, `unit_conversion=...`),
         not part of the rate law: the line loads as plain `A -> B` at k."""
@@ -357,15 +380,17 @@ class TestTokensAfterTheRateLaw:
         assert (rxn["type"], rxn["rate_law"], rxn["stat_factor"]) == ("elementary", "k", 1.0)
         bngsim.Model.from_net(str(net))
 
-    def test_an_mm_rate_law_with_one_constant_is_refused_as_such(self, tmp_path: Path) -> None:
-        """`MM kcat` used to fall through to the elementary branch and be refused
-        at build as "unknown parameter 'MM'"."""
-        net = _one_reaction_net(tmp_path, "1 1,2 1,3 MM kcat")
-        message = re.escape("an MM rate law takes two constants, 'MM kcat Km'")
-        with pytest.raises(ValueError, match=message):
-            parse_net_file(net)
-        with pytest.raises(ModelError, match=message):
-            bngsim.Model.from_net(str(net))
+    @pytest.mark.parametrize("name", ["MM", "Ele"])
+    def test_a_rate_constant_named_like_a_type_keyword_still_loads(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        """A rate column of one token is a rate constant or function, whatever it
+        is called (run_network reads it so too). `MM kcat` with one constant is
+        refused in test_net_reader_legacy_and_tfun.py."""
+        net = _one_reaction_net(tmp_path, f"1 2 3 {name}", extra_params=f"8 {name} 1.5\n")
+        (rxn,) = parse_net_file(net)["reactions"]
+        assert (rxn["type"], rxn["rate_law"]) == ("elementary", name)
+        bngsim.Model.from_net(str(net))
 
     @pytest.mark.parametrize(
         ("law", "line"),

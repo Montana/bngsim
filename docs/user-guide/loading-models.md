@@ -201,6 +201,14 @@ The deprecated `Sat` and `Hill` rate-law tokens come back rewritten, as
 `"functional"`, driven by an explicit function, and a single-species observable
 is added for each reactant the function reads.
 
+A reaction line is `<index> <reactants> <products> <rate law>`, and only a
+`Sat`, `Hill` or `MM` rate law takes more tokens: its constants.
+`parse_net_file` and `Model.from_net` refuse a line with anything else after
+the rate law, as run_network does, rather than load it without that part.
+bngsim reads no per-reaction modifiers, such as a delay (issue #505). A stat
+factor on an `MM`, `Sat` or `Hill` rate law (`2*MM kcat Km`) is refused too,
+until issue #1230.
+
 **Use with BNGsim** (fastest path — C++ CVODE/SSA):
 
 ```python
