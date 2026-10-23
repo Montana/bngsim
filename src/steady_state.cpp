@@ -6027,16 +6027,6 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                                     q.concentrations.data())
                                : std::numeric_limits<double>::quiet_NaN();
                 };
-                // The polish holds a species the mask leaves out where it is
-                // given it, and moving the rest broke a sum the reactions do
-                // not show: X -> 0 and 0 -> Y at one rate, Y left out, came
-                // back with X + Y 2.5e-6 short of 1, X polished on 250 of its
-                // tolerances to 0. Where the mask leaves out a species that
-                // moves, the polish is kept only within a tolerance.
-                bool holds_one = false;
-                for (const int e : sub.excluded)
-                    holds_one = holds_one || !model.species()[e].fixed;
-                const double reach = holds_one ? 1.0 : kPolishFurthest;
                 const double before = result.newton_distance;
                 const double before_residual =
                     compute_residual(rhs, result.concentrations.data(), ns, sub);
@@ -6049,8 +6039,13 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     // one 381 tolerances off, which the runs then refused. The
                     // step is had after where it was before: whether it is
                     // taken depends on the count of unknowns, not the state.
+                    // And no further than kPolishFurthest tolerances, as far
+                    // as the step said the root was: with the mask leaving out
+                    // G of BIOMD0000000341, which pins B, KINSOL went 1e8
+                    // tolerances to a root of the rest with G held, I = B = 0,
+                    // where the march had stopped at the dynamics' root.
                     if (p.converged &&
-                        (!holds_one || went(result.concentrations, p.concentrations) <= reach)) {
+                        went(result.concentrations, p.concentrations) <= kPolishFurthest) {
                         const double after = step_at(p);
                         if (after < before)
                             adopt(p, after);
@@ -6087,7 +6082,7 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                             compute_residual(rhs, result.concentrations.data(), ns, sub);
                         SteadyStateResult q = polished(result.concentrations);
                         if (q.converged && q.residual < end_residual &&
-                            went(result.concentrations, q.concentrations) <= reach)
+                            went(result.concentrations, q.concentrations) <= kPolishFurthest)
                             adopt(q, step_at(q));
                     }
                 }

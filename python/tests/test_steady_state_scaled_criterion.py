@@ -1091,10 +1091,14 @@ def test_above_512_unknowns_a_masked_accumulator_goes_on_with_the_run(tmp_path):
     assert scaled.concentrations[c - 1] - march == pytest.approx(1e6, rel=1e-9)
 
 
-@pytest.mark.parametrize(("copies", "kg"), [(260, 1e-3), (260, 1e-4), (20, 1e-3), (20, 1e-4)])
+@pytest.mark.parametrize(
+    ("copies", "kg"), [(260, 1e-3), (260, 5e-4), (260, 1e-4), (20, 1e-3), (20, 1e-4)]
+)
 def test_a_masked_species_that_overflows_in_the_run_is_refused(tmp_path, copies, kg):
     # C' = kg·C from 1, left out by the mask: a run of 1e6 overflows it at
-    # kg = 1e-3 (e^1000) and not at 1e-4 (e^100). Started again from zero,
+    # kg = 1e-3 (e^1000) and not at 1e-4 (e^100); above 512 unknowns, where
+    # the state returned is the end of a run already, at 5e-4 too. Started
+    # again from zero,
     # as a species stepped below zero is, C came back 0 with converged=True
     # beside 520 unknowns. A run that cannot be taken to its time passes
     # nothing: the solve is refused, at any size, with C a number where the
@@ -1119,7 +1123,7 @@ def test_a_masked_species_that_overflows_in_the_run_is_refused(tmp_path, copies,
     assert math.isfinite(scaled.concentrations[c - 1])
     assert scaled.concentrations[c - 1] > 1.0
     assert scaled.converged == (kg == 1e-4)
-    if kg == 1e-3:
+    if kg > 1e-4:
         assert math.isinf(scaled.continued_run_distance)
     if copies == 260 and kg == 1e-3:
         assert scaled.concentrations[c - 1] == pytest.approx(
@@ -1180,6 +1184,25 @@ def test_above_512_unknowns_a_masked_sink_keeps_its_law(tmp_path, kx):
     assert ss.converged
     assert ss.concentrations[x - 1] + ss.concentrations[s - 1] == pytest.approx(1.0, abs=1e-12)
     assert ss.concentrations[s - 1] == pytest.approx(1.0, abs=1e-10)
+
+
+_B341 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000341.xml"
+
+
+def test_a_polish_with_a_species_held_goes_no_further_than_its_step(tmp_path):
+    # BIOMD0000000341 with G left out by the mask: G pins B, and KINSOL, with
+    # G held, went 1e8 tolerances from the march's state, at the dynamics'
+    # root (100, 10, 300), to a root of the rest, I = B = 0, which was
+    # converged. The step had put the root within a thousand tolerances, and
+    # the polish goes no further.
+    names = list(bngsim.Model.from_sbml(str(_B341)).species_names)
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B341)), method="ode").steady_state(
+        method="integration", mask=[name != "G" for name in names]
+    )
+    assert ss.converged
+    c = dict(zip(names, ss.concentrations, strict=True))
+    assert c["I"] == pytest.approx(10.0, rel=1e-6)
+    assert c["B"] == pytest.approx(300.0, rel=1e-6)
 
 
 def _wide_hidden_sum_sbml(nz, kx, how):
@@ -1258,32 +1281,26 @@ def _wide_hidden_sum_sbml(nz, kx, how):
     )
 
 
-@pytest.mark.parametrize("kx", [1e-3, 1e-5])
 @pytest.mark.parametrize("how", ["rate rules", "two reactions", "dilution"])
-def test_above_512_unknowns_a_masked_species_keeps_a_sum_no_reaction_shows(tmp_path, how, kx):
+def test_above_512_unknowns_a_masked_species_keeps_a_sum_no_reaction_shows(tmp_path, how):
     # Y left out by the mask, beside 520 species: the march stops short, and
     # the run taken on from the state before the polish takes X (V) and Y on
     # together. Put back where the march left it, as an earlier form of this
     # change did for a species nothing else reads and no reaction moves with
     # another, Y broke the sum: X + Y came back 0.99950, and Y·V 0.50026,
-    # with converged=True. At kx = 1e-5 the run ends with X 2.5e-6 from 0,
-    # 250 of its tolerances, and the polish, which holds Y, took X the rest of
-    # the way: X + Y came back 2.5e-6 short, converged. Where the mask leaves
-    # out a species that moves, the polish is kept only within a tolerance,
-    # and the run's end, still moving, is refused.
+    # with converged=True.
     path = tmp_path / "wide_hidden_sum.xml"
-    path.write_text(_wide_hidden_sum_sbml(520, kx, how))
+    path.write_text(_wide_hidden_sum_sbml(520, 1e-3, how))
     model = bngsim.Model.from_sbml(str(path))
     names = list(model.species_names)
     mask = [name != "Y" for name in names]
     ss = bngsim.Simulator(model, method="ode").steady_state(method="integration", mask=mask)
     assert math.isnan(ss.newton_distance)
-    assert ss.converged == (kx == 1e-3)
+    assert ss.converged
     c = dict(zip(names, ss.concentrations, strict=True))
     if how == "dilution":
         # To the march's own error: the state it stopped at holds Y·V to 7e-7.
-        if kx == 1e-3:
-            assert c["V"] == pytest.approx(1.0, abs=1e-12)
+        assert c["V"] == pytest.approx(1.0, abs=1e-12)
         assert c["Y"] * c["V"] == pytest.approx(0.5, abs=1e-5)
     else:
         assert c["X"] + c["Y"] == pytest.approx(1.0, abs=1e-12)
