@@ -106,6 +106,11 @@ name: python-tests
 #     so nothing tests the floor at runtime (ruff's target-version=py310 catches
 #     syntax, not stdlib API). Adding it is one more matrix entry.
 #
+# Line coverage of bngsim's Python (issue #585) is measured on the ubuntu-latest
+# leg only, both shards, and combined by the python-coverage job below: a report
+# in that job's log and summary, never a gate. The other legs run the same tests
+# unmeasured.
+#
 # One known skip is environmental rather than structural: $BNGPATH is unset, so
 # the 14 BNG2.pl round-trip tests in test_sbml_to_bngl.py skip. Closing that needs
 # the perl toolchain plus the `parity` dependency group (a git+https reference to
@@ -146,7 +151,9 @@ jobs:
             label: ubuntu-latest
             apt: "" # bare host: the #178 proof. Do not add a package here.
             expect_lapack: "false"
-            coverage: "true" # the one leg that measures line coverage (#585)
+            # The one leg that measures line coverage (#585). The python-coverage job
+            # reads the source from a checkout at this leg's path, so keep it on ubuntu.
+            coverage: "true"
           - os: macos-14 # macOS arm64 — covered only by one developer's pre-push hook
             label: macos-14
             apt: ""
@@ -291,7 +298,9 @@ jobs:
       # coverage is not a number anyone should read. COVERAGE_CORE=sysmon is
       # Python 3.12's sys.monitoring, which costs next to nothing where the
       # default tracer cost a test slice 70% more time (4.8 s plain, 5.0 s
-      # sysmon, 8.3 s traced, measured on five test files).
+      # sysmon, 8.3 s traced, measured on five test files). The interpreters the
+      # tests spawn (`python -m bngsim.cache`, 49 call sites) are measured through
+      # coverage's start-up hook, since pytest-cov sees only its own process.
       - name: Run the Python suite (this shard)
         id: pytest
         if: ${{ matrix.shard == 1 || !github.event.inputs.pytest_args }}
@@ -304,6 +313,9 @@ jobs:
           COVERAGE_CORE: sysmon
           COVERAGE_FILE: ${{ github.workspace }}/coverage-${{ matrix.leg.label }}-${{ matrix.shard }}.dat
           COV_ARGS: ${{ matrix.leg.coverage == 'true' && '--cov=bngsim --cov-report=' || '' }}
+          # Subprocesses the tests spawn are measured too (ci/subprocess.coveragerc
+          # says how); empty on the other legs, which coverage's hook reads as unset.
+          COVERAGE_PROCESS_START: ${{ matrix.leg.coverage == 'true' && format('{0}/ci/subprocess.coveragerc', github.workspace) || '' }}
         run: |
           set -o pipefail
           if [ -n "$PYTEST_ARGS" ]; then unset BNGSIM_TEST_SHARD; fi
@@ -505,7 +517,11 @@ jobs:
           if [ "${#files[@]}" -ne 2 ]; then
             echo "::warning::Coverage data from ${#files[@]} of 2 shards: the total covers part of the suite."
           fi
-          version="$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"] if p["name"] == "coverage"))')"
+          version="$(python3 -c 'import tomllib; print(next((p["version"] for p in tomllib.load(open("uv.lock", "rb"))["package"] if p["name"] == "coverage"), ""))')"
+          if [ -z "$version" ]; then
+            echo "::warning::coverage is not in uv.lock: nothing to report."
+            exit 0
+          fi
           cov() { uvx --from "coverage==$version" coverage "$@"; }
           cov combine --data-file=.coverage "${files[@]}"
           cov report --data-file=.coverage -m --skip-covered --sort=cover | tee coverage-report.txt
@@ -514,7 +530,7 @@ jobs:
           {
             echo "### Python line coverage (report only, issue #585)"
             echo ""
-            echo "**${total}%** of bngsim's Python statements ran across the suite (ubuntu-latest, both shards, ${#files[@]} data file(s))."
+            echo "**${total}%** of bngsim's Python statements ran across the suite (ubuntu-latest, ${#files[@]} of 2 shard data files)."
             echo "The per-file table, with the missing lines, is in this job's log and the \`python-coverage-report\` artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 

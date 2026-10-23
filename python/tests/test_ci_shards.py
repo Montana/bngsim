@@ -247,6 +247,14 @@ def test_the_coverage_job_reads_the_one_leg_that_measures_it():
     assert f"pattern: python-coverage-{measured[0]}-?" in text
     assert "name: python-coverage-${{ matrix.leg.label }}-${{ matrix.shard }}" in text
     assert "--cov=bngsim --cov-report=" in text
+    # The interpreters the tests spawn are measured too: the leg names the config
+    # coverage's start-up hook reads, and that config asks for parallel data files
+    # of bngsim, which pytest-cov's end-of-session combine sweeps up.
+    assert "COVERAGE_PROCESS_START: ${{ matrix.leg.coverage == 'true' &&" in text
+    assert "format('{0}/ci/subprocess.coveragerc', github.workspace)" in text
+    body = (REPO_ROOT / "ci" / "subprocess.coveragerc").read_text(encoding="utf-8")
+    assert re.search(r"^parallel = true$", body, re.M)
+    assert re.search(r"^source = bngsim$", body, re.M)
 
 
 def _durations_script():
