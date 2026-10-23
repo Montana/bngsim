@@ -2978,11 +2978,28 @@ static constexpr int kRelaxationSteps = 8;
 // of a column, as SUNDIALS' dense factorization takes it), in place. `row[k]`
 // is the row of the original matrix that ended at k. Returns the column of an
 // exact zero pivot, or -1.
-static int ss_lu_pivoted(std::vector<double> &a, int n, std::vector<int> &row) {
+//
+// With `rounding_is_zero`, a pivot within n·eps of the magnitudes it was made
+// of (each update adds |l|·|u| to an entry's) is a zero pivot too. Whether a
+// singular matrix shows an exact one is rounding. Two equal columns leave
+// x - (x/p)*p: exactly 0 where the product and the difference are rounded
+// apart, as on x86-64, and the residue of the division where they are fused
+// into one multiply-add, as on arm64. The factors and the solve from them are
+// the same either way.
+static int ss_lu_pivoted(std::vector<double> &a, int n, std::vector<int> &row,
+                         bool rounding_is_zero = false) {
     row.resize(static_cast<size_t>(n));
     for (int k = 0; k < n; ++k) {
         row[static_cast<size_t>(k)] = k;
     }
+    std::vector<double> mag; // what each entry was made of, where asked for
+    if (rounding_is_zero) {
+        mag.resize(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            mag[i] = std::abs(a[i]);
+        }
+    }
+    const double tol = static_cast<double>(n) * std::numeric_limits<double>::epsilon();
     for (int k = 0; k < n; ++k) {
         double *col_k = a.data() + static_cast<size_t>(k) * n;
         int p = k;
@@ -2995,10 +3012,16 @@ static int ss_lu_pivoted(std::vector<double> &a, int n, std::vector<int> &row) {
             for (int j = 0; j < n; ++j) {
                 std::swap(a[static_cast<size_t>(j) * n + k], a[static_cast<size_t>(j) * n + p]);
             }
+            for (int j = 0; j < n && !mag.empty(); ++j) {
+                std::swap(mag[static_cast<size_t>(j) * n + k], mag[static_cast<size_t>(j) * n + p]);
+            }
             std::swap(row[static_cast<size_t>(k)], row[static_cast<size_t>(p)]);
         }
         const double pivot = col_k[k];
         if (pivot == 0.0 || !std::isfinite(pivot)) {
+            return k;
+        }
+        if (!mag.empty() && std::abs(pivot) <= tol * mag[static_cast<size_t>(k) * n + k]) {
             return k;
         }
         for (int i = k + 1; i < n; ++i) {
@@ -3006,6 +3029,14 @@ static int ss_lu_pivoted(std::vector<double> &a, int n, std::vector<int> &row) {
         }
         for (int j = k + 1; j < n; ++j) {
             double *col_j = a.data() + static_cast<size_t>(j) * n;
+            if (!mag.empty()) {
+                // Added whatever u is: one that is 0 by rounding stands for
+                // what it was made of as well.
+                double *mag_j = mag.data() + static_cast<size_t>(j) * n;
+                for (int i = k + 1; i < n; ++i) {
+                    mag_j[i] += std::abs(col_k[i]) * mag_j[k];
+                }
+            }
             const double u = col_j[k];
             if (u == 0.0) {
                 continue;
@@ -3225,12 +3256,16 @@ static double ss_newton_distance(NetworkModel &model, SteadyStateRhs &rhs,
     // The Newton step for rates `fm` through `Jm`, every species' share of it:
     // the unknowns' own, a law's dependent the change that keeps its total (in
     // reconstruct_full's order), and 0 for a species held. Empty where the
-    // reduced matrix is singular.
+    // reduced matrix is singular, which leaves the state uncertified unless
+    // its rates are 0 (at_root, above). Singular by its rounding as well as
+    // exactly: a root that is not isolated, IIa_alpha2M and IIa_ATIII fed by
+    // IIa alone at IIa = 0 in BIOMD0000000358, was refused on x86-64 and
+    // certified on arm64, where the zero pivot came out as -7.9e-43.
     const auto newton_step = [&](const std::vector<double> &Jm, const std::vector<double> &fm) {
         std::vector<double> M;
         ss_reduce_jacobian(Jm.data(), ns, cl, idx, M);
         std::vector<int> row;
-        if (ss_lu_pivoted(M, n, row) >= 0)
+        if (ss_lu_pivoted(M, n, row, /*rounding_is_zero=*/true) >= 0)
             return std::vector<double>();
         std::vector<double> b(static_cast<size_t>(n));
         for (int j = 0; j < n; ++j)
