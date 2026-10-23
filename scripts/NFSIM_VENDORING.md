@@ -118,6 +118,9 @@ Current carry topics:
   (GH #854)
 - `exit(1)` → `throw std::runtime_error` where a BNG-written function or a rule
   that reads one cannot be built, which the earlier conversion left out
+- every table function indexed by the time read at each of its breakpoints in
+  `stepTo()`, whether or not a reaction has fired, so a rate that is 0 until a
+  later breakpoint turns on (GH #892)
 
 Not a carry, but tied to the vendored NFsim: bngsim refuses, by name, the rate
 laws NFsim cannot run, in `python/bngsim/_network_free_checks.py`
@@ -234,6 +237,8 @@ Expected carry order:
     (GH #854)
 19. `exit(1)` → `throw std::runtime_error` where a BNG-written function or a
     rule that reads one cannot be built
+20. time-indexed table functions read at their breakpoints in `stepTo()`
+    (GH #892)
 
 When you intentionally change the carry stack, regenerate the patch bundle
 afterward.

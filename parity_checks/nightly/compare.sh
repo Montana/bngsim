@@ -81,7 +81,8 @@ if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
       [ -f "$prev/verdicts.json" ]; then
       python3 "$here/verdicts.py" diff \
         --baseline "$prev/verdicts.json" --fresh "$out/verdicts.json" \
-        --label "vs previous night (run $id)" --flaky "$here/flaky.json" --timeout-flips-info \
+        --label "vs previous night (run $id)" --flaky "$here/flaky.json" \
+        --timeout-flips-info --phases-may-differ \
         --json-out "$out/diff-prev.json" --md-out "$out/diff-prev.md" "$@" >/dev/null || rc=1
       [ -f "$out/diff-prev.md" ] && cat "$out/diff-prev.md" >>"$summary"
       break

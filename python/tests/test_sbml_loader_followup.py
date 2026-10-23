@@ -1200,6 +1200,16 @@ def _cf_rule(kind: str, math: str) -> str:
 
 
 _CF_VARIABLE = '<parameter id="cf" constant="false"/>'
+_RATEOF = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/rateOf">'
+    "rateOf</csymbol>"
+)
+
+
+def _two_plus_rate_of(sid: str) -> str:
+    return f"<apply><plus/><cn>2</cn><apply>{_RATEOF}<ci>{sid}</ci></apply></apply>"
+
+
 _TIME = (
     '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
 )
@@ -1236,6 +1246,15 @@ _TIME = (
             {"cf_param": _CF_VARIABLE, "extra": _cf_rule("assignmentRule", "<ci>J0</ci>")},
             "the assignment rule cf := J0",
             id="rule-reading-a-reaction-rate",
+        ),
+        # rateOf(S1) moves as S1 does (issue #1124, item 9, the other way).
+        pytest.param(
+            {
+                "cf_param": _CF_VARIABLE,
+                "extra": _cf_rule("assignmentRule", _two_plus_rate_of("S1")),
+            },
+            "the assignment rule cf := 2 + rateOf(S1)",
+            id="rule-reading-a-moving-rate-of",
         ),
         pytest.param(
             {
@@ -1298,6 +1317,16 @@ _J1_AT_TWO = (
                 "extra_species": _S3_HELD,
             },
             id="rule-reading-a-species-nothing-changes",
+        ),
+        # rateOf(S3) is 0 throughout: it was refused as the clock (issue #1124,
+        # item 9), and with the model's factor on S3 as well its fold read the
+        # factor it was working out.
+        pytest.param(
+            {
+                "extra": _cf_rule("assignmentRule", _two_plus_rate_of("S3")),
+                "extra_species": _S3_HELD,
+            },
+            id="rule-reading-the-rate-of-a-species-nothing-changes",
         ),
     ],
 )

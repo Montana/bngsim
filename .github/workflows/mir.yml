@@ -63,9 +63,15 @@ name: mir-jit
 # MIR itself rather than in bngsim's use of it: MIR_gen's register allocator
 # overran a two-entry table on `x = x * x`, which glibc's stack protector turned
 # into a SIGABRT on the Linux leg while the other three laid the frame out
-# harmlessly. test_codegen_jit_self_multiply.py is the regression, and the fix is
-# a local carry in third_party/mir/mir-gen.c — see VENDOR.json `local_carries`,
-# which test_mir_vendoring.py now checks is still applied.
+# harmlessly. test_codegen_jit_self_multiply.py is the regression. The fix was
+# carried locally in third_party/mir/mir-gen.c until upstream merged it as
+# vnmakarov/mir#468; #1208 moved the pin past it, and test_mir_vendoring.py now
+# checks upstream's copy still bounds the table.
+#
+# #1208 found a third, in what reaches c2mir: a call the generated C makes to a
+# function it never declares (frac, equal) is an error under cc, but c2mir
+# declares it implicitly, so MIR either exit()ed the process or bound an
+# unrelated symbol of that name. test_codegen_jit_prelude.py pins the refusal.
 
 on:
   workflow_dispatch:
@@ -226,6 +232,7 @@ jobs:
           # not-run: test_codegen_sens_term_scale.py -- (b) same: cg.compile_rhs + ctypes.CDLL, so this leg re-runs the cc path verbatim
           # not-run: test_codegen_structural_key.py -- (a) the warm-cache case asserts a .so is returned without generating source
           # not-run: test_codegen_gen_scaling.py -- source *generation* scaling; identical Python before either backend is chosen
+          # not-run: test_codegen_key_stream.py -- the core's key bytes against the Python walk; made before either backend is chosen
           # not-run: test_codegen_jacobian_sparse.py -- the sparse Jacobian entry point is KLU-gated and this leg builds ENABLE_KLU=OFF
           python -m pytest -p no:cacheprovider \
             python/tests/test_mir_equivalence.py \

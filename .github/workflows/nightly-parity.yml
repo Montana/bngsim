@@ -18,6 +18,8 @@ name: nightly-parity
 #                                                 only there)
 #   bng-stoch    run_network SSA / NFsim          110 SSA + 235 NF committed BNGL jobs
 #   amici-sens   AMICI forward sensitivities      48 of the 50 curated BioModels x 2 methods
+#   rr-ssa       libRoadRunner gillespie          the 269 of the 306 SSA-screen BioModels
+#                                                 candidates the corpus holds (#806)
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -371,6 +373,61 @@ jobs:
           retention-days: 30
 
   # ------------------------------------------------------------------------- #
+  # The broad SBML SSA screen against libRoadRunner's gillespie (#806):
+  # parity_checks/rr_parity/ssa_screen.py over the ssa_candidates.json BioModels,
+  # read from the same cached materialization rr-ode uses (269 of the 306; the
+  # other 37 have no pinned provenance, and --present-only leaves them out
+  # rather than reporting them as skips). Per-model cap 120 s in the parallel
+  # phase; the serial re-validation of time-event models is capped at 300 s each.
+  # The nightly diffs the screen's _core report with verdicts.py, which alerts on
+  # PASS -> SKIP / TIMEOUT where diff_ssa_baseline.py does not.
+  # ------------------------------------------------------------------------- #
+  rr-ssa:
+    name: RoadRunner SSA screen
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/nightly.swap
+          sudo chmod 600 /mnt/nightly.swap
+          sudo mkswap /mnt/nightly.swap
+          sudo swapon /mnt/nightly.swap
+          free -h
+      - uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ needs.corpus.outputs.key }}
+          fail-on-cache-miss: true
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp, roadrunner; print('bngsim', bngsim.__version__, 'roadrunner', roadrunner.__version__); bp.print_identity()"
+      - name: Run ssa_screen.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+        run: |
+          uv run --no-sync python parity_checks/rr_parity/ssa_screen.py --corpus biomodels \
+            --present-only --jobs 4 --revalidate-timeout 300 \
+            --out "$RUNNER_TEMP/ssa_screen.json" --core-out "$RUNNER_TEMP/rr_ssa.json" || true
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh rr_ssa core "$RUNNER_TEMP/rr_ssa.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-rr_ssa
+          path: nightly-out/rr_ssa/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
   # Stochastic tracks against run_network's SSA and standalone NFsim. Seeds are
   # fixed on both sides.
   # ------------------------------------------------------------------------- #
@@ -513,7 +570,7 @@ jobs:
   # ------------------------------------------------------------------------- #
   report:
     name: Report
-    needs: [corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens]
+    needs: [corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens, rr-ssa]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
