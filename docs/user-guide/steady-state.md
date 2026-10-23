@@ -114,13 +114,16 @@ run's own error shrinks with them. BIOMD0000000211 moved by 194 tolerances at
 the criterion's own, 15.7 at a tenth and 0.68 at a hundredth. A move of more
 than 10 tolerances that does not halve at a tenth of them is taken for a drift
 and refused there. The kicked run is integrated at the criterion's own, and
-each species may move ten times its own kick, or the largest kick of a species
-the solve chose to kick, whichever is more. Its kick
+each species may move ten times its own kick or the largest kick of an unknown
+(a species the solve kicks, not a law's dependent that follows) it is coupled
+to through the Jacobian's structure, whichever is more; a `$`-fixed species
+couples nothing. Its kick
 keeps the conserved totals: a law's dependent that the kick would take below
 0 turns its law's kicks the other way, and one kicked by more than ten
 millionths of itself has them cut, so that one species does not stand in for
 the whole kick. A species at 0 is not kicked: at a state that rests nothing
-makes it, and no integrator error makes it from nothing. SIR with `I = 0` is
+makes it, and no integrator error makes it from nothing. Nor is a law's
+dependent at 0: the law's largest member present takes up its kicks. SIR with `I = 0` is
 converged, as on main, though an infection would grow; so is a counter whose
 pulse is at 0, which a kicked pulse would move by more than the kick may grow
 to.
@@ -132,7 +135,8 @@ a state under `tol` whose step is within tolerance (up to 512 unknowns). That
 is what takes the issue's cubic on from 0.894 to 1. The state the solve stops
 at is then polished by KINSOL, with a Jacobian at every iterate, where its
 step is within a thousand tolerances (above 512 unknowns, always, to a
-thousandth of `tol`), and the polish kept if it passes the parity test: that
+thousandth of `tol`), and the polish kept if it passes the parity test and is
+nearer the root: that
 takes a march that stalled short of its root the rest of the way, and makes
 dY_ss/dp that of the root. The step decides nothing about `converged`: where it
 cannot be passed (a continuum of steady states, where it is singular but for
@@ -503,8 +507,9 @@ ss.eigenvalues                # array([-0.863+0.j, -1.137+0.j]) — the spectrum
   that root. There is nowhere to fall back to then — integration would return the
   same state — so the verdict is reported rather than acted on. Under the
   default criterion the result is then `converged=False`, whatever a run kicked
-  off the root shows, unless a species is at 0: an absent invader is not
-  kicked, and SIR at `I = 0` is converged and labelled `"unstable"`.
+  off the root shows, unless what grows is a species at 0: where one is, the
+  species present are asked alone. An absent invader is not kicked, and SIR at
+  `I = 0` is converged and labelled `"unstable"`.
 - `n_unstable_roots_rejected > 0` on a result whose `method_used` is
   `"integration"` explains why the polish did not answer.
 - `eigenvalues` is the spectrum the verdict was read off (issue #523): the

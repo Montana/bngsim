@@ -619,6 +619,13 @@ static double ss_largest_species(const NetworkModel &model, const SteadyStateOpt
     return largest;
 }
 
+// Whether a species at `yi` is absent (issue #1001): at 0, to the rounding of
+// the largest species. A law's dependent made from its total comes back at
+// -1.6e-17 beside members at 0.99 and 0.01.
+static bool ss_is_absent(double yi, double largest) {
+    return std::abs(yi) <= 8.0 * std::numeric_limits<double>::epsilon() * largest;
+}
+
 // Do two candidate steady states agree to AGREE_RTOL? Used by the two-tier
 // solver (GH #27 Bug 2) to accept a KINSOL root only once it is *seed-stable*:
 // two Newton solves from successively tighter integration bursts landing on the
@@ -1262,13 +1269,16 @@ class SteadyStateMarcher {
             // jump), or is 1e52 tolerances (a species at 5e19), the march was
             // taken on past the state the residual test stops at, which a run
             // from it does not move, until it ran away: BIOMD0000000463 to a
-            // residual of 2e16, MODEL1102210001 to 1.5e-4.
-            if (by_distance_ && !converged && !integrator_failed_ && !passed.empty() &&
-                !(*residual_out < tol)) {
+            // residual of 2e16, MODEL1102210001 to 1.5e-4. Or on until the
+            // integrator failed, and a retry on difference quotients failed the
+            // same way: glioblastoma-egfrviii-signaling passed at step 2075 and
+            // came back with a residual of NaN.
+            if (by_distance_ && !converged && !passed.empty() && !(*residual_out < tol)) {
                 std::copy(passed.begin(), passed.end(), y_data);
                 *residual_out = passed_resid;
                 converged = !passed_asked &&
                             ss_accepts(model_, rhs_, opts_, sub_, passed.data(), passed_resid);
+                integrator_failed_ = false;
                 if (!reinit_here()) {
                     integrator_failed_ = true;
                 }
@@ -5641,8 +5651,9 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     // chosen (the unknowns', not the dependents' that follow them).
     std::vector<double> kicked(un, 0.0);
     double chosen = 0.0;
-    // The largest kick, each in its own tolerance, of the species each one is
-    // coupled to through the Jacobian's structure.
+    // The larger of each species' own kick and the largest kick of an unknown
+    // it is coupled to through the Jacobian's structure (not through a
+    // $-fixed species), each in its own tolerance.
     std::vector<double> coupled(un, 0.0);
     if (kick_size > 0.0) {
         const SsDistanceSystem system = ss_distance_system(model, sub);
@@ -5662,11 +5673,42 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                 const auto ui = static_cast<size_t>(i);
                 const double share = 2.0 * std::fmod((i + 1) * 0.6180339887498949, 1.0) - 1.0;
                 double v = kick_size * size_of(i) * share * share_of[ui];
-                if (y[ui] == 0.0)
+                if (ss_is_absent(y[ui], largest))
                     v = 0.0;
                 if (y[ui] >= 0.0 && y[ui] + v < 0.0)
                     v = -v;
                 kick[ui] = v;
+            }
+            // A law whose dependent is absent takes up its unknowns' kicks
+            // with its largest member present, so that the dependent stays
+            // absent: with I the dependent of S + I + R, SIR at I = 0 was
+            // refused in two orders of its species of six.
+            std::vector<char> taking_up(un, 0);
+            for (int k = 0; k < cl.n_laws; ++k) {
+                const auto &row = cl.coefficients[static_cast<size_t>(k)];
+                const int dep = cl.dependent[static_cast<size_t>(k)];
+                if (!ss_is_absent(y[static_cast<size_t>(dep)], largest))
+                    continue;
+                int by = -1;
+                for (int i : system.unknowns) {
+                    const auto ui = static_cast<size_t>(i);
+                    if (row[ui] == 0.0 || taking_up[ui] || ss_is_absent(y[ui], largest))
+                        continue;
+                    if (by < 0 ||
+                        std::abs(row[ui] * y[ui]) >
+                            std::abs(row[static_cast<size_t>(by)] * y[static_cast<size_t>(by)]))
+                        by = i;
+                }
+                if (by < 0)
+                    continue;
+                const auto ub = static_cast<size_t>(by);
+                taking_up[ub] = 1;
+                double acc = 0.0;
+                for (size_t i = 0; i < un; ++i) {
+                    if (static_cast<int>(i) != dep && i != ub)
+                        acc += row[i] * kick[i];
+                }
+                kick[ub] = -acc / row[ub];
             }
             for (int k = 0; k < cl.n_laws; ++k) {
                 const auto &row = cl.coefficients[static_cast<size_t>(k)];
@@ -5679,7 +5721,11 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                     if (static_cast<int>(i) != dep)
                         acc += row[i] * kick[i];
                 }
-                kick[static_cast<size_t>(dep)] = -acc / coeff_dep;
+                kick[static_cast<size_t>(dep)] =
+                    ss_is_absent(y[static_cast<size_t>(dep)], largest) &&
+                            std::abs(acc) <= 1e-12 * kick_size * largest * std::abs(coeff_dep)
+                        ? 0.0
+                        : -acc / coeff_dep;
             }
         };
         build();
@@ -5736,22 +5782,27 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                 return i;
             };
             for (int j = 0; j < ns; ++j) {
+                if (species[j].fixed)
+                    continue;
                 for (int64_t k = pattern.col_ptrs[static_cast<size_t>(j)];
                      k < pattern.col_ptrs[static_cast<size_t>(j) + 1]; ++k) {
-                    const int a =
-                        find(static_cast<int>(pattern.row_indices[static_cast<size_t>(k)]));
-                    const int b = find(j);
-                    if (a != b)
-                        group[static_cast<size_t>(a)] = b;
+                    const int r = static_cast<int>(pattern.row_indices[static_cast<size_t>(k)]);
+                    if (species[r].fixed)
+                        continue;
+                    const int ga = find(r);
+                    const int gb = find(j);
+                    if (ga != gb)
+                        group[static_cast<size_t>(ga)] = gb;
                 }
             }
             std::vector<double> largest_in(un, 0.0);
-            for (int i = 0; i < ns; ++i) {
+            for (int i : system.unknowns) {
                 const auto g = static_cast<size_t>(find(i));
                 largest_in[g] = std::max(largest_in[g], kicked[static_cast<size_t>(i)]);
             }
             for (int i = 0; i < ns; ++i)
-                coupled[static_cast<size_t>(i)] = largest_in[static_cast<size_t>(find(i))];
+                coupled[static_cast<size_t>(i)] = std::max(
+                    kicked[static_cast<size_t>(i)], largest_in[static_cast<size_t>(find(i))]);
         } else {
             for (size_t i = 0; i < un; ++i)
                 coupled[i] = std::max(kicked[i], chosen);
@@ -5853,7 +5904,8 @@ static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
     double last = still;
     for (double tighter : {1e-1, 1e-2, 1e-3}) {
         if (!(still > 1.0) || !std::isfinite(still) ||
-            (tighter < 1e-2 && !opts.criterion_by_distance))
+            (tighter < 1e-2 && !opts.criterion_by_distance) ||
+            opts.rtol * tighter * 10.0 <= kRunRtolLeast)
             break;
         const double again = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, tighter);
         if (!std::isfinite(again))
@@ -5866,6 +5918,59 @@ static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
     if (!(still <= 1.0))
         return still;
     return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick, 1.0));
+}
+
+// Whether the Jacobian at `y` restricted to the species present there (not
+// $-fixed, not absent) has an eigenvalue whose real part is past
+// kStabilityRelTol of the spectrum's radius or of the largest entry of the
+// whole matrix, whichever is more (issue #1001): an unstable root
+// among the species present, whatever is at 0. An absent invader's instability
+// is in its own row, which this leaves out: SIR at I = 0 is not unstable here,
+// and the cubic at its unstable root is, beside a species at 0 or not.
+static bool ss_unstable_among_present(NetworkModel &model, SteadyStateRhs &rhs,
+                                      const SteadyStateOptions &opts, const ResidualSubspace &sub,
+                                      const std::vector<double> &y) {
+    const int ns = model.n_species();
+    const double largest = ss_largest_species(model, opts, y.data());
+    std::vector<int> idx;
+    for (int i : sub.included) {
+        if (!model.species()[i].fixed && !ss_is_absent(y[static_cast<size_t>(i)], largest))
+            idx.push_back(i);
+    }
+    const int n = static_cast<int>(idx.size());
+    if (n == 0 || n > kStabilitySpectrumMaxN)
+        return false;
+    std::vector<double> saved(static_cast<size_t>(ns));
+    model.get_state_into(saved.data());
+    model.set_state_from(y.data());
+    std::vector<double> J(static_cast<size_t>(ns) * ns, 0.0);
+    ss_fill_state_jacobian(rhs, y.data(), ns, sub, ss_want_analytical_jacobian(opts.jacobian),
+                           J.data());
+    model.set_state_from(saved.data());
+    // The scale is the whole matrix's: restricted to the species present, SIR
+    // at I = -1.6e-17 (a law's rounding) is a matrix of rounding, and a
+    // spectrum of 1e-17 read past its own radius.
+    double scale = 0.0;
+    for (int a : sub.included)
+        for (int b : sub.included)
+            scale = std::max(scale, std::abs(J[static_cast<size_t>(a) * ns + b]));
+    std::vector<double> M(static_cast<size_t>(n) * n);
+    for (int a = 0; a < n; ++a)
+        for (int b = 0; b < n; ++b)
+            M[static_cast<size_t>(a) * n + b] =
+                J[static_cast<size_t>(idx[static_cast<size_t>(a)]) * ns +
+                  idx[static_cast<size_t>(b)]];
+    std::vector<double> wr(static_cast<size_t>(n)), wi(static_cast<size_t>(n));
+    if (!dense_eigenvalues(M.data(), n, wr.data(), wi.data()))
+        return false;
+    double max_re = -std::numeric_limits<double>::infinity();
+    double radius = 0.0;
+    for (int i = 0; i < n; ++i) {
+        max_re = std::max(max_re, wr[static_cast<size_t>(i)]);
+        radius =
+            std::max(radius, std::hypot(wr[static_cast<size_t>(i)], wi[static_cast<size_t>(i)]));
+    }
+    return max_re > kStabilityRelTol * std::max(radius, scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -6079,8 +6184,8 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // that dY_ss/dp is that of the root and not of a state a tolerance
         // off it (a species settling at 1e-11 from 1, at atol 1e-8, came back
         // 0.4% off with its column). The polish is kept where it passes the
-        // parity test; the runs then decide. Above kNewtonDistanceMost
-        // unknowns, where there is no step, always.
+        // parity test and is nearer the root; the runs then decide. Above
+        // kNewtonDistanceMost unknowns, where there is no step, always.
         if (std::isnan(result.newton_distance) || result.newton_distance <= kPolishFurthest) {
             std::vector<double> held(static_cast<size_t>(ns));
             model.get_state_into(held.data());
@@ -6139,19 +6244,24 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // solve returns only where it started, is not a state the system
         // rests at, whatever the kicked run saw: X at its unstable root
         // 0.99999, 500 tolerances from its next root, kicked by a millionth
-        // reached it before the kick had grown tenfold. Unless a species is at
-        // 0, which may be what the eigenvalues see grow: an absent invader is
-        // not kicked, and nothing makes it (SIR at I = 0).
+        // reached it before the kick had grown tenfold. Unless it is a species
+        // at 0 that the eigenvalues see grow: an absent invader is not kicked,
+        // and nothing makes it (SIR at I = 0). Where one is at 0, the species
+        // present are asked alone; an unrelated one at 0 let the cubic's
+        // unstable root through.
         if (result.root_stability == "unstable") {
             bool absent = false;
+            const double largest =
+                ss_largest_species(model, *effective, result.concentrations.data());
             for (int i : sub.included) {
                 if (!model.species()[i].fixed &&
-                    result.concentrations[static_cast<size_t>(i)] == 0.0) {
+                    ss_is_absent(result.concentrations[static_cast<size_t>(i)], largest)) {
                     absent = true;
                     break;
                 }
             }
-            if (!absent)
+            if (!absent ||
+                ss_unstable_among_present(model, rhs, *effective, sub, result.concentrations))
                 result.converged = false;
         }
     }

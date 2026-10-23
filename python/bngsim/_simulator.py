@@ -10537,8 +10537,9 @@ class SteadyStateResult:
     continued_run_distance : float
         The run test of ``criterion="scaled"``: the largest move of a
         measured species, over its tolerance, across the run taken on from
-        the state returned, and the kicked run's over ten times 1 + twice its
-        kick; at most 1 passes (issue #1001). ``inf`` where a run could not
+        the state returned, and the kicked run's over ten times 1 + twice the
+        larger of its own kick and the largest kick of an unknown it is
+        coupled to, in tolerances; at most 1 passes (issue #1001). ``inf`` where a run could not
         be taken to its time; NaN where none was taken (under ``"residual"``,
         where the parity test already refused, and for a burst-free Newton
         solve).

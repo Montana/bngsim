@@ -1330,8 +1330,9 @@ struct SteadyStateResult {
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
     // Issue #1001, the run test of "scaled": the largest move of a measured
     // species over its tolerance, across the run taken on from the returned
-    // state, and the kicked run's over ten times 1 + twice its kick; at most 1
-    // passes. +inf where a run could not be taken to its time; NaN where none
+    // state, and the kicked run's over ten times 1 + twice the larger of its
+    // own kick and the largest kick of an unknown it is coupled to, in
+    // tolerances; at most 1 passes. +inf where a run could not be taken to its time; NaN where none
     // was taken (under "residual", where the parity test already refused, and
     // for a burst-free Newton solve).
     double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
