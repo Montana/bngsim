@@ -27,7 +27,9 @@ tolerance, which reads the same in any units. These tests cover:
   drains steps the A and B it feeds, whatever the species order;
 - a differenced Jacobian across a rate law's jump certifies nothing;
 - a $-fixed species does not set the floor;
-- a batch entry at another scale marches at its own "auto" atol.
+- a batch entry at another scale marches at its own "auto" atol;
+- a Jacobian singular by its rounding is singular, so a root that is not
+  isolated is refused on x86-64 and arm64 alike.
 """
 
 from __future__ import annotations
@@ -847,11 +849,49 @@ _B358 = (
 @pytest.mark.skipif(
     not _B358.exists(), reason="rr_parity corpus model BIOMD0000000358 not present"
 )
-def test_a_species_far_below_its_step_keeps_its_forward_column():
-    # A species at 1.7e-44: its secant to 0 moves the rows by less than their
-    # rounding, the column lost its entries, and the root was refused.
+@pytest.mark.parametrize("jacobian", ["fd", "auto"])
+def test_a_root_that_is_not_isolated_is_refused_on_every_platform(jacobian):
+    # IIa_alpha2M and IIa_ATIII are fed by IIa alone, which is 0 at the root,
+    # so their columns of the reduced Jacobian are one column and any split of
+    # the two is a root. A singular J stays uncertified. Its zero pivot was
+    # exact on x86-64 and -7.9e-43 on arm64, where this read converged=True.
     ss = bngsim.Simulator(
-        bngsim.Model.from_sbml(str(_B358)), method="ode", jacobian="fd"
+        bngsim.Model.from_sbml(str(_B358)), method="ode", jacobian=jacobian
     ).steady_state(criterion="scaled")
-    assert ss.converged
-    assert ss.newton_distance <= 1.0
+    assert not ss.converged
+    assert ss.newton_distance == math.inf
+
+
+# I feeds C1 at 3 and C2 at 1, and nothing else moves: at I = 0 every split of
+# C1 and C2 is a root, and their columns of the reduced Jacobian are one.
+SPLIT_NET = """begin parameters
+    1 k1 3.0
+    2 k2 1.0
+end parameters
+begin species
+    1 I() 1.0
+    2 C1() 0
+    3 C2() 0
+end species
+begin reactions
+    1 1 2 k1
+    2 1 3 k2
+end reactions
+"""
+
+
+@pytest.mark.parametrize("jacobian", ["auto", "fd"])
+def test_a_singular_jacobian_is_singular_on_every_platform(tmp_path, jacobian):
+    # The march stops with I near 1e-40, short of 0, so the rates are not 0
+    # and the step is asked for. Its last pivot is -1 + (1/3)*3: 0 where the
+    # product is rounded before the sum, as on x86-64, and -5.6e-17 where the
+    # two are fused into one multiply-add, as on arm64, which took the step
+    # and read converged=True. By its rounding the matrix is singular on both.
+    path = tmp_path / "split.net"
+    path.write_text(SPLIT_NET)
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+    ).steady_state(criterion="scaled", method="integration")
+    assert not ss.converged
+    assert ss.newton_distance == math.inf
+    assert list(ss.concentrations[1:]) == pytest.approx([0.75, 0.25], rel=1e-9)
