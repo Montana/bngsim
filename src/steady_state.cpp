@@ -1099,6 +1099,11 @@ class SteadyStateMarcher {
         // Whether the state the march stops at was asked by ss_accepts
         // (accept_by_distance), which is only every so many steps.
         bool asked = false;
+        // The last state that passed the residual test (accept_by_distance),
+        // its residual, and whether ss_accepts was asked there.
+        std::vector<double> passed;
+        double passed_resid = 0.0;
+        bool passed_asked = false;
 
         while (t_ < t_stop) {
             // `tout` is NOT the budget (issue #235). In CV_ONE_STEP CVODE returns
@@ -1137,6 +1142,11 @@ class SteadyStateMarcher {
                     distance_check_at_ = 2 * distance_steps_;
                     reached = ss_accepts(model_, rhs_, opts_, sub_, y_data, resid);
                     asked = true;
+                }
+                if (resid < tol) {
+                    passed.assign(y_data, y_data + ns_);
+                    passed_resid = resid;
+                    passed_asked = asked;
                 }
             }
             if (reached) {
@@ -1200,6 +1210,16 @@ class SteadyStateMarcher {
         }
 
         if (!converged) {
+            // Starts the integrator again where the state was put back to,
+            // its counts banked first, which the restart zeroes.
+            const auto reinit_here = [&]() {
+                long int nst_so_far = 0, nfe_so_far = 0;
+                CVodeGetNumSteps(cvode_mem_, &nst_so_far);
+                CVodeGetNumRhsEvals(cvode_mem_, &nfe_so_far);
+                steps_before_reinit_ += nst_so_far;
+                rhs_evals_before_reinit_ += nfe_so_far;
+                return CVodeReInit(cvode_mem_, t_, y_) == CV_SUCCESS;
+            };
             *residual_out = compute_residual(rhs_, y_data, ns_, sub_);
             // Marched over a switch the state slides along (past
             // MAX_ROOT_RESTARTS) and ended further from a steady state than
@@ -1213,7 +1233,7 @@ class SteadyStateMarcher {
                 std::copy(dropped_at_.begin(), dropped_at_.end(), y_data);
                 *residual_out = dropped_residual_;
                 asked = false;
-                if (CVodeReInit(cvode_mem_, t_, y_) != CV_SUCCESS) {
+                if (!reinit_here()) {
                     integrator_failed_ = true;
                 }
             }
@@ -1224,6 +1244,27 @@ class SteadyStateMarcher {
             // and came back unconverged.
             if (by_distance_ && !asked) {
                 converged = ss_accepts(model_, rhs_, opts_, sub_, y_data, *residual_out);
+            }
+            // Stopped at a state the residual test refuses, the march returns
+            // the last state it passed, asked there, where it was not, whether
+            // the step takes it (issue #1001). The step only says where to
+            // stop, and the runs decide. On a species at 2e12 f is rounding, 0
+            // at one step and 2.6e-6 at the next: Monro2008 passed at step
+            // 517, between asks, and stopped at its max_time at step 518 with
+            // a residual of 1.3e-6. Where the step cannot be had (across a
+            // jump), or is 1e52 tolerances (a species at 5e19), the march was
+            // taken on past the state the residual test stops at, which a run
+            // from it does not move, until it ran away: BIOMD0000000463 to a
+            // residual of 2e16, MODEL1102210001 to 1.5e-4.
+            if (by_distance_ && !converged && !integrator_failed_ && !passed.empty() &&
+                !(*residual_out < tol)) {
+                std::copy(passed.begin(), passed.end(), y_data);
+                *residual_out = passed_resid;
+                converged = !passed_asked &&
+                            ss_accepts(model_, rhs_, opts_, sub_, passed.data(), passed_resid);
+                if (!reinit_here()) {
+                    integrator_failed_ = true;
+                }
             }
         }
         return converged;
@@ -1866,10 +1907,17 @@ static SsDistanceSystem ss_distance_system(const NetworkModel &model, const Resi
 // attempt fails identically. The two-tier ladder uses this to stop probing
 // KINSOL instead of building MAX_NEWTON_ATTEMPTS dense n_ind×n_ind
 // factorizations that are all doomed.
+//
+// `fresh_jacobian` evaluates the Jacobian at every iterate, where KINSOL by
+// default keeps one for ten: the polish of the "scaled" criterion (issue
+// #1001) has ten iterations, and on the matrix of where it starts they close
+// a gap only linearly. X' = 1e-6·(1 - X²) beside 520 unknowns, polished from
+// X = 0.698, ended 3.7e-5 short of 1.
 static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rhs,
                                          const SteadyStateOptions &opts,
                                          const ResidualSubspace &sub,
-                                         bool *linsolv_failed = nullptr, int max_iters = 200) {
+                                         bool *linsolv_failed = nullptr, int max_iters = 200,
+                                         bool fresh_jacobian = false) {
 
     if (linsolv_failed) {
         *linsolv_failed = false;
@@ -2003,6 +2051,8 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
                       opts.criterion_by_distance ? std::numeric_limits<double>::min() : opts.tol);
     KINSetScaledStepTol(kin_mem, 1e-15); // allow very small steps
     KINSetNumMaxIters(kin_mem, max_iters);
+    if (fresh_jacobian)
+        KINSetMaxSetupCalls(kin_mem, 1);
     // Set max Newton step large enough for the problem scale
     double max_newton_step = 0.0;
     for (int i = 0; i < n_ind; ++i) {
@@ -2130,9 +2180,10 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
 static SteadyStateResult ss_newton_from(NetworkModel &model, SteadyStateRhs &rhs,
                                         const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                         const std::vector<double> &seed,
-                                        bool *linsolv_failed = nullptr, int max_iters = 200) {
+                                        bool *linsolv_failed = nullptr, int max_iters = 200,
+                                        bool fresh_jacobian = false) {
     model.set_state_from(seed.data());
-    return solve_by_newton(model, rhs, opts, sub, linsolv_failed, max_iters);
+    return solve_by_newton(model, rhs, opts, sub, linsolv_failed, max_iters, fresh_jacobian);
 }
 
 // ── Is a polished root one the dynamics can actually rest on? (issue #78) ────
@@ -5533,19 +5584,24 @@ static constexpr long kRunSteps = 50;
 // 1 + 2k, and so the kick may grow tenfold before it is said to have grown.
 // An unstable root's grows to the next root, by millions.
 //
-// A species' size is the larger of its value and its atol over rtol, so that
-// one at 0 is kicked too, at its own scale. The kick's signs are the golden
-// ratio's multiples, so that no symmetry of the model is kept, and each law's
-// dependent follows the unknowns so that the totals stay where they are: on a
-// neighbouring manifold a state the system rests at can be further than a
-// tolerance away. An unknown kicked below 0 is kicked the other way. A
-// dependent so taken below 0 turns its law's unknowns' kicks the other way,
-// and if that does not do, drops them; one kicked by more than ten
-// millionths of itself has them cut until it is not. Each law to its own
-// unknowns, not the whole kick: scaled down to the room of one dependent at
-// 4.6e-10, the kick of a cubic beside it fell under the integrator's
-// tolerance and its unstable root at 0.3 was returned; and a dependent at
-// 1e-6 kicked by 1 by its law's partner at 1e6 let every species move 5e14
+// A species at 0 is not kicked: at a state that rests nothing makes it, and
+// no integrator error makes it from nothing. Kicked, an absent species was an
+// invader that grew (an SIR model at I = 0, which main and #997's hold
+// return), or one the rest answered with a gain past ten (a counter driven by
+// a pulse at 0, synbio_counter_molecular; FceRI signalling with no ligand,
+// x3_2), at states the system rests at. A species' size, which a dependent's
+// kick is cut to, is the larger of its value and its atol over rtol. The
+// kick's signs are the golden ratio's multiples, so that no symmetry of the
+// model is kept, and each law's dependent follows the unknowns so that the
+// totals stay where they are: on a neighbouring manifold a state the system
+// rests at can be further than a tolerance away. An unknown kicked below 0 is
+// kicked the other way. A dependent so taken below 0 turns its law's unknowns'
+// kicks the other way, and if that does not do, drops them; one kicked by more
+// than ten millionths of itself has them cut until it is not. Each law to its
+// own unknowns, not the whole kick: scaled down to the room of one dependent
+// at 4.6e-10, the kick of a cubic beside it fell under the integrator's
+// tolerance and its unstable root at 0.3 was returned; and a dependent at 1e-6
+// kicked by 1 by its law's partner at 1e6 let every species move 5e14
 // tolerances, and an unstable root beside them go to its next root.
 static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                                     const SteadyStateOptions &opts, const ResidualSubspace &sub,
@@ -5576,6 +5632,8 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                 const auto ui = static_cast<size_t>(i);
                 const double share = 2.0 * std::fmod((i + 1) * 0.6180339887498949, 1.0) - 1.0;
                 double v = kick_size * size_of(i) * share * share_of[ui];
+                if (y[ui] == 0.0)
+                    v = 0.0;
                 if (y[ui] >= 0.0 && y[ui] + v < 0.0)
                     v = -v;
                 kick[ui] = v;
@@ -5714,8 +5772,8 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
 // Above kNewtonDistanceMost unknowns it is not: there the run at a tenth
 // took multisite_phos (1026 species) 34 s, to main's whole solve's 0.8. The
 // kicked run, asked only that the kick not grow tenfold, is integrated at the
-// criterion's own tolerances. At a hundredth of the
-// criterion's, BIOMD0000000038 moved by 1.41 tolerances and by 0.46 at a thousandth;
+// criterion's own tolerances. At a hundredth of the criterion's,
+// BIOMD0000000038 moved by 1.41 tolerances and by 0.46 at a thousandth;
 // BIOMD0000000211 by 194 at the criterion's own, and by 0.68 at a hundredth.
 static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
                                const SteadyStateOptions &opts, const ResidualSubspace &sub,
@@ -5964,7 +6022,7 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 if (!effective->criterion_by_distance)
                     polish.tol = effective->tol * 1e-3;
                 SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, result.concentrations,
-                                                     nullptr, kPolishIters);
+                                                     nullptr, kPolishIters, true);
                 if (p.converged && static_cast<int>(p.concentrations.size()) == ns) {
                     result.concentrations = p.concentrations;
                     result.n_steps += p.n_steps;

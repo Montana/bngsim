@@ -110,20 +110,27 @@ a hundredth. The kicked run is integrated at the criterion's own. Its kick
 keeps the conserved totals: a law's dependent that the kick would take below
 0 turns its law's kicks the other way, and one kicked by more than ten
 millionths of itself has them cut, so that one species does not stand in for
-the whole kick.
+the whole kick. A species at 0 is not kicked: at a state that rests nothing
+makes it, and no integrator error makes it from nothing. SIR with `I = 0` is
+converged, as on main, though an infection would grow; so is a counter whose
+pulse is at 0, which a kicked pulse would move by more than the kick may grow
+to.
 
 **Where the solve stops.** The Newton step from the state to the root,
 `δ = −J⁻¹f` on the system with the conserved totals taken out, measured in the
 same tolerances, steers it: the march, the bursts and the KINSOL polish stop at
 a state under `tol` whose step is within tolerance (up to 512 unknowns). That
 is what takes the issue's cubic on from 0.894 to 1. The state the solve stops
-at is then polished by KINSOL where its step is within a thousand tolerances
-(above 512 unknowns, to a thousandth of `tol`), and the polish kept if it
-passes the parity test: that takes a march that stalled short of its root the
-rest of the way, and makes dY_ss/dp that of the root. The step decides nothing
-about `converged`: where it cannot be passed (a continuum of steady states,
-where it is singular but for rounding, or a species reaching 0 as 1/t) the
-march goes on to `max_time` and the two tests decide there.
+at is then polished by KINSOL, with a Jacobian at every iterate, where its
+step is within a thousand tolerances (above 512 unknowns, always, to a
+thousandth of `tol`), and the polish kept if it passes the parity test: that
+takes a march that stalled short of its root the rest of the way, and makes
+dY_ss/dp that of the root. The step decides nothing about `converged`: where it
+cannot be passed (a continuum of steady states, where it is singular but for
+rounding, or a species reaching 0 as 1/t) the march goes on to `max_time`, and
+where it stops at a state the parity test refuses it returns the last one the
+test passed; the two tests decide there. On a species at 2e12, f is rounding:
+Monro2008 passed at one step and was 1.3e-6 at the next.
 
 ```python
 ss = sim.steady_state()
@@ -144,10 +151,10 @@ What it does not do:
   state with Calcium at 188, not 958.
 - **A kicked run that cannot be taken to its time** refuses, as on a neutral
   cycle, where the kick goes round for good.
-- **An absent species that would invade** is kicked like any other, and the
-  state refused where it grows: SIR with `I = 0` and `beta·S/gamma > 1`, a
-  disease-free state the epidemic leaves, is not converged. A state where
-  every species is 0 has no size to kick at, and is not kicked.
+- **An absent species that would invade** is not kicked, and the state is
+  converged: SIR with `I = 0` and `beta·S/gamma > 1`, a disease-free state an
+  infection would leave, is converged, as on main. The multistart's
+  eigenvalues say whether such a state is stable.
 - **A species that starts at 0 and settles below `rtol` times the largest**
   counts as nothing: it is resolved to that, not to its own size.
 - **Where every species starts at 0** the start has no size, and the march

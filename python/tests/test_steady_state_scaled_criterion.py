@@ -1059,6 +1059,37 @@ def test_above_512_unknowns_the_runs_decide(tmp_path):
     assert out["scaled"].continued_run_distance > 1.0
 
 
+def test_above_512_unknowns_a_march_stopped_short_is_polished_to_its_root(tmp_path):
+    # X' = 1e-6·(1 - X²) among 520 unknowns: the march stops by the residual
+    # test at X = 0.698, which the residual criterion returns. With no step to
+    # tell how far off it is, the state is polished, to a thousandth of tol and
+    # on a Jacobian taken at every iterate: on the one it started with, the
+    # polish's ten iterations ended 3.7e-5 short of 1.
+    n = 2 * 260 + 1
+    text = (
+        _wide_net(260)
+        .replace("end parameters", "    3 kx 1e-6\nend parameters")
+        .replace("end species", f"    {n} X() 0\nend species")
+        .replace(
+            "end reactions",
+            f"    {4 * 260 + 1} 0 {n} kx\n    {4 * 260 + 2} {n},{n} {n} kx\nend reactions",
+        )
+    )
+    path = tmp_path / "wide_slow.net"
+    path.write_text(text)
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method="integration")
+    assert out["residual"].converged
+    assert abs(out["residual"].concentrations[n - 1] - 1.0) > 0.1
+    scaled = out["scaled"]
+    assert scaled.converged
+    assert math.isnan(scaled.newton_distance)
+    assert abs(scaled.concentrations[n - 1] - 1.0) < 1e-10
+
+
 def test_an_unstable_root_beside_a_larger_species_is_not_converged(tmp_path):
     # The cubic at 1e-9, at its root 0.3 exactly, beside Y at 1, where Y
     # stays. Each species is measured in its own tolerance: a kick measured in
@@ -1418,7 +1449,7 @@ UNSTABLE_BESIDE_A_LOPSIDED_LAW_ANT = """model ui
   J2: B -> A; kr*B
   J3: -> X; k2*X^2
   J4: X -> ; k3*X^3 + k1*X
-  kf = 1e-12; kr = 1.0; k1 = 0.3; k2 = 1.3; k3 = 1.0
+  kf = 0; kr = 0; k1 = 0.3; k2 = 1.3; k3 = 1.0
 end"""
 
 
@@ -1426,8 +1457,9 @@ end"""
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_an_unstable_root_in_or_beside_a_law_is_not_converged(text, method):
     # The cubic's root at 0.3 in a law whose dependent sits at 0: its kick was
-    # dropped. Beside a law of A at 1e6 and B at 1e-6: B, the dependent, was
-    # kicked by 1 by A's millionth, and every species let move 5e14
+    # dropped. Beside a law of A at 1e6 and B at 1e-6 (which do not exchange,
+    # so that the state rests and the kicked run decides): B, the dependent,
+    # was kicked by 1 by A's millionth, and every species let move 5e14
     # tolerances. A law's kicks are turned, or cut to its dependent's own.
     model = bngsim.Model.from_antimony_string(text)
     ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
@@ -1475,3 +1507,79 @@ def test_a_burst_free_solve_says_it_was_decided_by_the_residual_test(tmp_path):
     [ss] = sim.steady_state_batch(states=[[0.5]], method="newton", newton_burst=False)
     assert ss.converged
     assert ss.criterion == "residual"
+
+
+def test_a_march_that_stops_where_f_is_rounding_returns_the_state_it_passed(data_dir):
+    # Control: main stops at the step that passes. Monro2008's R rests at 2e12,
+    # where f is rounding: 0 at step 517, which falls between the steps the
+    # step test is asked at, and 2.6e-6 at step 518, the march's max_time. The
+    # march returns the last state that passed.
+    path = str(data_dir / "BIOMD0000000776.xml")
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
+    assert ss.converged
+    assert ss.residual < 1e-9
+
+
+SIR_AT_NO_INFECTION_ANT = """model sir0
+  S = 0.99; I = 0; R = 0.01
+  J1: S + I -> 2 I; kb*S*I
+  J2: I -> R; kg*I
+  kb = 0.5; kg = 0.2
+end"""
+
+COUNTER_AT_NO_PULSE_ANT = """model counter
+  S0 = 100; S1 = 0; S2 = 0; S3 = 0; P = 0
+  J1: S0 -> S1; k*S0*P
+  J2: S1 -> S2; k*S1*P
+  J3: S2 -> S3; k*S2*P
+  J4: P -> ; kd*P
+  k = 10; kd = 1
+end"""
+
+
+@pytest.mark.parametrize("text", [SIR_AT_NO_INFECTION_ANT, COUNTER_AT_NO_PULSE_ANT])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_an_absent_species_is_not_kicked(text, method):
+    # Control: main converges. A species at 0 at a state that rests stays at 0:
+    # nothing makes it, and no integrator error makes it from nothing. Kicked,
+    # the infection grew (by 4e6 of the kick), and the counter's pulse moved
+    # the counter by 50 times what the kick may grow to.
+    model = bngsim.Model.from_antimony_string(text)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
+    assert ss.converged
+    np.testing.assert_array_equal(ss.concentrations, model.get_state())
+
+
+SQUARE_DECAY_NET = """begin parameters
+    1 k 1.0
+end parameters
+begin species
+    1 X() 1.0
+end species
+begin reactions
+    1 1,1 1 k
+end reactions
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_species_reaching_zero_as_one_over_t_is_polished_there(tmp_path, method):
+    # X' = -X² reaches its root, 0, as 1/t. The residual test returns X at
+    # 3e-5, which a run of max_time halves; the march ends at max_time with X
+    # near 1e-6, 50 tolerances short. The polish halves X at each of its ten
+    # iterations, its steps never small enough to stop it, and so ends at its
+    # iteration limit, where the iterate it ends at passes the parity test and
+    # is kept.
+    path = tmp_path / "square_decay.net"
+    path.write_text(SQUARE_DECAY_NET)
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method=method)
+    assert out["residual"].converged
+    assert out["residual"].concentrations[0] > 1e-5
+    scaled = out["scaled"]
+    assert scaled.converged
+    assert 0.0 < scaled.concentrations[0] < 1e-8
+    assert scaled.continued_run_distance <= 1.0
