@@ -1011,10 +1011,10 @@ def test_an_epidemic_that_burns_out_is_converged(tmp_path, method):
     assert abs(i) < 1e-9
 
 
-def _wide_square_decay(kx):
-    # X' = kx·(1 - X²) beside 520 unknowns.
+def _wide_square_decay(kx, accumulator=False):
+    # X' = kx·(1 - X²) beside 520 unknowns; with `accumulator`, C' = 1 too.
     n = 2 * 260 + 1
-    return n, (
+    text = (
         _wide_net(260)
         .replace("end parameters", f"    3 kx {kx!r}\nend parameters")
         .replace("end species", f"    {n} X() 0\nend species")
@@ -1023,17 +1023,26 @@ def _wide_square_decay(kx):
             f"    {4 * 260 + 1} 0 {n} kx\n    {4 * 260 + 2} {n},{n} {n} kx\nend reactions",
         )
     )
+    if accumulator:
+        text = (
+            text.replace("end parameters", "    4 kc 1.0\nend parameters")
+            .replace("end species", f"    {n + 1} C() 0\nend species")
+            .replace("end reactions", f"    {4 * 260 + 3} 0 {n + 1} kc\nend reactions")
+        )
+    return n, text
 
 
 @pytest.mark.parametrize("kx", [0.03, 1e-6])
 def test_above_512_unknowns_a_march_stopped_short_is_polished_within_reach(tmp_path, kx):
     # Among 520 unknowns the march stops by the residual test, at kx = 0.03
     # 7.3e-6 short of 1 (360 tolerances) and at 1e-6 at X = 0.698, which the
-    # residual criterion returns. With no step to tell how far off it is, the
-    # state is polished, to a thousandth of tol and on a Jacobian at every
-    # iterate, and the polish is kept within a thousand tolerances of where it
-    # started: at 0.03 it reaches the root; at 1e-6 it may not go that far, and
-    # the run refuses the state the march stopped at.
+    # residual criterion returns. With no step to tell how far off it is, and
+    # a polish that would move it more than a tolerance, a run of 1e6 is taken
+    # on from the state first, and the state polished from where it ends, to a
+    # thousandth of tol, on a Jacobian at every iterate, and no further than a
+    # thousand tolerances: at 0.03 the run ends at the root; at 1e-6 it ends at
+    # tanh(1 + artanh(0.698)) = 0.953, still moving, beyond the polish's reach,
+    # and the run test refuses that state.
     n, text = _wide_square_decay(kx)
     path = tmp_path / "wide_square_decay.net"
     path.write_text(text)
@@ -1052,6 +1061,31 @@ def test_above_512_unknowns_a_march_stopped_short_is_polished_within_reach(tmp_p
     else:
         assert not scaled.converged
         assert scaled.continued_run_distance > 1.0
+        reached = math.tanh(kx * 1e6 + math.atanh(out["residual"].concentrations[n - 1]))
+        assert scaled.concentrations[n - 1] == pytest.approx(reached, rel=1e-5)
+
+
+def test_above_512_unknowns_a_masked_accumulator_keeps_where_the_march_left_it(tmp_path):
+    # A species the mask leaves out and no rate reads, C' = 1, came back 1e6
+    # on from where the march left it (1,000,213 for 213): the run taken on
+    # from the state before the polish carried it too. It keeps the march's
+    # value, which the residual criterion returns.
+    n, text = _wide_square_decay(0.03, accumulator=True)
+    path = tmp_path / "wide_square_decay_accumulator.net"
+    path.write_text(text)
+    mask = [True] * n + [False]
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method="integration", mask=mask)
+    scaled = out["scaled"]
+    assert math.isnan(scaled.newton_distance)
+    assert scaled.converged
+    assert abs(scaled.concentrations[n - 1] - 1.0) < 1e-10
+    march = out["residual"].concentrations[n]
+    assert 10.0 < march < 1e4
+    assert scaled.concentrations[n] == pytest.approx(march, rel=1e-9)
 
 
 def _wide_cubic_net(x0, s=1e-9, z0=1e-20):

@@ -5958,10 +5958,11 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         // that dY_ss/dp is that of the root and not of a state a tolerance
         // off it (a species settling at 1e-11 from 1, at atol 1e-8, came back
         // 0.4% off with its column). The polish is kept where it passes the
-        // parity test and is nearer the root; the runs then decide. Where
-        // there is no step (above kNewtonDistanceMost unknowns, or a Jacobian
-        // singular at the state), always, the dynamics taken on first where
-        // the polish would move a species more than its tolerance.
+        // parity test and is nearer the root; the runs then decide. Above
+        // kNewtonDistanceMost unknowns, where no step is taken, always, the
+        // dynamics taken on first where the polish would move a species more
+        // than its tolerance. A Jacobian singular at the state reads an
+        // infinite step and is not polished.
         if (std::isnan(result.newton_distance) || result.newton_distance <= kPolishFurthest) {
             std::vector<double> held(static_cast<size_t>(ns));
             model.get_state_into(held.data());
@@ -6016,20 +6017,16 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     compute_residual(rhs, result.concentrations.data(), ns, sub);
                 SteadyStateResult p = polished(result.concentrations);
                 if (!std::isnan(before)) {
-                    // Kept where it is nearer the root, by the step where there
-                    // is one after too, else by the residual: KINSOL solves for
-                    // a law's unknowns and makes its dependent from the total,
-                    // which loses the digits of a dependent at 1e-6 beside a
-                    // partner at 1e6. An exact state was polished to one 381
-                    // tolerances off, which the runs then refused.
+                    // Kept where it is nearer the root by the step: KINSOL
+                    // solves for a law's unknowns and makes its dependent from
+                    // the total, which loses the digits of a dependent at 1e-6
+                    // beside a partner at 1e6. An exact state was polished to
+                    // one 381 tolerances off, which the runs then refused. The
+                    // step is had after where it was before: whether it is
+                    // taken depends on the count of unknowns, not the state.
                     if (p.converged) {
                         const double after = step_at(p);
-                        const bool nearer = std::isnan(after)
-                                                ? p.residual < before_residual &&
-                                                      went(result.concentrations,
-                                                           p.concentrations) <= kPolishFurthest
-                                                : after < before;
-                        if (nearer)
+                        if (after < before)
                             adopt(p, after);
                     }
                 } else if (p.converged && p.residual < before_residual &&
@@ -6037,20 +6034,32 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     adopt(p, step_at(p));
                 } else {
                     // No step says how far the root is, and the polish would
-                    // move a species more than its tolerance: which root it
-                    // goes to is KINSOL's, not the dynamics'. Above 512
-                    // unknowns, the cubic at 1e-9, stopped at its first step
-                    // at 0.136 on its way to 0, was polished to its other root
-                    // at 1, and at 0.3 + 1e-6 to beside its unstable root.
-                    // The dynamics are taken on first, as far as a run goes,
-                    // and polished from there, no further than kPolishFurthest
-                    // tolerances: where the march stopped further off than
-                    // that, fceri_fyn's run, from 3e4 tolerances, reaches its
-                    // root, and a bound on the polish alone refused it.
+                    // move a species more than its tolerance, or failed, or
+                    // did not lower the residual: which root it goes to is
+                    // KINSOL's, not the dynamics'. Above 512 unknowns, the
+                    // cubic at 1e-9, stopped at its first step at 0.15 on its
+                    // way to 0, was polished to its other root at 1, and at
+                    // 0.3 + 1e-6 to beside its unstable root. The dynamics are
+                    // taken on first, as far as a run goes, and polished from
+                    // there, no further than kPolishFurthest tolerances: where
+                    // the march stopped further off than that, fceri_fyn's
+                    // run, from 3e4 tolerances, reaches its root, and a bound
+                    // on the polish alone refused it. A species the mask
+                    // leaves out and no rate reads keeps the value the march
+                    // left it: an accumulator fed by a flux of 1 came back
+                    // 1e6 on from where the march stopped.
                     std::vector<double> end;
                     const double moved = ss_continued_run_once(model, rhs, *effective, sub,
                                                                result.concentrations, 1.0, &end);
                     if (std::isfinite(moved) && static_cast<int>(end.size()) == ns) {
+                        const auto &sp = model.jacobian_sparsity();
+                        if (sp.n == ns && sp.col_ptrs.size() == static_cast<size_t>(ns) + 1) {
+                            for (const int e : sub.excluded) {
+                                const auto ue = static_cast<size_t>(e);
+                                if (sp.col_ptrs[ue + 1] == sp.col_ptrs[ue])
+                                    end[ue] = result.concentrations[ue];
+                            }
+                        }
                         result.concentrations = end;
                         result.newton_distance = std::numeric_limits<double>::quiet_NaN();
                         const double end_residual =
