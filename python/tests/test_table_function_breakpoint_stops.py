@@ -217,6 +217,7 @@ class _Options:
     """What `_apply_crossing_stops` writes to, kept where it can be read."""
 
     max_step_size = 0.0
+    rtol = 1e-6
 
     def __init__(self):
         self.stops = None

@@ -2324,6 +2324,18 @@ struct ExecutedEventFire {
 // treat them as one instant (issue #737). The Python detector groups crossings
 // by the same reach (`_switch_sensitivity._same_instant`).
 constexpr double kSwitchInstantUlps = 64.0;
+// Issue #891: CVODE takes a stop as reached once a step ends within
+// 100*uround*(|t| + |h|) of it, and does not integrate the rest. A stop where a
+// rate jumps by so much that that time's worth of the jump is more than this
+// share of the error test's tolerance is taken from the double before it
+// (t_crossing_cvode in CvodeSimulator::run): stopped on the stop itself, the
+// step cut to end there rounds onto it, reads the new branch, fails, until a
+// step ends within that distance, and the rest was lost (2e-8 a switch at
+// t = 1e6). Not every stop: one taken from the double before reads the branch
+// that ends, and a step reaching it no longer fails on the jump, so CVODE no
+// longer walks the stretch; a pulse inside a stretch of a law that jumps on
+// every stop was then stepped over where main kept it.
+constexpr double kStopLossShare = 0.1;
 // What `Impl::changes_inside` and `Impl::measured_nothing` work in: CVODE's
 // history at tn, its error weights and error estimates, and the predicted
 // state, the predicted rate and the rate at a place.
@@ -2806,6 +2818,14 @@ struct CvodeSimulator::Impl {
                                CvodeUserData &user_data);
     // f(t, y) from the interpreted evaluator, with the species synced first.
     void comoving_rhs(double t, const double *y, int ns, std::vector<double> &out);
+    // Issue #891: whether a stop at *t* would lose more of its jump than
+    // kStopLossShare of the tolerance, read on *y* with the right-hand side
+    // CVODE steps with (run_rhs_fn).
+    bool stop_would_lose(void *cvode_mem, double t, N_Vector y, int ns, double rtol, double atol,
+                         const std::vector<double> &atol_v);
+    // The right-hand side CVODE was given, compiled or interpreted
+    // (create_cvode_core), for what reads it outside CVODE (stop_would_lose).
+    CVRhsFn run_rhs_fn = nullptr;
     // Issue #998: whether the step just taken measured nothing: its own error
     // estimate, in CVODE's weighted norm, is small enough that CVODE grows the
     // next step by as much as it lets a step grow (kStepGrowth).
@@ -4000,6 +4020,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     // rhs). codegen_param_buf must outlive the integration loop in run() — the
     // user_data points into it.
     CVRhsFn rhs_fn = setup_codegen_rhs(opts, user_data, codegen_param_buf);
+    run_rhs_fn = rhs_fn;
 
     int flag = CVodeInit(cvode_mem, rhs_fn, times.t_start, y);
     if (flag != CV_SUCCESS) {
@@ -5711,6 +5732,38 @@ void CvodeSimulator::Impl::comoving_rhs(double t, const double *y, int ns,
     }
     out.resize(static_cast<size_t>(ns));
     model.compute_derivs(t, y, out.data());
+}
+
+bool CvodeSimulator::Impl::stop_would_lose(void *cvode_mem, double t, N_Vector y, int ns,
+                                           double rtol, double atol,
+                                           const std::vector<double> &atol_v) {
+    const double reach = 100.0 * std::numeric_limits<double>::epsilon() * std::fabs(t);
+    void *user_data = nullptr;
+    if (run_rhs_fn == nullptr || CVodeGetUserData(cvode_mem, &user_data) != CV_SUCCESS) {
+        return false;
+    }
+    // Read with the right-hand side CVODE steps with: interpreted, the three
+    // reads a stop this took cost a model of 3,000 reactions 46% of its run.
+    NVectorGuard before(N_VClone(y));
+    NVectorGuard after(N_VClone(y));
+    if (!before || !after ||
+        run_rhs_fn(
+            static_cast<sunrealtype>(std::nextafter(t, -std::numeric_limits<double>::infinity())),
+            y, static_cast<N_Vector>(before), user_data) != 0 ||
+        run_rhs_fn(static_cast<sunrealtype>(t), y, static_cast<N_Vector>(after), user_data) != 0) {
+        return false;
+    }
+    const double *y_data = N_VGetArrayPointer(y);
+    const double *f_before = N_VGetArrayPointer(static_cast<N_Vector>(before));
+    const double *f_after = N_VGetArrayPointer(static_cast<N_Vector>(after));
+    for (int j = 0; j < ns; ++j) {
+        const size_t k = static_cast<size_t>(j);
+        const double tol = rtol * std::fabs(y_data[j]) + (atol_v.empty() ? atol : atol_v[k]);
+        if (std::fabs(f_after[j] - f_before[j]) * reach > kStopLossShare * tol) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool CvodeSimulator::Impl::measured_nothing(void *cvode_mem, N_Vector y, LookScratch &scratch) {
@@ -13723,6 +13776,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     bool look_open = false;
     double look_from = -std::numeric_limits<double>::infinity();
     bool look_h_stale = false;
+    // Issue #891: which stop the run last asked about (kStopLossShare), and
+    // whether it is taken from the double before it.
+    size_t shift_asked_for = std::numeric_limits<size_t>::max();
+    bool shift_this_stop = false;
     long look_watched = 0;
     LookScratch look_scratch;
     // The stops among them the run added for its comoving columns (issue #760):
@@ -14480,6 +14537,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             bool stop_at_crossing = false;
             double t_switch = 0.0;
             double t_crossing = 0.0;
+            double t_crossing_cvode = 0.0;
             // Issue #760: the stops the run takes for its comoving columns on the
             // stretch from the restart that asked to the next crossing. In its
             // frame a column carries c·∂f/∂t for everything f does, and another
@@ -14606,6 +14664,19 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // and walk the stretch, as on main. Where it would pass, it is read
             // inside, and a place where a step would fail becomes a stop that
             // restarts the run, so the step ends there and fails.
+            // Issue #891: whether the next stop is taken from the double
+            // before it (kStopLossShare), asked once a stop.
+            auto shifts_before_stop = [&]() {
+                if (sens.n_total != 0 || next_crossing >= crossing_stops.size()) {
+                    return false;
+                }
+                if (shift_asked_for != next_crossing) {
+                    shift_asked_for = next_crossing;
+                    shift_this_stop = impl_->stop_would_lose(
+                        cvode_mem, crossing_stops[next_crossing].t_star, y, ns, rtol, atol, atol_v);
+                }
+                return shift_this_stop;
+            };
             long look_steps = 0;
             sunrealtype look_tn = 0.0;
             sunrealtype look_h = 0.0;
@@ -14645,15 +14716,19 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                  impl_->measured_nothing(cvode_mem, y, look_scratch);
                 }
                 if (unmeasured) {
-                    // The step's own end. One that reaches the stop ahead is cut
-                    // to end a few doubles short of it, and whether its last
-                    // double is the stop's (where a law that switches there reads
-                    // its new value) or the one before is the step size's last
-                    // bit (issue #891): it is read on the stop, the side where
-                    // the step would pass. Where CVODE in fact ends it short, the
-                    // step fails without the look.
+                    // The step's own end. One that reaches the stop ahead is
+                    // read where CVODE ends it: on the stop, the side where it
+                    // would pass, or, where CVODE is stopped on the double
+                    // before the stop (issue #891, kStopLossShare), there: read
+                    // on the stop, the look left a step to CVODE that CVODE,
+                    // reading the branch that ends, then passed.
                     const double step_end = tn + static_cast<double>(look_h);
-                    const double end = step_end >= to - 1e-9 * left ? to : step_end;
+                    const bool reaches_stop = step_end >= to - 1e-9 * left;
+                    const double end =
+                        !reaches_stop ? step_end
+                        : shifts_before_stop()
+                            ? std::nextafter(to, -std::numeric_limits<double>::infinity())
+                            : to;
                     bool end_fails = false;
                     const double at =
                         impl_->changes_inside(cvode_mem, y, ns, tn, end, look_scratch, end_fails);
@@ -14667,7 +14742,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         // run's end, the rest of the stretch is CVODE's.
                         const bool restarts_there = next_crossing >= crossing_stops.size() ||
                                                     crossing_stops[next_crossing].restart;
-                        if (end >= to && restarts_there) {
+                        if (reaches_stop && restarts_there) {
                             look_open = false;
                         } else {
                             look_from = end;
@@ -14686,7 +14761,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             crossing_stops.insert(crossing_stops.begin(), look);
                         }
                         look_from = at;
-                    } else if (end >= to) {
+                    } else if (reaches_stop) {
                         // Seen to the stop and unchanged: CVODE's own stepping,
                         // past a stop that restarts nothing too (issue #1192).
                         look_open = false;
@@ -14709,7 +14784,26 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 stop_at_switch = true;
             } else if (have_crossing) {
                 t_crossing = crossing_stops[next_crossing].t_star;
-                int sf = CVodeSetStopTime(cvode_mem, static_cast<sunrealtype>(t_crossing));
+                // Issue #891: where a stop would lose more of its jump than
+                // CVODE's stop tolerance allows (kStopLossShare), CVODE is
+                // stopped on the double before it, the last of the branch that
+                // ends there, and the stop is taken from that (below). Not in a
+                // run with sensitivity columns, which steps as it did.
+                t_crossing_cvode = t_crossing;
+                if (shifts_before_stop()) {
+                    sunrealtype tn_here = 0.0;
+                    CVodeGetCurrentTime(cvode_mem, &tn_here);
+                    const double before_stop =
+                        std::nextafter(t_crossing, -std::numeric_limits<double>::infinity());
+                    // Not for a stop within an instant of where CVODE stands,
+                    // which CVODE could not start a step towards.
+                    if (before_stop - static_cast<double>(tn_here) >
+                        kSwitchInstantUlps * std::numeric_limits<double>::epsilon() *
+                            std::max(std::fabs(t_crossing), 1.0)) {
+                        t_crossing_cvode = before_stop;
+                    }
+                }
+                int sf = CVodeSetStopTime(cvode_mem, static_cast<sunrealtype>(t_crossing_cvode));
                 if (sf != CV_SUCCESS) {
                     throw std::runtime_error("CVodeSetStopTime for discontinuity crossing t=" +
                                              std::to_string(t_crossing) +
@@ -14833,6 +14927,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             } else {
                 flag = CVode(cvode_mem, look_tout, y, &t_ret,
                              (one_step || first_alone) ? CV_ONE_STEP : CV_NORMAL);
+                // The double before the stop reached: the stop is taken from
+                // there, with that one double integrated on the branch that
+                // ends (t_crossing_cvode above). Left out, it was half a double
+                // of a dose's time lost at each stop: 1.7e-8 at t = 1e7 over 200
+                // stops, 1,700 times rtol at 1e-11.
+                if (flag == CV_TSTOP_RETURN && stop_at_crossing && t_crossing_cvode != t_crossing &&
+                    static_cast<double>(t_ret) == t_crossing_cvode) {
+                    double *y_last = N_VGetArrayPointer(y);
+                    std::vector<double> f_last;
+                    impl_->comoving_rhs(t_crossing_cvode, y_last, ns, f_last);
+                    const double dt_last = t_crossing - t_crossing_cvode;
+                    for (int j = 0; j < ns; ++j) {
+                        y_last[j] += dt_last * f_last[static_cast<size_t>(j)];
+                    }
+                    t_ret = static_cast<sunrealtype>(t_crossing);
+                }
             }
 
             // Issue #928: a whole batch of steps spent pinned on a state-switch
