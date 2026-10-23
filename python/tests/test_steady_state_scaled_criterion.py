@@ -1814,3 +1814,43 @@ def test_a_fixed_species_does_not_couple_what_it_touches(tmp_path, method):
         method=method
     )
     assert not ss.converged
+
+
+GLUED_TO_A_LARGER_KICK_ANT = """model g
+  W = 1
+  V = 1
+  U = 1
+  X = 0.99999
+  E = 1
+  JU1: $E -> U + $E; ku*E
+  JU2: U -> ; kd*U
+  JW1: -> W; kd
+  JW2: W -> ; kd*W
+  JV1: -> V; kd
+  JV2: V -> ; kd*V
+  JX: $E -> X + $E; -kx*E*(X - b)*(X - a)*(X - 1)
+  ku = 1; kd = 1; kx = 1e10; b = 0.99998; a = 0.99999
+end"""
+
+
+def test_a_fixed_species_does_not_lend_its_neighbours_kicks():
+    # X at its unstable root, 1e-5 above its stable root b, kicked by -0.056
+    # of a millionth (the golden ratio's sign for its place); U, kicked by 0.71,
+    # shares only the $-fixed E with it. Coupled through E, X was measured by
+    # U's kick and went its 500 tolerances to b unrefused.
+    model = bngsim.Model.from_antimony_string(GLUED_TO_A_LARGER_KICK_ANT)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method="integration")
+    assert not ss.converged
+    assert ss.continued_run_distance > 1.0
+
+
+def test_an_unrelated_absent_species_leaves_the_eigenvalues_asked():
+    # The root the kicked run misses (a = 0.99999), beside a Z at 0 that
+    # nothing touches (declared after X, so that X's kick is as it was): with
+    # a species at 0 the eigenvalues were not asked.
+    text = _near_unstable_ant(0.99999).replace("  J1: ", "  Z = 0\n  JZ: Z -> ; Z\n  J1: ")
+    model = bngsim.Model.from_antimony_string(text)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method="newton")
+    assert ss.root_stability == "unstable"
+    assert ss.continued_run_distance <= 1.0
+    assert not ss.converged
