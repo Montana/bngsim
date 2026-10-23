@@ -80,6 +80,11 @@ STATUS_TO_OUTCOME: dict[str, Outcome] = {
     # adjudication that runs RoadRunner live. Never compared; the refusal names it.
     "archive_stale": Outcome.REFERENCE_FAILED,
     "archive_unreplayable": Outcome.REFERENCE_FAILED,
+    # bngsim refused a NaN or infinite propensity (issue #809), and RoadRunner's
+    # gillespie, on the same seeds, reaches a non-finite rate too, or cannot run the
+    # model at all (issue #1211). The rate law is undefined at a state the SSA
+    # reaches, so neither engine has a trajectory: the model is the problem.
+    "nonfinite_rate": Outcome.BAD_TEST,
     "error": Outcome.EXCEPTION,
     "skip": Outcome.SKIP,
 }
@@ -237,6 +242,43 @@ def _comment(case: dict, status: str) -> str:
     elif status in ("archive_stale", "archive_unreplayable"):
         why = str(case.get("error") or "").split(f"{status}: ", 1)[-1]
         parts.append(f"not compared: the reference archive cannot stand in for RoadRunner ({why})")
+    elif status == "nonfinite_rate":
+        found = case.get("nonfinite_rate") or {}
+        if found.get("roadrunner_error"):
+            parts.append(
+                "bngsim refuses a NaN or infinite rate law at a state its SSA reaches, and "
+                f"RoadRunner's gillespie cannot run the model ({found['roadrunner_error']}) — "
+                "neither engine has a trajectory"
+            )
+        else:
+            hit = found.get("match") or {}
+            parts.append(
+                "a rate law is NaN or infinite at a state the SSA reaches: bngsim refuses it, "
+                f"and RoadRunner's gillespie reaches a {hit.get('rate')} rate of the same "
+                f"reaction, {hit.get('reaction')} (seed {found.get('seed')}), where it fires "
+                "nothing more and raises nothing — neither engine has a trajectory, so the "
+                "model is the problem"
+            )
+    elif status == "error" and case.get("nonfinite_rate"):
+        found = case["nonfinite_rate"]
+        if found.get("roadrunner_error"):
+            parts.append(
+                f"RoadRunner's gillespie raised ({found['roadrunner_error']}), which does not "
+                "show the rate law bngsim refused is undefined in the model"
+            )
+        elif found.get("nonfinite"):
+            others = ", ".join(hit["reaction"] for hit in found["nonfinite"])
+            parts.append(
+                f"RoadRunner's gillespie reaches a non-finite rate of {others} (seed "
+                f"{found.get('seed')}), not of the reaction bngsim refused, so nothing shows "
+                "that rate law is undefined in the model"
+            )
+        else:
+            parts.append(
+                f"RoadRunner's gillespie kept every rate finite on the same "
+                f"{found.get('replicates')} seeds, so nothing shows the rate law bngsim "
+                "refused is undefined in the model"
+            )
     elif status == "attribution_incomplete":
         parts.append(
             "SSA ensembles diverged, but the deterministic-ODE oracle that assigns fault "

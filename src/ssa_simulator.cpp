@@ -362,12 +362,64 @@ static std::string reaction_label(const NetworkModel &model, const Reaction &rxn
            join(rxn.product_indices) + ")";
 }
 
+static double storage_to_count(double storage_value, double volume_factor);
+
+// Issue #1211 — the species the reaction's rate law reads, with their values at
+// the refusal, so the message shows the state the law was undefined at (a count
+// of 0 under a division or a log) without a rerun. Zero and non-finite values
+// come first, then the rest, at most eight in all and a count of the remainder:
+// a functional law over an observable reads every species in it, and on a large
+// network the one zero would be buried. Counts are derived from the storage
+// value as the trajectory derives them; a slot that is not a count (a rule
+// target, a volume) is printed as stored. Empty for the total (r < 0) and when
+// the law's reads cannot be decided (a rateOf read, or a table function indexed
+// by something that is neither the time, a parameter nor an observable).
+BNGSIM_SSA_COLD static std::string law_state_at_refusal(const NetworkModel &model, int r,
+                                                        const std::vector<double> &conc,
+                                                        const std::vector<char> &is_count) {
+    std::vector<int> sup;
+    if (r < 0 || r >= static_cast<int>(model.reactions().size()))
+        return "";
+    // False means the set cannot be decided: what `sup` then holds is partial,
+    // and a partial list would read as the whole one, so nothing is named.
+    if (!model.reaction_rate_species_support(r, sup))
+        return "";
+    const auto &names = model.species_names();
+    const auto &species_list = model.species();
+    std::vector<std::pair<int, double>> values;
+    for (int si : sup) {
+        if (si < 0 || si >= static_cast<int>(names.size()) || si >= static_cast<int>(conc.size()))
+            continue;
+        const double v = (si < static_cast<int>(is_count.size()) && is_count[si])
+                             ? storage_to_count(conc[si], species_list[si].volume_factor)
+                             : conc[si];
+        values.emplace_back(si, v);
+    }
+    // The telling values first, in a stable order: the rest keep the read set's order.
+    std::stable_partition(values.begin(), values.end(), [](const std::pair<int, double> &p) {
+        return p.second == 0.0 || !std::isfinite(p.second);
+    });
+    constexpr size_t kShown = 8;
+    std::string s;
+    for (size_t i = 0; i < values.size() && i < kShown; ++i) {
+        char buf[48];
+        std::snprintf(buf, sizeof buf, "%.15g", values[i].second);
+        if (!s.empty())
+            s += ", ";
+        s += names[static_cast<size_t>(values[i].first)] + " = " + buf;
+    }
+    if (values.size() > kShown)
+        s += ", and " + std::to_string(values.size() - kShown) + " more";
+    return s.empty() ? std::string() : ", with " + s;
+}
+
 // Issue #809 — refuse a NaN or infinite propensity, naming the reaction (or,
 // with r < 0, the total) and the time. Out of line and cold: it is reached at
 // most once per run, and building the message inside the SSA loop's lambdas
 // made them too large to inline, which cost 8-22% on small networks.
 [[noreturn]] BNGSIM_SSA_COLD static void
-throw_nonfinite_propensity(const NetworkModel &model, int r, double value, double t_at, bool psa) {
+throw_nonfinite_propensity(const NetworkModel &model, int r, double value, double t_at, bool psa,
+                           const std::string &state = std::string()) {
     // Spelled out for NaN and infinity: glibc prints a NaN whose sign bit is
     // set as "-nan" and macOS prints "nan", and the message should not depend
     // on the platform (or on the sign bit, which carries no meaning).
@@ -386,7 +438,7 @@ throw_nonfinite_propensity(const NetworkModel &model, int r, double value, doubl
                                     : "the total propensity is " + num(value) +
                                           " (every reaction's is finite; their sum overflowed)";
     throw std::runtime_error(
-        std::string(psa ? "PSA: " : "SSA: ") + what + " at t = " + num(t_at) +
+        std::string(psa ? "PSA: " : "SSA: ") + what + " at t = " + num(t_at) + state +
         ". A rate law that evaluates to NaN or infinity has no stochastic meaning: check its "
         "parameters and functions at this state (for example a sqrt or log of a negative value, "
         "a division by zero, or a table function read at a NaN index).");
@@ -924,7 +976,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // initial state as a trajectory. Refuse it where it is computed, naming the
     // reaction and the time, as the ODE path refuses a non-finite RHS.
     auto refuse_nonfinite_propensity = [&](int r, double value, double t_at) {
-        throw_nonfinite_propensity(model, r, value, t_at, use_psa);
+        throw_nonfinite_propensity(model, r, value, t_at, use_psa,
+                                   law_state_at_refusal(model, r, conc, is_count));
     };
 
     // ─── Structure-specialized propensity-vector backend (GH #149 / #190) ─────
