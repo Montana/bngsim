@@ -60,10 +60,8 @@ def _regapped(tmp_path, data_dir, k_v_stim):
 
 
 def _solve(net, max_time=1e6, tol=None, jacobian="fd"):
-    # The residual test, by name (issue #1001): what is pinned here is the march.
-    # Its parking gaps put Voltage within its own tolerance of the v_rec switch,
-    # and the default criterion refuses that state for it
-    # (test_steady_state_scaled_criterion.py).
+    # The residual test, by name (issue #1001): what is pinned here is the
+    # march, not the run the default criterion takes from the state it stops at.
     kwargs = {} if tol is None else {"tol": tol}
     return bngsim.Simulator(
         bngsim.Model.from_net(net), method="ode", jacobian=jacobian

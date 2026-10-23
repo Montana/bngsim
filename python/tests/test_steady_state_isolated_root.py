@@ -1438,8 +1438,9 @@ def test_a_root_the_solve_steps_to_and_the_system_leaves_is_refused(tmp_path):
 
 
 def test_the_default_marches_past_the_middle_root_to_where_a_run_ends(tmp_path):
-    """Under the default criterion the solve is not returned beside the middle
-    root: it marches on to X = 1, where a run ends, and the columns of s are
+    """Control: main's opt-in criterion="scaled" does the same. Under the
+    default criterion the solve is not returned beside the middle root: it
+    marches on to X = 1, where a run ends, and the columns of s are
     those of that root (dX*/ds = 0, dW*/ds = 1/kd)."""
     sim = bngsim.Simulator(_net(tmp_path, BETWEEN_TWO_ROOTS), method="ode")
     out = sim.steady_state(sensitivity_params=["s"], max_time=1e9, criterion="scaled")
@@ -2161,8 +2162,9 @@ def test_a_species_on_its_way_up_from_a_seed_is_not_stepped_down_to_nothing(tmp_
 
 
 def test_the_default_marches_the_seed_to_where_it_grows(tmp_path):
-    """Under the default criterion the start is not a steady state, and the
-    solve marches N to K, where a run ends: dN*/dK = 1, dN*/dr = 0."""
+    """Control: main's opt-in criterion="scaled" does the same. Under the
+    default criterion the start is not a steady state, and the solve marches N
+    to K, where a run ends: dN*/dK = 1, dN*/dr = 0."""
     sim = bngsim.Simulator(_net(tmp_path, SEEDED), method="ode")
     out = sim.steady_state(sensitivity_params=["K", "r"], criterion="scaled")
     assert out.converged

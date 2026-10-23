@@ -478,9 +478,9 @@ def test_the_retry_matches_the_messages_the_core_raises(
 # discontinuity is its own defect with its own blast radius, so it is tracked in
 # issue #235 rather than papered over here.
 #
-# The two that ask for `converged` name the residual test (issue #1001): the
-# fixture's Voltage relaxes to its switch's own threshold, a state the default
-# criterion refuses (test_steady_state_scaled_criterion.py).
+# The two that ask for `converged` name the residual test (issue #1001): what
+# they pin is the march's own verdict, not the run the default criterion takes
+# from the state it stops at.
 
 
 def test_steady_state_auto_falls_back_and_converges(data_dir: Path) -> None:

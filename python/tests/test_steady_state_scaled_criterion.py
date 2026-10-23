@@ -927,8 +927,9 @@ end functions
 
 @pytest.mark.parametrize("jacobian", ["auto", "fd"])
 def test_a_rate_with_a_floor_at_its_kink_is_not_converged(tmp_path, jacobian):
+    # Control for the verdict: main refuses it too (its newton_distance is NaN).
     # The march parks at the kink, and the step from there, 5e-12, is within
-    # tolerance: there is no root. Kicked past the kink the run grows.
+    # tolerance: there is no root, and the parity test refuses it (f = 1e-3).
     path = tmp_path / "kink.net"
     path.write_text(KINK_NET)
     ss = bngsim.Simulator(
@@ -1010,23 +1011,31 @@ def test_an_epidemic_that_burns_out_is_converged(tmp_path, method):
     assert abs(i) < 1e-9
 
 
-def test_above_512_unknowns_a_march_stopped_short_is_polished_to_its_root(tmp_path):
-    # X' = 1e-6·(1 - X²) among 520 unknowns: the march stops by the residual
-    # test at X = 0.698, which the residual criterion returns. With no step to
-    # tell how far off it is, the state is polished, to a thousandth of tol and
-    # on a Jacobian taken at every iterate: on the one it started with, the
-    # polish's ten iterations ended 3.7e-5 short of 1.
+def _wide_square_decay(kx):
+    # X' = kx·(1 - X²) beside 520 unknowns.
     n = 2 * 260 + 1
-    text = (
+    return n, (
         _wide_net(260)
-        .replace("end parameters", "    3 kx 1e-6\nend parameters")
+        .replace("end parameters", f"    3 kx {kx!r}\nend parameters")
         .replace("end species", f"    {n} X() 0\nend species")
         .replace(
             "end reactions",
             f"    {4 * 260 + 1} 0 {n} kx\n    {4 * 260 + 2} {n},{n} {n} kx\nend reactions",
         )
     )
-    path = tmp_path / "wide_slow.net"
+
+
+@pytest.mark.parametrize("kx", [0.03, 1e-6])
+def test_above_512_unknowns_a_march_stopped_short_is_polished_within_reach(tmp_path, kx):
+    # Among 520 unknowns the march stops by the residual test, at kx = 0.03
+    # 7.3e-6 short of 1 (360 tolerances) and at 1e-6 at X = 0.698, which the
+    # residual criterion returns. With no step to tell how far off it is, the
+    # state is polished, to a thousandth of tol and on a Jacobian at every
+    # iterate, and the polish is kept within a thousand tolerances of where it
+    # started: at 0.03 it reaches the root; at 1e-6 it may not go that far, and
+    # the run refuses the state the march stopped at.
+    n, text = _wide_square_decay(kx)
+    path = tmp_path / "wide_square_decay.net"
     path.write_text(text)
     out = {}
     for criterion in ("residual", "scaled"):
@@ -1034,11 +1043,48 @@ def test_above_512_unknowns_a_march_stopped_short_is_polished_to_its_root(tmp_pa
             bngsim.Model.from_net(str(path)), method="ode"
         ).steady_state(criterion=criterion, method="integration")
     assert out["residual"].converged
-    assert abs(out["residual"].concentrations[n - 1] - 1.0) > 0.1
+    assert abs(out["residual"].concentrations[n - 1] - 1.0) > 1e-6
     scaled = out["scaled"]
-    assert scaled.converged
     assert math.isnan(scaled.newton_distance)
-    assert abs(scaled.concentrations[n - 1] - 1.0) < 1e-10
+    if kx == 0.03:
+        assert scaled.converged
+        assert abs(scaled.concentrations[n - 1] - 1.0) < 1e-10
+    else:
+        assert not scaled.converged
+        assert scaled.continued_run_distance > 1.0
+
+
+def _wide_cubic_net(x0):
+    # The issue's cubic at a scale of 1e-9 (stable roots 0 and 1, unstable 0.3)
+    # beside 520 fast decays from 1e-20.
+    s = 1e-9
+    species = [f"    1 X() {x0 * s!r}"] + [f"    {i + 2} Z{i}() 1e-20" for i in range(520)]
+    reactions = ["    1 1,1,1 1,1 k3", "    2 1,1 1,1,1 k2", "    3 1 0 k1"] + [
+        f"    {i + 4} {i + 2} 0 kz" for i in range(520)
+    ]
+    return "\n".join(
+        ["begin parameters", "    1 k 1.0", "    2 a 0.3", "    3 u 1.0", f"    4 s {s!r}"]
+        + ["    5 k3 k/(s*s)", "    6 k2 k*(u+a)/s", "    7 k1 k*a*u", "    8 kz 1e6"]
+        + ["end parameters", "begin species", *species, "end species"]
+        + ["begin reactions", *reactions, "end reactions", ""]
+    )
+
+
+@pytest.mark.parametrize(("x0", "reached"), [(0.15, 0.0), (0.5, 1.0)])
+def test_above_512_unknowns_the_polish_does_not_leave_the_basin(tmp_path, x0, reached):
+    # The march stops at its first step, under tol at a scale of 1e-9, with no
+    # step to say how far the root is. Polished without a bound, the state from
+    # 0.15, on its way to 0, went on to the other root at 1, and the one from
+    # 0.5, on its way to 1, to 0.2999999, beside the unstable root, both
+    # converged. Main returns 0.136 and 0.543. The run decides at the state the
+    # march stopped at, or at the root it is on its way to.
+    path = tmp_path / "wide_cubic.net"
+    path.write_text(_wide_cubic_net(x0))
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method="integration"
+    )
+    if ss.converged:
+        assert ss.concentrations[0] / 1e-9 == pytest.approx(reached, abs=1e-6)
 
 
 _B002 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000002.xml"

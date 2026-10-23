@@ -159,7 +159,7 @@ class TestGH78Reporting:
         """Handed the saddle as the IC, there is nowhere else to fall back to —
         integration would return the same state. Report the verdict instead of
         acting on it. Under either criterion a run from the saddle does not
-        leave it (issue #1001)."""
+        leave it (issue #1001). Control: main returns it converged under both."""
         sim, model = _toggle()
         model.set_concentration("R1()", float(_SADDLE[0]))
         model.set_concentration("R2()", float(_SADDLE[1]))

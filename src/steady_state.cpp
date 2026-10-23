@@ -5874,7 +5874,7 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
             // taken. Accepted by the step, egfr_path's RA() going to 0 as 1/t left
             // every start of steady_states() unconverged.
             SteadyStateOptions by_residual = o;
-            by_residual.criterion_by_residual = true;
+            by_residual.criterion_by_residual = o.criterion == "scaled";
             return solve_by_newton_from_state(model, rhs, by_residual, sub);
         }
         return solve_by_newton_two_tier(model, rhs, o, sub, &integrator_failed);
@@ -5985,9 +5985,30 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                                                   p.concentrations.data())
                                              : std::numeric_limits<double>::quiet_NaN();
                     const double before = result.newton_distance;
-                    const bool nearer = (std::isnan(before) || std::isnan(after))
-                                            ? p.residual < before_residual
-                                            : after < before;
+                    // Where there is no step to say how far the root is, the
+                    // polish is kept only within kPolishFurthest tolerances of
+                    // where it started: above 512 unknowns, from the cubic's
+                    // 0.136 on its way to 0, KINSOL went on to its other root at
+                    // 1, and from 0.54 on its way to 1 to 0.2999999, beside
+                    // its unstable root.
+                    double went = 0.0;
+                    if (std::isnan(before) || std::isnan(after)) {
+                        const double largest =
+                            ss_largest_species(model, *effective, result.concentrations.data());
+                        for (int i : sub.included) {
+                            if (model.species()[i].fixed)
+                                continue;
+                            const auto ui = static_cast<size_t>(i);
+                            went = std::max(
+                                went, std::abs(p.concentrations[ui] - result.concentrations[ui]) /
+                                          ss_scaled_tolerance(*effective, i,
+                                                              result.concentrations[ui], largest));
+                        }
+                    }
+                    const bool nearer =
+                        (std::isnan(before) || std::isnan(after))
+                            ? p.residual < before_residual && went <= kPolishFurthest
+                            : after < before;
                     if (nearer) {
                         result.concentrations = p.concentrations;
                         result.n_steps += p.n_steps;

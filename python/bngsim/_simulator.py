@@ -7421,9 +7421,10 @@ class Simulator:
               of 1e-9 on from 0.894 to its root at 1, and the state it stops at
               is polished by KINSOL; the step decides nothing about
               ``converged``. ``mask`` says which species are measured, not
-              which move: the step and the run move every species but a
-              ``$``-fixed one and a masked one that nothing reads or that
-              reads nothing (a counter), which is held. Where neither ``atol``
+              which move: the step moves every species but a ``$``-fixed one
+              and a masked one that nothing reads or that reads nothing (a
+              counter), which is held; the run moves every species but a
+              ``$``-fixed one. Where neither ``atol``
               nor :meth:`set_tolerances` gives one, each species is marched at
               the smaller of what ``atol="auto"`` gives it and the scalar
               1e-8: the scalar is no tolerance for a model in small units, nor
@@ -7441,8 +7442,8 @@ class Simulator:
             :attr:`SteadyStateResult.newton_distance`.
         max_time : float
             Max integration time for the integration path, and how long the
-            runs of ``criterion="scaled"``'s run test are taken on for.
-            Default 1e6.
+            run of ``criterion="scaled"``'s run test is taken on for, up to
+            1e6. Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
