@@ -51,6 +51,7 @@ from collections.abc import Callable
 from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _PY_KEYWORD_PARAM_NAMES,
+    _RATEOF_PREFIX,
     _alias_keyword_param,
     _coerce_booleans_used_as_numbers,
     _normalize_exprtk_operators,
@@ -716,27 +717,48 @@ def _compact_inlined(expr: str, func_map: dict[str, str]) -> str | None:
 
 def rateof_rate_laws(data: dict) -> dict[str, str]:
     """``rate_of__X`` → the text of dX/dt, for each species whose rate every
-    reaction that changes it states as a rate law the derivations can read.
+    reaction that changes it states in a form the derivations can read.
 
     ``rate_of__X`` is the engine's live dX/dt: a value read off the last RHS,
     which no derivation can differentiate, and a rate law that reads one (a
     dilution term ``-S·(r·rate_of__P)/C1`` under ``C1 := 2 + r*P``) declined the
     analytic Jacobian and the analytic sensitivity RHS. Run on CVODES' difference
-    quotient, a sensitivity run at rtol 1e-11 took 3.6 million steps for 413
-    (issue #1124, item 7). dX/dt is Σ_r ν_Xr·stat_r·func_r over the reactions
-    that change X, which the engine sums for the same value, so written into
-    the function map under the token's name it is inlined and differentiated
-    through like any rule.
+    quotient, a sensitivity run of that model at rtol 1e-11 took 291,511 steps
+    for 284 (issue #1124, item 7). dX/dt is Σ_r ν_Xr·rate_r over the reactions
+    that change X, which the engine sums for the same value
+    (``NetworkModel::compute_derivs_core``), so written into the function map
+    under the token's name it is inlined and differentiated through like any
+    rule.
 
-    Only where every such reaction is Functional with no species factor (its
-    law is its whole rate) and no per-species volume divide; a fixed species'
-    rate is 0. Any other species is left out, and a law that reads its token
-    declines as before. ``data`` is the model's ``codegen_data()``; one with no
-    reaction list says nothing of any rate, and gives none.
+    A reaction's rate is its rate law (Functional) or its rate constant
+    (Elementary) times its stat factor, times, where the species factor applies,
+    each reactant's value. That value is read through the observable that holds
+    the species alone at weight 1, which is what the engine multiplies by (an
+    amount-valued species' amount): an SBML model has one per species, under
+    the species' own name. The SBML loader reads a mass-action kinetic law
+    (``k1*P*C0``) as Elementary, so leaving those out left the common model on
+    the difference quotient.
+
+    A fixed species' rate is 0. Left out, so that a law reading the token
+    declines as before: a species a reaction changes that divides by each
+    species' volume, is Michaelis–Menten, or takes a species factor of a
+    reactant no observable holds alone; and a species whose ``rateOf`` reports
+    an amount. ``data`` is the model's ``codegen_data()``; one with no reaction
+    list says nothing of any rate and gives none, and so does one whose
+    functions read none.
     """
-    if "reactions" not in data:
+    functions = data.get("functions") or ()
+    if "reactions" not in data or not any(
+        _RATEOF_PREFIX in f.get("expression", "") for f in functions
+    ):
         return {}
     species = data.get("species") or []
+    params = data.get("parameters") or []
+    alone: dict[int, str] = {}
+    for o in data.get("observables") or ():
+        entries = list(o.get("entries") or ())
+        if len(entries) == 1 and float(entries[0][1]) == 1.0:
+            alone.setdefault(int(entries[0][0]), o["name"])
     terms: dict[int, list[str]] = {}
     unreadable: set[int] = set()
     for rxn in data.get("reactions") or []:
@@ -745,27 +767,51 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
             net[int(i)] = net.get(int(i), 0) - 1
         for i in rxn.get("products", ()):
             net[int(i)] = net.get(int(i), 0) + 1
-        readable = (
-            rxn.get("type") == "functional"
-            and not (rxn.get("apply_species_factor", True) and rxn.get("reactants"))
-            and not rxn.get("per_species_volume_scaling", False)
-            and bool(rxn.get("function_name"))
-        )
+        rate = _reaction_rate_text(rxn, params, alone)
         for i, n in net.items():
             if n == 0:
                 continue
-            if not readable:
+            if rate is None:
                 unreadable.add(i)
                 continue
             coeff = n * float(rxn.get("stat_factor", 1.0))
-            terms.setdefault(i, []).append(f"({coeff!r})*{rxn['function_name']}")
+            terms.setdefault(i, []).append(f"({coeff!r})*{rate}")
     out: dict[str, str] = {}
     for i, sp in enumerate(species):
-        if i in unreadable or sp.get("report_rateof_amount", False):
+        if sp.get("fixed", False):
+            rate = "0"
+        elif i in unreadable or sp.get("report_rateof_amount", False):
             continue
-        rate = "0" if sp.get("fixed", False) else (" + ".join(terms.get(i, ())) or "0")
-        out[f"rate_of__{sp['name']}"] = f"({rate})"
+        else:
+            rate = " + ".join(terms.get(i, ())) or "0"
+        out[f"{_RATEOF_PREFIX}{sp['name']}"] = f"({rate})"
     return out
+
+
+def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str | None:
+    """A reaction's rate before its stat factor, as ``compute_rxn_rate`` forms
+    it on the ODE path, or ``None`` where :func:`rateof_rate_laws` cannot state
+    it. ``alone`` maps a species to the observable that holds it alone."""
+    if rxn.get("per_species_volume_scaling", False):
+        return None
+    kind = rxn.get("type")
+    if kind == "functional":
+        base = rxn.get("function_name") or ""
+    elif kind == "elementary":
+        k = list(rxn.get("rate_param_indices") or ())
+        base = params[int(k[0])]["name"] if k and 0 <= int(k[0]) < len(params) else ""
+    else:
+        return None  # Michaelis–Menten
+    if not base:
+        return None
+    factors = [base]
+    if rxn.get("apply_species_factor", True):
+        for i in rxn.get("reactants", ()):
+            name = alone.get(int(i))
+            if name is None:
+                return None
+            factors.append(name)
+    return "*".join(factors)
 
 
 def _inline_functions(
@@ -1000,8 +1046,10 @@ def _finish_kinks(deriv):
     folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
-        lambda n: (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
-        + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True)),
+        lambda n: (
+            (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
+            + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True))
+        ),
     )
     memo: dict = {}
 
@@ -4134,11 +4182,14 @@ def attach_functional_jacobian(core) -> bool:
         return False  # no Functional reactions — Elementary path already handled
 
     # A rate_of__X a law reads is X's own rate law, differentiated through
-    # (issue #1124, item 7).
-    try:
-        rate_laws = rateof_rate_laws(core.codegen_data())
-    except Exception:
-        rate_laws = {}
+    # (issue #1124, item 7). Only a model whose functions read a rate pays for
+    # the reaction list.
+    rate_laws: dict[str, str] = {}
+    if any(_RATEOF_PREFIX in body for body in ctx["function_map"].values()):
+        try:
+            rate_laws = rateof_rate_laws(core.codegen_data())
+        except Exception as exc:  # the attach never raises; the laws then decline
+            logger.debug("GH#76 analytical Jacobian: no rate laws for rateOf (%s)", exc)
     func_map = {**rate_laws, **dict(ctx["function_map"])}
     obs_groups = {name: [(int(si), float(f)) for si, f in grp] for name, grp in ctx["observables"]}
     obs_idx = {name: i for i, (name, _grp) in enumerate(ctx["observables"])}

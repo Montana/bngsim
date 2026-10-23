@@ -7074,7 +7074,9 @@ def _emit_function_lines(
     Shared by the RHS and analytical-Jacobian emitters (see
     ``_emit_observable_lines``). ``rateof_map`` (GH #106) resolves
     rate_of__<species> tokens to current_derivs[idx]; only the RHS emitter
-    passes it (the Jacobian emitter declines for rateOf models).
+    passes it. The Jacobian and sensitivity-RHS emitters have no such buffer and
+    pass functions whose rates are written out instead
+    (``_functions_with_rates_written_out``).
 
     Statements are emitted in dependency order (``_topological_function_order``)
     so a function that references another declared after it does not read an
@@ -8039,10 +8041,17 @@ def generate_jacobian_from_model(model) -> str | None:
         if _jac_obs_lines
         else ([], [])
     )
+    # A function that reads rate_of__X has no live dx/dt here: its value is
+    # read off X's rate laws, the ones the terms above differentiated (issue
+    # #1124, item 7). Where they cannot be written out, decline rather than emit
+    # the token as an undeclared C name.
+    jac_functions = _functions_with_rates_written_out(data) if (need_func and functions) else []
+    if jac_functions is None:
+        return None
     jac_func_in, jac_func_fs = (
         _shard_value_lines(
             _emit_function_lines(
-                functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
+                jac_functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
             ),
             chunk=chunk,
             fn_prefix="jac_func_blk",
@@ -11261,6 +11270,71 @@ def generate_sens_from_model(
     return src
 
 
+_RATEOF_TOKEN_RE = re.compile(r"\b" + _RATEOF_PREFIX + r"\w+")
+_TFUN_CALL_RE = re.compile(r"\btfun_\w+\s*\(")
+
+
+def _functions_with_rates_written_out(data: dict) -> list[dict] | None:
+    """``data["functions"]``, each ``rate_of__X`` its texts read written out as
+    X's rate laws, inlined down to observables, parameters and time (issue
+    #1124, item 7); ``None`` where one cannot be.
+
+    ``rate_of__X`` is the live dx/dt the RHS's probe passes leave in
+    ``current_derivs``, and only the RHS has that buffer. The ``func[]``
+    recomputations of the analytical Jacobian and the sensitivity RHS read the
+    same value off the rate laws :func:`bngsim._jacobian.rateof_rate_laws`
+    states, which is what the derivations they are written against
+    differentiate. ``None`` where a function reads a rate it does not state,
+    where rates read each other in a ring, or where a written-out rate calls a
+    table, which neither caller can evaluate.
+
+    Both texts are rewritten. The value is printed from ``eval_expression``
+    where the loader set one (the zero-base log guard, GH #333), and the laws
+    are inlined through those same texts, so the value is the one the RHS sums.
+    """
+    functions = data["functions"]
+    if not any(_RATEOF_PREFIX in f["expression"] for f in functions):
+        return functions
+    from bngsim._jacobian import _inline_functions, rateof_rate_laws
+
+    laws = rateof_rate_laws(data)
+    bodies = {
+        **laws,
+        **{f["name"]: f.get("eval_expression") or f["expression"] for f in functions},
+    }
+    memo: dict[str, str] = {}
+    flat: dict[str, str | None] = {}
+
+    def written_out(token: str) -> str | None:
+        if token not in flat:
+            law = _inline_functions(laws[token], bodies, memo=memo) if token in laws else None
+            if law is not None and (_RATEOF_PREFIX in law or _TFUN_CALL_RE.search(law)):
+                law = None
+            flat[token] = law
+        return flat[token]
+
+    out = []
+    for f in functions:
+        texts = {
+            key: f[key]
+            for key in ("expression", "eval_expression")
+            if _RATEOF_PREFIX in f.get(key, "")
+        }
+        for text in texts.values():
+            if any(written_out(token) is None for token in _RATEOF_TOKEN_RE.findall(text)):
+                return None
+        if texts:
+            f = {
+                **f,
+                **{
+                    key: _RATEOF_TOKEN_RE.sub(lambda m: f"({flat[m.group(0)]})", text)
+                    for key, text in texts.items()
+                },
+            }
+        out.append(f)
+    return out
+
+
 def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """The ``obs[]``/``func[]`` recomputation ``bngsim_dfdp`` reads (GH #65).
 
@@ -11277,7 +11351,9 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     * an **embedded tfun wrapper**, which even the value codegen declines
       (``generate_outputs_from_model``) because the ``tfun_<table>(...)`` token
       would be emitted as an undeclared C call.
-    * **rateOf**, which needs the live dx/dt buffer no sensitivity-RHS call has.
+    * a **rateOf** that :func:`_functions_with_rates_written_out` cannot write
+      out as its species' rate laws: the live dx/dt it reads is in a buffer no
+      sensitivity-RHS call has.
 
     Called lazily and at most once per emit, and only when the ∂f/∂p switch
     actually references ``obs[``/``func[`` — an Elementary model never does, so
@@ -11285,36 +11361,10 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """
     species = data["species"]
     observables = data["observables"]
-    functions = data["functions"]
+    functions = _functions_with_rates_written_out(data)
+    if functions is None:
+        return None
     tfun_specs = data.get("table_functions", [])
-
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
-        # A function that reads rate_of__X reads X's rate law in its place,
-        # written out to species and parameters (issue #1124, item 7): the
-        # sensitivity RHS has no live dx/dt, and the value is the same. Where
-        # X's rate is not one rateof_rate_laws can state, or the rates read
-        # each other in a ring, the model declines as before.
-        from bngsim._jacobian import _inline_functions, rateof_rate_laws
-
-        def _wrapped_from(flat: dict[str, str]) -> Callable[[re.Match[str]], str]:
-            return lambda m: f"({flat[m.group(0)]})"
-
-        laws = rateof_rate_laws(data)
-        bodies = {**laws, **{f["name"]: f["expression"] for f in functions}}
-        token = re.compile(r"\b" + _RATEOF_PREFIX + r"[A-Za-z0-9_]+")
-        rewritten = []
-        for f in functions:
-            expr = f["expression"]
-            if _RATEOF_PREFIX in expr:
-                flat: dict[str, str] = {}
-                for tok in set(token.findall(expr)):
-                    law = _inline_functions(laws[tok], bodies) if tok in laws else None
-                    if law is None or _RATEOF_PREFIX in law:
-                        return None
-                    flat[tok] = law
-                f = {**f, "expression": token.sub(_wrapped_from(flat), expr)}
-            rewritten.append(f)
-        functions = rewritten
 
     tfun_names = [spec["name"] for spec in tfun_specs]
     for f in functions:

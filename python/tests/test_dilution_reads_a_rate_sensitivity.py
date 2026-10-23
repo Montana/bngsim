@@ -77,3 +77,47 @@ def test_the_analytic_jacobian_attaches(codegen):
     t = np.asarray(result.time)
     w = list(result.species_names).index("S")
     np.testing.assert_allclose(np.asarray(result.species)[:, w], _s(t), rtol=1e-8)
+
+
+def test_a_mass_action_law_on_p_is_written_out_too():
+    """The loader reads ``k1*P*C0`` as an Elementary reaction, k1·P, and left
+    out, the model as usually written stayed on the difference quotient. The
+    k1 column goes through P's rate: d[S]/dk1 = 5(2 + r)·r·t·e^(-0.2t)·P/C1²."""
+    text = _TEXT.replace("r = 0.5;", "r = 0.5; k1 = 0.3;").replace("0.3*P*C0", "k1*P*C0")
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["r", "k1"]
+    )
+    assert sim.has_analytic_sens_rhs
+    result = sim.run(t_span=(0.0, 10.0), n_points=11, **_TIGHT)
+    t = np.asarray(result.time)
+    w = list(result.species_names).index("S")
+    sens = np.asarray(result.sensitivities)[:, w, :]
+    ds_dk1 = 5 * 2.5 * 0.5 * t * np.exp(-0.2 * t) * np.exp(-0.3 * t) / _c1(t) ** 2
+    np.testing.assert_allclose(sens[:, 0], _ds_dr(t), rtol=1e-6)
+    np.testing.assert_allclose(sens[:, 1], ds_dk1, rtol=1e-6, atol=1e-12)
+    assert result.solver_stats["n_steps"] < 5_000
+
+
+def test_the_compiled_jacobian_reads_the_rate_too():
+    """A cross-compartment reaction into a rate-ruled compartment makes the
+    compiled Jacobian recompute func[], the dilution term's included. It wrote
+    ``rate_of__P`` into the C as an undeclared name, and the build failed: a
+    sensitivity run raised where it had run on the difference quotient.
+    A and B leave P and S as they were."""
+    text = _TEXT + (
+        "compartment Cv = 2; Cv' = 0.1;\n"
+        "species A in C0 = 1; species B in Cv = 1;\n"
+        "Jx: A -> B; 0.1*A*C0;\n"
+    )
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text),
+        method="ode",
+        codegen=True,
+        sensitivity_params=["r"],
+    )
+    assert sim.has_analytic_sens_rhs
+    result = sim.run(t_span=(0.0, 10.0), n_points=11, **_TIGHT)
+    t = np.asarray(result.time)
+    w = list(result.species_names).index("S")
+    np.testing.assert_allclose(np.asarray(result.species)[:, w], _s(t), rtol=1e-8)
+    np.testing.assert_allclose(np.asarray(result.sensitivities)[:, w, 0], _ds_dr(t), rtol=1e-6)
