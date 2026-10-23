@@ -4397,10 +4397,11 @@ class Simulator:
         but not under double precision's resolution beside the largest: a
         species a run left at 1e-22, or one declared at -1.6e-34
         (MODEL2307110001), held every other at 0 to that, and its march
-        failed. Where every species takes the scalar, or every species not
-        ``$``-fixed starts at 0 (a ``$Src`` at 1e-12 held the rest to 1e-20),
-        it is passed as the scalar, whose march is the residual criterion's: as
-        a vector of equal entries, BIOMD0000000252's stalled.
+        failed. Where every species not ``$``-fixed starts at 0, ``"auto"``
+        takes its own floor from every species, a ``$``-fixed one too (a
+        ``$Src`` at 1e-12 holds the rest to 1e-20). Where every species takes
+        the scalar it is passed as the scalar, whose march is the residual
+        criterion's: as a vector of equal entries, BIOMD0000000252's stalled.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
             eff_rtol = self._rtol if rtol is None else rtol
@@ -4408,9 +4409,11 @@ class Simulator:
             free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
             largest = float(free.max(initial=0.0))
             positive = free[free > 0.0]
-            if not positive.size:
-                return None
-            floor = max(float(positive.min()), float(np.finfo(float).eps) * largest)
+            floor = (
+                max(float(positive.min()), float(np.finfo(float).eps) * largest)
+                if positive.size
+                else None
+            )
             own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
             if np.all(own == self._atol):
                 return None

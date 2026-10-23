@@ -103,8 +103,9 @@ parity test's march, and in a model in small units no coarser than the model.
 `"auto"`'s floor here is the smallest species the start holds that is not
 `$`-fixed, but not under double precision's resolution beside the largest, so
 that a species left at 1e-22 by a run does not hold every other at 0 to that.
-Where every species takes the scalar, or every species that is not `$`-fixed
-starts at 0, the march takes the scalar and is the parity test's own.
+Where every species that is not `$`-fixed starts at 0, a `$`-fixed one sets the
+floor (a `$Src` at 1e-12 holds the rest to 1e-20). Where every species takes
+the scalar, the march is the parity test's own.
 
 The unkicked run is integrated at those tolerances, and where it moves the
 state it is taken again at a tenth of them, a hundredth and (up to 512
@@ -169,8 +170,8 @@ What it does not do:
   eigenvalues say whether such a state is stable.
 - **A species that starts at 0 and settles below `rtol` times the largest**
   counts as nothing: it is resolved to that, not to its own size.
-- **Where every species that is not `$`-fixed starts at 0** the start has no
-  size, and the march takes the scalar 1e-8; a model whose species settle far below that is
+- **Where every species starts at 0** the start has no size, and the march
+  takes the scalar 1e-8; a model whose species settle far below that is
   resolved only to it (a `$Src`-fed dimer at 1e-10 is marched through zero and
   refused).
 - **Above 512 unknowns** an unkicked run that its own error moves past
