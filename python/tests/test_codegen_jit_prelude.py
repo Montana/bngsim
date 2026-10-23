@@ -35,6 +35,13 @@ Two levels, because the end-to-end one only bites where the JIT actually runs:
 * :class:`TestTheGeneratedSourceCompiles` puts each of the three through a real
   ``Simulator``: a formality under ``cc``, the actual #85 reproducer under
   ``BNGSIM_CODEGEN_JIT=mir``.
+
+The prelude also bounds the other direction: it is the whole list of libc/libm
+names a JIT'd source may import. c2mir accepts a call to an undeclared function
+(an implicit ``int name()``) where cc refuses it, so a bare call the emitter has
+no C for used to reach MIR_link, and either ended the process or was bound to an
+unrelated global of the same name. :class:`TestACallThePreludeDoesNotDeclareIsRefused`
+pins the refusal ``MirJit`` now makes instead.
 """
 
 from __future__ import annotations
@@ -42,6 +49,8 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import bngsim
@@ -407,3 +416,198 @@ class TestTheGeneratedSourceCompiles:
         # The NaN sentinel lives in the *function* sensitivities, which this
         # selector does not return; the state sensitivities are always real.
         assert np.isfinite(sens).all()
+
+    @pytest.mark.parametrize("base", [10, 2], ids=["M_LN10", "M_LN2"])
+    def test_a_log_parameterised_rate_constant_has_its_sensitivity(self, tmp_path, base):
+        """``k = base^logk``, the usual fitting parameterisation. sympy writes
+        dk/dlogk as ``pow(base, logk)*M_LN10`` (``M_LN2``), and no generated
+        source defined either, so under ``BNGSIM_CODEGEN_JIT=mir`` c2mir stopped
+        at "undeclared identifier M_LN10". A(t) = A0 exp(-k t) gives the oracle:
+        dA/dlogk = -A0 t k ln(base) exp(-k t)."""
+        model = _model(tmp_path, LOG_PARAMETERISED.format(base=base))
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["logk"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        k = float(base) ** -0.3
+        exact = -2.0 * k * np.log(base) * np.exp(-k)
+        got = np.asarray(run.sensitivities)[-1, 0, 0]
+        assert got == pytest.approx(exact, rel=1e-5)
+
+    @pytest.mark.parametrize(("base", "power"), [(10, 20), (6, 30)])
+    def test_an_integer_past_64_bits_in_a_derivative_is_a_double(self, tmp_path, base, power):
+        """``k = p*base^power`` with ``p = base^-power``: sympy prints dk/dp as
+        the integer base^power, which is past 2^64. Printed as a bare integer
+        literal, cc refused to build the source and c2mir read it as the 64-bit
+        maximum, so dA/dp came back 82% (10^20) or 99.99% (6^30) small with no
+        warning. k = 1, so dA/dp = -A0 t base^power exp(-t)."""
+        text = LOG_PARAMETERISED.replace("logk -0.3", f"p {float(base) ** -power!r}")
+        text = text.replace("{base}^logk", f"p*{base}^{power}")
+        model = _model(tmp_path, text)
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["p"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        exact = -2.0 * float(base) ** power * np.exp(-1.0)
+        assert np.asarray(run.sensitivities)[-1, 0, 0] == pytest.approx(exact, rel=1e-5)
+
+    def test_an_integer_exponent_that_is_not_exactly_a_double_is_refused(self):
+        """A double literal would round such an exponent, and its parity with
+        it: d/dp p^(10^20) at p = -1 printed as pow(p, 1e20) is +1 where
+        (-1)^(10^20 - 1) is -1. The printer refuses it, which declines the
+        analytic derivative, rather than print it."""
+        from bngsim import _term_order
+
+        sympy = pytest.importorskip("sympy")
+        p = sympy.Symbol("p")
+        assert _term_order.ccode(p**1000) == "pow(p, 1000.0)"
+        assert _term_order.ccode(p ** (2**53)) == f"pow(p, {2**53}.0)"
+        for n in (2**53 + 1, 10**20 - 1):
+            with pytest.raises(ValueError, match="not exactly a double"):
+                _term_order.ccode(p**n)
+
+    def test_infinity_in_an_untaken_branch_compiles(self, tmp_path):
+        """sympy prints oo as ``INFINITY``, a <math.h> macro the JIT strips;
+        ``k = if(p > 1, p, p*abs(1/0))`` puts it in the branch not taken. k = p
+        = 2, so dA/dp = -A0 t exp(-2 t)."""
+        text = LOG_PARAMETERISED.replace("logk -0.3", "p 2.0")
+        text = text.replace("{base}^logk", "if(p>1,p,p*abs(1/0))")
+        model = _model(tmp_path, text)
+        sim = bngsim.Simulator(model, method="ode", sensitivity_params=["p"])
+        run = sim.run(t_span=(0.0, 1.0), n_points=2)
+        exact = -2.0 * np.exp(-2.0)
+        assert np.asarray(run.sensitivities)[-1, 0, 0] == pytest.approx(exact, rel=1e-5)
+
+
+# The model for the tests above: one first-order decay at k = base^logk.
+LOG_PARAMETERISED = """\
+begin parameters
+    1 logk -0.3
+    2 k    {base}^logk
+end parameters
+begin species
+    1 A() 2.0
+    2 B() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+class TestEachSourceDefinesEveryConstantSympyCanPrint:
+    """Text-level, so it holds on every backend. M_PI and M_E were the only
+    constants a source defined (GH #470), but sympy's C printer has a dozen
+    (``sympy.printing.c.get_math_macros``) and the sensitivity source is printed
+    by it. Each standalone source has to define every one, with the double
+    <math.h> would have given."""
+
+    @pytest.mark.parametrize(
+        ("name", "net_text", "generate"),
+        STANDALONE_SOURCES,
+        ids=[s[0] for s in STANDALONE_SOURCES],
+    )
+    def test_with_the_value_math_h_gives(self, tmp_path, name, net_text, generate):
+        sympy = pytest.importorskip("sympy")
+        from sympy.printing.c import get_math_macros
+
+        # Several expressions map to one macro, and the sympy.codegen spellings
+        # (Sqrt(2)) do not evaluate; any one that does gives the value.
+        exact = {}
+        for expr, macro in get_math_macros().items():
+            value = sympy.N(expr, 40)
+            if value.is_real:
+                exact.setdefault(macro, value)
+        assert set(exact) == set(get_math_macros().values())
+        c_source = generate(None, _model(tmp_path, net_text, name="constants.net"))
+        for macro, value in exact.items():
+            found = re.search(rf"^\s*#\s*define\s+{macro}\s+(\S+)", c_source, re.M)
+            assert found, f"{name} does not define {macro}, which sympy's C printer writes"
+            assert float(found.group(1)) == float(value), (
+                f"{name} defines {macro} as {found.group(1)}, not the double nearest {value}"
+            )
+
+
+# ─── a call the prelude does not declare ───────────────────────────────────
+#
+# The emitter writes some ExprTk functions through as bare calls it has no C for
+# (frac, inrange, iclamp, roundn, root, logn, sinc, equal, a table function's
+# name). cc refuses such a source as a call to an undeclared function, and codegen
+# falls back or refuses by name. c2mir instead takes the call as an implicit
+# ``int name()``, the C89 rule, so on the JIT backend the name reached MIR_link as
+# an import of its own. One the resolver could not find, MIR's default error
+# function reported by exit(1), which ended the Python process mid-run. One dlsym
+# could find was bound to whatever global has that spelling: on macOS a private
+# framework loaded into the Python process exports an ``equal``, and a run of
+# ``k*(1 + equal(k, 0.5))`` came back with B(1) = 0.787 where the answer is 1.264,
+# with no warning. MirJit now refuses every import outside the prelude's table
+# before it links.
+
+_UNDECLARED_NET = """begin parameters
+    1 k 0.5
+end parameters
+begin species
+    1 A() 2.0
+    2 B() 0
+end species
+begin functions
+    1 f() {law}
+end functions
+begin reactions
+    1 1 2 f #_R1
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+# name -> a rate law that calls it where the call decides the rate all run long.
+_UNDECLARED_LAWS = {
+    "equal": "k*(1 + equal(k, 0.5))",
+    "frac": "k*(1 + frac(k + 2))",
+}
+
+# Run in a child: before the fix the frac case exit(1)ed, which would have taken
+# the pytest worker with it rather than failing this test.
+_RUN_IN_A_CHILD = """
+import sys
+import bngsim
+sim = bngsim.Simulator(bngsim.Model.from_net(sys.argv[1]), method="ode", codegen=True)
+try:
+    sim.run(t_span=(0.0, 5.0), n_points=6)
+except Exception as e:
+    print(f"refused: {e}")
+else:
+    print("ran")
+"""
+
+
+class TestACallThePreludeDoesNotDeclareIsRefused:
+    @pytest.mark.parametrize("name", list(_UNDECLARED_LAWS))
+    def test_the_emitter_still_writes_it_as_a_bare_call(self, tmp_path, prelude, name):
+        """Keeps the end-to-end case honest: it covers the hole only while the
+        emitted source calls ``name`` without defining it, and the prelude does
+        not declare it. If the codegen learns C for one, pick another name."""
+        model = _model(tmp_path, _UNDECLARED_NET.format(law=_UNDECLARED_LAWS[name]))
+        code = _COMMENTS.sub(" ", cg.prepare_model_codegen_source(model))
+        call = rf"(?<![A-Za-z0-9_]){re.escape(name)}\s*\("
+        assert re.search(call, code), f"the emitted source no longer calls {name}()"
+        assert not re.search(rf"\b(?:double|int)\s+{re.escape(name)}\s*\(", code)
+        assert not re.search(call, prelude)
+
+    @pytest.mark.skipif(
+        not getattr(bngsim, "HAS_MIR", False),
+        reason="bngsim built without the MIR backend (configure with -DBNGSIM_ENABLE_MIR=ON)",
+    )
+    @pytest.mark.parametrize("name", list(_UNDECLARED_LAWS))
+    def test_the_jit_refuses_it_by_name(self, tmp_path, name):
+        net = tmp_path / "m.net"
+        net.write_text(_UNDECLARED_NET.format(law=_UNDECLARED_LAWS[name]))
+        child = subprocess.run(
+            [sys.executable, "-c", _RUN_IN_A_CHILD, str(net)],
+            env={**os.environ, "BNGSIM_CODEGEN_JIT": "mir"},
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert child.returncode == 0, child.stderr[-2000:]
+        assert f"refers to {name}," in child.stdout, child.stdout + child.stderr[-2000:]

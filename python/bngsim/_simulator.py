@@ -1045,20 +1045,19 @@ class Simulator:
             from bngsim._bngsim_core import RuleMonkeySimulator
             from bngsim._network_free_checks import (
                 refuse_rulemonkey_compartments,
-                refuse_rulemonkey_energy_misreads,
                 rulemonkey_clock,
             )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
             refuse_rulemonkey_compartments(xml_path)
-            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             # Elapsed time, which keeps event times small at a large t_start. A
             # model that reads the clock reads model time (issue #1022): through
             # time(), from a copy of its XML whose clock is time() + __bngsim_t0,
             # set to each run's t_start (issue #1063), since on model time itself
-            # RuleMonkey's waiting times round away there. A table indexed by the
-            # clock cannot be offset (bngsim/_rulemonkey_clock.py), and a model
-            # with one runs on model time as before.
+            # RuleMonkey 3.11.0's waiting times rounded away there. A model with a
+            # table indexed by the clock is not offset and runs on model time,
+            # where RuleMonkey 3.12.0 keeps its waiting times (issue #1063,
+            # bngsim/_rulemonkey_clock.py).
             readers, tables = rulemonkey_clock(xml_path)
             reads_clock = bool(readers)
             self._rm_clock_offset = reads_clock and not tables

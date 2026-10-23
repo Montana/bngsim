@@ -1846,6 +1846,20 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // ─── Main simulation loop ────────────────────────────────────────────────
 
     double t = times.t_start;
+    // Issue #1059: what t + tau rounded away at the last firing, carried into the
+    // next one (compensated summation). Far from the origin the doubles near t
+    // are coarse, 1.2e-4 apart at t = 1e12, and a waiting time below half that
+    // was lost whole, or one above it rounded to a whole spacing. The clock fell
+    // behind the firings, and a decay ran fast: z = -289 at t + 2 from t_start =
+    // 1e12, z = -762 from 1e15. Carried, the absolute time of every firing is the
+    // exact sum of the waiting times to within half a spacing, and the error no
+    // longer builds up; and a sample, an event or a breakpoint is weighed against
+    // that exact time, t - t_carry, so a firing that rounds onto one of them is
+    // still on its own side of it. A time set rather than reached, at an event or
+    // a breakpoint, starts the sum again. Only the two loops that draw a waiting
+    // time from a constant a0 carry; the continuous loop places its firings on
+    // panels in absolute time, and keeps the limit (issue #1059).
+    double t_carry = 0.0;
     int next_output = 1;
     long total_steps = 0;
 
@@ -2198,7 +2212,12 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             while (r1 == 0.0)
                 r1 = next_u01();
             double tau = -std::log(r1) / a0;
-            double t_proposed = t + tau;
+            const double tau_carried = tau - t_carry;
+            double t_proposed = t + tau_carried;
+            // An infinite wait (a subnormal a0) carries nothing: inf - inf is a
+            // NaN, past which no sample would ever be read.
+            const double carry_next =
+                std::isfinite(t_proposed) ? (t_proposed - t) - tau_carried : 0.0;
 
             // Record output points strictly before the fire time. Evaluated per
             // sample, matching the main loop byte-for-byte. `time_dependent_rates`
@@ -2208,7 +2227,9 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             // sample anyway: it is the same answer at a cost this branch does not
             // notice (it runs once per output row, not once per fire), and it is
             // the one form that stays correct if the gate ever widens again.
-            while (next_output < n_out && t_proposed >= t_out[next_output]) {
+            // At the firing's exact time, t_proposed - carry_next: a firing that
+            // rounds onto a sample time is not after it (issue #1059).
+            while (next_output < n_out && t_proposed - t_out[next_output] >= carry_next) {
                 model.update_observables(conc.data());
                 for (int j = 0; j < n_obs; ++j)
                     obs_buf[j] = model.observables()[j].total;
@@ -2262,6 +2283,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
 
             // Advance time only (see header note: no per-step set_current_time).
             t = t_proposed;
+            t_carry = carry_next;
             ++total_steps;
         }
     }
@@ -3123,7 +3145,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 budget.check();
                 steps_since_timeout_check = 0;
             }
-            if (pc_due(t))
+            // Due once the exact time, t - t_carry, has reached the breakpoint: a
+            // firing that rounds onto it from before it leaves the old rate in
+            // force (issue #1059).
+            if (pc_due(t) && t - pc_next() >= t_carry)
                 pc_refresh_at(t);
 
             // 1. Total propensity: the sum tree's root, O(1), or an O(N) flat sum.
@@ -3170,6 +3195,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                         if (next_output >= n_out)
                             break;
                         t = t_event_idle;
+                        t_carry = 0.0;
                         psa_now = t; // GH #15 — keep the PSA dwell clock on t
                         sync_state(t);
                         const bool fired = fire_rising_edges(t);
@@ -3199,6 +3225,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     if (next_output >= n_out)
                         break;
                     t = t_lim;
+                    t_carry = 0.0;
                     psa_now = t;
                     model.set_current_time(t);
                     continue;
@@ -3236,12 +3263,19 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             while (r1 == 0.0)
                 r1 = next_u01(); // avoid log(0)
             double tau = -std::log(r1) / a0;
-            double t_proposed = t + tau;
+            const double tau_carried = tau - t_carry;
+            double t_proposed = t + tau_carried;
+            const double carry_next =
+                std::isfinite(t_proposed) ? (t_proposed - t) - tau_carried : 0.0;
             // A breakpoint first: a piecewise-constant rate jumps there, so stop,
-            // re-read the rates and redraw (exact by memorylessness).
-            const bool pc_cap = pc_refresh && t_proposed > pc_next();
+            // re-read the rates and redraw (exact by memorylessness). Weighed at
+            // the firing's exact time, t_proposed - carry_next, as a sample is.
+            const bool pc_cap = pc_refresh && t_proposed - pc_next() > carry_next;
             if (pc_cap)
                 t_proposed = pc_next();
+            // What t_proposed is short of the exact time it stands for: the carry
+            // of a firing, none for a breakpoint.
+            const double proposed_carry = pc_cap ? 0.0 : carry_next;
 
             // 4. Detect event-trigger crossings within (t, t_proposed].
             //    State is piecewise-constant during τ, so a time-dependent trigger
@@ -3253,10 +3287,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
 
             // At the breakpoint itself an event still fires: the stop there is
             // not a firing, and the event's rows then read its effect, as
-            // without the stop.
-            const bool event_wins = std::isfinite(t_event) &&
-                                    (t_event < t_proposed || (pc_cap && t_event <= t_proposed));
+            // without the stop. A firing that rounds onto the event's time from
+            // past it comes after the event (issue #1059).
+            const bool event_wins =
+                std::isfinite(t_event) &&
+                (t_proposed - t_event > proposed_carry || (pc_cap && t_event <= t_proposed));
             double t_advance = event_wins ? t_event : t_proposed;
+            const double advance_carry = event_wins ? 0.0 : proposed_carry;
 
             // 5. Record output points strictly before t_advance. When an event
             //    lands at (or within bisection precision of) a sample time,
@@ -3266,7 +3303,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             //    strictly before t_event is still recorded pre-event. A sample
             //    within it at which no trigger has changed yet is before the
             //    event all the same (row_before_time_change).
-            while (next_output < n_out && t_advance >= t_out[next_output]) {
+            while (next_output < n_out && t_advance - t_out[next_output] >= advance_carry) {
                 const double ts = t_out[next_output];
                 if (event_wins && ts >= t_event - sample_event_tol(t_event) &&
                     !(ts < t_event && row_before_time_change(ts)))
@@ -3295,6 +3332,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 // The breakpoint came first: nothing fired. The rates are re-read
                 // at the loop's top.
                 t = t_proposed;
+                t_carry = 0.0;
                 psa_now = t;
                 model.set_current_time(t);
                 continue;
@@ -3305,6 +3343,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 // candidate reaction is NOT fired — its tentative τ assumed the
                 // pre-event state and is discarded on the redraw.
                 t = t_event;
+                t_carry = 0.0;
                 psa_now = t; // GH #15 — keep the PSA dwell clock on t
                 sync_state(t);
                 const bool fired = fire_rising_edges(t);
@@ -3327,6 +3366,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
 
             // 8. Advance time unconditionally so time() stays current
             t = t_proposed;
+            t_carry = carry_next;
             psa_now = t; // GH #15 — keep the PSA dwell clock on t
             model.set_current_time(t);
             ++total_steps;

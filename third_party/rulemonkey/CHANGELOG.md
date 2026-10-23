@@ -7,6 +7,238 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.12.0] — 2026-10-22
+
+### Added
+
+- **Replicate ensembles: `run_ensemble()` and `rm_driver --reps` (issue
+  #113).** `run_ensemble(ts, EnsembleSpec{n_reps, n_threads,
+  keep_trajectories}, base_seed)` runs `n_reps` independent replicates on
+  worker threads and returns the per-time-point mean and sample standard
+  deviation (n - 1) of every observable and global function. Replicate `i`
+  is seeded `base_seed + i` and is bit-identical to `run(ts, base_seed + i)`,
+  so any one can be rerun alone. Statistics are folded in replicate order,
+  so the result is bit-identical for every thread count. Cancellation polls
+  the callback under a lock; a replicate's own exception stops only the
+  replicates numbered above it and is rethrown as itself, so the error
+  reported is the lowest-numbered one whatever the timing.
+
+  `rm_driver --reps N [--threads T] [--sd-out <path>]` writes the ensemble
+  mean as an ordinary `.gdat` on stdout and the SD in the same layout to
+  `--sd-out`, matching the `*.mean.tsv` / `*.std.tsv` reference pairs.
+  `--reps 1` prints exactly the single run. Single-trajectory output is
+  byte-identical to `main`.
+
+  `run()` on one simulator must still not be called from two threads at
+  once, since it re-applies overrides to the shared parsed model;
+  `run_ensemble()` is the supported way to parallelise one simulator.
+  `librulemonkey` now links `Threads::Threads`, and the installed package
+  config finds it for `find_package(RuleMonkey)` consumers.
+
+  A new `tsan` preset (`RULEMONKEY_ENABLE_TSAN`) and CI job run the
+  threaded tests under ThreadSanitizer.
+
+  A rule's "propensity clamped to 0" warning prints once for the whole
+  ensemble, not once per replicate. Like `run()`, `run_ensemble()` may be
+  called while a session is active.
+
+### Fixed
+
+- **A run from a late `t_start` lost its waiting times to rounding (issue
+  #110).** Since #98 the seed state sits at `t_start` on the model's
+  clock, and every event was placed at `t + tau` in doubles. Once the
+  total propensity times |t| neared 1e15, `tau` was below the spacing of
+  the doubles near `t` and was rounded away or up to a whole spacing. The
+  run fired too slowly or not at all, with no error. `A(s~0) -> A(s~1)` at
+  k = 0.5 from 1e5 copies, mean of 10 seeds at `t_start + 2` against
+  1e5·e⁻¹ = 36788: z = −290 from `t_start = 1e12`. From 1e13 the tolerance
+  for "this sample is at the start", 1e-12·|t_end|, was 10 time units, so
+  the sample at `t_start + 2` recorded the seed state. A run from 1e13 of
+  the same decay at `k + a*(time() - T0)` did not finish in 20 minutes; it
+  takes a fraction of a second now. RM now keeps the clock as an origin,
+  where each `run()`, `simulate()` or `step_to()` call starts, plus the time
+  elapsed since, and places events, samples and the clock-driven hazard's
+  panels on the elapsed part. `time()`, a TFUN's time
+  counter, the sample labels and the saved state read origin + elapsed. For
+  a model whose rates do not read the clock, a run, a session or a
+  `parameter_scan` from `t_start = 1e13` is the one from 0, draw for draw,
+  over a span the doubles there hold exactly;
+  a grid's points sit at `i*dt` past `t_start` even from 1e16, where their
+  labels round together. Only the clock a rate law reads is rounded, as it
+  is for BNG's network `simulate`. A run from `t_start = 0` is unchanged by
+  construction. `rm_driver --print-functions` output from `--t-start` 0 and
+  from 5 is byte-identical to `main` on all 262 XMLs under `tests/`, two
+  seeds each, rates that read the clock included.
+- **A session that reached an absorbing state kept the time of its last
+  event.** For a model whose rates do not read the clock, `simulate()` and
+  `step_to()` stopped without moving the clock to `t_end` once nothing could
+  fire, so the next `simulate()` from `t_end` was refused for starting after
+  the session's time. A session from an empty pool stayed at its start. The clock now goes to `t_end`, as it does
+  when a draw outlasts the call. `rm_driver --save-state` saved the last
+  event's time, so a `--load-state` continuation from `t_end` was refused:
+  split at half its run, 11 of the 262 XMLs under `tests/` failed so on
+  `main`. The other 251 continue byte-identically. In a `parameter_scan`
+  carry-over chain, the point after one that decays out now starts at that
+  point's `t_end`, not at its last event.
+- **An infinite `t_end` was accepted and went wrong.** `run({0, inf, 2})`
+  labelled its rows NaN, inf, inf and recorded every one at the end state.
+  With no grid, its two rows, labelled 0 and inf, both recorded the seed
+  state. A model that never stops firing never returned. With the fix
+  above, `step_to(inf)` on a pool that decays out would leave
+  `current_time()` at inf, a state `load_state` cannot read back. Every
+  run, `simulate()`, `step_to()`, ensemble and scan now refuses a `t_end`
+  that is not finite, as `initialize()` already refuses such a `t_start`.
+  `simulate()` also refuses a NaN segment start. Its tolerance check,
+  `|t_start - session time| > tol`, is false for NaN, so the call ran with
+  its first row labelled NaN. A NaN anywhere in `sample_times` is refused
+  as well. It passed the ascending-order check, then stalled the sample
+  cursor, so every later sample recorded the final state: with
+  `{0, NaN, 1, 2, 4}`, the rows at 1 and 2 held the state at 4.
+- **`simulate(TimeSpec)` ran a `t_end` before the session's time.** With
+  `sample_times` set, it checked only the last sample against the session's
+  time. A `t_end` before it ran nothing and labelled the session's state
+  with the later sample times. That includes `t_end` left at its default
+  0 on a session past 0, which is how `session_sample_times_test` called
+  it: its rows at 6.5, 8 and 10 were the state at 5, and the test checked
+  only their labels. It is now refused, as `simulate(t_start, t_end, n)`
+  refuses a `t_end` before the session's time. A caller that leaves
+  `t_end` unset with `sample_times` has to set it.
+- **Arrhenius rules ran at the wrong rate wherever the load-time expansion
+  could not represent an energy pattern's context, or the rule's own
+  (issue #109); they now run at BioNetGen's rate.** RM expanded each
+  Arrhenius rule at load into conventional rules with fixed rates. The
+  expansion turns each energy pattern holding the rule's bond into at most
+  one "this site of a center molecule is bound to anything" condition, and
+  builds every rule from the two bond sites alone. Outside what that can
+  express, it dropped or misapplied the context with no warning:
+  - It dropped an energy pattern carrying a state, one written with
+    wildcard bonds only (`L(r!+,r!+)`), and one whose context bond sits on
+    a second site named like the reaction site.
+  - It applied a pattern that requires a site free whether the site was
+    free or not, a `!+` on a site named like the reaction site whether the
+    other site was bound or not, and a context site's pattern whatever the
+    site was bound to.
+  - It applied context two bonds out whether it was there or not, and a
+    pattern with two context conditions when either was met.
+  - It counted once a pattern with a `!?` that BioNetGen counts more than
+    once, such as `L(r!1,r!?).R(l!1)` on `L(r,r,r)`, which BioNetGen
+    counts twice (k `!?` on m same-named components count C(m, k) times).
+  - It dropped any context in the rule's own reactant pattern, so
+    `A(b!1,s~1).B(a!1) -> A(b,s~1) + B(a)` unbound `A(s~0)` complexes too.
+
+  Measured on the issue's reproducers, each ran 48 to 52 standard errors
+  off BioNetGen's network. Results from 3.11.0 and earlier are wrong for
+  any such model.
+
+  The expansion is kept where it is exact, and such a model runs
+  byte-identical to before. Every other Arrhenius rule now runs as itself,
+  with dG counted at each firing as BioNetGen's network counts it per
+  reaction (new `energy_match.{hpp,cpp}`):
+  - The weight is matches divided by automorphisms, both counted by
+    BioNetGen's rules, so a `!+` lands on a `!?` and a `~?` needs a state.
+  - The sum runs over the energy patterns the bond changes, which for a
+    connected pattern are the matches on the bond's two sites.
+
+  The rule draws firings against per-molecule weights that bound its rate,
+  and keeps each with probability rate / bound. The weights are exact
+  unless an energy pattern has context on both sides of the bond. Such a
+  pattern is bounded, and split into one rule per class of its far side
+  where the bound would inflate the rate past e. Each class rule, named
+  with `_arr_cK` appended, keeps only the pairs in its class. A pattern
+  left bounded past that is reported with a warning.
+
+  This costs more per event than the expansion: 20 to 60 µs against
+  2.5 µs on a bivalent ligand–receptor system of 2,000 to 20,000
+  molecules, growing with the size of the complexes events touch.
+
+  Still refused, with the rule and the reason named:
+  - an Arrhenius rule that changes a state, makes or breaks two bonds,
+    closes a ring, binds a homodimer, or carries include/exclude
+    constraints;
+  - a rule off the expansion whose bond can reach an energy pattern joined
+    only by `.` and change it.
+
+  The issue's nine reproducers, nine more unbinding shapes and ten binding
+  ones are pinned against BNG2 in the new `arrhenius_context` (unbinding,
+  ode) and `arrhenius_context_bind` (reversible binding, ssa) oracle
+  models; main misses them by up to 61 standard errors on binding and by
+  an unbounded z on a rule that never fires there. `energy_match_test` pins the
+  counting against BioNetGen's species weights, `arrhenius_context_test`
+  what is still refused, and `arrhenius_set_param_test` the exact path
+  under an override.
+- **A rule labelled `_reverse_X` took the reverse half's phi (issue
+  #109).** BNG2 writes the reverse half of a reversible rule X as a rule
+  named `_reverse_X`, and that name is the only mark the XML carries, so RM
+  gave every Arrhenius rule of that name `1-phi`. A rule the modeler labels
+  `_reverse_X` is a rule as written, and BNG2 gives it `phi`: measured at
+  443 of 1000 complexes left at t = 2 under BNG2 against 645 under RM. A
+  rule is now read as a reverse half only if the model also has an
+  Arrhenius rule X with the same rate constants and the mirror-image bond
+  operation, which is what BNG2 writes for a reversible rule. Two
+  unidirectional rules, X and `_reverse_X`, that mirror each other and name
+  the same parameters for phi and Ea0 write the same XML as one reversible
+  rule, so they are still read as one. Pinned by five new columns of the
+  `arrhenius_formula` BNG2-oracle model: no rule X; an unrelated rule X; and
+  an Arrhenius rule X that differs from the mirror image in its rate
+  constants, its operation, or its sites. Before the fix, main misses the
+  first by 102 standard errors. Two more columns pin the lone `!+`, which
+  the expansion prices exactly and which stays accepted.
+- **A function settled ahead of a function it reads got a stale value
+  (issue #111).** RM settles the function table whenever the state it
+  reads moves, and it settled it in declaration order. BNG2 does not
+  promise that is a dependency order: 2.9.3's `writeXML` moves only a
+  function's direct references ahead of it, so a chain declared top down,
+  `a() = b()`, `b() = 2*c()`, `c() = k`, is written as `b, a, c`. `b()`
+  then read `c()` before `c()` was settled. With `0 -> B() a()` the rate
+  was 0 at the start, nothing fired to re-settle it, and `B` never
+  appeared; the reported `a` column still read 20. The same chain through
+  local functions, `l1(x) = k*2*l2(x)`, `l2(x) = l3(x) + 1`,
+  `l3(x) = A0(x)`, read `l3` at its global value instead of the
+  molecule's and started about 50 times too fast. Results from 3.11.0 and
+  earlier are wrong for any model whose XML lists a function ahead of one
+  it reads. The table is now settled in dependency order, computed once
+  per model. A cycle, a function reading itself included, has no value to
+  settle to, so such a model is now refused with an error.
+  `rm_driver --print-functions` output is byte-identical to `main` on all
+  242 XMLs under `tests/` that predate this fix.
+- **A table function indexed by a function crashed the process (issue
+  #111).** A `TFUN` with `ctrName` naming a global function, such as
+  `clock() = time()`, overflowed the stack on the first rate evaluation:
+  settling the table evaluated the TFUN's counter, and the counter asked
+  for the table to be settled first. The settle order above now puts each
+  TFUN after its counter function, and the TFUN reads the counter's settled
+  value. A `tfun()` index is not a reference BNG2 orders by at all, so a
+  TFUN can come ahead of its counter in any BNG2 version. A counter that is
+  itself a table with no expression used to read 0.
+- **A function that read a table function got the bare table value.** For
+  `f() = k*tfun(...)` the settled value of `f()` was the table value
+  without the `k`, so a function reading `f()`, such as a rate law
+  `kf*f()`, ran at the wrong rate, and the reported `f` column was wrong.
+  A rule whose rate law is `f()` itself computed it correctly. The settled
+  value is now the whole expression.
+- **A rate law that read `reactant_N()` through a helper function never
+  fired (issue #59).** RM binds the asking rule's reactant counts into the
+  placeholder before it evaluates the rule's rate law, but only for that
+  one evaluation. A rate law that reads the placeholder through another
+  function, `2*g()` with `g() = reactant_1()*kf()`, read `g`'s settled
+  value, computed with the placeholder at 0. The rate was 0 and the rule
+  never fired, with no error or warning. A helper read by two rules held
+  one rule's value: with `g()` as one rule's rate law and `3*g()` as
+  another's, the second rule ran at the first rule's count. A TFUN whose
+  counter reads the placeholder was not seen to read it at all. And
+  `reactant_1() TotalRate`, which BNG2 writes with the placeholder itself
+  as the rate function, read 0. Results from 3.11.0 and earlier are wrong
+  for any model with one of these shapes. Each evaluation of such a rate
+  law now re-evaluates the functions between it and the placeholder
+  against its own rule's counts. A reported helper reads its value against
+  the rule whose whole rate law it is, or else the first rule whose rate
+  law reads it; a function no rule reads reports with the placeholder at
+  0. A local rate law that reaches the placeholder through a helper is
+  refused at load, as one that reads it directly already was.
+  `rm_driver --print-functions` output is byte-identical to before this fix
+  on all 245 XMLs under `tests/` that predate it, with and without
+  `--ignore-unsupported`.
+
 ## [3.11.0] — 2026-10-13
 
 ### Changed
@@ -3370,7 +3602,8 @@ The legacy implementation, RuleMonkey 2.0.25, was introduced in:
 > RG. *RuleMonkey: software for stochastic simulation of rule-based
 > models.* BMC Bioinformatics 11:404 (2010). PMID: 20673321.
 
-[Unreleased]: https://github.com/richardposner/RuleMonkey/compare/v3.11.0...HEAD
+[Unreleased]: https://github.com/richardposner/RuleMonkey/compare/v3.12.0...HEAD
+[3.12.0]: https://github.com/richardposner/RuleMonkey/releases/tag/v3.12.0
 [3.11.0]: https://github.com/richardposner/RuleMonkey/releases/tag/v3.11.0
 [3.10.1]: https://github.com/richardposner/RuleMonkey/releases/tag/v3.10.1
 [3.10.0]: https://github.com/richardposner/RuleMonkey/releases/tag/v3.10.0

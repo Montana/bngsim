@@ -52,6 +52,7 @@ from bngsim._codegen import (
     _derived_expr_partials_numeric,
     _find_close_paren_strict,
     _inline_derived_param_refs,
+    _spell_mod,
     _split_top_level_commas,
 )
 from bngsim._exceptions import SensitivityUnsupportedError
@@ -454,7 +455,7 @@ def _condition_only_params(
 
     data = core.codegen_data()
     params = data["parameters"]
-    func_map = dict(core.functional_jacobian_context()["function_map"])
+    func_map = _scan_function_map(core.functional_jacobian_context())
 
     pats = {
         name: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
@@ -489,7 +490,7 @@ def _condition_only_params(
         if rxn.get("type") != "functional":
             continue
         fname = rxn.get("function_name")
-        body = func_map.get(fname) if fname else rxn.get("rate_expression")
+        body = func_map.get(fname) if fname else _spell_mod(rxn.get("rate_expression") or "")
         if body:
             bodies.append(_inline_functions(body, func_map) or body)
 
@@ -569,7 +570,7 @@ def texts_spell_a_switch(core) -> bool:
         return False
     return any(
         has_condition_construct(t)
-        or _STEP_CALL.search(t)
+        or _STEP_CALL.search(_spell_mod(t))
         or _RELATIONAL.search(t)
         or _BEND_CALL.search(t)
         for t in (*core.function_expressions, *core.param_expressions)
@@ -1881,6 +1882,11 @@ def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchCo
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
+    # As written, and not through _spell_mod: a derived parameter is a
+    # constant of the run, so a `%` in one switches nothing, and the
+    # resolvers that inline these texts decline a call they do not know.
+    # `thr = base % 10` read as `mod(base, 10)` lost the exact crossing of
+    # `time() > thr`, and with it the SSA's piecewise-constant rate (#1127).
     exprs = list(core.param_expressions)
     clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
@@ -2228,7 +2234,7 @@ def _function_slot_bodies(ctx) -> dict[str, str]:
     So the resolver inlines every one of them, and what the bodies read decides:
     time resolves, a parameter is read at its live value, and a species declines.
     """
-    return {n: b for n, b in dict(ctx["function_map"]).items() if isinstance(b, str)}
+    return {n: b for n, b in _scan_function_map(ctx).items() if isinstance(b, str)}
 
 
 def _inline_function_slots(expr: str, bodies: dict[str, str]) -> str:
@@ -2547,10 +2553,10 @@ def time_discontinuity_conditions(
             if not _unit_rate_clock_indices(core, clock_candidates):
                 return ()
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -3702,8 +3708,8 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
     if not conditions:
         return frozenset()
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    func_map = _scan_function_map(ctx)
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -5146,7 +5152,9 @@ def piecewise_constant_time_functions(
         return []
     out = []
     for name, expr in clock_functions:
-        rest = expr
+        # Spelled as the recovered conditions are (issue #1127), or a condition
+        # found in a `%` text could not be found in it again.
+        rest = _spell_mod(expr)
         for c in exact:
             rest = _remove_whole_atoms(rest, c)
         if not _ANY_CLOCK.search(rest):
@@ -5239,6 +5247,19 @@ _STEP_CALL = re.compile(
     r"(?:floor|ceil|round|roundn|rint|nint|trunc|frac|sign|sgn|mod|fmod|rem|iclamp|inrange)"
     r"\s*\("
 )
+
+
+def _scan_function_map(ctx) -> dict:
+    """``ctx["function_map"]`` with each body as the scanners read it (:func:`_spell_mod`)."""
+    return {
+        name: _spell_mod(body) if isinstance(body, str) else body
+        for name, body in dict(ctx["function_map"]).items()
+    }
+
+
+def _scan_rate_law(rxn) -> str:
+    """A functional reaction's rate law as the scanners read it (:func:`_spell_mod`)."""
+    return _spell_mod(str(rxn.get("rate_expr", "")))
 
 
 # Calls that bend rather than jump: continuous, with a slope that is not. A
@@ -5479,10 +5500,10 @@ def model_moving_crossings(core, ctx=None) -> tuple[str, ...]:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -5576,14 +5597,14 @@ def model_uncompensated_crossing_reason(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     # Reaction rate expressions only — the exact texts _functional_dfdp_terms
     # differentiates (frxn["rate_expr"] per functional reaction). A function that
     # no rate law reaches is inert here, so it is never scanned. Inlined BEFORE
     # the condition test and the recognizer, exactly as codegen inlines it: a
     # rate law written as a bare function name — or one nesting the condition a
     # level down — only reveals its ``if()`` after inlining.
-    texts = [str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]]
+    texts = [_scan_rate_law(r) for r in ctx["functional_reactions"]]
     flats = [_inline_functions(t, func_map) or t for t in texts]
     conditional = [f for f in flats if has_condition_construct(f)]
     if not conditional:
@@ -6666,7 +6687,7 @@ def fallback_crossing(
     requested = frozenset(sens_param_names)
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
-    exprs = list(core.param_expressions)
+    exprs = [_spell_mod(e) for e in core.param_expressions]
     derived = {
         param_names[i]: exprs[i] for i in range(len(param_names)) if is_expr[i] and exprs[i]
     }
@@ -6743,8 +6764,8 @@ def fallback_crossing(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    func_map = _scan_function_map(ctx)
+    texts = [_scan_rate_law(reaction) for reaction in ctx["functional_reactions"]]
     # A table a rate law reads is indexed by what its index reads, which the
     # law's text, ``tfun_g()``, does not show. Where the index is a function,
     # ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
@@ -7755,12 +7776,12 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         return []
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    bodies = list(func_map.values())
-    # Same cheap first gate as compute_switch_time_sens: no `if()` anywhere
-    # means no branch to cross, and no RHS probe is paid.
-    if not any(_IF_CALL.search(body) for body in bodies):
+    # Same cheap first gate as compute_switch_time_sens, on the raw bodies: no
+    # `if()` anywhere means no branch to cross, and no RHS probe is paid.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return []
+    func_map = _scan_function_map(ctx)
+    bodies = list(func_map.values())
 
     scope = switch_condition_scope(core, ctx)
     conditions: list[str] = []
@@ -7834,7 +7855,7 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
         return out
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -7856,7 +7877,7 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     if not wanted:
         return out
     for rxn in ctx["functional_reactions"]:
-        flat = inline(str(rxn.get("rate_expr", "")))
+        flat = inline(_scan_rate_law(rxn))
         hit: set[int] = set()
         if _IF_CALL.search(flat):
             for written in _iter_condition_atoms(flat):
@@ -7961,7 +7982,7 @@ def state_switch_root_conditions(
         return bool(
             _IF_CALL.search(text)
             or _RELATIONAL.search(text)
-            or _STEP_CALL.search(text)
+            or _STEP_CALL.search(_spell_mod(text))
             or _BEND_CALL.search(text)
         )
 
@@ -7969,7 +7990,7 @@ def state_switch_root_conditions(
         return ((), ()) if with_guards else ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -8028,7 +8049,7 @@ def state_switch_root_conditions(
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a
     # shared function's conditions once per rate law that reaches it.
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -8177,10 +8198,10 @@ def switch_gate_cache_digest(core, ctx=None) -> tuple:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     if not conditional:
@@ -9392,15 +9413,16 @@ def compute_switch_time_sens(
         return [], []
 
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
     # Cheapest possible gate, checked before anything else: a model with no
     # conditional rate law has no switch to find. On the RAW bodies, so a
     # genome-scale model with tens of thousands of functions and no `if()`
     # short-circuits before any inlining — inlining cannot create an `if()` that
-    # no body already has. Keeps the RHS probes and the sympy work off the path
-    # of every ordinary sensitivity run, including the per-row batch path.
-    if not any(_IF_CALL.search(body) for body in func_map.values()):
+    # no body already has, and neither can spelling a `%` as `mod()`. Keeps the
+    # RHS probes and the sympy work off the path of every ordinary sensitivity
+    # run, including the per-row batch path.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return [], []
+    func_map = _scan_function_map(ctx)
     # Inline function references before scanning, exactly as the issue #150 state
     # detector (:func:`state_switch_conditions`) already does — "the gate and the
     # detector must scan the SAME text". A clock threshold can hide behind a
@@ -9727,7 +9749,7 @@ def _threshold_scope(scope: SwitchConditionScope, ctx) -> ThresholdScope:
     exprs = dict(scope.derived_exprs)
     rule_bound = {
         name: body
-        for name, body in dict(ctx["function_map"]).items()
+        for name, body in _scan_function_map(ctx).items()
         if name in scope.param_idx and body
     }
     # `f(` anywhere means a call — a rule over floor()/if() is not arithmetic
@@ -9837,7 +9859,7 @@ def compute_event_time_sens(
     # parameter. Kept separate from `thresholds.exprs`, which admits only the
     # bodies that reduce to arithmetic over primaries.
     all_bodies = dict(scope.derived_exprs)
-    all_bodies.update({n: b for n, b in dict(ctx["function_map"]).items() if b})
+    all_bodies.update({n: b for n, b in _scan_function_map(ctx).items() if b})
     requested = set(names)
     # A requested parameter that is itself derived gets a column of its own, on
     # the same terms the rate-law switch times use (issue #475). Restricted to

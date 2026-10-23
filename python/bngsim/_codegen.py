@@ -16,6 +16,7 @@ Architecture (AMICI/libRoadRunner pattern):
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
@@ -515,6 +516,34 @@ _SHARD_UNIT_BLOCKS = 8
 # would rather under-subscribe RAM than OOM a shared node. Override (MB) with
 # BNGSIM_CODEGEN_MEM_PER_JOB.
 _DEFAULT_SHARD_MEM_MB = 512
+
+# The <math.h> constants a generated source can name, with <math.h>'s own digits
+# so the value is the same double whichever header defines it. M_PI and M_E come
+# from a rate law over the engine's _pi / _e; the rest from sympy's C printer,
+# which writes d/dp 10^p as pow(10, p)*M_LN10 and likewise for the other entries
+# of sympy.printing.c.get_math_macros(). <math.h> is not a dependable supplier:
+# MSVC defines none of them without _USE_MATH_DEFINES, glibc hides them in strict
+# C mode, and the MIR JIT strips the include outright, so each source that
+# stands alone defines all of them, #ifndef-guarded (GH #470).
+_MATH_CONSTANT_DEFINES = tuple(
+    line
+    for name, value in (
+        ("M_E", "2.7182818284590452354"),
+        ("M_LOG2E", "1.4426950408889634074"),
+        ("M_LOG10E", "0.43429448190325182765"),
+        ("M_LN2", "0.69314718055994530942"),
+        ("M_LN10", "2.30258509299404568402"),
+        ("M_PI", "3.14159265358979323846"),
+        ("M_PI_2", "1.57079632679489661923"),
+        ("M_PI_4", "0.78539816339744830962"),
+        ("M_1_PI", "0.31830988618379067154"),
+        ("M_2_PI", "0.63661977236758134308"),
+        ("M_2_SQRTPI", "1.12837916709551257390"),
+        ("M_SQRT2", "1.41421356237309504880"),
+        ("M_SQRT1_2", "0.70710678118654752440"),
+    )
+    for line in (f"#ifndef {name}", f"#define {name} {value}", "#endif")
+)
 
 # Portable codegen prelude, emitted once per translation unit. Each macro is
 # #ifndef-guarded so the RHS + sensitivity + jacobian + output sources
@@ -1755,6 +1784,137 @@ def _normalize_exprtk_operators(expr: str) -> str:
     return _parenthesize_relational_chains(s)
 
 
+# What ends the operand of a `%`: an operator that binds looser than `*`,
+# `/` and `%` do, or a comma.
+_LOOSER_THAN_PRODUCT = frozenset("<>=!&|?:;,")
+_LOOSER_WORDS = frozenset(("and", "or", "xor", "nand", "nor", "xnor"))
+_NUMBER_BEFORE_EXPONENT = re.compile(r"(?<![A-Za-z0-9_.])(?:\d+\.?\d*|\.\d+)[eE]$")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ExprTk groups with all three kinds of bracket.
+_BRACKET_CLOSES = {"(": ")", "[": "]", "{": "}"}
+_CLOSING_BRACKETS = frozenset(_BRACKET_CLOSES.values())
+
+
+class _UnbalancedBrackets(Exception):
+    """A bracket in a text :func:`_spell_mod` reads has no partner of its kind."""
+
+
+def _spell_mod(text: str) -> str:
+    """*text* with each ``a % b`` written ``mod(a, b)``.
+
+    ExprTk's ``%`` on doubles is ``std::fmod``, which is its ``mod()`` too, so
+    the two read the same everywhere. C has no ``%`` on doubles. The stop and
+    root scanners of :mod:`bngsim._switch_sensitivity` read named calls only
+    (``_STEP_CALL``), and a pulse written with the operator got no stop on a
+    clock and no root on a counter, and was stepped over: Y = 0 for 3.93
+    (issue #1127). ``%`` binds like ``*`` and ``/``, from the left, and tighter
+    than ``+`` and ``-``: ``a*b % c - d`` is ``mod(a*b, c) - d``. Quoted text
+    (a ``tfun`` file name) is left alone, and so is a text whose brackets do
+    not pair up, which ExprTk would not compile either.
+
+    The test for ``%`` comes before the cache, so the bodies without one,
+    nearly all of them, are not hashed into it: a model with more functions
+    than the cache holds evicted every entry on every scan of its bodies.
+    """
+    if "%" not in text:
+        return text
+    return _spell_mod_cached(text)
+
+
+@functools.lru_cache(maxsize=16384)
+def _spell_mod_cached(text: str) -> str:
+    try:
+        out, _ = _spell_mod_from(text, 0, None)
+    except _UnbalancedBrackets:
+        return text
+    return out
+
+
+def _spell_mod_from(text: str, i: int, closer: str | None) -> tuple[str, int]:
+    """:func:`_spell_mod` of *text* from *i* to *closer*, the bracket that
+    closes it (``None``: the end of the text)."""
+    out: list[str] = []
+    chain: list[tuple[str, str]] = []  # (operator before it, factor) in one product
+    op, factor = "", ""
+
+    def close_chain() -> None:
+        nonlocal op, factor
+        chain.append((op, factor))
+        if any(o == "%" for o, _ in chain):
+            lead = chain[0][1][: len(chain[0][1]) - len(chain[0][1].lstrip())]
+            trail = factor[len(factor.rstrip()) :]
+            acc = chain[0][1].strip()
+            for o, f in chain[1:]:
+                acc = f"mod({acc}, {f.strip()})" if o == "%" else f"{acc}{o}{f.strip()}"
+            out.append(lead + acc + trail)
+        else:
+            out.append("".join(o + f for o, f in chain))
+        chain.clear()
+        op, factor = "", ""
+
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in _BRACKET_CLOSES:
+            inner, i = _spell_mod_from(text, i + 1, _BRACKET_CLOSES[c])
+            factor += c + inner + _BRACKET_CLOSES[c]
+            continue
+        if c in _CLOSING_BRACKETS:
+            if c != closer:
+                raise _UnbalancedBrackets
+            close_chain()
+            return "".join(out), i + 1
+        if c in "'\"":
+            end = text.find(c, i + 1)
+            end = n if end < 0 else end + 1
+            factor += text[i:end]
+            i = end
+            continue
+        if c == "*" and text.startswith("**", i):
+            factor += "**"
+            i += 2
+            continue
+        if c in "*/%":
+            chain.append((op, factor))
+            op, factor = c, ""
+            i += 1
+            continue
+        if c in "+-":
+            before = factor.rstrip()
+            if (
+                before
+                and not before.endswith(("^", "**"))
+                and not (_NUMBER_BEFORE_EXPONENT.search(before))
+            ):
+                close_chain()
+                out.append(c)
+                i += 1
+                continue
+            factor += c
+            i += 1
+            continue
+        if c in _LOOSER_THAN_PRODUCT:
+            close_chain()
+            out.append(c)
+            i += 1
+            continue
+        word = _WORD.match(text, i) if c.isalpha() or c == "_" else None
+        if word:
+            if word.group() in _LOOSER_WORDS and factor.strip():
+                close_chain()
+                out.append(word.group())
+            else:
+                factor += word.group()
+            i = word.end()
+            continue
+        factor += c
+        i += 1
+    if closer is not None:
+        raise _UnbalancedBrackets
+    close_chain()
+    return "".join(out), n
+
+
 def _parenthesize_relational_chains(s: str) -> str:
     """Left-associate every run of two or more relationals within one operand.
 
@@ -2948,7 +3108,8 @@ def _direct_derived_partials(
         # sp.ccode skipped: d(E^n)/dn printed as pow(E,n)*log(E) and d(E^n)/dE
         # as n*pow(E,n)/E, both NaN at E = 0, so every sensitivity run on such
         # a model was refused while the same law written inline in a Functional
-        # rate was right (issue #720). The printing itself stays sp.ccode.
+        # rate was right (issue #720). The printing itself is sp.ccode's, but
+        # for integers, which print as double literals (_term_order.ccode).
         deriv = _guard_zero_base(deriv)
         try:
             # sp.ccode, with a sum's terms in an order that does not follow the
@@ -3677,20 +3838,16 @@ def _emit_sens_rhs_body(
     _emit("#include <math.h>")
     _emit("#include <string.h>")
     _emit("")
-    # The same block the two RHS sources open with. A rate constant written over
+    # The same block the RHS source opens with. A rate constant written over
     # the engine's _pi or _e reaches this source as M_PI/M_E (see
-    # _BUILTIN_CONSTANT_VALUES), and <math.h> is not a reliable source for
-    # either: MSVC defines neither without _USE_MATH_DEFINES, and glibc hides
-    # both in strict C mode. On the MIR JIT backend every "#include <...>" line
-    # is stripped before c2mir sees the source, so these two defines are the
-    # only place the names come from at all — which is what the prelude comment
-    # in include/bngsim/mir_jit.hpp says is supposed to be happening here.
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    # _BUILTIN_CONSTANT_VALUES), and sympy writes the chain rule through 10^p as
+    # M_LN10 (see _MATH_CONSTANT_DEFINES). On the MIR JIT backend every
+    # "#include <...>" line is stripped before c2mir sees the source, so these
+    # defines are the only place the names come from at all — which is what the
+    # prelude comment in include/bngsim/mir_jit.hpp says is supposed to be
+    # happening here.
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     _emit(f"#define N_SPECIES {n_sp}")
     _emit(f"#define N_PARAMS  {n_params}")
@@ -5517,6 +5674,9 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     # ExprTk's reading of =, <>, -- and relational chains made explicit before
     # anything else, since each is copied through as text (issue #734).
     result = _normalize_exprtk_operators(expr)
+    # ``a % b`` on doubles does not compile in C; ``mod()`` becomes ``fmod``
+    # below, which is what ExprTk's operator is (issue #1127).
+    result = _spell_mod(result)
     # if() must be expanded first so nested ternary structure is correct
     # before identifier rewriting touches anything.
     result = _replace_if_calls(result)
@@ -6545,12 +6705,8 @@ def generate_rhs_from_model(model) -> str:
     _emit("#include <stdlib.h>")
     _emit("#include <string.h>")
     _emit("")
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     # Layout MUST match CodegenUserDataForSO in cvode_simulator.cpp —
     # tfun_eval is invoked from this RHS for any tfun-backed function.
