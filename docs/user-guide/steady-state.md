@@ -97,17 +97,22 @@ largest species the solve starts with or reaches. Where neither `atol=` nor
 `atol="auto"` derives from the start (with a floor at the smallest species of
 the start above 1e-14 of its largest) and the scalar 1e-8: never looser than
 the parity test's march, and in a model in small units no coarser than the
-model. The runs are integrated at a hundredth of those tolerances, so that the
-run's own error is not read as a move.
+model. The runs are integrated at a hundredth of those tolerances, and a run
+that moves the state is taken again at a thousandth and a ten-thousandth: a
+drift moves the state at any of them, and the run's own error does not.
+BIOMD0000000211 moved by 194 tolerances at the criterion's own, and by 0.68 at
+a hundredth.
 
 **Where the solve stops.** The Newton step from the state to the root,
 `δ = −J⁻¹f` on the system with the conserved totals taken out, measured in the
 same tolerances, steers it: the march, the bursts and the KINSOL polish stop at
 a state under `tol` whose step is within tolerance (up to 512 unknowns). That
-is what takes the issue's cubic on from 0.894 to 1. The step decides nothing
-about `converged`: where it cannot be passed (a continuum of steady states,
-where it is singular but for rounding, or a species reaching 0 as 1/t) the
-march goes on to `max_time` and the two tests decide there.
+is what takes the issue's cubic on from 0.894 to 1. A march that stalls within
+a thousand tolerances of its root is given a short Newton polish there, kept
+if it passes the parity test and lands where the step said. The step decides
+nothing about `converged`: where it cannot be passed (a continuum of steady
+states, where it is singular but for rounding, or a species reaching 0 as 1/t)
+the march goes on to `max_time` and the two tests decide there.
 
 ```python
 ss = sim.steady_state()
