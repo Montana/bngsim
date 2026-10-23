@@ -1176,14 +1176,15 @@ struct SteadyStateOptions {
     double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
     // What `converged` asks of a state (issue #1001). "scaled" (the default):
     // the parity test below, and a run taken on from the state for max_time
-    // moves no species by more than rtol·|y_i| + atol_i (the march's own
-    // tolerances), and one from it kicked by a millionth of each species does
-    // not let the kick grow tenfold: what tells a state the system rests at
-    // from one under tol that a run leaves (a model in small units, or a slow
-    // one), an unstable root, or a kink with a floor. The Newton step from the
-    // state to the root within the same tolerances (to 512 unknowns) decides
-    // where the solve stops, not `converged`. A burst-free Newton solve
-    // (newton_burst false), which reports unstable roots, takes no runs.
+    // (at most 1e6) moves no species by more than rtol·|y_i| + atol_i (the
+    // march's own tolerances), and one from it kicked by a millionth of each
+    // species does not let the kick grow tenfold: what tells a state the system
+    // rests at from one under tol that a run leaves (a model in small units, or
+    // a slow one), an unstable root, or a kink with a floor. The Newton step
+    // from the state to the root within the same tolerances (to 512 unknowns)
+    // decides where the solve stops, not `converged`; the state it stops at is
+    // polished. A burst-free Newton solve (newton_burst false), which reports
+    // unstable roots, takes no runs and is decided by the parity test.
     // "residual": BNG2.pl's parity test alone, ||f(y)||_2 / n_species < tol,
     // a number in the model's units of concentration per time, kept for
     // comparisons with run_network.

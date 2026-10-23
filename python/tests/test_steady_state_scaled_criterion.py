@@ -340,7 +340,8 @@ def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
     # The step is not taken there, and the solve stops where the residual one
     # does: with KINSOL's stopping rule left at the scaled one, the polish ran
     # on past the residual's answer (BaruaBCR_2012 was never accepted, 18 s
-    # against 2 s). A run taken on from the state decides.
+    # against 2 s). That answer is polished, to a thousandth of tol, and a run
+    # taken on from it decides.
     path = tmp_path / "wide.net"
     path.write_text(_wide_net(260))
     out = {}
@@ -353,8 +354,8 @@ def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
     assert scaled.criterion == "scaled"
     assert math.isnan(scaled.newton_distance)
     assert scaled.continued_run_distance <= 1.0
-    assert scaled.n_steps == residual.n_steps
-    assert np.array_equal(scaled.concentrations, residual.concentrations)
+    assert scaled.residual < 1e-12
+    np.testing.assert_allclose(scaled.concentrations, residual.concentrations, rtol=1e-8)
 
 
 @pytest.mark.parametrize("name", ["BIOMD0000000252", "BIOMD0000000685"])
@@ -768,7 +769,6 @@ end functions
         (1e-9, 1e-6, 2.5e-10),
         (1e-9, 1e-6, 9e-10),
         (1e-12, 1e-6, 0.0),
-        (1e-20, 1e-30, 5e-21),
     ],
 )
 @pytest.mark.parametrize("jacobian", ["fd", "auto"])
@@ -778,14 +778,15 @@ def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, c, klo, x0,
     # jump through; the secant to 0 reads the law's own slope, 0, and where X
     # is too small for that secant to be read (9e-15, 3e-41), a forward quotient
     # at half the step grows across the jump.
-    # Where there is no step to take the runs decide, over max_time: of 1e-30
-    # they see nothing. A closed-form Jacobian of the switch is 0, and at
-    # klo = 1e-30 a run of 1 moves X by 1e-30, within its tolerance; on
-    # differenced columns a march of 1 from 9e-10 ends at X = -86, where X'
-    # is 1e-6 and its tolerance 1.7e-6.
+    # The step steers where the solve stops and decides nothing; the parity
+    # test and the runs decide, over max_time. (At c = 1e-20, klo = 1e-30 the
+    # drift is too slow to show in it: X moves by 1e-24 in 1e6, within its
+    # tolerance of 2.2e-24, and the state passes.) On differenced columns a
+    # march of 1 from 9e-10 ends at X = -86, where X' is 1e-6 and its
+    # tolerance 1.7e-6.
     path = tmp_path / "near_zero.net"
     path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0, c=c, klo=klo))
-    short = klo > 1e-20 and not (jacobian == "fd" and x0 == 9e-10)
+    short = not (jacobian == "fd" and x0 == 9e-10)
     for max_time in (1.0, 1e6) if short else (1e6,):
         ss = bngsim.Simulator(
             bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
@@ -994,7 +995,6 @@ def test_a_drift_too_slow_to_show_in_max_time_passes(tmp_path):
     path = tmp_path / "drift.net"
     path.write_text(DRIFT_NET.format(k=1e-20))
     ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state()
-    assert math.isinf(ss.newton_distance)
     assert ss.converged
 
 
@@ -1365,3 +1365,113 @@ def test_a_run_is_not_moved_by_its_own_error(data_dir):
     ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
     assert ss.converged
     assert ss.continued_run_distance <= 1.0
+
+
+# ─── What the second review found (issue #1001) ──────────────────────────────
+
+# 0 -> S at k0, S -> 0 at kd, from S = 1: S* = k0/kd, dS*/dkd = -k0/kd^2.
+FROM_ABOVE_NET = """begin parameters
+    1 k0  5e-14
+    2 kd  5e-3
+end parameters
+begin species
+    1 S() 1.0
+end species
+begin reactions
+    1 0 1 k0
+    2 1 0 kd
+end reactions
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_species_settling_far_below_its_start_has_its_root_and_column(tmp_path, method):
+    # Control: main's steps land on the root. S settles at 1e-11 from 1, at an
+    # atol of 1e-8: stopped within tolerance, S came back 0.4% off, and
+    # dS*/dkd with it, on the way to this change. The state is polished.
+    path = tmp_path / "from_above.net"
+    path.write_text(FROM_ABOVE_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method, sensitivity_params=["kd"]
+    )
+    assert ss.converged
+    assert ss.concentrations[0] == pytest.approx(5e-14 / 5e-3, rel=1e-9)
+    assert np.asarray(ss.sensitivity)[0, 0] == pytest.approx(-5e-14 / 5e-3**2, rel=1e-6)
+
+
+UNSTABLE_IN_A_LAW_ANT = """model ul
+  D = 0
+  X = 0.3
+  E = 10
+  J1: E -> X; k2*X^2
+  J2: X -> E; k3*X^3 + k1*X
+  J3: E + D -> D + D; kde*E*D
+  J4: D -> E; kd*D
+  k1 = 0.3; k2 = 1.3; k3 = 1.0; kde = 0.01; kd = 1.0
+end"""
+
+UNSTABLE_BESIDE_A_LOPSIDED_LAW_ANT = """model ui
+  B = 1e-6
+  A = 1e6
+  X = 0.3
+  J1: A -> B; kf*A
+  J2: B -> A; kr*B
+  J3: -> X; k2*X^2
+  J4: X -> ; k3*X^3 + k1*X
+  kf = 1e-12; kr = 1.0; k1 = 0.3; k2 = 1.3; k3 = 1.0
+end"""
+
+
+@pytest.mark.parametrize("text", [UNSTABLE_IN_A_LAW_ANT, UNSTABLE_BESIDE_A_LOPSIDED_LAW_ANT])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_an_unstable_root_in_or_beside_a_law_is_not_converged(text, method):
+    # The cubic's root at 0.3 in a law whose dependent sits at 0: its kick was
+    # dropped. Beside a law of A at 1e6 and B at 1e-6: B, the dependent, was
+    # kicked by 1 by A's millionth, and every species let move 5e14
+    # tolerances. A law's kicks are turned, or cut to its dependent's own.
+    model = bngsim.Model.from_antimony_string(text)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
+    assert not ss.converged
+    assert ss.continued_run_distance > 1.0
+
+
+@pytest.mark.parametrize("x0", [0.5, 0.9, 1.5])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_the_cubic_beside_a_species_at_1e6_reaches_its_root(tmp_path, x0, method):
+    # 1e-14 of the largest species was taken for dust, and X at 5e-10 beside
+    # Y at 1e6 was held to 1e-8: the issue's answers came back (0.894, 1.008,
+    # 0.443, and 0.3 by Newton). A species keeps its own size.
+    text = (
+        CUBIC_NET.format(s=1e-9, x0=x0)
+        .replace("end species", "    2 Y() 1e6\nend species")
+        .replace("end reactions", "    4 0 2 big\n    5 2 0 k\nend reactions")
+        .replace("end parameters", "    9 big 1e6\nend parameters")
+    )
+    path = tmp_path / "cubic_beside_big.net"
+    path.write_text(text)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method
+    )
+    assert ss.converged
+    assert ss.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("max_time", [1e8, 1e10])
+def test_a_long_max_time_does_not_lengthen_the_runs_past_the_default(data_dir, max_time):
+    # Taken on for max_time, the runs from BIOMD0000000038's steady state at
+    # 1e8 could not be taken to their time, and egfr_net's at 1e10 took 228 s;
+    # main converged on both.
+    path = str(data_dir / "BIOMD0000000038.xml")
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state(
+        max_time=max_time
+    )
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0
+
+
+def test_a_burst_free_solve_says_it_was_decided_by_the_residual_test(tmp_path):
+    # Control: main's default is the residual test.
+    sim = bngsim.Simulator(_cubic(tmp_path, 1.0, 0.5), method="ode")
+    [ss] = sim.steady_state_batch(states=[[0.5]], method="newton", newton_burst=False)
+    assert ss.converged
+    assert ss.criterion == "residual"

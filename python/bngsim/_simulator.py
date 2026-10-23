@@ -4393,17 +4393,28 @@ class Simulator:
         units (the issue's cubic at a scale of 1e-9 ran through zero), and
         ``"auto"`` alone none for a species that starts large and settles
         small: one decaying from 1e7 to 7e-4 was held to 0.1. ``"auto"``'s floor
-        here is the smallest species of the state above 1e-14 of its largest,
-        what double precision resolves beside it: a species a run left at
-        1e-22, or one declared at -1.6e-34 (MODEL2307110001), held every other
-        at 0 to that, and its march failed.
+        here is the smallest species the state holds that is not ``$``-fixed,
+        but not under double precision's resolution beside the largest: a
+        species a run left at 1e-22, or one declared at -1.6e-34
+        (MODEL2307110001), held every other at 0 to that, and its march
+        failed. Where every species takes the scalar it is passed as the
+        scalar, whose march is the residual criterion's: as a vector of equal
+        entries, BIOMD0000000252's stalled.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
             eff_rtol = self._rtol if rtol is None else rtol
             values = np.abs(np.asarray(state, dtype=float))
-            above = values[values > 1e-14 * float(values.max(initial=0.0))]
-            floor = float(above.min()) if above.size else None
+            free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
+            largest = float(free.max(initial=0.0))
+            positive = free[free > 0.0]
+            floor = (
+                max(float(positive.min()), float(np.finfo(float).eps) * largest)
+                if positive.size
+                else None
+            )
             own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
+            if np.all(own == self._atol):
+                return None
             return [float(v) for v in own]
         return atol
 
@@ -7395,9 +7406,10 @@ class Simulator:
 
             - ``"scaled"`` (default): the parity test,
               ``||f(y)||_2 / n_species < tol``, and the run test. A run taken
-              on from the state for ``max_time`` moves no species by more than
-              ``rtol·|y_i| + atol_i``, and one from it kicked by a millionth
-              of each species does not let the kick grow tenfold: what tells
+              on from the state for ``max_time`` (at most 1e6) moves no species
+              by more than ``rtol·|y_i| + atol_i``, and one from it kicked by a
+              millionth of each species does not let the kick grow tenfold:
+              what tells
               a state the system rests at from one under ``tol`` that a run
               leaves (a model in small units, or a slow one), and from an
               unstable root (the cubic's 0.3, from which nothing moves an
@@ -7406,7 +7418,8 @@ class Simulator:
               reaches. The Newton step ``δ = −J⁻¹f`` from the state to the
               root, within the same tolerances, decides where the solve stops
               (up to 512 unknowns), which takes the issue's cubic at a scale
-              of 1e-9 on from 0.894 to its root at 1; it decides nothing about
+              of 1e-9 on from 0.894 to its root at 1, and the state it stops at
+              is polished by KINSOL; the step decides nothing about
               ``converged``. ``mask`` says which species are measured, not
               which move: the step and the run move every species but a
               ``$``-fixed one and a masked one that nothing reads or that

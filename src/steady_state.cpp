@@ -5506,6 +5506,12 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
 static constexpr int kPolishIters = 10;
 static constexpr double kPolishFurthest = 1e3;
 
+// The longest the runs are taken on for, max_time being longer: the default
+// max_time. Taken on for 1e10, the runs from egfr_net's steady state took 228
+// s, and integrated their own error along directions nothing restores past
+// tolerance.
+static constexpr double kRunHorizonMost = 1e6;
+
 // The runs' step budget, in max_steps: integrated at a hundredth of the
 // criterion's tolerances, the run from BIOMD0000000211 needed more than its
 // 20,000 steps to reach 1e6, and at a thousandth MODEL1510230005's more than
@@ -5532,11 +5538,15 @@ static constexpr long kRunSteps = 50;
 // ratio's multiples, so that no symmetry of the model is kept, and each law's
 // dependent follows the unknowns so that the totals stay where they are: on a
 // neighbouring manifold a state the system rests at can be further than a
-// tolerance away. An unknown kicked below 0 is kicked the other way, and a
-// dependent so taken below 0 drops the kicks of its law's unknowns, not the
-// whole kick: scaled down to the room of one dependent at 4.6e-10, the kick
-// of a cubic beside it fell under the integrator's tolerance and its unstable
-// root at 0.3 was returned.
+// tolerance away. An unknown kicked below 0 is kicked the other way. A
+// dependent so taken below 0 turns its law's unknowns' kicks the other way,
+// and if that does not do, drops them; one kicked by more than ten
+// millionths of itself has them cut until it is not. Each law to its own
+// unknowns, not the whole kick: scaled down to the room of one dependent at
+// 4.6e-10, the kick of a cubic beside it fell under the integrator's
+// tolerance and its unstable root at 0.3 was returned; and a dependent at
+// 1e-6 kicked by 1 by its law's partner at 1e6 let every species move 5e14
+// tolerances, and an unstable root beside them go to its next root.
 static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                                     const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                     const std::vector<double> &y, double kick_size,
@@ -5551,17 +5561,21 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     if (kick_size > 0.0) {
         const SsDistanceSystem system = ss_distance_system(model, sub);
         const ConservationLaws &cl = system.laws;
-        std::vector<char> dropped(un, 0);
+        // Each unknown's share of its kick: turned the other way, cut, or 0, by
+        // the laws it is in.
+        std::vector<double> share_of(un, 1.0);
+        std::vector<char> turned(static_cast<size_t>(cl.n_laws), 0);
+        const auto size_of = [&](int i) {
+            const auto ui = static_cast<size_t>(i);
+            return std::max(std::abs(y[ui]),
+                            std::min(ss_species_atol(opts, i) / opts.rtol, largest));
+        };
         const auto build = [&]() {
             std::fill(kick.begin(), kick.end(), 0.0);
             for (int i : system.unknowns) {
                 const auto ui = static_cast<size_t>(i);
-                if (dropped[ui])
-                    continue;
-                const double size = std::max(
-                    std::abs(y[ui]), std::min(ss_species_atol(opts, i) / opts.rtol, largest));
                 const double share = 2.0 * std::fmod((i + 1) * 0.6180339887498949, 1.0) - 1.0;
-                double v = kick_size * size * share;
+                double v = kick_size * size_of(i) * share * share_of[ui];
                 if (y[ui] >= 0.0 && y[ui] + v < 0.0)
                     v = -v;
                 kick[ui] = v;
@@ -5581,18 +5595,26 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
             }
         };
         build();
-        for (int pass = 0; pass < cl.n_laws; ++pass) {
+        for (int pass = 0; pass <= 2 * cl.n_laws; ++pass) {
             bool more = false;
             for (int k = 0; k < cl.n_laws; ++k) {
-                const auto dep = static_cast<size_t>(cl.dependent[static_cast<size_t>(k)]);
-                if (!(y[dep] >= 0.0 && y[dep] + kick[dep] < 0.0))
-                    continue;
+                const int dep = cl.dependent[static_cast<size_t>(k)];
+                const auto ud = static_cast<size_t>(dep);
                 const auto &row = cl.coefficients[static_cast<size_t>(k)];
-                for (size_t i = 0; i < un; ++i) {
-                    if (i != dep && row[i] != 0.0 && kick[i] != 0.0 && !dropped[i]) {
-                        dropped[i] = 1;
-                        more = true;
+                const auto each = [&](double f) {
+                    for (size_t i = 0; i < un; ++i) {
+                        if (i != ud && row[i] != 0.0)
+                            share_of[i] *= f;
                     }
+                };
+                const double most = 10.0 * kick_size * size_of(dep);
+                if (y[ud] >= 0.0 && y[ud] + kick[ud] < 0.0) {
+                    each(turned[static_cast<size_t>(k)] ? 0.0 : -1.0);
+                    turned[static_cast<size_t>(k)] = 1;
+                    more = true;
+                } else if (std::abs(kick[ud]) > most) {
+                    each(most / std::abs(kick[ud]));
+                    more = true;
                 }
             }
             if (!more)
@@ -5615,6 +5637,7 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     }
 
     SteadyStateOptions run_opts = opts;
+    run_opts.max_time = std::min(opts.max_time, kRunHorizonMost);
     run_opts.rtol = opts.rtol * tighter;
     run_opts.atol = opts.atol * tighter;
     for (double &a : run_opts.atol_vec)
@@ -5633,13 +5656,13 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
         double left = 0.0;
         run.march(0.0, &left);
         for (int again = 0; again < kHoldRestarts && run.integrator_failed() &&
-                            run.time() < opts.max_time && !run.out_of_steps();
+                            run.time() < run_opts.max_time && !run.out_of_steps();
              ++again) {
             if (!run.restart_at_zero(y))
                 break;
             run.march(0.0, &left);
         }
-        if (!run.integrator_failed() && run.time() >= opts.max_time) {
+        if (!run.integrator_failed() && run.time() >= run_opts.max_time) {
             const std::vector<double> end = run.make_result(false, left).concentrations;
             moved = 0.0;
             for (int i : sub.included) {
@@ -5686,17 +5709,20 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
 // kicked across it the run chatters on to another state, Calcium at 188 for
 // 958.
 //
-// An unkicked run that moves the state is taken again at a tenth and then a
-// hundredth of its tolerances: a drift is a drift at any of them, and the
-// run's own error is not. At a hundredth of the criterion's, BIOMD0000000038
-// moved by 1.41 tolerances and by 0.46 at a thousandth; BIOMD0000000211 by 194
-// at the criterion's own, and by 0.68 at a hundredth.
+// An unkicked run that moves the state is taken again at a tenth of its
+// tolerances: a drift is a drift at either, and the run's own error is not.
+// Above kNewtonDistanceMost unknowns it is not: there the run at a tenth
+// took multisite_phos (1026 species) 34 s, to main's whole solve's 0.8. The
+// kicked run, asked only that the kick not grow tenfold, is integrated at the
+// criterion's own tolerances. At a hundredth of the
+// criterion's, BIOMD0000000038 moved by 1.41 tolerances and by 0.46 at a thousandth;
+// BIOMD0000000211 by 194 at the criterion's own, and by 0.68 at a hundredth.
 static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
                                const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                const std::vector<double> &y) {
     double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, 1e-2);
-    for (double tighter : {1e-3, 1e-4}) {
-        if (!(still > 1.0) || !std::isfinite(still))
+    for (double tighter : {1e-3}) {
+        if (!opts.criterion_by_distance || !(still > 1.0) || !std::isfinite(still))
             break;
         const double again = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, tighter);
         if (!std::isfinite(again))
@@ -5705,7 +5731,7 @@ static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
     }
     if (!(still <= 1.0))
         return still;
-    return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick, 1e-2));
+    return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick, 1.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -5912,11 +5938,16 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
             opts.criterion_by_distance
                 ? ss_newton_distance(model, rhs, *effective, sub, result.concentrations.data())
                 : std::numeric_limits<double>::quiet_NaN();
-        // A march that stalled short of its root by a step's worth is polished
-        // there: BIOMD0000000685's stopped 1.62 tolerances from it, and
-        // BIOMD0000000252's 1.64 at a residual of 2.1e-7. The polish is kept
-        // where it passes the parity test; the runs then decide.
-        if (result.newton_distance > 1.0 && result.newton_distance <= kPolishFurthest) {
+        // The state the solve stopped at is polished where it is within a
+        // step's worth of its root: a march that stalled short of it
+        // (BIOMD0000000685's 1.62 tolerances from it, BIOMD0000000252's 1.64
+        // at a residual of 2.1e-7), and one that stopped within tolerance, so
+        // that dY_ss/dp is that of the root and not of a state a tolerance
+        // off it (a species settling at 1e-11 from 1, at atol 1e-8, came back
+        // 0.4% off with its column). The polish is kept where it passes the
+        // parity test; the runs then decide. Above kNewtonDistanceMost
+        // unknowns, where there is no step, always.
+        if (std::isnan(result.newton_distance) || result.newton_distance <= kPolishFurthest) {
             std::vector<double> held(static_cast<size_t>(ns));
             model.get_state_into(held.data());
             try {
@@ -5925,6 +5956,13 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 // reports success only where its steps stop.
                 SteadyStateOptions polish = *effective;
                 polish.criterion_by_residual = true;
+                // Above kNewtonDistanceMost unknowns KINSOL stops by the
+                // residual test, which the state passes already: asked for a
+                // thousandth of tol, it takes multisite_phos (1026 species) to
+                // its root, where the runs, from 3.8 tolerances off it, had
+                // taken 246 s to settle the run's own error.
+                if (!effective->criterion_by_distance)
+                    polish.tol = effective->tol * 1e-3;
                 SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, result.concentrations,
                                                      nullptr, kPolishIters);
                 if (p.converged && static_cast<int>(p.concentrations.size()) == ns) {
@@ -6155,7 +6193,11 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
     // closed form that stopped the march read +inf at nn_xor.bngl's Newton
     // root, which the differenced one had accepted. (dY_ss/dp can step the
     // state on, so it is measured again where it is returned.)
-    result.criterion = opts.criterion;
+    // A burst-free Newton solve under "scaled" is decided by the residual test
+    // alone, and says so.
+    result.criterion = (opts.criterion == "scaled" && method == "newton" && !opts.newton_burst)
+                           ? "residual"
+                           : opts.criterion;
     if (opts.criterion_by_distance && static_cast<int>(result.concentrations.size()) == ns) {
         result.newton_distance =
             ss_newton_distance(model, rhs, *effective, sub, result.concentrations.data());

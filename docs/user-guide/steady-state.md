@@ -83,36 +83,47 @@ the parity test **and** the run test:
 
 - **The parity test**, `||f(y)||_2 / n_species < tol`, as `run_network -c`
   asks it. No state that test refuses is converged under the default.
-- **The run test.** A run taken on from the state for `max_time` moves no
-  species by more than its tolerance, `rtol·|y_i| + atol_i`, and a run from the
-  state kicked by a millionth of each species (the conserved totals kept) does
-  not let the kick grow tenfold. The unkicked run sees a state under `tol` that
-  the dynamics leave: BIOMD0000000407, under `tol` where it starts, is still
-  moving at 1e6. The kicked one sees an unstable root, which a run from exactly
-  on it does not leave: the cubic's 0.3 is a root in floating point.
+- **The run test.** A run taken on from the state for `max_time` (at most
+  1e6, the default) moves no species by more than its tolerance,
+  `rtol·|y_i| + atol_i`, and a run from the state kicked by a millionth of each
+  species does not let the kick grow tenfold. The unkicked run sees a state
+  under `tol` that the dynamics leave: BIOMD0000000407, under `tol` where it
+  starts, is still moving at 1e6. The kicked one sees an unstable root, which
+  a run from exactly on it does not leave: the cubic's 0.3 is a root in
+  floating point.
 
 `atol_i` is the march's own absolute tolerance, never more than `rtol` times the
 largest species the solve starts with or reaches. Where neither `atol=` nor
 `set_tolerances` gives one, each species is marched at the smaller of what
-`atol="auto"` derives from the start (with a floor at the smallest species of
-the start above 1e-14 of its largest) and the scalar 1e-8: never looser than
-the parity test's march, and in a model in small units no coarser than the
-model. The runs are integrated at a hundredth of those tolerances, and a run
-that moves the state is taken again at a thousandth and a ten-thousandth: a
-drift moves the state at any of them, and the run's own error does not.
+`atol="auto"` derives from the start and the scalar 1e-8: never looser than the
+parity test's march, and in a model in small units no coarser than the model.
+`"auto"`'s floor here is the smallest species the start holds that is not
+`$`-fixed, but not under double precision's resolution beside the largest, so
+that a species left at 1e-22 by a run does not hold every other at 0 to that.
+Where every species takes the scalar, the march is the parity test's own.
+
+The unkicked run is integrated at a hundredth of those tolerances, and where
+it moves the state it is taken again at a thousandth (up to 512 unknowns): a
+drift moves the state at either, and the run's own error does not.
 BIOMD0000000211 moved by 194 tolerances at the criterion's own, and by 0.68 at
-a hundredth.
+a hundredth. The kicked run is integrated at the criterion's own. Its kick
+keeps the conserved totals: a law's dependent that the kick would take below
+0 turns its law's kicks the other way, and one kicked by more than ten
+millionths of itself has them cut, so that one species does not stand in for
+the whole kick.
 
 **Where the solve stops.** The Newton step from the state to the root,
 `δ = −J⁻¹f` on the system with the conserved totals taken out, measured in the
 same tolerances, steers it: the march, the bursts and the KINSOL polish stop at
 a state under `tol` whose step is within tolerance (up to 512 unknowns). That
-is what takes the issue's cubic on from 0.894 to 1. A march that stalls within
-a thousand tolerances of its root is given a short Newton polish there, kept
-if it passes the parity test. The step decides
-nothing about `converged`: where it cannot be passed (a continuum of steady
-states, where it is singular but for rounding, or a species reaching 0 as 1/t)
-the march goes on to `max_time` and the two tests decide there.
+is what takes the issue's cubic on from 0.894 to 1. The state the solve stops
+at is then polished by KINSOL where its step is within a thousand tolerances
+(above 512 unknowns, to a thousandth of `tol`), and the polish kept if it
+passes the parity test: that takes a march that stalled short of its root the
+rest of the way, and makes dY_ss/dp that of the root. The step decides nothing
+about `converged`: where it cannot be passed (a continuum of steady states,
+where it is singular but for rounding, or a species reaching 0 as 1/t) the
+march goes on to `max_time` and the two tests decide there.
 
 ```python
 ss = sim.steady_state()
@@ -133,9 +144,23 @@ What it does not do:
   state with Calcium at 188, not 958.
 - **A kicked run that cannot be taken to its time** refuses, as on a neutral
   cycle, where the kick goes round for good.
+- **An absent species that would invade** is kicked like any other, and the
+  state refused where it grows: SIR with `I = 0` and `beta·S/gamma > 1`, a
+  disease-free state the epidemic leaves, is not converged. A state where
+  every species is 0 has no size to kick at, and is not kicked.
+- **A species that starts at 0 and settles below `rtol` times the largest**
+  counts as nothing: it is resolved to that, not to its own size.
+- **Where every species starts at 0** the start has no size, and the march
+  takes the scalar 1e-8; a model whose species settle far below that is
+  resolved only to it (a `$Src`-fed dimer at 1e-10 is marched through zero and
+  refused).
+- **Above 512 unknowns** an unkicked run that its own error moves past
+  tolerance refuses: taken again at a thousandth of the tolerances it cost
+  multisite_phos 34 s.
 - **A burst-free Newton solve** (`steady_states()`, or `newton_burst=False`)
   takes no runs. KINSOL is taken to the root and the root accepted by the
-  parity test; the multistart labels unstable roots instead.
+  parity test, and `criterion` says `"residual"`; the multistart labels
+  unstable roots instead.
 
 `criterion="residual"` keeps the parity test alone for comparisons with
 `run_network`: it takes no run and no step, and `newton_distance` and
