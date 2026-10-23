@@ -72,7 +72,8 @@ python run.py --replicates 40     # larger correctness ensemble
 
 `run_network` is located via `BNGPATH` / `RUN_NETWORK` (see the
 top-level `benchmarks/README.md`). Results are written to the
-git-ignored `results/` (`psa_results.json` + `psa_results.md`).
+git-ignored `results/` (`psa_results.json` + `psa_results.md`), or to
+the directory `--out` names.
 
 ## BNGsim-only warm timing
 

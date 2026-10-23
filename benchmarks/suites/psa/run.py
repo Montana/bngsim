@@ -352,7 +352,7 @@ def main():
     parser.add_argument("--runs", type=int, default=nb.DEFAULT_RUNS, help="Timing timed runs.")
     parser.add_argument(
         "--out",
-        type=Path,
+        type=lambda p: Path(p).resolve(),
         default=RESULTS_DIR,
         help="Directory for psa_results.json and psa_results.md (default: results/ beside "
         "this script). A caller aims a run elsewhere with it (issue #551).",

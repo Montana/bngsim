@@ -846,7 +846,7 @@ def main():
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument(
         "--out",
-        type=Path,
+        type=lambda p: Path(p).resolve(),
         default=RESULTS_DIR,
         help="Directory for steady_state_results.json and steady_state_results.md "
         "(default: results/ beside this script). A caller aims a run elsewhere with it "

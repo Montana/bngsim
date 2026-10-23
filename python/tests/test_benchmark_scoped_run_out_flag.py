@@ -279,3 +279,27 @@ def test_gen_networks_resumes_from_the_manifest_it_writes(gen_networks):
         "main() reaches the committed cache or manifest without going through resolve_out()"
     )
     assert "gen_one, j, bng2_pl, args.timeout, nets" in main
+
+
+def test_a_relative_out_is_made_absolute(gen_networks, tmp_path, monkeypatch):
+    """A relative ``--out`` was used as given: convert_all.py logged ``conv/x.xml``,
+    which reads like a path inside the suite (the default's form) though it is
+    relative to wherever the run started. Every runner resolves it."""
+    monkeypatch.chdir(tmp_path)
+    nets, manifest = gen_networks.resolve_out(argparse.Namespace(out=Path("scratch")))
+    assert nets.is_absolute() and manifest.is_absolute()
+    assert nets == (tmp_path / "scratch" / "nets").resolve()
+
+    convert_all = _load("ssa_table5/convert_all.py", "convert_all_under_test")
+    try:
+        out = convert_all.build_parser().parse_args(["--out", "conv"]).out
+        assert out == (tmp_path / "conv").resolve()
+        assert convert_all._shown(out / "x.xml") == str(out / "x.xml")
+        assert convert_all._shown(convert_all.OUT / "x.xml") == "results/converted/x.xml"
+    finally:
+        sys.modules.pop("convert_all_under_test", None)
+
+    for rel in ("psa/run.py", "steady_state/run.py"):
+        src = (SUITES_DIR / rel).read_text()
+        block = src[src.index('"--out",') :][:200]
+        assert "Path(p).resolve()" in block, f"{rel} takes --out without resolving it"

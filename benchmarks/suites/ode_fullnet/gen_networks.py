@@ -233,7 +233,8 @@ def resolve_out(args) -> tuple[Path, Path]:
     """
     if args.out is None:
         return NETS, MANIFEST
-    return args.out / "nets", args.out / "nets_manifest.json"
+    out = Path(args.out).resolve()
+    return out / "nets", out / "nets_manifest.json"
 
 
 def load_manifest(manifest: Path = MANIFEST) -> dict:
@@ -264,7 +265,9 @@ def main(argv=None) -> int:
         type=Path,
         default=None,
         help="Directory for the run's nets/ and nets_manifest.json, read for resume and "
-        "written (default: nets/ and the committed nets_manifest.json beside this script).",
+        "written (default: nets/ and the committed nets_manifest.json beside this script). "
+        "run_timing.py, run_forced.py and run_s3_timing.py read the default only: a cache "
+        "aimed elsewhere is for the caller, not for them.",
     )
     args = ap.parse_args(argv)
     nets, manifest = resolve_out(args)

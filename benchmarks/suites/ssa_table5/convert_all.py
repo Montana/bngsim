@@ -91,7 +91,8 @@ def _dropped_events(rep) -> bool:
 
 def _shown(path: Path) -> str:
     """A written path as the log records it: relative to this suite when it is
-    under it (the committed default), absolute when --out aimed it elsewhere."""
+    under it (the committed default), absolute when --out aimed it elsewhere
+    (``--out`` is resolved when parsed, so a relative one is absolute here too)."""
     try:
         return str(path.relative_to(HERE))
     except ValueError:
@@ -224,10 +225,12 @@ def build_parser():
     )
     ap.add_argument(
         "--out",
-        type=Path,
+        type=lambda p: Path(p).resolve(),
         default=OUT,
         help="Directory for the converted models and conversion_log.json "
-        "(default: results/converted/ beside this script).",
+        "(default: results/converted/ beside this script). The ssa_table5 runners read "
+        "the default only (_ssa_config.CONVERTED): a conversion aimed elsewhere is for "
+        "the caller, not for them.",
     )
     return ap
 
