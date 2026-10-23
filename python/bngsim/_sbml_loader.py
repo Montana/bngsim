@@ -7622,14 +7622,31 @@ def _build_model_from_sbml_doc_in_context(doc):
     # and bngsim's own `.net` → SBML export writes `_rateLaw_<rid>` out as a real
     # parameter — so re-importing that file collided on the first reaction and
     # `ModelBuilder::validate` rejected the model outright. Uniquifying covers the
-    # pre-existing hazard as well.
-    _taken_param_names: set[str] = {
-        _safe_name(sbml_model.getParameter(j).getId())
-        for j in range(sbml_model.getNumParameters())
-    } | {
-        _safe_name(sbml_model.getCompartment(j).getId())
-        for j in range(sbml_model.getNumCompartments())
-    }
+    # pre-existing hazard as well. A species' id is a symbol of its own too, and
+    # a reaction's id the function its rate law is read by: a function the
+    # loader names after either overwrote it or failed to register (#1124).
+    _taken_param_names: set[str] = (
+        {
+            _safe_name(sbml_model.getParameter(j).getId())
+            for j in range(sbml_model.getNumParameters())
+        }
+        | {
+            _safe_name(sbml_model.getCompartment(j).getId())
+            for j in range(sbml_model.getNumCompartments())
+        }
+        | {_safe_name(sp.getId()) for sp in sbml_model.getListOfSpecies()}
+        | {
+            _safe_name(element.getId())
+            for rxn in sbml_model.getListOfReactions()
+            for element in (
+                rxn,
+                *rxn.getListOfReactants(),
+                *rxn.getListOfProducts(),
+                *rxn.getListOfModifiers(),
+            )
+            if element.getId()
+        }
+    )
 
     def _unique_param_name(base: str) -> str:
         name = base

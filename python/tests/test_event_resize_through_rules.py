@@ -689,34 +689,47 @@ def test_the_limit_is_the_length_written_out(monkeypatch):
     assert _rsz(bngsim.Model.from_sbml_string(xml))
 
 
-def test_a_function_is_not_named_as_one_of_the_model_s_parameters():
-    """A parameter _rsz_e_cv_r1 = 0.25, read by J: A -> B, was bound to the
-    function of that name (#266), which wrote r1's value after the event, 3,
-    over it at every step: B(4) = 12 for 1."""
+@pytest.mark.parametrize("kind", ["parameter", "reaction", "species"])
+def test_a_function_is_not_named_as_one_of_the_model_s_symbols(kind):
+    """``_rsz_e_cv_r1``, 0.25, read by J: A -> B as a parameter, as the
+    reaction's own id, or as a species. A function of that name was bound to
+    the parameter (#266), or took the place of the reaction's rate law, and
+    wrote r1's value after the event, 3, over it: B(4) = 12 for 1. Beside a
+    species of that name the model failed to load."""
     taken = "_rsz_e_cv_r1"
     assert taken in _rsz(bngsim.Model.from_sbml_string(_diamond_doc(26)))
-    boundary = (
-        '<species id="A" compartment="c0" initialConcentration="1" '
-        'hasOnlySubstanceUnits="false" boundaryCondition="true" constant="true"/>'
-        + _species("B", "c0", 0)
-    )
     a, b = (f'<speciesReference species="{s}" stoichiometry="1" constant="true"/>' for s in "AB")
-    reaction = f"""<listOfReactions><reaction id="J" reversible="false">
+    held = (
+        '<species id="{}" compartment="c0" initialConcentration="{}" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="true" constant="true"/>'
+    )
+    species = held.format("A", 1) + _species("B", "c0", 0)
+    params = ""
+    rid, law = "J", _apply("times", _ci(taken), _ci("A"))
+    if kind == "parameter":
+        params = _param(taken, 0.25, True)
+    elif kind == "species":
+        species += held.format(taken, 0.25)
+    else:
+        rid, law = taken, _apply("times", _cn(0.25), _ci("A"))
+    reaction = f"""<listOfReactions><reaction id="{rid}" reversible="false">
   <listOfReactants>{a}</listOfReactants><listOfProducts>{b}</listOfProducts>
-  <kineticLaw><math {M}>{_apply("times", _ci(taken), _ci("A"))}</math></kineticLaw>
+  <kineticLaw><math {M}>{law}</math></kineticLaw>
  </reaction></listOfReactions>"""
     xml = (
         _diamond_doc(26)
         .replace(_comp("cv"), _comp("cv") + '<compartment id="c0" size="1" constant="true"/>')
-        .replace(_species("Sn", "cv", 5), _species("Sn", "cv", 5) + boundary)
-        .replace("<listOfParameters>", f"<listOfParameters>{_param(taken, 0.25, True)}")
+        .replace(_species("Sn", "cv", 5), _species("Sn", "cv", 5) + species)
+        .replace("<listOfParameters>", f"<listOfParameters>{params}")
         .replace("<listOfEvents>", reaction + "<listOfEvents>")
     )
     model = bngsim.Model.from_sbml_string(xml)
-    assert _rsz(model) and taken not in model.function_names
+    # The helper takes a name of its own; a reaction's rate law keeps its id.
+    assert f"{taken}_1" in model.function_names
+    assert model.function_names.count(taken) == (kind == "reaction")
     result = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 4.0), n_points=9)
     names = list(result.species_names)
-    species = np.asarray(result.species)
-    np.testing.assert_allclose(species[:, names.index("B")], 0.25 * result.time, rtol=1e-8)
-    sn = species[:, names.index("Sn")]
+    values = np.asarray(result.species)
+    np.testing.assert_allclose(values[:, names.index("B")], 0.25 * result.time, rtol=1e-8)
+    sn = values[:, names.index("Sn")]
     np.testing.assert_allclose(sn[3:], 5 * _diamond_size(26, 1.0, 1) / _diamond_size(26, 1.0, 2))
