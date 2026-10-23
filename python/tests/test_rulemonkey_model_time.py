@@ -195,6 +195,35 @@ def test_a_time_indexed_table_function_from_a_late_start(tmp_path):
     _assert_mean(runs, 100 * q, 100 * q * (1 - q))
 
 
+# ── #1063: a time-indexed table far from t = 0 ───────────────────────────────
+
+
+@pytest.mark.parametrize("t0", [1e12, 1e13])
+@pytest.mark.parametrize("path", ["run", "session"])
+def test_a_time_indexed_table_keeps_its_waiting_times_far_from_t0(tmp_path, t0, path):
+    """From t0 >= 2 the step table reads 20, so 10^4 X(p~1) leave at 20 and come
+    back at 0.001: a total propensity of 2e5, whose waiting times are below the
+    spacing of the doubles near t0. A table indexed by time is not offset, so the
+    run is on model time, and bngsim refused a span this short there until
+    RuleMonkey 3.12.0 put its events and its clock panels on elapsed time
+    (richardposner/RuleMonkey#110)."""
+    n, dephos = 10_000, 0.001
+    xml = _tfun_variant(tmp_path, 0, n, dephos)
+    span = (t0 + 0.05) - t0  # the span the doubles near t0 hold
+    T = [t0, t0 + span]
+    runs = []
+    for seed in range(1, 41):
+        if path == "run":
+            runs.append(_rm(xml, seed, sample_times=T).observables["X_phos"])
+        else:
+            with bngsim.RuleMonkeySession(str(xml)) as s:
+                s.initialize(seed=seed, t_start=t0)
+                runs.append(s.simulate(sample_times=T).observables["X_phos"])
+    rate = dephos + 20.0
+    q = dephos / rate + (1 - dephos / rate) * np.exp(-rate * np.array([0.0, span]))
+    _assert_mean(runs, n * q, n * q * (1 - q))
+
+
 # ── Sessions on model time ───────────────────────────────────────────────────
 
 
@@ -336,17 +365,21 @@ def test_a_span_that_is_not_finite_is_refused(xml):
         assert s.simulate(0.0, 1.0, n_points=2).n_times == 2
 
 
-def test_a_clock_too_coarse_to_integrate_over_is_refused():
+def test_a_short_span_far_from_t0_runs():
     """At t = 1e13 the doubles are 0.002 apart, and a span of 2 has integration
-    panels of 0.002: on model time RuleMonkey fired nothing where a constant rate
-    written through time() should have left 135 of 1000. A model with a table
-    indexed by time still runs on model time, and refuses such a span, one-shot
-    and in a session. A longer span, or one nearer 0, runs.
+    panels of 0.002: on model time RuleMonkey 3.11.0 fired nothing where a
+    constant rate written through time() should have left 135 of 1000.
 
     A model that reads the clock through its functions integrates on elapsed
     time since issue #1063, one-shot and in a session, and reads the clock as
     time() + t_start: 0.02 * 1e13 per molecule clears all 1000 in the first
-    instant, as the closed form exp(-0.02 * (t^2 - t0^2) / 2) does."""
+    instant, as the closed form exp(-0.02 * (t^2 - t0^2) / 2) does.
+
+    A model with a table indexed by time runs on model time, where bngsim
+    refused such a span until RuleMonkey 3.12.0 placed its events and panels on
+    elapsed time (richardposner/RuleMonkey#110). It now runs one-shot, as a
+    session segment and as a step; its values are checked against the closed
+    form in test_a_time_indexed_table_keeps_its_waiting_times_far_from_t0."""
     span = (1e13, 1e13 + 2.0)
     a = np.asarray(_rm(f"{RAMP}.xml", 1, t_span=span, n_points=3).observables["A0"])
     np.testing.assert_array_equal(a, [1000, 0, 0])
@@ -355,14 +388,14 @@ def test_a_clock_too_coarse_to_integrate_over_is_refused():
         a = np.asarray(s.simulate(*span, n_points=3).observables["A0"])
     np.testing.assert_array_equal(a, [1000, 0, 0])
 
-    with pytest.raises(bngsim.SimulationError, match="too coarse"):
-        _rm(TFUN, 1, t_span=span, n_points=3)
+    assert _rm(TFUN, 1, t_span=span, n_points=3).n_times == 3
     with bngsim.RuleMonkeySession(str(TFUN)) as s:
         s.initialize(seed=1, t_start=span[0])
-        with pytest.raises(bngsim.SimulationError, match="too coarse"):
-            s.simulate(*span, n_points=3)
-        with pytest.raises(bngsim.SimulationError, match="too coarse"):
-            s.step_to(span[1])
+        assert s.simulate(*span, n_points=3).n_times == 3
+    with bngsim.RuleMonkeySession(str(TFUN)) as s:
+        s.initialize(seed=1, t_start=span[0])
+        s.step_to(span[1])
+        assert s.current_time == span[1]
     # A model that reads no clock runs on elapsed time there (test_network_free_t_start).
     assert _rm(str(NF / "first_order_switch.xml"), 1, t_span=span, n_points=3).n_times == 3
 

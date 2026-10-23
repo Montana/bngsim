@@ -182,15 +182,14 @@ reports is model time (issue #1063). Before that its waiting times were rounded
 once the total propensity times |t| neared 1e15, and from t = 1e12 a run or a
 session was biased with no error.
 
-A model with a table indexed by time still places its events on absolute time,
-so the same rounding applies there, as it does to `method="ssa"` on any model
-(issue #1059): keep such a run's times moderate. (Offsetting a table's clock
-would index it through a function, and RuleMonkey 3.11.0 recurses without end on
-a table whose counter is a function, richardposner/RuleMonkey#111.) RuleMonkey
-integrates a rate that reads the clock on panels of a thousandth of a span, so
-on absolute time `method="rm"` refuses a span too short for the doubles near its
-times to place them (a span of 2 at t = 1e13), rather than return a run that
-never fires.
+A model with a table indexed by time is not offset, and runs on model time.
+Since RuleMonkey 3.12.0 that keeps its waiting times too: RuleMonkey places its
+events, and the panels on which it integrates a rate that reads the clock, on
+the time elapsed since each call starts (richardposner/RuleMonkey#110), and only
+the clock a rate reads is rounded to the doubles near it. From t = 1e13 a step
+table's run matches its closed form, where bngsim used to refuse a span that
+short (issue #1063). `method="ssa"` keeps the rounding limit on a rate that
+reads `time()` (issue #1059).
 
 ### Arrhenius (energy) rules
 
