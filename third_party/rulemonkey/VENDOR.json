@@ -9,10 +9,10 @@
     "local_origin_remote": "https://github.com/richardposner/RuleMonkey.git",
     "local_upstream_remote": null,
     "fork_remote": null,
-    "branch_or_ref": "v3.11.0",
-    "commit": "f11c2514b11e1e9b27f680b49457e3ae011b8c6a"
+    "branch_or_ref": "v3.12.0",
+    "commit": "9df2984e53f6c76cc28199b0b6e8e8cb6ee1b8bc"
   },
-  "imported_at_utc": "2026-10-15T18:56:51+00:00",
+  "imported_at_utc": "2026-10-23T02:43:29+00:00",
   "pruning": {
     "included_paths": [
       "CMakeLists.txt",
@@ -30,7 +30,7 @@
   },
   "exprtk_sync": {
     "rulemonkey_vendor_note": "third_party/bngsim_expr/VENDOR",
-    "pinned_bngsim_commit": "6ce22768c8ccdcfb02b5ba999e0d84698d6726ad",
+    "pinned_bngsim_commit": "4361958f39a27b153974cff7f219d02627c0f3b8",
     "verified_against_bngsim_paths": [
       "bngsim/third_party/exprtk/exprtk.hpp",
       "bngsim/include/bngsim/expression.hpp",
