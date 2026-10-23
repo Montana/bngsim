@@ -162,7 +162,6 @@ def test_an_epidemic_that_burns_out_is_refused(tmp_path):
     assert "pure_sink_species" in message
 
 
-
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_the_same_with_the_sink_masked_out_is_refused(tmp_path, method):
     """With R masked out the solve had one unknown, I, with S following from
