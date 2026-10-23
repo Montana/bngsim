@@ -109,7 +109,7 @@ same tolerances, steers it: the march, the bursts and the KINSOL polish stop at
 a state under `tol` whose step is within tolerance (up to 512 unknowns). That
 is what takes the issue's cubic on from 0.894 to 1. A march that stalls within
 a thousand tolerances of its root is given a short Newton polish there, kept
-if it passes the parity test and lands where the step said. The step decides
+if it passes the parity test. The step decides
 nothing about `converged`: where it cannot be passed (a continuum of steady
 states, where it is singular but for rounding, or a species reaching 0 as 1/t)
 the march goes on to `max_time` and the two tests decide there.
