@@ -1265,13 +1265,14 @@ class SteadyStateMarcher {
             // residual of 2e16, MODEL1102210001 to 1.5e-4. Or on until the
             // integrator failed, and a retry on difference quotients failed the
             // same way: glioblastoma-egfrviii-signaling passed at step 2075 and
-            // came back with a residual of NaN.
+            // came back with a residual of NaN. A failure is still reported,
+            // so that a state the step does not take is retried on difference
+            // quotients: MODEL1712050008's retry comes to rest.
             if (by_distance_ && !converged && !passed.empty() && !(*residual_out < tol)) {
                 std::copy(passed.begin(), passed.end(), y_data);
                 *residual_out = passed_resid;
                 converged = !passed_asked &&
                             ss_accepts(model_, rhs_, opts_, sub_, passed.data(), passed_resid);
-                integrator_failed_ = false;
                 if (!reinit_here()) {
                     integrator_failed_ = true;
                 }

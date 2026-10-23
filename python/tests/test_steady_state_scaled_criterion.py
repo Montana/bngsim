@@ -1599,3 +1599,17 @@ def test_a_singular_jacobian_is_singular_on_every_platform(tmp_path, jacobian):
     assert ss.converged
     assert ss.newton_distance == math.inf
     assert list(ss.concentrations[1:]) == pytest.approx([0.75, 0.25], rel=1e-9)
+
+
+def test_a_march_whose_integrator_fails_is_still_retried_on_difference_quotients(data_dir):
+    # MODEL1712050008's march passes the residual test, goes on, and its
+    # integrator fails; the step does not take the state it passed (202
+    # tolerances), which the run then leaves. Reported as a failure still, the
+    # solve is retried on difference quotients, and that retry comes to rest.
+    # Taking the passed state as the answer turned the retry off. Main
+    # converges at a state a run moves 2.2e5 tolerances.
+    path = str(data_dir / "MODEL1712050008.xml")
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
+    assert ss.solver_jacobian_retried
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0
