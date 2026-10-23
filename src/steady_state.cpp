@@ -619,13 +619,6 @@ static double ss_largest_species(const NetworkModel &model, const SteadyStateOpt
     return largest;
 }
 
-// Whether a species at `yi` is absent (issue #1001): at 0, to the rounding of
-// the largest species. A law's dependent made from its total comes back at
-// -1.6e-17 beside members at 0.99 and 0.01.
-static bool ss_is_absent(double yi, double largest) {
-    return std::abs(yi) <= 8.0 * std::numeric_limits<double>::epsilon() * largest;
-}
-
 // Do two candidate steady states agree to AGREE_RTOL? Used by the two-tier
 // solver (GH #27 Bug 2) to accept a KINSOL root only once it is *seed-stable*:
 // two Newton solves from successively tighter integration bursts landing on the
@@ -5631,218 +5624,21 @@ static constexpr double kRunRtolLeast = 1e-13;
 static constexpr double kDriftAtLeast = 10.0;
 
 // One run of the run test of the "scaled" criterion (issue #1001): from `y`,
-// kicked by `kick_size` of each species' own size, taken on for max_time and
-// integrated at `tighter` times the criterion's tolerances, in kRunSteps
-// times max_steps at most (at an rtol of kRunRtolLeast at least). Returns the
-// largest move of a measured species from `y` over its tolerance
-// (ss_scaled_tolerance), and for a kicked run that over 10·(1 + 2k): what the
-// kick may not grow to, k the largest kick, each in its own tolerances, among
-// the species it is coupled to through the Jacobian's structure (where the
-// model has none, its own or the largest of the unknowns'). Not the largest of
-// any species': a dependent cut to 500 of its tolerances, in a law that
-// touched nothing else, let every species move 1e4, and an unstable root
-// beside it go 5e3 to its next root. Nor its own or the unknowns' alone:
-// egfr_simple's and air_travel_model's kicks, on their continua, landed a
-// species 47 and 8 times that away. +inf where the run cannot be taken to
-// its time (the integrator gives up past kHoldRestarts restarts, or the steps
-// run out). The model's state is left as it was.
-//
-// A kick on a continuum of steady states lands on another of
-// them, which can be a few kicks away in a species: e2_1.bngl's was 1.26 of
-// 1 + 2k, and so the kick may grow tenfold before it is said to have grown.
-// An unstable root's grows to the next root, by millions.
-//
-// A species at 0 is not kicked: at a state that rests nothing makes it, and
-// no integrator error makes it from nothing. Kicked, an absent species was an
-// invader that grew (an SIR model at I = 0, which main and #997's hold
-// return), or one the rest answered with a gain past ten (a counter driven by
-// a pulse at 0, synbio_counter_molecular; FceRI signalling with no ligand,
-// x3_2), at states the system rests at. A species' size, which a dependent's
-// kick is cut to, is the larger of its value and its atol over rtol. The
-// kick's signs are the golden ratio's multiples, so that no symmetry of the
-// model is kept, and each law's dependent follows the unknowns so that the
-// totals stay where they are: on a neighbouring manifold a state the system
-// rests at can be further than a tolerance away. An unknown kicked below 0 is
-// kicked the other way. A dependent so taken below 0 turns its law's unknowns'
-// kicks the other way, and if that does not do, drops them; one kicked by more
-// than ten millionths of itself has them cut until it is not. Each law to its
-// own unknowns, not the whole kick: scaled down to the room of one dependent
-// at 4.6e-10, the kick of a cubic beside it fell under the integrator's
-// tolerance and its unstable root at 0.3 was returned; and a dependent at 1e-6
-// kicked by 1 by its law's partner at 1e6 let every species move 5e14
-// tolerances, and an unstable root beside them go to its next root.
+// taken on for max_time (at most kRunHorizonMost) and integrated at `tighter`
+// times the criterion's tolerances (at an rtol of kRunRtolLeast at least), in
+// kRunSteps times max_steps at most. Returns the largest move of a measured
+// species from `y` over its tolerance (ss_scaled_tolerance), and +inf where
+// the run cannot be taken to its time (the integrator gives up past
+// kHoldRestarts restarts, or the steps run out). The model's state is left as
+// it was.
 static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                                     const SteadyStateOptions &opts, const ResidualSubspace &sub,
-                                    const std::vector<double> &y, double kick_size,
-                                    double tighter) {
+                                    const std::vector<double> &y, double tighter) {
     const int ns = model.n_species();
     const auto un = static_cast<size_t>(ns);
     const double inf = std::numeric_limits<double>::infinity();
     auto &species = const_cast<std::vector<Species> &>(model.species());
-
     const double largest = ss_largest_species(model, opts, y.data());
-    std::vector<double> kick(un, 0.0);
-    // Each species' kick in its own tolerance, and the largest of the kicks
-    // chosen (the unknowns', not the dependents' that follow them).
-    std::vector<double> kicked(un, 0.0);
-    double chosen = 0.0;
-    // The larger of each species' own kick and the largest kick of an unknown
-    // it is coupled to through the Jacobian's structure (not through a
-    // $-fixed species), each in its own tolerance.
-    std::vector<double> coupled(un, 0.0);
-    if (kick_size > 0.0) {
-        const SsDistanceSystem system = ss_distance_system(model, sub);
-        const ConservationLaws &cl = system.laws;
-        // Each unknown's share of its kick: turned the other way, cut, or 0, by
-        // the laws it is in.
-        std::vector<double> share_of(un, 1.0);
-        std::vector<char> turned(static_cast<size_t>(cl.n_laws), 0);
-        const auto size_of = [&](int i) {
-            const auto ui = static_cast<size_t>(i);
-            return std::max(std::abs(y[ui]),
-                            std::min(ss_species_atol(opts, i) / opts.rtol, largest));
-        };
-        const auto build = [&]() {
-            std::fill(kick.begin(), kick.end(), 0.0);
-            for (int i : system.unknowns) {
-                const auto ui = static_cast<size_t>(i);
-                const double share = 2.0 * std::fmod((i + 1) * 0.6180339887498949, 1.0) - 1.0;
-                double v = kick_size * size_of(i) * share * share_of[ui];
-                if (ss_is_absent(y[ui], largest))
-                    v = 0.0;
-                if (y[ui] >= 0.0 && y[ui] + v < 0.0)
-                    v = -v;
-                kick[ui] = v;
-            }
-            // A law whose dependent is absent takes up its unknowns' kicks
-            // with its largest member present, so that the dependent stays
-            // absent: with I the dependent of S + I + R, SIR at I = 0 was
-            // refused in two orders of its species of six.
-            std::vector<char> taking_up(un, 0);
-            for (int k = 0; k < cl.n_laws; ++k) {
-                const auto &row = cl.coefficients[static_cast<size_t>(k)];
-                const int dep = cl.dependent[static_cast<size_t>(k)];
-                if (!ss_is_absent(y[static_cast<size_t>(dep)], largest))
-                    continue;
-                int by = -1;
-                for (int i : system.unknowns) {
-                    const auto ui = static_cast<size_t>(i);
-                    if (row[ui] == 0.0 || taking_up[ui] || ss_is_absent(y[ui], largest))
-                        continue;
-                    if (by < 0 ||
-                        std::abs(row[ui] * y[ui]) >
-                            std::abs(row[static_cast<size_t>(by)] * y[static_cast<size_t>(by)]))
-                        by = i;
-                }
-                if (by < 0)
-                    continue;
-                const auto ub = static_cast<size_t>(by);
-                taking_up[ub] = 1;
-                double acc = 0.0;
-                for (size_t i = 0; i < un; ++i) {
-                    if (static_cast<int>(i) != dep && i != ub)
-                        acc += row[i] * kick[i];
-                }
-                kick[ub] = -acc / row[ub];
-            }
-            for (int k = 0; k < cl.n_laws; ++k) {
-                const auto &row = cl.coefficients[static_cast<size_t>(k)];
-                const int dep = cl.dependent[static_cast<size_t>(k)];
-                const double coeff_dep = row[static_cast<size_t>(dep)];
-                if (std::abs(coeff_dep) < 1e-15)
-                    continue;
-                double acc = 0.0;
-                for (size_t i = 0; i < un; ++i) {
-                    if (static_cast<int>(i) != dep)
-                        acc += row[i] * kick[i];
-                }
-                kick[static_cast<size_t>(dep)] =
-                    ss_is_absent(y[static_cast<size_t>(dep)], largest) &&
-                            std::abs(acc) <= 1e-12 * kick_size * largest * std::abs(coeff_dep)
-                        ? 0.0
-                        : -acc / coeff_dep;
-            }
-        };
-        build();
-        for (int pass = 0; pass <= 2 * cl.n_laws; ++pass) {
-            bool more = false;
-            for (int k = 0; k < cl.n_laws; ++k) {
-                const int dep = cl.dependent[static_cast<size_t>(k)];
-                const auto ud = static_cast<size_t>(dep);
-                const auto &row = cl.coefficients[static_cast<size_t>(k)];
-                const auto each = [&](double f) {
-                    for (size_t i = 0; i < un; ++i) {
-                        if (i != ud && row[i] != 0.0)
-                            share_of[i] *= f;
-                    }
-                };
-                const double most = 10.0 * kick_size * size_of(dep);
-                if (y[ud] >= 0.0 && y[ud] + kick[ud] < 0.0) {
-                    each(turned[static_cast<size_t>(k)] ? 0.0 : -1.0);
-                    turned[static_cast<size_t>(k)] = 1;
-                    more = true;
-                } else if (std::abs(kick[ud]) > most) {
-                    each(most / std::abs(kick[ud]));
-                    more = true;
-                }
-            }
-            if (!more)
-                break;
-            build();
-        }
-        for (size_t i = 0; i < un; ++i) {
-            if (y[i] >= 0.0 && y[i] + kick[i] < 0.0 && !species[static_cast<int>(i)].fixed) {
-                std::fill(kick.begin(), kick.end(), 0.0);
-                break;
-            }
-        }
-        for (int i : sub.included) {
-            const auto ui = static_cast<size_t>(i);
-            if (!species[i].fixed && kick[ui] != 0.0)
-                kicked[ui] = std::abs(kick[ui]) / ss_scaled_tolerance(opts, i, y[ui], largest);
-        }
-        for (int i : system.unknowns)
-            chosen = std::max(chosen, kicked[static_cast<size_t>(i)]);
-        const JacobianSparsity &pattern = model.jacobian_sparsity();
-        if (pattern.n == ns) {
-            std::vector<int> group(un);
-            for (int i = 0; i < ns; ++i)
-                group[static_cast<size_t>(i)] = i;
-            const auto find = [&](int i) {
-                while (group[static_cast<size_t>(i)] != i) {
-                    group[static_cast<size_t>(i)] =
-                        group[static_cast<size_t>(group[static_cast<size_t>(i)])];
-                    i = group[static_cast<size_t>(i)];
-                }
-                return i;
-            };
-            for (int j = 0; j < ns; ++j) {
-                if (species[j].fixed)
-                    continue;
-                for (int64_t k = pattern.col_ptrs[static_cast<size_t>(j)];
-                     k < pattern.col_ptrs[static_cast<size_t>(j) + 1]; ++k) {
-                    const int r = static_cast<int>(pattern.row_indices[static_cast<size_t>(k)]);
-                    if (species[r].fixed)
-                        continue;
-                    const int ga = find(r);
-                    const int gb = find(j);
-                    if (ga != gb)
-                        group[static_cast<size_t>(ga)] = gb;
-                }
-            }
-            std::vector<double> largest_in(un, 0.0);
-            for (int i : system.unknowns) {
-                const auto g = static_cast<size_t>(find(i));
-                largest_in[g] = std::max(largest_in[g], kicked[static_cast<size_t>(i)]);
-            }
-            for (int i = 0; i < ns; ++i)
-                coupled[static_cast<size_t>(i)] = std::max(
-                    kicked[static_cast<size_t>(i)], largest_in[static_cast<size_t>(find(i))]);
-        } else {
-            for (size_t i = 0; i < un; ++i)
-                coupled[i] = std::max(kicked[i], chosen);
-        }
-    }
 
     SteadyStateOptions run_opts = opts;
     run_opts.max_time = std::min(opts.max_time, kRunHorizonMost);
@@ -5855,7 +5651,7 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     std::vector<double> saved(un);
     for (size_t i = 0; i < un; ++i) {
         saved[i] = species[static_cast<int>(i)].concentration;
-        species[static_cast<int>(i)].concentration = y[i] + kick[i];
+        species[static_cast<int>(i)].concentration = y[i];
     }
     double moved = inf;
     try {
@@ -5883,12 +5679,8 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                     moved = inf;
                     break;
                 }
-                if (d > 0.0) {
-                    double m = d / ss_scaled_tolerance(opts, i, y[ui], largest);
-                    if (kick_size > 0.0)
-                        m /= 10.0 * (1.0 + 2.0 * coupled[ui]);
-                    moved = std::max(moved, m);
-                }
+                if (d > 0.0)
+                    moved = std::max(moved, d / ss_scaled_tolerance(opts, i, y[ui], largest));
             }
         }
     } catch (const std::exception &) {
@@ -5901,48 +5693,43 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
 }
 
 // The run test of the "scaled" criterion (issue #1001): a run taken on from
-// the state for max_time moves no measured species beyond its tolerance, and
-// the kick of a run from it kicked by a millionth of each species (kHoldKick,
-// as #997's run is) does not grow tenfold. Returns the larger of the two
-// measures (at most 1 passes).
+// the state for max_time moves no measured species beyond its tolerance.
+// Returns the run's measure (at most 1 passes).
 //
 // The residual test passes states a run leaves: a model in small units, or a
 // slow one, is under tol far from its steady state (BIOMD0000000407, one step
 // from where it starts, which a run takes one species of from 2.448 to 3e-4).
-// Two runs, because neither does both jobs. The unkicked one sees a drift to
-// its tolerance over max_time, but not an unstable root: the issue's cubic has
-// one at x = 0.3, exact in floating point, and moved by a kick under the
-// integrator's own tolerance a run's steps grow until the implicit method
-// damps the mode it should follow, and the run stays. The kicked one sees
-// that, but a stable mode slower than max_time keeps such a kick, so it is
-// asked only that the kick not grow. A kicked run that cannot be taken to its
-// time refuses: GH #176's state is within a millionth of its switch, and
-// kicked across it the run chatters on to another state, Calcium at 188 for
-// 958.
 //
-// The unkicked run is taken at the criterion's own tolerances, and where it
-// moves the state, again at a tenth of them, and a tenth of that, and a tenth
-// of that up to kNewtonDistanceMost unknowns (above, a thousandth took
-// multisite_phos, 1026 species, 34 s to main's whole solve's 0.8): a drift
-// moves the state at every tolerance, and the run's own error shrinks with
-// them, though not always at each step. BIOMD0000000211 moved by 194
-// tolerances at the criterion's own, 15.7 at a tenth and 0.68 at a hundredth;
-// MODEL1510230005 by 84, 4.8, 6.9 and 0.03. A move of more than kDriftAtLeast
-// that does not halve at a tenth of the tolerances is a drift, and the runs
-// stop there: HIV_v1_1, which a run moves by 327 and 203, could not be taken
-// to its time at a hundredth in 150 s. The kicked run, asked only that the
-// kick not grow tenfold, is integrated at the criterion's own tolerances.
+// The run is taken at the criterion's own tolerances, and where it moves the
+// state, again at a tenth of them, and a tenth of that, and a tenth of that up
+// to kNewtonDistanceMost unknowns (above, a thousandth took multisite_phos,
+// 1026 species, 34 s to main's whole solve's 0.8): a drift moves the state at
+// every tolerance, and the run's own error shrinks with them, though not
+// always at each step. BIOMD0000000211 moved by 194 tolerances at the
+// criterion's own, 15.7 at a tenth and 0.68 at a hundredth; MODEL1510230005 by
+// 84, 4.8, 6.9 and 0.03. A move of more than kDriftAtLeast that does not halve
+// at a tenth of the tolerances is a drift, and the runs stop there: HIV_v1_1,
+// which a run moves by 327 and 203, could not be taken to its time at a
+// hundredth in 150 s.
+//
+// An unstable root that a run from it does not leave passes, as it passes the
+// residual test: the issue's cubic at x = 0.3, exact in floating point. A run
+// kicked off the state as well refused states the system rests at (a counter
+// whose pulse is at 0; air_travel_model's continuum, where a kick of 4.4
+// tolerances on a large species landed a small one 909 of its own away), and
+// each way of measuring the kick let some unstable root through. The Newton
+// path reports a root's eigenvalues (root_stability).
 static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
                                const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                const std::vector<double> &y) {
-    double still = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, 1.0);
+    double still = ss_continued_run_once(model, rhs, opts, sub, y, 1.0);
     double last = still;
     for (double tighter : {1e-1, 1e-2, 1e-3}) {
         if (!(still > 1.0) || !std::isfinite(still) ||
             (tighter < 1e-2 && !opts.criterion_by_distance) ||
             opts.rtol * tighter * 10.0 <= kRunRtolLeast)
             break;
-        const double again = ss_continued_run_once(model, rhs, opts, sub, y, 0.0, tighter);
+        const double again = ss_continued_run_once(model, rhs, opts, sub, y, tighter);
         if (!std::isfinite(again))
             break;
         still = std::min(still, again);
@@ -5950,62 +5737,7 @@ static double ss_continued_run(NetworkModel &model, SteadyStateRhs &rhs,
             break;
         last = again;
     }
-    if (!(still <= 1.0))
-        return still;
-    return std::max(still, ss_continued_run_once(model, rhs, opts, sub, y, kHoldKick, 1.0));
-}
-
-// Whether the Jacobian at `y` restricted to the species present there (not
-// $-fixed, not absent) has an eigenvalue whose real part is past
-// kStabilityRelTol of the spectrum's radius or of the largest entry of the
-// whole matrix, whichever is more (issue #1001): an unstable root
-// among the species present, whatever is at 0. An absent invader's instability
-// is in its own row, which this leaves out: SIR at I = 0 is not unstable here,
-// and the cubic at its unstable root is, beside a species at 0 or not.
-static bool ss_unstable_among_present(NetworkModel &model, SteadyStateRhs &rhs,
-                                      const SteadyStateOptions &opts, const ResidualSubspace &sub,
-                                      const std::vector<double> &y) {
-    const int ns = model.n_species();
-    const double largest = ss_largest_species(model, opts, y.data());
-    std::vector<int> idx;
-    for (int i : sub.included) {
-        if (!model.species()[i].fixed && !ss_is_absent(y[static_cast<size_t>(i)], largest))
-            idx.push_back(i);
-    }
-    const int n = static_cast<int>(idx.size());
-    if (n == 0 || n > kStabilitySpectrumMaxN)
-        return false;
-    std::vector<double> saved(static_cast<size_t>(ns));
-    model.get_state_into(saved.data());
-    model.set_state_from(y.data());
-    std::vector<double> J(static_cast<size_t>(ns) * ns, 0.0);
-    ss_fill_state_jacobian(rhs, y.data(), ns, sub, ss_want_analytical_jacobian(opts.jacobian),
-                           J.data());
-    model.set_state_from(saved.data());
-    // The scale is the whole matrix's: restricted to the species present, SIR
-    // at I = -1.6e-17 (a law's rounding) is a matrix of rounding, and a
-    // spectrum of 1e-17 read past its own radius.
-    double scale = 0.0;
-    for (int a : sub.included)
-        for (int b : sub.included)
-            scale = std::max(scale, std::abs(J[static_cast<size_t>(a) * ns + b]));
-    std::vector<double> M(static_cast<size_t>(n) * n);
-    for (int a = 0; a < n; ++a)
-        for (int b = 0; b < n; ++b)
-            M[static_cast<size_t>(a) * n + b] =
-                J[static_cast<size_t>(idx[static_cast<size_t>(a)]) * ns +
-                  idx[static_cast<size_t>(b)]];
-    std::vector<double> wr(static_cast<size_t>(n)), wi(static_cast<size_t>(n));
-    if (!dense_eigenvalues(M.data(), n, wr.data(), wi.data()))
-        return false;
-    double max_re = -std::numeric_limits<double>::infinity();
-    double radius = 0.0;
-    for (int i = 0; i < n; ++i) {
-        max_re = std::max(max_re, wr[static_cast<size_t>(i)]);
-        radius =
-            std::max(radius, std::hypot(wr[static_cast<size_t>(i)], wi[static_cast<size_t>(i)]));
-    }
-    return max_re > kStabilityRelTol * std::max(radius, scale);
+    return still;
 }
 
 // ---------------------------------------------------------------------------
@@ -6274,30 +6006,6 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
             result.converged = result.continued_run_distance <= 1.0;
         } else {
             result.converged = false;
-        }
-        // A root the polish's eigenvalues show unstable (issue #78), which the
-        // solve returns only where it started, is not a state the system
-        // rests at, whatever the kicked run saw: X at its unstable root
-        // 0.99999, 500 tolerances from its next root, kicked by a millionth
-        // reached it before the kick had grown tenfold. Unless it is a species
-        // at 0 that the eigenvalues see grow: an absent invader is not kicked,
-        // and nothing makes it (SIR at I = 0). Where one is at 0, the species
-        // present are asked alone; an unrelated one at 0 let the cubic's
-        // unstable root through.
-        if (result.root_stability == "unstable") {
-            bool absent = false;
-            const double largest =
-                ss_largest_species(model, *effective, result.concentrations.data());
-            for (int i : sub.included) {
-                if (!model.species()[i].fixed &&
-                    ss_is_absent(result.concentrations[static_cast<size_t>(i)], largest)) {
-                    absent = true;
-                    break;
-                }
-            }
-            if (!absent ||
-                ss_unstable_among_present(model, rhs, *effective, sub, result.concentrations))
-                result.converged = false;
         }
     }
 

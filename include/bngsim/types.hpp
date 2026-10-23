@@ -1177,10 +1177,9 @@ struct SteadyStateOptions {
     // What `converged` asks of a state (issue #1001). "scaled" (the default):
     // the parity test below, and a run taken on from the state for max_time
     // (at most 1e6) moves no species by more than rtol·|y_i| + atol_i (the
-    // march's own tolerances), and one from it kicked by a millionth of each
-    // species does not let the kick grow tenfold: what tells a state the system
-    // rests at from one under tol that a run leaves (a model in small units, or
-    // a slow one), an unstable root, or a kink with a floor. The Newton step
+    // march's own tolerances): what tells a state the system rests at from one
+    // under tol that a run leaves (a model in small units, or a slow one). An
+    // unstable root a run from it does not leave passes. The Newton step
     // from the state to the root within the same tolerances (to 512 unknowns)
     // decides where the solve stops, not `converged`; the state it stops at is
     // polished. A burst-free Newton solve (newton_burst false), which reports
@@ -1330,11 +1329,9 @@ struct SteadyStateResult {
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
     // Issue #1001, the run test of "scaled": the largest move of a measured
     // species over its tolerance, across the run taken on from the returned
-    // state, and the kicked run's over ten times 1 + twice the larger of its
-    // own kick and the largest kick of an unknown it is coupled to, in
-    // tolerances; at most 1 passes. +inf where a run could not be taken to its time; NaN where none
-    // was taken (under "residual", where the parity test already refused, and
-    // for a burst-free Newton solve).
+    // state; at most 1 passes. +inf where the run could not be taken to its
+    // time; NaN where none was taken (under "residual", where the parity test
+    // already refused, and for a burst-free Newton solve).
     double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
     std::string criterion;   // the criterion `converged` was decided by
     std::string method_used; // "integration" or "newton"

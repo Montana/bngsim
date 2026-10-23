@@ -158,14 +158,13 @@ class TestGH78Reporting:
     def test_an_initial_condition_at_the_saddle_is_reported_not_hidden(self, criterion):
         """Handed the saddle as the IC, there is nowhere else to fall back to —
         integration would return the same state. Report the verdict instead of
-        acting on it. Under the default criterion a run kicked off the saddle
-        leaves it, so it is not converged (issue #1001); the residual test
-        returns it converged."""
+        acting on it. Under either criterion a run from the saddle does not
+        leave it (issue #1001)."""
         sim, model = _toggle()
         model.set_concentration("R1()", float(_SADDLE[0]))
         model.set_concentration("R2()", float(_SADDLE[1]))
         r = sim.steady_state(method="newton", criterion=criterion)
-        assert r.converged == (criterion == "residual")
+        assert r.converged
         assert r.method_used == "newton"
         np.testing.assert_allclose(np.asarray(r.concentrations, dtype=float), _SADDLE, rtol=1e-6)
         assert r.root_stability == "unstable"
