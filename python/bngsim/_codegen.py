@@ -8370,10 +8370,13 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "Forward sensitivity: %s, so the analytic sensitivity RHS is declined for "
         "this model and CVODES' internal difference quotient is used instead "
         "(correct, but slower, where every rate law is continuous in the state along "
-        "the run, though a column can still be wrong where a clamp() over the state "
-        "bends a narrow pulse: by a fifth to six-fold, with the tolerance, at a "
-        "triangle of width 0.01, issue #1126. A time course is refused "
-        "for the jumps that are found in the rate "
+        "the run, though a column can still be wrong where a min(), max(), abs() or "
+        "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
+        "tolerance, at a triangle of width 0.01, issue #1126. Of these, min, max and "
+        "abs are left here only in a model whose rate laws hold a condition, or where "
+        "one sits in anything but a sum, a product, a whole power, an exp() or another "
+        "bend, or in a product with a division or a fractional power of the state or "
+        "the clock. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -8818,7 +8821,8 @@ def _bend_under_a_break(expr, moving: set[str]) -> str | None:
     whose slope is infinite at the bend. So a bend under one, or in a product
     with one of what reads a name in *moving* (the state and the clock), is
     named, and the law is declined as before. ``max(…)/w`` over a parameter is
-    not.
+    not. Nor is any other call trusted (``log(max(e, 0))`` is −∞ at the bend),
+    so a bend under one is named too.
     """
     import sympy as sp
 
@@ -8967,7 +8971,7 @@ def _functional_rate_law_partials(
         moving = {a for a, ref in scope.c_ref.items() if ref.startswith("obs[")} | {_TIME_SYM}
         broken = _bend_under_a_break(sym_expr, moving)
         if broken is not None:
-            return None, f"uses unsupported construct: {broken} under a division or a power"
+            return None, f"uses unsupported construct: {broken} under a call, division or power"
 
     targets = free & (set(scope.param_of_alias) | set(scope.obs_volume_weights))
     # Issue #1126: an abs over a differentiation variable differentiates to
