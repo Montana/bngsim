@@ -468,8 +468,7 @@ the context the reviewer had.
 
 - Rerun the review until it comes back clean.
 - Turn each reviewer probe into a test.
-- List what was found and fixed under a "Review" heading in the PR body, one
-  line per finding.
+- List what was found and fixed under a "Review" heading in the PR body.
 - Reviewers report findings to the author, not as new issues.
 
 File a new issue only for a finding that is a design question needing the
@@ -490,8 +489,8 @@ of [When a value cannot be computed](#when-a-value-cannot-be-computed) applied
 to derivatives: a refusal is an acceptable outcome, a silently wrong derivative
 is not.
 
-The exact envelope is the sensitivity family's owner's to write, and it is drawn
-deliberately narrowly. As a starting point, inside means:
+The exact envelope is for the sensitivity family's owner to write, and it is
+drawn deliberately narrowly. As a starting point, inside means:
 
 - **Isolated transversal crossings.** A switch or event crossing that is
   isolated in time, from other crossings and from events, and transversal: the
@@ -502,7 +501,7 @@ deliberately narrowly. As a starting point, inside means:
 - **Plain thresholds.** A threshold linear in the parameters, a clock that is
   time itself, and a window whose edges are each such a crossing.
 
-Outside means, and is refused:
+Outside means:
 
 - coincident or near-coincident crossings;
 - sliding modes and chattering;
@@ -523,9 +522,11 @@ This changes how sensitivity issues and reviews are judged:
 - In review, a wrong derivative inside the envelope is a bug in that PR. So is a
   wrong derivative outside it that is not refused: the refusal is missing. A
   correct refusal is not a finding.
-- A refusal of a case inside the envelope is not a wrong answer, but it is a
-  refusal to lift. Runs refused where a derivative exists are tracked in #961,
-  each with what lifting it would take where that is known; add a new one there.
+- A refusal of a case inside the envelope is not wrong and is not a finding
+  against the PR, but it is a refusal to lift once the silently wrong results
+  are cleared. #961 tracks every refusal where a derivative exists, these among
+  them, each with what is refused, why the code cannot tell it from the unsafe
+  case, and, where known, what lifting it would take. Add a new one there.
 
 ### Triage before fixing
 
