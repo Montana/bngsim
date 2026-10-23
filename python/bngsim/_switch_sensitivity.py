@@ -1826,7 +1826,12 @@ def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchCo
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
-    exprs = [_spell_mod(e) for e in core.param_expressions]
+    # As written, and not through _spell_mod: a derived parameter is a
+    # constant of the run, so a `%` in one switches nothing, and the
+    # resolvers that inline these texts decline a call they do not know.
+    # `thr = base % 10` read as `mod(base, 10)` lost the exact crossing of
+    # `time() > thr`, and with it the SSA's piecewise-constant rate (#1127).
+    exprs = list(core.param_expressions)
     clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
     function_names = frozenset(core.function_names)
@@ -5088,7 +5093,9 @@ def piecewise_constant_time_functions(
         return []
     out = []
     for name, expr in clock_functions:
-        rest = expr
+        # Spelled as the recovered conditions are (issue #1127), or a condition
+        # found in a `%` text could not be found in it again.
+        rest = _spell_mod(expr)
         for c in exact:
             rest = _remove_whole_atoms(rest, c)
         if not _ANY_CLOCK.search(rest):
@@ -7673,12 +7680,12 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         return []
     if ctx is None:
         ctx = core.functional_jacobian_context()
+    # Same cheap first gate as compute_switch_time_sens, on the raw bodies: no
+    # `if()` anywhere means no branch to cross, and no RHS probe is paid.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
+        return []
     func_map = _scan_function_map(ctx)
     bodies = list(func_map.values())
-    # Same cheap first gate as compute_switch_time_sens: no `if()` anywhere
-    # means no branch to cross, and no RHS probe is paid.
-    if not any(_IF_CALL.search(body) for body in bodies):
-        return []
 
     scope = switch_condition_scope(core, ctx)
     conditions: list[str] = []
@@ -9278,15 +9285,16 @@ def compute_switch_time_sens(
         return [], []
 
     ctx = core.functional_jacobian_context()
-    func_map = _scan_function_map(ctx)
     # Cheapest possible gate, checked before anything else: a model with no
     # conditional rate law has no switch to find. On the RAW bodies, so a
     # genome-scale model with tens of thousands of functions and no `if()`
     # short-circuits before any inlining — inlining cannot create an `if()` that
-    # no body already has. Keeps the RHS probes and the sympy work off the path
-    # of every ordinary sensitivity run, including the per-row batch path.
-    if not any(_IF_CALL.search(body) for body in func_map.values()):
+    # no body already has, and neither can spelling a `%` as `mod()`. Keeps the
+    # RHS probes and the sympy work off the path of every ordinary sensitivity
+    # run, including the per-row batch path.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return [], []
+    func_map = _scan_function_map(ctx)
     # Inline function references before scanning, exactly as the issue #150 state
     # detector (:func:`state_switch_conditions`) already does — "the gate and the
     # detector must scan the SAME text". A clock threshold can hide behind a

@@ -1756,9 +1756,15 @@ _LOOSER_THAN_PRODUCT = frozenset("<>=!&|?:;,")
 _LOOSER_WORDS = frozenset(("and", "or", "xor", "nand", "nor", "xnor"))
 _NUMBER_BEFORE_EXPONENT = re.compile(r"(?<![A-Za-z0-9_.])(?:\d+\.?\d*|\.\d+)[eE]$")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ExprTk groups with all three kinds of bracket.
+_BRACKET_CLOSES = {"(": ")", "[": "]", "{": "}"}
+_CLOSING_BRACKETS = frozenset(_BRACKET_CLOSES.values())
 
 
-@functools.lru_cache(maxsize=16384)
+class _UnbalancedBrackets(Exception):
+    """A bracket in a text :func:`_spell_mod` reads has no partner of its kind."""
+
+
 def _spell_mod(text: str) -> str:
     """*text* with each ``a % b`` written ``mod(a, b)``.
 
@@ -1769,16 +1775,30 @@ def _spell_mod(text: str) -> str:
     clock and no root on a counter, and was stepped over: Y = 0 for 3.93
     (issue #1127). ``%`` binds like ``*`` and ``/``, from the left, and tighter
     than ``+`` and ``-``: ``a*b % c - d`` is ``mod(a*b, c) - d``. Quoted text
-    (a ``tfun`` file name) is left alone.
+    (a ``tfun`` file name) is left alone, and so is a text whose brackets do
+    not pair up, which ExprTk would not compile either.
+
+    The test for ``%`` comes before the cache, so the bodies without one,
+    nearly all of them, are not hashed into it: a model with more functions
+    than the cache holds evicted every entry on every scan of its bodies.
     """
     if "%" not in text:
         return text
-    out, _ = _spell_mod_from(text, 0)
+    return _spell_mod_cached(text)
+
+
+@functools.lru_cache(maxsize=16384)
+def _spell_mod_cached(text: str) -> str:
+    try:
+        out, _ = _spell_mod_from(text, 0, None)
+    except _UnbalancedBrackets:
+        return text
     return out
 
 
-def _spell_mod_from(text: str, i: int) -> tuple[str, int]:
-    """:func:`_spell_mod` of *text* from *i* to the paren that closes it (or the end)."""
+def _spell_mod_from(text: str, i: int, closer: str | None) -> tuple[str, int]:
+    """:func:`_spell_mod` of *text* from *i* to *closer*, the bracket that
+    closes it (``None``: the end of the text)."""
     out: list[str] = []
     chain: list[tuple[str, str]] = []  # (operator before it, factor) in one product
     op, factor = "", ""
@@ -1801,11 +1821,13 @@ def _spell_mod_from(text: str, i: int) -> tuple[str, int]:
     n = len(text)
     while i < n:
         c = text[i]
-        if c == "(":
-            inner, i = _spell_mod_from(text, i + 1)
-            factor += "(" + inner + ")"
+        if c in _BRACKET_CLOSES:
+            inner, i = _spell_mod_from(text, i + 1, _BRACKET_CLOSES[c])
+            factor += c + inner + _BRACKET_CLOSES[c]
             continue
-        if c == ")":
+        if c in _CLOSING_BRACKETS:
+            if c != closer:
+                raise _UnbalancedBrackets
             close_chain()
             return "".join(out), i + 1
         if c in "'\"":
@@ -1853,6 +1875,8 @@ def _spell_mod_from(text: str, i: int) -> tuple[str, int]:
             continue
         factor += c
         i += 1
+    if closer is not None:
+        raise _UnbalancedBrackets
     close_chain()
     return "".join(out), n
 

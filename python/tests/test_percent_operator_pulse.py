@@ -125,10 +125,75 @@ def test_a_sensitivity_run_on_a_counter_is_refused_as_the_call_is(tmp_path):
         ("if(T%2<1, 1, 0)", "if(mod(T, 2)<1, 1, 0)"),
         ("x%y and z", "mod(x, y) and z"),
         ('tfun("a%b.tsv", T)', 'tfun("a%b.tsv", T)'),
+        # ExprTk groups with [] and {} as it does with ().
+        ("{a+b}%c", "mod({a+b}, c)"),
+        ("[a+b]%c - d", "mod([a+b], c) - d"),
+        ("tfun([0,1],[0,3], h%2)", "tfun([0,1],[0,3], mod(h, 2))"),
+        # Brackets that do not pair up: not ExprTk, so left as written.
+        ("a%b)c", "a%b)c"),
+        ("f(a%b", "f(a%b"),
+        ("(a%b]", "(a%b]"),
     ],
 )
 def test_the_spelling(text, spelled):
     assert _spell_mod(text) == spelled
+
+
+DERIVED = """begin parameters
+    1 kx 1
+    2 base {base}
+    3 n 2.9999999
+    4 thr {thr}
+    5 kd {kd}
+end parameters
+begin functions
+    1 f() kx*if(time() > thr + 10 && time() < thr + 10.01, 100, 0)
+end functions
+begin species
+    1 X() 10
+    2 Y() 0
+    3 Z() 10
+end species
+begin reactions
+    1 1 2 f
+    2 3 0 kd
+end reactions
+"""
+
+
+def _derived(tmp_path, *, base: float = 13.0, thr: str = "3", kd: str = "1") -> bngsim.Model:
+    path = tmp_path / "derived.net"
+    path.write_text(DERIVED.format(base=base, thr=thr, kd=kd))
+    return bngsim.Model.from_net(str(path))
+
+
+@pytest.mark.parametrize("base", [13.0, -13.0])
+def test_a_derived_threshold_written_with_the_operator_is_still_placed(tmp_path, base):
+    """A derived parameter is a constant of the run, so its ``%`` is no switch:
+    ``thr = base % 10`` crosses where its value says, exactly, as a literal
+    does, and the SSA holds the rate between the crossings. Read as ``mod()``
+    it was not placed at all. At base = -13 the value is ExprTk's, -3, and not
+    the 7 a floored modulus gives."""
+    from bngsim._switch_sensitivity import fixed_time_crossings, piecewise_constant_time_functions
+
+    model = _derived(tmp_path, base=base, thr="base%10")
+    at = 10 + float(np.fmod(base, 10))
+    conditions = model.time_discontinuity_conditions()
+    assert fixed_time_crossings(model._core, 0.0, 30.0, conditions) == pytest.approx(
+        [at, at + 0.01]
+    )
+    assert piecewise_constant_time_functions(model._core, 0.0, 30.0, conditions) == ["f"]
+    run = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 30.0), n_points=3)
+    assert float(np.asarray(run.species)[-1, 1]) == pytest.approx(10 * (1 - np.exp(-1)), rel=1e-5)
+
+
+def test_a_derived_rate_constant_written_with_the_operator_is_refused_as_the_call_is(tmp_path):
+    """``kd = n % 3`` jumps in n, and the difference quotient over n reads across
+    the jump: refused, as ``mod(n, 3)`` is, where it was a CVODE failure."""
+    for kd in ("n%3", "mod(n,3)"):
+        sim = bngsim.Simulator(_derived(tmp_path, kd=kd), method="ode", sensitivity_params=["n"])
+        with pytest.raises(bngsim.SensitivityUnsupportedError):
+            sim.run(t_span=(0.0, 1.0), n_points=3)
 
 
 def _random_expression(rng, depth: int = 0) -> str:
