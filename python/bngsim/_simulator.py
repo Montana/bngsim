@@ -4384,20 +4384,26 @@ class Simulator:
     def _steady_state_atol(
         self, atol: AtolLike | None, criterion: str, state=None, rtol: float | None = None
     ) -> AtolLike | None:
-        """The march's ``atol`` for a steady-state solve (issue #1001).
+        """The march's ``atol`` for a steady-state solve, which under
+        ``criterion="scaled"`` is also the run test's (issue #1001).
 
-        Under ``criterion="scaled"`` a state is accepted within each species'
-        own tolerance, the one ``atol="auto"`` derives; a march at the scalar
-        default of 1e-8 cannot reach that for a model in small units (it runs
-        through zero first). ``"auto"`` alone resolves a species that starts
-        large to rtol of that size, and a march of BIOMD0000000685 so held
-        stopped 59 tolerances from the root a march at 1e-8 reaches. So where
-        neither the call nor :meth:`set_tolerances` gave an ``atol``, each
-        species takes the smaller of the two, from ``state`` at ``rtol``.
+        Where neither the call nor :meth:`set_tolerances` gave an ``atol``, each
+        species takes the smaller of what ``atol="auto"`` derives from ``state``
+        and the scalar default. The scalar is no tolerance for a model in small
+        units (the issue's cubic at a scale of 1e-9 ran through zero), and
+        ``"auto"`` alone none for a species that starts large and settles
+        small: one decaying from 1e7 to 7e-4 was held to 0.1. ``"auto"``'s floor
+        here is the smallest species of the state above 1e-14 of its largest,
+        what double precision resolves beside it: a species a run left at
+        1e-22, or one declared at -1.6e-34 (MODEL2307110001), held every other
+        at 0 to that, and its march failed.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
             eff_rtol = self._rtol if rtol is None else rtol
-            own = np.minimum(derive_atol(np.asarray(state, dtype=float), eff_rtol), self._atol)
+            values = np.abs(np.asarray(state, dtype=float))
+            above = values[values > 1e-14 * float(values.max(initial=0.0))]
+            floor = float(above.min()) if above.size else None
+            own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
             return [float(v) for v in own]
         return atol
 
@@ -7369,10 +7375,10 @@ class Simulator:
         ``"integration"`` is the default. Two things still argue for
         ``"newton"``:
 
-        - **A much tighter root.** The polish lands well inside the test,
-          where integration stops the moment it passes it — worth
+        - **A much tighter root.** The polish lands near a residual of ~1e-13
+          where integration stops the moment it crosses ``tol`` (~1e-9) — worth
           having when the steady state feeds a stiff downstream solve.
-        - **A tight ``max_time`` budget.** Newton passes the test from a
+        - **A tight ``max_time`` budget.** Newton reaches ``tol`` from a
           *looser* burst than integration needs on its own, so when ``max_time``
           is cut well below the default it can converge where integration runs
           out of time. At the default ``max_time=1e6`` this does not happen on
@@ -7383,76 +7389,60 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
-            Under ``criterion="scaled"`` it is read only above 512 unknowns,
-            where the march stops by it.
+            Both criteria ask it.
         criterion : str
             What ``converged`` asks of a state (issue #1001).
 
-            - ``"scaled"`` (default): two tests, and no unit of concentration
-              or of time in either.
+            - ``"scaled"`` (default): the parity test,
+              ``||f(y)||_2 / n_species < tol``, and the run test. A run taken
+              on from the state for ``max_time`` moves no species by more than
+              ``rtol·|y_i| + atol_i``, and one from it kicked by a millionth
+              of each species does not let the kick grow tenfold: what tells
+              a state the system rests at from one under ``tol`` that a run
+              leaves (a model in small units, or a slow one), and from an
+              unstable root (the cubic's 0.3, from which nothing moves an
+              unkicked run). ``atol_i`` is the march's own, never more than
+              ``rtol`` times the largest species the solve starts with or
+              reaches. The Newton step ``δ = −J⁻¹f`` from the state to the
+              root, within the same tolerances, decides where the solve stops
+              (up to 512 unknowns), which takes the issue's cubic at a scale
+              of 1e-9 on from 0.894 to its root at 1; it decides nothing about
+              ``converged``. ``mask`` says which species are measured, not
+              which move: the step and the run move every species but a
+              ``$``-fixed one and a masked one that nothing reads or that
+              reads nothing (a counter), which is held. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, each species is marched at
+              the smaller of what ``atol="auto"`` gives it and the scalar
+              1e-8: the scalar is no tolerance for a model in small units, nor
+              ``"auto"`` for a species that starts large and settles small.
+            - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test
+              alone, kept for comparisons with ``run_network``. The norm is in
+              the model's units of concentration per unit time, so a model in
+              molar units, or a slow one, passes it far from its steady state:
+              the cubic ``X' = -k·x·(x - 0.3)·(x - 1)`` at a scale of 1e-9 came
+              back ``converged=True`` at x = 0.894, 1.003 and 0.131 after one
+              step, where every run ends at 1.
 
-              1. The Newton step ``δ = −J⁻¹f`` from the state to the root is
-                 within every species' own tolerance,
-                 ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-                 rtol·max(|y_i|, |y⁰_i|, floor)``: as ``atol="auto"`` derives
-                 it from ``y⁰``, the state the solve starts from, or from the
-                 state, whichever is larger. The floor is the
-                 smallest positive initial concentration the model declares of
-                 a species that is not ``$``-fixed (where none is above 0, the
-                 smallest of ``y⁰``; where that is 0 too, the largest species
-                 of the state or of the root it steps to). A species that
-                 starts at 0 is held to ``rtol`` times the floor, so one whose
-                 steady state is smaller than that is within tolerance of 0.
-              2. A run taken on from the state for ``max_time`` moves no
-                 species by more than its tolerance, and one from it kicked by
-                 a millionth of each species moves none, in its tolerance, by
-                 more than twice the kick. It is what tells a state the system
-                 rests at from an unstable root (the cubic's 0.3, from which
-                 nothing moves an unkicked run), from a rate with a floor at a
-                 kink, and from a slow drift.
-
-              Where there is no step to take, at a reduced Jacobian singular
-              or singular but for rounding (a continuum of steady states) or
-              above 512 unknowns, where the march stops by ``tol``, the runs
-              decide alone. They are taken on for ``max_time``, and a drift too
-              slow to move a species its tolerance in that time passes them. A
-              differenced Jacobian that straddles a jump in a rate law
-              certifies nothing. ``mask`` says which
-              species are measured, not which move: the step and the run move
-              every species but a ``$``-fixed one and a masked one that nothing
-              reads or that reads nothing (a counter), which is held. Where
-              neither ``atol`` nor :meth:`set_tolerances` gives one, each
-              species is marched at the smaller of what ``atol="auto"`` gives
-              it and the scalar 1e-8: the scalar is no tolerance for a model
-              in small units, nor ``"auto"`` for a species that starts large.
-            - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test,
-              kept for comparisons with ``run_network``. The norm is in the
-              model's units of concentration per unit time, so a model in molar
-              units, or a slow one, passes it far from its steady state: the
-              cubic ``X' = -k·x·(x - 0.3)·(x - 1)`` at a scale of 1e-9 came back
-              ``converged=True`` at x = 0.894, 1.003 and 0.131 after one step,
-              where every run ends at 1.
-
-            Under ``"scaled"`` the two tests are reported as
-            :attr:`SteadyStateResult.newton_distance` and
-            :attr:`SteadyStateResult.continued_run_distance`.
+            Under ``"scaled"`` the run test and the step are reported as
+            :attr:`SteadyStateResult.continued_run_distance` and
+            :attr:`SteadyStateResult.newton_distance`.
         max_time : float
             Max integration time for the integration path, and how long the
-            runs of ``criterion="scaled"``'s second test are taken on for.
+            runs of ``criterion="scaled"``'s run test are taken on for.
             Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
         rtol : float, optional
             Relative tolerance for the CVODE march, and under
-            ``criterion="scaled"`` for the test of having arrived. Default
-            ``1e-8``.
+            ``criterion="scaled"`` for the run test. Default ``1e-8``.
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the CVODE march — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
             :meth:`run` for the contract. This is the accuracy the march is
-            held to on the way to the root; the test of having arrived takes
-            its own, as ``atol="auto"`` does.
+            held to on the way to the root, and under ``criterion="scaled"``
+            the run test's; ``tol`` above is the separate test for having
+            arrived, a single norm over all species.
         max_steps : int, optional
             Max CVODE internal steps per output point.
         sensitivity_params : list[str], optional
@@ -8009,10 +7999,6 @@ class Simulator:
             "steady_state(sensitivity_params=...) does not return dY_ss/dp for this model "
             "at this steady state (issue #995): "
         )
-        # Issue #1001: what solves nearer the root is the criterion's own
-        # tolerance, tol for the residual test and rtol for the default.
-        residual_test = result.criterion == "residual"
-        tighter = "a smaller tol" if residual_test else "a smaller rtol"
         not_isolated = (
             f"{opening}the steady state is not an isolated root of the equations the "
             "columns are solved on"
@@ -8050,7 +8036,7 @@ class Simulator:
                     "(it is one of a continuum, or a root of higher order, which a species "
                     "nears as 1/t), or a rate law is discontinuous between the two states, "
                     "or the returned state is far from the steady state for the size of "
-                    f"its rates, which solving again with {tighter} settles. "
+                    "its rates, which solving again with a smaller tol settles. "
                 )
             else:
                 # Negative, or above the upper limit.
@@ -8058,13 +8044,8 @@ class Simulator:
                     "a determinant that changes sign or grows so is not that of one matrix "
                     "at two states close together. A rate law is discontinuous between "
                     "the two, or the returned state is far from the steady state for the "
-                    "size of its rates ("
-                    + (
-                        "tol bounds the residual and not the distance to the root: "
-                        if residual_test
-                        else ""
-                    )
-                    + f"solve again with {tighter}), or the determinant is what "
+                    "size of its rates (tol bounds the residual and not the distance to "
+                    "the root: solve again with a smaller tol), or the determinant is what "
                     "rounding leaves of a zero, and the Jacobian is singular whatever the "
                     "state. "
                 )
@@ -8141,14 +8122,9 @@ class Simulator:
                 "step leaves where it is, with its columns. The columns are solved again a "
                 "Newton step on, and where they or the state move the state is stepped "
                 f"again, up to ten times: after the last, {moved}. The returned state is "
-                "far from a root for the size of its rates ("
-                + (
-                    "tol bounds the residual ||f(y)||/n and not the distance to the root: "
-                    f"this solve stopped at {result.residual:.1e}, and "
-                    if residual_test
-                    else ""
-                )
-                + f"{tighter} starts the steps nearer), or the "
+                "far from a root for the size of its rates (tol bounds the residual "
+                "||f(y)||/n and not the distance to the root: this solve stopped at "
+                f"{result.residual:.1e}, and a smaller tol starts the steps nearer), or the "
                 "steady state is not an isolated root, or a species runs out through a "
                 "rate that has no value at nothing, so that it cannot be shown to be at a "
                 f"zero. The columns are those of {time_course}."
@@ -8192,7 +8168,7 @@ class Simulator:
                 f"{away} from that root in {result.sens_root_hold_species}, of what that "
                 f"species is taken over (the limit is "
                 f"{self._SS_ROOT_HOLD_SHIFT_MAX:.0%}). The solver stopped beside a root "
-                f"the system leaves, or between two. Solve again with {tighter}, or "
+                "the system leaves, or between two. Solve again with a smaller tol, or "
                 f"take the columns from {time_course}."
             )
         if not held <= self._SS_ROOT_HOLD_SHIFT_MAX or short:
@@ -8251,15 +8227,11 @@ class Simulator:
                     )
             raise SimulationError(
                 f"{opening}the state the solve returned is not one a run stays at. {moved} "
-                + (
-                    "An integration stops at the first state whose residual ||f(y)||/n is "
-                    "under tol, which says where the run is and not where it is going, and a "
-                    if residual_test
-                    else "A "
-                )
-                + "root can be one the system leaves, where "
+                "An integration stops at the first state whose residual ||f(y)||/n is "
+                "under tol, which says where the run is and not where it is going, and a "
+                "root can be one the system leaves, where "
                 "-J⁻¹·∂f/∂p is how the root moves and not where a run ends. Solve again "
-                f"with {tighter}, or from a state that is not on such a root, or take "
+                "with a smaller tol, or from a state that is not on such a root, or take "
                 f"the columns from {time_course}."
             )
         if not relaxation <= self._SS_ROOT_RELAXATION_MAX:
@@ -10542,19 +10514,19 @@ class SteadyStateResult:
         ``max|f(y)|`` at convergence.
     newton_distance : float
         The Newton step from the state returned to the root, in each
-        species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
-        is within it (issue #1001). NaN under ``criterion="residual"``, which
-        does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular at a state that is not a root, or a differenced
-        one straddles a jump. Past 1 through a Jacobian singular but for
-        rounding it decides nothing, and the runs do.
+        species' own tolerance, which under ``criterion="scaled"`` decided
+        where the solve stopped (issue #1001); at most 1 is within it. NaN
+        under ``criterion="residual"``, which does not take the step, and
+        above 512 unknowns; ``inf`` where the Jacobian is singular at a state
+        that is not a root, or a differenced one straddles a jump.
     continued_run_distance : float
-        The second test of ``criterion="scaled"``: the largest move of a
-        measured species, over its tolerance, across the runs taken on from
-        the state returned (the kicked one's over 1 + twice its kick); at
-        most 1 passes (issue #1001). ``inf`` where a run could not be taken
-        to its time; NaN where none was taken (under ``"residual"``, where
-        the Newton step already refused, and for a burst-free Newton solve).
+        The run test of ``criterion="scaled"``: the largest move of a
+        measured species, over its tolerance, across the run taken on from
+        the state returned, and the kicked run's over ten times 1 + twice its
+        kick; at most 1 passes (issue #1001). ``inf`` where a run could not
+        be taken to its time; NaN where none was taken (under ``"residual"``,
+        where the parity test already refused, and for a burst-free Newton
+        solve).
     criterion : str
         The test ``converged`` was decided by, ``"scaled"`` or ``"residual"``.
     method_used : str

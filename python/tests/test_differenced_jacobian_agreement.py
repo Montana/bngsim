@@ -98,11 +98,7 @@ def _first_quotient(model, y, j):
 
 def _steady(model, **kw):
     sim = bngsim.Simulator(model, method="ode", **kw)
-    # The residual test, by name (issue #1001). Under the default, X, which
-    # starts at 0 beside G at `big`, is held to rtol·big, as atol="auto" holds
-    # it: at G = 1e8 that is 1 against X* = 0.87, and the columns read off the
-    # state are not to 1e-9.
-    return sim.steady_state(sensitivity_params=["s"], criterion="residual")
+    return sim.steady_state(sensitivity_params=["s"])
 
 
 # ─── The steady state's columns ──────────────────────────────────────────────

@@ -186,9 +186,10 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     but a $-fixed one and a masked one nothing reads (an empty column of the
     Jacobian's pattern), which is held; the laws are cut down to the ones no
     such species is in; the step is solved on all of it, with a rank check.
-    Its size is taken over each kept species' rtol·|y| + rtol·max(|y|, |y0|,
-    floor), y0 the state the solve started from (the model's, here) and the
-    floor the smallest of it above 0."""
+    Its size is taken over each kept species' rtol·|y| + min(atol_i,
+    rtol·largest): atol_i the march's, the smaller of what atol="auto" derives
+    from the start y0 and 1e-8, and `largest` the largest species of y0, y and
+    y + δ."""
     ns = len(y)
     cl = model.conservation_laws
     laws = np.asarray(cl["coefficients"], float).reshape(cl["n_laws"], ns)
@@ -210,8 +211,11 @@ def _numpy_newton_distance(model, y, rtol, mask=None):
     delta = np.zeros(ns)
     delta[moves] = step
     y0 = np.asarray(model.get_state(), float)
-    floor = min(abs(v) for v, keep in zip(y0, kept, strict=True) if keep and v != 0)
-    scale = rtol * np.abs(y) + rtol * np.maximum(np.maximum(np.abs(y), np.abs(y0)), floor)
+    a0 = np.abs(y0)
+    floor = a0[a0 > 1e-14 * a0.max()].min()
+    atol = np.minimum(rtol * np.maximum(a0, floor), 1e-8)
+    largest = max(a0[~fixed].max(), np.abs(y[~fixed]).max(), np.abs((y + delta)[~fixed]).max())
+    scale = rtol * np.abs(y) + np.minimum(atol, rtol * largest)
     return float(np.max(np.abs(delta[kept]) / scale[kept]))
 
 
@@ -967,8 +971,8 @@ end reactions
 @pytest.mark.parametrize("k", [1.0, 1e-12])
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_a_drift_with_no_step_to_take_is_not_converged(tmp_path, k, method):
-    # With no step to take the runs decide alone, over max_time: X moves by
-    # k·1e6, past its tolerance of 2e-8.
+    # There is no step to take. At k = 1 the residual test refuses; at 1e-12,
+    # under tol, a run of max_time moves X by 1e-6, past its tolerance.
     path = tmp_path / "drift.net"
     path.write_text(DRIFT_NET.format(k=k))
     ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
@@ -976,7 +980,10 @@ def test_a_drift_with_no_step_to_take_is_not_converged(tmp_path, k, method):
     )
     assert math.isinf(ss.newton_distance)
     assert not ss.converged
-    assert ss.continued_run_distance > 1.0
+    if k < 1e-9:
+        assert ss.continued_run_distance > 1.0
+    else:
+        assert math.isnan(ss.continued_run_distance)
 
 
 def test_a_drift_too_slow_to_show_in_max_time_passes(tmp_path):
@@ -1146,9 +1153,9 @@ _SHP2 = Path(__file__).resolve().parents[2] / "benchmarks/models/net/ode/SHP2_ba
 @pytest.mark.skipif(not _SHP2.exists(), reason="benchmark net SHP2_base_model not present")
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_a_solve_seeded_with_its_own_answer_converges_again(method):
-    # The floor is the model's, from what it declares. Taken from the state a
-    # solve starts at, the species SHP2 drains to nothing set it, and a solve
-    # seeded with its own answer was refused there (a step of 7.7e3).
+    # The species SHP2 drains to nothing sit at 1e-20 and below: taken as the
+    # floor of the march's tolerances, they held every species at 0 to that,
+    # and a solve seeded with its own answer was refused there.
     model = bngsim.Model.from_net(str(_SHP2))
     sim = bngsim.Simulator(model, method="ode")
     first = sim.steady_state(method="integration")
@@ -1156,4 +1163,210 @@ def test_a_solve_seeded_with_its_own_answer_converges_again(method):
     model.set_state(np.asarray(first.concentrations))
     again = sim.steady_state(method=method)
     assert again.converged
-    assert again.newton_distance <= 1.0
+    assert again.continued_run_distance <= 1.0
+    np.testing.assert_allclose(
+        np.asarray(again.concentrations),
+        np.asarray(first.concentrations),
+        rtol=1e-6,
+        atol=1e-8,
+    )
+
+
+# ─── What the independent review found (issue #1001) ─────────────────────────
+
+# 0 -> X at s, X -> 0 at k1, X + X -> D at k2, D -> 0; G, unrelated, at `big`.
+BESIDE_A_LARGE_ONE_NET = """begin parameters
+    1 s   1.3
+    2 k1  0.21
+    3 k2  0.73
+    4 kd  0.5
+    5 sg  {big!r}
+    6 dg  1.0
+end parameters
+begin species
+    1 X() 0
+    2 D() 0
+    3 G() {big!r}
+end species
+begin reactions
+    1 0 1 s
+    2 1 0 k1
+    3 1,1 2 k2
+    4 2 0 kd
+    5 0 3 sg
+    6 3 0 dg
+end reactions
+"""
+
+
+@pytest.mark.parametrize("big", [1e8, 1e12])
+@pytest.mark.parametrize("jacobian", ["auto", "fd"])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_species_beside_a_large_one_is_solved_to_its_root(tmp_path, big, jacobian, method):
+    # Control: main solves it. X starts at 0 beside G at `big`; held to
+    # rtol·big, as atol="auto" holds a species with no size of its own, X
+    # came back converged 5% off at 1e8 and 129% off at 1e12 (differenced
+    # columns) on the way to this change.
+    path = tmp_path / "beside.net"
+    path.write_text(BESIDE_A_LARGE_ONE_NET.format(big=big))
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
+    ).steady_state(method=method)
+    x_root = (-0.21 + math.sqrt(0.21**2 + 8 * 0.73 * 1.3)) / (4 * 0.73)
+    assert ss.converged
+    assert ss.concentrations[0] == pytest.approx(x_root, rel=1e-7)
+
+
+# A + A -> 0 at 1, 0 -> A at 1e-6: A settles at 7.07e-4 from wherever it starts.
+SETTLES_SMALL_NET = """begin parameters
+    1 k 1.0
+    2 s 1e-6
+end parameters
+begin species
+    1 A() {a0!r}
+end species
+begin reactions
+    1 1,1 0 k
+    2 0 1 s
+end reactions
+"""
+
+
+@pytest.mark.parametrize("a0", [1e5, 1e7, 1e8])
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_species_that_settles_far_below_its_start_is_solved_to_its_root(tmp_path, a0, method):
+    # Marched at atol="auto" from 1e7, A was held to 0.1 and came back
+    # converged 91 times its root; from 1e5 the march ran to -1e19.
+    path = tmp_path / "settles.net"
+    path.write_text(SETTLES_SMALL_NET.format(a0=a0))
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method
+    )
+    assert ss.converged
+    assert ss.concentrations[0] == pytest.approx(math.sqrt(1e-6 / 2), rel=1e-7)
+
+
+def test_a_tol_the_call_gives_is_read(tmp_path):
+    # Control: main reads it. A <-> B with A0 the rate back: A* = 9/4. Under
+    # the default the parity test is asked too, at the tol given.
+    path = tmp_path / "ab.net"
+    path.write_text(
+        "begin parameters\n    1 A0 3\n    2 kf 1\nend parameters\n"
+        "begin species\n    1 A() A0\n    2 B() 0\nend species\n"
+        "begin reactions\n    1 1 2 kf\n    2 2 1 A0\nend reactions\n"
+    )
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(tol=1e-14)
+    assert ss.converged and ss.residual < 1e-14
+    np.testing.assert_allclose(np.asarray(ss.concentrations), [9 / 4, 3 / 4], rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "text,want",
+    [
+        ("model neg\n V = 0\n J0: -> V; k*(Vrest - V)\n k = 0.5\n Vrest = -65\nend", [-65.0]),
+        (
+            "model neg2\n V = -60\n n = 0.3\n J0: -> V; k*(Vrest - V) - g*n*(V - Ek)\n"
+            " J1: -> n; a*(1 - n) - b*n\n k = 0.5\n Vrest = -65\n g = 0.1\n Ek = -80\n"
+            " a = 0.1\n b = 0.2\nend",
+            [-65.9375, 1 / 3],
+        ),
+    ],
+)
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_variable_that_rests_below_zero_is_converged(text, want, method):
+    # Control: main converges. A membrane potential at -65; a guard on the
+    # sign of every species refused it on the way to this change.
+    model = bngsim.Model.from_antimony_string(text)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
+    assert ss.converged
+    np.testing.assert_allclose(np.asarray(ss.concentrations), want, rtol=1e-7)
+
+
+# The cubic at its root 0.3 beside two laws whose dependents, C1 and C2, sit at
+# 0 and would want kicks of opposite signs.
+KICK_BESIDE_LAWS_NET = """begin parameters
+    1 k3 1.0
+    2 k2 1.3
+    3 k1 0.3
+    4 k 1.0
+end parameters
+begin species
+    1 X() 0.3
+    2 C1() 0
+    3 E1() 1
+    4 C2() 0
+    5 E2() 1
+end species
+begin reactions
+    1 1,1,1 1,1 k3
+    2 1,1 1,1,1 k2
+    3 1 0 k1
+    4 2 3 k
+    5 4 5 k
+end reactions
+"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_an_unstable_root_beside_a_dependent_at_zero_is_not_converged(tmp_path, method):
+    # Scaled down to the room its law's dependents had, the whole kick fell to
+    # 0 and the root at 0.3 was returned converged.
+    path = tmp_path / "kick.net"
+    path.write_text(KICK_BESIDE_LAWS_NET)
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
+        method=method
+    )
+    assert ss.concentrations[0] == pytest.approx(0.3, rel=1e-9)
+    assert not ss.converged
+    assert ss.continued_run_distance > 1.0
+
+
+@pytest.mark.parametrize("x0", [0.5, 0.9, 1.5])
+def test_a_state_set_at_another_scale_is_held_to_its_own(tmp_path, x0):
+    # The cubic at a scale of 1e-9, declared at 1 and started by set_state()
+    # and states=. Held to the floor its declaration gave, it was returned
+    # where it was set.
+    model = _cubic(tmp_path, 1e-9, 1.0 / 1e-9)
+    model.set_state([x0 * 1e-9])
+    ss = bngsim.Simulator(model, method="ode").steady_state()
+    assert ss.converged
+    assert ss.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+    [batch] = bngsim.Simulator(
+        _cubic(tmp_path, 1e-9, 1.0 / 1e-9), method="ode"
+    ).steady_state_batch(states=[[x0 * 1e-9]])
+    assert batch.converged
+    assert batch.concentrations[0] / 1e-9 == pytest.approx(1.0, rel=1e-6)
+
+
+def test_a_species_at_roundoff_does_not_set_the_march_tolerance():
+    # MODEL2307110001 declares a species at -1.6e-34. Taken as the floor of
+    # atol="auto", it held every species at 0 to that, and the march failed.
+    sim = (
+        bngsim.Simulator(bngsim.Model.from_net(str(_SHP2)), method="ode")
+        if _SHP2.exists()
+        else None
+    )
+    if sim is None:
+        pytest.skip("benchmark net SHP2_base_model not present")
+    state = np.asarray(sim._model.get_state(), float)
+    state[0] = -1.6e-34
+    atol = np.asarray(sim._steady_state_atol(None, "scaled", state, 1e-8))
+    assert atol.min() > 1e-30
+    assert atol.max() <= 1e-8
+
+
+_B038 = (
+    Path(__file__).resolve().parents[2]
+    / "parity_checks/rr_parity/models/BIOMD0000000038/BIOMD0000000038_url.xml"
+)
+
+
+@pytest.mark.skipif(
+    not _B038.exists(), reason="rr_parity corpus model BIOMD0000000038 not present"
+)
+def test_a_run_is_not_moved_by_its_own_error():
+    # Integrated at the criterion's own tolerances, the run moved the state by
+    # 2 tolerances of its own error; at 1e-12 by 0.04.
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B038)), method="ode").steady_state()
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0

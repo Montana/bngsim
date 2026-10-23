@@ -702,26 +702,15 @@ def test_a_continuum_across_sizes_is_refused():
     model = bngsim.Model.from_antimony_string(CONTINUUM.format(v2=2.3))
     np.testing.assert_allclose(_law(model), [1, 2.3 / 0.7, 2.3 / 0.7, 1, 2.3 / 0.7, 1], rtol=1e-12)
     sim = bngsim.Simulator(model, method="ode")
-    # The residual test, by name (issue #1001), and the default below: there
-    # the step along the continuum, 2.7e8 tolerances through a matrix singular
-    # but for rounding, is no step, and a run from the state stays. Either way
-    # the columns are refused.
     for name in ("kp", "k1"):
         with pytest.raises(
             bngsim.SimulationError,
             match=r"#995.*not an isolated root",
         ):
-            sim.steady_state(sensitivity_params=[name], tol=1e-10, criterion="residual")
+            sim.steady_state(sensitivity_params=[name], tol=1e-10)
         model.reset()
-    out = sim.steady_state(tol=1e-10, criterion="residual")  # where a run ends
+    out = sim.steady_state(tol=1e-10)  # the state itself is where a run ends
     assert out.converged and abs(np.asarray(out.concentrations)[1]) < 1e-8
-    model.reset()
-    out = sim.steady_state()
-    assert out.converged and out.newton_distance > 1e6
-    assert out.continued_run_distance <= 1.0
-    model.reset()
-    with pytest.raises(bngsim.SimulationError, match=r"#995.*not an isolated root"):
-        sim.steady_state(sensitivity_params=["kp"])
 
 
 def test_a_zero_pivot_beside_a_law_across_sizes_is_refused_as_having_no_gradient():
@@ -736,9 +725,7 @@ def test_a_zero_pivot_beside_a_law_across_sizes_is_refused_as_having_no_gradient
     )
     assert model._core.conservation_law_members() == [[0, 1]]
     with pytest.raises(bngsim.SimulationError, match="dY_ss/dp does not exist") as caught:
-        bngsim.Simulator(model, method="ode").steady_state(
-            sensitivity_params=["kp"], tol=1e-10, criterion="residual"
-        )
+        bngsim.Simulator(model, method="ode").steady_state(sensitivity_params=["kp"], tol=1e-10)
     assert not isinstance(caught.value, bngsim.SensitivityUnsupportedError)
 
 
@@ -759,9 +746,7 @@ def test_the_continuum_in_amounts_under_a_rate_rule_is_refused():
     )
     assert model.compartment_size_params == ["c1"]
     with pytest.raises(bngsim.SimulationError, match=r"#995.*not an isolated root"):
-        bngsim.Simulator(model, method="ode").steady_state(
-            sensitivity_params=["kp"], tol=1e-10, criterion="residual"
-        )
+        bngsim.Simulator(model, method="ode").steady_state(sensitivity_params=["kp"], tol=1e-10)
 
 
 def test_the_same_continuum_in_one_size_is_refused_as_it_was():
