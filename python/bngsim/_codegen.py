@@ -16,6 +16,7 @@ Architecture (AMICI/libRoadRunner pattern):
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
@@ -1781,6 +1782,137 @@ def _normalize_exprtk_operators(expr: str) -> str:
     s = _LONE_EQUALS_RE.sub("==", expr).replace("<>", "!=")
     s = _SIGN_RUN_RE.sub(r"\1 ", s)
     return _parenthesize_relational_chains(s)
+
+
+# What ends the operand of a `%`: an operator that binds looser than `*`,
+# `/` and `%` do, or a comma.
+_LOOSER_THAN_PRODUCT = frozenset("<>=!&|?:;,")
+_LOOSER_WORDS = frozenset(("and", "or", "xor", "nand", "nor", "xnor"))
+_NUMBER_BEFORE_EXPONENT = re.compile(r"(?<![A-Za-z0-9_.])(?:\d+\.?\d*|\.\d+)[eE]$")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ExprTk groups with all three kinds of bracket.
+_BRACKET_CLOSES = {"(": ")", "[": "]", "{": "}"}
+_CLOSING_BRACKETS = frozenset(_BRACKET_CLOSES.values())
+
+
+class _UnbalancedBrackets(Exception):
+    """A bracket in a text :func:`_spell_mod` reads has no partner of its kind."""
+
+
+def _spell_mod(text: str) -> str:
+    """*text* with each ``a % b`` written ``mod(a, b)``.
+
+    ExprTk's ``%`` on doubles is ``std::fmod``, which is its ``mod()`` too, so
+    the two read the same everywhere. C has no ``%`` on doubles. The stop and
+    root scanners of :mod:`bngsim._switch_sensitivity` read named calls only
+    (``_STEP_CALL``), and a pulse written with the operator got no stop on a
+    clock and no root on a counter, and was stepped over: Y = 0 for 3.93
+    (issue #1127). ``%`` binds like ``*`` and ``/``, from the left, and tighter
+    than ``+`` and ``-``: ``a*b % c - d`` is ``mod(a*b, c) - d``. Quoted text
+    (a ``tfun`` file name) is left alone, and so is a text whose brackets do
+    not pair up, which ExprTk would not compile either.
+
+    The test for ``%`` comes before the cache, so the bodies without one,
+    nearly all of them, are not hashed into it: a model with more functions
+    than the cache holds evicted every entry on every scan of its bodies.
+    """
+    if "%" not in text:
+        return text
+    return _spell_mod_cached(text)
+
+
+@functools.lru_cache(maxsize=16384)
+def _spell_mod_cached(text: str) -> str:
+    try:
+        out, _ = _spell_mod_from(text, 0, None)
+    except _UnbalancedBrackets:
+        return text
+    return out
+
+
+def _spell_mod_from(text: str, i: int, closer: str | None) -> tuple[str, int]:
+    """:func:`_spell_mod` of *text* from *i* to *closer*, the bracket that
+    closes it (``None``: the end of the text)."""
+    out: list[str] = []
+    chain: list[tuple[str, str]] = []  # (operator before it, factor) in one product
+    op, factor = "", ""
+
+    def close_chain() -> None:
+        nonlocal op, factor
+        chain.append((op, factor))
+        if any(o == "%" for o, _ in chain):
+            lead = chain[0][1][: len(chain[0][1]) - len(chain[0][1].lstrip())]
+            trail = factor[len(factor.rstrip()) :]
+            acc = chain[0][1].strip()
+            for o, f in chain[1:]:
+                acc = f"mod({acc}, {f.strip()})" if o == "%" else f"{acc}{o}{f.strip()}"
+            out.append(lead + acc + trail)
+        else:
+            out.append("".join(o + f for o, f in chain))
+        chain.clear()
+        op, factor = "", ""
+
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in _BRACKET_CLOSES:
+            inner, i = _spell_mod_from(text, i + 1, _BRACKET_CLOSES[c])
+            factor += c + inner + _BRACKET_CLOSES[c]
+            continue
+        if c in _CLOSING_BRACKETS:
+            if c != closer:
+                raise _UnbalancedBrackets
+            close_chain()
+            return "".join(out), i + 1
+        if c in "'\"":
+            end = text.find(c, i + 1)
+            end = n if end < 0 else end + 1
+            factor += text[i:end]
+            i = end
+            continue
+        if c == "*" and text.startswith("**", i):
+            factor += "**"
+            i += 2
+            continue
+        if c in "*/%":
+            chain.append((op, factor))
+            op, factor = c, ""
+            i += 1
+            continue
+        if c in "+-":
+            before = factor.rstrip()
+            if (
+                before
+                and not before.endswith(("^", "**"))
+                and not (_NUMBER_BEFORE_EXPONENT.search(before))
+            ):
+                close_chain()
+                out.append(c)
+                i += 1
+                continue
+            factor += c
+            i += 1
+            continue
+        if c in _LOOSER_THAN_PRODUCT:
+            close_chain()
+            out.append(c)
+            i += 1
+            continue
+        word = _WORD.match(text, i) if c.isalpha() or c == "_" else None
+        if word:
+            if word.group() in _LOOSER_WORDS and factor.strip():
+                close_chain()
+                out.append(word.group())
+            else:
+                factor += word.group()
+            i = word.end()
+            continue
+        factor += c
+        i += 1
+    if closer is not None:
+        raise _UnbalancedBrackets
+    close_chain()
+    return "".join(out), n
 
 
 def _parenthesize_relational_chains(s: str) -> str:
@@ -5542,6 +5674,9 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     # ExprTk's reading of =, <>, -- and relational chains made explicit before
     # anything else, since each is copied through as text (issue #734).
     result = _normalize_exprtk_operators(expr)
+    # ``a % b`` on doubles does not compile in C; ``mod()`` becomes ``fmod``
+    # below, which is what ExprTk's operator is (issue #1127).
+    result = _spell_mod(result)
     # if() must be expanded first so nested ternary structure is correct
     # before identifier rewriting touches anything.
     result = _replace_if_calls(result)
