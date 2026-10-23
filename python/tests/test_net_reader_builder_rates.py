@@ -9,6 +9,7 @@ of the column that `Model.from_net` did not share.
 
 from __future__ import annotations
 
+import re
 import textwrap
 from pathlib import Path
 
@@ -279,4 +280,151 @@ class TestBuildModelFromParsedRates:
         with pytest.raises((RuntimeError, ValueError), match=r"\(0\.5\*kp2"):
             build_model_from_parsed(parse_net_file(net))
         with pytest.raises(ModelError, match=r"\(0\.5\*kp2"):
+            bngsim.Model.from_net(str(net))
+
+
+def _one_reaction_net(tmp_path: Path, line: str, extra_params: str = "") -> Path:
+    """A network whose reactions block is *line*; E, S, P and every name the
+    cases below read are declared, so only the line itself can be refused."""
+    net = tmp_path / "model.net"
+    net.write_text(
+        textwrap.dedent(
+            """\
+            begin parameters
+              1 k     1.0
+              2 tau   5.0
+              3 kcat  2.0
+              4 Km    3.0
+              5 V     4.0
+              6 K     5.0
+              7 n     2.0
+            {extra}end parameters
+            begin species
+              1 E() 10
+              2 S() 100
+              3 P() 0
+            end species
+            begin reactions
+              {line}
+            end reactions
+            begin groups
+              1 Ptot 3
+            end groups
+            begin functions
+              1 f() 2*k
+            end functions
+            """
+        ).format(line=line, extra=extra_params)
+    )
+    return net
+
+
+class TestTokensAfterTheRateLaw:
+    """A reaction line is `<index> <reactants> <products> <rate law>`, and only a
+    Sat, Hill or MM rate law runs past one token, on its constants. The loader
+    used to read the line and drop whatever followed, so `1 2 3 k delay=tau`
+    loaded as an undelayed reaction with no error; run_network refuses it
+    ("Undefined rateLaw type"). Issue #1231."""
+
+    @pytest.mark.parametrize(
+        ("line", "extra", "law"),
+        [
+            ("1 2 3 k delay=tau", "delay=tau", "k"),
+            ("1 2 3 2*k delay=tau", "delay=tau", "2*k"),
+            ("1 2 3 f delay=tau", "delay=tau", "f"),
+            ("1 2 3 k 2", "2", "k"),
+            ("1 2 3 k delay = tau", "delay = tau", "k"),
+            ("1 1,2 1,3 MM kcat Km delay=tau", "delay=tau", "MM kcat Km"),
+            ("1 1,2 1,3 MM kcat Km Km", "Km", "MM kcat Km"),
+        ],
+        ids=["elementary", "stat-factor", "functional", "number", "spaced", "mm", "mm-third"],
+    )
+    def test_a_token_after_the_rate_law_is_refused(
+        self, tmp_path: Path, line: str, extra: str, law: str
+    ) -> None:
+        net = _one_reaction_net(tmp_path, line)
+        message = re.escape(f"has '{extra}' after its rate law '{law}'")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
+    def test_the_comment_is_not_read_as_tokens(self, tmp_path: Path) -> None:
+        """What follows `#` is BNG2.pl's comment (`#_R1`, `unit_conversion=...`),
+        not part of the rate law: the line loads as plain `A -> B` at k."""
+        net = _one_reaction_net(tmp_path, "1 2 3 k #_R1 delay=tau")
+        (rxn,) = parse_net_file(net)["reactions"]
+        assert (rxn["type"], rxn["rate_law"], rxn["stat_factor"]) == ("elementary", "k", 1.0)
+        bngsim.Model.from_net(str(net))
+
+    def test_an_mm_rate_law_with_one_constant_is_refused_as_such(self, tmp_path: Path) -> None:
+        """`MM kcat` used to fall through to the elementary branch and be refused
+        at build as "unknown parameter 'MM'"."""
+        net = _one_reaction_net(tmp_path, "1 1,2 1,3 MM kcat")
+        message = re.escape("an MM rate law takes two constants, 'MM kcat Km'")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
+    @pytest.mark.parametrize(
+        ("law", "line"),
+        [
+            ("MM", "1 1,2 1,3 2*MM kcat Km"),
+            ("Sat", "1 2 3 2*Sat k Km"),
+            ("Hill", "1 2 3 2*Hill V K n"),
+        ],
+    )
+    def test_a_stat_factor_on_a_typed_rate_law_is_refused_as_such(
+        self, tmp_path: Path, law: str, line: str
+    ) -> None:
+        """BNG2.pl writes `2*MM kcat Km` for a symmetric substrate. bngsim does not
+        read that form yet (#1230); it was refused at build as "unknown parameter
+        'MM'", which names the wrong thing."""
+        net = _one_reaction_net(tmp_path, line)
+        message = re.escape(f"puts a stat factor on its {law} rate law") + r".*#1230"
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
+    @pytest.mark.parametrize(
+        ("line", "same_rate", "doubled"),
+        [
+            ("1 1,2 1,3 2*MM kcat Km", "1 1,2 1,3 MM kcat2 Km", "8 kcat2 4.0\n"),
+            ("1 2 3 2*Sat k Km", "1 2 3 Sat k2 Km", "8 k2 2.0\n"),
+            ("1 2 3 2*Hill V K n", "1 2 3 Hill V2 K n", "8 V2 8.0\n"),
+        ],
+        ids=["MM", "Sat", "Hill"],
+    )
+    @pytest.mark.xfail(
+        strict=True,
+        raises=ModelError,
+        reason="#1230: a stat factor on an MM, Sat or Hill rate law is refused",
+    )
+    def test_a_stat_factor_on_a_typed_rate_law_scales_the_rate(
+        self, tmp_path: Path, line: str, same_rate: str, doubled: str
+    ) -> None:
+        """run_network multiplies the whole rate by the factor (network.cpp:
+        `stat_factor * kcat * Et * S / (Km + S)`, `stat_factor * param[0] * ...`),
+        so `2*T c1 c2...` is `T c1' c2...` with c1' = 2*c1."""
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        expect = bngsim.Model.from_net(str(_one_reaction_net(tmp_path / "b", same_rate, doubled)))
+        got = bngsim.Model.from_net(str(_one_reaction_net(tmp_path / "a", line)))
+
+        def run(model: bngsim.Model) -> np.ndarray:
+            sim = bngsim.Simulator(model, method="ode")
+            return np.asarray(sim.run(t_span=(0.0, 5.0), n_points=11).species)
+
+        np.testing.assert_allclose(run(got), run(expect), rtol=1e-6, atol=1e-9)
+
+    def test_the_ele_keyword_is_refused_as_such(self, tmp_path: Path) -> None:
+        """run_network reads `Ele k` as elementary k; BNG2.pl never writes it, and
+        this loader refused it at build as "unknown parameter 'Ele'"."""
+        net = _one_reaction_net(tmp_path, "1 2 3 Ele k")
+        message = re.escape("spells out the Ele rate-law type")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
             bngsim.Model.from_net(str(net))
