@@ -47,11 +47,31 @@ collapses into `PASS` — and records the attribution in `JobResult.subclass`:
 | `diff_ode_level` | `DIFF` | `ode_level` | **red** |
 | `diff_not_bngsim` | `DIFF` | `diff_not_bngsim` | green |
 | `rr_known` | `DIFF` | `rr_known` | green |
+| `partial` | `DIFF` | `partial_horizon` | green (provisional) |
+| `extended` | `DIFF` | `extended_horizon` | green (provisional) |
+| `attribution_incomplete` | `DIFF` | `attribution_incomplete` | green (provisional) |
+| `rr_time_event` | `DIFF` | `rr_time_event` | green (RR capability gap) |
+| `rr_time_event_unverified` | `DIFF` | `rr_time_event_unverified` | green (RR capability gap) |
 | `too_slow` | `TIMEOUT` | — | green (coverage gap) |
 | `error` | `EXCEPTION` | — | **red** |
+| `nonfinite_rate` | `BAD_TEST` | — | green (not compared) |
 | `skip` | `SKIP` | — | green |
 | `archive_stale` | `REFERENCE_FAILED` | — (`reference_refusal: archive_stale`) | green (not compared) |
 | `archive_unreplayable` | `REFERENCE_FAILED` | — (`reference_refusal: archive_unreplayable`) | green (not compared) |
+
+`nonfinite_rate` (issue #1211) is a bngsim refusal of a NaN or infinite
+propensity (#809) that the model, not bngsim, causes. RoadRunner's gillespie
+raises nothing at such a state: it fires no further reaction and holds the
+state to the end of the run. So on that refusal the screen runs it on the same
+seeds and reads its rates at the end of each replicate. Where the rate of the
+reaction bngsim named (matched by its net change of each floating species) is
+NaN or infinite there too, the rate law is undefined at a state the SSA
+reaches. Where RoadRunner's gillespie declines the model for a feature it does
+not simulate (a rate rule, say), neither engine has a trajectory either. Both
+are `nonfinite_rate`. Everything else stays a red `error`: every rate finite, a
+non-finite rate of another reaction, any other RoadRunner error. The check runs
+where bngsim's full-horizon ensemble refuses; a refusal inside the partial- or
+extended-horizon ladders, or in the time-event re-validation, stays an `error`.
 
 A suite scoring policy (`is_expected(outcome, subclass)`) decides green/red — it
 greens the attributed-not-bngsim DIFFs, the `too_slow` coverage gap (deliberately
@@ -80,7 +100,9 @@ An entry holds every RoadRunner result the screen used for that model:
 - the gillespie ensemble at the full horizon, or the error it raised;
 - the ensemble at each rung of the partial- or extended-horizon ladder the run
   walked;
-- RoadRunner's ODE on the screen's grid, when a fail was attributed.
+- RoadRunner's ODE on the screen's grid, when a fail was attributed;
+- whether RoadRunner's gillespie reaches a NaN or infinite rate, or the error
+  it raised, when bngsim refused such a propensity.
 
 The replay re-runs bngsim and walks the same ladders, so it reaches the same
 verdicts unless bngsim's own behaviour changed. In that case it may need a
@@ -90,6 +112,7 @@ depends on how fast bngsim finishes them, so a faster or slower machine can
 turn a recorded `partial` or `extended` row into `archive_unreplayable` too;
 read that as a reason to re-record, not as a regression. A fail whose
 RoadRunner ODE the record does not hold stays a red `fail` ("unattributed"),
+and a NaN refusal whose RoadRunner rates it does not hold stays a red `error`,
 so a regression is never hidden. The z-gate knobs
 (`--mean-z-tol`, `--min-mean-count`, `--self-z-tol`) are not part of an entry,
 so a replay can rescore the same ensembles under new gates.

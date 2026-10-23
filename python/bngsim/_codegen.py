@@ -8372,8 +8372,11 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "(correct, but slower, where every rate law is continuous in the state along "
         "the run, though a column can still be wrong where a min(), max(), abs() or "
         "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
-        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
-        "for the jumps that are found in the rate "
+        "tolerance, at a triangle of width 0.01, issue #1126. Of these, min, max and "
+        "abs are left here only in a model whose rate laws hold a condition, or where "
+        "one sits in anything but a sum, a product, a whole power, an exp() or another "
+        "bend, or in a product with a division or a fractional power of the state or "
+        "the clock. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -8799,6 +8802,55 @@ class _FunctionalDfdpScope(NamedTuple):
     # Empty unless the model has an amount-valued species whose compartment size
     # is writable — see :func:`_observable_volume_weights`.
     obs_volume_weights: dict[str, dict[int, str]] = {}
+    # Issue #1126: whether abs / min / max are differentiated rather than
+    # declined. Only in a model whose rate laws hold no condition at all: the
+    # crossing gate is what a condition is read through on the analytic path,
+    # and a bend that kept such a model on the difference quotient kept it
+    # where the #938 refusal reads it. ``B == 0`` over a B that a max() makes
+    # from 0 is one the gate takes, and returned dY/dq = 0 for -2.
+    bends_analytic: bool = False
+
+
+def _bend_under_a_break(expr, moving: set[str]) -> str | None:
+    """The first ``abs``, ``min`` or ``max`` in *expr* that what it is written
+    in can break, as text, or ``None`` (issue #1126).
+
+    A bend is continuous, and so is a sum, a product, a whole positive power,
+    an ``exp`` or another bend of it. A division or a fractional power may not
+    be: ``e/abs(e)`` is a sign, ``max(e, 0)/e`` a step, ``sqrt(abs(e))`` a cusp
+    whose slope is infinite at the bend. So a bend under one, or in a product
+    with one of what reads a name in *moving* (the state and the clock), is
+    named, and the law is declined as before. ``max(…)/w`` over a parameter is
+    not. Nor is any other call trusted (``log(max(e, 0))`` is −∞ at the bend),
+    so a bend under one is named too.
+    """
+    import sympy as sp
+
+    def breaks(node) -> bool:
+        if not isinstance(node, sp.Pow):
+            return False
+        e = node.exp
+        whole = bool(e.is_Integer and e >= 1)
+        return not whole and bool({str(x) for x in node.base.free_symbols} & moving)
+
+    def walk(node, safe: bool) -> str | None:
+        if isinstance(node, (sp.Abs, sp.Min, sp.Max)):
+            if not safe:
+                return str(node)
+            return next((w for a in node.args if (w := walk(a, True))), None)
+        if isinstance(node, sp.Pow):
+            e = node.exp
+            whole = bool(e.is_Integer and e >= 1)
+            return walk(node.base, safe and whole) or walk(e, False)
+        if isinstance(node, sp.Mul):
+            inner = safe and not any(breaks(a) for a in node.args)
+        elif isinstance(node, (sp.Add, sp.exp)):
+            inner = safe
+        else:
+            inner = False
+        return next((w for a in node.args if (w := walk(a, inner))), None)
+
+    return walk(expr, True)
 
 
 def _functional_rate_law_partials(
@@ -8826,8 +8878,10 @@ def _functional_rate_law_partials(
         _IDENT_CALL_RE,
         _TIME_SYM,
         _exprtk_to_sympy,
+        _finish_kinks,
         _finish_zero_bases,
         _inline_functions,
+        _prepare_kinks,
         _prepare_zero_bases,
         sympy_to_c,
         unemitted_derivative_reason,
@@ -8851,7 +8905,13 @@ def _functional_rate_law_partials(
 
     # Reject on the *inlined* text so a construct hidden inside a referenced
     # function is caught, not just one written in the rate law itself.
-    reason = unsupported_expr_construct(inlined, allow_conditions=scope.switch_scope is not None)
+    # A bend (abs, min, max) is differentiated through the kink twins below
+    # (issue #1126): its derivative has no delta, so nothing is left to make up.
+    reason = unsupported_expr_construct(
+        inlined,
+        allow_conditions=scope.switch_scope is not None,
+        allow_bends=scope.bends_analytic,
+    )
     if reason is not None:
         return None, f"uses unsupported construct: {reason}"
 
@@ -8907,19 +8967,27 @@ def _functional_rate_law_partials(
     if unknown:
         return None, "references unrecognized symbol(s): " + ", ".join(sorted(unknown))
 
+    if scope.bends_analytic:
+        moving = {a for a, ref in scope.c_ref.items() if ref.startswith("obs[")} | {_TIME_SYM}
+        broken = _bend_under_a_break(sym_expr, moving)
+        if broken is not None:
+            return None, f"uses unsupported construct: {broken} under a call, division or power"
+
+    targets = free & (set(scope.param_of_alias) | set(scope.obs_volume_weights))
+    # Issue #1126: an abs over a differentiation variable differentiates to
+    # sign(a)·a', and min / max to the Heaviside _finish_kinks spells as if().
+    sym_expr = _prepare_kinks(sym_expr, targets)
     # Issue #541: a power with a zero base — an ``if(c, u, 0)`` raised to a
     # parameter-dependent exponent — differentiates to 0, not to sympy's nan.
     sym_expr = _prepare_zero_bases(
-        sym_expr,
-        free & (set(scope.param_of_alias) | set(scope.obs_volume_weights)),
-        set(scope.param_of_alias) | set(_MATH_CONSTANT_C),
+        sym_expr, targets, set(scope.param_of_alias) | set(_MATH_CONSTANT_C)
     )
 
     terms: list[tuple[int, str]] = []
     for a in sorted(free & set(scope.param_of_alias)):
         pname = scope.param_of_alias[a]
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -8973,7 +9041,7 @@ def _functional_rate_law_partials(
     # so this loop does not run and the emitted text is unchanged.
     for a in sorted(free & set(scope.obs_volume_weights)):
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -10444,7 +10512,8 @@ def _functional_dfdp_terms(
     conditional_text = list(func_map.values()) + [
         str(r.get("rate_expr", "")) for r in frxn_by_idx.values()
     ]
-    if any(has_condition_construct(body) for body in conditional_text):
+    has_conditions = any(has_condition_construct(body) for body in conditional_text)
+    if has_conditions:
         from bngsim._switch_sensitivity import switch_condition_scope
 
         try:
@@ -10467,6 +10536,7 @@ def _functional_dfdp_terms(
         # (#170 stage 3) The compartment size an observable's amount conversion
         # hides. Empty ⇒ the derivative loop that reads it never runs.
         obs_volume_weights=_observable_volume_weights(data["species"], observables, _alias),
+        bends_analytic=not has_conditions,
     )
 
     # A rule-generated network reuses one rate-law expression across many

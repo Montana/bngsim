@@ -220,6 +220,7 @@ def test_a_stop_on_every_wrap_of_a_coarse_sawtooth_adds_every_period(
 
     class _Options:
         max_step_size = 0.0
+        rtol = 1e-6
         max_steps = 10000
         stops: list = []
 

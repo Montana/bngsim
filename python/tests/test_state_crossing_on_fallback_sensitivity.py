@@ -64,7 +64,9 @@ begin groups
 end groups
 """
 
-DECLINED = "kc*max(Aobs,0.5)"
+# clamp(0.5, A, 1e300) is max(A, 0.5). min, max and abs have an analytic
+# sensitivity RHS since issue #1126; clamp is still declined.
+DECLINED = "kc*clamp(0.5,Aobs,1e300)"
 T_END = 6.0
 
 
@@ -114,12 +116,12 @@ def test_a_counter_against_a_literal_is_moved_too(tmp_path):
 
 @pytest.mark.parametrize("kc", ["1e6", "1e8"])
 def test_a_counter_beside_a_flux_a_million_times_the_jump_is_refused(tmp_path, kc):
-    """The declined rate law is ``kc·max(Aobs, 0.5)`` with kc at 1e6 and 1e8.
+    """The declined rate law is ``kc·clamp(0.5, Aobs, 1e300)`` with kc at 1e6 and 1e8.
     A cut that refused at the crossing asked whether the rate law jumps there
     by more than a millionth of the largest flux in the model, and read a jump
     of 3 beside 4.4e6 as none: dY/dk came back 28.75 at rtol 1e-4 and 14.56 at
     1e-10, for 10.2."""
-    sim = _simulator(tmp_path, "if(Aobs>thr,kb,0)", f"{kc}*max(Aobs,0.5)", ["k", "thr"])
+    sim = _simulator(tmp_path, "if(Aobs>thr,kb,0)", f"{kc}*clamp(0.5,Aobs,1e300)", ["k", "thr"])
     _refused(sim, "Aobs>thr")
 
 
@@ -165,7 +167,7 @@ def test_a_step_call_on_the_state_is_refused(tmp_path):
 def test_a_step_call_on_the_state_inside_a_condition_is_refused(tmp_path):
     """``if(floor(Aobs/P) > 2, 1, 2)``: the condition's atom reads the state
     through a step call. dZ/dk came back −67.9 for −49.5."""
-    law = "kc*max(Aobs,0.5)*if(floor(Aobs/P)>2,1,2)"
+    law = "kc*clamp(0.5,Aobs,1e300)*if(floor(Aobs/P)>2,1,2)"
     sim = _simulator(tmp_path, "kb", law, ["k"], decays=True)
     _refused(sim, "floor(Aobs/P)", rtol=1e-4)
 
@@ -534,7 +536,7 @@ def test_the_same_bend_written_with_a_choice_runs(tmp_path, law):
 )
 def test_a_magnitude_runs(tmp_path, law):
     """Control. ``kb·abs(Aobs − thr)`` is continuous where A is thr, and so is
-    the declined law beside it, ``kc·max(Aobs, 0.5)``: bends, which the
+    the declined law beside it, ``kc·clamp(0.5, Aobs, 1e300)``: bends, which the
     quotient is right across. Written as a condition, both branches are 0
     where it flips. dY/dk in closed form."""
     sim = _simulator(tmp_path, law, DECLINED, ["k"])
@@ -1430,7 +1432,7 @@ DERIVED = """begin parameters
 end parameters
 begin functions
     1 fY() {fy}
-    2 fZ() kc*max(Aobs,0.5)
+    2 fZ() kc*clamp(0.5,Aobs,1e300)
 end functions
 begin species
     1 A() A0

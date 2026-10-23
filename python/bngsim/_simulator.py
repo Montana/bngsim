@@ -434,6 +434,11 @@ def _finite_time(t: float) -> float:
     return t
 
 
+# Issue #891: the loosest rtol at which a plain ODE run's stops are moved onto
+# the evaluator's change (see Simulator._apply_crossing_stops).
+_FLIP_LOOSEST_RTOL = 1e-4
+
+
 class Simulator:
     """Unified simulation interface for ODE, SSA, PSA, and network-free methods.
 
@@ -2221,6 +2226,13 @@ class Simulator:
                 touches=getattr(model, "_event_disc_conditions", frozenset()),
                 over_budget=over_budget,
                 sensitivity_params=tuple(self._sensitivity_params) if sensitivities else None,
+                # Issue #891: onto the evaluator's change only where the run's
+                # tolerance can use it. At rtol 1e-3 and looser the step that
+                # reaches a stop on the new branch's first double reads the new
+                # rate at its end and passes, and a `mod` schedule came out 82%
+                # high where main, its stops a double early, was 4% (at 1e-4 and
+                # tighter the moved stops were the more accurate in every case).
+                on_the_flip=not sensitivities and float(opts.rtol) <= _FLIP_LOOSEST_RTOL,
             )
             knots = (
                 table_function_stops(model._core, float(t_start), float(t_end), table_breaks)
