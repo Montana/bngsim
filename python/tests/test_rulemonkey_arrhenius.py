@@ -13,17 +13,20 @@ Oracles: network SSA on the BNG-generated .net for the transient, the exact
 stationary distribution for the equilibrium (detailed balance gives it a product
 form), and the closed form of a one-way unbinding rule, which is first order.
 
-RuleMonkey 3.11.0 still expands some energy rules differently from BNG2: it
-drops or misapplies an energy pattern's context, and an Arrhenius rule's own
-reactant context (richardposner/RuleMonkey#109). rm refuses those by name until
-issue #1058 lifts the refusal; the models are in arrhenius/misread/.
+RuleMonkey 3.11.0 expanded some energy rules differently from BNG2: it dropped
+or misapplied an energy pattern's context, and an Arrhenius rule's own reactant
+context, and rm refused those by name. RuleMonkey 3.12.0 runs each at BNG2's
+rate, expanded at load where that is exact and counted at each firing elsewhere
+(richardposner/RuleMonkey#109), and issue #1058 lifted the refusal. The models
+are in arrhenius/misread/, each one-way unbinding with a closed form, and
+state_pattern, a reversible rule with a state in its energy pattern, which
+settles on its exact stationary distribution.
 """
 
 from __future__ import annotations
 
 import functools
 import math
-import re
 import warnings
 from pathlib import Path
 
@@ -51,14 +54,20 @@ pytestmark = pytest.mark.skipif(not _has_rulemonkey(), reason="RuleMonkey not co
 
 @functools.cache
 def _runs(method: str, name: str, n: int, observables: tuple[str, ...]) -> np.ndarray:
-    """replicates x observables x times."""
+    """replicates x observables x times, a fresh Model or session per replicate.
+    *method* is a Simulator method or ``"session"``, a RuleMonkeySession."""
     out = []
     for seed in range(1, n + 1):
-        m = bngsim.Model.from_net(str(ARR / f"{name}.net"))
-        kw = {"xml_path": str(ARR / f"{name}.xml")} if method == "rm" else {}
         with warnings.catch_warnings():
             warnings.simplefilter("error", bngsim.RuleMonkeyWarning)
-            r = bngsim.Simulator(m, method=method, **kw).run(sample_times=T, seed=seed)
+            if method == "session":
+                with bngsim.RuleMonkeySession(str(ARR / f"{name}.xml")) as s:
+                    s.initialize(seed=seed)
+                    r = s.simulate(sample_times=T)
+            else:
+                m = bngsim.Model.from_net(str(ARR / f"{name}.net"))
+                kw = {"xml_path": str(ARR / f"{name}.xml")} if method == "rm" else {}
+                r = bngsim.Simulator(m, method=method, **kw).run(sample_times=T, seed=seed)
         out.append([np.asarray(r.observables[o]) for o in observables])
     return np.asarray(out, dtype=float)
 
@@ -156,47 +165,127 @@ def test_one_way_energy_rules_fire_one_way_at_bng2s_rate():
     assert np.all(np.abs(z) < 4.5), z
 
 
-# Each .bngl in misread/ says what BNG2's rate is. RuleMonkey 3.11.0 gets all
-# but plain_two_a and samename_explicit wrong (|z| from 24 to 142 against BNG2's
-# closed form, 40 seeds); those two lie outside the shapes the refusal can tell
-# are safe from the XML. Issue #1058 turns these into value tests.
+# Each .bngl in misread/ unbinds one-way and its header gives BNG2's rate for each
+# kind of complex it seeds, 1000 of each, so an observable that counts one kind
+# is binomial(1000, exp(-k t)) at t, and k = 0 holds it at 1000. RuleMonkey 3.11.0
+# read all but plain_two_a and samename_explicit wrong (|z| from 24 to 142 against
+# these, 40 seeds), and rm refused all fifteen until issue #1058.
+E09, E125 = math.exp(-0.9), math.exp(-1.25)
 MISREADS = {
-    "state_ctx": "energy patterns 'A(b!1).B(a!1,s~1)'",
-    "freectx": "energy patterns 'A(b!1,c).B(a!1)'",
-    "wild": "energy patterns 'L(r!+,r!+)'",
-    "samename": "energy patterns 'L(r!1,r!+).R(l!1)'",
-    "samename_partner": "energy patterns 'L(r!1,r!2).R(l!1).S(l!2)'",
-    "partner": "energy patterns 'A(b!1,c!2).B(a!1).C(a!2)'",
-    "chain2ctx": "energy patterns 'A(b!1).B(a!1,c!2).C(b!2,d!3).D(c!3)'",
-    "two_leaves": "energy patterns 'A(b!1,c!2,d!3).B(a!1).C(a!2).D(a!3)'",
-    # A(x,c,c): one "c bound" variant matches an A with one c of each kind.
-    "samectx": "energy patterns 'A(x!1,c!2).B(y!1).C(a!2)'",
+    # A state in the energy pattern: A(b!1).B(a!1,s~1).
+    "state_ctx": {"AB1": E125, "AB0": E09},
+    # A site the pattern needs free: A(b!1,c).B(a!1).
+    "freectx": {"AB1": E125, "AB0": E09},
+    # Wildcard bonds only, L(r!+,r!+): both bonds of L.R.R break at e^-1.25.
+    "wild": {"AB1": 2 * E125},
+    # L(r!1,r!+).R(l!1) needs the other r bound, which L(r!1,r).R(l!1) lacks.
+    "samename": {"AB1": E09},
+    # L(r!1,r!2).R(l!1).S(l!2) applies only where the other r holds an S.
+    "samename_partner": {"LRS": E125, "LRR": 2 * E09},
+    # A's c binds C or D, and A(b!1,c!2).B(a!1).C(a!2) only C.
+    "partner": {"ABC": E125, "ABD": E09},
+    # Context two bonds out: A(b!1).B(a!1,c!2).C(b!2,d!3).D(c!3).
+    "chain2ctx": {"ABCD": E125, "ABC": E09},
+    # Two context bonds, both needed: A(b!1,c!2,d!3).B(a!1).C(a!2).D(a!3).
+    "two_leaves": {"ABCD": E125, "ABC": E09},
+    # A(x,c,c): one embedding of A(x!1,c!2).B(y!1).C(a!2) per bound c.
+    "samectx": {"AB1": E125, "AB2": math.exp(-1.6)},
     # Z, not C, binds A.c, through a rule that synthesizes Z bound.
-    "synth": "energy patterns 'A(x!1,c!2).B(y!1).C(a!2)'",
-    "rule_context": "rules '_R1'",
-    # Unbinding inside a ring: the product stays one complex.
-    "ringopen": "rules '_R1'",
-    # A one-way rule named like a reverse half, which RuleMonkey gives 1-phi.
-    "revname": "rules '_reverse_u'",
-    "plain_two_a": "energy patterns 'A(b!1).B(a1!1,a2!2).A(b!2)'",
-    "samename_explicit": "energy patterns 'L(r!1,r!2).R(l!1).R(l!2)'",
+    "synth": {"AB": E09},
+    # A state in the rule's own reactant pattern: only A(s~1).B unbinds.
+    "rule_context": {"AB1": E09, "AB0": 0.0},
+    # Unbinding written with '.': the ring opens, the chain never parts.
+    "ringopen": {"Ring": E09, "Open": 0.0},
+    # A unidirectional rule named like a reverse half, which BNG2 gives phi.
+    "revname": {"AB": E09},
+    # Two A on one B, A(b!1).B(a1!1,a2!2).A(b!2); only the a1 bond breaks.
+    "plain_two_a": {"Full": E125},
+    # A site named twice, with explicit bonds: L(r!1,r!2).R(l!1).R(l!2).
+    "samename_explicit": {"Full": 2 * E125},
 }
 
 
+def _assert_decays(counts: np.ndarray, k: float) -> None:
+    """*counts* (replicates x times) of 1000 complexes that each leave at rate *k*."""
+    if k == 0:
+        assert np.all(counts == 1000), counts.min()
+        return
+    q = np.exp(-k * np.asarray(T))
+    assert np.all(counts[:, 0] == 1000)
+    assert np.all(np.diff(counts, axis=1) <= 0)  # one-way: nothing comes back
+    se = np.sqrt(1000 * q[1:] * (1 - q[1:]) / len(counts))
+    z = (counts.mean(axis=0)[1:] - 1000 * q[1:]) / se
+    assert np.all(np.abs(z) < 4.5), z
+
+
+@pytest.mark.parametrize("method", ["rm", "session", "ssa"])
 @pytest.mark.parametrize("name", sorted(MISREADS))
-def test_rm_refuses_an_energy_rule_it_would_misread(name):
-    xml = ARR / "misread" / f"{name}.xml"
-    match = re.escape(MISREADS[name]) + r".*RuleMonkey#109.*issue #1058"
-    m = bngsim.Model.from_net(str(ARR / "misread" / f"{name}.net"))
-    with pytest.raises(bngsim.ModelError, match=match):
-        bngsim.Simulator(m, method="rm", xml_path=str(xml))
-    with pytest.raises(bngsim.ModelError, match=match):
-        bngsim.RuleMonkeySession(str(xml))
+def test_energy_context_fires_at_bng2s_closed_form(name, method):
+    # ssa, on the generated network, checks the closed form itself.
+    obs = tuple(MISREADS[name])
+    runs = _runs(method, f"misread/{name}", N_SSA if method == "ssa" else N_RM, obs)
+    for j, o in enumerate(obs):
+        _assert_decays(runs[:, j, :], MISREADS[name][o])
+
+
+@pytest.mark.parametrize("name", sorted(MISREADS))
+def test_energy_context_matches_network_ssa(name):
+    obs = tuple(MISREADS[name])
+    rm = _runs("rm", f"misread/{name}", N_RM, obs)
+    ssa = _runs("ssa", f"misread/{name}", N_SSA, obs)
+    for j in range(len(obs)):
+        _assert_same_mean(rm[:, j, :], ssa[:, j, :])
+
+
+@functools.cache
+def _state_pattern_equilibrium() -> dict[str, float]:
+    """Exact stationary means of AB0 and AB1 for state_pattern.
+
+    100 A, 100 B(s~0) and 100 B(s~1), and nothing changes s. Detailed balance
+    makes the stationary distribution prod_s w_s^n_s / n_s! with w = 1 for a
+    monomer, exp(-3.5) for A.B(s~0) and exp(-(3.5 - 2)) for A.B(s~1).
+    """
+    n = 100
+    x = np.arange(n + 1)[:, None]  # AB0
+    y = np.arange(n + 1)[None, :]  # AB1
+    a = n - x - y
+    ok = a >= 0
+    log_fact = np.array([math.lgamma(k + 1.0) for k in range(n + 1)])
+
+    def lgam(k):
+        return log_fact[np.where(ok, k, 0)]
+
+    logw = -3.5 * x - 1.5 * y - lgam(a) - lgam(n - x) - lgam(n - y) - lgam(x) - lgam(y)
+    logw = np.where(ok, logw, -np.inf)
+    p = np.exp(logw - logw.max())
+    p /= p.sum()
+    return {"AB0": float((p * x).sum()), "AB1": float((p * y).sum())}
+
+
+def test_a_reversible_rule_with_a_state_energy_pattern_matches_network_ssa():
+    obs = ("AB0", "AB1")
+    rm = _runs("rm", "state_pattern", N_RM, obs)
+    ssa = _runs("ssa", "state_pattern", N_SSA, obs)
+    for j in range(len(obs)):
+        _assert_same_mean(rm[:, j, :], ssa[:, j, :])
+
+
+@pytest.mark.parametrize("method", ["rm", "ssa"])
+def test_a_reversible_rule_with_a_state_energy_pattern_settles_on_the_exact_equilibrium(
+    method,
+):
+    # ssa, on the generated network, checks the oracle itself.
+    obs = ("AB0", "AB1")
+    runs = _runs(method, "state_pattern", N_SSA if method == "ssa" else N_RM, obs)[:, :, -1]
+    exact = _state_pattern_equilibrium()
+    for j, o in enumerate(obs):
+        se = runs[:, j].std(ddof=1) / math.sqrt(len(runs))
+        assert abs(runs[:, j].mean() - exact[o]) < 4.5 * se, (o, runs[:, j].mean(), exact[o])
 
 
 def test_rulemonkey_names_an_energy_rule_shape_it_refuses_itself():
     """A state-change Arrhenius rule is refused by RuleMonkey's own load check,
-    whose message says what it is; this check stands aside."""
+    whose message names the rule and says what it is."""
     xml = str(ARR / "state_change.xml")
     m = bngsim.Model.from_net(str(ARR / "state_change.net"))
     for build in (
@@ -204,10 +293,9 @@ def test_rulemonkey_names_an_energy_rule_shape_it_refuses_itself():
         lambda: bngsim.RuleMonkeySession(xml),
     ):
         with pytest.raises(
-            RuntimeError, match="outside the shapes RM runs: it changes a state"
-        ) as err:
+            RuntimeError, match="rule '_R1' is outside the shapes RM runs: it changes a state"
+        ):
             build()
-        assert "#109" not in str(err.value)
 
 
 def test_cooperativity_on_both_reaction_centers_matches_network_ssa():

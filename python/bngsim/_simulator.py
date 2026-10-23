@@ -1045,13 +1045,11 @@ class Simulator:
             from bngsim._bngsim_core import RuleMonkeySimulator
             from bngsim._network_free_checks import (
                 refuse_rulemonkey_compartments,
-                refuse_rulemonkey_energy_misreads,
                 rulemonkey_clock,
             )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
             refuse_rulemonkey_compartments(xml_path)
-            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             # Elapsed time, which keeps event times small at a large t_start. A
             # model that reads the clock reads model time (issue #1022): through
             # time(), from a copy of its XML whose clock is time() + __bngsim_t0,
