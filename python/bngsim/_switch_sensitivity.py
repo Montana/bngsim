@@ -52,6 +52,7 @@ from bngsim._codegen import (
     _derived_expr_partials_numeric,
     _find_close_paren_strict,
     _inline_derived_param_refs,
+    _spell_mod,
     _split_top_level_commas,
 )
 from bngsim._exceptions import SensitivityUnsupportedError
@@ -95,6 +96,62 @@ _TIME_SYMBOLS = frozenset({"time", "time()"})
 # zeroth-order synthesis with rate constant 1, so its RHS row is exactly 1.0, and
 # anything else is a different kind of variable we should not treat as a clock.
 _CLOCK_SLOPE = 1.0
+
+
+_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
+
+
+def _fully_parenthesised(expr: str) -> bool:
+    """Whether the opening ``(`` of *expr* is closed by its last character."""
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return False
+    return _find_close_paren_strict(expr, 0) == len(expr) - 1
+
+
+def _is_name_or_call(text: str) -> bool:
+    """A lone name or number, or a name applied to one parenthesised group."""
+    if _ATOMIC_TOKEN.fullmatch(text):
+        return True
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    if m is None:
+        return False
+    return _fully_parenthesised(text[m.end() :])
+
+
+def _condition_key(cond: str) -> str:
+    """The text of a condition with the parentheses the SBML loader's
+    ``_atomic`` adds around a call dropped, and those around a lone name or
+    number, so that one crossing reached two ways has one key (issue #1082).
+
+    A function-definition formal bound to ``time()`` is spliced into the body
+    as ``(time())``, so ``near(time, 2.5, 0.005)`` with ``near := abs(x - c) <
+    w`` and ``abs(time - 2.5) < 0.005`` written directly gave two spellings of
+    each edge, and two roots. A group that is a call's own argument list is
+    left alone, and so is any group with an operator in it. Lives here, beside
+    :func:`_strip_redundant_parens`, so the loader that registers conditions
+    and the recovery in ``Model.time_discontinuity_conditions`` compare on one
+    form without the loader (and libsbml) being imported for it.
+    """
+    prev = None
+    while prev != cond:
+        prev = cond
+        out: list[str] = []
+        i = 0
+        n = len(cond)
+        while i < n:
+            ch = cond[i]
+            # An opening parenthesis that is not a call's own (no name before it).
+            if ch == "(" and not (out and (out[-1][-1:].isalnum() or out[-1][-1:] == "_")):
+                close = _find_close_paren_strict(cond, i)
+                inner = cond[i + 1 : close] if close >= 0 else ""
+                if close >= 0 and _is_name_or_call(inner):
+                    out.append(inner)
+                    i = close + 1
+                    continue
+            out.append(ch)
+            i += 1
+        cond = "".join(out)
+    return cond
 
 
 def _strip_redundant_parens(s: str) -> str:
@@ -398,7 +455,7 @@ def _condition_only_params(
 
     data = core.codegen_data()
     params = data["parameters"]
-    func_map = dict(core.functional_jacobian_context()["function_map"])
+    func_map = _scan_function_map(core.functional_jacobian_context())
 
     pats = {
         name: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
@@ -433,7 +490,7 @@ def _condition_only_params(
         if rxn.get("type") != "functional":
             continue
         fname = rxn.get("function_name")
-        body = func_map.get(fname) if fname else rxn.get("rate_expression")
+        body = func_map.get(fname) if fname else _spell_mod(rxn.get("rate_expression") or "")
         if body:
             bodies.append(_inline_functions(body, func_map) or body)
 
@@ -513,7 +570,7 @@ def texts_spell_a_switch(core) -> bool:
         return False
     return any(
         has_condition_construct(t)
-        or _STEP_CALL.search(t)
+        or _STEP_CALL.search(_spell_mod(t))
         or _RELATIONAL.search(t)
         or _BEND_CALL.search(t)
         for t in (*core.function_expressions, *core.param_expressions)
@@ -1825,6 +1882,11 @@ def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchCo
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
+    # As written, and not through _spell_mod: a derived parameter is a
+    # constant of the run, so a `%` in one switches nothing, and the
+    # resolvers that inline these texts decline a call they do not know.
+    # `thr = base % 10` read as `mod(base, 10)` lost the exact crossing of
+    # `time() > thr`, and with it the SSA's piecewise-constant rate (#1127).
     exprs = list(core.param_expressions)
     clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
@@ -2172,7 +2234,7 @@ def _function_slot_bodies(ctx) -> dict[str, str]:
     So the resolver inlines every one of them, and what the bodies read decides:
     time resolves, a parameter is read at its live value, and a species declines.
     """
-    return {n: b for n, b in dict(ctx["function_map"]).items() if isinstance(b, str)}
+    return {n: b for n, b in _scan_function_map(ctx).items() if isinstance(b, str)}
 
 
 def _inline_function_slots(expr: str, bodies: dict[str, str]) -> str:
@@ -2491,10 +2553,10 @@ def time_discontinuity_conditions(
             if not _unit_rate_clock_indices(core, clock_candidates):
                 return ()
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -3646,8 +3708,8 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
     if not conditions:
         return frozenset()
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    func_map = _scan_function_map(ctx)
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -3811,8 +3873,11 @@ def _coarse_sawtooth(core, asked: _EngineCondition, phase, lo: float, hi: float)
     `100*mod(1.1e12 + time(), 0.0048828125)` over (0, 20.2), each on its
     wrap, X was 0.0826 for 4.685, where main, with no stop, has it right. Two
     stops to the wrap held for X(0) = 0 and not for X(0) = 1e4. So the scan's
-    stops are not placed for it, and it is left as on main, until that is
-    fixed in the run.
+    stops are not placed for it, and it is left as on main. The run now looks
+    inside such a stretch before it takes it in one step (issue #998), which
+    makes a stop on every wrap add every period for X(0) = 0; whether to place
+    them again, and what to do where the dose is small against the tolerance,
+    is issue #1018.
 
     How long a flat stretch it takes depends on the rate and the tolerances,
     not on the run: at a clock of 1e6, `frac((3e9 + time())/0.0009765625)`
@@ -3882,7 +3947,7 @@ def _engine_scan_stop_times(
     lo, hi = float(t_start) + shift, float(t_end) + shift
     sawtooth = _sawtooth_of_a_line(asked, scope)
     if sawtooth is not None and _coarse_sawtooth(core, asked, sawtooth, lo, hi):
-        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#998)", cond)
+        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#1018)", cond)
         return None
 
     class Unreadable(Exception):
@@ -5087,7 +5152,9 @@ def piecewise_constant_time_functions(
         return []
     out = []
     for name, expr in clock_functions:
-        rest = expr
+        # Spelled as the recovered conditions are (issue #1127), or a condition
+        # found in a `%` text could not be found in it again.
+        rest = _spell_mod(expr)
         for c in exact:
             rest = _remove_whole_atoms(rest, c)
         if not _ANY_CLOCK.search(rest):
@@ -5182,6 +5249,19 @@ _STEP_CALL = re.compile(
 )
 
 
+def _scan_function_map(ctx) -> dict:
+    """``ctx["function_map"]`` with each body as the scanners read it (:func:`_spell_mod`)."""
+    return {
+        name: _spell_mod(body) if isinstance(body, str) else body
+        for name, body in dict(ctx["function_map"]).items()
+    }
+
+
+def _scan_rate_law(rxn) -> str:
+    """A functional reaction's rate law as the scanners read it (:func:`_spell_mod`)."""
+    return _spell_mod(str(rxn.get("rate_expr", "")))
+
+
 # Calls that bend rather than jump: continuous, with a slope that is not. A
 # pulse written with them alone, `max(0, 1 - abs(time()-t0)/w)`, is flat on
 # both sides of itself, and a step spans it as it would a window (issue #904).
@@ -5267,13 +5347,27 @@ def _bend_branches(atom: str) -> list[str]:
     return [piece + atom[cursor:] for piece in out]
 
 
+def _call_turn_pieces(call: str) -> list[str]:
+    """The roots that stand for a step or bend *call*: each of its
+    :func:`_turn_atoms`, cut at its own edges or unfolded into its bend's
+    branches (issue #1068). What :func:`state_switch_root_conditions` roots
+    and :func:`state_switch_reactions` reads, so the two cannot drift apart."""
+    return [
+        piece
+        for atom in _turn_atoms(call)
+        for piece in (_monotone_pieces(atom) or _bend_branches(atom) or [atom])
+    ]
+
+
 def _iter_step_calls(
     expr: str,
     outermost: bool = False,
     pattern: re.Pattern | None = None,
     skip: Sequence[tuple[int, int]] = (),
+    with_start: bool = False,
 ):
-    """``(call, argument)`` for every :data:`_STEP_CALL` outside an ``if()`` condition.
+    """``(call, argument)`` for every :data:`_STEP_CALL` outside an ``if()`` condition,
+    and the call's offset in *expr* after them with *with_start*.
 
     One inside a condition is that condition's business: its atom is scanned
     whole, floor and all, so reporting the call again would only repeat it.
@@ -5298,7 +5392,42 @@ def _iter_step_calls(
             continue
         if outermost:
             covered = close_paren
-        yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
+        if with_start:
+            yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren], m.start()
+        else:
+            yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
+
+
+def _branch_guard(expr: str, pos: int) -> str | None:
+    """Whether the ``if()`` branches enclosing offset *pos* of *expr* are on, as
+    an expression that reads 1 where they all are and 0 where one is not:
+    ``((c)!=0)`` for a then-branch and ``((c)==0)`` for an else-branch,
+    multiplied. ``None`` where no ``if()`` branch encloses it (issue #1147).
+
+    A condition is ExprTk's to read, and ExprTk takes a branch wherever its
+    condition is nonzero, not only where it is a comparison's 1: ``if(F, ...)``
+    with ``F = 0.3`` runs its then-branch, and ``(c)`` read against ``> 0.5``
+    called that branch off and stepped over its kink."""
+    factors: list[str] = []
+    for m in _IF_CALL.finditer(expr):
+        open_paren = m.end() - 1
+        if open_paren >= pos:
+            break
+        close_paren = _find_close_paren_strict(expr, open_paren)
+        if close_paren < 0 or close_paren <= pos:
+            continue
+        args = _split_top_level_commas(expr[open_paren + 1 : close_paren])
+        if len(args) != 3:
+            return None  # not the form read here: no guard to give
+        then_start = open_paren + 1 + len(args[0]) + 1
+        else_start = then_start + len(args[1]) + 1
+        if then_start <= pos < else_start - 1:
+            factors.append(f"(({args[0]})!=0)")
+        elif pos >= else_start:
+            factors.append(f"(({args[0]})==0)")
+        else:
+            return None  # in the condition itself
+    return "*".join(factors) if factors else None
 
 
 def _fixed_clock_step(arg_flat: str, scope: SwitchConditionScope) -> bool:
@@ -5371,10 +5500,10 @@ def model_moving_crossings(core, ctx=None) -> tuple[str, ...]:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -5468,14 +5597,14 @@ def model_uncompensated_crossing_reason(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     # Reaction rate expressions only — the exact texts _functional_dfdp_terms
     # differentiates (frxn["rate_expr"] per functional reaction). A function that
     # no rate law reaches is inert here, so it is never scanned. Inlined BEFORE
     # the condition test and the recognizer, exactly as codegen inlines it: a
     # rate law written as a bare function name — or one nesting the condition a
     # level down — only reveals its ``if()`` after inlining.
-    texts = [str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]]
+    texts = [_scan_rate_law(r) for r in ctx["functional_reactions"]]
     flats = [_inline_functions(t, func_map) or t for t in texts]
     conditional = [f for f in flats if has_condition_construct(f)]
     if not conditional:
@@ -6558,7 +6687,7 @@ def fallback_crossing(
     requested = frozenset(sens_param_names)
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
-    exprs = list(core.param_expressions)
+    exprs = [_spell_mod(e) for e in core.param_expressions]
     derived = {
         param_names[i]: exprs[i] for i in range(len(param_names)) if is_expr[i] and exprs[i]
     }
@@ -6635,8 +6764,8 @@ def fallback_crossing(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    func_map = _scan_function_map(ctx)
+    texts = [_scan_rate_law(reaction) for reaction in ctx["functional_reactions"]]
     # A table a rate law reads is indexed by what its index reads, which the
     # law's text, ``tfun_g()``, does not show. Where the index is a function,
     # ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
@@ -7647,12 +7776,12 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         return []
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    bodies = list(func_map.values())
-    # Same cheap first gate as compute_switch_time_sens: no `if()` anywhere
-    # means no branch to cross, and no RHS probe is paid.
-    if not any(_IF_CALL.search(body) for body in bodies):
+    # Same cheap first gate as compute_switch_time_sens, on the raw bodies: no
+    # `if()` anywhere means no branch to cross, and no RHS probe is paid.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return []
+    func_map = _scan_function_map(ctx)
+    bodies = list(func_map.values())
 
     scope = switch_condition_scope(core, ctx)
     conditions: list[str] = []
@@ -7693,7 +7822,10 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     """For each condition, the 0-based functional reactions whose rate law reads it.
 
     Parallel to ``conditions`` (the list :func:`state_switch_conditions`
-    returns), for ``SolverOptions.set_state_switch_reactions``. The solver asks
+    returns, and the stops a run with sensitivities adds for step and bend
+    calls), for ``SolverOptions.set_state_switch_reactions``. A law reads a stop
+    when it holds a step call rooted there; a bend lists no law, since it does
+    not jump. The solver asks
     whether a crossing is continuous of these reactions' flux alone (issue
     #763). Asked of every species' whole dx/dt, a species the switch never
     touches decided it: one whose rate law cancels internally (``0.3*P -
@@ -7723,7 +7855,7 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
         return out
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -7745,15 +7877,24 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     if not wanted:
         return out
     for rxn in ctx["functional_reactions"]:
-        flat = inline(str(rxn.get("rate_expr", "")))
-        if not _IF_CALL.search(flat):
-            continue
+        flat = inline(_scan_rate_law(rxn))
         hit: set[int] = set()
-        for written in _iter_condition_atoms(flat):
-            for whole in _split_logical_atoms(written):
-                # The edges a turning residual is rooted at (issue #904) are
-                # read by the rate law that reads the whole atom.
-                for atom in (whole, *_monotone_pieces(whole)):
+        if _IF_CALL.search(flat):
+            for written in _iter_condition_atoms(flat):
+                for whole in _split_logical_atoms(written):
+                    # The edges a turning residual is rooted at (issue #904) are
+                    # read by the rate law that reads the whole atom.
+                    for atom in (whole, *_monotone_pieces(whole)):
+                        hit.update(wanted.get(surface(atom) or "", ()))
+        # A step call jumps the law that holds it at the roots that stand for
+        # it (issue #1068). sign() over the state has an analytic sensitivity
+        # right-hand side since issue #1128, so the solver applies that jump, and
+        # it reads it from the laws listed here. Unlisted, the jump was read
+        # against the largest |dx/dt| anywhere: a 1e8-molecule pool turning over
+        # beside it took the saltation term away, and dX/dk came back 96% off.
+        if _STEP_CALL.search(flat):
+            for call, _arg in _iter_step_calls(flat):
+                for atom in _call_turn_pieces(call):
                     hit.update(wanted.get(surface(atom) or "", ()))
         for i in hit:
             out[i].append(int(rxn["rxn_idx"]))
@@ -7761,8 +7902,13 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
 
 
 def state_switch_root_conditions(
-    core, covered: Sequence[str] = (), ctx=None, *, calls_only: bool = False
-) -> tuple[str, ...]:
+    core,
+    covered: Sequence[str] = (),
+    ctx=None,
+    *,
+    calls_only: bool = False,
+    with_guards: bool = False,
+):
     """Rate-law conditions over model state that a run without sensitivities roots on (#897).
 
     Inside each branch of ``if((time() >= onset) && (time() < onset + w), k, 0)``
@@ -7808,6 +7954,13 @@ def state_switch_root_conditions(
     :func:`state_switch_conditions` jumps. It is this set with the comparisons
     taken out, deduplicated as here.
 
+    With *with_guards*, returns ``(conditions, guards)``: for each condition,
+    the ``if()`` branches its step or bend calls stand in, as an expression
+    that reads 1 where one of them is on, or ``""`` where any of its readings
+    stands in no branch (issue #1147). A crossing whose every branch is off
+    changes nothing, and a plain run steps on through it rather than restart.
+    Those branches' own conditions are rooted, so they cannot turn at it.
+
     Equalities are skipped for the reason :func:`state_switch_conditions` gives.
     Deduplicated by residual, read through :func:`_surface_key`, so one crossing
     written two ways is one root. Empty for a model with no conditional rate
@@ -7816,7 +7969,7 @@ def state_switch_root_conditions(
     from bngsim._jacobian import _IDENT_RE, _inline_functions
 
     if core.n_functions == 0:
-        return ()
+        return ((), ()) if with_guards else ()
 
     # The raw texts gate first, as in time_discontinuity_conditions: inlining
     # cannot introduce an `if(` or a comparison that none of them spells, and
@@ -7829,15 +7982,15 @@ def state_switch_root_conditions(
         return bool(
             _IF_CALL.search(text)
             or _RELATIONAL.search(text)
-            or _STEP_CALL.search(text)
+            or _STEP_CALL.search(_spell_mod(text))
             or _BEND_CALL.search(text)
         )
 
     if not any(switches(t) for t in (*core.function_expressions, *core.param_expressions)):
-        return ()
+        return ((), ()) if with_guards else ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -7860,9 +8013,6 @@ def state_switch_root_conditions(
     # A covered step or bend call of a clock (issue #869) is stopped on at each
     # of its jumps, and covers the roots that stand for them and for the calls
     # inside it (issue #1068).
-    def pieces(atom: str) -> list[str]:
-        return _monotone_pieces(atom) or _bend_branches(atom) or [atom]
-
     def is_call(text: str) -> bool:
         return bool(_STEP_CALL.match(text) or _BEND_CALL.match(text)) and (
             _find_close_paren_strict(text, text.index("(")) == len(text) - 1
@@ -7871,7 +8021,7 @@ def state_switch_root_conditions(
     def call_atoms(text: str) -> list[str]:
         if not is_call(text):
             return []
-        return [p for atom in _turn_atoms(text) for p in pieces(atom)]
+        return _call_turn_pieces(text)
 
     # One atom is met again from every rate law and function that reads it, and
     # a min() of two inlined assignment rules has a residual 11k characters
@@ -7899,7 +8049,7 @@ def state_switch_root_conditions(
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a
     # shared function's conditions once per rate law that reaches it.
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -7909,13 +8059,24 @@ def state_switch_root_conditions(
             pending.extend(n for n in _IDENT_RE.findall(func_map[name]) if n in func_map)
 
     conditions: list[str] = []
+    # Each kept condition's surface, and the branches its readings stand in:
+    # None once one reading stands in none (issue #1147).
+    kept_keys: list[str] = []
+    branches: dict[str, list[str] | None] = {}
 
-    def admit(atom: str, keep: bool = True) -> None:
+    def admit(atom: str, keep: bool = True, guard: str | None = None) -> None:
         key = surface(atom)
-        if key is not None and key not in seen:
+        if key is None:
+            return
+        if key not in seen:
             seen.add(key)
             if keep:
                 conditions.append(atom)
+                kept_keys.append(key)
+                branches[key] = None if guard is None else [guard]
+        elif key in branches:
+            had = branches[key]
+            branches[key] = None if had is None or guard is None else [*had, guard]
 
     for text in (*rate_laws, *(func_map[name] for name in reached)):
         if not switches(text):
@@ -7944,10 +8105,19 @@ def state_switch_root_conditions(
             for start in (m.start() for m in re.finditer(re.escape(atom), text))
         ]
         for pattern in (_STEP_CALL, _BEND_CALL):
-            for call, _arg in _iter_step_calls(text, pattern=pattern, skip=spans):
+            for call, _arg, start in _iter_step_calls(
+                text, pattern=pattern, skip=spans, with_start=True
+            ):
+                guard = _branch_guard(text, start)
                 for atom in call_atoms(inline(call)):
-                    admit(atom)
-    return tuple(conditions)
+                    admit(atom, guard=None if guard is None else inline(guard))
+    if not with_guards:
+        return tuple(conditions)
+    guards = []
+    for key in kept_keys:
+        on = branches[key]
+        guards.append("" if not on else (on[0] if len(on) == 1 else f"max({', '.join(on)})"))
+    return tuple(conditions), tuple(guards)
 
 
 # ExprTk spellings Python's parser reads differently or not at all. `if` is a
@@ -8028,10 +8198,10 @@ def switch_gate_cache_digest(core, ctx=None) -> tuple:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     if not conditional:
@@ -9243,15 +9413,16 @@ def compute_switch_time_sens(
         return [], []
 
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
     # Cheapest possible gate, checked before anything else: a model with no
     # conditional rate law has no switch to find. On the RAW bodies, so a
     # genome-scale model with tens of thousands of functions and no `if()`
     # short-circuits before any inlining — inlining cannot create an `if()` that
-    # no body already has. Keeps the RHS probes and the sympy work off the path
-    # of every ordinary sensitivity run, including the per-row batch path.
-    if not any(_IF_CALL.search(body) for body in func_map.values()):
+    # no body already has, and neither can spelling a `%` as `mod()`. Keeps the
+    # RHS probes and the sympy work off the path of every ordinary sensitivity
+    # run, including the per-row batch path.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return [], []
+    func_map = _scan_function_map(ctx)
     # Inline function references before scanning, exactly as the issue #150 state
     # detector (:func:`state_switch_conditions`) already does — "the gate and the
     # detector must scan the SAME text". A clock threshold can hide behind a
@@ -9578,7 +9749,7 @@ def _threshold_scope(scope: SwitchConditionScope, ctx) -> ThresholdScope:
     exprs = dict(scope.derived_exprs)
     rule_bound = {
         name: body
-        for name, body in dict(ctx["function_map"]).items()
+        for name, body in _scan_function_map(ctx).items()
         if name in scope.param_idx and body
     }
     # `f(` anywhere means a call — a rule over floor()/if() is not arithmetic
@@ -9688,7 +9859,7 @@ def compute_event_time_sens(
     # parameter. Kept separate from `thresholds.exprs`, which admits only the
     # bodies that reduce to arithmetic over primaries.
     all_bodies = dict(scope.derived_exprs)
-    all_bodies.update({n: b for n, b in dict(ctx["function_map"]).items() if b})
+    all_bodies.update({n: b for n, b in _scan_function_map(ctx).items() if b})
     requested = set(names)
     # A requested parameter that is itself derived gets a column of its own, on
     # the same terms the rate-law switch times use (issue #475). Restricted to

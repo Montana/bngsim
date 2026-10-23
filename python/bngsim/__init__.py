@@ -54,6 +54,7 @@ from bngsim._rulemonkey_session import RuleMonkeySession
 from bngsim._simulator import (
     Simulator,
     SteadyStateResult,
+    SteadyStates,
     normalize_method,
 )
 from bngsim._ssa_validation import SsaIssue, validate_for_ssa
@@ -375,6 +376,7 @@ __all__ = [
     "IdentifiabilityReport",
     "EvaluationSpec",
     "SteadyStateResult",
+    "SteadyStates",
     "NfsimSession",
     "RuleMonkeySession",
     "NamedArray",

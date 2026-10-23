@@ -50,6 +50,8 @@ collapses into `PASS` — and records the attribution in `JobResult.subclass`:
 | `too_slow` | `TIMEOUT` | — | green (coverage gap) |
 | `error` | `EXCEPTION` | — | **red** |
 | `skip` | `SKIP` | — | green |
+| `archive_stale` | `REFERENCE_FAILED` | — (`reference_refusal: archive_stale`) | green (not compared) |
+| `archive_unreplayable` | `REFERENCE_FAILED` | — (`reference_refusal: archive_unreplayable`) | green (not compared) |
 
 A suite scoring policy (`is_expected(outcome, subclass)`) decides green/red — it
 greens the attributed-not-bngsim DIFFs, the `too_slow` coverage gap (deliberately
@@ -59,6 +61,47 @@ since bngsim ran where RR couldn't), and reds exactly the screen's own exit-code
 set (a `bngsim_suspect` / `ode_level` DIFF, a bngsim-side EXCEPTION). The GH #108
 regression diff is built on `is_regression(...)` (a model crossing from an
 expected state into a scoring DIFF/EXCEPTION).
+
+### Replaying the SSA screen from a reference archive (issue #805)
+
+A live screen run can record RoadRunner's side once, and later runs can then
+compare bngsim against that record with no RoadRunner installed:
+
+```bash
+# record: a normal live run that also writes one .npz per model
+python ssa_screen.py --corpus biomodels --write-reference-archive runs/ssa_archive
+
+# replay: same corpus and knobs; neither the screen nor any worker imports RoadRunner
+python ssa_screen.py --corpus biomodels --reference-archive runs/ssa_archive
+```
+
+An entry holds every RoadRunner result the screen used for that model:
+
+- the gillespie ensemble at the full horizon, or the error it raised;
+- the ensemble at each rung of the partial- or extended-horizon ladder the run
+  walked;
+- RoadRunner's ODE on the screen's grid, when a fail was attributed.
+
+The replay re-runs bngsim and walks the same ladders, so it reaches the same
+verdicts unless bngsim's own behaviour changed. In that case it may need a
+gillespie result the record does not hold, a rung the recorded run never
+reached, and the row is `archive_unreplayable`. Which rungs a ladder walks
+depends on how fast bngsim finishes them, so a faster or slower machine can
+turn a recorded `partial` or `extended` row into `archive_unreplayable` too;
+read that as a reason to re-record, not as a regression. A fail whose
+RoadRunner ODE the record does not hold stays a red `fail` ("unattributed"),
+so a regression is never hidden. The z-gate knobs
+(`--mean-z-tol`, `--min-mean-count`, `--self-z-tol`) are not part of an entry,
+so a replay can rescore the same ensembles under new gates.
+
+An entry is used only while it still describes the model: the SBML's sha256,
+`t_end`, `n_steps`, `--n` and `--seed-base` must all match. Otherwise, with no
+entry, or with an entry that cannot be read, the row is `archive_stale` and
+names why, and bngsim is not run for it. Each entry also records the
+RoadRunner version that made it; a replayed row reports that version, not the
+one installed where the replay ran. Neither kind of row
+is compared; re-record to clear them. The two flags are mutually exclusive, and
+the native report's `config.reference_source` records which side was used.
 
 ### SSA timing (GH #135)
 

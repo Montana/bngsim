@@ -82,9 +82,7 @@ class TestNfsimMethod:
     @pytest.mark.parametrize(
         "fixture_name",
         [
-            "valid_file_linear_time.xml",
             "valid_file_step_time.xml",
-            "valid_inline_linear_time.xml",
             "valid_inline_step_time.xml",
             "valid_inline_parameter.xml",
             "valid_inline_observable.xml",
@@ -106,30 +104,38 @@ class TestNfsimMethod:
         assert result.n_observables == 3
         assert result.observable_names == ["X_unphos", "X_phos", "X_total"]
 
-    def test_tfun_new_format_step_vs_linear_file_mode_differs(
+    @pytest.mark.parametrize(
+        "fixture_name", ["valid_file_linear_time.xml", "valid_inline_linear_time.xml"]
+    )
+    def test_tfun_new_format_linear_time_fixtures_are_refused(
+        self,
+        dummy_model,
+        nfsim_tfun_new_format_dir: Path,
+        fixture_name: str,
+    ):
+        """A linear table indexed by time is held between its x values (#1179)."""
+        xml_path = nfsim_tfun_new_format_dir / fixture_name
+        with pytest.raises(bngsim.ModelError, match=r"linear table .*'tfun_rate'.*#1179"):
+            bngsim.Simulator(dummy_model, method="nfsim", xml_path=str(xml_path))
+
+    def test_tfun_new_format_file_mode_reads_the_method(
         self,
         dummy_model,
         nfsim_tfun_new_format_dir: Path,
     ):
-        """Linear and step interpolation produce different trajectories."""
-        linear = bngsim.Simulator(
-            dummy_model,
-            method="nfsim",
-            xml_path=str(nfsim_tfun_new_format_dir / "valid_file_linear_time.xml"),
-        )
+        """The same file table is refused as a linear table and runs as a step."""
+        with pytest.raises(bngsim.ModelError, match="#1179"):
+            bngsim.Simulator(
+                dummy_model,
+                method="nfsim",
+                xml_path=str(nfsim_tfun_new_format_dir / "valid_file_linear_time.xml"),
+            )
         step = bngsim.Simulator(
             dummy_model,
             method="nfsim",
             xml_path=str(nfsim_tfun_new_format_dir / "valid_file_step_time.xml"),
         )
-
-        r_linear = linear.run(t_span=(0, 2), n_points=11, seed=123)
-        r_step = step.run(t_span=(0, 2), n_points=11, seed=123)
-
-        assert not np.array_equal(
-            np.asarray(r_linear.observables),
-            np.asarray(r_step.observables),
-        )
+        assert step.run(t_span=(0, 2), n_points=11, seed=123).n_times == 11
 
     def test_observables_nonnegative(self, dummy_model, nfsim_xml):
         """All observable values should be non-negative."""
@@ -302,11 +308,20 @@ class TestNfsimMethod:
 
         assert result.n_species == 0
 
-    def test_compartment_xml_smoke(self, dummy_model, nfsim_compartment_xml):
-        """cBNGL smoke test: compartmental XML parses and simulates."""
-        sim = bngsim.Simulator(dummy_model, method="nfsim", xml_path=str(nfsim_compartment_xml))
-        result = sim.run(t_span=(0, 0.1), n_points=2, seed=42)
-        assert result.n_observables == 6
+    def test_compartment_xml_is_refused(self, dummy_model, nfsim_compartment_xml):
+        """GH #1067: NFsim runs compartment models wrong, so method='nfsim' refuses one."""
+        with pytest.raises(bngsim.ModelError, match="cannot run a compartment model"):
+            bngsim.Simulator(dummy_model, method="nfsim", xml_path=str(nfsim_compartment_xml))
+
+    def test_compartment_xml_smoke(self, nfsim_compartment_xml):
+        """cBNGL smoke test, through the core the refusal does not guard: the
+        compartmental XML still parses and simulates."""
+        from bngsim._bngsim_core import NfsimSimulator
+
+        sim = NfsimSimulator(str(nfsim_compartment_xml))
+        sim.initialize(42)
+        result = sim.simulate(0, 0.1, 2)
+        sim.destroy_session()
         assert result.observable_names == [
             "X_free",
             "X_p_total",

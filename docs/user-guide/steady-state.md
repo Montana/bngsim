@@ -6,9 +6,11 @@ BNGsim includes a steady-state solver for finding f(y) = 0 — the equilibrium
 where all species concentrations stop changing. This is essential for
 dose-response curves, bifurcation analysis, and fitting steady-state data.
 
-All paths share **one** convergence criterion, matching BNG2.pl's
+By default all paths share **one** convergence criterion, matching BNG2.pl's
 `run_network -c`: the parity residual `||f(y)||_2 / n_species < tol`. This is
-the same quantity `run(steady_state=True)` checks (see below).
+the same quantity `run(steady_state=True)` checks (see below). The opt-in
+`criterion="scaled"` asks every path a test in the model's own units instead
+(see [Convergence in the model's units](#convergence-in-the-models-units)).
 
 **`method="integration"` (default)**: CVODE BDF integration that marches
 forward one step at a time and stops when the parity residual
@@ -65,6 +67,61 @@ always echoed in `ss.method_used`).
 > The old `method="auto"` and the `max|f|` / geometric-time-horizon Tier-1
 > criterion were removed: `"newton"` already means integrate-then-polish-with-
 > fallback, and every integration path now uses the single `||f||_2/n` rule.
+
+### Convergence in the model's units
+
+`||f(y)||_2 / n_species` is a rate, in the model's units of concentration per
+unit time, so `tol` means something different for every model. A model in
+molar units, or a slow one, is under it far from its steady state: the cubic
+`X' = -k·x·(x - 0.3)·(x - 1)` at a scale of 1e-9 came back `converged=True` at
+x = 0.894, 1.003 and 0.131 after one step, where every run ends at 1 (issue
+#1001).
+
+`steady_state(criterion="scaled")` (and `steady_state_batch`) accepts a state
+when the Newton step from it to the root, `δ = −J⁻¹f` on the system with the
+conserved totals taken out, is within each species' own tolerance:
+
+`|δ_i| ≤ rtol·|y_i| + atol_i`, with `atol_i = rtol·max(|y_i|, floor)`
+
+The floor is the smallest positive initial concentration of a species that is
+not `$`-fixed, or, where none starts above 0, the largest species of the state
+or of the root it steps to. A species that starts at 0 is held to `rtol` times
+the floor, as under `atol="auto"`: one whose steady state is smaller than that is
+within tolerance of 0. `mask=` says which species are measured, not which move:
+the step moves every species by its own equation but a `$`-fixed one and a
+masked one that nothing reads (a write-only sink) or that reads nothing (a
+counter run at a constant rate), which is held.
+Neither side has a unit of concentration or of time in it. The
+march, the bursts, the KINSOL polish and the test at the start all ask it.
+Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes
+`atol="auto"`.
+
+```python
+ss = sim.steady_state(criterion="scaled")
+ss.criterion          # "scaled"
+ss.newton_distance    # the step in those units; at most 1 is accepted
+```
+
+What it does not do:
+
+- **A singular reduced Jacobian is not certified.** Where the Jacobian at the
+  state is singular, the state is accepted only if `f` is 0 there, and
+  `newton_distance` is `inf` otherwise. Across the corpus a least-squares step
+  at those states would have accepted states that a run moves by more than 1%.
+- **A differenced Jacobian across a jump** in a rate law (an `if()` the state
+  sits on) is not certified either: there the quotient is the jump over the
+  step, and the step through it says nothing.
+- **A slope steep enough to hide a floor** can pass. The distance is first
+  order: `X' = 0.001 + 1e8·|X - 1|` has no root, but its slope at the kink makes
+  the step 5e-12, within tolerance. Checking the step on the right-hand side
+  refused that, and 63 corpus models' genuine roots with it.
+- **More than 512 unknowns** take no step, and the solve is the residual one,
+  `tol` and all; `ss.criterion` then says `"residual"`.
+- **A root the dynamics leave** can still pass: the test is a distance to a
+  root, not a run taken on from it.
+
+`criterion="residual"` stays the default until a run taken on from the state
+is part of the test too.
 
 Every path evaluates whatever RHS the Simulator's
 [`codegen_backend`](codegen.md) reports — the compiled `.so`, the in-process MIR
@@ -398,9 +455,45 @@ attractor. On the toggle dose above, `method="newton"` returns the correct branc
 at a residual of `7.5e-14` against integration's `3.2e-10`.
 
 The certificate is *not* a bifurcation analysis — it says whether the root that
-was returned is linearly stable, not how many other roots exist. For the full
-picture, scan the parameter and compare `method="integration"` from different
-initial conditions.
+was returned is linearly stable, not how many other roots exist. For that, see
+the next section.
+
+### Every steady state of a parameter set (`steady_states()`, issue #524)
+
+`sim.steady_states()` looks for all of them by multistart Newton:
+
+1. It samples `n_starts` starting states on the conservation manifold.
+2. It runs KINSOL from each one with no integration burst.
+3. It clusters the roots it reaches.
+
+The burst is what carries `steady_state(method="newton")` into an attractor's basin, and the certificate is what turns a saddle down. Here neither applies: every root reached is kept and labelled.
+
+```python
+roots = sim.steady_states(n_starts=200, seed=0)   # the Gardner toggle at alpha_2 = 53.53
+roots                 # SteadyStates(3 distinct root(s) from 200 starts, 52 failed: ...)
+roots.states          # [[28.245, 1.830], [0.0076, 53.123], [144.373, 0.368]]
+roots.stability       # ["unstable", "stable", "stable"]
+roots.eigenvalues     # the spectrum at each root, as on SteadyStateResult
+roots.multiplicity    # how many starts reached each root: a rough basin size
+roots.basins          # root index per start, -1 where Newton did not converge
+```
+
+**Sampling.** Each species a start moves is drawn log-uniformly from `decades` (default 4) decades below a bound up to it:
+
+- A species in no conservation law is bounded by `upper`. Its default is ten times the largest concentration of the model's state, law total, and value of the steady state one ordinary solve reaches (10 when all of them are 0).
+- The species in a law are drawn below the largest total, then moved onto the laws together, at the totals the model's state holds. They go to the point that satisfies the laws nearest the draw in relative entropy, which keeps every species positive however many species a law holds. The members of a law start within about `decades` decades of each other, so a root where one sits further below its law's total is reached only if Newton walks there; widen `decades` for it.
+
+A `$`-fixed species, and one `mask=` leaves out, keeps its value in every start and is not an unknown of the solve, though a law's dependent species is rebuilt from the law as the others move.
+
+**Scale.** `tol` is absolute, as in `steady_state()`. A model at so small a scale that most starts are under `tol` before Newton moves them is refused, since any state would pass there. At law totals above about `1e7`, the law's round-off alone can exceed `tol`, and a root is then counted as a failed start. Below concentrations of about `1e-9`, KINSOL's step limits are absolute too, and most starts fail even with a `tol` scaled to match.
+
+**Failed starts.** Newton does not converge from every start (52 of 200 on the toggle, most of them near zero, where its Hill terms turn NaN). Those starts are counted in `n_failed` and have basin -1. A write-only accumulator fails every start, since it makes Newton's system singular; exclude it with `mask=~model.is_pure_sink()`.
+
+**Distinct roots.** Each root is polished with a few more Newton steps after KINSOL first gets under `tol`. Two roots are the same when every species agrees to `dedupe_rtol` (default `1e-6`) of its magnitude, or, for a species in a conservation law, to `1e-9` of its smallest law's scale `Σ|L·y|`, which is as close as the solve places it. A continuum of steady states (a zero eigenvalue in each root's spectrum, as on SIR's line of disease-free states) is not a set of isolated roots: each start lands somewhere on it and is reported as a root of its own.
+
+**Building block.** `steady_state_batch(states=..., method="newton", newton_burst=False)` runs the same burst-free solves from starting states of your own, paired row by row with `params=` when both are given. It leaves a `$`-fixed species out of the unknowns, as `steady_states()` does.
+
+This is a search, not a proof. A root with a small basin, or a saddle Newton never lands on, can be missed, and nothing here claims the list is complete. Completeness for polynomial mass-action systems is what homotopy continuation offers (#502).
 
 ### Time course that stops at steady state (`run(steady_state=True)`)
 
