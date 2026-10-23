@@ -1583,3 +1583,24 @@ def test_a_species_reaching_zero_as_one_over_t_is_polished_there(tmp_path, metho
     assert scaled.converged
     assert 0.0 < scaled.concentrations[0] < 1e-8
     assert scaled.continued_run_distance <= 1.0
+
+
+LOPSIDED_LAW_ANT = """model lop
+  B = 1e-6
+  A = 1e6
+  J1: A -> B; kf*A
+  J2: B -> A; kr*B
+  kf = 1e-12; kr = 1.0
+end"""
+
+
+@pytest.mark.parametrize("method", ["integration", "newton"])
+def test_a_polish_that_loses_a_dependents_digits_is_not_kept(method):
+    # The start is the steady state. KINSOL solves for A and makes B from the
+    # total, 1e6 + 1e-6, which leaves B at 1.0000076e-6, 381 tolerances off,
+    # where main's Newton solve returns it. The polish is kept only where it is
+    # nearer the root.
+    model = bngsim.Model.from_antimony_string(LOPSIDED_LAW_ANT)
+    ss = bngsim.Simulator(model, method="ode").steady_state(method=method)
+    assert ss.converged
+    np.testing.assert_array_equal(ss.concentrations, model.get_state())

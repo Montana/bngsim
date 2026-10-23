@@ -6021,14 +6021,31 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 // taken 246 s to settle the run's own error.
                 if (!effective->criterion_by_distance)
                     polish.tol = effective->tol * 1e-3;
+                const double before_residual =
+                    compute_residual(rhs, result.concentrations.data(), ns, sub);
                 SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, result.concentrations,
                                                      nullptr, kPolishIters, true);
                 if (p.converged && static_cast<int>(p.concentrations.size()) == ns) {
-                    result.concentrations = p.concentrations;
-                    result.n_steps += p.n_steps;
-                    result.n_rhs_evals += p.n_rhs_evals;
-                    result.newton_distance = ss_newton_distance(model, rhs, *effective, sub,
-                                                                result.concentrations.data());
+                    // Kept where it is nearer the root, by the step where there
+                    // is one before and after, else by the residual: KINSOL
+                    // solves for a law's unknowns and makes its dependent from
+                    // the total, which loses the digits of a dependent at 1e-6
+                    // beside a partner at 1e6. An exact state was polished to
+                    // one 381 tolerances off, which the runs then refused.
+                    const double after = effective->criterion_by_distance
+                                             ? ss_newton_distance(model, rhs, *effective, sub,
+                                                                  p.concentrations.data())
+                                             : std::numeric_limits<double>::quiet_NaN();
+                    const double before = result.newton_distance;
+                    const bool nearer = (std::isnan(before) || std::isnan(after))
+                                            ? p.residual < before_residual
+                                            : after < before;
+                    if (nearer) {
+                        result.concentrations = p.concentrations;
+                        result.n_steps += p.n_steps;
+                        result.n_rhs_evals += p.n_rhs_evals;
+                        result.newton_distance = after;
+                    }
                 }
             } catch (const std::exception &) {
             }
