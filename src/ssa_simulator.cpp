@@ -1849,13 +1849,16 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // Issue #1059: what t + tau rounded away at the last firing, carried into the
     // next one (compensated summation). Far from the origin the doubles near t
     // are coarse, 1.2e-4 apart at t = 1e12, and a waiting time below half that
-    // was lost whole, or one above it rounded to a whole spacing. A decay from
-    // t_start = 1e12 ran slow (z = -289 at t + 2) and one from 1e15 ran fast
-    // (z = -762). Carried, the absolute time of every firing is the exact sum of
-    // the waiting times to within half a spacing, and the error no longer
-    // builds up; and a sample is read against that exact time, t - t_carry,
-    // so a firing that rounds onto a sample time is still before it. A time set
-    // rather than reached, at an event or a breakpoint, starts the sum again.
+    // was lost whole, or one above it rounded to a whole spacing. The clock fell
+    // behind the firings, and a decay ran fast: z = -289 at t + 2 from t_start =
+    // 1e12, z = -762 from 1e15. Carried, the absolute time of every firing is the
+    // exact sum of the waiting times to within half a spacing, and the error no
+    // longer builds up; and a sample, an event or a breakpoint is weighed against
+    // that exact time, t - t_carry, so a firing that rounds onto one of them is
+    // still on its own side of it. A time set rather than reached, at an event or
+    // a breakpoint, starts the sum again. Only the two loops that draw a waiting
+    // time from a constant a0 carry; the continuous loop places its firings on
+    // panels in absolute time, and keeps the limit (issue #1059).
     double t_carry = 0.0;
     int next_output = 1;
     long total_steps = 0;
@@ -2211,7 +2214,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             double tau = -std::log(r1) / a0;
             const double tau_carried = tau - t_carry;
             double t_proposed = t + tau_carried;
-            const double carry_next = (t_proposed - t) - tau_carried;
+            // An infinite wait (a subnormal a0) carries nothing: inf - inf is a
+            // NaN, past which no sample would ever be read.
+            const double carry_next =
+                std::isfinite(t_proposed) ? (t_proposed - t) - tau_carried : 0.0;
 
             // Record output points strictly before the fire time. Evaluated per
             // sample, matching the main loop byte-for-byte. `time_dependent_rates`
@@ -3006,7 +3012,6 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             if (!event_first && !fire_first) {
                 // Nothing discrete in the panel: move to its end.
                 t = s1;
-                t_carry = 0.0;
                 y = y1;
                 A0 = Av[4];
                 F0 = F2;
@@ -3030,7 +3035,6 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 load_y(y.data());
             }
             t = s_cut;
-            t_carry = 0.0;
             psa_now = t;
             model.set_current_time(t);
             sync_state(t);
@@ -3141,7 +3145,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 budget.check();
                 steps_since_timeout_check = 0;
             }
-            if (pc_due(t))
+            // Due once the exact time, t - t_carry, has reached the breakpoint: a
+            // firing that rounds onto it from before it leaves the old rate in
+            // force (issue #1059).
+            if (pc_due(t) && t - pc_next() >= t_carry)
                 pc_refresh_at(t);
 
             // 1. Total propensity: the sum tree's root, O(1), or an O(N) flat sum.
@@ -3258,12 +3265,17 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             double tau = -std::log(r1) / a0;
             const double tau_carried = tau - t_carry;
             double t_proposed = t + tau_carried;
-            const double carry_next = (t_proposed - t) - tau_carried;
+            const double carry_next =
+                std::isfinite(t_proposed) ? (t_proposed - t) - tau_carried : 0.0;
             // A breakpoint first: a piecewise-constant rate jumps there, so stop,
-            // re-read the rates and redraw (exact by memorylessness).
-            const bool pc_cap = pc_refresh && t_proposed > pc_next();
+            // re-read the rates and redraw (exact by memorylessness). Weighed at
+            // the firing's exact time, t_proposed - carry_next, as a sample is.
+            const bool pc_cap = pc_refresh && t_proposed - pc_next() > carry_next;
             if (pc_cap)
                 t_proposed = pc_next();
+            // What t_proposed is short of the exact time it stands for: the carry
+            // of a firing, none for a breakpoint.
+            const double proposed_carry = pc_cap ? 0.0 : carry_next;
 
             // 4. Detect event-trigger crossings within (t, t_proposed].
             //    State is piecewise-constant during τ, so a time-dependent trigger
@@ -3275,13 +3287,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
 
             // At the breakpoint itself an event still fires: the stop there is
             // not a firing, and the event's rows then read its effect, as
-            // without the stop.
-            const bool event_wins = std::isfinite(t_event) &&
-                                    (t_event < t_proposed || (pc_cap && t_event <= t_proposed));
+            // without the stop. A firing that rounds onto the event's time from
+            // past it comes after the event (issue #1059).
+            const bool event_wins =
+                std::isfinite(t_event) &&
+                (t_proposed - t_event > proposed_carry || (pc_cap && t_event <= t_proposed));
             double t_advance = event_wins ? t_event : t_proposed;
-            // What t_advance is short of the exact time it stands for: the carry
-            // of a firing, none for a time set at an event or a breakpoint.
-            const double advance_carry = (event_wins || pc_cap) ? 0.0 : carry_next;
+            const double advance_carry = event_wins ? 0.0 : proposed_carry;
 
             // 5. Record output points strictly before t_advance. When an event
             //    lands at (or within bisection precision of) a sample time,
