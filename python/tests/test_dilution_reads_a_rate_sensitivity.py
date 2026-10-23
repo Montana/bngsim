@@ -100,10 +100,10 @@ def test_a_mass_action_law_on_p_is_written_out_too():
 
 def test_the_compiled_jacobian_reads_the_rate_too():
     """A cross-compartment reaction into a rate-ruled compartment makes the
-    compiled Jacobian recompute func[], the dilution term's included. It wrote
-    ``rate_of__P`` into the C as an undeclared name, and the build failed: a
-    sensitivity run raised where it had run on the difference quotient.
-    A and B leave P and S as they were."""
+    compiled Jacobian recompute func[], the dilution term's included, and that
+    recomputation has no live dx/dt. Once the interpreted Jacobian attached, the
+    token went into the C as an undeclared name: the build failed, and the
+    sensitivity run raised. A and B leave P and S as they were."""
     text = _TEXT + (
         "compartment Cv = 2; Cv' = 0.1;\n"
         "species A in C0 = 1; species B in Cv = 1;\n"
@@ -121,3 +121,50 @@ def test_the_compiled_jacobian_reads_the_rate_too():
     w = list(result.species_names).index("S")
     np.testing.assert_allclose(np.asarray(result.species)[:, w], _s(t), rtol=1e-8)
     np.testing.assert_allclose(np.asarray(result.sensitivities)[:, w, 0], _ds_dr(t), rtol=1e-6)
+
+
+def test_a_rate_beside_such_a_reaction_compiles_where_only_an_output_reads_it():
+    """``y := rateOf(P)`` read by no rate law. The interpreted Jacobian never
+    reads y, so it attached on main too, and the compiled one wrote
+    ``func[0] = rate_of__P;``: the build failed under ``codegen=True``. y is
+    -0.3·P."""
+    text = (
+        "compartment C0 = 1; compartment Cv = 2; Cv' = 0.1;\n"
+        "species P in C0 = 1; species A in C0 = 1; species B in Cv = 1;\n"
+        "J1: P -> ; 0.3*P*C0; Jx: A -> B; 0.1*A*C0;\n"
+        "y := rateOf(P);\n"
+    )
+    result = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", codegen=True
+    ).run(t_span=(0.0, 5.0), n_points=6, **_TIGHT)
+    p = np.asarray(result.species)[:, list(result.species_names).index("P")]
+    y = np.asarray(result.expressions)[:, result.expression_names.index("y")]
+    np.testing.assert_allclose(p, np.exp(-0.3 * np.asarray(result.time)), rtol=1e-8)
+    np.testing.assert_allclose(y, -0.3 * p, rtol=1e-8)
+
+
+def test_an_amount_whose_rate_of_reports_an_amount():
+    """P an amount in C0 = 2: its rateOf is d(amount)/dt, the engine's sum times
+    C0. Left out, the run went to the difference quotient for millions of steps.
+    P = e^(-k1·t), so [S] = 10·e^(-0.2t)/(1 + P) and
+    d[S]/dk1 = 10·e^(-0.2t)·t·P/(1 + P)²; C0 moves neither."""
+    text = """
+compartment C0 = 2; compartment C; C := 1 + P; k1 = 0.3;
+substanceOnly species P in C0 = 1; species S in C = 5;
+J1: P -> ; k1*P; J2: S -> ; 0.2*S*C;
+"""
+    sim = bngsim.Simulator(
+        bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=["k1", "C0"]
+    )
+    assert sim.has_analytic_sens_rhs
+    result = sim.run(t_span=(0.0, 10.0), n_points=11, **_TIGHT)
+    t = np.asarray(result.time)
+    p = np.exp(-0.3 * t)
+    w = list(result.species_names).index("S")
+    sens = np.asarray(result.sensitivities)[:, w, :]
+    np.testing.assert_allclose(
+        np.asarray(result.species)[:, w], 10 * np.exp(-0.2 * t) / (1 + p), rtol=1e-8
+    )
+    np.testing.assert_allclose(sens[:, 0], 10 * np.exp(-0.2 * t) * t * p / (1 + p) ** 2, rtol=1e-6)
+    np.testing.assert_allclose(sens[:, 1], 0.0, atol=1e-9)
+    assert result.solver_stats["n_steps"] < 5_000

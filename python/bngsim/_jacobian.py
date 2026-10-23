@@ -739,13 +739,16 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
     (``k1*P*C0``) as Elementary, so leaving those out left the common model on
     the difference quotient.
 
-    A fixed species' rate is 0. Left out, so that a law reading the token
-    declines as before: a species a reaction changes that divides by each
-    species' volume, is Michaelis–Menten, or takes a species factor of a
-    reactant no observable holds alone; and a species whose ``rateOf`` reports
-    an amount. ``data`` is the model's ``codegen_data()``; one with no reaction
-    list says nothing of any rate and gives none, and so does one whose
-    functions read none.
+    A fixed species' rate is 0. A species whose ``rateOf`` reports an amount
+    (``report_rateof_amount``) reads the sum times its compartment's size, as
+    ``refresh_rateof_derivs_once_`` scales it: the size parameter by name where
+    the size is writable, so a write moves it (issue #170), else the number.
+    Left out, so that a law reading the token declines as before: a species a
+    reaction changes that divides by each species' volume, is
+    Michaelis–Menten, or takes a species factor of a reactant no observable
+    holds alone. ``data`` is the model's ``codegen_data()``; one with no
+    reaction list says nothing of any rate and gives none, and so does one
+    whose functions read none.
     """
     functions = data.get("functions") or ()
     if "reactions" not in data or not any(
@@ -780,10 +783,14 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
     for i, sp in enumerate(species):
         if sp.get("fixed", False):
             rate = "0"
-        elif i in unreadable or sp.get("report_rateof_amount", False):
+        elif i in unreadable:
             continue
         else:
             rate = " + ".join(terms.get(i, ())) or "0"
+            if sp.get("report_rateof_amount", False):
+                k = int(sp.get("volume_param_idx0", -1))
+                size = params[k]["name"] if 0 <= k < len(params) else None
+                rate = f"{size or repr(float(sp.get('volume_factor', 1.0)))}*({rate})"
         out[f"{_RATEOF_PREFIX}{sp['name']}"] = f"({rate})"
     return out
 
