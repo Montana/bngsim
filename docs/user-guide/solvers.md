@@ -530,12 +530,32 @@ in the argument (`mod(1e12 + time(), 0.3)`) billions of doubles of the clock
 multiply-add (issue #963), so it changes on the same double as the
 interpreter. (A law read tread by tread is stopped on the last double before
 each change: above.) A condition an event's trigger reads keeps its stop where it
-was put, as does every condition in a run with sensitivity columns or at an
-`rtol` of 1e-3 or looser. In a run where a moved stop would sit a double or
-two from another stop (two spellings of one schedule, or another switch on
-one of its edges), every stop of the run is where it was put: the run takes
-the second of two such as reached where it restarts on the first, and
-neither alone is right for both conditions.
+was put, as does every condition in a run with sensitivity columns. At an
+`rtol` looser than 1e-4, each stop the resolvers or the scan put on a change
+sits on the last double before the change instead (issue #1226); one on a
+counter clock stays where it was put, since the integrated counter lands a
+few doubles past it. A step ends on a stop, and the implicit step reads the
+rate at its end: on the change, the step that reaches it is taken at the next
+stretch's rate, and at a tolerance loose enough for that step to span the
+stretch, `if(mod(time(), 24) < 1, 1, 0)` over 1,000 days came to 14,627 for
+1,000 at `rtol` 1e-2 (each day's 23 hours off at the rate on, its hour on at
+the rate off). A double earlier it is exact to rounding, where the rate law
+holds between its changes. One that reads the clock outside every condition
+that holds between its changes (a sawtooth, written with `mod`, `frac` or
+`floor`, a ramp, a pulse times the clock) keeps its stops where they were put:
+spanned by one step, its stretch is read at one end, and the end a double
+before the change is no better than the other (`mod(time(), 0.7)` from
+X(0) = 1e4 at `rtol` 1e-3 was 19.3 over a double before each change, and 0.45
+as the stops were put). A condition that comes in parentheses, as every one an
+SBML or Antimony model loads does (`((time() - 24*floor(time()/24)) < 1)`), is
+not read as one that holds, and keeps its stops where they were put: an SBML
+pulse schedule is main's at every tolerance. Tighter, the step on the change fails on the jump and
+the run walks the stretch before it, which finds a pulse inside the stretch
+that a step from the double before would not. In a run where a moved stop
+would sit a double or two from another stop (two spellings of one schedule,
+or another switch on one of its edges), every stop the resolvers placed is
+where they put it: the run takes the second of two such as reached where it
+restarts on the first, and neither alone is right for both conditions.
 
 CVODE takes a stop as reached once a step ends within 100 doubles' worth of
 its time, about 2.2e-14*t, and does not integrate what is left. Where a rate

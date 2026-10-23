@@ -2236,6 +2236,16 @@ class Simulator:
                 # high where main, its stops a double early, was 4% (at 1e-4 and
                 # tighter the moved stops were the more accurate in every case).
                 on_the_flip=not sensitivities and float(opts.rtol) <= _FLIP_LOOSEST_RTOL,
+                # Issue #1226: looser, a double before the change. The step
+                # that ends on a stop reads the rate at its end, and where the
+                # tolerance lets it span a stretch, on the change it was taken
+                # at the next stretch's rate: `if(mod(time(), 24) < 1, 1, 0)`
+                # over 1,000 days was 14,627 for 1,000 at rtol 1e-2. A double
+                # earlier it is exact to rounding at every tolerance; tighter
+                # than this, where the step fails on the jump and the run walks
+                # the stretch before it, that walk finds a pulse inside the
+                # stretch that a step from the double before would not.
+                before_the_flip=not sensitivities and float(opts.rtol) > _FLIP_LOOSEST_RTOL,
                 # Issue #1018: a law on a line far from zero that the scan
                 # refuses or leaves alone is read tread by tread.
                 by_tread=not sensitivities,
