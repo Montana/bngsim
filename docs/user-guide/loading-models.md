@@ -188,7 +188,10 @@ A reaction's `"type"` says how to read its `"rate_law"`:
   reactant amounts, as for an elementary reaction (`0.5*f1` comes back as
   `"rate_law": "f1"`, `"stat_factor": 0.5`).
 - `"mm"`: `"<kcat>,<Km>"` for a `MM kcat Km` rate column, with
-  `"legacy_constants": [kcat, Km]`.
+  `"legacy_constants": [kcat, Km]`. BNG2.pl writes a symmetry factor ahead of
+  the type, `2*MM kcat Km`, and it comes back as `"stat_factor": 2.0`, which
+  multiplies the whole rate (likewise `2*Sat k K` and `2*Hill V K h`, whose
+  factor stays the rewritten reaction's `"stat_factor"`).
 
 Values are evaluated: a parameter's is the number `Model.from_net` puts in its
 slot, and a species whose initial concentration names a parameter carries that
@@ -199,15 +202,16 @@ species.
 The deprecated `Sat` and `Hill` rate-law tokens come back rewritten, as
 `Model.from_net` rewrites them, with the same warning: the reaction is
 `"functional"`, driven by an explicit function, and a single-species observable
-is added for each reactant the function reads.
+is added for each reactant the function reads. A factor ahead of the type
+(`2*Sat k K`, `2*Hill V K h`) stays the reaction's `"stat_factor"`.
 
 A reaction line is `<index> <reactants> <products> <rate law>`, and only a
 `Sat`, `Hill` or `MM` rate law takes more tokens: its constants.
 `parse_net_file` and `Model.from_net` refuse a line with anything else after
 the rate law, as run_network does, rather than load it without that part.
 bngsim reads no per-reaction modifiers, such as a delay (issue #505). A stat
-factor on an `MM`, `Sat` or `Hill` rate law (`2*MM kcat Km`) is refused too,
-until issue #1230.
+factor ahead of the rate law's type (`2*MM kcat Km`) is read off the first
+token before the type is matched, as run_network reads it.
 
 **Use with BNGsim** (fastest path — C++ CVODE/SSA):
 

@@ -380,38 +380,21 @@ class TestTokensAfterTheRateLaw:
         assert (rxn["type"], rxn["rate_law"], rxn["stat_factor"]) == ("elementary", "k", 1.0)
         bngsim.Model.from_net(str(net))
 
-    @pytest.mark.parametrize("name", ["MM", "Ele"])
+    @pytest.mark.parametrize("factor", ["", "2*"], ids=["bare", "factor"])
+    @pytest.mark.parametrize("name", ["MM", "Ele", "Sat", "Hill"])
     def test_a_rate_constant_named_like_a_type_keyword_still_loads(
-        self, tmp_path: Path, name: str
+        self, tmp_path: Path, name: str, factor: str
     ) -> None:
         """A rate column of one token is a rate constant or function, whatever it
-        is called (run_network reads it so too). `MM kcat` with one constant is
-        refused in test_net_reader_legacy_and_tfun.py."""
-        net = _one_reaction_net(tmp_path, f"1 2 3 {name}", extra_params=f"8 {name} 1.5\n")
+        is called (run_network reads it so too), with a stat factor or without.
+        `Sat` or `Hill` alone used to be read as that law with no constants, and
+        `2*Sat` became so once the factor came off first (issue #1230). `MM kcat`
+        with one constant is refused in test_net_reader_legacy_and_tfun.py."""
+        net = _one_reaction_net(tmp_path, f"1 2 3 {factor}{name}", extra_params=f"8 {name} 1.5\n")
         (rxn,) = parse_net_file(net)["reactions"]
         assert (rxn["type"], rxn["rate_law"]) == ("elementary", name)
+        assert rxn["stat_factor"] == (2.0 if factor else 1.0)
         bngsim.Model.from_net(str(net))
-
-    @pytest.mark.parametrize(
-        ("law", "line"),
-        [
-            ("MM", "1 1,2 1,3 2*MM kcat Km"),
-            ("Sat", "1 2 3 2*Sat k Km"),
-            ("Hill", "1 2 3 2*Hill V K n"),
-        ],
-    )
-    def test_a_stat_factor_on_a_typed_rate_law_is_refused_as_such(
-        self, tmp_path: Path, law: str, line: str
-    ) -> None:
-        """BNG2.pl writes `2*MM kcat Km` for a symmetric substrate. bngsim does not
-        read that form yet (#1230); it was refused at build as "unknown parameter
-        'MM'", which names the wrong thing."""
-        net = _one_reaction_net(tmp_path, line)
-        message = re.escape(f"puts a stat factor on its {law} rate law") + r".*#1230"
-        with pytest.raises(ValueError, match=message):
-            parse_net_file(net)
-        with pytest.raises(ModelError, match=message):
-            bngsim.Model.from_net(str(net))
 
     @pytest.mark.parametrize(
         ("line", "same_rate", "doubled"),
@@ -422,17 +405,14 @@ class TestTokensAfterTheRateLaw:
         ],
         ids=["MM", "Sat", "Hill"],
     )
-    @pytest.mark.xfail(
-        strict=True,
-        raises=ModelError,
-        reason="#1230: a stat factor on an MM, Sat or Hill rate law is refused",
-    )
+    @pytest.mark.filterwarnings("ignore:Legacy/deprecated BioNetGen .net rate law token")
     def test_a_stat_factor_on_a_typed_rate_law_scales_the_rate(
         self, tmp_path: Path, line: str, same_rate: str, doubled: str
     ) -> None:
         """run_network multiplies the whole rate by the factor (network.cpp:
         `stat_factor * kcat * Et * S / (Km + S)`, `stat_factor * param[0] * ...`),
-        so `2*T c1 c2...` is `T c1' c2...` with c1' = 2*c1."""
+        so `2*T c1 c2...` is `T c1' c2...` with c1' = 2*c1. BNG2.pl writes this
+        form for a symmetric substrate; until issue #1230 the loader refused it."""
         (tmp_path / "a").mkdir()
         (tmp_path / "b").mkdir()
         expect = bngsim.Model.from_net(str(_one_reaction_net(tmp_path / "b", same_rate, doubled)))
@@ -443,6 +423,26 @@ class TestTokensAfterTheRateLaw:
             return np.asarray(sim.run(t_span=(0.0, 5.0), n_points=11).species)
 
         np.testing.assert_allclose(run(got), run(expect), rtol=1e-6, atol=1e-9)
+
+    @pytest.mark.parametrize(
+        ("line", "message"),
+        [
+            ("1 2 3 2*Ele k", "spells out the Ele rate-law type"),
+            ("1 1,2 1,3 2*MM kcat", "an MM rate law takes two constants"),
+        ],
+        ids=["ele", "mm-one-constant"],
+    )
+    def test_a_factor_ahead_of_the_type_leaves_the_types_own_refusal(
+        self, tmp_path: Path, line: str, message: str
+    ) -> None:
+        """The factor comes off before the type is matched (issue #1230), so the
+        line is judged by its type: `2*Ele k` by the Ele refusal and `2*MM kcat`
+        by MM's count, not by a stat-factor message."""
+        net = _one_reaction_net(tmp_path, line)
+        with pytest.raises(ValueError, match=re.escape(message)):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=re.escape(message)):
+            bngsim.Model.from_net(str(net))
 
     def test_the_ele_keyword_is_refused_as_such(self, tmp_path: Path) -> None:
         """run_network reads `Ele k` as elementary k; BNG2.pl never writes it, and
