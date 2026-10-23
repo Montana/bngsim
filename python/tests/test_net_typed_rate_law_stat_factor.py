@@ -7,15 +7,16 @@ before it matches the type (`sscanf("%lf*%s")` in Network3's `read_Rxn_array`)
 and multiplies the whole rate by it. bngsim's loader compared the token to `MM`,
 `Sat` and `Hill` exactly, so `2*MM` fell through to the elementary branch,
 which took the factor off and read `MM` as a rate constant's name, and the
-model was refused as "references unknown parameter 'MM'".
+model was refused as "references unknown parameter 'MM'", and since #1232 by
+name, as a form bngsim did not read yet.
 
 What this file pins:
 
 * the files BNG2.pl 2.9.3 writes for a symmetric substrate under each type load,
   from both doors, and give run_network's trajectory;
 * `2*<law>` with kcat is the same model as `<law>` with 2·kcat on every path that
-  reads the factor: the ODE right-hand side, interpreted and compiled, SSA, and
-  the sensitivities;
+  reads the factor: the ODE right-hand side, interpreted and compiled, SSA, PSA,
+  and the sensitivities;
 * the factor is held to what #803 holds an elementary one to.
 """
 
@@ -220,6 +221,7 @@ class TestTheFactorScalesTheWholeRate:
         ]
         np.testing.assert_array_equal(np.asarray(runs[0].species), np.asarray(runs[1].species))
 
+    @requires_cc
     def test_sensitivities(self, tmp_path: Path, kind: str) -> None:
         """d/dkcat of 2·kcat·g is twice d/d(kcat') of kcat'·g; d/dKm is the same."""
         doubled, plain = (
