@@ -431,8 +431,9 @@ def test_a_pending_execution_carries_across_run_until(method):
     assert second.as_roadrunner(["S"])["S"][-1] == 100
 
 
+@pytest.mark.parametrize("method", ["ssa", "psa"])
 @pytest.mark.parametrize("rate", ["2", "2 + sin(time)"], ids=["discrete", "continuous"])
-def test_a_delay_queued_by_a_firing_executes_at_its_time(rate):
+def test_a_delay_queued_by_a_firing_executes_at_its_time(rate, method):
     """`X >= 3` rises at a firing of J1. Twins with that trigger and delay 1e-3
     record the trigger time (frozen) and the execution time (read then), so
     their difference is the delay. J2's time-dependent rate puts the run on the
@@ -448,8 +449,8 @@ def test_a_delay_queued_by_a_firing_executes_at_its_time(rate):
         f"Z2: at {d} after (X >= 3), t0=false, fromTrigger=false: Exec = 1e6*time"
     )
     for seed in range(10):
-        trig = _conc(ant, "ssa", [0.0, 10.0], seed=seed, species="Trig")[-1] / 1e6
-        execd = _conc(ant, "ssa", [0.0, 10.0], seed=seed, species="Exec")[-1] / 1e6
+        trig = _conc(ant, method, [0.0, 10.0], seed=seed, species="Trig")[-1] / 1e6
+        execd = _conc(ant, method, [0.0, 10.0], seed=seed, species="Exec")[-1] / 1e6
         assert trig > 0
         assert execd - trig == pytest.approx(d, abs=1e-6), seed
 
@@ -473,6 +474,46 @@ def test_a_carried_execution_whose_trigger_falls_at_the_leg_start_is_cancelled(m
     model.set_param("p", 1.0)
     assert sim.run_until(t=1.75).as_roadrunner(["S"])["S"][-1] == 0
     assert sim.run_until(t=2.25).as_roadrunner(["S"])["S"][-1] == 100
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_an_unprioritised_event_goes_before_an_execution_due_with_it(method):
+    """At 2, E's execution (`S = S + 100`, frozen at 1 as 100) comes due as F
+    rises (`S = 0`). Neither has a priority, so the immediate F goes first, as
+    under ODE, and S(3) is 100 for every seed, not 0 or 100 at random."""
+    ant = (
+        "species S = 0, Y = 0; J: => Y; 2\n"
+        "E: at 1 after (time >= 1), t0=false: S = S + 100\n"
+        "F: at (time >= 2), t0=false: S = 0"
+    )
+    seeds = range(12) if method != "ode" else [7]
+    assert [_conc(ant, method, [0.0, 3.0], seed=s)[-1] for s in seeds] == [100.0] * len(seeds)
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_a_delayed_execution_raises_an_event_at_its_time(method):
+    """E's execution at 1.5 sets G, which raises F there: the row at 1.5 reads
+    both, and the one just before it neither."""
+    ant = (
+        "species S = 0, G = 0, Y = 0; J: => Y; 20\n"
+        "E: at 0.5 after (time >= 1), t0=false: G = 1\n"
+        "F: at (G > 0.5), t0=false: S = 50"
+    )
+    times = [0.0, 1.5 - 5e-10, 1.5, 2.0]
+    np.testing.assert_array_equal(_conc(ant, method, times, species="G"), [0, 0, 1, 1])
+    np.testing.assert_array_equal(_conc(ant, method, times), [0, 0, 50, 50])
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+@pytest.mark.parametrize(
+    "reaction",
+    ["", "J: => Y; 20", "J: => Y; 2 + sin(time)"],
+    ids=["idle", "discrete", "continuous"],
+)
+def test_an_execution_on_the_runs_end_is_in_its_last_row(method, reaction):
+    """Due at 1.5 with the run ending there: the last row reads it, on every loop."""
+    ant = f"species S = 0, Y = 0; {reaction}\nE: at 0.5 after (time >= 1), t0=false: S = 100"
+    np.testing.assert_array_equal(_conc(ant, method, [0.0, 1.0, 1.5]), [0, 0, 100])
 
 
 def test_a_negative_delay_is_refused_by_name():
