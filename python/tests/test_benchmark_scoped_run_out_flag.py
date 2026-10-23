@@ -303,3 +303,30 @@ def test_a_relative_out_is_made_absolute(gen_networks, tmp_path, monkeypatch):
         src = (SUITES_DIR / rel).read_text()
         block = src[src.index('"--out",') :][:200]
         assert "Path(p).resolve()" in block, f"{rel} takes --out without resolving it"
+
+
+def test_a_failed_regeneration_keeps_an_ok_row(gen_networks, tmp_path, monkeypatch, capsys):
+    """In a checkout without nets/ every ok row is regenerated, since its .net is
+    absent, and a run without a working BNG2.pl wrote ``netgen_failed`` over each
+    one in the tracked manifest. The ok row is kept exactly, so the file's bytes
+    do not change; the failure is reported on the model's line and in the tally."""
+    ok = {"model_id": "m", "method": "ode", "status": "ok", "net_file": "m.net", "n_species": 3}
+    out = tmp_path / "run"
+    out.mkdir()
+    gen_networks.save_manifest({"m": ok}, out / "nets_manifest.json")
+    before = (out / "nets_manifest.json").read_bytes()
+    job = argparse.Namespace(model_id="m", method="ode", model="m.bngl")
+    monkeypatch.setattr(gen_networks, "read_manifest", lambda path: ({}, [job]))
+    monkeypatch.setattr(gen_networks, "resolve_bng2pl", lambda: "/nonexistent/BNG2.pl")
+    failed = {"model_id": "m", "method": "ode", "status": "netgen_failed", "detail": "no BNG2.pl"}
+    monkeypatch.setattr(gen_networks, "gen_one", lambda *a, **k: dict(failed))
+    committed = gen_networks.MANIFEST.read_bytes()
+    assert gen_networks.main(["--out", str(out), "--workers", "1"]) == 0
+    assert gen_networks.MANIFEST.read_bytes() == committed
+    assert (out / "nets_manifest.json").read_bytes() == before
+    assert gen_networks.load_manifest(out / "nets_manifest.json")["m"] == ok
+    printed = capsys.readouterr().out
+    assert "NETGEN_FAILED (ok row kept)" in printed and "1 ok row(s) kept" in printed
+    # A row that was not ok takes the new result, and an ok result replaces an ok row.
+    assert gen_networks._kept_ok({**ok, "status": "netgen_failed"}, failed) == failed
+    assert gen_networks._kept_ok(ok, {**ok, "n_species": 4})["n_species"] == 4

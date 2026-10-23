@@ -237,6 +237,22 @@ def resolve_out(args) -> tuple[Path, Path]:
     return out / "nets", out / "nets_manifest.json"
 
 
+def _kept_ok(prev: dict | None, row: dict) -> dict:
+    """The manifest row to store for one regeneration's result.
+
+    A regeneration that fails does not undo a row that was ok. In a checkout
+    without the git-ignored ``nets/`` (any fresh clone) every ok row is
+    regenerated, since its ``.net`` is absent, and a run without a working
+    BNG2.pl turned each one into ``netgen_failed`` in the tracked manifest. The
+    ok row is kept as it was, so the tracked file is unchanged; the failed
+    attempt is reported on the model's line and in the closing tally. An ok
+    result replaces the row as before.
+    """
+    if row.get("status") == "ok" or not prev or prev.get("status") != "ok":
+        return row
+    return prev
+
+
 def load_manifest(manifest: Path = MANIFEST) -> dict:
     if manifest.exists():
         return json.loads(manifest.read_text())
@@ -315,16 +331,22 @@ def main(argv=None) -> int:
 
     t0 = time.perf_counter()
     done = 0
+    kept = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(gen_one, j, bng2_pl, args.timeout, nets): j for j in todo}
         for fut in as_completed(futs):
             row = fut.result()
             with _manifest_lock:
-                man[row["model_id"]] = row
+                stored = _kept_ok(man.get(row["model_id"]), row)
+                man[row["model_id"]] = stored
                 save_manifest(man, manifest)
             done += 1
             st = row.get("status")
             tag = "ok " if st == "ok" else st.upper()
+            if stored is not row:
+                # The line reports the attempt; the manifest keeps the ok row.
+                kept += 1
+                tag += " (ok row kept)"
             extra = (
                 f"N={row.get('n_species')} rxn={row.get('n_reactions')}"
                 if st == "ok"
@@ -342,6 +364,8 @@ def main(argv=None) -> int:
     tally = Counter((man.get(j.model_id) or {}).get("status", "missing") for j in jobs)
     print()
     print(f"  processed {done} in {dt:.0f}s. corpus status: {dict(tally)}")
+    if kept:
+        print(f"  {kept} ok row(s) kept after a failed regeneration")
     print(f"  manifest: {manifest}")
     return 0
 
