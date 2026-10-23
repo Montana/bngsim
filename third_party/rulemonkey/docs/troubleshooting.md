@@ -9,11 +9,15 @@ header comments, and the model-semantics doc.
 ### "ERROR: Unsupported BNGL feature: …"
 
 `rm_driver` refuses by default if the model uses a BNGL construct RM
-cannot honor (compartments, Sat / Hill rate laws, non-binding Arrhenius
-energy rules, `population` molecule types, multi-molecule Fixed species,
+cannot honor (compartments, Sat / Hill rate laws, Arrhenius energy rules
+that change a state, make two bonds, close a ring, join a homodimer, carry
+include/exclude constraints or meet an energy pattern joined only by `.`,
+`population` molecule types,
+multi-molecule Fixed species,
 n-ary rules outside the implemented shape, …).  Each refusal names the
-offending element and gives per-feature guidance.  (`FunctionProduct` rate laws and 2-reactant binding
-`Arrhenius` energy rules are now implemented — see
+offending element and gives per-feature guidance.  (`FunctionProduct` rate laws, and
+`Arrhenius` energy rules that make or break one bond, with connected energy
+patterns and reactant context of any shape, are implemented — see
 [`model_semantics.md`](model_semantics.md).)
 
 Two ways forward:

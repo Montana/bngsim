@@ -203,7 +203,9 @@ def test_rulemonkey_names_an_energy_rule_shape_it_refuses_itself():
         lambda: bngsim.Simulator(m, method="rm", xml_path=xml),
         lambda: bngsim.RuleMonkeySession(xml),
     ):
-        with pytest.raises(RuntimeError, match="binding/unbinding shape") as err:
+        with pytest.raises(
+            RuntimeError, match="outside the shapes RM runs: it changes a state"
+        ) as err:
             build()
         assert "#109" not in str(err.value)
 
