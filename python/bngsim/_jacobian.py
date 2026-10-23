@@ -946,8 +946,10 @@ def _finish_kinks(deriv):
     folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
-        lambda n: (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
-        + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True)),
+        lambda n: (
+            (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
+            + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True))
+        ),
     )
     memo: dict = {}
 
