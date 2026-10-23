@@ -119,10 +119,13 @@ is what takes the issue's cubic on from 0.894 to 1. The state the solve stops
 at is then polished by KINSOL, with a Jacobian at every iterate, where its
 step is within a thousand tolerances (above 512 unknowns, where there is no
 step, always, to a thousandth of `tol`), and the polish kept if it passes the
-parity test and is nearer the root, and, where there is no step, if no species
-moves more than a thousand tolerances: from the cubic beside 520 species, on
-its way to 0 at its first step, a polish went on to its other root. The
-polish takes a march that stalled short of its root the rest of the way, and makes
+parity test and is nearer the root. Where there is no step and the polish
+would move a species more than its tolerance, which root it goes to is
+KINSOL's, not the dynamics': from the cubic beside 520 species, stopped at its
+first step on its way to 0, a polish went on to the other root at 1. There a
+run is taken on from the state first, and the state polished from where it
+ends, no further than a thousand tolerances. That costs a run: fceri_gamma
+(3,744 species) takes 78 s, where main takes 17. The polish takes a march that stalled short of its root the rest of the way, and makes
 dY_ss/dp that of the root. The step decides nothing about `converged`: where it
 cannot be passed (a continuum of steady states, where it is singular but for
 rounding, or a species reaching 0 as 1/t) the march goes on to `max_time`, and

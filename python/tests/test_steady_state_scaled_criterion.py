@@ -1054,11 +1054,10 @@ def test_above_512_unknowns_a_march_stopped_short_is_polished_within_reach(tmp_p
         assert scaled.continued_run_distance > 1.0
 
 
-def _wide_cubic_net(x0):
-    # The issue's cubic at a scale of 1e-9 (stable roots 0 and 1, unstable 0.3)
-    # beside 520 fast decays from 1e-20.
-    s = 1e-9
-    species = [f"    1 X() {x0 * s!r}"] + [f"    {i + 2} Z{i}() 1e-20" for i in range(520)]
+def _wide_cubic_net(x0, s=1e-9, z0=1e-20):
+    # The issue's cubic at a scale of s (stable roots 0 and 1, unstable 0.3)
+    # beside 520 fast decays from z0.
+    species = [f"    1 X() {x0 * s!r}"] + [f"    {i + 2} Z{i}() {z0!r}" for i in range(520)]
     reactions = ["    1 1,1,1 1,1 k3", "    2 1,1 1,1,1 k2", "    3 1 0 k1"] + [
         f"    {i + 4} {i + 2} 0 kz" for i in range(520)
     ]
@@ -1070,21 +1069,41 @@ def _wide_cubic_net(x0):
     )
 
 
-@pytest.mark.parametrize(("x0", "reached"), [(0.15, 0.0), (0.5, 1.0)])
-def test_above_512_unknowns_the_polish_does_not_leave_the_basin(tmp_path, x0, reached):
-    # The march stops at its first step, under tol at a scale of 1e-9, with no
-    # step to say how far the root is. Polished without a bound, the state from
-    # 0.15, on its way to 0, went on to the other root at 1, and the one from
-    # 0.5, on its way to 1, to 0.2999999, beside the unstable root, both
-    # converged. Main returns 0.136 and 0.543. The run decides at the state the
-    # march stopped at, or at the root it is on its way to.
+@pytest.mark.parametrize(
+    ("x0", "s", "z0", "reached"),
+    [
+        (0.15, 1e-9, 1e-20, 0.0),
+        (0.5, 1e-9, 1e-20, 1.0),
+        (0.3 + 1e-6, 1e-3, 0.0, 1.0),
+        (0.3 - 1e-6, 1e-3, 0.0, 0.0),
+    ],
+)
+def test_above_512_unknowns_the_polish_does_not_leave_the_basin(tmp_path, x0, s, z0, reached):
+    # The march stops at its first step, under tol, with no step to say how far
+    # the root is. Polished from there, the state from 0.15, on its way to 0,
+    # went on to the other root at 1, and the one from 0.5, on its way to 1, to
+    # 0.2999999, beside the unstable root; bounded to a thousand tolerances, the
+    # polish still took 0.3 + 1e-6 to beside it. All converged; main returns
+    # the states the march stopped at. The dynamics are taken on first, and the
+    # state is polished from where a run ends: the root they reach.
     path = tmp_path / "wide_cubic.net"
-    path.write_text(_wide_cubic_net(x0))
+    path.write_text(_wide_cubic_net(x0, s, z0))
     ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state(
         method="integration"
     )
-    if ss.converged:
-        assert ss.concentrations[0] / 1e-9 == pytest.approx(reached, abs=1e-6)
+    assert ss.converged
+    assert ss.concentrations[0] / s == pytest.approx(reached, abs=1e-6)
+
+
+def test_above_512_unknowns_a_march_stopped_far_short_is_taken_on_to_its_root():
+    # Control: main converges it, at the state its march stops at. fceri_fyn
+    # (1281 species) stops with a free receptor at 2.96e-4, 3e4 tolerances from
+    # where a run ends. A polish bounded to a thousand tolerances refused it; a
+    # run is taken on from the state, and the polish from where it ends.
+    path = Path(__file__).resolve().parents[2] / "benchmarks/models/net/ode/fceri_fyn.net"
+    ss = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").steady_state()
+    assert ss.converged
+    assert ss.residual < 1e-9
 
 
 _B002 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000002.xml"
