@@ -125,17 +125,19 @@ root it goes to is KINSOL's, not the dynamics': from the cubic beside 520
 species, stopped at its first step on its way to 0, a polish went on to the
 other root at 1. There a run is taken on from the state first, for `max_time`
 or 1e6, whichever is shorter, and the state polished from where it ends, no
-further than a thousand tolerances. The state returned is then the run's end or
-its polish, past the time the march took; a species the mask leaves out and no
-rate reads (an accumulator) keeps the value the march left it. That costs a
-run: fceri_gamma (3,744 species) takes 78 s, where main takes 17 s. The polish
-takes a march that stalled short of its root the rest of the way, and makes
-dY_ss/dp that of the root. The step decides nothing about `converged`: where it
-cannot be passed (a continuum of steady states, where it is singular but for
-rounding, or a species reaching 0 as 1/t) the march goes on to `max_time`, and
-where it stops at a state the parity test refuses it returns the last one the
-test passed; the two tests decide there. On a species at 2e12, f is rounding:
-Monro2008 passed at one step and was 1.3e-6 at the next.
+further than a thousand tolerances; where that run cannot be taken to its time,
+the state the march stopped at is returned, unpolished. The state returned is
+otherwise the run's end or its polish, past the time the march took, every
+species with it: an accumulator the mask leaves out has gone on accumulating
+over the run. That costs a run: fceri_gamma (3,744 species) takes 78 s, where
+main takes 17 s. The polish takes a march that stalled short of its root the
+rest of the way, and makes dY_ss/dp that of the root. The step decides nothing
+about `converged`: where it cannot be passed (a continuum of steady states,
+where it is singular but for rounding, or a species reaching 0 as 1/t) the
+march goes on to `max_time`, and where it stops at a state the parity test
+refuses it returns the last one the test passed; the two tests decide there. On
+a species at 2e12, f is rounding: Monro2008 passed at one step and was 1.3e-6
+at the next.
 
 ```python
 ss = sim.steady_state()

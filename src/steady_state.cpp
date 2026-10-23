@@ -6044,22 +6044,17 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     // there, no further than kPolishFurthest tolerances: where
                     // the march stopped further off than that, fceri_fyn's
                     // run, from 3e4 tolerances, reaches its root, and a bound
-                    // on the polish alone refused it. A species the mask
-                    // leaves out and no rate reads keeps the value the march
-                    // left it: an accumulator fed by a flux of 1 came back
-                    // 1e6 on from where the march stopped.
+                    // on the polish alone refused it. The state is the run's
+                    // end, the species the mask leaves out too: put back where
+                    // the march left them, they broke sums the reactions do
+                    // not show (X -> 0 and 0 -> Y at one rate keep X + Y,
+                    // which came back 0.9995 for 1 with converged=True; a rate
+                    // rule; a dilution). An accumulator the mask leaves out
+                    // goes on with the run, as it would on any run.
                     std::vector<double> end;
                     const double moved = ss_continued_run_once(model, rhs, *effective, sub,
                                                                result.concentrations, 1.0, &end);
                     if (std::isfinite(moved) && static_cast<int>(end.size()) == ns) {
-                        const auto &sp = model.jacobian_sparsity();
-                        if (sp.n == ns && sp.col_ptrs.size() == static_cast<size_t>(ns) + 1) {
-                            for (const int e : sub.excluded) {
-                                const auto ue = static_cast<size_t>(e);
-                                if (sp.col_ptrs[ue + 1] == sp.col_ptrs[ue])
-                                    end[ue] = result.concentrations[ue];
-                            }
-                        }
                         result.concentrations = end;
                         result.newton_distance = std::numeric_limits<double>::quiet_NaN();
                         const double end_residual =

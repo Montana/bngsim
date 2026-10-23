@@ -1011,25 +1011,24 @@ def test_an_epidemic_that_burns_out_is_converged(tmp_path, method):
     assert abs(i) < 1e-9
 
 
-def _wide_square_decay(kx, accumulator=False):
-    # X' = kx·(1 - X²) beside 520 unknowns; with `accumulator`, C' = 1 too.
+def _wide_square_decay(kx, extra_species=(), extra_reactions=()):
+    # X' = kx·(1 - X²) beside 520 unknowns, and whatever species (named
+    # after X, from n + 1) and reactions (numbered on from X's) are added.
     n = 2 * 260 + 1
-    text = (
+    species = [f"    {n} X() 0"] + [
+        f"    {n + 1 + k} {s}() 0" for k, s in enumerate(extra_species)
+    ]
+    reactions = [f"    {4 * 260 + 1} 0 {n} kx", f"    {4 * 260 + 2} {n},{n} {n} kx"] + [
+        f"    {4 * 260 + 3 + k} {r}" for k, r in enumerate(extra_reactions)
+    ]
+    return n, (
         _wide_net(260)
-        .replace("end parameters", f"    3 kx {kx!r}\nend parameters")
-        .replace("end species", f"    {n} X() 0\nend species")
         .replace(
-            "end reactions",
-            f"    {4 * 260 + 1} 0 {n} kx\n    {4 * 260 + 2} {n},{n} {n} kx\nend reactions",
+            "end parameters", f"    3 kx {kx!r}\n    4 kc 1.0\n    5 kl 1e-12\nend parameters"
         )
+        .replace("end species", "\n".join([*species, "end species"]))
+        .replace("end reactions", "\n".join([*reactions, "end reactions"]))
     )
-    if accumulator:
-        text = (
-            text.replace("end parameters", "    4 kc 1.0\nend parameters")
-            .replace("end species", f"    {n + 1} C() 0\nend species")
-            .replace("end reactions", f"    {4 * 260 + 3} 0 {n + 1} kc\nend reactions")
-        )
-    return n, text
 
 
 @pytest.mark.parametrize("kx", [0.03, 1e-6])
@@ -1065,12 +1064,19 @@ def test_above_512_unknowns_a_march_stopped_short_is_polished_within_reach(tmp_p
         assert scaled.concentrations[n - 1] == pytest.approx(reached, rel=1e-5)
 
 
-def test_above_512_unknowns_a_masked_accumulator_keeps_where_the_march_left_it(tmp_path):
-    # A species the mask leaves out and no rate reads, C' = 1, came back 1e6
-    # on from where the march left it (1,000,213 for 213): the run taken on
-    # from the state before the polish carried it too. It keeps the march's
-    # value, which the residual criterion returns.
-    n, text = _wide_square_decay(0.03, accumulator=True)
+_X = 521  # _wide_square_decay's X
+
+
+def test_above_512_unknowns_a_masked_accumulator_goes_on_with_the_run(tmp_path):
+    # C' = 1, left out by the mask, beside 520 unknowns: the march stops with
+    # C at 213, which the residual criterion returns, and the run taken on
+    # from the state before the polish carries it on by the run's 1e6, to the
+    # run's end with every other species. Put back where the march left it,
+    # a species the mask leaves out broke sums the reactions do not show (the
+    # tests below).
+    c = _X + 1
+    n, text = _wide_square_decay(0.03, ("C",), [f"0 {c} kc"])
+    assert n == _X
     path = tmp_path / "wide_square_decay_accumulator.net"
     path.write_text(text)
     mask = [True] * n + [False]
@@ -1083,9 +1089,165 @@ def test_above_512_unknowns_a_masked_accumulator_keeps_where_the_march_left_it(t
     assert math.isnan(scaled.newton_distance)
     assert scaled.converged
     assert abs(scaled.concentrations[n - 1] - 1.0) < 1e-10
-    march = out["residual"].concentrations[n]
+    march = out["residual"].concentrations[c - 1]
     assert 10.0 < march < 1e4
-    assert scaled.concentrations[n] == pytest.approx(march, rel=1e-9)
+    assert scaled.concentrations[c - 1] - march == pytest.approx(1e6, rel=1e-9)
+
+
+def test_above_512_unknowns_a_masked_species_another_reads_is_taken_on_with_it(tmp_path):
+    # C, left out by the mask, relaxes to 1 at 1e-3, and W follows it at 1:
+    # the march stops with both 4.8e-4 short, which the residual criterion
+    # returns. The run taken on from the state before the polish takes both
+    # to 1. Put back where the march left it, C would sit beside a W it is
+    # 4.8e-4 from, and the state would fail the parity test.
+    c, w = _X + 1, _X + 2
+    n, text = _wide_square_decay(
+        1e-3, ("C", "W"), [f"0 {c} kx", f"{c} 0 kx", f"{c} {c},{w} kc", f"{w} 0 kc"]
+    )
+    path = tmp_path / "wide_square_decay_reader.net"
+    path.write_text(text)
+    mask = [True] * (n + 2)
+    mask[c - 1] = False
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method="integration", mask=mask)
+    assert out["residual"].converged
+    assert 1.0 - out["residual"].concentrations[w - 1] > 1e-4
+    scaled = out["scaled"]
+    assert math.isnan(scaled.newton_distance)
+    assert scaled.converged
+    assert scaled.concentrations[c - 1] == pytest.approx(1.0, abs=1e-10)
+    assert scaled.concentrations[w - 1] == pytest.approx(1.0, abs=1e-10)
+
+
+@pytest.mark.parametrize("kx", [1e-3, 1e-4])
+def test_above_512_unknowns_a_masked_sink_keeps_its_law(tmp_path, kx):
+    # X -> S beside 520 unknowns, S left out by mask=~is_pure_sink(): the
+    # march stops with X at 4.7e-4 (kx = 1e-3) and 4.8e-3 (1e-4), and the run
+    # taken on from it before the polish carries X to 0, and S with it. Put
+    # back where the march left it, as an earlier form of this change did, S
+    # broke X + S, which came back 0.99953 and 0.99520 with converged=True.
+    copies = 260
+    x, s = 2 * copies + 1, 2 * copies + 2
+    text = (
+        _wide_net(copies)
+        .replace("end parameters", f"    3 kx {kx!r}\nend parameters")
+        .replace("end species", f"    {x} X() 1.0\n    {s} S() 0\nend species")
+        .replace("end reactions", f"    {4 * copies + 1} {x} {s} kx\nend reactions")
+    )
+    path = tmp_path / "wide_sink.net"
+    path.write_text(text)
+    model = bngsim.Model.from_net(str(path))
+    mask = ~np.asarray(model.is_pure_sink())
+    assert not mask[s - 1]
+    ss = bngsim.Simulator(model, method="ode").steady_state(method="integration", mask=mask)
+    assert math.isnan(ss.newton_distance)
+    assert ss.converged
+    assert ss.concentrations[x - 1] + ss.concentrations[s - 1] == pytest.approx(1.0, abs=1e-12)
+    assert ss.concentrations[s - 1] == pytest.approx(1.0, abs=1e-10)
+
+
+def _wide_hidden_sum_sbml(nz, kx, how):
+    # Y in a sum with X that no reaction shows, beside nz species Z fed and
+    # drained at 1 from 1: by rate rules X' = -kx·X and Y' = kx·X; by two
+    # reactions, X -> 0 and 0 -> Y, at the one rate kx·X; or, by a dilution,
+    # Y in a compartment V that a rate rule takes from 0.5 to 1 at kx, which
+    # keeps Y·V.
+    math_ns = 'xmlns="http://www.w3.org/1998/Math/MathML"'
+
+    def species(name, value, compartment="c"):
+        return (
+            f'<species id="{name}" compartment="{compartment}" initialConcentration="{value}" '
+            'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+        )
+
+    def reaction(rid, reactant, product, law):
+        sides = [
+            (
+                f"<{tag}>"
+                f'<speciesReference species="{sp}" stoichiometry="1" constant="true"/>'
+                f"</{tag}>"
+            )
+            for tag, sp in (("listOfReactants", reactant), ("listOfProducts", product))
+            if sp
+        ]
+        return (
+            f'<reaction id="{rid}" reversible="false">{"".join(sides)}'
+            f"<kineticLaw><math {math_ns}>{law}</math></kineticLaw></reaction>"
+        )
+
+    def times(*names):
+        return "<apply><times/>" + "".join(f"<ci>{n}</ci>" for n in names) + "</apply>"
+
+    reactions = []
+    for i in range(nz):
+        reactions.append(reaction(f"s{i}", None, f"Z{i}", "<ci>ks</ci>"))
+        reactions.append(reaction(f"d{i}", f"Z{i}", None, times("kz", f"Z{i}")))
+    rules = ""
+    compartments = '<compartment id="c" size="1" constant="true" spatialDimensions="3"/>'
+    y = species("Y", 0)
+    if how == "rate rules":
+        rules = (
+            f'<rateRule variable="X"><math {math_ns}><apply><minus/>{times("kx", "X")}'
+            f'</apply></math></rateRule><rateRule variable="Y"><math {math_ns}>'
+            f"{times('kx', 'X')}</math></rateRule>"
+        )
+    elif how == "two reactions":
+        reactions += [
+            reaction("loseX", "X", None, times("kx", "X")),
+            reaction("gainY", None, "Y", times("kx", "X")),
+        ]
+    else:
+        compartments += '<compartment id="V" size="0.5" constant="false" spatialDimensions="3"/>'
+        y = species("Y", 1, "V")
+        rules = (
+            f'<rateRule variable="V"><math {math_ns}><apply><times/><ci>kx</ci>'
+            "<apply><minus/><cn>1</cn><ci>V</ci></apply></apply></math></rateRule>"
+        )
+    return "".join(
+        [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">',
+            f'<model id="m"><listOfCompartments>{compartments}</listOfCompartments>',
+            "<listOfSpecies>",
+            species("X", 1),
+            y,
+            *(species(f"Z{i}", 1) for i in range(nz)),
+            "</listOfSpecies><listOfParameters>",
+            f'<parameter id="kx" value="{kx!r}" constant="true"/>',
+            '<parameter id="ks" value="1" constant="true"/>',
+            '<parameter id="kz" value="1" constant="true"/>',
+            f"</listOfParameters><listOfRules>{rules}</listOfRules>",
+            f"<listOfReactions>{''.join(reactions)}</listOfReactions></model></sbml>",
+        ]
+    )
+
+
+@pytest.mark.parametrize("how", ["rate rules", "two reactions", "dilution"])
+def test_above_512_unknowns_a_masked_species_keeps_a_sum_no_reaction_shows(tmp_path, how):
+    # Y left out by the mask, beside 520 species: the march stops short, and
+    # the run taken on from the state before the polish takes X (V) and Y on
+    # together. Put back where the march left it, as an earlier form of this
+    # change did for a species nothing else reads and no reaction moves with
+    # another, Y broke the sum: X + Y came back 0.99950, and Y·V 0.50025,
+    # with converged=True.
+    path = tmp_path / "wide_hidden_sum.xml"
+    path.write_text(_wide_hidden_sum_sbml(520, 1e-3, how))
+    model = bngsim.Model.from_sbml(str(path))
+    names = list(model.species_names)
+    mask = [name != "Y" for name in names]
+    ss = bngsim.Simulator(model, method="ode").steady_state(method="integration", mask=mask)
+    assert math.isnan(ss.newton_distance)
+    assert ss.converged
+    c = dict(zip(names, ss.concentrations, strict=True))
+    if how == "dilution":
+        # To the march's own error: the state it stopped at holds Y·V to 7e-7.
+        assert c["V"] == pytest.approx(1.0, abs=1e-12)
+        assert c["Y"] * c["V"] == pytest.approx(0.5, abs=1e-5)
+    else:
+        assert c["X"] + c["Y"] == pytest.approx(1.0, abs=1e-12)
 
 
 def _wide_cubic_net(x0, s=1e-9, z0=1e-20):
