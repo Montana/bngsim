@@ -1718,6 +1718,12 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 carry != nullptr ? carry->trigger[i] != 0 : events[i].initial_value;
             double val = eval_ref.evaluate(events[i].trigger_expr_idx);
             bool now_true = (val > 0.5);
+            // A carried execution of a non-persistent event whose trigger now
+            // reads false is cancelled here, as wherever a trigger is read
+            // false (§4.11.3). Left for the next sweep, it survived an event of
+            // this start's batch raising the trigger again, and ran.
+            if (!now_true && !events[i].persistent)
+                drop_pending_of(i);
             if (now_true && !trigger_was_true[i]) {
                 t0_firing.push_back(i);
             }
@@ -3261,7 +3267,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 for (int i = 0; i < m; ++i)
                     y[i] = conc[rate_rule_odes[i].target0];
             }
-            if (!drained && th_cut < 1.0 && fire_keeps_panel[selected]) {
+            // A delayed execution the drain has just queued inside this panel
+            // ends it: the panel's end was fixed before the execution existed,
+            // and kept, the loop stepped past it and the execution ran at the
+            // next drain, up to a panel late (issue #526). Queuing changes no
+            // state, so `drained` does not say so.
+            if (!drained && th_cut < 1.0 && fire_keeps_panel[selected] &&
+                !(earliest_pending() < s1p)) {
                 // Nothing a_d reads moved: stay in this panel.
                 carry = true;
                 fresh = false;

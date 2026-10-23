@@ -431,6 +431,50 @@ def test_a_pending_execution_carries_across_run_until(method):
     assert second.as_roadrunner(["S"])["S"][-1] == 100
 
 
+@pytest.mark.parametrize("rate", ["2", "2 + sin(time)"], ids=["discrete", "continuous"])
+def test_a_delay_queued_by_a_firing_executes_at_its_time(rate):
+    """`X >= 3` rises at a firing of J1. Twins with that trigger and delay 1e-3
+    record the trigger time (frozen) and the execution time (read then), so
+    their difference is the delay. J2's time-dependent rate puts the run on the
+    continuous loop, where a firing that queues an execution and changes nothing
+    else kept its panel, whose end was fixed before the execution existed: the
+    execution ran at the next drain, a median 0.08 late over 20 seeds."""
+    d = 1e-3
+    ant = (
+        "species X = 0, Y = 0, Trig = 0, Exec = 0\n"
+        "J1: => X; 5\n"
+        f"J2: => Y; {rate}\n"
+        f"Z1: at {d} after (X >= 3), t0=false, fromTrigger=true: Trig = 1e6*time\n"
+        f"Z2: at {d} after (X >= 3), t0=false, fromTrigger=false: Exec = 1e6*time"
+    )
+    for seed in range(10):
+        trig = _conc(ant, "ssa", [0.0, 10.0], seed=seed, species="Trig")[-1] / 1e6
+        execd = _conc(ant, "ssa", [0.0, 10.0], seed=seed, species="Exec")[-1] / 1e6
+        assert trig > 0
+        assert execd - trig == pytest.approx(d, abs=1e-6), seed
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa"])
+def test_a_carried_execution_whose_trigger_falls_at_the_leg_start_is_cancelled(method):
+    """E (non-persistent) triggered at 0.5 waits for 1.5. Between legs G := 0
+    reads its trigger false, which cancels that execution, and p := 1 raises H
+    at the leg start, which sets G = 1 again: a new instance, due 2.0. Left for
+    the next sweep, the cancellation never came, and the old execution ran at
+    1.5 under SSA."""
+    model = bngsim.Model.from_antimony_string(
+        "species S = 0, G = 0; p = 0\n"
+        "E: at 1 after (G > 0.5), t0=false, persistent=false: S = 100\n"
+        "F: at (time >= 0.5), t0=false: G = 1\n"
+        "H: at (p > 0.5), t0=false: G = 1"
+    )
+    sim = bngsim.Simulator(model, method=method)
+    sim.run_until(t=1.0)
+    model.set_concentration("G", 0.0)
+    model.set_param("p", 1.0)
+    assert sim.run_until(t=1.75).as_roadrunner(["S"])["S"][-1] == 0
+    assert sim.run_until(t=2.25).as_roadrunner(["S"])["S"][-1] == 100
+
+
 def test_a_negative_delay_is_refused_by_name():
     ant = "S = 0; D = -1; E: at D after (time >= 1), t0=false: S = 100"
     with pytest.raises(Exception, match=r"event 'E'.*delay -1.*non-negative"):
