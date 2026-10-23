@@ -1011,21 +1011,18 @@ def test_an_epidemic_that_burns_out_is_converged(tmp_path, method):
     assert abs(i) < 1e-9
 
 
-def _wide_square_decay(kx, extra_species=(), extra_reactions=()):
-    # X' = kx·(1 - X²) beside 520 unknowns, and whatever species (named
-    # after X, from n + 1) and reactions (numbered on from X's) are added.
-    n = 2 * 260 + 1
-    species = [f"    {n} X() 0"] + [
-        f"    {n + 1 + k} {s}() 0" for k, s in enumerate(extra_species)
-    ]
-    reactions = [f"    {4 * 260 + 1} 0 {n} kx", f"    {4 * 260 + 2} {n},{n} {n} kx"] + [
-        f"    {4 * 260 + 3 + k} {r}" for k, r in enumerate(extra_reactions)
+def _wide_square_decay(kx, extra_species=(), extra_reactions=(), copies=260):
+    # X' = kx·(1 - X²) beside 2·copies unknowns, and whatever species (named
+    # after X, from n + 1, at 0) and reactions (numbered on from X's) are added.
+    n = 2 * copies + 1
+    species = [f"    {n} X() 0"]
+    species += [f"    {n + 1 + k} {name}() 0" for k, name in enumerate(extra_species)]
+    reactions = [f"    {4 * copies + 1} 0 {n} kx", f"    {4 * copies + 2} {n},{n} {n} kx"] + [
+        f"    {4 * copies + 3 + k} {r}" for k, r in enumerate(extra_reactions)
     ]
     return n, (
-        _wide_net(260)
-        .replace(
-            "end parameters", f"    3 kx {kx!r}\n    4 kc 1.0\n    5 kl 1e-12\nend parameters"
-        )
+        _wide_net(copies)
+        .replace("end parameters", f"    3 kx {kx!r}\n    4 kc 1.0\nend parameters")
         .replace("end species", "\n".join([*species, "end species"]))
         .replace("end reactions", "\n".join([*reactions, "end reactions"]))
     )
@@ -1092,6 +1089,42 @@ def test_above_512_unknowns_a_masked_accumulator_goes_on_with_the_run(tmp_path):
     march = out["residual"].concentrations[c - 1]
     assert 10.0 < march < 1e4
     assert scaled.concentrations[c - 1] - march == pytest.approx(1e6, rel=1e-9)
+
+
+@pytest.mark.parametrize(("copies", "kg"), [(260, 1e-3), (260, 1e-4), (20, 1e-3), (20, 1e-4)])
+def test_a_masked_species_that_overflows_in_the_run_is_refused(tmp_path, copies, kg):
+    # C' = kg·C from 1, left out by the mask: a run of 1e6 overflows it at
+    # kg = 1e-3 (e^1000) and not at 1e-4 (e^100). Started again from zero,
+    # as a species stepped below zero is, C came back 0 with converged=True
+    # beside 520 unknowns. A run that cannot be taken to its time passes
+    # nothing: the solve is refused, at any size, with C a number where the
+    # march left it. The residual criterion converges both, by the residual
+    # alone.
+    c = 2 * copies + 2
+    n, text = _wide_square_decay(0.03, ("C",), [f"{c} {c},{c} kg"], copies=copies)
+    path = tmp_path / "wide_square_decay_growth.net"
+    path.write_text(
+        text.replace("end parameters", f"    5 kg {kg!r}\nend parameters").replace(
+            f"    {c} C() 0", f"    {c} C() 1.0"
+        )
+    )
+    mask = [True] * n + [False]
+    out = {}
+    for criterion in ("residual", "scaled"):
+        out[criterion] = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode"
+        ).steady_state(criterion=criterion, method="integration", mask=mask)
+    assert out["residual"].converged
+    scaled = out["scaled"]
+    assert math.isfinite(scaled.concentrations[c - 1])
+    assert scaled.concentrations[c - 1] > 1.0
+    assert scaled.converged == (kg == 1e-4)
+    if kg == 1e-3:
+        assert math.isinf(scaled.continued_run_distance)
+    if copies == 260 and kg == 1e-3:
+        assert scaled.concentrations[c - 1] == pytest.approx(
+            out["residual"].concentrations[c - 1], rel=1e-9
+        )
 
 
 def test_above_512_unknowns_a_masked_species_another_reads_is_taken_on_with_it(tmp_path):
@@ -1225,26 +1258,32 @@ def _wide_hidden_sum_sbml(nz, kx, how):
     )
 
 
+@pytest.mark.parametrize("kx", [1e-3, 1e-5])
 @pytest.mark.parametrize("how", ["rate rules", "two reactions", "dilution"])
-def test_above_512_unknowns_a_masked_species_keeps_a_sum_no_reaction_shows(tmp_path, how):
+def test_above_512_unknowns_a_masked_species_keeps_a_sum_no_reaction_shows(tmp_path, how, kx):
     # Y left out by the mask, beside 520 species: the march stops short, and
     # the run taken on from the state before the polish takes X (V) and Y on
     # together. Put back where the march left it, as an earlier form of this
     # change did for a species nothing else reads and no reaction moves with
-    # another, Y broke the sum: X + Y came back 0.99950, and Y·V 0.50025,
-    # with converged=True.
+    # another, Y broke the sum: X + Y came back 0.99950, and Y·V 0.50026,
+    # with converged=True. At kx = 1e-5 the run ends with X 2.5e-6 from 0,
+    # 250 of its tolerances, and the polish, which holds Y, took X the rest of
+    # the way: X + Y came back 2.5e-6 short, converged. Where the mask leaves
+    # out a species that moves, the polish is kept only within a tolerance,
+    # and the run's end, still moving, is refused.
     path = tmp_path / "wide_hidden_sum.xml"
-    path.write_text(_wide_hidden_sum_sbml(520, 1e-3, how))
+    path.write_text(_wide_hidden_sum_sbml(520, kx, how))
     model = bngsim.Model.from_sbml(str(path))
     names = list(model.species_names)
     mask = [name != "Y" for name in names]
     ss = bngsim.Simulator(model, method="ode").steady_state(method="integration", mask=mask)
     assert math.isnan(ss.newton_distance)
-    assert ss.converged
+    assert ss.converged == (kx == 1e-3)
     c = dict(zip(names, ss.concentrations, strict=True))
     if how == "dilution":
         # To the march's own error: the state it stopped at holds Y·V to 7e-7.
-        assert c["V"] == pytest.approx(1.0, abs=1e-12)
+        if kx == 1e-3:
+            assert c["V"] == pytest.approx(1.0, abs=1e-12)
         assert c["Y"] * c["V"] == pytest.approx(0.5, abs=1e-5)
     else:
         assert c["X"] + c["Y"] == pytest.approx(1.0, abs=1e-12)

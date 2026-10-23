@@ -129,15 +129,18 @@ further than a thousand tolerances; where that run cannot be taken to its time,
 the state the march stopped at is returned, unpolished. The state returned is
 otherwise the run's end or its polish, past the time the march took, every
 species with it: an accumulator the mask leaves out has gone on accumulating
-over the run. That costs a run: fceri_gamma (3,744 species) takes 78 s, where
-main takes 17 s. The polish takes a march that stalled short of its root the
-rest of the way, and makes dY_ss/dp that of the root. The step decides nothing
-about `converged`: where it cannot be passed (a continuum of steady states,
-where it is singular but for rounding, or a species reaching 0 as 1/t) the
-march goes on to `max_time`, and where it stops at a state the parity test
-refuses it returns the last one the test passed; the two tests decide there. On
-a species at 2e12, f is rounding: Monro2008 passed at one step and was 1.3e-6
-at the next.
+over the run. The polish holds a species the mask leaves out where it is given
+it, so where the mask leaves out a species that moves, a polish is kept only
+within a tolerance: X -> 0 and 0 -> Y at one rate, Y left out, came back with
+X + Y 2.5e-6 short of 1 when X was polished on 250 of its tolerances. That
+costs a run: fceri_gamma (3,744 species) takes 78 s, where main takes 17 s. The
+polish takes a march that stalled short of its root the rest of the way, and
+makes dY_ss/dp that of the root. The step decides nothing about `converged`:
+where it cannot be passed (a continuum of steady states, where it is singular
+but for rounding, or a species reaching 0 as 1/t) the march goes on to
+`max_time`, and where it stops at a state the parity test refuses it returns
+the last one the test passed; the two tests decide there. On a species at 2e12,
+f is rounding: Monro2008 passed at one step and was 1.3e-6 at the next.
 
 ```python
 ss = sim.steady_state()
@@ -159,10 +162,18 @@ What it does not do:
   march started off such a root leaves it, but from within a few tolerances of
   it, or of the boundary between two basins, it can stop at the root or go on
   to the root on the other side. The Newton path labels an unstable root
-  (`root_stability="unstable"`, below). A run kicked off the state as well
+  (`root_stability="unstable"`, below). Above 512 unknowns
+  `method="newton"` goes where KINSOL goes, from much further than that, and
+  labels no root there (`root_stability="undetermined"`): the cubic at a scale
+  of 1e-3 beside 520 species went from 0.3·(1 ± 1e-4) to the unstable root,
+  and from 0.3·(1 − 1e-3) to the root at 1. A run kicked off the state as well
   was tried: it refused states the system rests at (a continuum where a kick
   on a large species lands a small one far beyond its own tolerance), and
   every way of measuring the kick let some unstable root through.
+- **A species the mask leaves out that overflows within the run** (C' = k·C
+  with k·min(`max_time`, 1e6) past 709) fails the run test, and the solve is
+  refused: a run that cannot be taken to its time passes nothing. Pass a
+  `max_time` short enough for it to stay finite.
 - **A species that starts at 0 and settles below `rtol` times the largest**
   counts as nothing: it is resolved to that, not to its own size.
 - **Where every species starts at 0** the start has no size, and the march

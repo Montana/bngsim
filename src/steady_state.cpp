@@ -1347,6 +1347,17 @@ class SteadyStateMarcher {
     // Whether such a run used up its steps.
     bool out_of_steps() const { return step_budget_ >= 0 && steps_taken_ >= step_budget_; }
 
+    // Whether every species is a number where the march stopped. One that
+    // overflowed is not on its way to zero, where restart_at_zero puts it.
+    bool state_finite() const {
+        const double *y_data = y_.data();
+        for (int i = 0; i < ns_; ++i) {
+            if (!std::isfinite(y_data[i]))
+                return false;
+        }
+        return true;
+    }
+
     // Start again where a march the integrator gave up on stopped, with every
     // species that `was` not below zero and is now put at zero. A species on
     // its way to zero is stepped below it, and a rate that has no value there
@@ -5631,9 +5642,13 @@ static constexpr double kDriftAtLeast = 10.0;
 // kRunSteps times max_steps at most. Returns the largest move of a measured
 // species from `y` over its tolerance (ss_scaled_tolerance), and +inf where
 // the run cannot be taken to its time (the integrator gives up past
-// kHoldRestarts restarts, or the steps run out). The model's state is left as
-// it was. Where `end` is given and the run is taken to its time, it is left
-// holding the state the run ends at.
+// kHoldRestarts restarts, or the steps run out, or a species overflows). The
+// model's state is left as it was. Where `end` is given and the run is taken
+// to its time, it is left holding the state the run ends at.
+//
+// A species that overflows is not started again from zero, as one stepped
+// below zero is: C' = k·C, left out by the mask, overflowed within the run,
+// was put at 0, and the run's end was returned with C = 0 and converged=True.
 static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                                     const SteadyStateOptions &opts, const ResidualSubspace &sub,
                                     const std::vector<double> &y, double tighter,
@@ -5667,11 +5682,11 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
         for (int again = 0; again < kHoldRestarts && run.integrator_failed() &&
                             run.time() < run_opts.max_time && !run.out_of_steps();
              ++again) {
-            if (!run.restart_at_zero(y))
+            if (!run.state_finite() || !run.restart_at_zero(y))
                 break;
             run.march(0.0, &left);
         }
-        if (!run.integrator_failed() && run.time() >= run_opts.max_time) {
+        if (!run.integrator_failed() && run.time() >= run_opts.max_time && run.state_finite()) {
             const std::vector<double> at = run.make_result(false, left).concentrations;
             if (end)
                 *end = at;
@@ -6012,6 +6027,16 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                                     q.concentrations.data())
                                : std::numeric_limits<double>::quiet_NaN();
                 };
+                // The polish holds a species the mask leaves out where it is
+                // given it, and moving the rest broke a sum the reactions do
+                // not show: X -> 0 and 0 -> Y at one rate, Y left out, came
+                // back with X + Y 2.5e-6 short of 1, X polished on 250 of its
+                // tolerances to 0. Where the mask leaves out a species that
+                // moves, the polish is kept only within a tolerance.
+                bool holds_one = false;
+                for (const int e : sub.excluded)
+                    holds_one = holds_one || !model.species()[e].fixed;
+                const double reach = holds_one ? 1.0 : kPolishFurthest;
                 const double before = result.newton_distance;
                 const double before_residual =
                     compute_residual(rhs, result.concentrations.data(), ns, sub);
@@ -6024,7 +6049,8 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     // one 381 tolerances off, which the runs then refused. The
                     // step is had after where it was before: whether it is
                     // taken depends on the count of unknowns, not the state.
-                    if (p.converged) {
+                    if (p.converged &&
+                        (!holds_one || went(result.concentrations, p.concentrations) <= reach)) {
                         const double after = step_at(p);
                         if (after < before)
                             adopt(p, after);
@@ -6037,8 +6063,8 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     // move a species more than its tolerance, or failed, or
                     // did not lower the residual: which root it goes to is
                     // KINSOL's, not the dynamics'. Above 512 unknowns, the
-                    // cubic at 1e-9, stopped at its first step at 0.15 on its
-                    // way to 0, was polished to its other root at 1, and at
+                    // cubic at 1e-9, stopped at its first step from 0.15 on
+                    // its way to 0, was polished to its other root at 1, and at
                     // 0.3 + 1e-6 to beside its unstable root. The dynamics are
                     // taken on first, as far as a run goes, and polished from
                     // there, no further than kPolishFurthest tolerances: where
@@ -6061,7 +6087,7 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                             compute_residual(rhs, result.concentrations.data(), ns, sub);
                         SteadyStateResult q = polished(result.concentrations);
                         if (q.converged && q.residual < end_residual &&
-                            went(result.concentrations, q.concentrations) <= kPolishFurthest)
+                            went(result.concentrations, q.concentrations) <= reach)
                             adopt(q, step_at(q));
                     }
                 }
