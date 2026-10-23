@@ -5915,13 +5915,10 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                                 : std::numeric_limits<double>::quiet_NaN();
         result.newton_distance = step;
         const bool alone = std::isnan(step) || no_step;
-        // Of a state that is a state (GH #27's guard on the Newton path): across
-        // its jump, a march on differenced columns took X' > 0 to X = -86, where
-        // there is no step and a run of max_time = 1 moved X by less than its
-        // tolerance there.
-        const bool physical =
-            ss_state_is_physical(result.concentrations, ss_negative_slack(*effective));
-        if (physical && (step <= 1.0 || alone)) {
+        // No guard on the sign of a species here, as there is none on main's
+        // integration path: RAF_dimerization_only_v1 declares one at -2.4e4,
+        // and BIOMD0000000484's ES rests at -40, where no run moves it.
+        if (step <= 1.0 || alone) {
             result.continued_run_distance =
                 ss_continued_run(model, rhs, *effective, sub, result.concentrations);
             result.converged = result.continued_run_distance <= 1.0;

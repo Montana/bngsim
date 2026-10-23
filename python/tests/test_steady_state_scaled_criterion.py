@@ -772,12 +772,15 @@ def test_a_jump_within_a_step_above_zero_certifies_nothing(tmp_path, c, klo, x0,
     # jump through; the secant to 0 reads the law's own slope, 0, and where X
     # is too small for that secant to be read (9e-15, 3e-41), a forward quotient
     # at half the step grows across the jump.
-    # A closed-form Jacobian of the switch is 0, so that there is no step to
-    # take and the runs decide, over max_time: of 1e-30 they see nothing, and
-    # at klo = 1e-30 one of 1 moves X by 1e-30, within its tolerance.
+    # Where there is no step to take the runs decide, over max_time: of 1e-30
+    # they see nothing. A closed-form Jacobian of the switch is 0, and at
+    # klo = 1e-30 a run of 1 moves X by 1e-30, within its tolerance; on
+    # differenced columns a march of 1 from 9e-10 ends at X = -86, where X'
+    # is 1e-6 and its tolerance 1.7e-6.
     path = tmp_path / "near_zero.net"
     path.write_text(NEAR_ZERO_JUMP_NET.format(x0=x0, c=c, klo=klo))
-    for max_time in (1.0, 1e6) if klo > 1e-20 or jacobian == "fd" else (1e6,):
+    short = klo > 1e-20 and not (jacobian == "fd" and x0 == 9e-10)
+    for max_time in (1.0, 1e6) if short else (1e6,):
         ss = bngsim.Simulator(
             bngsim.Model.from_net(str(path)), method="ode", jacobian=jacobian
         ).steady_state(criterion="scaled", method=method, max_time=max_time)

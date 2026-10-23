@@ -88,10 +88,12 @@ species' own tolerance:
 `y⁰` is the state the solve starts from, and the floor is the smallest positive
 initial concentration the model declares of a species that is not `$`-fixed
 (where none is above 0, the smallest of `y⁰`; where that is 0 too, the largest
-species of the state or of the root it steps to). `atol="auto"` gives the
-march the same tolerances from `y⁰`, and the march takes them where neither
-`atol=` nor `set_tolerances` gives an `atol`; a species that has grown since
-is held to its own size. A species that starts at 0 is held to `rtol`
+species of the state or of the root it steps to). `atol="auto"` derives the
+same tolerances from `y⁰`. Where neither `atol=` nor `set_tolerances` gives an
+`atol`, each species is marched at the smaller of what `"auto"` gives it and
+the scalar 1e-8: the scalar is no tolerance for a model in small units, and
+`"auto"` alone left a march of BIOMD0000000685, whose species start large, 59
+tolerances short of the root. A species that starts at 0 is held to `rtol`
 times the floor: one whose steady state is smaller than that is within
 tolerance of 0. `mask=` says which species are measured, not which move: the
 step moves every species by its own equation but a `$`-fixed one and a masked

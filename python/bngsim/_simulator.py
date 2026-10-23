@@ -4381,17 +4381,24 @@ class Simulator:
             )
         return vec
 
-    def _steady_state_atol(self, atol: AtolLike | None, criterion: str) -> AtolLike | None:
+    def _steady_state_atol(
+        self, atol: AtolLike | None, criterion: str, state=None, rtol: float | None = None
+    ) -> AtolLike | None:
         """The march's ``atol`` for a steady-state solve (issue #1001).
 
         Under ``criterion="scaled"`` a state is accepted within each species'
         own tolerance, the one ``atol="auto"`` derives; a march at the scalar
         default of 1e-8 cannot reach that for a model in small units (it runs
-        through zero first), so where neither the call nor
-        :meth:`set_tolerances` gave an ``atol`` the march takes ``"auto"``.
+        through zero first). ``"auto"`` alone resolves a species that starts
+        large to rtol of that size, and a march of BIOMD0000000685 so held
+        stopped 59 tolerances from the root a march at 1e-8 reaches. So where
+        neither the call nor :meth:`set_tolerances` gave an ``atol``, each
+        species takes the smaller of the two, from ``state`` at ``rtol``.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
-            return "auto"
+            eff_rtol = self._rtol if rtol is None else rtol
+            own = np.minimum(derive_atol(np.asarray(state, dtype=float), eff_rtol), self._atol)
+            return [float(v) for v in own]
         return atol
 
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
@@ -7414,9 +7421,10 @@ class Simulator:
               species are measured, not which move: the step and the run move
               every species but a ``$``-fixed one and a masked one that nothing
               reads or that reads nothing (a counter), which is held. Where
-              neither ``atol`` nor :meth:`set_tolerances` gives one, the march
-              takes ``atol="auto"``: the scalar 1e-8 is no tolerance for a model
-              in small units.
+              neither ``atol`` nor :meth:`set_tolerances` gives one, each
+              species is marched at the smaller of what ``atol="auto"`` gives
+              it and the scalar 1e-8: the scalar is no tolerance for a model
+              in small units, nor ``"auto"`` for a species that starts large.
             - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test,
               kept for comparisons with ``run_network``. The norm is in the
               model's units of concentration per unit time, so a model in molar
@@ -7587,7 +7595,9 @@ class Simulator:
         opts.rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — scalar, per-species, or tracking for the march.
         self._resolve_atol(
-            self._steady_state_atol(atol, criterion), opts.rtol, where="steady_state(atol=...)"
+            self._steady_state_atol(atol, criterion, self._model.get_state(), opts.rtol),
+            opts.rtol,
+            where="steady_state(atol=...)",
         ).apply_to(opts)
         opts.max_steps = max_steps if max_steps is not None else self._max_steps
         # A previous solve on this Simulator already proved the closed-form
@@ -8910,7 +8920,7 @@ class Simulator:
         # takes when no atol is given, which is each entry's own. Taken from
         # this model, an entry whose parameters put it at 1e-9 of this one
         # marched at this one's tolerance and ran through zero (x = -3.7).
-        own_auto = self._steady_state_atol(atol, criterion) is not atol
+        own_auto = atol is None and criterion == "scaled" and not self._atol_set
         eff_atol_spec = self._resolve_atol(
             None if own_auto else atol,
             eff_rtol,
@@ -8941,7 +8951,7 @@ class Simulator:
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
             if own_auto:
-                own = [float(v) for v in derive_atol(clone.get_state(), eff_rtol)]
+                own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
                 _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
             else:
                 eff_atol_spec.apply_to(opts)
