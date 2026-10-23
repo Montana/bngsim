@@ -357,23 +357,25 @@ def test_above_512_unknowns_the_solve_is_the_residual_one(tmp_path):
     assert np.array_equal(scaled.concentrations, residual.concentrations)
 
 
-_B252 = (
-    Path(__file__).resolve().parents[2]
-    / "parity_checks/rr_parity/models/BIOMD0000000252/BIOMD0000000252_url.xml"
-)
-
-
-@pytest.mark.skipif(
-    not _B252.exists(), reason="rr_parity corpus model BIOMD0000000252 not present"
-)
-def test_a_march_that_stalls_between_asks_is_asked_where_it_stops():
-    # The march stalls at step 5411, between the asks at 4096 and 8192, at a
-    # state within its tolerance, and came back unconverged.
-    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B252)), method="ode").steady_state(
-        criterion="scaled"
-    )
+@pytest.mark.parametrize("name", ["BIOMD0000000252", "BIOMD0000000685"])
+def test_a_march_that_stalls_short_of_its_root_is_polished(data_dir, name):
+    # BIOMD0000000252's march stalls at step 5411 at a residual of 2.1e-7, a
+    # step of 1.64 tolerances from its root, and BIOMD0000000685's 1.62 from
+    # its, where main had stopped under tol at states no run moves. A short
+    # Newton polish from there is kept where it passes the parity test and
+    # lands where the step said.
+    path = str(data_dir / f"{name}.xml")
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
     assert ss.converged
     assert ss.newton_distance <= 1.0
+    assert ss.continued_run_distance <= 1.0
+    run = bngsim.Model.from_sbml(path)
+    bngsim.Simulator(run, method="ode").run(
+        t_span=(0.0, 1e7), n_points=2, rtol=1e-11, atol=1e-16, max_steps=2_000_000
+    )
+    end = np.asarray(run._core.get_state(), float)
+    y = np.asarray(ss.concentrations)
+    np.testing.assert_allclose(y, end, rtol=1e-6, atol=1e-9 * np.abs(end).max())
 
 
 @pytest.mark.parametrize("s", [1.0, 1e-9])
@@ -1355,18 +1357,11 @@ def test_a_species_at_roundoff_does_not_set_the_march_tolerance():
     assert atol.max() <= 1e-8
 
 
-_B038 = (
-    Path(__file__).resolve().parents[2]
-    / "parity_checks/rr_parity/models/BIOMD0000000038/BIOMD0000000038_url.xml"
-)
-
-
-@pytest.mark.skipif(
-    not _B038.exists(), reason="rr_parity corpus model BIOMD0000000038 not present"
-)
-def test_a_run_is_not_moved_by_its_own_error():
+def test_a_run_is_not_moved_by_its_own_error(data_dir):
     # Integrated at the criterion's own tolerances, the run moved the state by
-    # 2 tolerances of its own error; at 1e-12 by 0.04.
-    ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B038)), method="ode").steady_state()
+    # 3.45 tolerances, at a hundredth of them by 1.41, at a thousandth by 0.46:
+    # its own error. A run that moves the state is taken again tighter.
+    path = str(data_dir / "BIOMD0000000038.xml")
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
     assert ss.converged
     assert ss.continued_run_distance <= 1.0

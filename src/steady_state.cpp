@@ -1131,10 +1131,6 @@ class SteadyStateMarcher {
             double resid = compute_residual(rhs_, y_data, ns_, sub_);
             bool reached = resid < tol;
             asked = false;
-            if (by_distance_ && step_budget_ < 0 && resid < opts_.tol) {
-                parity_at_.assign(y_data, y_data + ns_);
-                parity_residual_ = resid;
-            }
             if (by_distance_) {
                 reached = false;
                 if (++distance_steps_ >= distance_check_at_ || flag == CV_TSTOP_RETURN) {
@@ -1216,20 +1212,6 @@ class SteadyStateMarcher {
             if (roots_dropped_ && step_budget_ < 0 && !(*residual_out <= dropped_residual_)) {
                 std::copy(dropped_at_.begin(), dropped_at_.end(), y_data);
                 *residual_out = dropped_residual_;
-                asked = false;
-                if (CVodeReInit(cvode_mem_, t_, y_) != CV_SUCCESS) {
-                    integrator_failed_ = true;
-                }
-            }
-            // A march that passed the parity test, went on for the Newton step
-            // to pass too, and ends where the parity test does not pass,
-            // returns the last state that passed it (issue #1001): marched on to
-            // max_time BIOMD0000000252 ended at a residual of 2.1e-7, where main
-            // had stopped under tol at a state no run moves. The runs taken on
-            // from the returned state decide (find_steady_state).
-            if (!parity_at_.empty() && !(*residual_out < opts_.tol)) {
-                std::copy(parity_at_.begin(), parity_at_.end(), y_data);
-                *residual_out = parity_residual_;
                 asked = false;
                 if (CVodeReInit(cvode_mem_, t_, y_) != CV_SUCCESS) {
                     integrator_failed_ = true;
@@ -1464,10 +1446,6 @@ class SteadyStateMarcher {
     // The state, and its residual, where the march stopped rooting.
     std::vector<double> dropped_at_;
     double dropped_residual_ = 0.0;
-    // The last state of a march under "scaled" that passed the parity test, and
-    // its residual (issue #1001).
-    std::vector<double> parity_at_;
-    double parity_residual_ = 0.0;
     // A march stopped for not settling after its stagnation escapes.
     bool stalled_ = false;
 };
@@ -5935,9 +5913,9 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 ? ss_newton_distance(model, rhs, *effective, sub, result.concentrations.data())
                 : std::numeric_limits<double>::quiet_NaN();
         // A march that stalled short of its root by a step's worth is polished
-        // there: BIOMD0000000685's stopped 1.62 tolerances from it. The polish
-        // is kept where KINSOL takes it to a state the solve may stop at, and
-        // no further from the march's than the step said; the runs then decide.
+        // there: BIOMD0000000685's stopped 1.62 tolerances from it, and
+        // BIOMD0000000252's 1.64 at a residual of 2.1e-7. The polish is kept
+        // where it passes the parity test; the runs then decide.
         if (result.newton_distance > 1.0 && result.newton_distance <= kPolishFurthest) {
             std::vector<double> held(static_cast<size_t>(ns));
             model.get_state_into(held.data());
@@ -5950,24 +5928,11 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                 SteadyStateResult p = ss_newton_from(model, rhs, polish, sub, result.concentrations,
                                                      nullptr, kPolishIters);
                 if (p.converged && static_cast<int>(p.concentrations.size()) == ns) {
-                    const double largest =
-                        ss_largest_species(model, *effective, result.concentrations.data());
-                    double moved = 0.0;
-                    for (int i = 0; i < ns; ++i) {
-                        const auto ui = static_cast<size_t>(i);
-                        const double tol_i =
-                            ss_scaled_tolerance(*effective, i, result.concentrations[ui], largest);
-                        moved = std::max(
-                            moved,
-                            std::abs(p.concentrations[ui] - result.concentrations[ui]) / tol_i);
-                    }
-                    if (moved <= 2.0 * result.newton_distance + 1.0) {
-                        result.concentrations = p.concentrations;
-                        result.n_steps += p.n_steps;
-                        result.n_rhs_evals += p.n_rhs_evals;
-                        result.newton_distance = ss_newton_distance(model, rhs, *effective, sub,
-                                                                    result.concentrations.data());
-                    }
+                    result.concentrations = p.concentrations;
+                    result.n_steps += p.n_steps;
+                    result.n_rhs_evals += p.n_rhs_evals;
+                    result.newton_distance = ss_newton_distance(model, rhs, *effective, sub,
+                                                                result.concentrations.data());
                 }
             } catch (const std::exception &) {
             }
