@@ -3137,8 +3137,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "Block same-complex binding. Default: true.")
         .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
              "Whether the model reads the clock (default true): one-shot runs then run on "
-             "the model's clock, else on time elapsed since t_start, and a span too short "
-             "for the doubles near its times to integrate a clock-driven rate is refused")
+             "the model's clock, else on time elapsed since t_start")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
         .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
