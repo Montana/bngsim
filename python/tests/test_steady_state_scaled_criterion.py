@@ -1098,12 +1098,12 @@ def test_a_masked_species_that_overflows_in_the_run_is_refused(tmp_path, copies,
     # C' = kg·C from 1, left out by the mask: a run of 1e6 overflows it at
     # kg = 1e-3 (e^1000) and not at 1e-4 (e^100); above 512 unknowns, where
     # the state returned is the end of a run already, at 5e-4 too. Started
-    # again from zero,
-    # as a species stepped below zero is, C came back 0 with converged=True
-    # beside 520 unknowns. A run that cannot be taken to its time passes
-    # nothing: the solve is refused, at any size, with C a number where the
-    # march left it. The residual criterion converges both, by the residual
-    # alone.
+    # again from zero, as a species stepped below zero is, C came back 0 with
+    # converged=True beside 520 unknowns. A run that cannot be taken to its
+    # time passes nothing: the solve is refused, at any size, with C a number,
+    # where the march left it or, at 5e-4 above 512, where the first run
+    # ended (e^500). The residual criterion converges all of them, by the
+    # residual alone.
     c = 2 * copies + 2
     n, text = _wide_square_decay(0.03, ("C",), [f"{c} {c},{c} kg"], copies=copies)
     path = tmp_path / "wide_square_decay_growth.net"
@@ -1189,12 +1189,13 @@ def test_above_512_unknowns_a_masked_sink_keeps_its_law(tmp_path, kx):
 _B341 = Path(__file__).resolve().parents[2] / "tests/data/BIOMD0000000341.xml"
 
 
-def test_a_polish_with_a_species_held_goes_no_further_than_its_step(tmp_path):
-    # BIOMD0000000341 with G left out by the mask: G pins B, and KINSOL, with
-    # G held, went 1e8 tolerances from the march's state, at the dynamics'
-    # root (100, 10, 300), to a root of the rest, I = B = 0, which was
-    # converged. The step had put the root within a thousand tolerances, and
-    # the polish goes no further.
+def test_a_polish_with_a_species_held_goes_no_further_than_a_thousand_tolerances(tmp_path):
+    # BIOMD0000000341 with G left out by the mask: G's own equation pins I
+    # and B, and KINSOL, with G held, went 1e8 tolerances from the march's
+    # state, at the dynamics' root (100, 10, 300), to a root of the rest,
+    # I = B = 0, which was converged. Its step was 1.9e-6; a step is polished
+    # from no further than a thousand tolerances, and the polish goes no
+    # further than that.
     names = list(bngsim.Model.from_sbml(str(_B341)).species_names)
     ss = bngsim.Simulator(bngsim.Model.from_sbml(str(_B341)), method="ode").steady_state(
         method="integration", mask=[name != "G" for name in names]

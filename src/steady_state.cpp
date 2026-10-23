@@ -6039,11 +6039,15 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
                     // one 381 tolerances off, which the runs then refused. The
                     // step is had after where it was before: whether it is
                     // taken depends on the count of unknowns, not the state.
-                    // And no further than kPolishFurthest tolerances, as far
-                    // as the step said the root was: with the mask leaving out
-                    // G of BIOMD0000000341, which pins B, KINSOL went 1e8
-                    // tolerances to a root of the rest with G held, I = B = 0,
-                    // where the march had stopped at the dynamics' root.
+                    // And no further than kPolishFurthest tolerances, the
+                    // furthest a step is polished from: with the mask leaving
+                    // out G of BIOMD0000000341, whose own equation pins I and
+                    // B, KINSOL went 1e8 tolerances, from a step of 1.9e-6, to
+                    // a root of the rest with G held, I = B = 0, where the
+                    // march had stopped at the dynamics' root. The step sees
+                    // half the way to a root a species reaches as 1/t (A + B
+                    // -> C at equal totals), so a march stopped at max_time
+                    // more than about 500 tolerances from one is refused.
                     if (p.converged &&
                         went(result.concentrations, p.concentrations) <= kPolishFurthest) {
                         const double after = step_at(p);
