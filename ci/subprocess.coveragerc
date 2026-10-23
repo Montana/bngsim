@@ -1,0 +1,16 @@
+# Coverage of the Python subprocesses the test suite spawns (issue #585).
+#
+# pytest-cov measures the pytest process and its xdist workers only. A test that
+# runs `python -m bngsim.cache` or another interpreter through subprocess is not
+# in that process, so what it executes read as unexecuted: the CLI entry points
+# were at 0% in the first report. coverage installs a start-up hook
+# (a1_coverage.pth) that starts measuring in any interpreter whose environment
+# names a config file in COVERAGE_PROCESS_START; the measuring leg points it at
+# this file. The child inherits COVERAGE_FILE and, with `parallel`, writes a
+# suffixed file beside it, which pytest-cov combines at the end of the session.
+[run]
+parallel = true
+source = bngsim
+# A child that never imports bngsim (a `python -c` probe) would otherwise warn on
+# stderr at exit, and a test that reads a child's stderr would see it on this leg only.
+disable_warnings = module-not-imported, no-data-collected

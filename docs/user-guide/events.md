@@ -173,6 +173,18 @@ carry into the next.
 - **`rateOf` triggers are ODE-only**: models using the SBML `rateOf` csymbol are
   rejected under SSA/PSA — the instantaneous dx/dt it refers to has no
   well-defined value in a discrete stochastic trajectory.
+- **An event that re-arms its own trigger as it fires is refused (Zeno)**: an
+  assignment that puts the trigger back where the flow makes it true again at
+  once — `at (B > 0): B = 0, n = n + 1` with `B' = 1`, or a ring of events each
+  re-arming the next — makes the events fire infinitely often at one instant,
+  and no trajectory continues past it. `method="ode"` stops with an error naming
+  the events after 100000 fires in a row, each within CVODE's root tolerance of
+  the last (issue #1158). Change the assignment or the trigger so the event
+  leaves its trigger false for a time, for example by moving the state past the
+  threshold rather than onto it. Fast event trains spaced by more than the root
+  tolerance are not affected. A clamp like `at (X < 0): X = 0` on a decaying X,
+  whose fires change X by less than the integration tolerance, is not refused:
+  once X has decayed far below `atol` bngsim stops re-firing it instead.
 - **Cross-validated**: 62/153 (40.5%) BioModels event models pass vs RoadRunner
   at max_rel_err < 1e-3. Including marginal matches: 79/138 = 57.2%.
   Remaining failures are due to event timing precision differences between

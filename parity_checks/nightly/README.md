@@ -13,6 +13,7 @@ a regression. Nothing here blocks a PR.
 | `bng_ode_codegen` | BNG2.pl + run_network | the same jobs on the compiled C path (`--codegen`) |
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
 | `amici_sens` | AMICI forward sensitivities | 48 of the 50 curated BioModels, staggered + simultaneous |
+| `rr_ssa` | libRoadRunner gillespie (`rr_parity/ssa_screen.py`) | the 269 of the 306 SSA-screen BioModels candidates the corpus holds (#806) |
 
 **The BioModels corpus.** 992 of the 1,323 BioModels come from sys-bio/temp-biomodels
 on GitHub. The other 331 come only from BioModels itself, whose CloudFront refuses
@@ -48,9 +49,16 @@ A night alerts on:
   evaluations, Jacobian evaluations, from `Result.solver_stats`) grew past x1.25
   (with an absolute floor), or a counter's corpus total grew past x1.05, or bngsim's
   total wall time grew past x2 on the same runner CPU model (x4 across models) and
-  by more than 30 s. The floor is for the stochastic legs, whose bngsim time is only
-  the model load and totals well under a second, so a fixed cost of a few
-  milliseconds per model reads there as a x50 blowup. The
+  by more than 30 s. bngsim's wall time is the sum of `BNGSIM_PHASES` in
+  `verdicts.py`: an ODE row's load, Jacobian, compile and first solve, and a
+  stochastic row's load and its base ensemble (`ensemble_sec`, plus on bng_nf each
+  replicate's `NfsimSession.initialize`; the replicates an escalation adds are not
+  timed). Before #901 the stochastic legs summed the
+  load alone, well under a second, and a fixed cost of a few milliseconds per model
+  read there as a x50 blowup; the 30 s floor is from then. A verdict file records
+  the phases it sums, and two that sum different ones are not compared on wall
+  time: against the committed baseline that alerts until the baseline is
+  re-extracted, and night to night it is only reported. The
   counters are deterministic for a given model, build and platform -- two runs on
   different runner hardware matched exactly -- so they catch the algorithmic
   slowdowns (a Jacobian falling back to finite differences, step-size control, an
@@ -75,9 +83,10 @@ comparison a flip into or out of TIMEOUT is reported, not alerted: two single ni
 can land on runner CPUs of different speed, and a timeout verdict depends on the wall
 clock. Against the committed baseline PASS -> TIMEOUT still alerts.
 
-`flaky.json` lists cases whose verdict measurably flips on identical code (with the
-runs that show it); their changes are reported and never alert, in both comparisons.
-Add one only with that evidence.
+`flaky.json` lists cases whose verdict or solver work measurably changes on
+identical code (with the runs that show it); their changes are reported and never
+alert, in both comparisons. A flaky case's work still counts in the totals. Add one
+only with that evidence.
 
 ## When it alerts
 

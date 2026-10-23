@@ -171,6 +171,10 @@ class NetworkModel:
         """
         Dense analytical-Jacobian scatter plan (Elementary + MM, rows resolved) for the codegen .so. GH #76 Task 4.
         """
+    def codegen_key_stream(self) -> bytes:
+        """
+        The bytes the structural codegen cache key hashes for codegen_data() (less each parameter's value and species' initial_amount), codegen_jacobian_plan() and functional_jacobian_context(), in that order: what bngsim._codegen._canon_update writes for them, made from the same walk (issue #820).
+        """
     def compute_derivs(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> numpy.typing.NDArray[numpy.float64]:
         """
         dy/dt at (t, conc) as a float64 ndarray (n_species,): the interpreted RHS the CVODE callback evaluates, with the same observable/function refresh (rhs_evaluates_observables) against the live parameters. Leaves the stored concentrations untouched. Issue #523.
@@ -222,6 +226,10 @@ class NetworkModel:
     def fill_dense_fd_jacobian(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> numpy.typing.NDArray[numpy.float64]:
         """
         The one-sided finite-difference Jacobian of compute_derivs at (t, conc) as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, stepped by the steady-state solver's own rule. Issue #523.
+        """
+    def fill_dense_fd_jacobian_own_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
+        """
+        The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale taken at their own step where the rules of fd_own_step_columns allow, and the species (0-based) whose columns that changed. Issue #1002.
         """
     def fill_sparse_analytical_jacobian(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> numpy.typing.NDArray[numpy.float64]:
         """
@@ -839,7 +847,7 @@ class RuleMonkeySimulator:
         """
     def set_reads_clock(self, enabled: bool) -> None:
         """
-        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start, and a span too short for the doubles near its times to integrate a clock-driven rate is refused
+        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start
         """
     def set_species_count(self, pattern: str, count: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
@@ -919,6 +927,10 @@ class SolverOptions:
     def set_state_switch_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
         """
         Set the rate-law conditions that read model state, as source text — one relational atom per entry, `Virus<1` (issue #150). Such a condition flips a branch of f at a crossing whose time moves with every parameter through the trajectory, so dx/dθ is DISCONTINUOUS there by the saltation term (f⁻−f⁺)·dt*/dθ — a term neither the analytic sensitivity RHS nor CVODES' difference quotient carries. run() resolves each through NetworkModel.state_switch_residual, registers that residual as a CVODE root so the crossing is located, and applies the jump there. A run without sensitivities roots the residuals it is given and applies no jump; it restarts at a crossing only where the flow clearly carries the state across (issue #897). Empty (the default) leaves the root set untouched.
+        """
+    def set_state_switch_guards(self, guards: collections.abc.Sequence[str]) -> None:
+        """
+        Parallel to set_state_switch_conditions (issue #1147): for each, the if() branches its step or bend calls switch a rate law in, as an expression that reads 1 where one of them is on, or an empty string where one of its readings stands in no branch. A plain run steps on through a crossing whose every branch is off rather than restart.
         """
     def set_state_switch_reactions(self, reactions: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]]) -> None:
         """
@@ -1167,10 +1179,12 @@ class SsaSimulator:
 class SteadyStateOptions:
     codegen_c_source: str
     codegen_so_path: str
+    criterion: str
     force_dense_linear_solver: bool
     force_sparse_linear_solver: bool
     jacobian: str
     method: str
+    newton_burst: bool
     def __init__(self) -> None:
         ...
     def set_ic_param_sens(self, triples: collections.abc.Sequence[tuple[typing.SupportsInt | typing.SupportsIndex, typing.SupportsInt | typing.SupportsIndex, typing.SupportsFloat | typing.SupportsIndex]]) -> None:
@@ -1249,6 +1263,9 @@ class SteadyStateResultCore:
     def converged(self) -> bool:
         ...
     @property
+    def criterion(self) -> str:
+        ...
+    @property
     def eigenvalues(self) -> numpy.typing.NDArray[numpy.complex128]:
         """
         Eigenvalues of the Jacobian restricted to the species the Newton polish solved for, sorted by descending real part (issue #523). Empty when the certificate did not compute a spectrum: an integration result, or a root it declined on (more than 512 unknowns, a solver failure).
@@ -1293,6 +1310,9 @@ class SteadyStateResultCore:
     def n_unstable_roots_rejected(self) -> int:
         ...
     @property
+    def newton_distance(self) -> float:
+        ...
+    @property
     def observable_names(self) -> list[str]:
         ...
     @property
@@ -1321,6 +1341,33 @@ class SteadyStateResultCore:
         ...
     @property
     def sens_dfdp_source(self) -> str:
+        ...
+    @property
+    def sens_fd_disagree_function(self) -> int:
+        ...
+    @property
+    def sens_fd_disagree_param(self) -> int:
+        ...
+    @property
+    def sens_fd_disagree_species(self) -> int:
+        ...
+    @property
+    def sens_fd_floored(self) -> float:
+        ...
+    @property
+    def sens_fd_function_floored(self) -> float:
+        ...
+    @property
+    def sens_fd_function_own_step(self) -> float:
+        ...
+    @property
+    def sens_fd_function_param(self) -> int:
+        ...
+    @property
+    def sens_fd_own_step(self) -> float:
+        ...
+    @property
+    def sens_fd_own_step_species(self) -> list[int]:
         ...
     @property
     def sens_jacobian_rcond(self) -> float:

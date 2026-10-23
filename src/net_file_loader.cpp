@@ -57,6 +57,17 @@ static std::vector<std::string> split_ws(const std::string &s) {
     return tokens;
 }
 
+// tokens[first, last), joined by single spaces, to quote in an error.
+static std::string join_tokens(const std::vector<std::string> &tokens, size_t first, size_t last) {
+    std::string out;
+    for (size_t i = first; i < last && i < tokens.size(); ++i) {
+        if (!out.empty())
+            out += ' ';
+        out += tokens[i];
+    }
+    return out;
+}
+
 // Whether a whitespace-delimited token is a leading line index. BNG2.pl strips
 // one with `s/^\s*\d+\s+//` — a run of digits delimited by whitespace — so a
 // token is an index exactly when it is all digits (issue #600).
@@ -464,6 +475,22 @@ static std::vector<ParsedFunction> parse_functions(std::ifstream &file) {
     return functions;
 }
 
+// A reaction line is `<index> <reactants> <products> <rate law>`, and only a
+// Sat, Hill or MM rate law runs past one token, on its constants. run_network
+// refuses anything after the rate law ("Undefined rateLaw type", or for MM
+// "Incorrect number of rate constants"); this loader
+// read the line and dropped the rest, so `1 1 2 k delay=tau` loaded as an
+// undelayed reaction and `MM kcat Km delay=tau` as plain MM (issue #1231).
+static std::runtime_error tokens_after_rate_law(const std::string &line,
+                                                const std::vector<std::string> &tokens,
+                                                size_t first) {
+    return std::runtime_error("reaction line '" + line + "' has '" +
+                              join_tokens(tokens, first, tokens.size()) + "' after its rate law '" +
+                              join_tokens(tokens, 3, first) +
+                              "'; bngsim reads nothing after a rate law, so a per-reaction "
+                              "modifier such as a delay is not supported");
+}
+
 static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
     std::vector<ParsedReaction> reactions;
     std::string line;
@@ -513,19 +540,35 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
         // Rate law
         std::string rate_token = tokens[3];
 
-        if (rate_token == "Sat") {
+        if (rate_token == "Sat" || rate_token == "Hill") {
             rxn.type = RateLawType::Functional;
             rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
+            for (size_t i = 4; i < tokens.size(); ++i) {
+                // Each constant is a parameter name; run_network looks every
+                // one up ("Undefined rate constant"). The counts are checked in
+                // rewrite_legacy_sat_hill_rate_laws, but Sat takes one constant
+                // per reactant, so with two reactants `Sat k Km 2` loaded with
+                // a literal 2 and `Sat k Km delay=tau` reached ExprTk (#1231).
+                if (!is_bare_identifier(tokens[i]))
+                    throw std::runtime_error(
+                        "reaction line '" + stripped + "' gives its " + rate_token +
+                        " rate law the constant '" + tokens[i] +
+                        "', which is not a parameter name; bngsim reads nothing after a "
+                        "rate law's constants, so a per-reaction modifier such as a delay "
+                        "is not supported");
                 rxn.legacy_rate_law_constants.push_back(tokens[i]);
+            }
 
-        } else if (rate_token == "Hill") {
-            rxn.type = RateLawType::Functional;
-            rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
-                rxn.legacy_rate_law_constants.push_back(tokens[i]);
-
-        } else if (rate_token == "MM" && tokens.size() >= 6) {
+        } else if (rate_token == "MM" && tokens.size() >= 5) {
+            // `MM kcat Km`; run_network refuses any other count of constants. A
+            // lone `MM kcat` used to fall through to the elementary branch as a
+            // rate constant named MM, refused at build as an unknown parameter.
+            if (tokens.size() == 5)
+                throw std::runtime_error("reaction line '" + stripped +
+                                         "' gives MM one constant; an MM rate law takes "
+                                         "two constants, 'MM kcat Km'");
+            if (tokens.size() > 6)
+                throw tokens_after_rate_law(stripped, tokens, 6);
             rxn.type = RateLawType::MichaelisMenten;
             rxn.mm_kcat_name = tokens[4];
             rxn.mm_km_name = tokens[5];
@@ -570,6 +613,25 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
                 // reaction that never fires (issue #803).
                 throw std::runtime_error("reaction line '" + stripped +
                                          "' has a stat factor but no rate constant");
+            }
+            if (tokens.size() > 4) {
+                // run_network reads more than one rate-law token as a type
+                // keyword and its constants. Two of its forms reach this branch.
+                // Both used to be refused at build, as an unknown parameter named
+                // after the keyword, or, in a model that declared a parameter of
+                // that name, loaded at it with the constants dropped.
+                if (param_name == "Ele")
+                    throw std::runtime_error(
+                        "reaction line '" + stripped +
+                        "' spells out the Ele rate-law type, which BNG2.pl does not write; "
+                        "bngsim reads an elementary rate law as its rate constant alone, "
+                        "e.g. 'k' or '2*k'");
+                if (param_name == "Sat" || param_name == "Hill" || param_name == "MM")
+                    throw std::runtime_error("reaction line '" + stripped +
+                                             "' puts a stat factor on its " + param_name +
+                                             " rate law ('" + rate_token +
+                                             "'), which bngsim does not read yet (issue #1230)");
+                throw tokens_after_rate_law(stripped, tokens, 4);
             }
             rxn.type = RateLawType::Elementary;
             rxn.rate_law_name = param_name;

@@ -258,7 +258,7 @@ def _rr_warmup() -> tuple[float, str]:
     return rr_import_sec, "import-proxy"
 
 
-def measure_ssa_warmup() -> dict:
+def measure_ssa_warmup(include_roadrunner: bool = True) -> dict:
     """One-time per-process warmup cost for the SSA screen (both engines).
 
     The SSA taxonomy differs from the ODE one (see :func:`measure_warmup`):
@@ -270,11 +270,16 @@ def measure_ssa_warmup() -> dict:
     Must be called **once at worker start, before any engine call**, so the
     extension import is captured here as per-process warmup rather than charged to
     the first model's per-model load.
+
+    ``include_roadrunner=False`` (a replay from a reference archive, issue #805)
+    measures bngsim alone and never imports RoadRunner.
     """
     t0 = time.perf_counter()
     import bngsim  # noqa: F401  — the _bngsim_core .so load is the measured cost
 
     bn_sec = time.perf_counter() - t0
+    if not include_roadrunner:
+        return {"bngsim_sec": round(bn_sec, 6)}
     rr_sec, rr_source = _rr_warmup()
     return {
         "bngsim_sec": round(bn_sec, 6),
@@ -1102,24 +1107,19 @@ def rr_ssa(
     is simply absent). The model is built once; each replicate resets, reseeds,
     and re-simulates.
     """
-    import roadrunner
-
-    rr = roadrunner.RoadRunner(xml)
+    rr = _rr_gillespie(xml)
     # Per-phase load breakdown from the instrumented RoadRunner build (#135);
     # absent on stock 2.9.2 (no getLoadTimings()).
     try:
         load = dict(rr.getLoadTimings())
     except AttributeError:
         load = {}
-    rr.integrator = "gillespie"
-    rr.integrator.variable_step_size = False
     out: list[np.ndarray] = []
     names: list[str] = []
     times: np.ndarray | None = None
     rep_secs: list[float] = []
     for rep in range(n_rep):
-        rr.reset()
-        rr.integrator.seed = int(seed_base + rep)
+        _rr_reseed(rr, seed_base + rep)
         t_run = time.perf_counter()
         res = rr.simulate(t_start, t_end, n_points)
         rep_secs.append(time.perf_counter() - t_run)
@@ -1157,6 +1157,69 @@ def rr_ssa(
         },
     }
     return times, np.stack(out, axis=0), names, timing
+
+
+def _rr_gillespie(xml: str):
+    """RoadRunner's model of ``xml`` on its gillespie integrator at a fixed step,
+    as :func:`rr_ssa` and :func:`rr_ssa_nonfinite_rate` both run it."""
+    import roadrunner
+
+    rr = roadrunner.RoadRunner(xml)
+    rr.integrator = "gillespie"
+    rr.integrator.variable_step_size = False
+    return rr
+
+
+def _rr_reseed(rr, seed: int) -> None:
+    """Start a replicate: the model back at its initial state, on ``seed``."""
+    rr.reset()
+    rr.integrator.seed = int(seed)
+
+
+def rr_ssa_nonfinite_rate(
+    xml: str, t_start: float, t_end: float, n_points: int, n_rep: int, seed_base: int
+) -> dict:
+    """Whether RoadRunner's gillespie, on the bngsim seed schedule, reaches a state
+    where one of its own reaction rates is NaN or infinite (issue #1211).
+
+    RoadRunner raises nothing there: its gillespie fires no further reaction and
+    holds that state to ``t_end`` (measured on 2.9.2). So a replicate that reached
+    one ends on it, and the rates are read at the end of each replicate, which runs
+    as in :func:`rr_ssa`. Stops at the first such replicate. Returns
+    ``{"replicates", "seed", "boundary", "nonfinite"}``: the replicates run, the
+    seed of the one that ended on a non-finite rate, the boundary species, and every
+    reaction whose rate is non-finite there, as ``{"reaction", "rate", "net"}``: its
+    id, its rate (``repr``, so the record stays JSON) and its net change of each
+    floating species, from RoadRunner's stoichiometry matrix. ``seed`` is None and
+    ``nonfinite`` empty when every rate stayed finite. Raises what RoadRunner
+    raises, for example on a model with rate rules, which its gillespie refuses.
+    """
+    rr = _rr_gillespie(xml)
+    reaction_ids = list(rr.model.getReactionIds())
+    boundary = list(rr.model.getBoundarySpeciesIds())
+    for rep in range(n_rep):
+        _rr_reseed(rr, seed_base + rep)
+        rr.simulate(t_start, t_end, n_points)
+        rates = np.asarray(rr.model.getReactionRates(), dtype=float)
+        bad = np.flatnonzero(~np.isfinite(rates))
+        if bad.size:
+            stoich = rr.getFullStoichiometryMatrix()
+            rows, cols = list(stoich.rownames), list(stoich.colnames)
+            m = np.asarray(stoich, dtype=float)
+            nonfinite = []
+            for j in bad:
+                c = cols.index(reaction_ids[j])
+                net = {rows[i]: float(m[i, c]) for i in range(len(rows)) if m[i, c] != 0.0}
+                nonfinite.append(
+                    {"reaction": reaction_ids[j], "rate": repr(float(rates[j])), "net": net}
+                )
+            return {
+                "replicates": rep + 1,
+                "seed": int(seed_base + rep),
+                "boundary": boundary,
+                "nonfinite": nonfinite,
+            }
+    return {"replicates": int(n_rep), "seed": None, "boundary": boundary, "nonfinite": []}
 
 
 # --------------------------------------------------------------------------- #
