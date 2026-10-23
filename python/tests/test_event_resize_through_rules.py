@@ -663,3 +663,60 @@ def test_the_sensitivity_through_a_chain_of_rules_deeper_than_was_written_out():
 
     want = 5 * (1e-3 * v(2) - v(1) * 2e-3) / v(2) ** 2
     np.testing.assert_allclose(_final_sensitivity(model, "Sn"), want, rtol=1e-6)
+
+
+def test_the_limit_is_the_length_written_out(monkeypatch):
+    """Functions start one character past the limit. Each name read was
+    counted beside the text put in for it, and they started near 17,000."""
+    import bngsim._sbml_loader as loader
+
+    sizes = []
+    real = loader._rule_compartments_an_event_resizes
+
+    def spy(*args, **kwargs):
+        found = real(*args, **kwargs)
+        sizes.extend(len(text) for _, text in found)
+        return found
+
+    monkeypatch.setattr(loader, "_rule_compartments_an_event_resizes", spy)
+    xml = _diamond_doc(16)
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", 10**9)
+    assert not _rsz(bngsim.Model.from_sbml_string(xml))
+    (written,) = sizes
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", written)
+    assert not _rsz(bngsim.Model.from_sbml_string(xml))
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", written - 1)
+    assert _rsz(bngsim.Model.from_sbml_string(xml))
+
+
+def test_a_function_is_not_named_as_one_of_the_model_s_parameters():
+    """A parameter _rsz_e_cv_r1 = 0.25, read by J: A -> B, was bound to the
+    function of that name (#266), which wrote r1's value after the event, 3,
+    over it at every step: B(4) = 12 for 1."""
+    taken = "_rsz_e_cv_r1"
+    assert taken in _rsz(bngsim.Model.from_sbml_string(_diamond_doc(26)))
+    boundary = (
+        '<species id="A" compartment="c0" initialConcentration="1" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="true" constant="true"/>'
+        + _species("B", "c0", 0)
+    )
+    a, b = (f'<speciesReference species="{s}" stoichiometry="1" constant="true"/>' for s in "AB")
+    reaction = f"""<listOfReactions><reaction id="J" reversible="false">
+  <listOfReactants>{a}</listOfReactants><listOfProducts>{b}</listOfProducts>
+  <kineticLaw><math {M}>{_apply("times", _ci(taken), _ci("A"))}</math></kineticLaw>
+ </reaction></listOfReactions>"""
+    xml = (
+        _diamond_doc(26)
+        .replace(_comp("cv"), _comp("cv") + '<compartment id="c0" size="1" constant="true"/>')
+        .replace(_species("Sn", "cv", 5), _species("Sn", "cv", 5) + boundary)
+        .replace("<listOfParameters>", f"<listOfParameters>{_param(taken, 0.25, True)}")
+        .replace("<listOfEvents>", reaction + "<listOfEvents>")
+    )
+    model = bngsim.Model.from_sbml_string(xml)
+    assert _rsz(model) and taken not in model.function_names
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 4.0), n_points=9)
+    names = list(result.species_names)
+    species = np.asarray(result.species)
+    np.testing.assert_allclose(species[:, names.index("B")], 0.25 * result.time, rtol=1e-8)
+    sn = species[:, names.index("Sn")]
+    np.testing.assert_allclose(sn[3:], 5 * _diamond_size(26, 1.0, 1) / _diamond_size(26, 1.0, 2))

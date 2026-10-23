@@ -2662,15 +2662,18 @@ def _rule_compartments_an_event_resizes(
                 return None if written[var] < 0 else written[var]
             written[var] = -1
             children[var] = reached_in(var)
+            # Each name read becomes its text in parentheses.
             n = len(rule_text[var]) + sum(
-                len(replacements[name]) + 2 for name in names_in(var) if name in replacements
+                len(replacements[name]) + 2 - len(name)
+                for name in names_in(var)
+                if name in replacements
             )
             d = 0
             for inner, k in children[var].items():
                 m = length(inner)
                 if m is None:
                     return None
-                n += k * (m + 2)
+                n += k * (m + 2 - len(_safe_name(inner)))
                 d = max(d, depth[inner] + 1)
             written[var] = n
             depth[var] = d
@@ -9088,6 +9091,16 @@ def _build_model_from_sbml_doc_in_context(doc):
                 )
                 helper_texts = [(name, sympy_to_exprtk(body)) for name, body in helpers]
                 texts = [sympy_to_exprtk(e) for e in written]
+                # Under a name none of the model's parameters has: a function
+                # of a parameter's name is bound to it (#266) and overwrote it.
+                renamed = {name: _unique_param_name(name) for name, _ in helpers}
+                renamed = {old: new for old, new in renamed.items() if new != old}
+                if renamed and all(t is not None for _, t in helper_texts):
+                    texts = [t and _replace_exprtk_symbols(t, renamed) for t in texts]
+                    helper_texts = [
+                        (renamed.get(name, name), _replace_exprtk_symbols(t, renamed))
+                        for name, t in helper_texts
+                    ]
                 if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where {c_read} "
@@ -10310,10 +10323,10 @@ def _build_model_from_sbml_doc_in_context(doc):
 
     # A rule's value after an event's resize, as a function of its own, where
     # the new size written out through its rules would be too long (issue
-    # #1124, item 4). One function for each text, under a name no other has:
-    # the ids it is named by are joined by "_", and two can meet (event e and
-    # compartment c_x, event e_c and compartment x), where an event read the
-    # value of the other's function of that name. Each is added once an
+    # #1124, item 4). One function for each text, under a name nothing else
+    # has: the ids it is named by are joined by "_", and two can meet (event
+    # e and compartment c_x, event e_c and compartment x), where an event read
+    # the value of the other's function of that name. Each is added once an
     # assignment the model keeps reads it, since every function is evaluated
     # at every step.
     _resize_helper_of: dict[str, str] = {}  # text -> name
@@ -10323,11 +10336,9 @@ def _build_model_from_sbml_doc_in_context(doc):
     def _resize_helper(key: str, text: str) -> str:
         name = _resize_helper_of.get(text)
         if name is None:
-            name = base = f"_rsz_{_safe_name(key)}"
-            n = 1
-            while name in _resize_helper_text:
-                n += 1
-                name = f"{base}_{n}"
+            # A function named as a parameter is bound to it (#266), and wrote
+            # its value over the parameter's at every step.
+            name = _unique_param_name(f"_rsz_{_safe_name(key)}")
             _resize_helper_of[text] = name
             _resize_helper_text[name] = text
         return name
