@@ -3137,8 +3137,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "Block same-complex binding. Default: true.")
         .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
              "Whether the model reads the clock (default true): one-shot runs then run on "
-             "the model's clock, else on time elapsed since t_start, and a span too short "
-             "for the doubles near its times to integrate a clock-driven rate is refused")
+             "the model's clock, else on time elapsed since t_start")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
         .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
@@ -3687,6 +3686,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
     py::class_<bngsim::SteadyStateOptions>(m, "SteadyStateOptions")
         .def(py::init<>())
         .def_readwrite("tol", &bngsim::SteadyStateOptions::tol)
+        // Issue #1001 — what `converged` asks: "residual" or "scaled".
+        .def_readwrite("criterion", &bngsim::SteadyStateOptions::criterion)
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
         // Issue #524 — "newton" from the given state, no burst, stability reported.
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
@@ -3736,6 +3737,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("concentrations", &bngsim::SteadyStateResult::concentrations)
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
+        .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)
         .def_readonly("n_steps", &bngsim::SteadyStateResult::n_steps)

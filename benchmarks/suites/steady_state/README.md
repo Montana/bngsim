@@ -47,7 +47,8 @@ python run.py --model RAFi        # substring filter on model name
 
 `run_network` is located via `BNGPATH` / `RUN_NETWORK` (see the
 top-level `benchmarks/README.md`). Results are written to the
-git-ignored `results/` (`steady_state_results.json` + `.md`).
+git-ignored `results/` (`steady_state_results.json` + `.md`), or to the
+directory `--out` names.
 
 ## Outcome
 

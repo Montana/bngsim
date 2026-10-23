@@ -28,7 +28,7 @@ disagree, trust `VENDOR.json`.
 ## Current Baseline
 
 - `bngsim/third_party/mir/VENDOR.json` records the pinned upstream commit
-  `99c65079038f3ba9242ef646f308c266cfd7a8e5`, canonical remote
+  `439a90a2d7d9f38a70e8d9a6ebeabd900d66e920`, canonical remote
   `https://github.com/vnmakarov/mir.git`, branch `master`, the MIT license, the
   three built translation units, the prune set, the per-file SHA256 anchors, and
   the wrapper guardrails.
@@ -41,7 +41,7 @@ disagree, trust `VENDOR.json`.
 
 - Authoritative repository: `https://github.com/vnmakarov/mir.git`
 - Authoritative branch: `master`
-- Pinned commit: `99c65079038f3ba9242ef646f308c266cfd7a8e5`
+- Pinned commit: `439a90a2d7d9f38a70e8d9a6ebeabd900d66e920`
 - `bngsim/scripts/vendor_mir.py`: only supported exporter into
   `bngsim/third_party/mir`
 - `bngsim/third_party/mir/VENDOR.json`: authoritative record of the vendored
@@ -72,7 +72,7 @@ Fresh clone, then check out the pinned commit from `VENDOR.json`:
 
 ```sh
 git clone https://github.com/vnmakarov/mir.git /tmp/mir-vendor-candidate
-git -C /tmp/mir-vendor-candidate checkout 99c65079038f3ba9242ef646f308c266cfd7a8e5
+git -C /tmp/mir-vendor-candidate checkout 439a90a2d7d9f38a70e8d9a6ebeabd900d66e920
 git -C /tmp/mir-vendor-candidate remote -v
 git -C /tmp/mir-vendor-candidate rev-parse HEAD
 ```
@@ -197,6 +197,14 @@ These behaviors are required by `mir_jit.hpp` and recorded under
   declarations for the libc/libm symbols the RHS can call (`pow`, `exp`, `sqrt`,
   `log`, `fabs`, `fmax`, `fmin`, `memset`, …). MIR resolves those externals at
   link time via the import resolver (`dlsym(RTLD_DEFAULT, name)`).
+- **Imports are limited to the prelude.** c2mir accepts a call to an undeclared
+  function as an implicit `int name()` where `cc` refuses it, so a bare call the
+  emitter has no C for reaches `MIR_link` as an import. MIR reports an unresolved
+  import by `exit()`ing the process, and `dlsym` binds any name a loaded library
+  happens to export (on macOS a private framework loaded into the Python process
+  has an `equal`). `MirJit` refuses every import outside the prelude's table
+  before linking; re-check on a pin bump that `MIR_link` still resolves imports
+  only through the resolver.
 - **Find the JIT'd function by iteration.** `MIR_get_global_item` is declared in
   `mir.h` but not defined at the pinned commit; `MirJit` locates the function by
   scanning `module->items` for the matching `MIR_func_item` (the version-stable
@@ -204,8 +212,8 @@ These behaviors are required by `mir_jit.hpp` and recorded under
   `MIR_get_global_item`, the scan still works — but verify before relying on it.
 - **Single-maintainer upstream.** MIR is effectively single-maintainer and pinned
   to an immutable commit. Refresh deliberately.
-- **Local carries: one.** The tree is otherwise stock upstream at the pinned
-  commit. `VENDOR.json` → `local_carries` records each deliberate BNGsim edit,
+- **Local carries: none.** The tree is stock upstream at the pinned commit.
+  `VENDOR.json` → `local_carries` records each deliberate BNGsim edit,
   and both `vendor_mir.py --check` and `test_mir_vendoring.py` verify every
   recorded carry is *still applied* — see "Local Carries" below.
 
@@ -233,7 +241,7 @@ Each entry records:
 | `reapply` | what to do when a refresh drops it |
 
 Those six are required — `--check` reports an entry missing any of them. An entry
-may carry more; the current one adds `function` and `upstream_file_sha256` (the
+may carry more; the #413 carry added `function` and `upstream_file_sha256` (the
 hash of the file *before* the carry, so a refresh can tell "upstream unchanged,
 re-apply verbatim" from "upstream rewrote this, read it first"). Note that
 `files{}` is rebuilt wholesale on every refresh, so a per-file extra key there
@@ -241,37 +249,27 @@ would not survive — carry-adjacent facts belong in the carry entry.
 
 ### Current carries
 
-- **`mir-gen.c` — `try_spilled_reg_mem` bounds check (issue #413).** MIR_gen's
-  register allocator rewrites every operand naming one spilled register into a
-  memory operand and records the rewritten indices in a two-entry
-  `op_nums[MAX_INSN_RELOAD_MEM_OPS]`, bounded only by `gen_assert` — i.e.
-  `assert`, which `-DNDEBUG` deletes from every release build. An insn *can* name
-  the register three times: `x = x * x` reaches the allocator as the three-operand
-  `dmul r, r, r`. The third store then lands past the array; glibc's stack
-  protector reports it as `*** stack smashing detected ***` and aborts, and a
-  toolchain that leaves the frame unguarded corrupts it silently. The carry raises
-  the table to 3 and replaces the vanishing assert with a real runtime check that
-  undoes the rewrites and declines. Both halves are load-bearing: 3 is what the
-  three-operand case needs so it is handled rather than given up on, and the
-  runtime check has to stay because 3 is not a *provable* bound — the call site is
-  reached for `MIR_USE` as well, and `MIR_USE` has unbounded `nops`. The carry's
-  code is byte-identical to the patch proposed upstream, so a refresh that picks
-  the fix up leaves only the marker comment to delete. Present in the pinned
-  commit and in upstream
-  master as of 2026-08-18, and reported there as
-  [vnmakarov/mir#410](https://github.com/vnmakarov/mir/issues/410) — open since
-  2024-07-08 and written up as a debug-build assertion failure, so it does not
-  record that a release build deletes the check and overruns silently. The fix is
-  proposed as [vnmakarov/mir#468](https://github.com/vnmakarov/mir/pull/468) with
-  code byte-identical to this carry. Drop the carry once that merges and the pin
-  moves past it. `python/tests/test_codegen_jit_self_multiply.py` is the
-  behavioral regression; `test_mir_vendoring.py` checks the carry is still there.
+None. The tree is stock upstream at the pinned commit.
 
-  The entry's `minimal_reproducer` is two lines of C — a call, then `o[0] = t*t` —
-  which is what to hand upstream, and what to re-check a refresh against. Both
-  halves are load-bearing: the call is what spills `t`, and the self-multiply is
-  what makes all three operands of one insn name it. Neither `t + t` nor
-  `t * 3.0` reproduces, and neither does the square with no call before it.
+### Past carries
+
+- **`mir-gen.c` — `try_spilled_reg_mem` bounds check (issue #413), carried
+  2026-08-18 to 2026-10-22.** MIR_gen's register allocator rewrites every operand
+  naming one spilled register into a memory operand and records the rewritten
+  indices in `op_nums[MAX_INSN_RELOAD_MEM_OPS]`. Upstream sized that table at 2
+  and bounded it with `gen_assert` alone, which `-DNDEBUG` deletes from every
+  release build; `x = x * x` reaches the allocator as the three-operand
+  `dmul r, r, r`, so the third store landed past the array (glibc:
+  `*** stack smashing detected ***`). The carry raised the table to 3 and added a
+  runtime check that undoes the rewrites and declines. Upstream merged the same
+  code as [vnmakarov/mir#468](https://github.com/vnmakarov/mir/pull/468), and the
+  carry was dropped when the pin moved to `439a90a2`, which includes it.
+  `test_mir_vendoring.py::test_mir_gen_spill_reload_table_is_bounds_checked`
+  now guards upstream's copy against a regression, and
+  `python/tests/test_codegen_jit_self_multiply.py` is still the end-to-end test.
+  The minimal reproducer is two lines of C, JIT'd at -O2: a call, then
+  `o[0] = t*t` (the call spills `t`; the square makes all three operands of one
+  insn name it).
 
 ## Build Wiring (for reference)
 

@@ -52,6 +52,7 @@ from bngsim._codegen import (
     _derived_expr_partials_numeric,
     _find_close_paren_strict,
     _inline_derived_param_refs,
+    _spell_mod,
     _split_top_level_commas,
 )
 from bngsim._exceptions import SensitivityUnsupportedError
@@ -95,6 +96,62 @@ _TIME_SYMBOLS = frozenset({"time", "time()"})
 # zeroth-order synthesis with rate constant 1, so its RHS row is exactly 1.0, and
 # anything else is a different kind of variable we should not treat as a clock.
 _CLOCK_SLOPE = 1.0
+
+
+_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
+
+
+def _fully_parenthesised(expr: str) -> bool:
+    """Whether the opening ``(`` of *expr* is closed by its last character."""
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return False
+    return _find_close_paren_strict(expr, 0) == len(expr) - 1
+
+
+def _is_name_or_call(text: str) -> bool:
+    """A lone name or number, or a name applied to one parenthesised group."""
+    if _ATOMIC_TOKEN.fullmatch(text):
+        return True
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    if m is None:
+        return False
+    return _fully_parenthesised(text[m.end() :])
+
+
+def _condition_key(cond: str) -> str:
+    """The text of a condition with the parentheses the SBML loader's
+    ``_atomic`` adds around a call dropped, and those around a lone name or
+    number, so that one crossing reached two ways has one key (issue #1082).
+
+    A function-definition formal bound to ``time()`` is spliced into the body
+    as ``(time())``, so ``near(time, 2.5, 0.005)`` with ``near := abs(x - c) <
+    w`` and ``abs(time - 2.5) < 0.005`` written directly gave two spellings of
+    each edge, and two roots. A group that is a call's own argument list is
+    left alone, and so is any group with an operator in it. Lives here, beside
+    :func:`_strip_redundant_parens`, so the loader that registers conditions
+    and the recovery in ``Model.time_discontinuity_conditions`` compare on one
+    form without the loader (and libsbml) being imported for it.
+    """
+    prev = None
+    while prev != cond:
+        prev = cond
+        out: list[str] = []
+        i = 0
+        n = len(cond)
+        while i < n:
+            ch = cond[i]
+            # An opening parenthesis that is not a call's own (no name before it).
+            if ch == "(" and not (out and (out[-1][-1:].isalnum() or out[-1][-1:] == "_")):
+                close = _find_close_paren_strict(cond, i)
+                inner = cond[i + 1 : close] if close >= 0 else ""
+                if close >= 0 and _is_name_or_call(inner):
+                    out.append(inner)
+                    i = close + 1
+                    continue
+            out.append(ch)
+            i += 1
+        cond = "".join(out)
+    return cond
 
 
 def _strip_redundant_parens(s: str) -> str:
@@ -398,7 +455,7 @@ def _condition_only_params(
 
     data = core.codegen_data()
     params = data["parameters"]
-    func_map = dict(core.functional_jacobian_context()["function_map"])
+    func_map = _scan_function_map(core.functional_jacobian_context())
 
     pats = {
         name: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
@@ -433,7 +490,7 @@ def _condition_only_params(
         if rxn.get("type") != "functional":
             continue
         fname = rxn.get("function_name")
-        body = func_map.get(fname) if fname else rxn.get("rate_expression")
+        body = func_map.get(fname) if fname else _spell_mod(rxn.get("rate_expression") or "")
         if body:
             bodies.append(_inline_functions(body, func_map) or body)
 
@@ -513,7 +570,7 @@ def texts_spell_a_switch(core) -> bool:
         return False
     return any(
         has_condition_construct(t)
-        or _STEP_CALL.search(t)
+        or _STEP_CALL.search(_spell_mod(t))
         or _RELATIONAL.search(t)
         or _BEND_CALL.search(t)
         for t in (*core.function_expressions, *core.param_expressions)
@@ -1825,6 +1882,11 @@ def switch_condition_scope(core, ctx=None, *, clock_candidates=None) -> SwitchCo
     """
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
+    # As written, and not through _spell_mod: a derived parameter is a
+    # constant of the run, so a `%` in one switches nothing, and the
+    # resolvers that inline these texts decline a call they do not know.
+    # `thr = base % 10` read as `mod(base, 10)` lost the exact crossing of
+    # `time() > thr`, and with it the SSA's piecewise-constant rate (#1127).
     exprs = list(core.param_expressions)
     clocks = _unit_rate_clock_species(core, ctx, clock_candidates)
     clock_symbols = frozenset(clocks) | _TIME_SYMBOLS
@@ -2172,7 +2234,7 @@ def _function_slot_bodies(ctx) -> dict[str, str]:
     So the resolver inlines every one of them, and what the bodies read decides:
     time resolves, a parameter is read at its live value, and a species declines.
     """
-    return {n: b for n, b in dict(ctx["function_map"]).items() if isinstance(b, str)}
+    return {n: b for n, b in _scan_function_map(ctx).items() if isinstance(b, str)}
 
 
 def _inline_function_slots(expr: str, bodies: dict[str, str]) -> str:
@@ -2491,10 +2553,10 @@ def time_discontinuity_conditions(
             if not _unit_rate_clock_indices(core, clock_candidates):
                 return ()
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -3114,6 +3176,11 @@ class CrossingStop(NamedTuple):
     # bends, at a breakpoint of a `linear` table function (issue #709): there
     # the step is made to end on the stop and the run keeps its history.
     restart: bool = True
+    # A stop moved onto the double at which its condition changes for the
+    # evaluator (issue #891), and where the resolvers had put it (None for one
+    # they did not list); see :func:`merge_crossing_stops`.
+    on_flip: bool = False
+    placed: float | None = None
 
 
 def _rewrite_counter_clock(
@@ -3232,6 +3299,7 @@ def crossings_with_periodic(
     touches=frozenset(),
     over_budget=None,
     sensitivity_params=None,
+    on_the_flip=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
     """:func:`all_fixed_crossings`, and for the conditions it leaves out, their
     stops and their crossings, from one pass over the conditions.
@@ -3269,6 +3337,12 @@ def crossings_with_periodic(
     time that reads none of those parameters: its changes are fixed times of
     the run, with no jump to make, and without the stop the columns were those
     of the stepped-over trajectory.
+
+    *on_the_flip* moves each periodic stop onto the double the evaluator
+    changes on (issue #891, :func:`_stops_on_the_flip`); the ODE path asks for
+    it in a run with no sensitivity columns. Not the SSA's: there a step rate on
+    `1e12 + t` switched a double of the clock, 1.2e-4 of time, later than the
+    same run from the origin, and the run far from it was no longer that run.
     """
     return _resolve_crossings(
         core,
@@ -3279,6 +3353,7 @@ def crossings_with_periodic(
         touches=touches,
         over_budget=over_budget,
         sensitivity_params=sensitivity_params,
+        on_the_flip=on_the_flip,
     )
 
 
@@ -3338,6 +3413,7 @@ def _resolve_crossings(
     touches=frozenset(),
     over_budget=None,
     sensitivity_params=None,
+    on_the_flip=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
     if not conditions:
         return [], [], []
@@ -3564,6 +3640,45 @@ def _resolve_crossings(
             stops.append(
                 CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0, touch=touch)
             )
+        # Each onto the double the evaluator changes on (issue #891), in a run
+        # that reads no condition for itself: one with sensitivity columns has
+        # its switch times from the resolvers' own numbers, and the two must
+        # stay one. Not for a condition an event's trigger reads: a trigger on
+        # `time > 1` stopped on its first true double, 1.0000000000000002, and
+        # a delay of 1.5 added to that rounds to 2.5, so the execution came
+        # before a row at 2.5 that it is after (issue #947 is where events on
+        # one instant are ordered).
+        on_flip = (
+            _stops_on_the_flip(core, engine, text, offset, scope, bodies, t_start, t_end, inside)
+            if inside
+            and periodic
+            and on_the_flip
+            and sensitivity_params is None
+            and cond not in touches
+            else None
+        )
+        if on_flip is not None:
+            as_placed: list[float | None] = [*inside, *(None for _ in on_flip[1])]
+            for t_placed, (t_cross, value) in zip(
+                as_placed, [*on_flip[0], *on_flip[1]], strict=True
+            ):
+                if t_cross > t_end and t_placed is not None:
+                    # The change is a double past the run's last instant, as
+                    # `time <= 0.3` is for a leg that ends on 0.3. The stop
+                    # stays on the end: a last step that is not stopped is
+                    # taken past the end and read back, across the change.
+                    t_cross, value = t_placed, t_placed + offset
+                if t_start < t_cross <= t_end:
+                    found.append(
+                        CrossingStop(
+                            t_cross,
+                            clock_idx,
+                            value if clock_idx >= 0 else 0.0,
+                            on_flip=True,
+                            placed=t_placed,
+                        )
+                    )
+            continue
         for t_cross in inside:
             # The counter's exact value at the crossing. Reading it back off the
             # rewrite rather than off the recognized threshold text is what keeps
@@ -3646,8 +3761,8 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
     if not conditions:
         return frozenset()
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    func_map = _scan_function_map(ctx)
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -3811,8 +3926,11 @@ def _coarse_sawtooth(core, asked: _EngineCondition, phase, lo: float, hi: float)
     `100*mod(1.1e12 + time(), 0.0048828125)` over (0, 20.2), each on its
     wrap, X was 0.0826 for 4.685, where main, with no stop, has it right. Two
     stops to the wrap held for X(0) = 0 and not for X(0) = 1e4. So the scan's
-    stops are not placed for it, and it is left as on main, until that is
-    fixed in the run.
+    stops are not placed for it, and it is left as on main. The run now looks
+    inside such a stretch before it takes it in one step (issue #998), which
+    makes a stop on every wrap add every period for X(0) = 0; whether to place
+    them again, and what to do where the dose is small against the tolerance,
+    is issue #1018.
 
     How long a flat stretch it takes depends on the rate and the tolerances,
     not on the run: at a clock of 1e6, `frac((3e9 + time())/0.0009765625)`
@@ -3882,7 +4000,7 @@ def _engine_scan_stop_times(
     lo, hi = float(t_start) + shift, float(t_end) + shift
     sawtooth = _sawtooth_of_a_line(asked, scope)
     if sawtooth is not None and _coarse_sawtooth(core, asked, sawtooth, lo, hi):
-        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#998)", cond)
+        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#1018)", cond)
         return None
 
     class Unreadable(Exception):
@@ -4012,6 +4130,182 @@ def _few_changes(
     if edges is None:
         return None
     return [(c - shift, c, False) if shift else (c, c + offset, False) for c in edges]
+
+
+# How many doubles of the time on each side of a stop the evaluator is asked on
+# before anything is searched for. A stop read off folded constants lands
+# within one or two of the double a condition on the bare clock flips at.
+_FLIP_REACH = 8
+# How many stops' doubles are read at once.
+_FLIP_BLOCK = 1 << 16
+
+
+def _stops_on_the_flip(
+    core, engine, text: str, offset: float, scope, bodies, t_start, t_end, times: Sequence[float]
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    """Each of *times* moved onto the first double at which the model's
+    evaluator reads the condition's new value, as ``(time, counter value)``,
+    and after them any change of it at the ends of the run that *times* does
+    not list; ``None`` where the evaluator cannot be asked (issue #891).
+
+    The resolvers work a stop out from folded constants: a period, an offset
+    and a duty, or ``(n - beta)/alpha``. That is not the arithmetic the
+    evaluator computes the condition with, and the stop can sit before the
+    double the condition changes on. The run then restarts on the branch that
+    just ended, and the jump falls inside the first step after the restart,
+    which has no history to see it with. With the clock read bare the two are
+    a double of the time apart, and the error (3e-6 at rtol 1e-8 with a period
+    of 0.3) did not follow the tolerance down. With an offset in the argument
+    they are up to a double of the *argument* apart, which is 1.2e-4 of time
+    at ``1e12 + time()``: billions of doubles of the clock.
+
+    So the evaluator is asked. First on the doubles around each stop, which
+    is where a condition on the bare clock changes; then, for a stop with no
+    change that near, between the two times half way to its neighbours, by
+    bisection. A stop with no change of the condition between those is left
+    where it was put, and so is one whose neighbours crowd it out: a change
+    further from its stop than half the way to the next is not this stop's.
+
+    *engine* makes the condition for the evaluator and is called only where
+    the answer is not remembered; *text* is the condition with its counter
+    written as time, which with the window and the times is what it is
+    remembered under.
+    """
+    import numpy as np
+
+    from bngsim import _clock_scan
+
+    if not times:
+        return None
+
+    def resolve():
+        asked = engine()
+        if asked is None or asked.kind not in ("comparison", "truth", "value"):
+            return None
+        shift = asked.shift
+
+        def ev(expr, at):
+            return asked.evaluate(core, expr, at)
+
+        if asked.kind == "value":
+            # What the call holds from one jump to the next: its value where it
+            # steps, the whole number it takes off its argument where it is a
+            # sawtooth.
+            held = _clock_scan._held(ev, asked.text)
+            if held is None:
+                return None
+            reading, by = held.reading, held.by
+        else:
+
+            def reading(at):
+                values = ev(asked.text, at)
+                return np.where(np.isnan(values), 2.0, (values != 0.0).astype(float))
+
+            by = 0.0
+
+        def differ(a, b):
+            return _clock_scan._differs(a, b, by)
+
+        order = np.argsort(np.asarray(times, dtype=float), kind="stable")
+        at = np.asarray(times, dtype=float)[order] + shift
+        moved = at.copy()
+        try:
+            # The doubles around each stop, a block of stops at a time: the
+            # grid and its readings for a million stops at once took 1.2 GB.
+            reach = _FLIP_REACH
+            gaps = np.arange(2 * reach)
+            # The change nearest the stop as placed; of two as near, the later.
+            near = np.abs(gaps + 0.5 - reach)[None, :] - 1e-3 * gaps[None, :]
+            found = np.zeros(at.size, dtype=bool)
+            for lo_i in range(0, at.size, _FLIP_BLOCK):
+                block = at[lo_i : lo_i + _FLIP_BLOCK]
+                grid = np.empty((block.size, 2 * reach + 1))
+                grid[:, reach] = block
+                down = up = block
+                for j in range(1, reach + 1):
+                    down = np.nextafter(down, -np.inf)
+                    up = np.nextafter(up, np.inf)
+                    grid[:, reach - j] = down
+                    grid[:, reach + j] = up
+                read = reading(grid.ravel()).reshape(grid.shape)
+                changed = differ(read[:, 1:], read[:, :-1])
+                pick = np.argmin(np.where(changed, near, np.inf), axis=1)
+                hit = changed.any(axis=1)
+                rows = np.nonzero(hit)[0]
+                moved[lo_i + rows] = grid[rows, pick[rows] + 1]
+                found[lo_i : lo_i + block.size] = hit
+            far = np.nonzero(~found)[0]
+            if far.size:
+                # Between the times half way to its neighbours, and inside the
+                # run: one side of the change at one end, the other at the other.
+                lo, hi = float(t_start) + shift, float(t_end) + shift
+                mid = 0.5 * (at[:-1] + at[1:])
+                a = np.concatenate(([lo], mid))[far]
+                b = np.concatenate((mid, [hi]))[far]
+                side_a, side_b = reading(a), reading(b)
+                across = differ(side_a, side_b) & (b > a)
+                if across.any():
+                    low = side_a[across]
+
+                    def side_of(t, rows):
+                        # On the low end's side or not: a third reading, where
+                        # more than one change lies between, is not.
+                        return np.where(differ(reading(t), low[rows]), 1.0, 0.0)
+
+                    moved[far[across]] = _clock_scan._bisect(
+                        side_of, a[across], b[across], np.zeros(int(across.sum()))
+                    )
+            # A change the resolvers put on the run's last instant or past it,
+            # or on its first or before it, they do not list, and the
+            # evaluator can have it inside the run: the wrap of
+            # `mod(1e12 + time(), 0.125)` that ends a run of whole periods is
+            # half a double of the argument before the end. So the reading
+            # after the last stop is held against the one on the run's last
+            # instant, and the reading on its first against the one before the
+            # first stop.
+            more: list[float] = []
+            lo, hi = float(t_start) + shift, float(t_end) + shift
+            first, last = float(np.min(moved)), float(np.max(moved))
+            below = float(np.nextafter(first, -np.inf))
+            for a, b in ((last, hi), (lo, below)):
+                if not b > a:
+                    continue
+                ends = reading(np.array([a, b]))
+                if differ(ends[:1], ends[1:])[0]:
+
+                    def side_at_an_end(t, rows, low=ends[:1]):
+                        return np.where(differ(reading(t), low[rows]), 1.0, 0.0)
+
+                    more.append(
+                        float(
+                            _clock_scan._bisect(
+                                side_at_an_end, np.array([a]), np.array([b]), np.zeros(1)
+                            )[0]
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - the stops stand as placed
+            logger.debug("stops on the flip: %r not evaluated (%s)", text, exc)
+            return None
+        back = np.empty_like(moved)
+        back[order] = moved
+        return [shift, back.tolist(), more]
+
+    key = (
+        "flip",
+        tuple(times) if len(times) <= 64 else (len(times), times[0], times[-1], math.fsum(times)),
+        *_stop_memo_key(
+            _inline_function_slots(text, bodies) if bodies else text, scope, t_start, t_end
+        ),
+    )
+    answer = _memoized_stops(key, resolve)
+    if answer is None:
+        return None
+    shift, moved, more = answer
+
+    def stop(c):
+        return (c - shift, c) if shift else (c, c + offset)
+
+    return [stop(c) for c in moved], [stop(c) for c in more]
 
 
 # Grid cells the evaluator is asked on when a resolver's stops are checked.
@@ -4936,7 +5230,10 @@ def merge_crossing_stops(found: Sequence[CrossingStop], floor: float = 1.0) -> l
     In time order each needs only the last one kept: comparing each against
     every one kept was quadratic, and a step of time can put thousands of stops
     in a window (issue #869). On one instant a touch of a threshold wins, then a
-    counter's stop, then the later of two on literal time. The merged stop
+    counter's stop, then, of two on literal time, the later; of a stop moved
+    onto its condition's change (issue #891) and one on the same double, the
+    one left in place; and where a moved stop is beside one on another double,
+    every stop goes back to where the resolvers put it. The merged stop
     restarts the integrator if any of them does.
 
     *floor* as for :func:`_same_instant`. With 1 under a plain run, an event
@@ -4944,6 +5241,30 @@ def merge_crossing_stops(found: Sequence[CrossingStop], floor: float = 1.0) -> l
     loop does not take for the same instant; the event was left to the root
     search and ran after a delayed execution due 65 doubles after it.
     """
+    # Issue #891: a stop moved onto its condition's change beside another on a
+    # double or two from it is one the run cannot take apart from it (it takes
+    # the second as reached where it restarts on the first), and no one stop is
+    # right for both conditions: folded onto the later, the step arriving
+    # there crossed the earlier change and read its new branch (S 6.8e-6 off
+    # in a slide model); onto the earlier, the law that changes later
+    # restarted a double before its own change (`time() - P*floor(time()/P)`
+    # beside `mod(time(), P)`: 305 times rtol, main 33); onto a moved one, an
+    # event trigger's stop was read a double late. Where any is, every stop
+    # goes back to where the resolvers put it, and the run is main's.
+    if any(stop.on_flip for stop in found) and any(
+        (a.on_flip or b.on_flip) and a.time != b.time and _same_instant(a.time, b.time, floor)
+        for a, b in zip(found, found[1:], strict=False)
+    ):
+        found = sorted(
+            (
+                stop._replace(
+                    time=stop.placed if stop.on_flip and stop.placed is not None else stop.time,
+                    on_flip=False,
+                )
+                for stop in found
+            ),
+            key=lambda stop: stop.time,
+        )
     out: list[CrossingStop] = []
     for stop in found:
         if not out or not _same_instant(stop.time, out[-1].time, floor):
@@ -4967,6 +5288,12 @@ def merge_crossing_stops(found: Sequence[CrossingStop], floor: float = 1.0) -> l
             # short and the counter's own condition reading false.
             out[-1] = stop
         elif stop.clock_species_idx < 0 and out[-1].clock_species_idx < 0:
+            if stop.on_flip or out[-1].on_flip:
+                # On one double (crowded ones are main's, above): one stop, the
+                # one left in place if one is.
+                if not stop.on_flip:
+                    out[-1] = stop
+                continue
             # Two on literal time: the later one. A periodic stop lands past
             # its crossing on purpose (issue #714), and a linear crossing at
             # the same instant is behind it too; the earlier one left the
@@ -5087,7 +5414,9 @@ def piecewise_constant_time_functions(
         return []
     out = []
     for name, expr in clock_functions:
-        rest = expr
+        # Spelled as the recovered conditions are (issue #1127), or a condition
+        # found in a `%` text could not be found in it again.
+        rest = _spell_mod(expr)
         for c in exact:
             rest = _remove_whole_atoms(rest, c)
         if not _ANY_CLOCK.search(rest):
@@ -5180,6 +5509,19 @@ _STEP_CALL = re.compile(
     r"(?:floor|ceil|round|roundn|rint|nint|trunc|frac|sign|sgn|mod|fmod|rem|iclamp|inrange)"
     r"\s*\("
 )
+
+
+def _scan_function_map(ctx) -> dict:
+    """``ctx["function_map"]`` with each body as the scanners read it (:func:`_spell_mod`)."""
+    return {
+        name: _spell_mod(body) if isinstance(body, str) else body
+        for name, body in dict(ctx["function_map"]).items()
+    }
+
+
+def _scan_rate_law(rxn) -> str:
+    """A functional reaction's rate law as the scanners read it (:func:`_spell_mod`)."""
+    return _spell_mod(str(rxn.get("rate_expr", "")))
 
 
 # Calls that bend rather than jump: continuous, with a slope that is not. A
@@ -5420,10 +5762,10 @@ def model_moving_crossings(core, ctx=None) -> tuple[str, ...]:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     stepped = [t for t in texts if _STEP_CALL.search(t)]
@@ -5517,14 +5859,14 @@ def model_uncompensated_crossing_reason(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     # Reaction rate expressions only — the exact texts _functional_dfdp_terms
     # differentiates (frxn["rate_expr"] per functional reaction). A function that
     # no rate law reaches is inert here, so it is never scanned. Inlined BEFORE
     # the condition test and the recognizer, exactly as codegen inlines it: a
     # rate law written as a bare function name — or one nesting the condition a
     # level down — only reveals its ``if()`` after inlining.
-    texts = [str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]]
+    texts = [_scan_rate_law(r) for r in ctx["functional_reactions"]]
     flats = [_inline_functions(t, func_map) or t for t in texts]
     conditional = [f for f in flats if has_condition_construct(f)]
     if not conditional:
@@ -6607,7 +6949,7 @@ def fallback_crossing(
     requested = frozenset(sens_param_names)
     param_names = list(core.param_names)
     is_expr = list(core.param_is_expression)
-    exprs = list(core.param_expressions)
+    exprs = [_spell_mod(e) for e in core.param_expressions]
     derived = {
         param_names[i]: exprs[i] for i in range(len(param_names)) if is_expr[i] and exprs[i]
     }
@@ -6684,8 +7026,8 @@ def fallback_crossing(
         return None
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    texts = [str(reaction.get("rate_expr", "")) for reaction in ctx["functional_reactions"]]
+    func_map = _scan_function_map(ctx)
+    texts = [_scan_rate_law(reaction) for reaction in ctx["functional_reactions"]]
     # A table a rate law reads is indexed by what its index reads, which the
     # law's text, ``tfun_g()``, does not show. Where the index is a function,
     # ``tfun([0,1],[0,3], h)`` with ``h() = if(Aobs<thr,1,0)``, the
@@ -7696,12 +8038,12 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
         return []
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
-    bodies = list(func_map.values())
-    # Same cheap first gate as compute_switch_time_sens: no `if()` anywhere
-    # means no branch to cross, and no RHS probe is paid.
-    if not any(_IF_CALL.search(body) for body in bodies):
+    # Same cheap first gate as compute_switch_time_sens, on the raw bodies: no
+    # `if()` anywhere means no branch to cross, and no RHS probe is paid.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return []
+    func_map = _scan_function_map(ctx)
+    bodies = list(func_map.values())
 
     scope = switch_condition_scope(core, ctx)
     conditions: list[str] = []
@@ -7775,7 +8117,7 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
         return out
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -7797,7 +8139,7 @@ def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[li
     if not wanted:
         return out
     for rxn in ctx["functional_reactions"]:
-        flat = inline(str(rxn.get("rate_expr", "")))
+        flat = inline(_scan_rate_law(rxn))
         hit: set[int] = set()
         if _IF_CALL.search(flat):
             for written in _iter_condition_atoms(flat):
@@ -7902,7 +8244,7 @@ def state_switch_root_conditions(
         return bool(
             _IF_CALL.search(text)
             or _RELATIONAL.search(text)
-            or _STEP_CALL.search(text)
+            or _STEP_CALL.search(_spell_mod(text))
             or _BEND_CALL.search(text)
         )
 
@@ -7910,7 +8252,7 @@ def state_switch_root_conditions(
         return ((), ()) if with_guards else ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
 
     def inline(text: str) -> str:
@@ -7969,7 +8311,7 @@ def state_switch_root_conditions(
     # Every `if()` a rate law reads, visited once: in the rate law's own text or
     # in a function it reaches. Flattening each rate law whole would visit a
     # shared function's conditions once per rate law that reaches it.
-    rate_laws = dict.fromkeys(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"])
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
     reached: dict[str, None] = {}
     pending = [n for text in rate_laws for n in _IDENT_RE.findall(text) if n in func_map]
     while pending:
@@ -8118,10 +8460,10 @@ def switch_gate_cache_digest(core, ctx=None) -> tuple:
         return ()
     if ctx is None:
         ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
+    func_map = _scan_function_map(ctx)
     texts = [
         *func_map.values(),
-        *(str(r.get("rate_expr", "")) for r in ctx["functional_reactions"]),
+        *(_scan_rate_law(r) for r in ctx["functional_reactions"]),
     ]
     conditional = [t for t in texts if has_condition_construct(t)]
     if not conditional:
@@ -9333,15 +9675,16 @@ def compute_switch_time_sens(
         return [], []
 
     ctx = core.functional_jacobian_context()
-    func_map = dict(ctx["function_map"])
     # Cheapest possible gate, checked before anything else: a model with no
     # conditional rate law has no switch to find. On the RAW bodies, so a
     # genome-scale model with tens of thousands of functions and no `if()`
     # short-circuits before any inlining — inlining cannot create an `if()` that
-    # no body already has. Keeps the RHS probes and the sympy work off the path
-    # of every ordinary sensitivity run, including the per-row batch path.
-    if not any(_IF_CALL.search(body) for body in func_map.values()):
+    # no body already has, and neither can spelling a `%` as `mod()`. Keeps the
+    # RHS probes and the sympy work off the path of every ordinary sensitivity
+    # run, including the per-row batch path.
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
         return [], []
+    func_map = _scan_function_map(ctx)
     # Inline function references before scanning, exactly as the issue #150 state
     # detector (:func:`state_switch_conditions`) already does — "the gate and the
     # detector must scan the SAME text". A clock threshold can hide behind a
@@ -9668,7 +10011,7 @@ def _threshold_scope(scope: SwitchConditionScope, ctx) -> ThresholdScope:
     exprs = dict(scope.derived_exprs)
     rule_bound = {
         name: body
-        for name, body in dict(ctx["function_map"]).items()
+        for name, body in _scan_function_map(ctx).items()
         if name in scope.param_idx and body
     }
     # `f(` anywhere means a call — a rule over floor()/if() is not arithmetic
@@ -9778,7 +10121,7 @@ def compute_event_time_sens(
     # parameter. Kept separate from `thresholds.exprs`, which admits only the
     # bodies that reduce to arithmetic over primaries.
     all_bodies = dict(scope.derived_exprs)
-    all_bodies.update({n: b for n, b in dict(ctx["function_map"]).items() if b})
+    all_bodies.update({n: b for n, b in _scan_function_map(ctx).items() if b})
     requested = set(names)
     # A requested parameter that is itself derived gets a column of its own, on
     # the same terms the rate-law switch times use (issue #475). Restricted to

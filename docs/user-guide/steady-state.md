@@ -6,9 +6,11 @@ BNGsim includes a steady-state solver for finding f(y) = 0 — the equilibrium
 where all species concentrations stop changing. This is essential for
 dose-response curves, bifurcation analysis, and fitting steady-state data.
 
-All paths share **one** convergence criterion, matching BNG2.pl's
+By default all paths share **one** convergence criterion, matching BNG2.pl's
 `run_network -c`: the parity residual `||f(y)||_2 / n_species < tol`. This is
-the same quantity `run(steady_state=True)` checks (see below).
+the same quantity `run(steady_state=True)` checks (see below). The opt-in
+`criterion="scaled"` asks every path a test in the model's own units instead
+(see [Convergence in the model's units](#convergence-in-the-models-units)).
 
 **`method="integration"` (default)**: CVODE BDF integration that marches
 forward one step at a time and stops when the parity residual
@@ -65,6 +67,61 @@ always echoed in `ss.method_used`).
 > The old `method="auto"` and the `max|f|` / geometric-time-horizon Tier-1
 > criterion were removed: `"newton"` already means integrate-then-polish-with-
 > fallback, and every integration path now uses the single `||f||_2/n` rule.
+
+### Convergence in the model's units
+
+`||f(y)||_2 / n_species` is a rate, in the model's units of concentration per
+unit time, so `tol` means something different for every model. A model in
+molar units, or a slow one, is under it far from its steady state: the cubic
+`X' = -k·x·(x - 0.3)·(x - 1)` at a scale of 1e-9 came back `converged=True` at
+x = 0.894, 1.003 and 0.131 after one step, where every run ends at 1 (issue
+#1001).
+
+`steady_state(criterion="scaled")` (and `steady_state_batch`) accepts a state
+when the Newton step from it to the root, `δ = −J⁻¹f` on the system with the
+conserved totals taken out, is within each species' own tolerance:
+
+`|δ_i| ≤ rtol·|y_i| + atol_i`, with `atol_i = rtol·max(|y_i|, floor)`
+
+The floor is the smallest positive initial concentration of a species that is
+not `$`-fixed, or, where none starts above 0, the largest species of the state
+or of the root it steps to. A species that starts at 0 is held to `rtol` times
+the floor, as under `atol="auto"`: one whose steady state is smaller than that is
+within tolerance of 0. `mask=` says which species are measured, not which move:
+the step moves every species by its own equation but a `$`-fixed one and a
+masked one that nothing reads (a write-only sink) or that reads nothing (a
+counter run at a constant rate), which is held.
+Neither side has a unit of concentration or of time in it. The
+march, the bursts, the KINSOL polish and the test at the start all ask it.
+Where neither `atol=` nor `set_tolerances` gives an `atol`, the march takes
+`atol="auto"`.
+
+```python
+ss = sim.steady_state(criterion="scaled")
+ss.criterion          # "scaled"
+ss.newton_distance    # the step in those units; at most 1 is accepted
+```
+
+What it does not do:
+
+- **A singular reduced Jacobian is not certified.** Where the Jacobian at the
+  state is singular, the state is accepted only if `f` is 0 there, and
+  `newton_distance` is `inf` otherwise. Across the corpus a least-squares step
+  at those states would have accepted states that a run moves by more than 1%.
+- **A differenced Jacobian across a jump** in a rate law (an `if()` the state
+  sits on) is not certified either: there the quotient is the jump over the
+  step, and the step through it says nothing.
+- **A slope steep enough to hide a floor** can pass. The distance is first
+  order: `X' = 0.001 + 1e8·|X - 1|` has no root, but its slope at the kink makes
+  the step 5e-12, within tolerance. Checking the step on the right-hand side
+  refused that, and 63 corpus models' genuine roots with it.
+- **More than 512 unknowns** take no step, and the solve is the residual one,
+  `tol` and all; `ss.criterion` then says `"residual"`.
+- **A root the dynamics leave** can still pass: the test is a distance to a
+  root, not a run taken on from it.
+
+`criterion="residual"` stays the default until a run taken on from the state
+is part of the test too.
 
 Every path evaluates whatever RHS the Simulator's
 [`codegen_backend`](codegen.md) reports — the compiled `.so`, the in-process MIR

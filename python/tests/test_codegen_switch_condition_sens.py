@@ -396,17 +396,18 @@ class TestTheRule:
     @pytest.mark.parametrize(
         ("body", "fragment"),
         [
-            ("beta*abs(I)", "abs()"),
-            ("beta*max(I,1)", "max()"),
-            ("beta*min(I,1)", "min()"),
+            ("if(I > 3, beta*abs(I), 0)", "abs()"),
+            ("if(I > 3, beta*max(I,1), 0)", "max()"),
+            ("if(I > 3, beta*min(I,1), 0)", "min()"),
             ("beta*floor(I)", "floor()"),
         ],
     )
     def test_the_non_conditional_constructs_are_still_refused(self, tmp_path, body, fragment):
         """``allow_conditions`` waives the branch-selecting class and nothing
-        else. A kink in the *state* has no crossing time, so there is no #48
+        else. A step in the *state* has no crossing time, so there is no #48
         jump that could compensate it and no version of this gate that admits
-        it."""
+        it. A bend is differentiated in a model with no condition (issue
+        #1126), and refused beside one, as here."""
         terms, reason = _decline(tmp_path, _with_law(body))
         assert terms == {}
         assert reason is not None and fragment in reason
