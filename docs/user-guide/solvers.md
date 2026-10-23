@@ -484,6 +484,31 @@ than that. `mod(time(), 0.0003)` over 10 time units (33,000 stops) accumulates
 1.5e-3, which the default `atol` of 1e-8 does not resolve and `atol=1e-14`
 does to 2e-8. Tighten `atol` where a run has many stops and small quantities.
 
+A stop sits on the first double at which the model's own arithmetic reads
+the rate law's new value, found by asking the evaluator: an edge worked out
+from a period and an offset can be a double away from it, and with an offset
+in the argument (`mod(1e12 + time(), 0.3)`) billions of doubles of the clock
+(issue #891). The compiled right-hand side is built without fused
+multiply-add (issue #963), so it changes on the same double as the
+interpreter. A condition an event's trigger reads keeps its stop where it
+was put, as does every condition in a run with sensitivity columns or at an
+`rtol` of 1e-3 or looser. In a run where a moved stop would sit a double or
+two from another stop (two spellings of one schedule, or another switch on
+one of its edges), every stop of the run is where it was put: the run takes
+the second of two such as reached where it restarts on the first, and
+neither alone is right for both conditions.
+
+CVODE takes a stop as reached once a step ends within 100 doubles' worth of
+its time, about 2.2e-14*t, and does not integrate what is left. Where a rate
+jumps on a stop by so much that that time's worth of the jump would be a tenth
+of the tolerance or more, a run with no sensitivity columns stops CVODE on the
+double before the stop, integrates that double on the branch that ends, and
+takes the stop from there: stopped on the stop itself, a dose schedule
+started at t = 1e6 lost 2e-8 at each stop where it switched off, 180 times
+rtol at 1e-9 (issue #891). Elsewhere the step that reaches a stop reads the
+new branch and, at a tight tolerance, fails on the jump, so the integrator
+walks the stretch before it, which is how a pulse inside it is found.
+
 Where the rate law is flat at a restart, the integrator's first step has
 nothing to measure its error by, and the steps after it grow as far as the
 integrator lets them (10,000 times the first, then ten times each) until one
