@@ -132,3 +132,86 @@ def test_every_column_is_a_difference_of_runs(tmp_path, law):
             for v in (base[name] + h, base[name] - h)
         ]
         np.testing.assert_allclose(sens[:, j], (y[0] - y[1]) / (2 * h), atol=5e-5, err_msg=name)
+
+
+# ─── A tie held over the run ─────────────────────────────────────────────────
+#
+# A, B and C are made and spent by the same reactions, so A == B == C for the
+# whole run, and every min() / max() of them sits on its bend. sympy's
+# d/dA Max(A, B) is Heaviside(A − B), and spelled ``if(u >= 0, 1, 0)`` both
+# arguments got the weight 1 at a tie: J·s counted dA/dkp twice. dY/dkp was
+# 5.77 for 2.88 on a run, and dX*/dkp at the steady state -3 for -1.5 (-4.5 for
+# three arguments), the latter on main too. A tie now splits the weight.
+
+TIE_NET = """begin parameters
+    1 kp 1.0
+    2 kd 0.5
+    3 kc 0.1
+    4 kx {kx!r}
+end parameters
+begin functions
+    1 f() {law}
+end functions
+begin species
+    1 A() 0
+    2 B() 0
+    3 C() 0
+    4 X() 10
+    5 Y() 0
+end species
+begin reactions
+    1 0 1 kp
+    2 0 2 kp
+    3 0 3 kp
+    4 1 0 kd
+    5 2 0 kd
+    6 3 0 kd
+    7 4 5 f
+    8 0 4 kx
+end reactions
+begin groups
+    1 Aobs 1
+    2 Bobs 2
+    3 Cobs 3
+end groups
+"""
+
+TIES = [
+    "kc*min(Aobs,Bobs)",
+    "kc*max(Aobs,Bobs)",
+    "max(kc*Aobs,kc*Bobs)",
+    "kc*min(Aobs,Bobs,Cobs)",
+    "kc*max(Aobs,Bobs,Cobs)",
+]
+
+
+def _tie_model(tmp_path, law: str, kx: float) -> bngsim.Model:
+    path = tmp_path / "tie.net"
+    path.write_text(TIE_NET.format(law=law, kx=kx))
+    return bngsim.Model.from_net(str(path))
+
+
+@pytest.mark.parametrize("law", TIES)
+def test_a_held_tie_is_counted_once_on_a_run(tmp_path, law):
+    """With kx = 0, X = 10·exp(−kc·I) for I = ∫A = (kp/kd)(t − (1 − e^{−kd t})/kd),
+    so dY/dkp = X·kc·I/kp and dY/dkc = X·I."""
+    sim = bngsim.Simulator(
+        _tie_model(tmp_path, law, 0.0), method="ode", sensitivity_params=["kp", "kc"]
+    )
+    assert sim.has_analytic_sens_rhs
+    run = sim.run(t_span=(0.0, 4.0), n_points=5, rtol=1e-10, atol=1e-12)
+    integral = 2.0 * (4.0 - (1.0 - math.exp(-2.0)) / 0.5)
+    x = 10.0 * math.exp(-0.1 * integral)
+    np.testing.assert_allclose(
+        np.asarray(run.sensitivities)[-1, 4, :], [x * 0.1 * integral, x * integral], rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize("law", [TIES[0], TIES[4]])
+def test_a_held_tie_is_counted_once_at_a_steady_state(tmp_path, law):
+    """A* = kp/kd = 2 and X* = kx/(kc·A*) = 1.5, so dX*/dkp = −1.5 and dX*/dkc = −15."""
+    model = _tie_model(tmp_path, law, 0.3)
+    ss = bngsim.Simulator(model, method="ode").steady_state(
+        method="newton", sensitivity_params=["kp", "kc"], mask=~model.is_pure_sink()
+    )
+    np.testing.assert_allclose(np.asarray(ss.sensitivity)[3, :], [-1.5, -15.0], rtol=1e-6)

@@ -865,27 +865,44 @@ def _kink_bindings(sp) -> dict:
             def fdiff(self, argindex=1):
                 return sp.sign(self.args[0])
 
-        bindings = {"absval": absval}
+        # Issue #1126: sympy's d/da Max(a1, …, an) is Heaviside(a1 − Max(a2, …,
+        # an)), a half at a tie, so a tie of n arguments weighs n/2 in all. These
+        # binary twins, folded by _prepare_kinks, weigh any tie 1, split as
+        # absval's sign(0) = 0 splits one: what a central difference reads there.
+        def binary(name: str, sign: int):
+            def fdiff(self, argindex=1):
+                a, b = self.args if argindex == 1 else self.args[::-1]
+                return sp.Heaviside(sign * (a - b), sp.S.Half)
+
+            return type(name, (sp.Function,), {"nargs": 2, "fdiff": fdiff})
+
+        bindings = {
+            "absval": absval,
+            "maxval": binary("maxval", 1),
+            "minval": binary("minval", -1),
+        }
         _kink_sympy_cache["bindings"] = bindings
     return bindings
 
 
 def _prepare_kinks(expr, targets: set[str]):
     """Before differentiation (issue #507): every ``Abs`` over a differentiation
-    variable becomes the ``absval`` twin of :func:`_kink_bindings`. ``Max`` and
-    ``Min`` need nothing here — sympy differentiates them to products of
-    ``Heaviside`` over their argument differences, which :func:`_finish_kinks`
-    spells — and neither does an ``Abs`` over parameters only, which is a value
-    factor of the derivative and prints best as ``abs(k)``. The walk skips the
-    condition half of every ``Piecewise`` pair for the reason
-    :func:`_nondifferentiable_over` gives: a condition is copied through
-    undifferentiated, so an ``Abs`` inside one is fine as it is.
+    variable becomes the ``absval`` twin of :func:`_kink_bindings`, and every
+    ``Max`` / ``Min`` over one a fold of the binary ``maxval`` / ``minval`` twins
+    (issue #1126), whose derivative splits a tie. Neither is needed over
+    parameters only, where the call is a value factor of the derivative and
+    prints best as itself. The walk skips the condition half of every
+    ``Piecewise`` pair for the reason :func:`_nondifferentiable_over` gives: a
+    condition is copied through undifferentiated, so a call inside one is fine
+    as it is.
     """
     try:
         import sympy as sp
     except ImportError:
         return expr
-    absval = _kink_bindings(sp)["absval"]
+    kinks = _kink_bindings(sp)
+    absval = kinks["absval"]
+    folds = {sp.Max: kinks["maxval"], sp.Min: kinks["minval"]}
 
     def touches(node) -> bool:
         return bool({str(sym) for sym in node.free_symbols} & targets)
@@ -900,27 +917,73 @@ def _prepare_kinks(expr, targets: set[str]):
             node = node.func(*new_args)
         if isinstance(node, sp.Abs) and touches(node):
             return absval(node.args[0])
+        if type(node) in folds and touches(node):
+            # A left fold, since sympy flattens a nested Max: the weights of a
+            # three-way tie are 1/4, 1/4, 1/2, and still sum to 1.
+            return functools.reduce(folds[type(node)], node.args)
         return node
 
     return walk(expr)
 
 
 def _finish_kinks(deriv):
-    """After differentiation (issue #507): ``Heaviside(u)`` — what ``d/da Max(a,
-    b)`` is — becomes ``Piecewise((1, u >= 0), (0, True))``, the step the emitters
-    print as ``if()``; and ``absval`` goes back to ``Abs`` so a value factor
-    prints as ``abs()``. At ``u = 0`` the value is a tie of the ``max``: a
-    switching surface, where the C++ self-check judges nothing (issue #511)."""
+    """After differentiation (issue #507): each twin of :func:`_prepare_kinks`
+    goes back to its call, so a value factor prints as ``abs()``, ``max()`` or
+    ``min()``; and ``Heaviside(u, h)``, what the twins differentiate to, becomes
+    the step the emitters print as ``if()``, ``h`` at ``u = 0``. That was 1, and
+    at a tie of ``min(A, B)`` over an ``A == B`` two symmetric reactions hold
+    for the whole run, J·s counted dA/dp twice: dY/dkp 5.77 for 2.88 (issue
+    #1126). It is spelled as a blend of two one-condition steps, since sympy's
+    Piecewise collapse recurses without end on a three-branch one over a nested
+    min / max. A tie is a switching surface, where the C++ self-check judges
+    nothing (issue #511)."""
     try:
         import sympy as sp
     except ImportError:
         return deriv
-    absval = _kink_bindings(sp)["absval"]
+    kinks = _kink_bindings(sp)
+    absval = kinks["absval"]
+    folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
-        lambda n: sp.Piecewise((sp.Integer(1), n.args[0] >= 0), (sp.Integer(0), True)),
+        lambda n: (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
+        + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True)),
     )
-    return deriv.replace(lambda n: isinstance(n, absval), lambda n: sp.Abs(n.args[0]))
+    memo: dict = {}
+
+    def back(node):
+        if not node.args:
+            return node
+        out = memo.get(node)
+        if out is not None:
+            return out
+        if type(node) in folds:
+            # One call over every leaf of the fold, unevaluated: the leaves are
+            # the arguments of a Max sympy has already simplified. Rebuilt a
+            # level at a time and evaluated, as ``replace`` does, each Max
+            # re-ran its local-zero search over all the arguments it flattens,
+            # and a max of 16 took 11 s to differentiate.
+            leaves, stack = [], [node]
+            while stack:
+                n = stack.pop()
+                if type(n) is type(node):
+                    stack.extend(reversed(n.args))
+                else:
+                    leaves.append(back(n))
+            out = folds[type(node)](*leaves, evaluate=False)
+        else:
+            args = [back(a) for a in node.args]
+            out = (
+                node.func(*args)
+                if any(a is not o for a, o in zip(args, node.args, strict=True))
+                else node
+            )
+            if type(out) is absval:
+                out = sp.Abs(out.args[0])
+        memo[node] = out
+        return out
+
+    return back(deriv)
 
 
 # ─── Issue #1128: a rounding call over the state ──────────────────────────
