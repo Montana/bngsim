@@ -5591,11 +5591,14 @@ static constexpr double kDriftAtLeast = 10.0;
 // times max_steps at most (at an rtol of kRunRtolLeast at least). Returns the
 // largest move of a measured species from `y` over its tolerance
 // (ss_scaled_tolerance), and for a kicked run that over 10·(1 + 2k): what the
-// kick may not grow to, k the larger of the species' own kick and the largest
-// of the unknowns', each in its own tolerances. Not the largest of any
-// species': a dependent cut to 500 of its tolerances, in a law that touched
-// nothing else, let every species move 1e4, and an unstable root beside it go
-// 5e3 to its next root. +inf where the run cannot be taken to
+// kick may not grow to, k the largest kick, each in its own tolerances, among
+// the species it is coupled to through the Jacobian's structure (where the
+// model has none, its own or the largest of the unknowns'). Not the largest of
+// any species': a dependent cut to 500 of its tolerances, in a law that
+// touched nothing else, let every species move 1e4, and an unstable root
+// beside it go 5e3 to its next root. Nor its own or the unknowns' alone:
+// egfr_simple's and air_travel_model's kicks, on their continua, landed a
+// species 47 and 8 times that away. +inf where the run cannot be taken to
 // its time (the integrator gives up past kHoldRestarts restarts, or the steps
 // run out). The model's state is left as it was.
 //
@@ -5638,6 +5641,9 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     // chosen (the unknowns', not the dependents' that follow them).
     std::vector<double> kicked(un, 0.0);
     double chosen = 0.0;
+    // The largest kick, each in its own tolerance, of the species each one is
+    // coupled to through the Jacobian's structure.
+    std::vector<double> coupled(un, 0.0);
     if (kick_size > 0.0) {
         const SsDistanceSystem system = ss_distance_system(model, sub);
         const ConservationLaws &cl = system.laws;
@@ -5716,6 +5722,40 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
         }
         for (int i : system.unknowns)
             chosen = std::max(chosen, kicked[static_cast<size_t>(i)]);
+        const JacobianSparsity &pattern = model.jacobian_sparsity();
+        if (pattern.n == ns) {
+            std::vector<int> group(un);
+            for (int i = 0; i < ns; ++i)
+                group[static_cast<size_t>(i)] = i;
+            const auto find = [&](int i) {
+                while (group[static_cast<size_t>(i)] != i) {
+                    group[static_cast<size_t>(i)] =
+                        group[static_cast<size_t>(group[static_cast<size_t>(i)])];
+                    i = group[static_cast<size_t>(i)];
+                }
+                return i;
+            };
+            for (int j = 0; j < ns; ++j) {
+                for (int64_t k = pattern.col_ptrs[static_cast<size_t>(j)];
+                     k < pattern.col_ptrs[static_cast<size_t>(j) + 1]; ++k) {
+                    const int a =
+                        find(static_cast<int>(pattern.row_indices[static_cast<size_t>(k)]));
+                    const int b = find(j);
+                    if (a != b)
+                        group[static_cast<size_t>(a)] = b;
+                }
+            }
+            std::vector<double> largest_in(un, 0.0);
+            for (int i = 0; i < ns; ++i) {
+                const auto g = static_cast<size_t>(find(i));
+                largest_in[g] = std::max(largest_in[g], kicked[static_cast<size_t>(i)]);
+            }
+            for (int i = 0; i < ns; ++i)
+                coupled[static_cast<size_t>(i)] = largest_in[static_cast<size_t>(find(i))];
+        } else {
+            for (size_t i = 0; i < un; ++i)
+                coupled[i] = std::max(kicked[i], chosen);
+        }
     }
 
     SteadyStateOptions run_opts = opts;
@@ -5760,7 +5800,7 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
                 if (d > 0.0) {
                     double m = d / ss_scaled_tolerance(opts, i, y[ui], largest);
                     if (kick_size > 0.0)
-                        m /= 10.0 * (1.0 + 2.0 * std::max(kicked[ui], chosen));
+                        m /= 10.0 * (1.0 + 2.0 * coupled[ui]);
                     moved = std::max(moved, m);
                 }
             }
