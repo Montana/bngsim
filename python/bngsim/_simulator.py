@@ -4416,17 +4416,43 @@ class Simulator:
             )
         return vec
 
-    def _steady_state_atol(self, atol: AtolLike | None, criterion: str) -> AtolLike | None:
-        """The march's ``atol`` for a steady-state solve (issue #1001).
+    def _steady_state_atol(
+        self, atol: AtolLike | None, criterion: str, state=None, rtol: float | None = None
+    ) -> AtolLike | None:
+        """The march's ``atol`` for a steady-state solve, which under
+        ``criterion="scaled"`` is also the run test's (issue #1001).
 
-        Under ``criterion="scaled"`` a state is accepted within each species'
-        own tolerance, the one ``atol="auto"`` derives; a march at the scalar
-        default of 1e-8 cannot reach that for a model in small units (it runs
-        through zero first), so where neither the call nor
-        :meth:`set_tolerances` gave an ``atol`` the march takes ``"auto"``.
+        Where neither the call nor :meth:`set_tolerances` gave an ``atol``, each
+        species takes the smaller of what ``atol="auto"`` derives from ``state``
+        and the scalar default. The scalar is no tolerance for a model in small
+        units (the issue's cubic at a scale of 1e-9 ran through zero), and
+        ``"auto"`` alone none for a species that starts large and settles
+        small: one decaying from 1e7 to 7e-4 was held to 0.1. ``"auto"``'s floor
+        here is the smallest species the state holds that is not ``$``-fixed,
+        but not under double precision's resolution beside the largest: a
+        species a run left at 1e-22, or one declared at -1.6e-34
+        (MODEL2307110001), held every other at 0 to that, and its march
+        failed. Where every species not ``$``-fixed starts at 0, ``"auto"``
+        takes its own floor from every species, a ``$``-fixed one too (a
+        ``$Src`` at 1e-12 holds the rest to 1e-20). Where every species takes
+        the scalar it is passed as the scalar, whose march is the residual
+        criterion's: as a vector of equal entries, BIOMD0000000252's stalled.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
-            return "auto"
+            eff_rtol = self._rtol if rtol is None else rtol
+            values = np.abs(np.asarray(state, dtype=float))
+            free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
+            largest = float(free.max(initial=0.0))
+            positive = free[free > 0.0]
+            floor = (
+                max(float(positive.min()), float(np.finfo(float).eps) * largest)
+                if positive.size
+                else None
+            )
+            own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
+            if np.all(own == self._atol):
+                return None
+            return [float(v) for v in own]
         return atol
 
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
@@ -7355,7 +7381,7 @@ class Simulator:
         max_steps=None,
         sensitivity_params=None,
         mask=None,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Find the steady state of the ODE system f(y) = 0.
 
@@ -7367,9 +7393,9 @@ class Simulator:
 
         Solver methods:
 
-        - ``"integration"`` (default): CVODE BDF integrated until the BNG2.pl
-          parity criterion ``||f(y)||_2 / n_species < tol``
-          (``run_network -c``).
+        - ``"integration"`` (default): CVODE BDF integrated until ``criterion``
+          is met (by default ``"scaled"``; ``"residual"`` is BNG2.pl's
+          ``||f(y)||_2 / n_species < tol``, ``run_network -c``).
         - ``"newton"``: two-tier integrate-first solver. The *same* CVODE burst
           carries the state into the physical root's basin, then KINSOL
           polishes. The polish is accepted only once it is *seed-stable*
@@ -7411,54 +7437,62 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
-            Under ``criterion="scaled"`` it is read only above 512 unknowns,
-            where that criterion falls back to it.
+            Both criteria ask it.
         criterion : str
             What ``converged`` asks of a state (issue #1001).
 
-            - ``"residual"`` (default): ``||f(y)||_2 / n_species < tol``, the
-              BNG2.pl parity test. The norm is in the model's units of
-              concentration per unit time, so a model in molar units, or a
-              slow one, passes it far from its steady state.
-            - ``"scaled"``: the Newton step ``δ = −J⁻¹f`` from the state to
-              the root is within every species' own tolerance,
-              ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-              rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration of a
-              species that is not ``$``-fixed; where none starts above 0, the
-              largest species of the state or of the root it steps to). Units
-              do not change the answer. A state where the reduced Jacobian is
-              singular is not accepted unless ``f`` is 0 there, nor one where
-              a differenced Jacobian straddles a jump in a rate law. ``mask``
-              says which species are measured, not which move: the step moves
-              every species by its own equation but a ``$``-fixed one and a
-              masked one that nothing reads or that reads nothing (a counter),
-              which is held. A species that
-              starts at 0 is held to ``rtol`` times the floor, so one whose
-              steady state is smaller than that is within tolerance of 0, as
-              under ``atol="auto"``. Above
-              512 unknowns the step is not taken, the solve is the residual
-              one, and :attr:`SteadyStateResult.criterion` says
-              ``"residual"``. Where neither ``atol``
-              nor :meth:`set_tolerances` gives one, the march takes
-              ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
-              small units.
+            - ``"scaled"`` (default): the parity test,
+              ``||f(y)||_2 / n_species < tol``, and the run test. A run taken
+              on from the state for ``max_time`` (at most 1e6) moves no species
+              by more than ``rtol·|y_i| + atol_i``: what tells a state the
+              system rests at from one under ``tol`` that a run leaves (a model
+              in small units, or a slow one). An unstable root that a run from
+              it does not leave passes (the cubic's 0.3); on the Newton path
+              :attr:`SteadyStateResult.root_stability` says so. ``atol_i`` is
+              the march's own, never more than
+              ``rtol`` times the largest species the solve starts with or
+              reaches. The Newton step ``δ = −J⁻¹f`` from the state to the
+              root, within the same tolerances, decides where the solve stops
+              (up to 512 unknowns), which takes the issue's cubic at a scale
+              of 1e-9 on from 0.894 to its root at 1, and the state it stops at
+              is polished by KINSOL; the step decides nothing about
+              ``converged``. ``mask`` says which species are measured, not
+              which move: the step moves every species but a ``$``-fixed one
+              and a masked one that nothing reads or that reads nothing (a
+              counter), which is held; the run moves every species but a
+              ``$``-fixed one. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, each species is marched at
+              the smaller of what ``atol="auto"`` gives it and the scalar
+              1e-8: the scalar is no tolerance for a model in small units, nor
+              ``"auto"`` for a species that starts large and settles small.
+            - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test
+              alone, kept for comparisons with ``run_network``. The norm is in
+              the model's units of concentration per unit time, so a model in
+              molar units, or a slow one, passes it far from its steady state:
+              the cubic ``X' = -k·x·(x - 0.3)·(x - 1)`` at a scale of 1e-9 came
+              back ``converged=True`` at x = 0.894, 1.003 and 0.131 after one
+              step, where every run ends at 1.
 
-            Under ``"scaled"`` the step is reported as
+            Under ``"scaled"`` the run test and the step are reported as
+            :attr:`SteadyStateResult.continued_run_distance` and
             :attr:`SteadyStateResult.newton_distance`.
         max_time : float
-            Max integration time for the integration path. Default 1e6.
+            Max integration time for the integration path, and how long the
+            run of ``criterion="scaled"``'s run test is taken on for, up to
+            1e6. Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
         rtol : float, optional
-            Relative tolerance for the CVODE march. Default ``1e-8``.
+            Relative tolerance for the CVODE march, and under
+            ``criterion="scaled"`` for the run test. Default ``1e-8``.
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the CVODE march — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
             :meth:`run` for the contract. This is the accuracy the march is
-            held to on the way to the root; ``tol`` above is the separate test
-            for having arrived, and stays a single norm over all species.
+            held to on the way to the root, and under ``criterion="scaled"``
+            the run test's; ``tol`` above is the separate test for having
+            arrived, a single norm over all species.
         max_steps : int, optional
             Max CVODE internal steps per output point.
         sensitivity_params : list[str], optional
@@ -7601,7 +7635,9 @@ class Simulator:
         opts.rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — scalar, per-species, or tracking for the march.
         self._resolve_atol(
-            self._steady_state_atol(atol, criterion), opts.rtol, where="steady_state(atol=...)"
+            self._steady_state_atol(atol, criterion, self._model.get_state(), opts.rtol),
+            opts.rtol,
+            where="steady_state(atol=...)",
         ).apply_to(opts)
         opts.max_steps = max_steps if max_steps is not None else self._max_steps
         # A previous solve on this Simulator already proved the closed-form
@@ -8800,7 +8836,7 @@ class Simulator:
         n_workers=None,
         mask=None,
         newton_burst: bool = True,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8831,7 +8867,7 @@ class Simulator:
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
         criterion : str
-            ``"residual"`` (default) or ``"scaled"``, as in
+            ``"scaled"`` (default) or ``"residual"``, as in
             :meth:`steady_state` (issue #1001).
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
@@ -8906,7 +8942,7 @@ class Simulator:
         # takes when no atol is given, which is each entry's own. Taken from
         # this model, an entry whose parameters put it at 1e-9 of this one
         # marched at this one's tolerance and ran through zero (x = -3.7).
-        own_auto = self._steady_state_atol(atol, criterion) is not atol
+        own_auto = atol is None and criterion == "scaled" and not self._atol_set
         eff_atol_spec = self._resolve_atol(
             None if own_auto else atol,
             eff_rtol,
@@ -8937,7 +8973,7 @@ class Simulator:
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
             if own_auto:
-                own = [float(v) for v in derive_atol(clone.get_state(), eff_rtol)]
+                own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
                 _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
             else:
                 eff_atol_spec.apply_to(opts)
@@ -10528,14 +10564,20 @@ class SteadyStateResult:
         ``max|f(y)|`` at convergence.
     newton_distance : float
         The Newton step from the state returned to the root, in each
-        species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
-        is within it (issue #1001). NaN under ``criterion="residual"``, which
-        does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular at a state that is not a root.
+        species' own tolerance, which under ``criterion="scaled"`` decided
+        where the solve stopped (issue #1001); at most 1 is within it. NaN
+        under ``criterion="residual"``, which does not take the step, and
+        above 512 unknowns; ``inf`` where the Jacobian is singular at a state
+        that is not a root, or a differenced one straddles a jump.
+    continued_run_distance : float
+        The run test of ``criterion="scaled"``: the largest move of a
+        measured species, over its tolerance, across the run taken on from
+        the state returned; at most 1 passes (issue #1001). ``inf`` where the
+        run could not be taken to its time; NaN where none was taken (under ``"residual"``,
+        where the parity test already refused, and for a burst-free Newton
+        solve).
     criterion : str
-        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``:
-        ``"residual"`` for a ``"scaled"`` request above 512 unknowns, which
-        that test falls back to.
+        The test ``converged`` was decided by, ``"scaled"`` or ``"residual"``.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool
@@ -10818,6 +10860,7 @@ class SteadyStateResult:
         "_name_to_idx",
         "residual",
         "newton_distance",
+        "continued_run_distance",
         "criterion",
         "method_used",
         "converged",
@@ -10895,6 +10938,7 @@ class SteadyStateResult:
         # each species' tolerance (at most 1 is within it; NaN where it was not
         # taken, as under "residual"), and the test `converged` was decided by.
         self.newton_distance = getattr(core, "newton_distance", float("nan"))
+        self.continued_run_distance = getattr(core, "continued_run_distance", float("nan"))
         self.criterion = getattr(core, "criterion", "residual")
         self.method_used = core.method_used
         self.converged = core.converged

@@ -3738,6 +3738,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
         .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("continued_run_distance", &bngsim::SteadyStateResult::continued_run_distance)
         .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)

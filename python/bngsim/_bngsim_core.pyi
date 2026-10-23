@@ -1260,6 +1260,9 @@ class SteadyStateResultCore:
     def concentrations(self) -> list[float]:
         ...
     @property
+    def continued_run_distance(self) -> float:
+        ...
+    @property
     def converged(self) -> bool:
         ...
     @property
