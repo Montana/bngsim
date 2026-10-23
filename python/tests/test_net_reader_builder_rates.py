@@ -380,16 +380,20 @@ class TestTokensAfterTheRateLaw:
         assert (rxn["type"], rxn["rate_law"], rxn["stat_factor"]) == ("elementary", "k", 1.0)
         bngsim.Model.from_net(str(net))
 
-    @pytest.mark.parametrize("name", ["MM", "Ele"])
+    @pytest.mark.parametrize("factor", ["", "2*"], ids=["bare", "factor"])
+    @pytest.mark.parametrize("name", ["MM", "Ele", "Sat", "Hill"])
     def test_a_rate_constant_named_like_a_type_keyword_still_loads(
-        self, tmp_path: Path, name: str
+        self, tmp_path: Path, name: str, factor: str
     ) -> None:
         """A rate column of one token is a rate constant or function, whatever it
-        is called (run_network reads it so too). `MM kcat` with one constant is
-        refused in test_net_reader_legacy_and_tfun.py."""
-        net = _one_reaction_net(tmp_path, f"1 2 3 {name}", extra_params=f"8 {name} 1.5\n")
+        is called (run_network reads it so too), with a stat factor or without.
+        `Sat` or `Hill` alone used to be read as that law with no constants, and
+        `2*Sat` became so once the factor came off first (issue #1230). `MM kcat`
+        with one constant is refused in test_net_reader_legacy_and_tfun.py."""
+        net = _one_reaction_net(tmp_path, f"1 2 3 {factor}{name}", extra_params=f"8 {name} 1.5\n")
         (rxn,) = parse_net_file(net)["reactions"]
         assert (rxn["type"], rxn["rate_law"]) == ("elementary", name)
+        assert rxn["stat_factor"] == (2.0 if factor else 1.0)
         bngsim.Model.from_net(str(net))
 
     @pytest.mark.parametrize(

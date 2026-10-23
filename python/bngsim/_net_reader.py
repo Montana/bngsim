@@ -77,11 +77,7 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
 
         ``"elementary"``
             ``rate_law`` is a parameter name; ``stat_factor`` carries a
-            ``<number>*`` prefix on it. The prefix goes ahead of a typed rate
-            law too (``2*MM kcat Km``, ``2*Sat k K``, ``2*Hill V K h``, which
-            BNG2.pl writes for a substrate with equivalent sites), and comes
-            back as the ``"mm"`` or rewritten ``"functional"`` reaction's
-            ``stat_factor``, which multiplies the whole rate (issue #1230).
+            ``<number>*`` prefix on it.
         ``"functional"``
             ``rate_law`` names a function in the ``functions`` block. A
             deprecated ``Sat`` or ``Hill`` rate law comes back as one of these,
@@ -90,6 +86,12 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
         ``"mm"``
             Michaelis-Menten (``MM kcat Km``); ``rate_law`` is
             ``"<kcat>,<Km>"``, the form ``ModelBuilder`` takes.
+
+        ``stat_factor`` is the ``<number>*`` prefix on the rate column, whatever
+        the type: BNG2.pl writes it ahead of a typed rate law too (``2*MM kcat
+        Km``, ``2*Sat k K``, ``2*Hill V K h``, for a substrate with equivalent
+        sites), and it comes back on the ``"mm"`` or rewritten ``"functional"``
+        reaction, multiplying the whole rate (issue #1230).
 
         ``legacy_constants`` holds an ``"mm"`` reaction's ``[kcat, Km]`` and is
         empty otherwise: a ``Sat`` or ``Hill`` rate law, whose operands it used to

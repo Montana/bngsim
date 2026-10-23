@@ -209,7 +209,7 @@ class TestTheFactorScalesTheWholeRate:
         ("method", "kw"),
         [
             ("ssa", {"codegen": False}),
-            pytest.param("ssa", {}, marks=requires_cc),
+            ("ssa", {}),
             ("psa", {"poplevel": 100}),
         ],
         ids=["ssa-interpreted", "ssa-default", "psa"],

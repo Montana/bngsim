@@ -581,7 +581,11 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
         std::string rate_token = tokens[3];
         rxn.stat_factor = take_stat_factor(rate_token, stripped);
 
-        if (rate_token == "Sat" || rate_token == "Hill") {
+        // A rate law of one token is a rate constant or function whatever it is
+        // called, as run_network reads it, so `Sat` or `Hill` alone (or `2*Sat`,
+        // once its factor is off) names a parameter, as `MM` or `Ele` alone does,
+        // rather than a Sat or Hill law with no constants.
+        if ((rate_token == "Sat" || rate_token == "Hill") && tokens.size() > 4) {
             rxn.type = RateLawType::Functional;
             rxn.legacy_rate_law_type = rate_token;
             for (size_t i = 4; i < tokens.size(); ++i) {

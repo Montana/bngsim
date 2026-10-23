@@ -202,7 +202,8 @@ species.
 The deprecated `Sat` and `Hill` rate-law tokens come back rewritten, as
 `Model.from_net` rewrites them, with the same warning: the reaction is
 `"functional"`, driven by an explicit function, and a single-species observable
-is added for each reactant the function reads.
+is added for each reactant the function reads. A factor ahead of the type
+(`2*Sat k K`, `2*Hill V K h`) stays the reaction's `"stat_factor"`.
 
 A reaction line is `<index> <reactants> <products> <rate law>`, and only a
 `Sat`, `Hill` or `MM` rate law takes more tokens: its constants.
