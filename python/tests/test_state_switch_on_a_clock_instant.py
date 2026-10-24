@@ -594,6 +594,162 @@ def test_a_run_that_starts_off_0_runs_where_its_tolerance_places_the_two():
     assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
 
 
+# Issue #1025's review. What a run's error is at a crossing is neither the sum
+# of what each step allows nor what |x| at the crossing allows: the first
+# refused runs that main returns right, and the second let through a crossing
+# whose error was made elsewhere. Past one step's tolerances, a pair inside a
+# generous window is confirmed against a plain run at a hundredth of the
+# tolerances instead.
+#
+# V = t − 0.5·cos(t) + 0.5 reaches 1000 at t ≈ 999.84, 0.66 before the event
+# at 1000.5, and an oscillator ω forces the steps. W gathers q·X from the
+# switch on, X halves at the event: dW/dtau = q·(tau − (1005 − tau)) = 697.2.
+LONG_RUN = (
+    "species X, W, V, O, P; X = 0; W = 0; V = 0; O = 1; P = 0; a = 2; q = 0.7;"
+    " tau = 1000.5\n"
+    "J0: -> X; a\nJv: -> V; 1 + 0.5*sin(time)\nJo: -> O; -{w}*P\nJp: -> P; {w}*O\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= tau): X = 0.5*X\n"
+)
+LONG_TIMES = [float(t) for t in np.linspace(0.0, 1005.0, 6)]
+
+
+@pytest.mark.parametrize(
+    "w, rtol",
+    [(0.0, 1e-5), (0.0, 1e-6), (5.0, 1e-4), (5.0, 1e-6)],
+    ids=["no-oscillator-1e-5", "no-oscillator-1e-6", "oscillator-1e-4", "oscillator-1e-6"],
+)
+def test_a_long_run_s_switch_well_before_the_event_runs(w, rtol):
+    """The step sum put the two within reach at every one of these, the
+    widest 6,070 against a gap of 0.66, and refused them; main returns
+    697.2. A run at a hundredth of the tolerances puts the state on the
+    switch's far side at the event by 4 to 10⁶ times what the residual
+    moved between the two."""
+    model = bngsim.Model.from_antimony_string(LONG_RUN.format(w=w))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=LONG_TIMES, rtol=rtol, atol=1e-9, timeout=60
+    )
+    w_idx = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w_idx, 0] == pytest.approx(697.2, rel=1e-6)
+
+
+# V = sin(t) crosses −δ just after π, where the event halves X. With the
+# event first, which is the truth, dW/dtau = −q·(π − 2·asin δ); with the
+# switch first it is 0.
+NEAR_0 = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; tau = {tau!r}\n"
+    "J0: -> X; a\nJv: -> V; cos(time)\nJ2: -> W; piecewise(q*X, V <= -{d}, 0)\n"
+    "E1: at (time >= tau): X = 0.5*X\n"
+)
+
+
+@pytest.mark.parametrize(
+    "d, rtol", [("5e-7", 3e-6), ("5e-7", 5e-7), ("5e-6", 3e-6), ("1e-10", 3e-6)]
+)
+def test_a_switch_near_0_whose_error_was_made_elsewhere_is_refused(d, rtol):
+    """V's error at π is what it took on where V was 1: 2.2e-5 at rtol 3e-6.
+    Read off |V| at the crossing, 1e-7 and below, and a bend weight of 0
+    there (V'' = 0), the reach was 10³ times short, and the run returned 0
+    for −2.199 with no error. The residual at the event moves by 6 to 160
+    times itself between this run and one at a hundredth of the
+    tolerances."""
+    _refused(NEAR_0.format(d=d, tau=math.pi), ["tau"], 945, EVENT_TIMES, rtol=rtol, atol=1e-9)
+
+
+def test_a_switch_near_0_the_tolerance_does_place_after_the_event_runs():
+    """Control: δ = 2e-5 at rtol 1e-6, where the run's error at π is a
+    seventh of the residual."""
+    model = bngsim.Model.from_antimony_string(NEAR_0.format(d="2e-5", tau=math.pi))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    truth = -0.7 * (math.pi - 2.0 * math.asin(2e-5))
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(truth, rel=1e-5)
+
+
+def _long_run_crossing():
+    """Where V = t − 0.5·cos(t) + 0.5 reaches 1000, by Newton."""
+    t = 1000.0
+    for _ in range(50):
+        t -= (t - 0.5 * math.cos(t) + 0.5 - 1000.0) / (1.0 + 0.5 * math.sin(t))
+    return t
+
+
+# The same switch moved by kv, V' = kv·(1 + 0.5·sin t), beside a fixed event
+# `gap` after it.
+MOVED_BY_KV = (
+    "species X, W, V, O, P; X = 0; W = 0; V = 0; O = 1; P = 0; a = 2; q = 0.7; kv = 1\n"
+    "J0: -> X; a\nJv: -> V; kv*(1 + 0.5*sin(time))\nJo: -> O; -{w}*P\nJp: -> P; {w}*O\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= {te!r}): X = 0.5*X\n"
+)
+
+
+def test_a_switch_a_column_moves_beside_a_fixed_event_is_refused_however_wide_the_window():
+    """A column moves a crossing where it moves its time by more than the
+    reach. Measured against the step sum, 6,000 at rtol 1e-4 under the
+    oscillator, kv moved it by 1,000 and was taken not to: the event does not
+    move either, nothing was refused, and dW/dkv came back 513,028, the
+    event-first side, for the 1,026,056 of a switch 1e-9 before it. Main
+    refuses; the reach a column is judged against is one step's again."""
+    text = MOVED_BY_KV.format(w=5.0, te=_long_run_crossing() + 1e-9)
+    _refused(text, ["kv"], 946, LONG_TIMES, rtol=1e-4, atol=1e-9)
+
+
+@pytest.mark.parametrize("gap", [-1e-9, 1e-3], ids=["event-first", "switch-first"])
+def test_a_switch_whose_error_is_far_past_its_gap_to_an_event_is_refused(gap):
+    """With no oscillator the run's crossing at rtol 1e-6 was 6.7e-3 early,
+    past the reach of an event 1e-9 or 1e-3 away. Main took the switch
+    first both times: dW/dkv came back 1,027,777, the switch-first side, for
+    an event that fires first, with no error. The switch's residual where
+    the event fired was 0.0105 against 0.00035 at a hundredth of the
+    tolerances."""
+    text = MOVED_BY_KV.format(w=0.0, te=_long_run_crossing() + gap)
+    _refused(text, ["kv"], 945, LONG_TIMES, rtol=1e-6, atol=1e-9)
+
+
+def test_a_switch_whose_gap_to_an_event_is_confirmed_runs():
+    """Control: under the oscillator the same gap is confirmed, and dW/dkv
+    is q·X(t*)·|dt*/dkv| = 0.7·2t*·1000/V'(t*)."""
+    ts = _long_run_crossing()
+    model = bngsim.Model.from_antimony_string(MOVED_BY_KV.format(w=5.0, te=ts + 1e-3))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["kv"]).run(
+        sample_times=LONG_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    truth = 0.7 * 2.0 * ts * 1000.0 / (1.0 + 0.5 * math.sin(ts))
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(truth, rel=1e-4)
+
+
+# SWITCH_BETWEEN's switch on V = e^(2t), 1.99e-5 after a fitted gate at tau in
+# the same rate law. With the gate first, which is the truth, the switch
+# turns on the whole law and dW/dtau = 0; with the switch first W gathers
+# half the law until tau, −0.5·q·X(tau) = −2.1.
+CLOCK_IN_THE_SAME_LAW = (
+    "species X, W, V; X = 0; W = 0; V = 1; a = 2; q = 0.7; tau = 3; kv = 2\n"
+    "J0: -> X; a\nJv: -> V; kv*V\n"
+    f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)"
+    "*piecewise(1, time >= tau, 0.5)\n"
+)
+
+
+@pytest.mark.parametrize("rtol", [2e-6, 1e-6, 1e-7])
+def test_a_switch_whose_error_has_added_up_beside_a_gate_in_its_law_is_refused(rtol):
+    """The #1025 edge from a clock's side: main returned −2.1 for 0 at each
+    of these with no error. The switch's residual at the gate is on the
+    other side of its surface in a run at a hundredth of the tolerances."""
+    _refused(CLOCK_IN_THE_SAME_LAW, ["tau"], 946, EVENT_TIMES, rtol=rtol, atol=1e-9)
+
+
+def test_a_switch_the_tolerance_does_place_after_a_gate_in_its_law_runs():
+    """Control: at rtol 1e-8 the gate comes first, as it does."""
+    model = bngsim.Model.from_antimony_string(CLOCK_IN_THE_SAME_LAW)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-8, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(0.0, abs=1e-8)
+
+
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
     """``at (V > U·e³)`` reads V, which the switch reads, and U. It fires
     where U says, not where V is on its way through 6: the two are not on one
