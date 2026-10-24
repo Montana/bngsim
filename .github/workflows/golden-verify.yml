@@ -1,0 +1,67 @@
+name: golden-verify
+
+# Issue #582: the committed goldens (parity_checks/bng_parity/golden/) as a gate.
+# Before this, no CI job compared a run against any of them, so a change that
+# shifted every trajectory produced a green run and an unchanged golden.json.
+#
+# `parity_golden.py --verify --gate` re-runs the deterministic allow-listed
+# models (GATED_MODELS, nine fast-tier ODE models with committed trajectories)
+# through the same bngsim sweep that generated them and compares each with its
+# golden entry. An identical checksum passes. One that differs, as it will across
+# platforms, passes when every per-variable stat (last, min, max, mean) is within
+# |x - y| <= 1e-5·|y| + 1e-6. Anything else fails the job: drift, a run that did
+# not complete, a job with nothing to compare, or fewer than all nine compared.
+#
+# A pull request that changes these numbers on purpose regenerates their entries
+# with `parity_golden.py --merge --gate` from output that agrees with BNG2.pl
+# (the nightly bng_ode baseline), so what this defends was cross-validated.
+#
+# The sweep goes through PyBioNetGen's bngsim bridge, so the parity group is
+# installed. Its pinned PyBioNetGen builds against this venv and runs
+# `pip install numpy` in it, hence the two-step provisioning and the pip below.
+# BNG2.pl comes bundled with it. The nine models run in seconds; the bngsim
+# build is the cost.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: golden-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Golden trajectories · ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: golden-verify-build
+          max-size: 500M
+
+      - name: Provision bngsim, then the parity group
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          uv sync --extra dev --python 3.12
+          uv pip install --python .venv/bin/python pip
+          uv sync --extra dev --group parity --python 3.12
+
+      - name: Verify the gated goldens
+        run: |
+          uv run --no-sync python parity_checks/bng_parity/parity_golden.py \
+            --verify --gate --workers 4 --sweep-out "$RUNNER_TEMP/golden-sweep"

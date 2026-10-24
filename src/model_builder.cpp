@@ -20,6 +20,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -878,6 +880,10 @@ std::vector<std::string> extract_ids(const std::string &expr) {
 // `tfun_<name>()` before this runs, so the index an observable- or
 // function-indexed table reads is no longer in the expression text; without
 // this map the species behind it drop out of the pattern (issue #781).
+//
+// `rateof_species_idx` maps each species name to its 0-based index where the
+// model registers the `rate_of__<species>` accessors (uses_rateof), and is
+// empty where it does not: there a `rate_of__` name is the model's own symbol.
 JacobianSparsity
 build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                    const std::vector<Observable> &observables,
@@ -885,6 +891,7 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                    const std::vector<Function> &functions,
                    const std::unordered_map<std::string, int> &func_name_to_idx,
                    const std::vector<Species> &species,
+                   const std::unordered_map<std::string, int> &rateof_species_idx,
                    const std::unordered_map<std::string, std::string> &tfun_index_by_call) {
 
     if (n_species == 0)
@@ -917,8 +924,9 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
     // assignment/rate-rule graphs are acyclic, the guard only protects against
     // malformed cyclic input.
     const int nf = static_cast<int>(functions.size());
-    std::vector<std::vector<int>> func_direct_obs(nf); // species from observables in expr
-    std::vector<std::vector<int>> func_refs(nf);       // functions referenced in expr
+    std::vector<std::vector<int>> func_direct_obs(nf);    // species from observables in expr
+    std::vector<std::vector<int>> func_refs(nf);          // functions referenced in expr
+    std::vector<std::vector<int>> func_direct_rateof(nf); // species whose rate expr reads
     for (int fi = 0; fi < nf; ++fi) {
         std::vector<std::string> ids = extract_ids(functions[fi].expression);
         // A table-function call reads its index (issue #781). Resolve it the
@@ -940,12 +948,20 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
             if (oit != obs_name_to_idx.end())
                 for (int si_0 : obs_species[oit->second])
                     func_direct_obs[fi].push_back(si_0);
+            // A `rate_of__<species>` token reads that species' live rate (issue
+            // #1239), under the name register_rateof_accessors binds it by.
+            if (!rateof_species_idx.empty() && id.rfind("rate_of__", 0) == 0) {
+                auto sit = rateof_species_idx.find(id.substr(sizeof("rate_of__") - 1));
+                if (sit != rateof_species_idx.end())
+                    func_direct_rateof[fi].push_back(sit->second);
+            }
             auto fjt = func_name_to_idx.find(id);
             if (fjt != func_name_to_idx.end() && fjt->second != fi)
                 func_refs[fi].push_back(fjt->second);
         }
     }
-    std::vector<std::vector<int>> func_deps(nf); // transitive sorted-unique species
+    std::vector<std::vector<int>> func_deps(nf);   // transitive sorted-unique species
+    std::vector<std::vector<int>> func_rateof(nf); // transitive sorted-unique rate reads
     {
         std::vector<char> fstate(nf, 0); // 0=unvisited, 1=on-stack, 2=done
         std::vector<int> stk;
@@ -968,6 +984,13 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                     std::sort(acc.begin(), acc.end());
                     acc.erase(std::unique(acc.begin(), acc.end()), acc.end());
                     func_deps[u] = std::move(acc);
+                    std::vector<int> rates = func_direct_rateof[u];
+                    for (int v : func_refs[u])
+                        if (fstate[v] == 2)
+                            rates.insert(rates.end(), func_rateof[v].begin(), func_rateof[v].end());
+                    std::sort(rates.begin(), rates.end());
+                    rates.erase(std::unique(rates.begin(), rates.end()), rates.end());
+                    func_rateof[u] = std::move(rates);
                     fstate[u] = 2;
                     stk.pop_back();
                 } else {
@@ -985,6 +1008,9 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
     // below is byte-identical to the dense path: rows sorted ascending and
     // de-duplicated per column.
     std::vector<std::vector<int>> col_rows(n_species);
+    // For each functional reaction whose law reads a species' live rate: the
+    // rows it changes and the species whose rates it reads (issue #1239).
+    std::vector<std::pair<std::vector<int>, std::vector<int>>> rate_readers;
 
     for (const auto &rxn : reactions) {
         std::unordered_map<int, double> net;
@@ -1012,6 +1038,8 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                 // observables it / its referenced functions read), plus the
                 // reactants the engine's species factor scales by (GH #164).
                 rate_deps = func_deps[fit->second];
+                if (!func_rateof[fit->second].empty())
+                    rate_readers.emplace_back(affected, func_rateof[fit->second]);
                 for (int ri : rxn.reactant_indices) {
                     int si_0 = ri - 1;
                     if (si_0 >= 0 && si_0 < n_species)
@@ -1056,6 +1084,75 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                 int L = species[i].ode_live_volume_idx0;
                 if (L >= 0 && L < n_species)
                     col_rows[L].push_back(i);
+            }
+        }
+    }
+
+    // Issue #1239: a law that reads `rate_of__X`, X's live dX/dt, depends on
+    // every species X's rate depends on, which is row X of this pattern. The
+    // pattern held none of those edges, so wherever X's rate read a species the
+    // law did not, the analytic Jacobian's entry had no slot and the attach
+    // declined it, and the colored finite-difference Jacobian of the sparse
+    // route missed it. Row X can itself grow through another rate it reads, so
+    // the edges are added until no row changes. Rows only grow, so this ends
+    // on a ring of rates too, which rateof_ring_refusal refuses to run; the
+    // pattern only has to be a superset.
+    //
+    // Readers of the same rates get the same columns, so each set of rates is
+    // one entry holding every reader's rows. A compartment whose size is a rule
+    // over n species gives each of the m species in it a dilution law that
+    // reads the same n rates; read once per reader, that was m·n rows per
+    // pass. Only the rows a reader reads or writes are gathered.
+    if (!rate_readers.empty()) {
+        std::map<std::vector<int>, std::vector<int>> rows_by_rates;
+        std::vector<char> gathered(static_cast<std::size_t>(n_species), 0);
+        for (const auto &[rows, rates] : rate_readers) {
+            auto &into = rows_by_rates[rates];
+            into.insert(into.end(), rows.begin(), rows.end());
+            for (int i : rows)
+                gathered[static_cast<std::size_t>(i)] = 1;
+            for (int y : rates)
+                gathered[static_cast<std::size_t>(y)] = 1;
+        }
+        for (auto &[rates, rows] : rows_by_rates) {
+            std::sort(rows.begin(), rows.end());
+            rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        }
+        // Each gathered row's columns, ascending (j is) and de-duplicated.
+        std::vector<std::vector<int>> row_cols(static_cast<std::size_t>(n_species));
+        for (int j = 0; j < n_species; ++j)
+            for (int i : col_rows[j])
+                if (gathered[static_cast<std::size_t>(i)])
+                    row_cols[static_cast<std::size_t>(i)].push_back(j);
+        for (auto &cols : row_cols)
+            cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+
+        std::vector<int> read, fresh, merged;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto &[rates, rows] : rows_by_rates) {
+                read.clear();
+                for (int y : rates) {
+                    const auto &cols = row_cols[static_cast<std::size_t>(y)];
+                    read.insert(read.end(), cols.begin(), cols.end());
+                }
+                std::sort(read.begin(), read.end());
+                read.erase(std::unique(read.begin(), read.end()), read.end());
+                for (int i : rows) {
+                    auto &have = row_cols[static_cast<std::size_t>(i)];
+                    fresh.clear();
+                    std::set_difference(read.begin(), read.end(), have.begin(), have.end(),
+                                        std::back_inserter(fresh));
+                    if (fresh.empty())
+                        continue;
+                    for (int j : fresh)
+                        col_rows[j].push_back(i);
+                    merged.clear();
+                    std::merge(have.begin(), have.end(), fresh.begin(), fresh.end(),
+                               std::back_inserter(merged));
+                    have.swap(merged);
+                    changed = true;
+                }
             }
         }
     }
@@ -2586,9 +2683,12 @@ NetworkModel ModelBuilder::build() {
     const int ns = static_cast<int>(impl.species.size());
     const int np = static_cast<int>(impl.parameters.size());
 
+    // A `rate_of__` name reads a rate only where the accessors are registered.
+    const std::unordered_map<std::string, int> no_rate_accessors;
     sd->jac_sparsity = build_jac_sparsity(
         sd->reactions, ns, impl.observables, sd->observable_name_to_idx, impl.functions,
-        sd->function_name_to_idx, impl.species, tfun_index_by_call);
+        sd->function_name_to_idx, impl.species,
+        impl.uses_rateof ? sd->species_name_to_idx : no_rate_accessors, tfun_index_by_call);
 
     sd->analytical_jac = build_anal_jac(sd->reactions, ns, np, sd->jac_sparsity, impl.species);
 
