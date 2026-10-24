@@ -1,18 +1,37 @@
-name: python-sanitizers
+name: sanitizers
 
-# The Python suite against an ASan + UBSan build of the extension.
+# Nightly: the C++ unit suite and the Python suite, each against an
+# AddressSanitizer + UndefinedBehaviorSanitizer build (issue #583). A bad index
+# in the engine does not crash, it returns a wrong number; these are the
+# detectors for that.
 #
-# native-tests.yml's sanitizers job (#583) watches only the code the C++ unit
-# suite runs, which was 37% of the lines it compiles, and 17% of
-# cvode_simulator.cpp, when this was added. It never builds _bngsim_core at all,
-# so the binding layer, where #566's unchecked memcpy was, is outside it. The
-# Python suite is where the engine is actually exercised: thousands of tests,
-# every one of them through _bngsim_core. This job runs that suite with the
-# extension, and the bngsim library linked into it, compiled under
-# -fsanitize=address,undefined. A bad index anywhere on those paths then stops
-# the test with a report instead of returning a wrong number.
+# Nightly, not per pull request, because of what they cost. On a pull request
+# that touched C++ they made CI wait 25 minutes (C++) and 35 to 55 (Python),
+# against about 14 for everything else, for bugs a nightly finds the next
+# morning with the file and line. Run one on demand (workflow_dispatch) before
+# merging a risky C++ change. A pull request that edits this file runs it, so a
+# change here is checked before it lands.
 #
-# How the pieces fit:
+# Both jobs fail the run on any finding (no continue-on-error: on a schedule
+# that would turn a finding into a green run), and the report job opens one
+# tracking issue, or comments on it, the way nightly-parity.yml does.
+#
+#   cpp     The lean native configuration (KLU and RuleMonkey OFF) plus NFsim
+#           and reference LAPACK, so nfsim_library_test and nfsim_simulator_test
+#           run under LeakSanitizer (the NFsim path's manual new/delete is where
+#           #577's leak was) and the BLAS dgetrf path's pivot rebasing runs.
+#           Leak detection is on.
+#
+#   python  The Python suite, through an extension built with the sanitizers.
+#           The C++ unit suite runs 37% of the lines it compiles and 17% of
+#           cvode_simulator.cpp, and never builds _bngsim_core, where #566's
+#           unchecked memcpy was; the Python suite runs the engine through it.
+#           Shown to catch what the C++ job misses: a one-element over-read
+#           planted in sync_sens_params (lanl/bngsim#1260, closed) passed the C++
+#           job and the ordinary Python suites and failed this one with
+#           "heap-buffer-overflow ... in sync_sens_params cvode_simulator.cpp".
+#
+# How the python job fits together:
 #
 #   * The flags reach CMake through SKBUILD_CMAKE_DEFINE, so pyproject.toml is
 #     untouched. SuiteSparse's autobuild does not inherit them and stays
@@ -22,45 +41,126 @@ name: python-sanitizers
 #     shell. PYTHONMALLOC=malloc routes Python's allocations through malloc,
 #     where ASan can see them.
 #   * Leak detection is off. CPython does not free everything at exit, so LSan
-#     would report the interpreter, not bngsim. native-tests.yml keeps it on for
-#     the C++ suite.
+#     would report the interpreter, not bngsim. The cpp job keeps it on.
 #   * --extra test, not dev: roadrunner and jax ship large native runtimes of
 #     their own, and this job is about bngsim's. Their tests skip here.
 #
-# What it still cannot see: the C the codegen path writes and compiles at run
-# time (cc -O3, no sanitizer flags), and anything the Python suite does not run.
+# What neither job sees: the C the codegen path writes and compiles at run time
+# (cc -O3, no sanitizer flags), and anything neither suite runs.
 #
-# Two guards, because a sanitizer job is green when nothing is reported, which
-# is also what a build the flags never reached reports. One checks that the
-# installed extension calls into both runtimes (uv caches builds, and a cached
-# plain one would otherwise pass). The other runs a known heap overflow through
-# the same interpreter and environment and requires that ASan stops it.
+# Every job guards against a false green, because a sanitizer job is green when
+# nothing is reported, which is also what a build the flags never reached
+# reports: the built library or extension must call into both runtimes, and in
+# the python job a known heap overflow must be stopped by ASan in the test
+# interpreter.
 #
-# Non-blocking, like the C++ sanitizer job, until it has been green for a while.
-# It runs on pull requests that touch the C++ side, nightly for everything else,
-# and on demand.
+# Scheduled workflows run only from the default branch, and GitHub disables them
+# after 60 days without repository activity.
 
 on:
+  schedule:
+    - cron: "37 6 * * *" # 06:37 UTC; off the hour, and clear of nightly-parity's 08:17
+  workflow_dispatch:
   pull_request:
     paths:
-      - "src/**"
-      - "include/**"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - ".github/workflows/python-sanitizers.yml"
-  schedule:
-    - cron: "37 6 * * *"
-  workflow_dispatch:
+      - ".github/workflows/sanitizers.yml"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: python-sanitizers-${{ github.ref }}
-  cancel-in-progress: true
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  python-sanitizers:
+  cpp:
+    name: C++ unit suite · ubuntu-latest · ASan + UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja and reference LAPACK
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build liblapack-dev
+
+      # Most of this job's 25 minutes was compiling ExprTk, NFsim and SUNDIALS
+      # under the sanitizers, none of which changes from one night to the next.
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: sanitizers-cpp-build
+          max-size: 500M
+
+      - name: Configure (sanitizers; tests ON; NFsim ON; KLU / RuleMonkey OFF)
+        run: |
+          set -euxo pipefail
+          SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBNGSIM_BUILD_TESTS=ON \
+            -DBNGSIM_ENABLE_KLU=OFF \
+            -DBNGSIM_REQUIRE_KLU=OFF \
+            -DBNGSIM_BUILD_NFSIM=ON \
+            -DBNGSIM_BUILD_RULEMONKEY=OFF \
+            "-DCMAKE_C_FLAGS=$SAN" "-DCMAKE_CXX_FLAGS=$SAN" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build the test suite
+        run: |
+          set -euxo pipefail
+          cmake --build build -j"$(nproc)"
+          ccache --show-stats
+
+      - name: Guard against an uninstrumented build
+        run: |
+          set -euo pipefail
+          lib="$(ls build/libbngsim.so* | head -1)"
+          for sym in __asan_report_ __ubsan_handle_; do
+            if ! nm -D --undefined-only "$lib" | grep -q "$sym"; then
+              echo "::error::$lib makes no $sym* calls; the sanitizer flags did not reach src/."
+              exit 1
+            fi
+          done
+          echo "$lib is instrumented for ASan and UBSan."
+
+      - name: Run the full C++ suite under the sanitizers (ctest)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build --output-on-failure --no-tests=error
+
+      # The dgetrf path above is only covered if the backend was found and its
+      # cases ran. test_lapack_dense_linsol passes either way, so ask it.
+      - name: Guard the BLAS dense backend (expected yes)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ./build/tests/test_lapack_dense_linsol 2>&1 | tee /tmp/test_lapack.log
+          if ! grep -q 'lapack_dense_available = yes' /tmp/test_lapack.log; then
+            echo "::error::test_lapack_dense_linsol does not see the BLAS backend; the dgetrf path did not run under the sanitizers."
+            exit 1
+          fi
+          skipped="$(grep -oE '[0-9]+ SKIPPED' /tmp/test_lapack.log | tail -1 \
+            | grep -oE '^[0-9]+' || echo 0)"
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::$skipped LAPACK cases skipped on the sanitizer leg; the dgetrf path did not run."
+            exit 1
+          fi
+          echo "All LAPACK dense cases ran under the sanitizers (0 skipped)."
+
+  python:
     name: Python suite · ubuntu-latest · ASan + UBSan · ${{ matrix.shard }}/2
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -78,7 +178,7 @@ jobs:
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: python-sanitizers-build
+          key: sanitizers-python-build
           save: ${{ matrix.shard == 1 }}
           max-size: 500M
 
@@ -289,3 +389,46 @@ jobs:
             python-sanitizers-${{ matrix.shard }}.log
             ${{ runner.temp }}/san/
           if-no-files-found: ignore
+
+  # One tracking issue for the whole night, opened or commented on when either
+  # job fails on a scheduled or manual run, as nightly-parity.yml does.
+  report:
+    name: Report
+    needs: [cpp, python]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        if: >-
+          github.event_name != 'pull_request' &&
+          (needs.cpp.result != 'success' || needs.python.result != 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Nightly sanitizers: reports detected"
+          CPP: ${{ needs.cpp.result }}
+          PY: ${{ needs.python.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Sanitizer run on \`${GITHUB_SHA::8}\`: $RUN_URL"
+            echo
+            echo "- C++ unit suite: **$CPP**"
+            echo "- Python suite: **$PY**"
+            echo
+            echo "Each failed job prints every ASan/UBSan report in full in its log (the python job also uploads them as an artifact). A job that failed without a report could not run; that suite went unchecked tonight."
+          } > body.md
+          num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" \
+            --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body-file body.md
+          fi
+      - name: Fail the run on any failure
+        if: needs.cpp.result != 'success' || needs.python.result != 'success'
+        run: exit 1
