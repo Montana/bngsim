@@ -9173,9 +9173,8 @@ class Simulator:
         ``multiplicity`` or ``basins``, and a root only it found has
         multiplicity 0. The seed is then put on the conservation laws at the
         model's totals, as every draw is. Two cases return less. Where Newton
-        cannot hold the root, as at the large law totals below (issue #1190), it
-        is missed: on a three-species law at a total of ``1e8``, the call returns
-        none. And where the solve had moved a held species, it solved another
+        cannot hold the root at ``tol``, as at the large rates below, it is
+        missed. And where the solve had moved a held species, it solved another
         problem: a masked sink at the end of a chain, as the pure-sink mask below
         makes it, moves its law's total, and a held species the rates read moves
         the rates. Newton from the seed then reaches a root of the problem the
@@ -9212,9 +9211,12 @@ class Simulator:
         rebuilds, from each conservation law, the member that carries the most
         of the law's total where the solve is, so a large total's round-off
         lands in a species at its own scale rather than in a small one (issue
-        #1190). Below concentrations of about ``1e-9``, KINSOL's step limits
-        are absolute too, and most starts fail even with a ``tol`` scaled to
-        match.
+        #1190). Where a root's rates are themselves large, their own rounding
+        can still exceed ``tol``, and the root is then reported as a failed
+        start: ``A <-> B`` at rates 1 and 2 and a total of ``1e8`` ends at a
+        residual of ``5e-9`` when Newton starts at the root itself. Below
+        concentrations of about ``1e-9``, KINSOL's step limits are absolute
+        too, and most starts fail even with a ``tol`` scaled to match.
 
         Parameters
         ----------
