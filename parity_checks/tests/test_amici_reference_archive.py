@@ -18,6 +18,7 @@ from pathlib import Path
 import amici_sens_run as A
 import numpy as np
 import pytest
+from test_sens_step_budget import _MINIMAL_SBML
 
 _AM = Path(A.__file__).resolve().parent
 SMOKE_JOBS = _AM.parent / "rr_parity" / "smoke" / "ode_jobs_smoke.json"
@@ -109,6 +110,107 @@ def test_a_stale_row_is_a_reference_failure_with_its_own_refusal():
     assert res["status"] == "reference_failed"
     assert res["reference_refusal"] == "archive_stale"
     assert res["exception"] == "amici (archive): archive_stale: the job's rtol changed"
+
+
+def test_keys_that_sanitize_alike_get_their_own_files(tmp_path):
+    assert A._archive_file(tmp_path, "a/b:sens:fsa") != A._archive_file(tmp_path, "a_b:sens:fsa")
+
+
+class _Queue(list):
+    put = list.append
+
+
+def _minimal_spec(tmp_path: Path) -> dict:
+    xml = tmp_path / "m.xml"
+    xml.write_text(_MINIMAL_SBML)
+    return {
+        "key": "M:sens:staggered",
+        "model_id": "M",
+        "method": "sens/staggered",
+        "sens_method": "staggered",
+        "metric": "max_rel_err",
+        "tol": 1e-4,
+        "xml": str(xml),
+        "params": {"t_start": 0.0, "t_end": 10.0, "n_points": 11, "rtol": 1e-9, "atol": 1e-12},
+        "param_cap": 20,
+        "param_budget": 20_000,
+        "max_steps": 10_000,
+        "config_env": {},
+        "reference_archive": str(tmp_path / "arch"),
+    }
+
+
+def _am_one_param():
+    t, x, _sx, names = _am()
+    return t, x, x[:, :, None] * 0.5, names
+
+
+def _replay(monkeypatch, spec, *, bn_sens):
+    """Drive the worker in-process on a replay of the minimal model: building or
+    running AMICI fails the test, and bngsim's sensitivity call is ``bn_sens``.
+    The model load and the shared-list negotiation are bngsim's own."""
+    monkeypatch.setattr(A.asens, "measure_warmup", lambda include_amici=True: {})
+    monkeypatch.setattr(
+        A.asens, "amici_free_parameter_ids", lambda xml: pytest.fail("AMICI built on a replay")
+    )
+    monkeypatch.setattr(
+        A.asens, "amici_sens", lambda *a, **k: pytest.fail("AMICI ran on a replay")
+    )
+    monkeypatch.setattr(
+        A.asens, "shared_sensitivity_params", lambda *a, **k: (["k1"], {"k1": "k1"}, 1)
+    )
+    monkeypatch.setattr(A.asens, "bn_sens", bn_sens)
+    q = _Queue()
+    A._worker(spec, q)
+    (res,) = q
+    return res
+
+
+def _bngsim_must_not_run(*a, **k):
+    pytest.fail("bngsim's sensitivity run ran for a row that is never compared")
+
+
+def test_an_unreadable_entry_is_refused_rather_than_raised(tmp_path, monkeypatch):
+    """It used to raise out of the worker, which died, and the row was EXCEPTION
+    blamed on bngsim."""
+    spec = _minimal_spec(tmp_path)
+    path = A._archive_file(spec["reference_archive"], spec["key"])
+    path.parent.mkdir()
+    path.write_bytes(b"not an npz")
+    res = _replay(monkeypatch, spec, bn_sens=_bngsim_must_not_run)
+    assert (res["status"], res["reference_refusal"]) == ("reference_failed", "archive_unreadable")
+    assert res["exception"].startswith("amici (archive): archive_unreadable: ")
+
+
+def test_a_run_recorded_short_of_amicis_sensitivities_is_refused_before_bngsim(
+    tmp_path, monkeypatch
+):
+    """The recorded run stopped once it had AMICI's ids (a bngsim-params refusal,
+    no shared parameter); the replay now negotiates a list, so it has nothing to
+    compare against, and finds that out before bngsim's sensitivity run."""
+    spec = _minimal_spec(tmp_path)
+    A.archive_save(
+        spec["reference_archive"], spec, {**A.archive_identity(spec), "amici_free_ids": ["k1"]}
+    )
+    res = _replay(monkeypatch, spec, bn_sens=_bngsim_must_not_run)
+    assert res["reference_refusal"] == "archive_stale"
+    assert res["exception"].endswith("the recorded run stopped before AMICI's sensitivities")
+
+
+def test_a_replay_scores_the_record_and_names_the_recorded_version(tmp_path, monkeypatch):
+    spec = _minimal_spec(tmp_path)
+    record = {
+        **A.archive_identity(spec),
+        "reference_version": "1.0.1",
+        "amici_free_ids": ["k1"],
+        "shared_ids": ["k1"],
+        "timing": {"integrate_sec": 0.01},
+    }
+    A.archive_save(spec["reference_archive"], spec, record, _am_one_param())
+    res = _replay(monkeypatch, spec, bn_sens=lambda *a, **k: (*_am_one_param(), {}))
+    assert res["status"] == "pass" and res["reference_version"] == "1.0.1"
+    assert res["timing"]["amici"]["replayed_from_archive"] is True
+    assert res["timing"]["amici"]["reference_version"] == "1.0.1"
 
 
 def test_the_two_flags_are_exclusive():

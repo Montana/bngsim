@@ -345,12 +345,21 @@ _is_declared_refusal = asens.is_declared_refusal
 # that record with no AMICI. An entry whose inputs no longer match the job (the
 # model file's sha256, grid, tolerances, method, step budget, parameter caps),
 # or whose shared list differs from the one a replay negotiates, is stale and
-# never compared: the row is REFERENCE_FAILED, refusal ``archive_stale``.
-ARCHIVE_FORMAT = 1
+# never compared: the row is REFERENCE_FAILED, refusal ``archive_stale``. One
+# that cannot be read at all is ``archive_unreadable``, the same row, rather
+# than a worker death blamed on bngsim. Both are refused before bngsim's
+# sensitivity run. Beside the identity, an entry records AMICI's version
+# (``reference_version``) and the harness's git revision; a replayed row
+# reports the archived version as the reference's.
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
 
 
 def _archive_file(directory, key: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", key) + ".npz")
+    # The readable part is sanitized, so the hash keeps keys such as a/b and a_b apart.
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', key)}-{digest}.npz"
 
 
 def archive_identity(spec: dict) -> dict:
@@ -406,11 +415,13 @@ def archive_load(directory, spec: dict):
     return record, am
 
 
-def _stale(res: dict, why: str) -> dict:
+def _stale(res: dict, why: str, kind: str = "archive_stale") -> dict:
+    """Stamp a row the archive cannot stand in for (``archive_stale`` or
+    ``archive_unreadable``). Never compared."""
     res["status"] = "reference_failed"
-    res["exception"] = f"amici (archive): archive_stale: {why}"
-    res["exception_class"] = "amici-archive:stale"
-    res["reference_refusal"] = "archive_stale"
+    res["exception"] = f"amici (archive): {kind}: {why}"[:400]
+    res["exception_class"] = f"amici-archive:{kind.removeprefix('archive_')}"
+    res["reference_refusal"] = kind
     return res
 
 
@@ -449,9 +460,19 @@ def _worker(spec: dict, q) -> None:
     am_full = ""
     am_wall = 0.0
     archived, archived_am = (None, None)
-    record: dict = archive_identity(spec) if record_to else {}
+    record: dict = {}
+    if record_to:
+        record = {
+            **archive_identity(spec),
+            "reference_version": versions.amici_version(),
+            "harness_git_rev": git_rev(str(HERE)),
+        }
     if replay:
-        archived, archived_am = archive_load(replay, spec)
+        try:
+            archived, archived_am = archive_load(replay, spec)
+        except Exception as exc:  # a corrupt or foreign file: the archive's fault
+            q.put(_stale(res, f"{type(exc).__name__}: {exc}", kind="archive_unreadable"))
+            return
         if archived is None:
             q.put(_stale(res, "no entry for this job"))
             return
@@ -460,6 +481,7 @@ def _worker(spec: dict, q) -> None:
         if changed:
             q.put(_stale(res, f"the job's {', '.join(changed)} changed"))
             return
+        res["reference_version"] = archived.get("reference_version")
         if "build_error" in archived:
             res["status"] = "reference_failed"
             res["exception"] = archived["build_error"]["text"]
@@ -572,7 +594,12 @@ def _worker(spec: dict, q) -> None:
         q.put(res)
         return
 
-    if replay and archived.get("shared_ids") is not None and archived["shared_ids"] != shared_ids:
+    # Both are known now, so a row that will never be compared skips bngsim's
+    # sensitivity run.
+    if replay and archived.get("shared_ids") is None:
+        q.put(_stale(res, "the recorded run stopped before AMICI's sensitivities"))
+        return
+    if replay and archived["shared_ids"] != shared_ids:
         q.put(_stale(res, "the shared parameter list changed"))
         return
     res["n_params"] = len(shared_ids)
@@ -615,13 +642,15 @@ def _worker(spec: dict, q) -> None:
     am = None
     am_timing = None
     if replay:
-        if archived.get("shared_ids") is None:
-            q.put(_stale(res, "the recorded run stopped before AMICI's sensitivities"))
-            return
         am = archived_am
         am_timing = archived.get("timing")
         if am_timing is not None:
-            am_timing = {**am_timing, "replayed_from_archive": True}
+            am_timing = {
+                **am_timing,
+                "replayed_from_archive": True,
+                "reference_version": archived.get("reference_version"),
+                "recorded_by_harness": archived.get("harness_git_rev"),
+            }
         if am is None:
             err = archived.get("run_error") or {}
             am_exc, am_cls, am_full = err.get("text", ""), err.get("cls", ""), err.get("full", "")
@@ -895,7 +924,8 @@ def main() -> int:
         f"  models: {len(jobs)}   methods: {','.join(methods)}   "
         f"jobs: {len(specs)}   workers: {args.workers}"
     )
-    print(f"  bngsim {ver['bngsim']}   amici {ver['amici']}   manifest {manifest.name}")
+    am_label = f"from archive {args.reference_archive}" if args.reference_archive else ver["amici"]
+    print(f"  bngsim {ver['bngsim']}   amici {am_label}   manifest {manifest.name}")
     print(
         f"  param budget: {args.param_budget or 'none'} coupled states"
         f"   extra cap: {args.param_cap or 'none'}   "
@@ -969,7 +999,12 @@ def main() -> int:
                 exception_class=r.get("exception_class"),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "amici": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 reference_refusal=refusal,
                 timing=r.get("timing"),
@@ -1015,6 +1050,11 @@ def main() -> int:
         suffix = "" if args.config == "auto" else f"__{args.config}"
         out_path = HERE / "runs" / f"report_sens{suffix}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.reference_archive:
+        # The report's header names the AMICI the archive entries recorded
+        # (issue #805), every distinct one where they differ.
+        recorded = sorted({v for r in raw if (v := r.get("reference_version"))})
+        ver["amici"] = " / ".join(recorded) or None
     meta = {
         "suite": "amici_parity",
         "reference_engine": "amici",
