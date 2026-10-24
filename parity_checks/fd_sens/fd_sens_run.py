@@ -15,6 +15,7 @@ and ``simultaneous``), as ``amici_sens`` runs them:
     over tolerance, or a non-finite cell .......... DIFF
     bngsim DECLARED it cannot differentiate ........ UNSUPPORTED (by type)
     bngsim raised .................................. EXCEPTION
+    a plain run of the difference raised ........... REFERENCE_FAILED
     no parameter to differentiate, or the FD
       reference did not converge with its step .... BAD_TEST (nothing compared)
     wall-clock cap exceeded ........................ TIMEOUT
@@ -31,13 +32,14 @@ documents are what that guards against:
 * **An unresolvable step.** A parameter that barely moves a species puts the
   difference under the solver's own floor, and the quotient is noise over 2h.
   The step is relative (``FD_REL_STEP``, coarse on purpose) and the runs are at
-  ``FD_RTOL`` = 1e-12. A column is compared only where its analytic value
-  clears both the verdict's ``atol/|p|`` floor and the difference's own noise
-  (:func:`judgeable_columns`); the rest are left out and named on the row. In
-  every compared column the two steps' quotients must agree to ``--fd-tol`` on
-  the column's own scale: one whose steps disagree is not a reference, and the
-  row is BAD_TEST with the disagreement recorded rather than a DIFF blamed on
-  the analytic side. A row with no column to compare is BAD_TEST too.
+  ``FD_RTOL`` = 1e-12. A column is compared only where its analytic value or
+  its difference clears both the verdict's ``atol/|p|`` floor and the
+  difference's own noise (:func:`judgeable_columns`); the rest are left out and
+  named on the row. Wherever the verdict looks, the two steps' quotients must
+  agree to ``--fd-tol`` on each (species, parameter) column's own scale
+  (:func:`step_disagreement`): one whose steps disagree is not a reference, and
+  the row is BAD_TEST with the disagreement recorded rather than a DIFF blamed
+  on the analytic side. A row with no column to compare is BAD_TEST too.
 * **A switch node.** A central difference taken exactly at a time where a
   switch fires straddles it and reads half the one-sided derivative. The
   manifest keeps such models' sample grids off their switch times.
@@ -124,16 +126,52 @@ def richardson(d_h: np.ndarray, d_h2: np.ndarray) -> np.ndarray:
     return (4.0 * d_h2 - d_h) / 3.0
 
 
-def step_disagreement(d_h: np.ndarray, d_h2: np.ndarray) -> float:
-    """How far one column's two quotients are apart, on the column's own scale:
-    ``max |D(h) - D(h/2)| / max |D(h/2)|``. A converged reference reads O(h²); a
-    step lost in the solver's noise reads O(1). Peak-relative, as ``_core.differ``
-    judges a column: per cell, a cell near zero in an otherwise large column read
-    1e-2 on references that converge (nested_derived_rate_const, expr_sens_chain)."""
-    peak = float(np.max(np.abs(d_h2))) if d_h2.size else 0.0
-    if peak == 0.0:
-        return 0.0 if not np.any(d_h) else float("inf")
-    return float(np.max(np.abs(d_h - d_h2))) / peak
+def step_disagreement(analytic: np.ndarray, reference: np.ndarray, gap: np.ndarray) -> float:
+    """How far the two steps' quotients are apart, on the scale the verdict judges.
+
+    ``gap`` is ``|D(h) - D(h/2)|`` cell by cell. ``sens_verdict`` flattens the
+    tensors to one column per (species, parameter) pair and judges each against
+    its own peak over time, counting a column only where that peak is past
+    ``_core.differ.SIGNIF_FLOOR`` of the tensor's; the peak is the larger of the
+    two sides', as ``differ`` takes it. This reads ``max |D(h) - D(h/2)| / peak``
+    over exactly those columns and the ones ``differ``'s movement gate judges. A
+    converged reference reads O(h²); a step lost in the solver's noise reads O(1).
+
+    Per (species, parameter) column, not per parameter: a small species whose
+    difference is noise sits beside a large one in the same parameter column,
+    so the parameter column's peak hides it, and the verdict, judging it on its
+    own peak, would blame that noise on the analytic side. Peak-relative, not
+    per cell: a cell near zero in an otherwise large column read 1e-2 on
+    references that converge (nested_derived_rate_const, expr_sens_chain).
+
+    A reference with a non-finite cell is no reference, and reads ``inf``; a
+    non-finite analytic cell is the verdict's to fail and sets no scale here.
+    """
+    from _core import differ
+
+    a = asens.flatten_tensor(np.asarray(analytic, dtype=float))
+    r = asens.flatten_tensor(np.asarray(reference, dtype=float))
+    g = asens.flatten_tensor(np.asarray(gap, dtype=float))
+    if not (np.isfinite(r).all() and np.isfinite(g).all()):
+        return float("inf")
+    if r.size == 0:
+        return 0.0
+    peak = np.maximum(np.where(np.isfinite(a), np.abs(a), 0.0), np.abs(r)).max(axis=0)
+    scale = float(peak.max())
+    if scale == 0.0:
+        return 0.0 if not np.any(g) else float("inf")
+    live = peak > differ.SIGNIF_FLOOR * scale
+    # And the columns its movement gate (issue #873) judges, chosen as it chooses
+    # them. Where the largest column holds still (mm_tqssa_stiff's dE/dE_0 = 1),
+    # that gate takes its scale from the columns that move, which can be a
+    # difference's noise.
+    ref_range, ref_peak = differ._range_and_peak(r)
+    eng_range, eng_peak = differ._range_and_peak(a)
+    col_range = np.maximum(ref_range, eng_range)
+    moves = col_range > differ.REL_TOL * np.maximum(ref_peak, eng_peak)
+    if moves.any():
+        live |= moves & (col_range > differ.SIGNIF_FLOOR * col_range[moves].max())
+    return float(np.max(g[:, live].max(axis=0) / peak[live]))
 
 
 def _plain_species(path: Path, param: str, value: float, job: dict) -> np.ndarray:
@@ -153,10 +191,10 @@ def _plain_species(path: Path, param: str, value: float, job: dict) -> np.ndarra
 
 
 def fd_tensor(path: Path, params: list[str], values: list[float], job: dict):
-    """The Richardson-extrapolated FD tensor ``(n_t, n_sp, n_p)`` and each
-    column's step disagreement."""
-    cols, disagreements = [], []
-    for p, v in zip(params, values, strict=False):
+    """The Richardson-extrapolated FD tensor ``(n_t, n_sp, n_p)`` and, shaped
+    like it, ``|D(h) - D(h/2)|``, the gap :func:`step_disagreement` reads."""
+    cols, gaps = [], []
+    for p, v in zip(params, values, strict=True):
         h = fd_step(v)
         quotients = []
         for step in (h, h / 2.0):
@@ -164,9 +202,9 @@ def fd_tensor(path: Path, params: list[str], values: list[float], job: dict):
             down = _plain_species(path, p, v - step, job)
             quotients.append((up - down) / (2.0 * step))
         d_h, d_h2 = quotients
-        disagreements.append(step_disagreement(d_h, d_h2))
+        gaps.append(np.abs(d_h - d_h2))
         cols.append(richardson(d_h, d_h2))
-    return np.stack(cols, axis=-1), disagreements
+    return np.stack(cols, axis=-1), np.stack(gaps, axis=-1)
 
 
 # How many multiples of a finite difference's own noise a column's analytic
@@ -174,10 +212,22 @@ def fd_tensor(path: Path, params: list[str], values: list[float], job: dict):
 FD_NOISE_FACTOR = 10.0
 
 
-def judgeable_columns(analytic: np.ndarray, x_max: float, values, atol: float) -> list[int]:
+def _column_peaks(tensor: np.ndarray) -> np.ndarray:
+    """Per parameter, the peak ``|value|`` over (time, species); a column holding
+    a non-finite cell peaks at ``inf``."""
+    t = np.asarray(tensor, dtype=float)
+    if t.size == 0:
+        return np.zeros(t.shape[-1] if t.ndim else 0)
+    return np.where(np.isfinite(t), np.abs(t), np.inf).max(axis=(0, 1))
+
+
+def judgeable_columns(
+    analytic: np.ndarray, reference: np.ndarray, x_max: float, values, atol: float
+) -> list[int]:
     """The parameter columns a finite difference can judge.
 
-    Two floors, and a column's analytic peak has to clear both:
+    Two floors, and a column's peak, the larger of the analytic one and the
+    difference's, has to clear both:
 
     * the verdict's own, ``factor·atol/|p|`` (``_amici_sens.sens_resolution_floors``):
       below it the analytic run itself does not resolve the column, and the
@@ -190,11 +240,18 @@ def judgeable_columns(analytic: np.ndarray, x_max: float, values, atol: float) -
     of the comparison (counted on the row). Measured: erk_activation's q3 (value
     3e-4, step 1.5e-7) and mm_tqssa_stiff's Km (1e-8) have analytic peaks of
     5e-8 and 8e-4 under difference noise of order 1e-1 and 1e3, and their
-    differences' two steps were 50% and 80% apart. A column wrongly LARGE
-    analytically still clears both floors and is still judged.
+    differences' two steps were 50% and 80% apart.
+
+    Either side's peak counts, so a column one side gets wrong is judged
+    whichever way it is wrong. One wrongly LARGE analytically clears the floors
+    on the analytic peak; one wrongly ZERO analytically, the silent zero, clears
+    them on the difference's, since a difference above its own noise floor is
+    signal. A column with a non-finite cell on either side peaks at ``inf`` and
+    is always judged: the verdict fails a non-finite analytic cell, and the gate
+    refuses a non-finite reference.
     """
     floors = asens.sens_resolution_floors(values, atol)
-    peaks = np.nanmax(np.abs(analytic), axis=(0, 1)) if analytic.size else np.zeros(0)
+    peaks = np.maximum(_column_peaks(analytic), _column_peaks(reference))
     out = []
     for j, v in enumerate(values):
         h_small = fd_step(v) / 2.0
@@ -202,6 +259,59 @@ def judgeable_columns(analytic: np.ndarray, x_max: float, values, atol: float) -
         if peaks[j] > max(floors[j], fd_floor):
             out.append(j)
     return out
+
+
+def _judge(res: dict, analytic, reference, gap, species, values, spec: dict) -> None:
+    """The verdict on two same-shaped tensors, into ``res``: which columns are
+    judged, whether the reference converged where the verdict looks, then
+    ``sens_verdict`` over the judged columns."""
+    x = np.abs(species)
+    finite = x[np.isfinite(x)]
+    x_max = float(finite.max()) if finite.size else 0.0
+    judged = judgeable_columns(analytic, reference, x_max, values, spec["atol"])
+    disagreement = (
+        step_disagreement(analytic[..., judged], reference[..., judged], gap[..., judged])
+        if judged
+        else 0.0
+    )
+    res["fd_step_disagreement"] = disagreement
+    res["n_columns_judged"] = len(judged)
+    res["columns_not_judged"] = [p for j, p in enumerate(res["params"]) if j not in judged]
+    if not judged:
+        res.update(
+            status="bad_test",
+            why="no column carries a sensitivity above the solver's resolution: "
+            "the comparison would establish nothing",
+        )
+    elif not np.isfinite(disagreement):
+        res.update(
+            status="bad_test",
+            why="the FD reference did not converge with its step: it is not finite",
+        )
+    elif not disagreement <= spec["fd_tol"]:
+        res.update(
+            status="bad_test",
+            why=(
+                f"the FD reference did not converge with its step: the two steps' "
+                f"quotients differ by {disagreement:.2e} relative (> {spec['fd_tol']:g})"
+            ),
+        )
+    else:
+        v = asens.sens_verdict(
+            analytic[..., judged],
+            reference[..., judged],
+            param_values=[values[j] for j in judged],
+            atol=spec["atol"],
+        )
+        res.update(
+            status="pass" if v["passed"] else "diff",
+            value=float(v["max_rel"]),
+            verdict={
+                k: v[k]
+                for k in ("n_below_noise_floor", "n_noise_rescued", "noise_decisive")
+                if k in v
+            },
+        )
 
 
 def _worker(spec: dict, q) -> None:
@@ -247,7 +357,8 @@ def _worker(spec: dict, q) -> None:
 
         res["timing"] = {
             "bngsim": {
-                "integrate_sec": round(integrate_sec, 6),
+                # One cold solve: the phase name verdicts.py sums into bngsim_sec.
+                "integrate_cold_sec": round(integrate_sec, 6),
                 "config": {
                     "codegen": sim.codegen_backend,
                     "jacobian": sim.jacobian_strategy,
@@ -256,53 +367,30 @@ def _worker(spec: dict, q) -> None:
                 "work": work_counters(stats),
             }
         }
-        reference, per_column = fd_tensor(path, params, values, spec)
-        x_max = float(np.nanmax(np.abs(np.asarray(run.species, dtype=float))))
-        judged = judgeable_columns(analytic, x_max, values, spec["atol"])
-        disagreement = max((per_column[j] for j in judged), default=0.0)
-        n_live = len(judged)
         res["params"] = params
-        res["fd_step_disagreement"] = disagreement
-        res["n_columns_judged"] = n_live
-        res["columns_not_judged"] = [p for j, p in enumerate(params) if j not in judged]
         res["max_abs_sx"] = float(np.nanmax(np.abs(analytic))) if analytic.size else 0.0
         res["resolvable_columns"] = asens.resolvable_param_columns(analytic, values, spec["atol"])
+        try:
+            reference, gap = fd_tensor(path, params, values, spec)
+        except Exception as e:  # noqa: BLE001 - the reference failed, not the code under test
+            captured = capture_exception(REFERENCE_ENGINE, e)
+            res.update(
+                status="reference_failed",
+                exception=captured.text,
+                exception_class=captured.cls,
+                wall_sec=round(time.perf_counter() - t0, 3),
+            )
+            q.put(res)
+            return
         if analytic.shape != reference.shape:
             res.update(
                 status="diff",
                 value=float("inf"),
                 why=f"tensor shapes differ: analytic {analytic.shape}, FD {reference.shape}",
             )
-        elif n_live == 0:
-            res.update(
-                status="bad_test",
-                why="no column carries a sensitivity above the solver's resolution: "
-                "the comparison would establish nothing",
-            )
-        elif disagreement > spec["fd_tol"]:
-            res.update(
-                status="bad_test",
-                why=(
-                    f"the FD reference did not converge with its step: the two steps' "
-                    f"quotients differ by {disagreement:.2e} relative (> {spec['fd_tol']:g})"
-                ),
-            )
         else:
-            v = asens.sens_verdict(
-                analytic[..., judged],
-                reference[..., judged],
-                param_values=[values[j] for j in judged],
-                atol=spec["atol"],
-            )
-            res.update(
-                status="pass" if v["passed"] else "diff",
-                value=float(v["max_rel"]),
-                verdict={
-                    k: v[k]
-                    for k in ("n_below_noise_floor", "n_noise_rescued", "noise_decisive")
-                    if k in v
-                },
-            )
+            species = np.asarray(run.species, dtype=float)
+            _judge(res, analytic, reference, gap, species, values, spec)
     except Exception as e:  # noqa: BLE001 - one model's failure is that row's EXCEPTION
         captured = capture_exception("bngsim", e)
         res.update(status="exception", exception=captured.text, exception_class=captured.cls)
@@ -315,6 +403,7 @@ _OUTCOME = {
     "diff": Outcome.DIFF,
     "exception": Outcome.EXCEPTION,
     "unsupported": Outcome.UNSUPPORTED,
+    "reference_failed": Outcome.REFERENCE_FAILED,
     "bad_test": Outcome.BAD_TEST,
     "timeout": Outcome.TIMEOUT,
     "dead": Outcome.EXCEPTION,
@@ -345,6 +434,18 @@ def make_specs(jobs: list[dict], args) -> list[dict]:
     return specs
 
 
+def _note(r: dict) -> str:
+    """What a row's note says. The scheduler's own results carry no ``why``: a
+    timeout says its cap, a child that died without a result its exit code."""
+    if r.get("exception") or r.get("why"):
+        return r.get("exception") or r.get("why")
+    if r.get("status") == "timeout":
+        return f"over the {r.get('cap')} s per-job cap"
+    if r.get("status") == "dead":
+        return f"the job's process died without a result (exit code {r.get('exitcode')})"
+    return ""
+
+
 def to_result(spec: dict, r: dict, stamp: dict) -> JobResult:
     outcome = _OUTCOME.get(r.get("status"), Outcome.EXCEPTION)
     extra = {
@@ -366,9 +467,9 @@ def to_result(spec: dict, r: dict, stamp: dict) -> JobResult:
         metric="max_rel_err",
         value=r.get("value"),
         tol=None,
-        exception=r.get("exception") or r.get("why") or "",
+        exception=_note(r),
         exception_class=r.get("exception_class"),
-        wall_sec=r.get("wall_sec"),
+        wall_sec=r.get("wall_sec", r.get("wall")),
         timestamp=_dt.datetime.now().isoformat(timespec="seconds"),
         versions=stamp,
         comment="",

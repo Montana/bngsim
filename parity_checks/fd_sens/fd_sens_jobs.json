@@ -1,5 +1,5 @@
 {
- "_comment": "Models parity_checks/fd_sens/fd_sens_run.py checks bngsim's analytic forward sensitivities on against central differences of its own trajectories (issue #804). Every path is a tracked .net file, so the nightly needs no corpus fetch and no BNG2.pl. Two groups: tests/data fixtures for the derivative shapes past defects broke (derived and nested-derived rate constants, Hill/Sat rewrites, the MM tQSSA forms, expression and observable chains, initial values from derived parameters, max/min/abs kinks), and published or tutorial networks from benchmarks/models/net/ode (four carry a scientific-notation rate factor, #689's shape). A model is left out, with its measurement, where a central difference is not a reference for it.",
+ "_comment": "Models parity_checks/fd_sens/fd_sens_run.py checks bngsim's analytic forward sensitivities against central differences of its own trajectories (issue #804). Every path is a tracked .net file, so the nightly needs no corpus fetch and no BNG2.pl. Two groups: tests/data fixtures for the derivative shapes past defects broke (derived and nested-derived rate constants, Hill/Sat rewrites, the MM tQSSA forms, expression and observable chains, initial values from derived parameters, max/min/abs kinks), and published or tutorial networks from benchmarks/models/net/ode (four carry a scientific-notation rate factor, #689's shape). A model is left out, with its measurement, where a central difference is not a reference for it.",
  "jobs": [
   {
    "model_id": "derived_rate_const",
@@ -267,8 +267,8 @@
   }
  ],
  "excluded": {
-  "CaOscillate_functional": "An oscillator over t = 0..50: a relative step of 1e-3 shifts the phase, and the two steps' quotients differ by 17% on a column clearing both floors. Not a reference without a phase-aware difference.",
-  "wofsy_goldstein": "K11 = 4.6e9: the two steps' quotients for its column differ by 4.3% at FD_RTOL 1e-12, a column clearing both floors. Not a reference at this step.",
+  "CaOscillate_functional": "An oscillator over t = 0..50: a relative step of 1e-3 shifts the phase. On k3 and k7 the two steps' quotients are 9.5% and 19% apart on each column's own scale, and the analytic values are 2.0% and 1.3% off the difference. The row would PASS, but only because the verdict judges every column against V's, 1e19 times larger, and does not look at the k columns: a PASS would claim coverage it does not have. Not a reference without a phase-aware difference.",
+  "wofsy_goldstein": "K11 = 4.6e9: the two steps' quotients for its column are 7.8% apart on its own scale at FD_RTOL 1e-12, so the difference is not a reference for K11 at this step. The row would PASS only because K11's column is 5e-18 of phi's, and the verdict, judging every column against the largest, does not look at it.",
   "egfr_path": "Over t = 0..50 no parameter column of the six sampled clears both the verdict's atol/|p| floor and the difference's own noise: the comparison would establish nothing (BAD_TEST).",
   "LV": "The sensitivity run of the Lotka-Volterra oscillator ran past the 300 s job cap on both correctors."
  }
