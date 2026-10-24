@@ -93,8 +93,9 @@ jobs:
       # and RelWithDebInfo's -O2 -g on the ExprTk-heavy translation units under
       # ASan is the heaviest compile in the tree. So: 3 at a time, no LTO
       # (CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF is what pybind11 defers to), and
-      # -O1 -g1, which is ASan's recommended level and keeps the line tables a
-      # report needs at a fraction of full debug info.
+      # -g1, which keeps the line tables a report needs at a fraction of full
+      # debug info. -O2 rather than ASan's suggested -O1: the suite is long, and
+      # every factor of slowdown is another wall-clock guard crossed.
       - name: Build the extension under the sanitizers
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
@@ -102,7 +103,7 @@ jobs:
           CMAKE_BUILD_PARALLEL_LEVEL: "3"
           SKBUILD_CMAKE_BUILD_TYPE: RelWithDebInfo
           SKBUILD_CMAKE_DEFINE: >-
-            BNGSIM_BUILD_PYTHON=ON;BNGSIM_REQUIRE_KLU=ON;CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF;CMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g1 -DNDEBUG;CMAKE_CXX_FLAGS_RELWITHDEBINFO=-O1 -g1 -DNDEBUG;CMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined;CMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined
+            BNGSIM_BUILD_PYTHON=ON;BNGSIM_REQUIRE_KLU=ON;CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF;CMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g1 -DNDEBUG;CMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g1 -DNDEBUG;CMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined;CMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined
         run: |
           set -euxo pipefail
           uv sync --extra test --python 3.12 --reinstall-package bngsim
@@ -133,6 +134,10 @@ jobs:
       # the log said only "worker 'gw3' crashed while running ..." and the report
       # that named the line was gone. Each process writes <log_path>.<pid>; the
       # last step prints them all.
+      #
+      # quarantine_size_mb=64 (default 256) because memory, not time, is what
+      # ran out on the second full run: four workers each holding a quarantine,
+      # on a 16 GB runner, beside the suite's largest stochastic ensembles.
       - name: Sanitizer runtime environment
         run: |
           set -euo pipefail
@@ -140,7 +145,7 @@ jobs:
           {
             echo "SAN_PRELOAD=$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)"
             echo "SAN_LOG_DIR=$RUNNER_TEMP/san"
-            echo "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:log_path=$RUNNER_TEMP/san/asan"
+            echo "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:quarantine_size_mb=64:log_path=$RUNNER_TEMP/san/asan"
             echo "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:log_path=$RUNNER_TEMP/san/ubsan"
             echo "PYTHONMALLOC=malloc"
           } >> "$GITHUB_ENV"
@@ -177,19 +182,33 @@ jobs:
           grep -h -m1 "ERROR: AddressSanitizer" "$SAN_LOG_DIR"/asan.*
           rm -f "$SAN_LOG_DIR"/*
 
-      # Deselected here, and only here (python-tests.yml still runs them):
+      # Wall-clock limits first. The build here is two to three times slower than
+      # python-tests.yml's, so two kinds of hang guard would fail on the
+      # slowdown rather than on a hang:
       #
-      #   * Wall-clock budgets. They guard against hangs and pathological
-      #     slowdowns with caps a normal build clears easily and the 2-3x
-      #     sanitizer slowdown does not: on this job's first runs a 30 s stall
-      #     bound took 47 s, a 5 s cap took 5.7 s, and a 60 s run timeout fired.
-      #     Each surfaces only when a run lands near its cap, so all of them are
-      #     listed, not just the ones seen failing: every test that asserts an
-      #     elapsed time below a budget, plus the one that hands the simulator a
-      #     60 s timeout on a run a normal build finishes in seconds.
-      #   * test_run_tests_sh's end-to-end check, which requires that the dev
-      #     extra's optional modules (diffrax, vivarium-core) be importable. This
-      #     job installs only the test extra.
+      #   * A timeout handed to Simulator.run (about 160 tests give one of two
+      #     minutes or less). BNGSIM_TEST_TIMEOUT_SCALE stretches each by 4; see
+      #     python/tests/conftest.py. The tests still run.
+      #   * A test that times itself and asserts the elapsed time is under a cap.
+      #     There is nothing to stretch, so those are deselected: every test
+      #     that reads time.* and asserts a bound, found by walking the suite's
+      #     syntax tree, not just the ones seen failing (on the first runs a 30 s
+      #     cap took 47 s, a 5 s cap 5.7 s, and a 1 s cap 3.1 s).
+      #
+      # Also deselected here, and only here (python-tests.yml runs them all):
+      #
+      #   * test_nfsim_run_system_leak's throwing-run probe. It caps its own
+      #     address space at 1.5 GB to make an allocation fail; ASan reserves
+      #     terabytes of address space and aborts on a failed allocation instead
+      #     of throwing, so the probe cannot run under it ("Failed to mmap").
+      #   * test_run_tests_sh's end-to-end check, which needs the dev extra's
+      #     diffrax and vivarium-core. This job installs only the test extra.
+      #   * The 18 stochastic-ensemble comparisons in test_ssa_variable_volume
+      #     (*_matches_extrande, *_matches_oracle). Under the sanitizers each
+      #     took 4 to 8 minutes, together most of a shard, and four at once ran
+      #     the runner out of memory. A sanitizer catches the same bad access on
+      #     the hundredth sample as on the ten-thousandth, and the file's other
+      #     21 tests run the same variable-volume paths.
       #
       # The suite is stopped with SIGINT at 80 minutes rather than by the job
       # limit, so pytest still prints which tests failed, and any single test
@@ -200,21 +219,31 @@ jobs:
           BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
           BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
           BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
+          BNGSIM_TEST_TIMEOUT_SCALE: "4"
           DESELECT: |
             test_codegen_gen_scaling.py::test_large_model_generation_is_not_quadratic
             test_codegen_gen_scaling.py::test_function_heavy_generation_is_not_quadratic
+            test_codegen_key_stream.py::test_the_key_of_a_large_model_is_cheap
+            test_codegen_power_denominator.py::test_the_rewrite_finishes_fast
             test_codegen_power_denominator.py::test_a_real_derivative_prints_fast
+            test_codegen_power_denominator.py::test_a_large_non_symbol_denominator_is_rejected_fast
             test_delayed_event_priority.py::test_many_idle_non_persistent_events_cost_one_pass_over_what_waits
             test_delayed_event_priority.py::test_many_waiting_executions_are_not_passed_over_at_every_stop
             test_discontinuity_stall_bound.py::test_stall_raises_quickly_instead_of_hanging
             test_discontinuity_stall_bound.py::test_raising_max_steps_does_not_reintroduce_the_hang
+            test_jacobian_symbolic.py::test_many_steps_derive_at_once
+            test_periodic_time_windows.py::test_a_degree_twelve_polynomial_is_solved_quickly
+            test_periodic_time_windows.py::test_too_many_crossings_are_declined_loudly_and_cheaply
             test_sbml_event_chatter_biomd711.py::test_biomd711_event_chatter_does_not_stall
             test_sbml_jacobian_budget_biomd496.py::test_large_functional_build_solve_under_budget
-            test_stalled_state_switch_surface.py::test_a_slide_along_the_surface_is_not_carried_across
+            test_size_jump_diamond_of_rules.py::test_two_relations_over_a_diamond_load_in_linear_time
+            test_size_jump_diamond_of_rules.py::test_two_roots_a_run_constant_puts_on_one_instant_over_a_diamond
+            test_ssa_audit_fixes.py::test_a_tiny_propensity_beside_a_clock_trigger_does_not_hang
             test_timeout.py::test_ssa_timeout_raises_simulation_timeout
             test_timeout.py::test_rulemonkey_stateless_timeout_raises
             test_timeout.py::test_rulemonkey_session_simulate_timeout_raises
             test_timeout.py::test_nfsim_session_simulate_timeout_raises
+            test_nfsim_run_system_leak.py::test_a_throwing_run_does_not_retain_the_system
             test_run_tests_sh.py::test_the_script_itself_runs_walk_up_dependent_tests_green
         run: |
           set -euxo pipefail
@@ -226,6 +255,7 @@ jobs:
             .venv/bin/python -m pytest -p no:cacheprovider python/tests \
             -n auto --dist worksteal -q --tb=short -rfE --durations=30 \
             -o faulthandler_timeout=300 "${deselect[@]}" \
+            -k "not (test_ssa_variable_volume and (matches_extrande or matches_oracle))" \
             2>&1 | tee python-sanitizers-${{ matrix.shard }}.log
 
       # Every report, in full, whatever wrote it: an xdist worker the suite saw

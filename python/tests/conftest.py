@@ -125,6 +125,38 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         shutil.rmtree(_EPHEMERAL_CACHE_ROOT, ignore_errors=True)
 
 
+# ─── Wall-clock timeouts on a slower build ────────────────────────────────────
+#
+# python-sanitizers.yml runs this suite against an ASan + UBSan build, two to
+# three times slower than the one python-tests.yml runs. About 160 tests hand a
+# run a timeout of two minutes or less as a hang guard, and on that build a run
+# that is merely slow can cross one: two did, on the job's first full runs.
+# BNGSIM_TEST_TIMEOUT_SCALE multiplies the timeout every Simulator.run call is
+# given. Unset, as it is everywhere but that job, nothing is patched.
+_TIMEOUT_SCALE_ENV = "BNGSIM_TEST_TIMEOUT_SCALE"
+
+
+def _scale_run_timeouts() -> None:
+    raw = os.environ.get(_TIMEOUT_SCALE_ENV, "").strip()
+    if not raw:
+        return
+    scale = float(raw)
+
+    import functools
+
+    import bngsim
+
+    run = bngsim.Simulator.run
+
+    @functools.wraps(run)
+    def run_with_scaled_timeout(self, *args, **kwargs):
+        if kwargs.get("timeout"):
+            kwargs["timeout"] = kwargs["timeout"] * scale
+        return run(self, *args, **kwargs)
+
+    bngsim.Simulator.run = run_with_scaled_timeout
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Cache redirect (issue #372), then the stale-binary preflight (issue #125).
 
@@ -143,6 +175,8 @@ def pytest_configure(config: pytest.Config) -> None:
     """
     _configure_shard(config)
     root = _redirect_artifact_caches(config)
+    # After the redirect, which has to land before the first bngsim import.
+    _scale_run_timeouts()
     # Under pytest-xdist every worker runs this hook as well, and a dozen copies
     # of the two lines below buried the one that describes the run. The workers
     # still redirect and still check; only the controller says so.
