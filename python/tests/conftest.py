@@ -131,9 +131,14 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 # three times slower than the one python-tests.yml runs. About 160 tests hand a
 # run a timeout of two minutes or less as a hang guard, and on that build a run
 # that is merely slow can cross one: two did, on the job's first full runs.
-# BNGSIM_TEST_TIMEOUT_SCALE multiplies the timeout every Simulator.run call is
-# given. Unset, as it is everywhere but that job, nothing is patched.
+# BNGSIM_TEST_TIMEOUT_SCALE multiplies the timeout a Simulator.run call is
+# given, when that timeout is a hang guard: _TIMEOUT_SCALE_FLOOR seconds or
+# more. A shorter one is usually the thing under test, a budget the test means
+# to see fire and then reads back off the exception (test_timeout.py, at 0.3
+# and 5 s), and stretching it failed exactly those. Unset, as it is everywhere
+# but that job, nothing is patched.
 _TIMEOUT_SCALE_ENV = "BNGSIM_TEST_TIMEOUT_SCALE"
+_TIMEOUT_SCALE_FLOOR = 10.0
 
 
 def _scale_run_timeouts() -> None:
@@ -150,8 +155,9 @@ def _scale_run_timeouts() -> None:
 
     @functools.wraps(run)
     def run_with_scaled_timeout(self, *args, **kwargs):
-        if kwargs.get("timeout"):
-            kwargs["timeout"] = kwargs["timeout"] * scale
+        timeout = kwargs.get("timeout")
+        if timeout is not None and timeout >= _TIMEOUT_SCALE_FLOOR:
+            kwargs["timeout"] = timeout * scale
         return run(self, *args, **kwargs)
 
     bngsim.Simulator.run = run_with_scaled_timeout

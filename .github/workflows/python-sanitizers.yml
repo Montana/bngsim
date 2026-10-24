@@ -187,8 +187,9 @@ jobs:
       # slowdown rather than on a hang:
       #
       #   * A timeout handed to Simulator.run (about 160 tests give one of two
-      #     minutes or less). BNGSIM_TEST_TIMEOUT_SCALE stretches each by 4; see
-      #     python/tests/conftest.py. The tests still run.
+      #     minutes or less). BNGSIM_TEST_TIMEOUT_SCALE stretches each one of
+      #     10 s or more by 4, leaving the short budgets test_timeout.py means to
+      #     see fire; see python/tests/conftest.py. The tests still run.
       #   * A test that times itself and asserts the elapsed time is under a cap.
       #     There is nothing to stretch, so those are deselected: every test
       #     that reads time.* and asserts a bound, found by walking the suite's
