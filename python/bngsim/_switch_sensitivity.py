@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import ast
 import bisect
+import contextlib
 import functools
 import logging
 import math
 import re
 import sys
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import NamedTuple
@@ -3300,6 +3302,7 @@ def crossings_with_periodic(
     over_budget=None,
     sensitivity_params=None,
     on_the_flip=False,
+    before_the_flip=False,
     by_tread=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
     """:func:`all_fixed_crossings`, and for the conditions it leaves out, their
@@ -3345,6 +3348,19 @@ def crossings_with_periodic(
     `1e12 + t` switched a double of the clock, 1.2e-4 of time, later than the
     same run from the origin, and the run far from it was no longer that run.
 
+    *before_the_flip* moves each such stop, and each the scan places on the
+    evaluator's change, onto the last double before that change, on literal
+    time: the ODE path asks for it at the tolerances that are not on the flip
+    (issue #1226). A step ends on a stop, and the implicit step reads the rate
+    at its end: on the first double of the next stretch it is taken at the
+    next stretch's rate, and where the tolerance lets it span the stretch,
+    `if(mod(time(), 24) < 1, 1, 0)` over 1,000 days at rtol 1e-2 came to
+    14,627 for 1,000. A double earlier it is exact to rounding. Only for a
+    condition whose rate laws hold between its changes: one that reads the
+    clock outside every condition that holds (a sawtooth, a ramp, a pulse
+    times the clock) keeps its stops where they were put
+    (`changes_between_its_stops` in :func:`_resolve_crossings`).
+
     *by_tread* reads a condition on a line far from zero tread by tread where
     the scan refuses it or leaves it without stops (issue #1018,
     :func:`_tread_stop_times`); the ODE path asks for it in a run with no
@@ -3361,6 +3377,7 @@ def crossings_with_periodic(
         over_budget=over_budget,
         sensitivity_params=sensitivity_params,
         on_the_flip=on_the_flip,
+        before_the_flip=before_the_flip,
         by_tread=by_tread,
     )
 
@@ -3428,6 +3445,7 @@ def _resolve_crossings(
     over_budget=None,
     sensitivity_params=None,
     on_the_flip=False,
+    before_the_flip=False,
     by_tread=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
     if not conditions:
@@ -3442,6 +3460,39 @@ def _resolve_crossings(
     unplaced: dict[int, list[float]] = {}
     # Stops read tread by tread (issue #1018), placed after every other's.
     treaded: list[tuple[str, int, _TreadStops]] = []
+    # The conditions whose value holds between two changes (a comparison, a
+    # step call): the rest of a rate law's reads of the clock are where it
+    # changes between its stops (issue #1226).
+    held_conditions = (
+        sorted((c for c in conditions if _held_between_changes(c)), key=len, reverse=True)
+        if before_the_flip
+        else []
+    )
+
+    reads_here: list[list[tuple[str, bool]] | None] = []
+
+    def changes_between_its_stops(cond: str) -> bool:
+        """Whether a rate law that reads *cond* reads the clock outside every
+        condition that holds between its changes: a sawtooth (a `mod`, `frac`
+        or `floor` remainder), a ramp, a pulse times the clock. Spanned by one
+        step, such a stretch is read at one end, and a double before the change
+        that end is not the right one more than the other: from X(0) = 1e4 at
+        rtol 1e-3, `mod(time(), 0.7)` over 70 was 19.3 over a double before
+        every change and 0.45 as the resolvers put them. So it keeps them. A
+        law that holds between its changes is exact a double before. (Each
+        rate law flattened, with what it calls written into it; past
+        :data:`_HELD_READ_MOST`, not read, and taken to change.)"""
+        if not reads_here:
+            try:
+                reads_here.append(_rate_laws_read_held(core, tuple(held_conditions)))
+            except Exception as exc:  # noqa: BLE001 - then it is taken to
+                logger.debug("the rate laws: not read (%s)", exc)
+                reads_here.append(None)
+        reads = reads_here[0]
+        if reads is None:
+            return True
+        return any(clock for flat, clock in reads if cond in flat)
+
     flats: list[list[str]] = []
 
     def read_by_a_rate_law(cond: str) -> bool:
@@ -3741,7 +3792,19 @@ def _resolve_crossings(
                     touch=t_stop == t_cross,
                 )
             )
+        # (The scan's stops are on the evaluator's change. A double before it,
+        # where the run asks for that and no event's trigger reads it: issue
+        # #1226, above.)
+        before = (
+            before_the_flip
+            and clock_idx < 0
+            and cond not in touches
+            and bool(scanned or inside)
+            and not changes_between_its_stops(cond)
+        )
         for t_cross, value, touch in scanned or ():
+            if before and not touch and t_start < math.nextafter(t_cross, -math.inf):
+                t_cross = math.nextafter(t_cross, -math.inf)
             crossings.append(CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0))
             stops.append(
                 CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0, touch=touch)
@@ -3758,7 +3821,7 @@ def _resolve_crossings(
             _stops_on_the_flip(core, engine, text, offset, scope, bodies, t_start, t_end, inside)
             if inside
             and periodic
-            and on_the_flip
+            and (on_the_flip or before)
             and sensitivity_params is None
             and cond not in touches
             else None
@@ -3774,6 +3837,10 @@ def _resolve_crossings(
                     # stays on the end: a last step that is not stopped is
                     # taken past the end and read back, across the change.
                     t_cross, value = t_placed, t_placed + offset
+                elif before:
+                    # The last double before the change (issue #1226).
+                    t_cross = math.nextafter(t_cross, -math.inf)
+                    value = t_cross + offset
                 if t_start < t_cross <= t_end:
                     found.append(
                         CrossingStop(
@@ -3905,11 +3972,88 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
     return frozenset(cond for cond in conditions if any(cond in flat for flat in flats))
 
 
-def _rate_law_flats(core) -> list[str]:
-    """Each rate law, and each function a rate law reaches, with the functions
-    it calls written out."""
+# What :func:`_rate_law_flat_parts` made, for each model it was made for (a
+# model's rate laws and functions are its core's for its life), and by the
+# texts it was made from, for a clone (a row of `run_batch` has a core of its
+# own): a loop of legs on one model asks on every leg, and the inlining was
+# half of such a leg's time.
+_FLATS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_FLATS_BY_TEXT: dict[tuple, tuple[list[str], int, float]] = {}
+_FLATS_BY_TEXT_MOST = 32
+# The longest a rate law may flatten to and be read for whether it holds
+# between its changes (issue #1226). Past it the inliner writes each text
+# through sympy: a chain of 600 functions took 27 s to read where the run took
+# 0.2, and main reads no rate law there. (The inliner's own limit.)
+_HELD_READ_MOST = 20_000
+# What :func:`_rate_laws_read_held` made, for each model, by the conditions
+# written out.
+_HELD_READS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _flattened_length(rate_laws, func_map) -> float:
+    """The most any of *rate_laws* would be with every function it calls
+    written out, from the lengths of the bodies, without writing one out."""
+    from bngsim._jacobian import _IDENT_RE
+
+    sizes: dict[str, float] = {}
+
+    def size(name: str) -> float:
+        if name not in sizes:
+            sizes[name] = math.inf  # a cycle reads as too long
+            sizes[name] = len(func_map[name]) + sum(
+                size(ref) + 2 - len(ref)
+                for ref in _IDENT_RE.findall(func_map[name])
+                if ref in func_map
+            )
+        return sizes[name]
+
+    try:
+        return max(
+            (
+                len(text)
+                + sum(
+                    size(ref) + 2 - len(ref) for ref in _IDENT_RE.findall(text) if ref in func_map
+                )
+                for text in rate_laws
+            ),
+            default=0.0,
+        )
+    except RecursionError:
+        return math.inf
+
+
+def _rate_law_flat_parts(core) -> tuple[list[str], int, float]:
+    """``(flats, n, longest)``: each rate law and then each function a rate law
+    reaches, with the functions it calls written out (the first *n* are the
+    rate laws'), and the most a rate law flattens to. The flats are made only
+    where that is within :data:`_HELD_READ_MOST` or a caller asks for them
+    whatever it is (:func:`_rate_law_flats`)."""
+    with contextlib.suppress(TypeError):
+        made = _FLATS.get(core)
+        if made is not None:
+            return made
+    ctx = core.functional_jacobian_context()
+    func_map = _scan_function_map(ctx)
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
+    key = (tuple(rate_laws), tuple(sorted(func_map.items())))
+    made = _FLATS_BY_TEXT.get(key)
+    if made is None:
+        made = ([], len(rate_laws), _flattened_length(rate_laws, func_map))
+        if len(_FLATS_BY_TEXT) >= _FLATS_BY_TEXT_MOST:
+            _FLATS_BY_TEXT.clear()
+        _FLATS_BY_TEXT[key] = made
+    with contextlib.suppress(TypeError):
+        _FLATS[core] = made
+    return made
+
+
+def _write_flats(core, made: tuple[list[str], int, float]) -> list[str]:
+    """Fill *made*'s flats in place, once."""
     from bngsim._jacobian import _IDENT_RE, _inline_functions
 
+    flats = made[0]
+    if flats:
+        return flats
     ctx = core.functional_jacobian_context()
     func_map = _scan_function_map(ctx)
     rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
@@ -3921,10 +4065,46 @@ def _rate_law_flats(core) -> list[str]:
             reached[name] = None
             pending.extend(n for n in _IDENT_RE.findall(func_map[name]) if n in func_map)
     memo: dict[str, str] = {}
-    return [
+    flats.extend(
         _inline_functions(text, func_map, memo=memo) or text
         for text in (*rate_laws, *(func_map[name] for name in reached))
-    ]
+    )
+    return flats
+
+
+def _rate_law_flats(core) -> list[str]:
+    """Each rate law, and each function a rate law reaches, with the functions
+    it calls written out."""
+    return _write_flats(core, _rate_law_flat_parts(core))
+
+
+def _rate_laws_read_held(core, held: tuple[str, ...]) -> list[tuple[str, bool]] | None:
+    """For each rate law flattened, ``(flat, reads the clock)`` with every one
+    of *held* written out of it; ``None`` where a rate law flattens past
+    :data:`_HELD_READ_MOST`, and is not read (issue #1226). Made once a model
+    and conditions: written out once a condition, a regimen of 600 windows in
+    one rate law took 21.8 s for main's 1.5."""
+    from bngsim import _clock_scan
+
+    made = _rate_law_flat_parts(core)
+    if made[2] > _HELD_READ_MOST:
+        return None
+    try:
+        reads = _HELD_READS.setdefault(core, {})
+    except TypeError:
+        reads = {}
+    if held not in reads:
+        flats = _write_flats(core, made)[: made[1]]
+        out = []
+        for flat in flats:
+            rest = flat
+            for text in held:
+                rest = rest.replace(text, "0")
+            out.append((flat, bool(_clock_scan._READS_CLOCK.search(rest))))
+        if len(reads) >= 4:
+            reads.clear()
+        reads[held] = out
+    return reads[held]
 
 
 def _a_far_line_outside(core, flat: str, conditions, scope, t_start, t_end) -> bool:
@@ -5818,7 +5998,9 @@ def merge_crossing_stops(found: Sequence[CrossingStop], floor: float = 1.0) -> l
     # restarted a double before its own change (`time() - P*floor(time()/P)`
     # beside `mod(time(), P)`: 305 times rtol, main 33); onto a moved one, an
     # event trigger's stop was read a double late. Where any is, every stop
-    # goes back to where the resolvers put it, and the run is main's.
+    # the resolvers placed goes back to where they put it. (A scanned stop has
+    # no placing of theirs, and stays a double before its change where it was
+    # put there, issue #1226.)
     if any(stop.on_flip for stop in found) and any(
         (a.on_flip or b.on_flip) and a.time != b.time and _same_instant(a.time, b.time, floor)
         for a, b in zip(found, found[1:], strict=False)
@@ -6076,6 +6258,35 @@ def _fixed_threshold_expr(threshold_expr: str, scope: SwitchConditionScope) -> b
 # shape :func:`_left_alone_tread_stops` reads, asked of a resolver's "no change"
 # before the condition is made for the evaluator.
 _SAWTOOTH_CALL = re.compile(r"\s*(?:mod|frac)\s*\(")
+
+
+# The calls whose value holds between two of its changes.
+_HELD_CALLS = frozenset(
+    {"floor", "ceil", "round", "roundn", "rint", "nint", "trunc", "sign", "sgn"}
+)
+
+
+def _held_between_changes(cond: str) -> bool:
+    """Whether *cond* holds its value between two of its changes: a comparison
+    (or a combination of them), or a whole step call. Not a sawtooth (`mod`,
+    `frac`), which climbs between its wraps, nor a bend. Read at the top
+    level only: a comparison in parentheses, as every one an SBML model loads
+    is, is not taken to, and keeps its stops where they were put."""
+    text = cond.strip()
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0 and ch in "<>" or (depth == 0 and text[i : i + 2] in ("==", "!=")):
+            return True
+    name, paren, _ = text.partition("(")
+    if not paren or name.strip() not in _HELD_CALLS:
+        return False
+    depth = 0
+    for i in range(len(name), len(text)):
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        if depth == 0:
+            return i == len(text) - 1
+    return False
 
 
 def _a_whole_sawtooth_call(text: str) -> bool:

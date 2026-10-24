@@ -71,21 +71,34 @@ then one record per line. Read it with `_core.read_golden(path)`.
 ## How a consumer uses it
 
 1. Regenerate the job through your bridge on the **same pinned bngsim** (match
-   `_meta.versions.bngsim`) with `seed=1` for stochastic jobs.
+   `_meta.versions.bngsim`) with `seed=1` for stochastic jobs. An entry named in
+   a `_meta.regenerations[*].models` list was regenerated later: pin the
+   `versions` and `bngsim_build_commit` of the last record that names it.
 2. Compute `_core.fingerprint.golden_pair(time, values, names)` per artifact and
    the spanning checksum the same way `parity_golden.build_golden_for_job` does.
 3. **Same platform** (the intended CI case): the `checksum` must match
    byte-for-byte — the strongest check, catching any divergence.
 4. **Different platform** (BLAS/rounding differs): fall back to comparing each
-   `artifacts[<file>]` fingerprint with `_core.fingerprint.fingerprint_max_rel`
-   against a tolerance. NOTE a single `seed=1` *stochastic* trajectory is chaotic
-   — its fingerprint is **not** cross-platform-stable; the byte checksum is the
-   meaningful stochastic check, and it certifies same-platform reproduction.
-5. **A blow-up fails both, unconditionally** (issue #572). A regenerated
-   variable that went `NaN`/`inf` where the golden is finite — or that blew up a
-   *different* way than the golden did — mismatches the checksum at step 3 and
-   scores `inf` from `fingerprint_max_rel` at step 4, so no tolerance you pick
-   can pass it. Only the *same* blow-up on both sides is a reproduction.
+   `artifacts[<file>]` fingerprint with
+   `_core.fingerprint.fingerprint_distance(fp, golden_fp, rtol, atol)`, which
+   must be at most 1. That is the CI gate's comparison, `|x - y| <= rtol·|y| +
+   atol` on `t_last` and every per-variable stat. `fingerprint_max_rel` is
+   purely relative, so it reads noise on a species resting near zero as large:
+   e2f-rb's `CKI_Inhibition`, 3.0e-8 against 2.3e-8, scores 22% there and
+   0.0066 of rtol 1e-5, atol 1e-6 here. NOTE a single `seed=1` *stochastic*
+   trajectory is chaotic — its fingerprint is **not** cross-platform-stable; the
+   byte checksum is the meaningful stochastic check, and it certifies
+   same-platform reproduction.
+5. **A blow-up fails both** (issue #572). A regenerated variable that went
+   `NaN`/`inf` where the golden is finite — or that blew up a *different* way
+   than the golden did — mismatches the checksum at step 3 and, where it reaches
+   a fingerprint stat, scores `inf` from `fingerprint_distance` (and
+   `fingerprint_max_rel`) at step 4, so no tolerance you pick can pass it. Only
+   the *same* blow-up on both sides is a reproduction. A stat reaches it at the
+   last row, or when a whole column is non-finite: min/max/mean skip non-finite
+   cells, so one NaN mid-trajectory leaves the fingerprint unchanged. For an
+   allow-listed job, compare the committed trajectory's non-finite cells
+   exactly, as the CI gate does.
 
 ## BNG2.pl is required to generate
 
@@ -140,3 +153,37 @@ python ../parity_golden.py --regime ode --workers 4               # ODE set (fas
 python ../parity_golden.py --regime stochastic --include glacial/ --workers 2  # NFsim (supervised!)
 python ../parity_golden.py --no-run-sweep --sweep-out ../runs/golden/bngsim    # rebuild json only
 ```
+
+## The CI gate (issue #582)
+
+`golden-verify.yml` runs `parity_golden.py --verify --gate` on every pull
+request. It re-runs the nine deterministic allow-listed models (`GATED_MODELS`)
+and compares each with its entry here: an identical checksum passes, and so does
+a differing one whose `t_last` and per-variable stats are all within
+`1e-5·|y| + 1e-6` (`Lang_2024` within `1e-4·|y| + 1e-6`: its long horizon
+carries rounding to about 1.1e-5 between Linux and macOS;
+`VERIFY_TOLERANCE_OVERRIDES` gives the measurement).
+Each gated model's non-finite cells must also sit where its committed
+trajectory has them, since a NaN mid-trajectory reaches no fingerprint stat.
+Drift, a failed run, or a gated model the sweep left no output for fails.
+
+Both `--verify` and `--merge` act only on the jobs the sweep ran, as its
+`_summary.json` lists them. A sweep root keeps every earlier run's output (the
+default `runs/golden/bngsim` can hold a full 895-job sweep), and judging or
+merging that would pass stale numbers off as this run's.
+
+A change that moves those numbers on purpose regenerates their entries:
+
+```
+python parity_checks/bng_parity/parity_golden.py --merge --gate
+```
+
+`--merge` replaces only the swept entries and their `_meta.protocol_replay`
+verdicts, keeps every other one, and appends what was regenerated, from which
+commit and engines, to `_meta.regenerations`. It writes nothing when a job it
+ran failed, or under `--gate` when a gated model was not swept. `--gate` without
+`--verify` or `--merge` is refused: a plain write keeps only the jobs in the
+sweep, so from a fresh `--sweep-out` it would drop every other entry. Regenerate
+only from output that still agrees with BNG2.pl (those models PASS in
+`parity_checks/nightly/baselines/bng_ode.json`), so the gate defends a
+cross-validated answer.
