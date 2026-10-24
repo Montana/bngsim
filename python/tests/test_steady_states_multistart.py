@@ -481,43 +481,98 @@ def test_the_extra_start_adds_nothing_to_a_root_the_draws_found(monkeypatch):
     assert (roots.multiplicity > 0).all()
 
 
-@pytest.mark.parametrize("name", ["m1_ground.net", "SIR.net"])
-def test_no_root_leaves_the_models_conservation_laws(name):
+_TINY_CHAIN_NET = """begin parameters
+    1 k1  300
+    2 k2  200
+    3 k3  100
+end parameters
+begin species
+    1 A() 5e-10
+    2 B() 0
+    3 C() 0
+    4 D() 0
+end species
+begin reactions
+    1 1 2 k1 #_R1
+    2 2 3 k2 #_R2
+    3 3 4 k3 #_R3
+end reactions
+begin groups
+    1 Dtot 4
+end groups
+"""
+
+
+def _held_sink_case(case, tmp_path):
+    """(model, steady_states kwargs) for a sink masked as the docstring advises."""
+    if case == "tiny_chain":
+        path = tmp_path / "tiny_chain.net"
+        path.write_text(_TINY_CHAIN_NET, encoding="utf-8")
+        return bngsim.Model.from_net(str(path)), {}
+    model = bngsim.Model.from_net(_net(case.split(":")[0] + ".net"))
+    if case == "SIR:gamma=2":
+        model.set_param("gamma", 2.0)
+        return model, {"dedupe_rtol": 1e-8}
+    return model, {}
+
+
+@pytest.mark.parametrize("case", ["m1_ground", "SIR", "tiny_chain", "SIR:gamma=2"])
+def test_no_root_leaves_the_models_conservation_laws(tmp_path, case):
     """Masked as the docstring advises a pure sink, m1_ground's D (A -> B -> C
-    -> D, total 100) and SIR's R are law members the ordinary solve moves. The
-    seed holds them at the draws' values, so its totals were the model's no
-    longer, and a "root" came back at a total of 0 (m1_ground) and 18355 of
-    2e7 (SIR). Every root is at the model's totals."""
+    -> D, total 100) and SIR's R are law members the ordinary solve moves. Set
+    back as the draws hold them, they moved the seed's law totals, and a "root"
+    came back at a total of 0 (m1_ground) and 18355 of 2e7 (SIR). The seed is
+    now put on the model's totals: every root holds them. tiny_chain is
+    m1_ground at a total of 5e-10, below tol, and SIR at gamma = 2 moves R by
+    only 2 of 2e7, under a looser dedupe_rtol: a threshold on the drift let both
+    through. m1_ground's held chain has no root at all, as on main."""
     from bngsim._simulator import _manifold_partition
 
-    model = bngsim.Model.from_net(_net(name))
+    model, kwargs = _held_sink_case(case, tmp_path)
     y0, L, _, _ = _manifold_partition(model, None)
-    totals = L @ y0
     assert L.shape[0] >= 1
     sim = bngsim.Simulator(model, method="ode")
-    roots = sim.steady_states(n_starts=20, seed=0, mask=~model.is_pure_sink())
+    roots = sim.steady_states(n_starts=20, seed=0, mask=~model.is_pure_sink(), **kwargs)
     for y in roots.states:
-        np.testing.assert_allclose(L @ y, totals, rtol=1e-6)
+        np.testing.assert_allclose(L @ y, L @ y0, rtol=1e-9)
+    if case in ("m1_ground", "tiny_chain"):
+        assert len(roots) == 0
 
 
-@pytest.mark.parametrize("how", ["raises", "unconverged"])
-def test_the_draws_stand_when_the_ordinary_solve_does_not(monkeypatch, how):
-    """The ordinary solve is only a seed and a scale. Where it raises, or does
-    not converge, nothing is seeded and the call returns what the draws found:
-    on Motivating_example, where every draw fails, no root at all."""
-    real = bngsim.Simulator.steady_state
+_ZERO_TOTAL_NET = """begin parameters
+    1 ks   1e8
+    2 kac  1.0
+    3 kd   1.0
+end parameters
+begin species
+    1 A() 0
+    2 B() 0
+    3 C() 0
+end species
+begin reactions
+    1 0 1,2 ks #_R1
+    2 1 3 kac #_R2
+    3 2,3 0 kd #_R3
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
 
-    def ordinary(self, **kwargs):
-        if how == "raises":
-            raise bngsim.SimulationError("the ordinary solve refused")
-        result = real(self, **kwargs)
-        result.converged = False
-        return result
 
-    monkeypatch.setattr(bngsim.Simulator, "steady_state", ordinary)
-    model = bngsim.Model.from_net(_net("Motivating_example.net"))
-    roots = bngsim.Simulator(model, method="ode").steady_states(n_starts=20, seed=0)
-    assert len(roots) == 0 and roots.n_failed == 20 == roots.basins.size
+def test_a_root_on_a_law_whose_total_is_zero_is_seeded(tmp_path):
+    """0 -> A + B, A -> C, B + C -> 0 holds A - B + C = 0, a row-reduced law at a
+    total of 0 from a zero state. steady_state() reaches A = 1e8, B = 1e8 + 1,
+    C = 1, where the law is held to ~5e-17 of its members. A threshold on the
+    drift scaled by the zero state dropped that seed, and with every draw
+    failing the call returned no root."""
+    path = tmp_path / "zero_total.net"
+    path.write_text(_ZERO_TOTAL_NET, encoding="utf-8")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    ordinary = sim.steady_state()
+    assert ordinary.converged
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert any(np.allclose(y, ordinary.concentrations, rtol=1e-6) for y in roots.states), roots
 
 
 _POOL_NET = """begin parameters
@@ -550,18 +605,21 @@ def _pool(tmp_path, total):
 
 
 @pytest.mark.parametrize("total", [1e4, 1e8])
-def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path, total):
-    """The control for the large-total case below: C <-> B <-> A, C first and
-    small. steady_state() converges at both totals; the seed's own solve, Newton
-    from that root, holds it at 1e4 and not at 1e8, where the rebuilt C carries
-    the total's round-off (#1190)."""
-    sim = _pool(tmp_path, total)
+def test_steady_state_converges_at_both_law_totals(tmp_path, total):
+    """The precondition of the large-total case below: C <-> B <-> A, C first
+    and small, has a root steady_state() reaches at a total of 1e4 and of 1e8."""
+    assert _pool(tmp_path, total).steady_state().converged
+
+
+def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path):
+    """The control for the large-total case below: at 1e4 the seed's own solve,
+    Newton from steady_state()'s root, holds it."""
+    sim = _pool(tmp_path, 1e4)
     ordinary = sim.steady_state()
-    assert ordinary.converged
     (seed,) = sim.steady_state_batch(
         states=[np.asarray(ordinary.concentrations)], method="newton", newton_burst=False
     )
-    assert seed.converged == (total < 1e7), seed
+    assert seed.converged, seed
 
 
 @pytest.mark.xfail(

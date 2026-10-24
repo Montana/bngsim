@@ -9171,15 +9171,15 @@ class Simulator:
         draws hold it, so the call returns that root too wherever Newton holds it
         at ``tol`` (issue #1189). It is no draw: it adds nothing to
         ``multiplicity`` or ``basins``, and a root only it found has
-        multiplicity 0. Three cases return less. Where Newton cannot hold it, as
-        at the large law totals below (issue #1190), that root is missed: on a
-        three-species law at a total of ``1e8``, the call returns none. Where
-        setting a held species moves a conservation law off the model's total (a
-        masked sink at the end of a chain, as the pure-sink mask below makes it),
-        the solve's root is no root of the problem the draws solve, and nothing
-        is seeded. And where a held species the rates read had moved, Newton
-        from the seed reaches a root with that species held, which need not be
-        the solve's.
+        multiplicity 0. The seed is then put on the conservation laws at the
+        model's totals, as every draw is. Two cases return less. Where Newton
+        cannot hold the root, as at the large law totals below (issue #1190), it
+        is missed: on a three-species law at a total of ``1e8``, the call returns
+        none. And where the solve had moved a held species, it solved another
+        problem: a masked sink at the end of a chain, as the pure-sink mask below
+        makes it, moves its law's total, and a held species the rates read moves
+        the rates. Newton from the seed then reaches a root of the problem the
+        draws solve, or none, and it need not be the solve's.
 
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
@@ -9319,15 +9319,22 @@ class Simulator:
             # in a species the solve does not move.
             seed_state = np.asarray(ordinary.concentrations, dtype=float).copy()
             seed_state[held] = starts[0][held]
-            # Unless that moves a law off the model's total: then the root is no
-            # root of this problem. A sink masked as the docstring advises is a
-            # law member wherever the chain ends in it (m1_ground's D, SIR's R),
-            # and the solve had moved it: with it put back, Newton recomputed the
-            # totals from the seed and reported a "root" of m1_ground at a total
-            # of 0, not 100. An integration holds the totals to a few 1e-9.
-            drift = np.abs(L @ seed_state - L @ y0)
-            if np.any(drift > 1e-6 * (np.abs(L) @ np.abs(y0)) + tol):
-                seed_state = None
+            # And onto the laws at the totals every draw holds, as a draw is put
+            # there. A sink masked as the docstring advises is a law member
+            # wherever a chain ends in it (m1_ground's D, SIR's R), and the solve
+            # had moved it: set back, it moved its law's total, and Newton, which
+            # recomputes the totals from its start, reported a "root" of
+            # m1_ground at a total of 0, not 100. Where nothing held moved, this
+            # moves the seed by the integration's drift, a few 1e-9.
+            A, totals = _moving_laws(L, in_law, y0)
+            if A.shape[0]:
+                cols = np.flatnonzero(in_law)
+                w = np.maximum(seed_state[cols], np.finfo(float).tiny)
+                y = _project_onto_laws(w, A, totals)
+                if y is None:
+                    seed_state = None
+                else:
+                    seed_state[cols] = y
         if seed_state is not None:
             try:
                 (from_ordinary,) = self.steady_state_batch(
@@ -10527,10 +10534,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    # A law over held species alone constrains nothing a start moves.
-    A = L[:, in_law]
-    A = A[(A != 0).any(axis=1)]
-    totals = A @ y0[in_law]
+    A, totals = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10549,6 +10553,15 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
                 )
             row[cols] = y
     return out
+
+
+def _moving_laws(L, in_law, y0):
+    """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
+    totals the model's state ``y0`` holds (issue #524). A law over held species
+    alone constrains nothing a start moves, and is left out."""
+    A = L[:, in_law]
+    A = A[(A != 0).any(axis=1)]
+    return A, A @ y0[in_law]
 
 
 def _project_onto_laws(w, A, b, max_iter=200):
