@@ -119,7 +119,8 @@
    "model_id": "nanomolar_dimer",
    "path": "tests/data/nanomolar_dimer.net",
    "t_end": 10,
-   "n_points": 51
+   "n_points": 51,
+   "atol": 1e-21
   },
   {
    "model_id": "jac_kinks_max_min_abs",

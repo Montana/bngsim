@@ -147,8 +147,11 @@ def step_disagreement(
     ``_core.differ.SIGNIF_FLOOR`` of the column's, or where ``differ``'s movement
     gate (issue #873) counts it. This reads ``max |D(h) - D(h/2)| / peak`` over
     exactly those species. ``settled`` cells, the ones inside a noise floor, which
-    the verdict forgives whatever the gap, are left out. A converged reference
-    reads O(h²); a step lost in the solver's noise reads O(1).
+    the verdict forgives whatever the gap, are left out, so where the two sides
+    agree within the floors everywhere this reads 0: the gate guards a verdict
+    from blaming an unsure reference, and there is nothing to blame. (The row's
+    ``fd_step_disagreement_raw`` reads every cell.) A converged reference reads
+    O(h²); a step lost in the solver's noise reads O(1).
 
     Per species, not per parameter: a small species whose difference is noise
     sits beside a large one in the same column, so the column's peak hides it.
@@ -246,6 +249,13 @@ FD_NOISE_FACTOR = 10.0
 # parameter) column's largest step gap |D(h) - D(h/2)| is inside the error that
 # gap estimates for the reference, and is not the analytic side's to fail.
 FD_UNCERTAINTY_FACTOR = 3.0
+# How far a column's peak must clear each floor to be judged: 1 / differ's
+# HARD_REL_CEILING (5%). The verdict forgives every cell inside a floor, so a
+# column only just over one would have all of its disagreement forgiven, and a
+# PASS on it would say nothing; at 20x, what a floor forgives stays under what
+# the verdict calls real. wofsy_goldstein's K11 (peak 2.2x its difference's
+# floor) passed a 30% error, and nanomolar_dimer (2.5x the atol/|p| floor) 40%.
+JUDGE_FACTOR = 20.0
 
 
 def fd_noise_floor(x_max: float, value: float) -> float:
@@ -271,7 +281,7 @@ def judgeable_columns(
     """The parameter columns a finite difference can judge.
 
     Two floors, and a column's peak, the larger of the analytic one and the
-    difference's, has to clear both:
+    difference's, has to clear both by ``JUDGE_FACTOR``:
 
     * the verdict's own, ``factor·atol/|p|`` (``_amici_sens.sens_resolution_floors``):
       below it the analytic run itself does not resolve the column, and the
@@ -294,7 +304,11 @@ def judgeable_columns(
     """
     floors = asens.sens_resolution_floors(values, atol)
     peaks = np.maximum(_column_peaks(analytic), _column_peaks(reference))
-    return [j for j, v in enumerate(values) if peaks[j] > max(floors[j], fd_noise_floor(x_max, v))]
+    return [
+        j
+        for j, v in enumerate(values)
+        if peaks[j] > JUDGE_FACTOR * max(floors[j], fd_noise_floor(x_max, v))
+    ]
 
 
 def reference_settled(analytic, reference, x_max: float, values) -> np.ndarray:
@@ -366,6 +380,12 @@ def _judge(res: dict, analytic, reference, gap, species, values, spec: dict) -> 
     )
     params = res["params"]
     res["fd_step_disagreement"] = disagreement
+    # The same over every cell, settled ones too: what the step did, whatever
+    # the verdict forgives.
+    res["fd_step_disagreement_raw"] = max(
+        (step_disagreement(analytic[..., j], reference[..., j], gap[..., j]) for j in judged),
+        default=0.0,
+    )
     res["n_columns_judged"] = len(judged)
     res["columns_not_judged"] = [p for j, p in enumerate(params) if j not in judged]
     if not judged:
@@ -450,8 +470,9 @@ def _worker(spec: dict, q) -> None:
         # difference, and the code under test never ran. The backend says so,
         # and --expect-backend cc alerts on it.
         analytic_rhs = bool(sim.has_analytic_sens_rhs)
-        if not analytic_rhs:
-            res["sens_rhs_decline_reason"] = str(sim.sens_rhs_decline_reason)[:400]
+        reason = None if analytic_rhs else sim.sens_rhs_decline_reason
+        if reason is not None:
+            res["sens_rhs_decline_reason"] = str(reason)[:400]
         res["timing"] = {
             "bngsim": {
                 # One cold solve: the phase name verdicts.py sums into bngsim_sec.
@@ -524,7 +545,9 @@ def make_specs(jobs: list[dict], args) -> list[dict]:
                     "n_points": int(job.get("n_points", 51)),
                     "max_steps": int(job.get("max_steps", 100_000)),
                     "rtol": args.rtol,
-                    "atol": args.atol,
+                    # A model whose states sit far from the suite's scale says so:
+                    # atol is absolute, and the atol/|p| floor with it.
+                    "atol": float(job.get("atol", args.atol)),
                     "fd_tol": args.fd_tol,
                     "param_cap": int(job.get("param_cap", args.param_cap)),
                     "sens_method": method,
@@ -553,6 +576,8 @@ def to_result(spec: dict, r: dict, stamp: dict) -> JobResult:
         "params": r.get("params"),
         "n_param_candidates": r.get("n_param_candidates"),
         "fd_step_disagreement": r.get("fd_step_disagreement"),
+        "fd_step_disagreement_raw": r.get("fd_step_disagreement_raw"),
+        "atol": spec.get("atol"),
         "n_columns_judged": r.get("n_columns_judged"),
         "columns_not_judged": r.get("columns_not_judged"),
         "max_abs_sx": r.get("max_abs_sx"),

@@ -128,6 +128,36 @@ def test_only_columns_clearing_both_floors_are_judged():
     assert judged == [0]
 
 
+def test_a_column_only_just_over_a_floor_is_not_judged():
+    """A floor forgives every cell inside it, so a column at twice a floor would
+    have all its disagreement forgiven (wofsy_goldstein's K11 passed a 30% error
+    at 2.2x). A column is judged only at JUDGE_FACTOR (20x) over each floor."""
+    values, atol, x_max = [2.0, 2.0], 1e-30, 1.0
+    floor = F.fd_noise_floor(x_max, 2.0)
+    analytic = np.zeros((3, 1, 2))
+    analytic[..., 0] = 2.0 * floor
+    analytic[..., 1] = 2.0 * F.JUDGE_FACTOR * floor
+    assert F.judgeable_columns(analytic, analytic, x_max, values, atol) == [1]
+    # The same for the verdict's own atol/|p| floor (nanomolar_dimer's 2.5x).
+    atol = 1e-12
+    vfloor = F.asens.sens_resolution_floors([2.0], atol)[0]
+    analytic = np.full((3, 1, 2), 2.0 * vfloor)
+    analytic[..., 1] = 2.0 * F.JUDGE_FACTOR * vfloor
+    assert F.judgeable_columns(analytic, analytic, 1e-30, values, atol) == [1]
+
+
+def test_a_job_can_set_its_own_atol():
+    import argparse
+
+    args = argparse.Namespace(rtol=1e-9, atol=1e-12, fd_tol=1e-3, param_cap=6, timeout=300.0)
+    jobs = [
+        {"model_id": "a", "path": "a.net", "t_end": 1},
+        {"model_id": "b", "path": "b.net", "t_end": 1, "atol": 1e-21},
+    ]
+    atols = {s["model_id"]: s["atol"] for s in F.make_specs(jobs, args)}
+    assert atols == {"a": 1e-12, "b": 1e-21}
+
+
 def _ramp(peak, n_t=21, n_sp=2):
     """A column that rises to ``peak``, a little differently per species."""
     t = np.linspace(0.0, 1.0, n_t)
@@ -189,6 +219,9 @@ def test_a_difference_inside_the_references_own_error_is_not_blamed():
     unsure = 0.01 * np.abs(ref)
     assert not F.column_verdicts(analytic, ref, sure, 1.0, [1.0], 1e-30, [0])[0]["passed"]
     assert F.column_verdicts(analytic, ref, unsure, 1.0, [1.0], 1e-30, [0])[0]["passed"]
+    # And no further: steps 0.2% apart do not cover a 2% error.
+    nearly = 0.002 * np.abs(ref)
+    assert not F.column_verdicts(analytic, ref, nearly, 1.0, [1.0], 1e-30, [0])[0]["passed"]
 
 
 def test_a_column_either_side_resolves_is_judged():
@@ -256,7 +289,7 @@ def test_a_real_model_passes_against_its_own_differences(spec):
     res = _worker(spec)
     assert res["status"] == "pass", res
     assert res["n_columns_judged"] == len(res["params"]) == 3
-    assert res["fd_step_disagreement"] < 1e-4
+    assert res["fd_step_disagreement"] <= res["fd_step_disagreement_raw"] < 1e-4
     assert res["timing"]["bngsim"]["work"]["n_steps"] > 0
 
 
