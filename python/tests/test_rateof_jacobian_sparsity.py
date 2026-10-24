@@ -46,12 +46,39 @@ JQ: Q -> ; k*Q*R; JR: R -> ; 0.1*R;
 P' = h*rateOf(Q) - 0.2*P;
 S' = g*rateOf(P);
 """,
+    # the same, with the rules declared reader first: one pass over the readers
+    # leaves S without what P's row gains after it
+    "a chain declared reader first": """
+compartment C0 = 1; g = 0.7; h = 0.3;
+species S in C0 = 0; species P in C0 = 1; species Q in C0 = 2; species R in C0 = 1;
+S' = g*rateOf(P);
+P' = h*rateOf(Q) - 0.2*P;
+Q' = -0.4*Q*R;
+JR: R -> ; 0.1*R;
+""",
     "rateOf through a function": """
 compartment C0 = 1; k1 = 0.3; g = 0.7;
 species P in C0 = 1; species S in C0 = 0; species W in C0 = 2;
 J1: P -> ; k1*P*W; JW: W -> ; 0.05*W;
 function f(x) x*x end
 S' = g*f(rateOf(P));
+""",
+    # the law reads y, a rule over rateOf: the rate comes in through a
+    # reference to another function, not in the law's own text
+    "rateOf through a rule variable": """
+compartment C0 = 1; k1 = 0.3; g = 0.7;
+species P in C0 = 1; species S in C0 = 0; species W in C0 = 2;
+J1: P -> ; k1*P*W; JW: W -> ; 0.05*W;
+y := g*rateOf(P);
+S' = y;
+""",
+    # a reaction's kinetic law, which loads as a function its reaction's law
+    # divides by the compartment, so it too reads the rate through a reference
+    "a kinetic law over rateOf": """
+compartment C0 = 1; k1 = 0.3; g = 0.7;
+species P in C0 = 1; species S in C0 = 0; species W in C0 = 2;
+J1: P -> ; k1*P*W; JW: W -> ; 0.05*W;
+J2: -> S; -g*rateOf(P);
 """,
 }
 CONTROL = """
@@ -99,13 +126,18 @@ def test_a_model_with_no_rate_read_keeps_its_pattern():
     assert sp["nnz"] == 2
 
 
-@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
+@pytest.mark.skipif(not bngsim.HAS_KLU, reason="KLU not compiled")
 @pytest.mark.parametrize("name", list(MODELS))
 def test_the_sparse_route_steps_as_the_dense_one_does(name):
     """The colored finite-difference Jacobian is colored from the pattern. With
-    every entry in it, KLU's run is the dense run to rounding, step for step."""
+    every entry in it, KLU's run is the dense finite-difference run to rounding,
+    step for step. Both runs ask for ``jacobian="fd"``: these models attach the
+    analytic Jacobian, which the dense run would otherwise take."""
     runs = []
-    for kw in ({}, {"force_sparse_linear_solver": True, "jacobian": "fd"}):
+    for kw in (
+        {"force_dense_linear_solver": True, "jacobian": "fd"},
+        {"force_sparse_linear_solver": True, "jacobian": "fd"},
+    ):
         sim = bngsim.Simulator(bngsim.Model.from_antimony_string(MODELS[name]), method="ode", **kw)
         runs.append(sim.run(t_span=(0, 20), n_points=21, rtol=1e-8, atol=1e-12))
     dense, klu = runs
