@@ -9167,10 +9167,12 @@ class Simulator:
         saddles a run of the dynamics never rests on are reported too.
 
         The root one ordinary :meth:`steady_state` solve reaches (with the same
-        ``mask``) is solved as one more start, so the call never returns fewer
-        roots than that solve has (issue #1189). It is no draw: it adds nothing
-        to ``multiplicity`` or ``basins``, and a root only it found has
-        multiplicity 0.
+        ``mask``) is solved as one more start, so the call returns that root too
+        wherever Newton holds it at ``tol`` (issue #1189). It is no draw: it adds
+        nothing to ``multiplicity`` or ``basins``, and a root only it found has
+        multiplicity 0. Where Newton cannot hold it, as at the large law totals
+        below (issue #1190), the call can still return fewer roots than that
+        solve: on a three-species law at a total of ``1e8``, none.
 
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
@@ -10598,7 +10600,8 @@ class SteadyStates:
     ----------
     states : ndarray, shape ``(n_roots, n_species)``
         Each root's concentrations, ordered like ``species_names``: the start
-        that reached it with the smallest residual.
+        that reached it with the smallest residual, the extra start from
+        :meth:`Simulator.steady_state`'s root among them.
     stability : list[str]
         ``"stable"``, ``"unstable"`` or ``"undetermined"`` per root, from the
         stability certificate.
@@ -10606,7 +10609,10 @@ class SteadyStates:
         The reduced Jacobian's spectrum at each root (empty where the
         certificate did not compute it).
     multiplicity : ndarray of int
-        How many starts reached each root: a rough measure of its basin.
+        How many starts reached each root: a rough measure of its basin. The
+        root of :meth:`Simulator.steady_state`, solved as one more start, is
+        no draw and counts for nothing, so a root only it reached reads 0
+        (issue #1189).
     basins : ndarray of int, shape ``(n_starts,)``
         Root index per start, -1 where the solve did not converge.
     residuals : ndarray

@@ -466,3 +466,74 @@ def test_the_extra_start_adds_nothing_to_a_root_the_draws_found():
     assert len(roots) == 3
     assert int(roots.multiplicity.sum()) + roots.n_failed == 200 == roots.basins.size
     assert (roots.multiplicity > 0).all()
+
+
+@pytest.mark.parametrize("how", ["raises", "unconverged"])
+def test_the_draws_stand_when_the_ordinary_solve_does_not(monkeypatch, how):
+    """The ordinary solve is only a seed and a scale. Where it raises, or does
+    not converge, nothing is seeded and the call returns what the draws found:
+    on Motivating_example, where every draw fails, no root at all."""
+    real = bngsim.Simulator.steady_state
+
+    def ordinary(self, **kwargs):
+        if how == "raises":
+            raise bngsim.SimulationError("the ordinary solve refused")
+        result = real(self, **kwargs)
+        result.converged = False
+        return result
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state", ordinary)
+    model = bngsim.Model.from_net(_net("Motivating_example.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(n_starts=20, seed=0)
+    assert len(roots) == 0 and roots.n_failed == 20 == roots.basins.size
+
+
+_POOL_NET = """begin parameters
+    1 kf   1.0
+    2 kr   1.0
+    3 kc   1e-12
+    4 kcr  1.0
+end parameters
+begin species
+    1 C() 0
+    2 A() {total}
+    3 B() 0
+end species
+begin reactions
+    1 2 3 kf #_R1
+    2 3 2 kr #_R2
+    3 3 1 kc #_R3
+    4 1 3 kcr #_R4
+end reactions
+begin groups
+    1 Ctot 1
+end groups
+"""
+
+
+def _pool(tmp_path, total):
+    path = tmp_path / "pool.net"
+    path.write_text(_POOL_NET.format(total=total), encoding="utf-8")
+    return bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+
+
+def test_the_seed_returns_the_root_of_a_small_law_total(tmp_path):
+    """The control for the large-total case below: C <-> B <-> A, C first and
+    small, at a total of 1e4. The root steady_state() reaches comes back."""
+    sim = _pool(tmp_path, 1e4)
+    assert sim.steady_state().converged
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert len(roots) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1190: burst-free Newton rebuilds the law's first member, C, as the "
+    "total less the others, and at 1e8 that round-off (residual 3.1e-9) exceeds "
+    "tol, so the root steady_state() converges to is rejected",
+)
+def test_the_seed_returns_the_root_of_a_large_law_total(tmp_path):
+    sim = _pool(tmp_path, 1e8)
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert len(roots) == 1
