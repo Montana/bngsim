@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,11 +45,16 @@ def _write_run(sweep: Path, values: np.ndarray, status: str = "ok") -> Path:
     return out
 
 
-def _golden(tmp: Path, values: np.ndarray, model_ids=(JOB.model_id,)) -> Path:
+def _golden(tmp: Path, values: np.ndarray, model_ids=(JOB.model_id,), trajectory=False) -> Path:
     """golden.json giving each of `model_ids` the entry built from `values`, the
-    way the generator builds it."""
+    way the generator builds it, with a committed trajectory if `trajectory`."""
     out = _write_run(tmp / "golden_src", values)
-    (checksum, fingerprint, _), _ = PG.build_golden_for_job(out, LOAD)
+    (checksum, fingerprint, trajectories), _ = PG.build_golden_for_job(out, LOAD)
+    traj_rel = None
+    if trajectory:
+        traj_rel = "trajectories/toy.json"
+        (tmp / "trajectories").mkdir()
+        (tmp / traj_rel).write_text(PG._traj_payload(JOB.model_id, "ode", "t", trajectories, 1))
     path = tmp / "golden.json"
     path.write_text(
         json.dumps(
@@ -60,6 +66,7 @@ def _golden(tmp: Path, values: np.ndarray, model_ids=(JOB.model_id,)) -> Path:
                         "method": "ode",
                         "checksum": checksum,
                         "fingerprint": fingerprint,
+                        "trajectory": traj_rel,
                     }
                     for model_id in model_ids
                 ],
@@ -286,3 +293,125 @@ def test_merge_replaces_only_the_fresh_entries_and_their_replay_verdicts():
     assert merged["regenerations"][0] == {"models": ["a"]}
     last = merged["regenerations"][-1]
     assert last["models"] == ["b", "c"] and last["versions"] == {"bngsim": "0.16.0"}
+
+
+def test_a_blow_up_mid_trajectory_is_drift(tmp_path, capsys):
+    """One NaN mid-column reaches no fingerprint stat: min/max/mean skip it and
+    `last` is another row. Here the fingerprint does not move at all (the mean
+    of 1.0..2.0 without its middle value is still 1.5), so only the committed
+    trajectory shows it."""
+    golden = _golden(tmp_path, BASE, trajectory=True)
+    blown = BASE.copy()
+    blown[5, 0] = np.nan
+    _write_run(tmp_path / "sweep", blown)
+    built, _ = PG.build_golden_for_job(tmp_path / "sweep/fast/x/toy/toy/det", LOAD)
+    entry = json.loads(golden.read_text())["golden"][0]
+    assert PG.job_fingerprint_distance(built[1], entry["fingerprint"], 1e-5, 1e-6) == 0.0
+    code = PG.verify_against_golden(golden, tmp_path / "sweep", [JOB], LOAD, 1e-5, 1e-6, 1)
+    out = capsys.readouterr().out
+    assert code == 1 and "DRIFT" in out and "A row 5 is NaN in this run only" in out
+
+
+def test_the_same_blow_up_on_both_sides_is_not_drift(tmp_path, capsys):
+    blown = BASE.copy()
+    blown[5, 0] = np.nan
+    golden = _golden(tmp_path, blown, trajectory=True)
+    noisy = blown.copy()
+    noisy[:, 1] *= 0.77  # under atol: the checksum moves, the fingerprint does not
+    _write_run(tmp_path / "sweep", noisy)
+    code = PG.verify_against_golden(golden, tmp_path / "sweep", [JOB], LOAD, 1e-5, 1e-6, 1)
+    assert code == 0 and "WITHIN_TOL" in capsys.readouterr().out
+
+
+# main(): which jobs --verify judges and --merge replaces, from a consumed
+# (--no-run-sweep) sweep root holding stale output beside this sweep's.
+
+
+def _summary(tmp: Path, model_ids, results=True) -> None:
+    summary = {"root": "/models"}
+    if results:
+        summary["results"] = [{"bngl": f"/models/{m}", "role": "det"} for m in model_ids]
+    (tmp / "sweep").mkdir(parents=True, exist_ok=True)
+    (tmp / "sweep/_summary.json").write_text(json.dumps(summary))
+
+
+def _main(monkeypatch, tmp: Path, *argv: str, gated=(JOB.model_id,)):
+    monkeypatch.setattr(PG, "_resolve_bngpath", lambda: "/bng")
+    monkeypatch.setattr(PG, "read_manifest", lambda path: ({}, [JOB, STALE]))
+    monkeypatch.setattr(PG, "GATED_MODELS", list(gated))
+    monkeypatch.setattr(PG, "git_rev", lambda path: "test")
+    monkeypatch.setattr(PG.versions, "stamp", lambda *a, **k: {"bngsim": "test"})
+    sweep = ["--no-run-sweep", "--sweep-out", str(tmp / "sweep"), "--golden-dir", str(tmp)]
+    monkeypatch.setattr(sys, "argv", ["parity_golden.py", *sweep, *argv])
+    try:
+        return PG.main()
+    except SystemExit as e:
+        return e.code
+
+
+def test_gate_judges_only_the_gated_set_of_a_consumed_sweep(tmp_path, monkeypatch, capsys):
+    """The July sweep's _summary.json lists all 895 jobs."""
+    _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
+    _write_run(tmp_path / "sweep", BASE)
+    _stale_toy2(tmp_path, BASE * 2.0)  # DRIFT, if it were judged
+    _summary(tmp_path, [JOB.model_id, STALE.model_id])
+    code = _main(monkeypatch, tmp_path, "--verify", "--gate")
+    out = capsys.readouterr().out
+    assert code == 0 and "1 compared" in out and "toy2" not in out
+
+
+def test_merge_replaces_only_what_the_sweep_ran(tmp_path, monkeypatch):
+    golden = _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
+    moved = BASE.copy()
+    moved[-1, 0] *= 1.001
+    _write_run(tmp_path / "sweep", moved)
+    _stale_toy2(tmp_path, BASE * 2.0)
+    _summary(tmp_path, [JOB.model_id])
+    before = {g["model_id"]: g for g in json.loads(golden.read_text())["golden"]}
+    assert _main(monkeypatch, tmp_path, "--merge") == 0
+    merged = json.loads(golden.read_text())
+    after = {g["model_id"]: g for g in merged["golden"]}
+    assert after[JOB.model_id]["checksum"] != before[JOB.model_id]["checksum"]
+    assert after[STALE.model_id] == before[STALE.model_id]
+    assert merged["_meta"]["regenerations"][-1]["models"] == [JOB.model_id]
+
+
+def test_merge_refuses_when_a_job_it_ran_failed(tmp_path, monkeypatch, capsys):
+    """The failed job would keep its old entry beside a record saying it was
+    redone, and the job that did run must not have its trajectory rewritten."""
+    monkeypatch.setitem(PG.TRAJECTORY_ALLOWLIST, JOB.model_id, "test")
+    golden = _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
+    text = golden.read_text()
+    _write_run(tmp_path / "sweep", BASE * 1.5)
+    _stale_toy2(tmp_path, BASE)
+    log = tmp_path / "sweep/fast/x/toy/toy2/det/_run.log"
+    log.write_text("# status=timeout\n")
+    _summary(tmp_path, [JOB.model_id, STALE.model_id])
+    code = _main(monkeypatch, tmp_path, "--merge")
+    assert isinstance(code, str) and "1 job(s) to regenerate produced no entry" in code
+    assert "toy2.bngl: run_timeout" in capsys.readouterr().out
+    assert golden.read_text() == text
+    assert not (tmp_path / "trajectories").exists()
+
+
+def test_merge_gate_refuses_a_gated_model_the_sweep_did_not_run(tmp_path, monkeypatch):
+    golden = _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
+    text = golden.read_text()
+    _write_run(tmp_path / "sweep", BASE)
+    _summary(tmp_path, [JOB.model_id])
+    code = _main(monkeypatch, tmp_path, "--merge", "--gate", gated=(JOB.model_id, STALE.model_id))
+    assert isinstance(code, str) and "produced no entry" in code
+    assert golden.read_text() == text
+
+
+def test_a_summary_without_results_is_not_mistaken_for_one(tmp_path, monkeypatch, capsys):
+    """Under --gate too: the gated set is not a record of what ran."""
+    golden = _golden(tmp_path, BASE)
+    text = golden.read_text()
+    _write_run(tmp_path / "sweep", BASE)
+    _summary(tmp_path, [], results=False)
+    code = _main(monkeypatch, tmp_path, "--merge", "--gate")
+    assert isinstance(code, str) and "lists none" in code
+    assert golden.read_text() == text
+    assert _main(monkeypatch, tmp_path, "--verify", "--gate") == 0
+    assert "WARN" in capsys.readouterr().out

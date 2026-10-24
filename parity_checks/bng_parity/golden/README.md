@@ -89,12 +89,16 @@ then one record per line. Read it with `_core.read_golden(path)`.
    trajectory is chaotic — its fingerprint is **not** cross-platform-stable; the
    byte checksum is the meaningful stochastic check, and it certifies
    same-platform reproduction.
-5. **A blow-up fails both, unconditionally** (issue #572). A regenerated
-   variable that went `NaN`/`inf` where the golden is finite — or that blew up a
-   *different* way than the golden did — mismatches the checksum at step 3 and
-   scores `inf` from `fingerprint_distance` (and `fingerprint_max_rel`) at step
-   4, so no tolerance you pick can pass it. Only the *same* blow-up on both
-   sides is a reproduction.
+5. **A blow-up fails both** (issue #572). A regenerated variable that went
+   `NaN`/`inf` where the golden is finite — or that blew up a *different* way
+   than the golden did — mismatches the checksum at step 3 and, where it reaches
+   a fingerprint stat, scores `inf` from `fingerprint_distance` (and
+   `fingerprint_max_rel`) at step 4, so no tolerance you pick can pass it. Only
+   the *same* blow-up on both sides is a reproduction. A stat reaches it at the
+   last row, or when a whole column is non-finite: min/max/mean skip non-finite
+   cells, so one NaN mid-trajectory leaves the fingerprint unchanged. For an
+   allow-listed job, compare the committed trajectory's non-finite cells
+   exactly, as the CI gate does.
 
 ## BNG2.pl is required to generate
 
@@ -159,6 +163,8 @@ a differing one whose `t_last` and per-variable stats are all within
 `1e-5·|y| + 1e-6` (`Lang_2024` within `1e-4·|y| + 1e-6`: its long horizon
 carries rounding to about 1.1e-5 between Linux and macOS;
 `VERIFY_TOLERANCE_OVERRIDES` gives the measurement).
+Each gated model's non-finite cells must also sit where its committed
+trajectory has them, since a NaN mid-trajectory reaches no fingerprint stat.
 Drift, a failed run, or a gated model the sweep left no output for fails.
 
 Both `--verify` and `--merge` act only on the jobs the sweep ran, as its
@@ -174,9 +180,10 @@ python parity_checks/bng_parity/parity_golden.py --merge --gate
 
 `--merge` replaces only the swept entries and their `_meta.protocol_replay`
 verdicts, keeps every other one, and appends what was regenerated, from which
-commit and engines, to `_meta.regenerations`. `--gate` without `--verify` or
-`--merge` is refused: a plain write keeps only the jobs in the sweep, so from a
-fresh `--sweep-out` it would drop every other entry. Regenerate only from output
-that still agrees with
-BNG2.pl (those models PASS in `parity_checks/nightly/baselines/bng_ode.json`),
-so the gate defends a cross-validated answer.
+commit and engines, to `_meta.regenerations`. It writes nothing when a job it
+ran failed, or under `--gate` when a gated model was not swept. `--gate` without
+`--verify` or `--merge` is refused: a plain write keeps only the jobs in the
+sweep, so from a fresh `--sweep-out` it would drop every other entry. Regenerate
+only from output that still agrees with BNG2.pl (those models PASS in
+`parity_checks/nightly/baselines/bng_ode.json`), so the gate defends a
+cross-validated answer.

@@ -171,8 +171,9 @@ VERIFY_TOLERANCE_OVERRIDES: dict[str, tuple[float, float, str]] = {
         "integrates at rtol 1e-8 over t = 0..136472 (1200 rows of a cell cycle): "
         "Linux x86_64 against a macOS arm64 golden read 1.11 times rtol 1e-5 "
         "(about 1.1e-5 relative) on identical code, rounding carried over the "
-        "long horizon. At 1e-4 that is 0.11 of it; the other gated models sit at "
-        "0.07 or less of 1e-5.",
+        "long horizon. At 1e-4 that is 0.11 of it, and 0.15 in a later run on "
+        "main two days on (the reading moves with the step sequence); the other "
+        "gated models sit at 0.07 or less of 1e-5.",
     ),
 }
 
@@ -380,7 +381,7 @@ def build_golden_for_job(out_dir: Path, load_normalized):
     ``checksum`` spans every selected file (sha256 over the sorted per-file
     checksums) so a byte divergence in *any* artifact is caught. ``fingerprint``
     nests one flat per-file fingerprint under ``artifacts`` — each directly
-    comparable with ``_core.fingerprint.fingerprint_max_rel`` for the
+    comparable with ``_core.fingerprint.fingerprint_distance`` for the
     cross-platform fallback. ``trajectories`` maps filename -> rounded
     ``(time, names, values)`` for the allow-listed subset (caller decides whether
     to write it).
@@ -458,6 +459,36 @@ def job_fingerprint_distance(a: dict, b: dict, rtol: float, atol: float) -> floa
     return max((fingerprint_distance(aa[n], ba[n], rtol, atol) for n in aa), default=0.0)
 
 
+def _nonfinite_cells_differ(trajectories: dict, traj_path: Path) -> str | None:
+    """Where a fresh run's non-finite cells differ from its committed
+    trajectory's, the first such cell; None when they agree.
+
+    The fingerprint's min/max/mean skip non-finite cells, so a NaN or inf
+    anywhere but the last row reaches no stat: a run that blew up once
+    mid-trajectory matched its golden's fingerprint (Lang_2024 with one NaN at
+    row 290 read 0.03 of its tolerance). The checksum sees it, but across
+    platforms the checksum already differs. An allow-listed job's committed
+    trajectory keeps every cell, or every stride-th row and the fresh run is cut
+    the same way, and a blow-up is no rounding difference: its cells must match
+    exactly, NaN for NaN and an inf of the same sign for an inf."""
+    payload = json.loads(traj_path.read_text())
+    stride = payload.get("downsampled_stride") or 1
+    fresh = _downsample_traj(trajectories, stride) if stride > 1 else trajectories
+    for fn, ref in payload["artifacts"].items():
+        if fn not in fresh:
+            return f"{fn}: not in this run"
+        a, b = np.asarray(fresh[fn]["values"], float), np.asarray(ref["values"], float)
+        if a.shape != b.shape:
+            return f"{fn}: {a.shape} cells against {b.shape}"
+        for kind, test in (("NaN", np.isnan), ("+inf", np.isposinf), ("-inf", np.isneginf)):
+            one_sided = test(a) != test(b)
+            if one_sided.any():
+                row, col = (int(i) for i in np.argwhere(one_sided)[0])
+                side = "this run" if test(a)[row, col] else "the golden"
+                return f"{fn}: {ref['names'][col]} row {row} is {kind} in {side} only"
+    return None
+
+
 def _swept_model_ids(sweep_summary: dict) -> set[str] | None:
     """The model_ids the consumed sweep ran, from its ``_summary.json``, or None
     for a sweep that recorded no per-unit results.
@@ -499,7 +530,9 @@ def verify_against_golden(
     under ``sweep_out`` for any other job is an earlier run's, so it is neither
     judged nor counted toward ``min_compared``. None judges every job present.
     Each model_id in ``expected`` (the gated set) must be compared, and one the
-    sweep left no output for fails as NOT_SWEPT, by name."""
+    sweep left no output for fails as NOT_SWEPT, by name. A job with a committed
+    trajectory (every gated one) must also put its non-finite cells where the
+    trajectory has them (``_nonfinite_cells_differ``)."""
     committed = {g["model_id"]: g for g in json.loads(golden_path.read_text())["golden"]}
     rows: list[tuple[str, str, str]] = []
     failed = 0
@@ -528,12 +561,20 @@ def verify_against_golden(
         compared += 1
         job_rtol, job_atol = VERIFY_TOLERANCE_OVERRIDES.get(job.model_id, (rtol, atol))[:2]
         tol = f"rtol {job_rtol:g}, atol {job_atol:g}"
-        checksum, fingerprint, _ = built
+        checksum, fingerprint, trajectories = built
         if checksum == golden["checksum"]:
             rows.append((job.model_id, "IDENTICAL", ""))
             continue
         worst = job_fingerprint_distance(fingerprint, golden["fingerprint"], job_rtol, job_atol)
-        if worst <= 1.0:
+        blowup = None
+        if worst <= 1.0 and golden.get("trajectory"):
+            blowup = _nonfinite_cells_differ(
+                trajectories, golden_path.parent / golden["trajectory"]
+            )
+        if blowup:
+            rows.append((job.model_id, "DRIFT", f"a blow-up no stat sees: {blowup}"))
+            failed += 1
+        elif worst <= 1.0:
             rows.append((job.model_id, "WITHIN_TOL", f"{worst:.2g} of the tolerance ({tol})"))
         else:
             rows.append((job.model_id, "DRIFT", f"{worst:.3g} times the tolerance ({tol})"))
@@ -763,15 +804,21 @@ def main() -> int:
     _meta, jobs = read_manifest(jobs_path)
     pd = _load_parity_diff()
     swept = _swept_model_ids(sweep_summary)
+    if swept is None:
+        if args.merge:
+            sys.exit(
+                f"ABORT: --merge replaces the jobs the sweep ran, and {summary_file} lists none."
+            )
+        if args.verify:
+            print(
+                f"WARN: {summary_file} lists no swept jobs; judging the output under "
+                f"{sweep_out} whichever run wrote it."
+            )
     if args.gate:
         # The gated set, whatever else a consumed (--no-run-sweep) sweep ran.
         swept = set(GATED_MODELS) if swept is None else swept & set(GATED_MODELS)
 
     if args.verify:
-        if swept is None:
-            print(
-                f"WARN: {summary_file} lists no swept jobs; judging every job under {sweep_out}."
-            )
         return verify_against_golden(
             golden_path,
             sweep_out,
@@ -783,14 +830,12 @@ def main() -> int:
             swept=swept,
             expected=GATED_MODELS if args.gate else (),
         )
-    if args.merge and swept is None:
-        sys.exit(f"ABORT: --merge replaces the jobs the sweep ran, and {summary_file} lists none.")
 
     golden: list[Golden] = []
     skipped: dict[str, str] = {}
     protocol_replay: dict[str, dict] = {}  # GH #179: per-model multi-phase replay verdict
     n_traj = 0
-    traj_dir = golden_dir / "trajectories"
+    traj_writes: list[tuple[Path, str]] = []  # written with golden.json, not before
     # --merge regenerates only what this sweep ran. The sweep root also holds
     # every earlier run's output, which a full generation reads on purpose.
     for job in [j for j in jobs if j.model_id in swept] if args.merge else jobs:
@@ -810,10 +855,8 @@ def main() -> int:
         checksum, fingerprint, trajectories = built
         traj_rel = None
         if job.model_id in TRAJECTORY_ALLOWLIST:
-            traj_dir.mkdir(parents=True, exist_ok=True)
             traj_rel = _traj_relpath(job.model_id)
             traj_path = golden_dir / traj_rel
-            traj_path.parent.mkdir(parents=True, exist_ok=True)
             reason = TRAJECTORY_ALLOWLIST[job.model_id]
             # Bound each committed trajectory below the large-file hook cap by
             # downsampling rows if needed (golden.json stays full-resolution).
@@ -831,7 +874,7 @@ def main() -> int:
                 print(
                     f"  downsampled {job.model_id} trajectory (stride {stride}) to fit {args.max_traj_kb}KB cap"
                 )
-            traj_path.write_text(text)
+            traj_writes.append((traj_path, text))
             n_traj += 1
         golden.append(
             Golden(
@@ -898,7 +941,7 @@ def main() -> int:
         "contract": (
             "D1: .gdat canonical + .scan when present; .cdat fallback only with no "
             "gdat/scan. Multi-file jobs: checksum spans all files, fingerprint nests "
-            "one flat per-file entry under 'artifacts' (each fingerprint_max_rel-"
+            "one flat per-file entry under 'artifacts' (each fingerprint_distance-"
             "comparable). D2: stochastic = single fixed seed=1 trajectory (byte-"
             "identity within a pinned version/platform/seed cell). D3: full "
             "trajectories only for the TRAJECTORY_ALLOWLIST subset, rounded to "
@@ -911,10 +954,28 @@ def main() -> int:
         meta["skipped"] = dict(sorted(real_skips.items())[:50])
         print(f"WARN: {len(real_skips)} swept job(s) produced no fingerprintable artifact.")
 
+    if args.merge:
+        # Every job this sweep ran must come back with a fresh entry. One that
+        # failed would keep its old entry, beside a record saying it was redone.
+        fresh = {g.model_id for g in golden}
+        unfresh = dict(skipped)
+        if args.gate:
+            unfresh |= {m: "not swept" for m in GATED_MODELS if m not in fresh | set(unfresh)}
+        if unfresh:
+            for model_id, why in sorted(unfresh.items()):
+                print(f"  {model_id}: {why}")
+            sys.exit(
+                f"ABORT: --merge: {len(unfresh)} job(s) to regenerate produced no entry; "
+                f"{golden_dir} is left as it was."
+            )
+
     golden_dir.mkdir(parents=True, exist_ok=True)
     if args.merge:
         old_meta, old_golden = read_golden(golden_path)
         meta, golden = merge_regeneration(old_meta, old_golden, golden, meta, protocol_replay)
+    for traj_path, text in traj_writes:
+        traj_path.parent.mkdir(parents=True, exist_ok=True)
+        traj_path.write_text(text)
     write_golden(golden_path, golden, meta=meta)
     print(f"\ngolden: {golden_path}")
     print(f"  golden records:   {len(golden)} / {len(jobs)} manifest jobs")

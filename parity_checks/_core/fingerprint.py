@@ -140,8 +140,11 @@ def fingerprint_distance(a: dict, b: dict, rtol: float, atol: float) -> float:
     otherwise match every stat of a model already at rest.
 
     inf for a structural difference (another variable set or row count), and for
-    a non-finite value that is not the same blow-up on both sides, by the rules
-    ``fingerprint_max_rel`` gives (issue #572).
+    a non-finite stat that is not the same blow-up on both sides, by the rules
+    ``fingerprint_max_rel`` gives (issue #572). A non-finite cell that reaches no
+    stat is invisible here: min/max/mean skip non-finite cells and ``last`` is one
+    row, so a NaN mid-trajectory leaves the fingerprint as it was. Compare a
+    committed trajectory's non-finite cells for that (the golden gate does).
     """
     av, bv = a.get("vars", {}), b.get("vars", {})
     if set(av) != set(bv) or a.get("n_time") != b.get("n_time"):
