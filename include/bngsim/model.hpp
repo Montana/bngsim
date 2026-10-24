@@ -241,26 +241,6 @@ class NetworkModel {
     // Empty when event_trigger_residual_expr() is -1.
     const std::vector<int> &event_trigger_residual_species(int event_idx0) const;
 
-    // What that residual reads, with a rateOf accessor kept apart from the
-    // species it names: `species_out` the species named (directly, through an
-    // observable, or through the function or expression behind a parameter),
-    // `rateof_out` the species whose rateOf is read. Where
-    // event_trigger_residual_species() answers "every species" for a rateOf
-    // accessor, this says which one. False when the residual reads something
-    // that is none of these, or when event_trigger_residual_expr() is -1: the
-    // caller must then assume every species.
-    bool event_trigger_residual_reads(int event_idx0, std::vector<int> &species_out,
-                                      std::vector<int> &rateof_out) const;
-
-    // For each species, the species whose rateOf its derivative reads, through
-    // the rate laws of the reactions that change it (a rate rule is one). The
-    // Jacobian's pattern has no entry for these: `S' = rateOf(A); A' = B` has
-    // none for S against B. Null when that cannot be said of some rate law, or
-    // of something else the model evaluates, and the caller must assume that
-    // any derivative reads any rateOf. Empty lists throughout in a model with
-    // no rateOf.
-    const std::vector<std::vector<int>> *derivative_rateof_reads() const;
-
     // How deep rateOf is nested, over the species whose rateOf is read at
     // all: 0 where none of their derivatives reads a rateOf, 1 for
     // `S' = rateOf(A)` with a rateOf(S) somewhere, and so on (a few where it
@@ -316,8 +296,9 @@ class NetworkModel {
     // compartment volume it divides by, and whatever
     // expression_support() finds behind each of its rate parameters (the
     // function or expression that writes it). Sorted, into `out`. Returns false
-    // when that cannot be decided — a table function indexed by an observable,
-    // whose species no expression names — and the caller must assume every species.
+    // when that cannot be decided — a rateOf read, or a table function indexed by
+    // something that is neither the time, a parameter nor an observable — and the
+    // caller must assume every species.
     bool reaction_rate_species_support(int rxn_idx0, std::vector<int> &out) const;
 
     // Does a rate parameter of reaction `rxn_idx0` take its value from a model
@@ -396,6 +377,13 @@ class NetworkModel {
     // event_trigger_reads_time takes (issue #908)? Never by probing values: a
     // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
     bool state_switch_reads_time(const StateSwitch &sw) const;
+
+    // The evaluator expression id of *expression_src*, compiled into this
+    // model's evaluator the first time it is asked for and the same id after
+    // (issue #1147: a run's state-switch guards, compiled on every run, grew the
+    // evaluator by one expression per guard per run). Cached by source text and,
+    // like state_switch(), NOT copied by clone(). Throws as compile() does.
+    int compiled_expression(const std::string &expression_src) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
@@ -515,6 +503,14 @@ class NetworkModel {
     // matrix the solver would have factored, not a different approximation.
     // Fixed-species rows come out zero because compute_derivs zeroes them.
     void fill_dense_fd_jacobian(double t, const double *conc, double *jac);
+
+    // The same matrix with the columns of species far below the state's scale
+    // taken at their own step where bngsim/fd_jacobian.hpp's rules allow
+    // (fd_own_step_columns, issue #1002), into `jac`, from the floored matrix
+    // `floored` that fill_dense_fd_jacobian wrote at the same point. Returns the
+    // species (0-based) whose columns differ; empty where none does.
+    std::vector<int> fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                     const double *floored, double *jac);
 
     // (species_idx0, param_idx0) pairs for species whose initial
     // concentration is set directly by a parameter (.net "begin species"
@@ -928,8 +924,8 @@ class NetworkModel {
     // species its reaction does not change takes nothing of the rate
     // (compute_derivs_core).
     void refresh_rateof_derivs_once_(double t, const double *conc);
-    // Fills, once and under a mutex, what derivative_rateof_reads(),
-    // rateof_nesting() and rateof_flow_nesting() answer from.
+    // Fills, once and under a mutex, what rateof_nesting() and
+    // rateof_flow_nesting() answer from.
     void ensure_rateof_reads_() const;
     // What the expressions `groups[k]` read between them, for each k: the
     // species named and the species whose rateOf is read. `known[k]` false

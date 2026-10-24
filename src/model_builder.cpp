@@ -2688,16 +2688,11 @@ NetworkModel ModelBuilder::build() {
     {
         // Register species concentrations as ExprTk variables so trigger
         // expressions can reference them (e.g., "S >= threshold").
-        for (auto &sp : impl.species) {
-            // Only register if not already registered (species names may
-            // collide with observable names in some SBML models).
-            // Use try-catch since define_variable throws on duplicate.
-            try {
-                eval.define_variable(sp.name, &sp.concentration);
-            } catch (...) {
-                // Already registered (e.g., as observable) — skip
-            }
-        }
+        // Only registered if not already registered (species names may
+        // collide with observable names in some SBML models), and if the name
+        // is a symbol at all (a .net species `A()` is not).
+        for (auto &sp : impl.species)
+            eval.try_define_variable(sp.name, &sp.concentration);
 
         for (const auto &espec : bimpl_->event_specs) {
             Event ev;

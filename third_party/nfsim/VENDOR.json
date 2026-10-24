@@ -7,11 +7,11 @@
     "local_origin_remote": "https://github.com/RuleWorld/nfsim.git",
     "fork_remote": null,
     "branch_or_ref": "bngsim/vendor",
-    "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
+    "commit": "9eb11325e05e81fda324553934edd92351d0e6fb",
     "base_ref": "origin/master",
     "base_commit": "1a54f38701ab2213de831f9ba272cbb14f7c371f"
   },
-  "imported_at_utc": "2026-10-15T20:05:11+00:00",
+  "imported_at_utc": "2026-10-21T19:01:52+00:00",
   "pruning": {
     "included_paths": [
       "CMakeLists.txt",
@@ -226,6 +226,17 @@
         {
           "commit": "7a8a2da7a51c2beed0fa431f03a40d317508e830",
           "summary": "bngsim: throw instead of exit(1) where a BNG-written function cannot be built"
+        }
+      ]
+    },
+    {
+      "topic": "bngsim/carry-step-to-time-table-breakpoints",
+      "kind": "local",
+      "status": "Read every table function indexed by the time at each of its breakpoints in stepTo(), whether or not a reaction has fired: a waiting-time draw that passes the next breakpoint is dropped there and drawn again, and a total propensity of 0 advances to the next breakpoint rather than the stopping time. A rate that is 0 until a later breakpoint never turned on. Exact for a step table; a linear table holds its last value between breakpoints, as before. A table listed in decreasing time is read one ulp past each x, where its new value holds. See bngsim GH #892.",
+      "commits": [
+        {
+          "commit": "9eb11325e05e81fda324553934edd92351d0e6fb",
+          "summary": "bngsim: read time-indexed tables at their breakpoints in stepTo"
         }
       ]
     }

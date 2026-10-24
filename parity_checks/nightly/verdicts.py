@@ -8,10 +8,11 @@ its verdict. The SBML-suite runner exits 0 no matter what. This tool makes the
 REPORT the verdict:
 
 ``extract``
-    report -> a normalized per-case verdict file: outcome, subclass, and for ODE
-    rows the bngsim solver work counters (``solver_stats``) and bngsim-side wall
-    seconds. A baseline is an extracted verdict file from a reviewed run, recorded
-    on the same runner class the nightly uses.
+    report -> a normalized per-case verdict file: outcome, subclass, for ODE rows
+    the bngsim solver work counters (``solver_stats``), and bngsim-side wall
+    seconds, the sum of ``BNGSIM_PHASES``, which the file records. A baseline is an
+    extracted verdict file from a reviewed run, recorded on the same runner class
+    the nightly uses.
 
 ``diff``
     fresh verdicts vs a baseline. Alerts (exit 1) on:
@@ -30,6 +31,9 @@ REPORT the verdict:
       ``--wall-ratio-any-cpu`` across models, and by more than
       ``--wall-min-delta`` seconds (coarse: hosted runners mix CPU generations;
       precise timing is benchmarks/perf_ab.py on a fixed machine).
+    * **wall phases** -- the two files' wall seconds sum different phases, so the
+      wall check cannot run until the baseline is re-extracted
+      (``--phases-may-differ`` reports it instead).
     * **incomplete** -- the run compared fewer than ``--min-fraction`` of the
       baseline's cases, so a green result would mean "compared too little".
 
@@ -86,14 +90,20 @@ WORK_ALERT_KEYS = ("n_steps", "n_rhs_evals", "n_jac_evals")
 # count on a trivial model does not alert.
 WORK_MIN_DELTA = {"n_steps": 25, "n_rhs_evals": 50, "n_jac_evals": 10}
 # And the wall total must grow by this many seconds too, so a fixed cost on a
-# total that is near zero does not alert as a blowup. On the stochastic legs
-# ``bngsim_sec`` is only the load phase, 0.011 s over bng_nf's 231 cases, and the
-# millisecond XML scan #885 added to each session's construction read as x56. The ODE
-# and sensitivity legs total 79-913 s, so a real doubling clears it on every one.
+# total that is near zero does not alert as a blowup: before issue #901 the
+# stochastic legs' ``bngsim_sec`` was only the load phase, 0.011 s over bng_nf's
+# 231 cases, and the millisecond XML scan #885 added to each session's
+# construction read as x56. With the ensemble counted, bng_nf totals about 4100 s
+# and bng_ssa about 840 s, and the ODE and sensitivity legs 79-913 s, so a real
+# doubling clears it on every leg.
 WALL_MIN_DELTA_SEC = 30.0
 
-# bngsim-side phases summed into ``bngsim_sec`` (whichever the runner records).
-BNGSIM_PHASES = (
+# What a verdict file extracted before issue #901 summed, which is what one that
+# does not say is read as: comparing its bngsim_sec with one that counts the
+# ensemble compared a load phase with a simulation (0.212 s -> 533 s, x2515).
+# Spelled out rather than derived from BNGSIM_PHASES, so that a phase added later
+# is not read as one an old file summed.
+LEGACY_BNGSIM_PHASES = (
     "io_sec",
     "parse_sec",
     "interpret_sec",
@@ -102,6 +112,21 @@ BNGSIM_PHASES = (
     "codegen_sec",
     "integrate_cold_sec",
 )
+# bngsim-side phases summed into ``bngsim_sec`` (whichever the runner records).
+# A stochastic run's simulation (bng_stoch_run.py) is ``ensemble_sec``, the runs
+# of the base ensemble's ``n_rep`` replicates, plus on bng_nf ``setup_sec``, each
+# replicate's ``NfsimSession.initialize``, which rebuilds the NFsim system: 452 s
+# of bng_nf's 4126 s, and most of the time on some models. The runner records
+# only that setup's mean, ``setup_per_rep_sec``, so ``setup_sec`` is it times
+# ``n_rep``.
+# Without the two, bng_nf summed only the session's construction, 0.012 s beside
+# 4004.5 s of NFsim, and bng_ssa its parse and load, so a 2x slower ensemble
+# could not alert (issue #901). The other per-replicate statistics
+# (``rep_*_sec``) are views of ``ensemble_sec`` and are not summed. The
+# replicates a borderline verdict adds at rungs 30 and 90 are not timed, so a
+# case sums the same 10-replicate workload whether or not it escalated that
+# night. An ODE row records neither.
+BNGSIM_PHASES = LEGACY_BNGSIM_PHASES + ("ensemble_sec", "setup_sec")
 
 NOTE_LIMIT = 200
 
@@ -123,11 +148,24 @@ def _core_work(row: dict) -> dict | None:
     return out or None
 
 
-def _core_bngsim_sec(row: dict) -> float | None:
+def _core_phase_secs(row: dict) -> dict[str, float]:
+    """The BNGSIM_PHASES a ``_core`` row records a time for, in seconds."""
     bn = (row.get("timing") or {}).get("bngsim") or {}
-    vals = [bn.get(k) for k in BNGSIM_PHASES]
-    vals = [float(v) for v in vals if isinstance(v, (int, float))]
-    return round(sum(vals), 6) if vals else None
+    out = {k: float(bn[k]) for k in BNGSIM_PHASES if isinstance(bn.get(k), (int, float))}
+    per_rep, n_rep = bn.get("setup_per_rep_sec"), bn.get("n_rep")
+    if "setup_sec" not in out and isinstance(per_rep, (int, float)) and isinstance(n_rep, int):
+        out["setup_sec"] = float(per_rep) * n_rep
+    return out
+
+
+def _core_bngsim_sec(row: dict) -> float | None:
+    secs = _core_phase_secs(row)
+    return round(sum(secs.values()), 6) if secs else None
+
+
+def _core_phases_seen(report: dict) -> set[str]:
+    """The BNGSIM_PHASES some row of a ``_core`` report records a time for."""
+    return {k for row in report.get("results", []) for k in _core_phase_secs(row)}
 
 
 def _core_backend(row: dict) -> str | None:
@@ -241,9 +279,12 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
         report_paths = [report_paths]
     cases: dict[str, dict] = {}
     metas = []
+    phases_seen: set[str] = set()
     for path in report_paths:
         payload = json.loads(Path(path).read_text())
         part = EXTRACTORS[kind](payload)
+        if kind == "core":
+            phases_seen |= _core_phases_seen(payload)
         dup = sorted(set(part) & set(cases))
         if dup:
             raise ValueError(f"case(s) in more than one report: {dup[:5]}")
@@ -252,7 +293,7 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
     source = dict(metas[0]) if metas else {}
     if len(metas) > 1:
         source["parts"] = metas
-    return {
+    out = {
         "schema": SCHEMA,
         "suite": suite,
         "kind": kind,
@@ -261,6 +302,30 @@ def extract(kind: str, report_paths, suite: str, provenance: dict | None = None)
         "tally": tally(cases),
         "cases": dict(sorted(cases.items())),
     }
+    if kind == "core":
+        # Which phases each case's bngsim_sec sums, and which of them a case
+        # recorded, so that a diff compares two files' wall time only where each
+        # counted what the other timed (issue #901).
+        out["bngsim_phases"] = list(BNGSIM_PHASES)
+        out["bngsim_phases_seen"] = sorted(phases_seen)
+    return out
+
+
+def _wall_comparable(base: dict, fresh: dict) -> bool:
+    """Whether two verdict files' bngsim_sec measure the same thing: every phase
+    either recorded a time for is one the other summed. A file that does not say
+    summed LEGACY_BNGSIM_PHASES, and is taken to have timed all of them. So an ODE
+    leg, which records no ensemble, compares across #901, and the first night
+    that counts a stochastic ensemble does not compare it with a load phase."""
+
+    def counted(obj: dict) -> set[str]:
+        return set(obj.get("bngsim_phases") or LEGACY_BNGSIM_PHASES)
+
+    def seen(obj: dict) -> set[str]:
+        recorded = obj.get("bngsim_phases_seen")
+        return set(recorded) if recorded is not None else counted(obj)
+
+    return seen(base) <= counted(fresh) and seen(fresh) <= counted(base)
 
 
 def dump_verdicts(obj: dict, path: Path) -> None:
@@ -311,15 +376,23 @@ def diff(
     expect_backend: str | None = None,
     flaky: dict[str, str] | None = None,
     timeout_flips_info: bool = False,
+    phases_may_differ: bool = False,
 ) -> dict:
     """Compare two verdict files of the same kind. Returns a JSON-able result.
 
-    ``flaky`` maps case ids whose verdict measurably depends on runner timing to
-    the reason; any change of theirs is reported under ``changed``, never alerted.
+    ``flaky`` maps case ids whose verdict or work measurably depends on the runner
+    to the reason; any change of theirs is reported, never alerted: an outcome
+    change under ``changed``, a per-case work increase under ``efficiency`` with
+    the reason beside it (GH #1153). Their work still counts in the totals.
     ``timeout_flips_info`` does the same for every transition into or out of
     TIMEOUT: right for comparing two single nights, which may land on runner CPUs
     of different speed, and wrong for the committed baseline, where PASS ->
     TIMEOUT is the efficiency regression the check exists to catch.
+
+    Two files whose ``bngsim_sec`` sum different phases are not compared on wall
+    time. Against the committed baseline that alerts, since the check would stay
+    off until someone re-extracted it; ``phases_may_differ`` only reports it,
+    which is right for two single nights across a change to BNGSIM_PHASES.
     """
     flaky = flaky or {}
     if base["kind"] != fresh["kind"]:
@@ -373,15 +446,17 @@ def diff(
             tb += vb
             tf += vf
             if vf > vb * work_ratio and vf - vb >= WORK_MIN_DELTA[key]:
-                work_items.append(
-                    {
-                        "case": c,
-                        "counter": key,
-                        "before": vb,
-                        "after": vf,
-                        "ratio": round(vf / vb, 3) if vb else None,
-                    }
-                )
+                item = {
+                    "case": c,
+                    "counter": key,
+                    "before": vb,
+                    "after": vf,
+                    "ratio": round(vf / vb, 3) if vb else None,
+                }
+                if c in flaky:
+                    item["flaky"] = True
+                    item["note"] = f"flaky: {flaky[c]}"
+                work_items.append(item)
         totals[key] = {
             "before": tb,
             "after": tf,
@@ -405,6 +480,10 @@ def diff(
     cpu_b, cpu_f = base.get("source", {}).get("cpu"), fresh.get("source", {}).get("cpu")
     same_cpu = bool(cpu_b) and cpu_b == cpu_f
     limit = wall_ratio if same_cpu else wall_ratio_any_cpu
+    # Two files whose bngsim_sec sums different phases measure different things:
+    # the first night after #901 compared bng_ssa's load phase with its ensemble.
+    same_phases = _wall_comparable(base, fresh)
+    phases_alert = bool(wall_cases) and not same_phases and not phases_may_differ
     wall = {
         "n_cases": len(wall_cases),
         "before": round(wb, 3),
@@ -415,7 +494,9 @@ def diff(
         "same_cpu": same_cpu,
         "limit": limit,
         "min_delta": wall_min_delta,
-        "alert": wb > 0 and wf > wb * limit and wf - wb > wall_min_delta,
+        "same_phases": same_phases,
+        "phases_alert": phases_alert,
+        "alert": same_phases and wb > 0 and wf > wb * limit and wf - wb > wall_min_delta,
     }
 
     # A run meant to exercise a specific backend must have run it: exprtk for the
@@ -433,9 +514,10 @@ def diff(
     alerts = {
         "regressed": len(regressed),
         "new_crash": len(new_crash),
-        "efficiency_cases": len(work_items),
+        "efficiency_cases": sum(1 for x in work_items if not x.get("flaky")),
         "efficiency_totals": sum(1 for t in totals.values() if t["alert"]),
         "wall": int(wall["alert"]),
+        "wall_phases": int(phases_alert),
         "backend": len(backend_miss),
         "incomplete": int(incomplete),
     }
@@ -639,14 +721,16 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
         lines += [f"**Did not run the expected backend: {len(result['backend_miss'])}**", ""]
         lines += _table(result["backend_miss"], ["case", "after", "note"], limit) + [""]
     if result["efficiency"]:
-        lines += [
-            f"**Efficiency: {len(result['efficiency'])} counter increase(s) above "
-            f"x{result['thresholds']['work_ratio']}**",
-            "",
-        ]
-        lines += _table(
-            result["efficiency"], ["case", "counter", "before", "after", "ratio"], limit
-        )
+        n_flaky = sum(1 for x in result["efficiency"] if x.get("flaky"))
+        n_alert = len(result["efficiency"]) - n_flaky
+        head = f"{n_alert} counter increase(s) above x{result['thresholds']['work_ratio']}"
+        if n_flaky:
+            head += f", and {n_flaky} on flaky cases, reported and not alerted"
+        lines += [f"**Efficiency: {head}**" if n_alert else f"Efficiency: {head}", ""]
+        cols = ["case", "counter", "before", "after", "ratio"]
+        if any("note" in x for x in result["efficiency"]):
+            cols.append("note")
+        lines += _table(result["efficiency"], cols, limit)
         lines.append("")
     tot = result["work_totals"]
     if any(t["before"] for t in tot.values()):
@@ -660,7 +744,18 @@ def render_md(result: dict, label: str = "", limit: int = 40) -> str:
             )
         lines.append("")
     w = result["wall"]
-    if w["n_cases"]:
+    if w["n_cases"] and not w.get("same_phases", True):
+        tail = (
+            " — **ALERT**: re-extract the baseline, so that the wall check runs again"
+            if w.get("phases_alert")
+            else ", and compare again once both are extracted with the same ones"
+        )
+        lines += [
+            f"bngsim wall over {w['n_cases']} cases: {w['before']} s -> {w['after']} s, "
+            f"not compared: the two files time different phases (issue #901){tail}.",
+            "",
+        ]
+    elif w["n_cases"]:
         flag = " — **ALERT**" if w["alert"] else ""
         where = (
             f"same CPU ({w.get('cpu_fresh')})"
@@ -740,6 +835,7 @@ def _cmd_diff(args) -> int:
         expect_backend=args.expect_backend or None,
         flaky=flaky,
         timeout_flips_info=args.timeout_flips_info,
+        phases_may_differ=args.phases_may_differ,
     )
     result["label"] = args.label
     md = render_md(result, args.label)
@@ -857,12 +953,18 @@ def main(argv=None) -> int:
     d.add_argument(
         "--flaky",
         default="",
-        help="JSON file {suite: {case: reason}}: changes of these cases never alert",
+        help="JSON file {suite: {case: reason}}: changes of these cases, in outcome "
+        "or in work, never alert",
     )
     d.add_argument(
         "--timeout-flips-info",
         action="store_true",
         help="report (do not alert on) transitions into or out of TIMEOUT",
+    )
+    d.add_argument(
+        "--phases-may-differ",
+        action="store_true",
+        help="report (do not alert on) the two files' bngsim_sec summing different phases",
     )
     d.add_argument(
         "--allow-missing-baseline",

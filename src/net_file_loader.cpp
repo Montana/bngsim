@@ -57,6 +57,17 @@ static std::vector<std::string> split_ws(const std::string &s) {
     return tokens;
 }
 
+// tokens[first, last), joined by single spaces, to quote in an error.
+static std::string join_tokens(const std::vector<std::string> &tokens, size_t first, size_t last) {
+    std::string out;
+    for (size_t i = first; i < last && i < tokens.size(); ++i) {
+        if (!out.empty())
+            out += ' ';
+        out += tokens[i];
+    }
+    return out;
+}
+
 // Whether a whitespace-delimited token is a leading line index. BNG2.pl strips
 // one with `s/^\s*\d+\s+//` — a run of digits delimited by whitespace — so a
 // token is an index exactly when it is all digits (issue #600).
@@ -464,6 +475,58 @@ static std::vector<ParsedFunction> parse_functions(std::ifstream &file) {
     return functions;
 }
 
+// A reaction line is `<index> <reactants> <products> <rate law>`, and only a
+// Sat, Hill or MM rate law runs past one token, on its constants. run_network
+// refuses anything after the rate law ("Undefined rateLaw type", or for MM
+// "Incorrect number of rate constants"); this loader
+// read the line and dropped the rest, so `1 1 2 k delay=tau` loaded as an
+// undelayed reaction and `MM kcat Km delay=tau` as plain MM (issue #1231).
+static std::runtime_error tokens_after_rate_law(const std::string &line,
+                                                const std::vector<std::string> &tokens,
+                                                size_t first) {
+    return std::runtime_error("reaction line '" + line + "' has '" +
+                              join_tokens(tokens, first, tokens.size()) + "' after its rate law '" +
+                              join_tokens(tokens, 3, first) +
+                              "'; bngsim reads nothing after a rate law, so a per-reaction "
+                              "modifier such as a delay is not supported");
+}
+
+// Takes the stat factor BNG2.pl writes ahead of a rate law (`0.5*kp2`,
+// `2*MM kcat Km`) off the front of `token` and returns it; 1 when there is none.
+// BNG2.pl writes the factor ahead of the type keyword for every type, and
+// run_network reads it there whatever follows (Network3's read_Rxn_array runs
+// `sscanf("%lf*%s")` on the token before matching the type), so `2*MM` is MM
+// times 2, not a rate constant named `MM` (issue #1230).
+static double take_stat_factor(std::string &token, const std::string &line) {
+    const auto star = token.find('*');
+    if (star == std::string::npos)
+        return 1.0;
+    // A stat factor is a number and nothing else: `2k*kf` and `nan*kf` used to
+    // read as 2 and NaN times kf, because stod stops at the first character it
+    // cannot use and accepts "nan". Anything else stays one name, which build()
+    // refuses unless the model declares it (issue #803).
+    const std::string prefix = token.substr(0, star);
+    double factor = 0.0;
+    try {
+        size_t used = 0;
+        factor = std::stod(prefix, &used);
+        if (used != prefix.size() || !std::isfinite(factor))
+            return 1.0;
+    } catch (...) {
+        return 1.0; // Not coeff*name, treat as plain name
+    }
+    // stod also takes a sign and C99 hex, so `-1*kf`, `0*kf` and `0x10*kf` read
+    // as a factor of -1, 0 and 16: a reaction run backwards (a negative SSA
+    // propensity), one that never fires, and a hex literal BNG2.pl never writes.
+    // A statistical or unit-conversion factor is a positive decimal number.
+    if (factor <= 0.0 || prefix.find_first_of("xXpP") != std::string::npos) {
+        throw std::runtime_error("reaction line '" + line + "' has stat factor '" + prefix +
+                                 "'; a stat factor must be a positive decimal number");
+    }
+    token.erase(0, star + 1);
+    return factor;
+}
+
 static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
     std::vector<ParsedReaction> reactions;
     std::string line;
@@ -510,69 +573,78 @@ static std::vector<ParsedReaction> parse_reactions(std::ifstream &file) {
                 rxn.product_indices_1based.push_back(idx);
         }
 
-        // Rate law
+        // Rate law. The stat factor comes off the first token before the type
+        // is matched, as run_network reads it: `2*MM kcat Km` is MM times 2,
+        // which BNG2.pl writes for a substrate with equivalent sites and this
+        // loader used to refuse, first at build as an unknown parameter `MM`
+        // and then by name (issue #1230).
         std::string rate_token = tokens[3];
+        rxn.stat_factor = take_stat_factor(rate_token, stripped);
 
-        if (rate_token == "Sat") {
+        // A rate law of one token is a rate constant or function whatever it is
+        // called, as run_network reads it, so `Sat` or `Hill` alone (or `2*Sat`,
+        // once its factor is off) names a parameter, as `MM` or `Ele` alone does,
+        // rather than a Sat or Hill law with no constants.
+        if ((rate_token == "Sat" || rate_token == "Hill") && tokens.size() > 4) {
             rxn.type = RateLawType::Functional;
             rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
+            for (size_t i = 4; i < tokens.size(); ++i) {
+                // Each constant is a parameter name; run_network looks every
+                // one up ("Undefined rate constant"). The counts are checked in
+                // rewrite_legacy_sat_hill_rate_laws, but Sat takes one constant
+                // per reactant, so with two reactants `Sat k Km 2` loaded with
+                // a literal 2 and `Sat k Km delay=tau` reached ExprTk (#1231).
+                if (!is_bare_identifier(tokens[i]))
+                    throw std::runtime_error(
+                        "reaction line '" + stripped + "' gives its " + rate_token +
+                        " rate law the constant '" + tokens[i] +
+                        "', which is not a parameter name; bngsim reads nothing after a "
+                        "rate law's constants, so a per-reaction modifier such as a delay "
+                        "is not supported");
                 rxn.legacy_rate_law_constants.push_back(tokens[i]);
+            }
 
-        } else if (rate_token == "Hill") {
-            rxn.type = RateLawType::Functional;
-            rxn.legacy_rate_law_type = rate_token;
-            for (size_t i = 4; i < tokens.size(); ++i)
-                rxn.legacy_rate_law_constants.push_back(tokens[i]);
-
-        } else if (rate_token == "MM" && tokens.size() >= 6) {
+        } else if (rate_token == "MM" && tokens.size() >= 5) {
+            // `MM kcat Km`; run_network refuses any other count of constants. A
+            // lone `MM kcat` used to fall through to the elementary branch as a
+            // rate constant named MM, refused at build as an unknown parameter.
+            if (tokens.size() == 5)
+                throw std::runtime_error("reaction line '" + stripped +
+                                         "' gives MM one constant; an MM rate law takes "
+                                         "two constants, 'MM kcat Km'");
+            if (tokens.size() > 6)
+                throw tokens_after_rate_law(stripped, tokens, 6);
             rxn.type = RateLawType::MichaelisMenten;
             rxn.mm_kcat_name = tokens[4];
             rxn.mm_km_name = tokens[5];
 
         } else {
-            // Elementary or Functional: check for "coeff*param" pattern
-            std::string param_name = rate_token;
-            auto star = rate_token.find('*');
-            if (star != std::string::npos) {
-                // A stat factor is a number and nothing else: `2k*kf` and
-                // `nan*kf` used to read as 2 and NaN times kf, because stod
-                // stops at the first character it cannot use and accepts
-                // "nan". Anything else stays one name, which build() refuses
-                // unless the model declares it (issue #803).
-                const std::string prefix = rate_token.substr(0, star);
-                try {
-                    size_t used = 0;
-                    const double factor = std::stod(prefix, &used);
-                    if (used == prefix.size() && std::isfinite(factor)) {
-                        rxn.stat_factor = factor;
-                        param_name = rate_token.substr(star + 1);
-                    }
-                } catch (...) {
-                    // Not coeff*name, treat as plain name
-                }
-                // stod also takes a sign and C99 hex, so `-1*kf`, `0*kf` and
-                // `0x10*kf` read as a factor of -1, 0 and 16: a reaction run
-                // backwards (a negative SSA propensity), one that never fires,
-                // and a hex literal BNG2.pl never writes. A statistical or
-                // unit-conversion factor is a positive decimal number.
-                if (param_name != rate_token &&
-                    (rxn.stat_factor <= 0.0 || prefix.find_first_of("xXpP") != std::string::npos)) {
-                    throw std::runtime_error("reaction line '" + stripped + "' has stat factor '" +
-                                             prefix +
-                                             "'; a stat factor must be a positive decimal number");
-                }
-            }
-
-            if (param_name.empty()) {
+            // Elementary or Functional: the rate constant's or function's name,
+            // with its stat factor already taken off.
+            if (rate_token.empty()) {
                 // `0.5*` — a stat factor and nothing to multiply. ModelBuilder's
                 // validation passes an empty rate name over, so this loaded as a
                 // reaction that never fires (issue #803).
                 throw std::runtime_error("reaction line '" + stripped +
                                          "' has a stat factor but no rate constant");
             }
+            if (tokens.size() > 4) {
+                // run_network reads more than one rate-law token as a type
+                // keyword and its constants. One of its forms reaches this
+                // branch. It used to be refused at build, as an unknown
+                // parameter named after the keyword, or, in a model that
+                // declared a parameter of that name, loaded at it with the
+                // constants dropped.
+                if (rate_token == "Ele")
+                    throw std::runtime_error(
+                        "reaction line '" + stripped +
+                        "' spells out the Ele rate-law type, which BNG2.pl does not write; "
+                        "bngsim reads an elementary rate law as its rate constant alone, "
+                        "e.g. 'k' or '2*k'");
+                throw tokens_after_rate_law(stripped, tokens, 4);
+            }
             rxn.type = RateLawType::Elementary;
-            rxn.rate_law_name = param_name;
+            rxn.rate_law_name = rate_token;
         }
 
         reactions.push_back(std::move(rxn));

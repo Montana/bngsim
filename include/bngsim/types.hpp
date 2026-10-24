@@ -1134,6 +1134,21 @@ struct SensitivityOptions {
     // jump the pre-#763 test reads, and that the listed reactions do not account
     // for, is judged as before: the list has missed a reaction.
     std::vector<std::vector<int>> state_switch_reactions;
+    // Issue #959: conditions over model state that a plain run watches for a
+    // state pinned on their surface (issue #928) without rooting on them. An
+    // SBML model's thresholds are rooted by the loader's discontinuity
+    // triggers, so they are not state_switch_conditions, and a run that could
+    // neither cross one nor pass it took batches of steps until its wall clock
+    // ran out. Read only by a run without sensitivity columns.
+    std::vector<std::string> stall_watch_conditions;
+
+    // Parallel to state_switch_conditions (issue #1147): for each, the if()
+    // branches its step or bend calls switch a rate law in, as an expression
+    // that reads 1 where one of them is on, or "" where one of its readings
+    // stands in no branch. A plain run steps on through a crossing whose every
+    // branch is off, which changes nothing, rather than restart there. Empty
+    // (the default) restarts at every crossing, as before.
+    std::vector<std::string> state_switch_guards;
 
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event
@@ -1158,7 +1173,29 @@ struct SensitivityOptions {
 // `jacobian` asks for it (issue #127); before that each differenced its own, at
 // one RHS evaluation per unknown per setup.
 struct SteadyStateOptions {
-    double tol = 1e-9;     // convergence tolerance: ||f(y)||_2 / n_species < tol
+    double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
+    // What `converged` asks of a state (issue #1001). "scaled" (the default):
+    // the parity test below, and a run taken on from the state for max_time
+    // (at most 1e6) moves no species by more than rtol·|y_i| + atol_i (the
+    // march's own tolerances): what tells a state the system rests at from one
+    // under tol that a run leaves (a model in small units, or a slow one). An
+    // unstable root a run from it does not leave passes. The Newton step
+    // from the state to the root within the same tolerances (to 512 unknowns)
+    // decides where the solve stops, not `converged`; the state it stops at is
+    // polished. A burst-free Newton solve (newton_burst false), which reports
+    // unstable roots, takes no runs and is decided by the parity test.
+    // "residual": BNG2.pl's parity test alone, ||f(y)||_2 / n_species < tol,
+    // a number in the model's units of concentration per time, kept for
+    // comparisons with run_network.
+    std::string criterion = "scaled";
+    // Set by find_steady_state, for "scaled": whether the step is taken; the
+    // largest species the solve starts with, which caps the absolute part of
+    // the criterion's tolerances; and, for a burst-free Newton solve, that
+    // its root is accepted by the residual test, at whatever iterate KINSOL
+    // ends.
+    bool criterion_by_distance = false;
+    double criterion_start_size = 0.0;
+    bool criterion_by_residual = false;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
     double atol = 1e-8;    // CVODE absolute tolerance
@@ -1183,6 +1220,12 @@ struct SteadyStateOptions {
     // "integration" (default; CVODE parity early-stop), "newton" (two-tier
     // integrate-then-polish), or "kinsol" (alias for newton).
     std::string method = "integration";
+    // Issue #524: false makes "newton" solve from the state it is given, with
+    // no integration burst first, and report the stability certificate's verdict
+    // instead of rejecting an unstable root. What enumerating roots from many
+    // starting states needs: a burst carries every start into an attractor's
+    // basin, and a saddle is discarded on purpose. Ignored by "integration".
+    bool newton_burst = true;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —
@@ -1276,7 +1319,21 @@ struct SteadyStateOptions {
 struct SteadyStateResult {
     std::vector<double> concentrations; // n_species steady-state values
     std::vector<std::string> species_names;
-    double residual = 0.0;   // max|f(y)| at convergence
+    double residual = 0.0; // max|f(y)| at convergence
+    // Issue #1001: the largest |δ_i| over rtol·|y_i| + atol_i at the returned
+    // state, δ the Newton step to the root, which under "scaled" decided
+    // where the solve stopped (SteadyStateOptions::criterion). Measured under
+    // "scaled" only, for a system of up to 512 unknowns; NaN under "residual"
+    // and above that, and +inf where the reduced Jacobian is singular at a
+    // state that is not a root.
+    double newton_distance = std::numeric_limits<double>::quiet_NaN();
+    // Issue #1001, the run test of "scaled": the largest move of a measured
+    // species over its tolerance, across the run taken on from the returned
+    // state; at most 1 passes. +inf where the run could not be taken to its
+    // time; NaN where none was taken (under "residual", where the parity test
+    // already refused, and for a burst-free Newton solve).
+    double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
+    std::string criterion;   // the criterion `converged` was decided by
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations
@@ -1468,6 +1525,31 @@ struct SteadyStateResult {
     double sens_root_spectral_radius = 0.0;
     int sens_mask_held_species = -1;
     int sens_mask_reader_species = -1;
+
+    // ─── Whether a differenced Jacobian's step decides the answer (issue #1002) ───
+    // Where sens_jacobian_source is "finite-difference", the columns are solved
+    // again with the matrix that has the columns of species far below the
+    // state's scale at their own step (fd_own_step_columns, in
+    // bngsim/fd_jacobian.hpp). sens_fd_own_step_species are the species
+    // (0-based) whose columns that changed; empty where none did, and then
+    // there is nothing to compare. Where the two answers are further apart
+    // than 1e-4 of a column's largest entry, sens_fd_disagree_species and
+    // sens_fd_disagree_param are the entry furthest apart (0-based species, and
+    // column into sens_param_names; -1 where none is) and sens_fd_floored and
+    // sens_fd_own_step its two values, the first being the one in
+    // `sensitivity`. sens_fd_disagree_function is the same for the
+    // state-chain term of a function sensitivity that was differenced (an
+    // index into function_names), with the two totals in
+    // sens_fd_function_floored and sens_fd_function_own_step.
+    std::vector<int> sens_fd_own_step_species;
+    int sens_fd_disagree_species = -1;
+    int sens_fd_disagree_param = -1;
+    double sens_fd_floored = 0.0;
+    double sens_fd_own_step = 0.0;
+    int sens_fd_disagree_function = -1;
+    int sens_fd_function_param = -1;
+    double sens_fd_function_floored = 0.0;
+    double sens_fd_function_own_step = 0.0;
 
     // ─── Observable / function output sensitivities at steady state (GH #12) ───
     // The chain-rule projection of the species dY_ss/dp above onto the model's

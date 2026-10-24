@@ -34,6 +34,7 @@ falls back to the finite-difference Jacobian — exactly the pre-#76 behavior.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -50,6 +51,7 @@ from collections.abc import Callable
 from bngsim._codegen import (
     _BUILTIN_CONSTANT_VALUES,
     _PY_KEYWORD_PARAM_NAMES,
+    _RATEOF_PREFIX,
     _alias_keyword_param,
     _coerce_booleans_used_as_numbers,
     _normalize_exprtk_operators,
@@ -429,6 +431,81 @@ def _preprocess_exprtk(expr: str) -> str:
     return _coerce_booleans_used_as_numbers(s)
 
 
+_piecewise_of_if_cache: dict = {}
+
+
+def _piecewise_of_if(sp):
+    """The ``Piecewise`` an ``if()`` parses to, built without sympy's set
+    theory for a condition that has an ``if()`` in it (issue #540).
+
+    sympy will not keep a ``Piecewise`` in a condition: ``ExprCondPair`` folds
+    the condition into one and rewrites that as an ``ITE`` chain, and the
+    rewrite computes ``as_set()`` of every inner condition
+    (``solve_univariate_inequality``, ``periodicity``, ``simplify``). That was
+    about 2 s for each of 12 rate laws of ``mt_music_sequencer``, whose
+    ``if(ds1() > 0, ...)`` reads a ``ds1()`` of nested chord ``if()`` chains, and
+    the model declined on its derivation budget after 8 of 14 reactions.
+
+    The sets are only used to find a condition the ones before it leave
+    nothing past, and cut the chain there; with a final ``(b, True)``, which
+    the fold of a translated ``if()`` always has, the chain is complete
+    without them. This builds that chain (``ITE(c1, b1, ITE(c2, b2, ...))``,
+    relationals made canonical, as the rewrite returns it), so ``ExprCondPair``
+    finds no ``Piecewise`` to rewrite. A fold with no default is left to sympy.
+
+    A branch of the fold is a truth value only where the condition compared an
+    ``if()``. Where the condition is the ``if()`` itself, ``if(if(F != 1, F, 0),
+    a, b)``, its branches are numbers, which ExprTk reads as true where they are
+    nonzero. ``ITE`` would take a bare ``F`` as a Boolean atom and simplify it
+    against ``F != 1`` (``ITE(Ne(F, 1), F, False)`` became ``F``, true at F = 1
+    where ExprTk reads the inner ``if()`` as 0), and refuse any other number,
+    which sympy's rewrite only escaped where its sets cut that branch off. So
+    a branch that is not already a comparison or a logical form of them is
+    written as ExprTk reads it, ``Ne(value, 0)``.
+    """
+    built = _piecewise_of_if_cache.get("built")
+    if built is not None:
+        return built
+    from sympy.core.relational import Relational
+    from sympy.functions.elementary.piecewise import piecewise_fold
+    from sympy.logic.boolalg import ITE, BooleanAtom, BooleanFunction
+
+    def _truth(value):
+        if isinstance(value, (BooleanAtom, Relational, BooleanFunction)):
+            return value
+        return sp.Ne(value, 0)
+
+    def _canonical(cond):
+        # sympy.core.relational._canonical, spelled out: that name is private,
+        # and this runs from _build_local_dict, outside _exprtk_to_sympy's try,
+        # so a sympy that renamed it would fail the load instead of declining.
+        return cond.xreplace({r: r.canonical for r in cond.atoms(Relational)})
+
+    def _without_piecewise(cond):
+        folded = piecewise_fold(cond)
+        if not isinstance(folded, sp.Piecewise):
+            return folded
+        pairs = list(folded.args)
+        if pairs[-1].cond != sp.true:
+            return cond
+        last = _truth(pairs[-1].expr)
+        for branch, c in reversed(pairs[:-1]):
+            last = ITE(c, _truth(branch), last)
+        return _canonical(last)
+
+    def piecewise(*pairs, **options):
+        fixed = []
+        for pair in pairs:
+            expr, cond = pair
+            if isinstance(cond, sp.Basic) and cond.has(sp.Piecewise):
+                cond = _without_piecewise(cond)
+            fixed.append((expr, cond))
+        return sp.Piecewise(*fixed, **options)
+
+    _piecewise_of_if_cache["built"] = piecewise
+    return piecewise
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -456,7 +533,7 @@ def _build_local_dict(preprocessed: str, sp):
         # model may name a parameter after one, so there is nothing to lose a
         # tie with.
         **engine_sympy_bindings(sp),
-        "Piecewise": sp.Piecewise,
+        "Piecewise": _piecewise_of_if(sp),
         "Not": sp.Not,
         "And": sp.And,
         "Or": sp.Or,
@@ -530,6 +607,220 @@ def _exprtk_to_sympy(expr: str):
 # ─── Function inlining ─────────────────────────────────────────────────────
 
 
+# Past this many characters, the text written out function by function is read
+# through sympy instead, each function once (issue #1124, item 4 has the same
+# limit for an event's resize).
+_INLINE_TEXT_LIMIT = 20_000
+
+
+def _inlined_length(expr: str, func_map: dict[str, str]) -> int | None:
+    """How long ``expr`` written out by :func:`_inline_functions` would be, without
+    writing it, or ``None`` where its functions read each other in a cycle."""
+    length: dict[str, int] = {}
+    on_path: set[str] = set()
+
+    def of(text: str) -> int | None:
+        n = len(text)
+        for name in _IDENT_RE.findall(text):
+            if name not in func_map:
+                continue
+            if name in on_path:
+                return None
+            if name not in length:
+                on_path.add(name)
+                got = of(func_map[name])
+                on_path.discard(name)
+                if got is None:
+                    return None
+                length[name] = got
+            n += length[name] + 2 - len(name)
+        return n
+
+    try:
+        return of(expr)
+    except RecursionError:
+        return None
+
+
+def _compact_inlined(expr: str, func_map: dict[str, str]) -> str | None:
+    """``expr`` with its functions written in, as sympy prints the result, where
+    writing them in as text would pass :data:`_INLINE_TEXT_LIMIT`; else ``None``.
+
+    Written in as text, a function that more than one path reaches is copied
+    once per path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made a
+    rate law that reads the last one exponential in the depth: the first ODE run
+    took 1.2 s at 26 rules and a codegen run 2.8 s, spent tokenizing, parsing and
+    compiling the text and its derivatives (issue #1124, item 5). Here each
+    function is parsed once and put in by reference, and sympy's own arithmetic
+    collects what the paths share: that diamond is a sum of two terms. The
+    printed result is used where it is short; where it is not (a diamond that
+    does not collect, ``sin(r_{i-1}) + cos(r_{i-2})``), or anything in it cannot
+    be parsed or printed, the text is written out as before.
+    """
+    predicted = _inlined_length(expr, func_map)
+    if predicted is None or predicted <= _INLINE_TEXT_LIMIT:
+        return None
+    try:
+        import sympy as sp
+    except ImportError:
+        return None
+
+    def symbol_of(name: str):
+        alias = _alias_keyword_param(name) if name in _PY_KEYWORD_PARAM_NAMES else name
+        return sp.Symbol(alias)
+
+    built: dict[str, object] = {}
+
+    def parsed(text: str):
+        sym = _exprtk_to_sympy(text)
+        if sym is None:
+            return None
+        subs = {}
+        for name in set(_IDENT_RE.findall(text)) & set(func_map):
+            if name not in built:
+                built[name] = None  # under way: a cycle reads no value
+                built[name] = parsed(func_map[name])
+            if built[name] is None:
+                return None
+            subs[symbol_of(name)] = built[name]
+        return sym.xreplace(subs) if subs else sym
+
+    try:
+        top = parsed(expr)
+    except (RecursionError, Exception):  # noqa: BLE001 - any failure keeps the text path
+        return None
+    if top is None:
+        return None
+    # The printed tree, a shared node counted once per use, before printing it.
+    size: dict[int, int] = {}
+    stack = [(top, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if id(node) in size:
+            continue
+        if expanded:
+            size[id(node)] = 1 + sum(size[id(a)] for a in node.args)
+        else:
+            stack.append((node, True))
+            stack.extend((a, False) for a in node.args if id(a) not in size)
+    if size[id(top)] * 4 > _INLINE_TEXT_LIMIT:
+        return None
+    # The law keeps its own form (no derivative rewrites), and is used only where
+    # it is much shorter than the text: a law just past the limit whose terms do
+    # not collect (BIOMD0000000628, 21,041 characters written out) printed longer
+    # than that, and paid the parse and print on top for nothing.
+    printed = sympy_to_exprtk(top, rewrites=False)
+    if printed is None or 2 * len(printed) > predicted:
+        return None
+    return printed
+
+
+def rateof_rate_laws(data: dict) -> dict[str, str]:
+    """``rate_of__X`` → the text of dX/dt, for each species whose rate every
+    reaction that changes it states in a form the derivations can read.
+
+    ``rate_of__X`` is the engine's live dX/dt: a value read off the last RHS,
+    which no derivation can differentiate, and a rate law that reads one (a
+    dilution term ``-S·(r·rate_of__P)/C1`` under ``C1 := 2 + r*P``) declined the
+    analytic Jacobian and the analytic sensitivity RHS. Run on CVODES' difference
+    quotient, a sensitivity run of that model at rtol 1e-11 took 291,511 steps
+    for 284 (issue #1124, item 7). dX/dt is Σ_r ν_Xr·rate_r over the reactions
+    that change X, which the engine sums for the same value
+    (``NetworkModel::compute_derivs_core``), so written into the function map
+    under the token's name it is inlined and differentiated through like any
+    rule.
+
+    A reaction's rate is its rate law (Functional) or its rate constant
+    (Elementary) times its stat factor, times, where the species factor applies,
+    each reactant's value. That value is read through the observable that holds
+    the species alone at weight 1, which is what the engine multiplies by (an
+    amount-valued species' amount): an SBML model has one per species, under
+    the species' own name. The SBML loader reads a mass-action kinetic law
+    (``k1*P*C0``) as Elementary, so leaving those out left the common model on
+    the difference quotient.
+
+    A fixed species' rate is 0. A species whose ``rateOf`` reports an amount
+    (``report_rateof_amount``) reads the sum times its compartment's size, as
+    ``refresh_rateof_derivs_once_`` scales it: the size parameter by name where
+    the size is writable, so a write moves it (issue #170), else the number.
+    Left out, so that a law reading the token declines as before: a species a
+    reaction changes that divides by each species' volume, is
+    Michaelis–Menten, or takes a species factor of a reactant no observable
+    holds alone. ``data`` is the model's ``codegen_data()``; one with no
+    reaction list says nothing of any rate and gives none, and so does one
+    whose functions read none.
+    """
+    functions = data.get("functions") or ()
+    if "reactions" not in data or not any(
+        _RATEOF_PREFIX in f.get("expression", "") for f in functions
+    ):
+        return {}
+    species = data.get("species") or []
+    params = data.get("parameters") or []
+    alone: dict[int, str] = {}
+    for o in data.get("observables") or ():
+        entries = list(o.get("entries") or ())
+        if len(entries) == 1 and float(entries[0][1]) == 1.0:
+            alone.setdefault(int(entries[0][0]), o["name"])
+    terms: dict[int, list[str]] = {}
+    unreadable: set[int] = set()
+    for rxn in data.get("reactions") or []:
+        net: dict[int, int] = {}
+        for i in rxn.get("reactants", ()):
+            net[int(i)] = net.get(int(i), 0) - 1
+        for i in rxn.get("products", ()):
+            net[int(i)] = net.get(int(i), 0) + 1
+        rate = _reaction_rate_text(rxn, params, alone)
+        for i, n in net.items():
+            if n == 0:
+                continue
+            if rate is None:
+                unreadable.add(i)
+                continue
+            coeff = n * float(rxn.get("stat_factor", 1.0))
+            terms.setdefault(i, []).append(f"({coeff!r})*{rate}")
+    out: dict[str, str] = {}
+    for i, sp in enumerate(species):
+        if sp.get("fixed", False):
+            rate = "0"
+        elif i in unreadable:
+            continue
+        else:
+            rate = " + ".join(terms.get(i, ())) or "0"
+            if sp.get("report_rateof_amount", False):
+                k = int(sp.get("volume_param_idx0", -1))
+                size = params[k]["name"] if 0 <= k < len(params) else None
+                rate = f"{size or repr(float(sp.get('volume_factor', 1.0)))}*({rate})"
+        out[f"{_RATEOF_PREFIX}{sp['name']}"] = f"({rate})"
+    return out
+
+
+def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str | None:
+    """A reaction's rate before its stat factor, as ``compute_rxn_rate`` forms
+    it on the ODE path, or ``None`` where :func:`rateof_rate_laws` cannot state
+    it. ``alone`` maps a species to the observable that holds it alone."""
+    if rxn.get("per_species_volume_scaling", False):
+        return None
+    kind = rxn.get("type")
+    if kind == "functional":
+        base = rxn.get("function_name") or ""
+    elif kind == "elementary":
+        k = list(rxn.get("rate_param_indices") or ())
+        base = params[int(k[0])]["name"] if k and 0 <= int(k[0]) < len(params) else ""
+    else:
+        return None  # Michaelis–Menten
+    if not base:
+        return None
+    factors = [base]
+    if rxn.get("apply_species_factor", True):
+        for i in rxn.get("reactants", ()):
+            name = alone.get(int(i))
+            if name is None:
+                return None
+            factors.append(name)
+    return "*".join(factors)
+
+
 def _inline_functions(
     expr: str,
     func_map: dict[str, str],
@@ -556,6 +847,10 @@ def _inline_functions(
         _seen = frozenset()
     if _depth > 64:
         return None
+    if _depth == 0:
+        compact = _compact_inlined(expr, func_map)
+        if compact is not None:
+            return compact
 
     # Intersect the identifiers actually present in ``expr`` with ``func_map``,
     # rather than running a regex for every function name. ``func_map`` can hold
@@ -589,19 +884,20 @@ def _inline_functions(
 # Derived rather than listed by hand: differentiate every name in
 # _SYMPY_FUNC_TO_EXPRTK the way differentiate_rate_law does (between
 # _prepare_kinks and _finish_kinks, issue #507) and keep the ones whose result
-# neither printer spells. Three do: ceiling / floor / sign come back as an
-# unevaluated Derivative, which is not a Function at all and needed
-# _is_emittable's own fix above. Abs / Min / Max were here too — sympy
+# neither printer spells. None does now. Abs / Min / Max were here — sympy
 # differentiates them to re()/im()/Heaviside — until the two kink steps gave
-# Abs the derivative sign(a)·a' and spelled Heaviside as if().
+# Abs the derivative sign(a)·a' and spelled Heaviside as if(). ceiling / floor /
+# sign were here — sympy leaves their derivative as an unevaluated Derivative,
+# which is not a Function at all and needed _is_emittable's own fix above —
+# until the step twins of issue #1128 gave them their derivative of 0.
 #
 # Catching the three before ``sp.diff`` is a build-time saving, not a behaviour
 # change: the model declines either way. The saving was not marginal when Abs was
 # still in the set — sympy is worst at exactly these constructs, and
 # BIOMD0000000385's three Abs over its differentiation variables cost **138 s**
 # discovering a decline against a 20 s budget, unbounded by it because one
-# ``sp.diff`` cannot be interrupted — and the pre-check stays for the names that
-# remain.
+# ``sp.diff`` cannot be interrupted — and the pre-check stays for a name the
+# emitter map gains that derives to nothing printable.
 #
 # Matched on the type name during one traversal, because Min/Max are Application
 # but *not* Function subclasses, so ``atoms(sp.Function)`` misses them.
@@ -613,7 +909,7 @@ def _inline_functions(
 # pre-declined for cases that work. ``mratio`` is the first function on either
 # count — closed form in its third argument only, and only in C (issue #457) — so
 # it is deliberately absent. test_jacobian_symbolic.py re-derives the whole set.
-_NONDIFFERENTIABLE_EMITTER_FUNCS = frozenset({"ceiling", "floor", "sign"})
+_NONDIFFERENTIABLE_EMITTER_FUNCS: frozenset[str] = frozenset()
 
 
 def _nondifferentiable_over(expr, targets: set[str]) -> str | None:
@@ -676,27 +972,44 @@ def _kink_bindings(sp) -> dict:
             def fdiff(self, argindex=1):
                 return sp.sign(self.args[0])
 
-        bindings = {"absval": absval}
+        # Issue #1126: sympy's d/da Max(a1, …, an) is Heaviside(a1 − Max(a2, …,
+        # an)), a half at a tie, so a tie of n arguments weighs n/2 in all. These
+        # binary twins, folded by _prepare_kinks, weigh any tie 1, split as
+        # absval's sign(0) = 0 splits one: what a central difference reads there.
+        def binary(name: str, sign: int):
+            def fdiff(self, argindex=1):
+                a, b = self.args if argindex == 1 else self.args[::-1]
+                return sp.Heaviside(sign * (a - b), sp.S.Half)
+
+            return type(name, (sp.Function,), {"nargs": 2, "fdiff": fdiff})
+
+        bindings = {
+            "absval": absval,
+            "maxval": binary("maxval", 1),
+            "minval": binary("minval", -1),
+        }
         _kink_sympy_cache["bindings"] = bindings
     return bindings
 
 
 def _prepare_kinks(expr, targets: set[str]):
     """Before differentiation (issue #507): every ``Abs`` over a differentiation
-    variable becomes the ``absval`` twin of :func:`_kink_bindings`. ``Max`` and
-    ``Min`` need nothing here — sympy differentiates them to products of
-    ``Heaviside`` over their argument differences, which :func:`_finish_kinks`
-    spells — and neither does an ``Abs`` over parameters only, which is a value
-    factor of the derivative and prints best as ``abs(k)``. The walk skips the
-    condition half of every ``Piecewise`` pair for the reason
-    :func:`_nondifferentiable_over` gives: a condition is copied through
-    undifferentiated, so an ``Abs`` inside one is fine as it is.
+    variable becomes the ``absval`` twin of :func:`_kink_bindings`, and every
+    ``Max`` / ``Min`` over one a fold of the binary ``maxval`` / ``minval`` twins
+    (issue #1126), whose derivative splits a tie. Neither is needed over
+    parameters only, where the call is a value factor of the derivative and
+    prints best as itself. The walk skips the condition half of every
+    ``Piecewise`` pair for the reason :func:`_nondifferentiable_over` gives: a
+    condition is copied through undifferentiated, so a call inside one is fine
+    as it is.
     """
     try:
         import sympy as sp
     except ImportError:
         return expr
-    absval = _kink_bindings(sp)["absval"]
+    kinks = _kink_bindings(sp)
+    absval = kinks["absval"]
+    folds = {sp.Max: kinks["maxval"], sp.Min: kinks["minval"]}
 
     def touches(node) -> bool:
         return bool({str(sym) for sym in node.free_symbols} & targets)
@@ -711,27 +1024,161 @@ def _prepare_kinks(expr, targets: set[str]):
             node = node.func(*new_args)
         if isinstance(node, sp.Abs) and touches(node):
             return absval(node.args[0])
+        if type(node) in folds and touches(node):
+            # A left fold, since sympy flattens a nested Max: the weights of a
+            # three-way tie are 1/4, 1/4, 1/2, and still sum to 1.
+            return functools.reduce(folds[type(node)], node.args)
         return node
 
     return walk(expr)
 
 
 def _finish_kinks(deriv):
-    """After differentiation (issue #507): ``Heaviside(u)`` — what ``d/da Max(a,
-    b)`` is — becomes ``Piecewise((1, u >= 0), (0, True))``, the step the emitters
-    print as ``if()``; and ``absval`` goes back to ``Abs`` so a value factor
-    prints as ``abs()``. At ``u = 0`` the value is a tie of the ``max``: a
-    switching surface, where the C++ self-check judges nothing (issue #511)."""
+    """After differentiation (issue #507): each twin of :func:`_prepare_kinks`
+    goes back to its call, so a value factor prints as ``abs()``, ``max()`` or
+    ``min()``; and ``Heaviside(u, h)``, what the twins differentiate to, becomes
+    the step the emitters print as ``if()``, ``h`` at ``u = 0``. That was 1, and
+    at a tie of ``min(A, B)`` over an ``A == B`` two symmetric reactions hold
+    for the whole run, J·s counted dA/dp twice: dY/dkp 5.77 for 2.88 (issue
+    #1126). It is spelled as a blend of two one-condition steps, since sympy's
+    Piecewise collapse recurses without end on a three-branch one over a nested
+    min / max. A tie is a switching surface, where the C++ self-check judges
+    nothing (issue #511)."""
     try:
         import sympy as sp
     except ImportError:
         return deriv
-    absval = _kink_bindings(sp)["absval"]
+    kinks = _kink_bindings(sp)
+    absval = kinks["absval"]
+    folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
-        lambda n: sp.Piecewise((sp.Integer(1), n.args[0] >= 0), (sp.Integer(0), True)),
+        lambda n: (
+            (1 - n.args[1]) * sp.Piecewise((1, n.args[0] > 0), (0, True))
+            + n.args[1] * sp.Piecewise((1, n.args[0] >= 0), (0, True))
+        ),
     )
-    return deriv.replace(lambda n: isinstance(n, absval), lambda n: sp.Abs(n.args[0]))
+    memo: dict = {}
+
+    def back(node):
+        if not node.args:
+            return node
+        out = memo.get(node)
+        if out is not None:
+            return out
+        if type(node) in folds:
+            # One call over every leaf of the fold, unevaluated: the leaves are
+            # the arguments of a Max sympy has already simplified. Rebuilt a
+            # level at a time and evaluated, as ``replace`` does, each Max
+            # re-ran its local-zero search over all the arguments it flattens,
+            # and a max of 16 took 11 s to differentiate.
+            leaves, stack = [], [node]
+            while stack:
+                n = stack.pop()
+                if type(n) is type(node):
+                    stack.extend(reversed(n.args))
+                else:
+                    leaves.append(back(n))
+            out = folds[type(node)](*leaves, evaluate=False)
+        else:
+            args = [back(a) for a in node.args]
+            out = (
+                node.func(*args)
+                if any(a is not o for a, o in zip(args, node.args, strict=True))
+                else node
+            )
+            if type(out) is absval:
+                out = sp.Abs(out.args[0])
+        memo[node] = out
+        return out
+
+    return back(deriv)
+
+
+# ─── Issue #1128: a rounding call over the state ──────────────────────────
+#
+# ``ceiling``, ``floor`` and ``sign`` step and are flat between their steps, so
+# their derivative is 0 wherever they have one, as ``if()``'s branches are
+# differentiated with the jump between them left out. They were declined over
+# a differentiation variable (GH #250) while nothing located their steps in the
+# state. Since #1068 each one is rooted where it jumps (and SBML's by its GH #244
+# trigger), so a step between two of them is smooth and a jump is a restart.
+#
+# The decline cost more than the analytical Jacobian. On CVODE's difference
+# quotient, a run that starts on a step -- ``0.01*ceil(0.4*X)*X`` from X = 10 --
+# perturbs X across it and reads a slope of -7e5 for -0.04. Newton's updates
+# under that matrix are too small to fail, so the corrector kept the predictor
+# for as long as CVODE kept the matrix, and X came back 5 % off with no error.
+#
+# Hence twins, as for ``abs`` and the zero base: before ``sp.diff`` each call
+# over a target becomes one whose ``fdiff`` is 0, and afterwards it goes back,
+# so a value factor prints as the call it is.
+_step_sympy_cache: dict = {}
+
+
+def _step_bindings(sp) -> dict:
+    """``{name: (call, twin)}`` for each rounding call, the twin's derivative 0
+    and *call* what it goes back to (issue #1128). ``sgn`` is the engine's
+    spelling of ``sign``, which sympy parses as a function no emitter prints, so
+    it goes back as ``sign``. Built once, for the reason
+    :func:`engine_sympy_bindings` gives."""
+    bindings = _step_sympy_cache.get("bindings")
+    if bindings is None:
+
+        def twin(name: str):
+            return type(name, (sp.Function,), {"nargs": 1, "fdiff": lambda self, i=1: sp.S.Zero})
+
+        calls = {"ceiling": sp.ceiling, "floor": sp.floor, "sign": sp.sign, "sgn": sp.sign}
+        bindings = {name: (call, twin(f"step{name}")) for name, call in calls.items()}
+        _step_sympy_cache["bindings"] = bindings
+    return bindings
+
+
+def _prepare_steps(expr, targets: set[str]):
+    """Before differentiation (issue #1128): every ``ceiling``, ``floor``,
+    ``sign`` and ``sgn`` over a differentiation variable becomes its twin of
+    :func:`_step_bindings`. The condition half of every ``Piecewise`` pair is
+    left as it is, for the reason :func:`_nondifferentiable_over` gives."""
+    try:
+        import sympy as sp
+    except ImportError:
+        return expr
+    twins = _step_bindings(sp)
+
+    def walk(node):
+        if isinstance(node, sp.Piecewise):
+            return sp.Piecewise(*[(walk(value), cond) for value, cond in node.args])
+        if not node.args:
+            return node
+        new_args = [walk(arg) for arg in node.args]
+        if any(n is not o for n, o in zip(new_args, node.args, strict=True)):
+            node = node.func(*new_args)
+        pair = twins.get(type(node).__name__)
+        if (
+            pair is not None
+            and len(node.args) == 1
+            and {str(s) for s in node.free_symbols} & targets
+        ):
+            return pair[1](*node.args)
+        return node
+
+    return walk(expr)
+
+
+def _finish_steps(deriv):
+    """After differentiation (issue #1128): each twin goes back to its call.
+
+    One ``has`` and at most one ``replace``, as in :func:`_finish_zero_bases`:
+    a ``replace`` per twin, asked of every derivative, cost BIOMD0000000628 1.7 s
+    of its 20 s derivation budget, on a model with no rounding call at all."""
+    try:
+        import sympy as sp
+    except ImportError:
+        return deriv
+    back = {twin: call for call, twin in _step_bindings(sp).values()}
+    if not deriv.has(*back):
+        return deriv
+    return deriv.replace(lambda n: type(n) in back, lambda n: back[type(n)](*n.args))
 
 
 # ─── Issue #541: a power whose base is exactly zero ────────────────────────
@@ -950,6 +1397,8 @@ def differentiate_rate_law(
     # Issue #507: an Abs over a differentiation variable gets a derivative the
     # emitters print (sign(a)·a'); Max / Min get theirs spelled after the fact.
     sym_expr = _prepare_kinks(sym_expr, targets)
+    # Issue #1128: a rounding call over the state is flat between its rooted steps.
+    sym_expr = _prepare_steps(sym_expr, targets)
     # Issue #541: a power with a zero base is a step in its exponent, not a nan.
     sym_expr = _prepare_zero_bases(sym_expr, targets, allowed - set(obs_alias) - {_TIME_SYM})
 
@@ -982,7 +1431,9 @@ def differentiate_rate_law(
             # GH #95: bail out of an over-budget derivation mid-rate-law so a
             # single law coupling many observables cannot blow the budget.
             raise _DerivationBudgetExceeded
-        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(alias))))
+        deriv = _finish_steps(
+            _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(alias))))
+        )
         if deriv == 0:
             continue
         reason = _non_emittable_reason(deriv)
@@ -2383,9 +2834,16 @@ def _folds_nonfinite(rewritten) -> bool:
     return bool(rewritten.has(sp.zoo, sp.oo, -sp.oo, sp.nan))
 
 
-def sympy_to_exprtk(expr) -> str | None:
+def sympy_to_exprtk(expr, *, rewrites: bool = True) -> str | None:
     """Emit a sympy expression as an ExprTk string, or ``None`` if it contains
-    a construct the emitter cannot represent."""
+    a construct the emitter cannot represent.
+
+    ``rewrites=False`` prints the expression as it stands, without
+    :func:`_emitter_rewrites`. Those are for a derivative about to be evaluated;
+    a rate law printed back for its consumers to parse and differentiate again
+    (:func:`_compact_inlined`) has to keep its own form, or a Hill term
+    ``S^n/(K^n + S^n)`` comes back as ``1/(K^n/S^n + 1)``, 0/0 at S = 0, and
+    its derivative there is NaN (issue #1124, item 5)."""
     try:
         import sympy as sp  # noqa: F401
     except ImportError:
@@ -2393,10 +2851,11 @@ def sympy_to_exprtk(expr) -> str | None:
     expr = _normalize_booleans(expr)
     if not _is_emittable(expr):
         return None
-    try:
-        expr = _emitter_rewrites(expr)
-    except Exception:
-        return None
+    if rewrites:
+        try:
+            expr = _emitter_rewrites(expr)
+        except Exception:
+            return None
     if _folds_nonfinite(expr):
         return None
     if not _printer_cache:
@@ -2707,7 +3166,24 @@ _UNSUPPORTED_EXPR_CONSTRUCTS: list[tuple[re.Pattern, str, bool]] = [
 _CONDITION_SAFE_CONSTRUCTS = frozenset({"floor()", "ceil()"})
 
 
-def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> str | None:
+# The constructs that bend a curve without breaking it (issue #1126). Their
+# derivative is a step, sign(a)·a' or a Heaviside, with no delta in it: a
+# delta appears only where the *value* jumps. So a sensitivity right-hand side
+# built from it is exact on both sides of a bend, and the sensitivity has no
+# jump to make up there, (f⁺ − f⁻)·dt*/dp being 0 for a continuous f.
+#
+# Only in a body made of bends alone, with no condition in it. Inside a
+# condition a bend makes crossings of its own, which the crossing gate does
+# not read: ``if(max(A − thr, 0) == 0, kb, 0)`` holds over an interval, and
+# taken on the analytic path it gave dY/dk = 0 for 2.46 with no error. The
+# sensitivity RHS asks for less still: no condition anywhere in the model
+# (``_FunctionalDfdpScope.bends_analytic``).
+_BEND_CONSTRUCTS = frozenset({"abs()", "min()", "max()"})
+
+
+def unsupported_expr_construct(
+    body: str, *, allow_conditions: bool = False, allow_bends: bool = False
+) -> str | None:
     """Return the reason a function body is unsupported for #198 output
     sensitivities, or ``None`` if no rejected construct is present.
 
@@ -2718,10 +3194,17 @@ def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> 
     rejected as before, because there it really is differentiated. Only a caller
     that has separately established the crossings are compensated may set it —
     see the table above.
+
+    ``allow_bends`` skips :data:`_BEND_CONSTRUCTS` in a body with no
+    conditional construct at all, for a caller that differentiates them through
+    :func:`_prepare_kinks` / :func:`_finish_kinks`.
     """
     spans: list[tuple[int, int]] | None = None
+    allow_bends = allow_bends and not has_condition_construct(body)
     for pat, name, conditional in _UNSUPPORTED_EXPR_CONSTRUCTS:
         if conditional and allow_conditions:
+            continue
+        if allow_bends and name in _BEND_CONSTRUCTS:
             continue
         if not pat.search(body):
             continue
@@ -2739,12 +3222,17 @@ def unsupported_expr_construct(body: str, *, allow_conditions: bool = False) -> 
     return None
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def has_condition_construct(body: str) -> bool:
     """True when *body* carries a construct from the conditional class.
 
     The cheap pre-check that decides whether a caller needs to build the
     switch-condition scope at all — same table, so it cannot drift from what
     ``allow_conditions`` actually waives.
+
+    Kept by text: the structural codegen key asks it of every function body on
+    each ``Simulator`` construction, which a solve per call on a fresh clone
+    paid in full every call (issue #919), and the answer is the text's alone.
     """
     return any(
         pat.search(body) for pat, _name, conditional in _UNSUPPORTED_EXPR_CONSTRUCTS if conditional
@@ -3700,7 +4188,16 @@ def attach_functional_jacobian(core) -> bool:
     if not rxns:
         return False  # no Functional reactions — Elementary path already handled
 
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law, differentiated through
+    # (issue #1124, item 7). Only a model whose functions read a rate pays for
+    # the reaction list.
+    rate_laws: dict[str, str] = {}
+    if any(_RATEOF_PREFIX in body for body in ctx["function_map"].values()):
+        try:
+            rate_laws = rateof_rate_laws(core.codegen_data())
+        except Exception as exc:  # the attach never raises; the laws then decline
+            logger.debug("GH#76 analytical Jacobian: no rate laws for rateOf (%s)", exc)
+    func_map = {**rate_laws, **dict(ctx["function_map"])}
     obs_groups = {name: [(int(si), float(f)) for si, f in grp] for name, grp in ctx["observables"]}
     obs_idx = {name: i for i, (name, _grp) in enumerate(ctx["observables"])}
     species_meta = {i: (bool(av), float(vf)) for i, (av, vf) in enumerate(ctx["species_meta"])}
