@@ -24,6 +24,10 @@ from bngsim import _codegen
 
 ANT = "species A, B; A = 10; B = 0; k1 = 1; k2 = 2*k1;\nR1: A -> B; k2*A*A\n"
 ANT_F = "species A, B; A = 10; B = 0; k1 = 1; k2 = 2*k1; F := k2*A;\nR1: A -> B; k2*A*A\n"
+KD = (
+    "species A, B; A = 10; B = 0; k1 = 1; k2 = 2*k1; kd = 0.1;\n"
+    "R1: A -> B; k2*A*A\nR2: A -> ; kd*A\n"
+)
 STEADY = "species A; A = 0; k1 = 1; kd = 0.5; k2 = 2*k1;\nJ0: -> A; k2\nJ1: A -> ; kd*A\n"
 CHAIN = "species C; C = 0; R0 = 1; Q = 3*R0; Rt = 2*Q\nJ0: -> C; Rt\n"
 NET = """begin parameters
@@ -268,6 +272,45 @@ def test_a_batch_row_that_attaches_one_again_runs_on_its_own_code():
     rows = _sim(model).run_batch(params=[{"k2": 2.0}, {"k2": 5.0}], **RUN)
     _close(_columns(rows[0]), ATTACHED)
     _close(_columns(rows[1]), PINNED_AT_5)
+
+
+def _decay(k2: float, kd: float, t: float = 1.0) -> tuple[float, list[float]]:
+    """A(t) and [dA/dk1, dA/dk2, dA/dkd] for ``A' = -k2*A*A - kd*A`` from
+    ``A(0) = 10`` with ``k2`` pinned: ``1/A = (1/10 + k2/kd)*exp(kd*t) - k2/kd``."""
+    e = np.exp(kd * t)
+    u = (0.1 + k2 / kd) * e - k2 / kd
+    du_dk2 = (e - 1.0) / kd
+    du_dkd = t * (0.1 + k2 / kd) * e - k2 * (e - 1.0) / kd**2
+    return 1.0 / u, [0.0, -du_dk2 / u**2, -du_dkd / u**2]
+
+
+@pytest.mark.parametrize("num_processors", [None, 2])
+def test_batch_rows_on_one_simulator_built_for_their_attachment_keep_their_own_values(
+    num_processors,
+):
+    """Both rows pin ``k2``, so both run on the one Simulator built for that
+    attachment (issue #961). The second row's ``kd`` is the model's 0.1. Cut
+    from the model that Simulator was built on, which holds the first row's
+    writes, it ran at ``kd = 1`` and returned the first row's A(1) = 0.1128
+    and columns for 0.1863."""
+    sim = _sim(_model(KD), ["k1", "k2", "kd"])
+    rows = sim.run_batch(
+        params=[{"kd": 1.0, "k2": 5.0}, {"k2": 5.0}], num_processors=num_processors, **RUN
+    )
+    for row, kd in zip(rows, (1.0, 0.1), strict=True):
+        a, columns = _decay(5.0, kd)
+        assert _a(row) == pytest.approx(a, rel=1e-8)
+        _close(_columns(row), columns)
+
+
+def test_a_batch_row_whose_write_is_the_expressions_value_only_at_another_rows_values():
+    """``{"k2": 6.0}`` pins ``k2``, where ``2*k1`` is 2. At the first row's
+    ``k1 = 3`` the same write is the expression's own value and attaches it, so
+    the row, cut from the model built for the first row, was refused (issue
+    #708)."""
+    rows = _sim(_model()).run_batch(params=[{"k1": 3.0, "k2": 5.0}, {"k2": 6.0}], **RUN)
+    _close(_columns(rows[0]), PINNED_AT_5)
+    _close(_columns(rows[1]), [0.0, _dk2(6.0)])
 
 
 def test_a_batch_on_a_model_pinned_after_the_simulator_was_built():

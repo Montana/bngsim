@@ -3272,9 +3272,8 @@ class Simulator:
             f"run_batch row {index} {' and '.join(what)}, which the requested column(s) "
             f"{upstream} reach the model through. The sensitivity code differentiates "
             "through a derived parameter while it follows its expression and not while "
-            "it is pinned, and every row of a batch runs on the code built for the model "
-            "as it stood when the batch began; those columns would be the other case's "
-            f"(issue #708). {self._ROW_REMEDY}"
+            "it is pinned, and the code this row was given was built for the other "
+            f"case; those columns would be that case's (issues #708, #961). {self._ROW_REMEDY}"
         )
 
     def _row_reads_another_build(self, clone: Model):
@@ -3328,6 +3327,11 @@ class Simulator:
         artifact (whether it holds the analytic columns, which expressions can
         be differentiated) is answered by that one. A row that writes no
         derived parameter is not cloned here.
+
+        That Simulator's model holds the writes of the first row of its group,
+        so each row is still cut from this Simulator's model
+        (:meth:`_run_single_batch`'s *model*): cut from that one, the next row
+        of the group ran at the first row's values.
         """
         core = self._model._core
         derived = {n for n, e in zip(core.param_names, core.param_expressions, strict=False) if e}
@@ -3339,7 +3343,10 @@ class Simulator:
             if not derived.intersection(pset):
                 continue
             clone = self._model.clone()
-            clone.set_params(pset)
+            try:
+                clone.set_params(pset)
+            except Exception:  # noqa: BLE001 - the row's own run raises it, as it did
+                continue
             if self._row_reads_another_build(clone) is None:
                 continue
             attached = _attachment(clone)
@@ -5435,6 +5442,7 @@ class Simulator:
                 steady_state=bool(steady_state),
                 steady_state_tol=ss_tol_value,
                 max_step=effective_max_step,
+                model=self._model,
             )
 
         if num_processors is not None and num_processors > 1:
@@ -6474,11 +6482,17 @@ class Simulator:
         steady_state: bool = False,
         steady_state_tol: float = 0.0,
         max_step: float | None = None,
+        model: Model | None = None,
     ) -> Result:
-        """Run a single simulation in a batch (thread-safe)."""
+        """Run a single simulation in a batch (thread-safe).
+
+        *model* is the batch's model, where this Simulator is one built for the
+        row's attachment (issue #961): its own model holds the writes of the
+        row it was built for, and a row cut from it ran at that row's values.
+        """
         from bngsim._bngsim_core import TimeSpec
 
-        clone = self._model.clone()
+        clone = (self._model if model is None else model).clone()
         clone.set_params(pset)
         clone.reset()
         self._raise_if_row_is_attached_otherwise(index, clone)
@@ -6516,7 +6530,9 @@ class Simulator:
                     opts.max_step_size = max_step
                 # GH #203 — the HPC contract: every batch row reuses the ONE
                 # compiled artifact this Simulator already prepared (large/codegen
-                # models would otherwise run interpreted per row, reusing nothing),
+                # models would otherwise run interpreted per row, reusing nothing;
+                # a row of another attachment is run by a Simulator built for it,
+                # issue #961),
                 # and a Simulator built with sensitivity_params yields the full
                 # per-row output-sensitivity tensor — mirroring single-shot run()
                 # (codegen + sensitivity option-building) so a θ-matrix batch and a
