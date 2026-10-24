@@ -86,6 +86,14 @@ compartment C0 = 1; k1 = 0.3;
 species P in C0 = 1; species S in C0 = 0;
 J1: P -> S; k1*P*C0;
 """
+# no rateOf, and a rule of the model's own named like a rate: it reads Q, not P's rate
+NAMED_LIKE_A_RATE = """
+compartment C0 = 1;
+species P in C0 = 1; species S in C0 = 0; species W in C0 = 2; species Q in C0 = 1;
+J1: P -> ; 0.3*P*W; JW: W -> ; 0.05*W;
+rate_of__P := 0.3*Q;
+J2: -> S; rate_of__P*Q;
+"""
 
 
 def _missing(core) -> list[tuple[int, int]]:
@@ -126,13 +134,22 @@ def test_a_model_with_no_rate_read_keeps_its_pattern():
     assert sp["nnz"] == 2
 
 
+def test_a_name_like_a_rate_reads_no_rate_where_the_model_reads_none():
+    model = bngsim.Model.from_antimony_string(NAMED_LIKE_A_RATE)
+    assert not model._core.uses_rateof
+    sp = model._core.jacobian_sparsity
+    assert _missing(model._core) == []
+    # (P,P), (P,W), (S,Q), (W,W), and not S on P's or W's
+    assert sp["nnz"] == 4
+
+
 @pytest.mark.skipif(not bngsim.HAS_KLU, reason="KLU not compiled")
 @pytest.mark.parametrize("name", list(MODELS))
 def test_the_sparse_route_steps_as_the_dense_one_does(name):
     """The colored finite-difference Jacobian is colored from the pattern. With
-    every entry in it, KLU's run is the dense finite-difference run to rounding,
-    step for step. Both runs ask for ``jacobian="fd"``: these models attach the
-    analytic Jacobian, which the dense run would otherwise take."""
+    every entry in it, KLU's run is the dense finite-difference run, step for
+    step. Both runs ask for ``jacobian="fd"``: these models attach the analytic
+    Jacobian, which the dense run would otherwise take."""
     runs = []
     for kw in (
         {"force_dense_linear_solver": True, "jacobian": "fd"},
@@ -143,6 +160,11 @@ def test_the_sparse_route_steps_as_the_dense_one_does(name):
     dense, klu = runs
     assert klu.solver_stats["linear_solver"] == 1  # LINEAR_SOLVER_KLU
     x_dense, x_klu = np.asarray(dense.species), np.asarray(klu.species)
-    # to rounding, against the largest value the run reaches
-    assert np.abs(x_klu - x_dense).max() <= 1e-12 * max(1.0, np.abs(x_dense).max())
+    # Against the largest value the run reaches. The two difference quotients
+    # take different increments (CVODE's own on the dense route), so the runs
+    # agree well inside the tolerance but not to rounding: at most 4e-14 at
+    # these settings, and up to 5e-11, or a step apart, at others (rtol 1e-7 to
+    # 1e-10, to t = 50). A missing entry costs 1.6e-10 on nested sizes, whose
+    # step count does not move.
+    assert np.abs(x_klu - x_dense).max() <= 1e-11 * max(1.0, np.abs(x_dense).max())
     assert klu.solver_stats["n_steps"] == dense.solver_stats["n_steps"]

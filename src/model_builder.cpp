@@ -880,6 +880,10 @@ std::vector<std::string> extract_ids(const std::string &expr) {
 // `tfun_<name>()` before this runs, so the index an observable- or
 // function-indexed table reads is no longer in the expression text; without
 // this map the species behind it drop out of the pattern (issue #781).
+//
+// `rateof_species_idx` maps each species name to its 0-based index where the
+// model registers the `rate_of__<species>` accessors (uses_rateof), and is
+// empty where it does not: there a `rate_of__` name is the model's own symbol.
 JacobianSparsity
 build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                    const std::vector<Observable> &observables,
@@ -887,7 +891,7 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                    const std::vector<Function> &functions,
                    const std::unordered_map<std::string, int> &func_name_to_idx,
                    const std::vector<Species> &species,
-                   const std::unordered_map<std::string, int> &species_name_to_idx,
+                   const std::unordered_map<std::string, int> &rateof_species_idx,
                    const std::unordered_map<std::string, std::string> &tfun_index_by_call) {
 
     if (n_species == 0)
@@ -946,9 +950,9 @@ build_jac_sparsity(const std::vector<Reaction> &reactions, int n_species,
                     func_direct_obs[fi].push_back(si_0);
             // A `rate_of__<species>` token reads that species' live rate (issue
             // #1239), under the name register_rateof_accessors binds it by.
-            if (id.rfind("rate_of__", 0) == 0) {
-                auto sit = species_name_to_idx.find(id.substr(sizeof("rate_of__") - 1));
-                if (sit != species_name_to_idx.end())
+            if (!rateof_species_idx.empty() && id.rfind("rate_of__", 0) == 0) {
+                auto sit = rateof_species_idx.find(id.substr(sizeof("rate_of__") - 1));
+                if (sit != rateof_species_idx.end())
                     func_direct_rateof[fi].push_back(sit->second);
             }
             auto fjt = func_name_to_idx.find(id);
@@ -2679,9 +2683,12 @@ NetworkModel ModelBuilder::build() {
     const int ns = static_cast<int>(impl.species.size());
     const int np = static_cast<int>(impl.parameters.size());
 
+    // A `rate_of__` name reads a rate only where the accessors are registered.
+    const std::unordered_map<std::string, int> no_rate_accessors;
     sd->jac_sparsity = build_jac_sparsity(
         sd->reactions, ns, impl.observables, sd->observable_name_to_idx, impl.functions,
-        sd->function_name_to_idx, impl.species, sd->species_name_to_idx, tfun_index_by_call);
+        sd->function_name_to_idx, impl.species,
+        impl.uses_rateof ? sd->species_name_to_idx : no_rate_accessors, tfun_index_by_call);
 
     sd->analytical_jac = build_anal_jac(sd->reactions, ns, np, sd->jac_sparsity, impl.species);
 
