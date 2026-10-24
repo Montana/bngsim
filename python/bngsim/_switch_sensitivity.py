@@ -37,6 +37,7 @@ import ast
 import bisect
 import contextlib
 import functools
+import itertools
 import logging
 import math
 import re
@@ -424,6 +425,44 @@ def _condition_spans(expr: str) -> list[tuple[int, int]]:
         cursor = open_paren + 1
 
 
+class _SpanIndex:
+    """Which character spans hold a match, answered by bisection (issue #1256).
+
+    ``contains(start, end)`` is ``any(lo <= start and end <= hi for lo, hi in
+    spans)``, and ``covers(start)`` is ``any(lo <= start < hi ...)``. Asked of
+    every match of a pattern against every ``if()`` condition span, as four
+    scans here did, that is a product of the two counts, and a rate law written
+    out through a diamond of rules holds thousands of both: 26.8 s of the 29 s
+    a sensitivity simulator for #1145's size jump took to build at 16 rules.
+
+    With the spans sorted by start and the furthest end of those so far kept
+    beside each, some span holds ``[start, end]`` exactly when, of the spans
+    that start at or before ``start``, the furthest end is at or after ``end``:
+    the same answer, in ``O(log n)``. (A match across two adjacent spans is in
+    their union, but in neither, and is not held: the furthest end belongs to
+    one span.)
+    """
+
+    __slots__ = ("_starts", "_furthest")
+
+    def __init__(self, spans) -> None:
+        ordered = sorted(spans)
+        self._starts = [lo for lo, _hi in ordered]
+        self._furthest = list(itertools.accumulate((hi for _lo, hi in ordered), max))
+
+    def _reach(self, start: int):
+        k = bisect.bisect_right(self._starts, start)
+        return self._furthest[k - 1] if k else None
+
+    def contains(self, start: int, end: int) -> bool:
+        far = self._reach(start)
+        return far is not None and far >= end
+
+    def covers(self, start: int) -> bool:
+        far = self._reach(start)
+        return far is not None and far > start
+
+
 def _condition_only_params(
     core,
     candidates: set[str],
@@ -517,10 +556,10 @@ def _condition_only_params(
             flat = _inline_derived_param_refs(body, exprs)
             if not flat:
                 continue
-            spans = _condition_spans(flat)
+            spans = _SpanIndex(_condition_spans(flat))
             for name in sorted(asking):
                 for m in pats[name].finditer(flat):
-                    if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans):
+                    if not spans.contains(m.start(), m.end()):
                         pure.discard(name)
                         break
         for text in constants:
@@ -6441,12 +6480,12 @@ def _iter_step_calls(
     *skip* are further spans of *expr* whose calls are not reported: the
     comparisons outside every ``if()`` that are conditions in their own right.
     """
-    spans = [*_condition_spans(expr), *skip]
+    spans = _SpanIndex([*_condition_spans(expr), *skip])
     covered = -1  # the close paren of the last call reported, under *outermost*
     for m in (pattern or _STEP_CALL).finditer(expr):
         if m.start() < covered:
             continue
-        if any(lo <= m.start() < hi for lo, hi in spans):
+        if spans.covers(m.start()):
             continue
         open_paren = m.end() - 1
         close_paren = _find_close_paren_strict(expr, open_paren)
@@ -8164,9 +8203,9 @@ def _compares_outside_an_if(text: str) -> bool:
     conditions reads those of an ``if()`` and does not find it."""
     if _SINGLE_EQUALS.search(text) or _TERNARY.search(text):
         return True
-    spans = _condition_spans(text)
+    spans = _SpanIndex(_condition_spans(text))
     return any(
-        not any(lo <= m.start() and m.end() <= hi for lo, hi in spans)
+        not spans.contains(m.start(), m.end())
         for pat in (_RELATIONAL, _LOGICAL, _NOT_OP, _NOT_CALL)
         for m in pat.finditer(text)
     )
@@ -9364,10 +9403,10 @@ def uncompensated_condition_reason(
     # carries no operator either pattern matches, so it was admitted, sympy
     # differentiated `~X` to a clean 1, and nothing warned. Both spellings now
     # land in the same class.
-    spans = _condition_spans(expr)
+    spans = _SpanIndex(_condition_spans(expr))
     for pat in (_RELATIONAL, _LOGICAL, _NOT_OP, _NOT_CALL):
         for m in pat.finditer(expr):
-            if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans):
+            if not spans.contains(m.start(), m.end()):
                 # `not(` is matched with its paren; report the operator alone.
                 op = m.group(0).rstrip("( \t")
                 return UncompensatedCrossingReason(
