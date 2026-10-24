@@ -55,73 +55,140 @@ def test_richardson_removes_the_h_squared_term():
     np.testing.assert_allclose(F.richardson(d_h, d_h2), true, rtol=1e-14)
 
 
-def _tensor(*columns):
-    """``(n_t, n_sp, n_p)`` from per-(species, parameter) time series, given as
-    ``columns[parameter][species]``."""
-    return np.stack([np.stack(c, axis=-1) for c in columns], axis=-1)
+def _column(*species):
+    """One parameter's column, ``(n_t, n_sp)``, from per-species time series."""
+    return np.stack(species, axis=-1)
 
 
 def test_step_disagreement_is_on_each_columns_own_scale():
     t = np.array([0.0, 1e-9, 10.0])
-    ref = _tensor([t])
+    ref = _column(t)
     assert F.step_disagreement(ref, ref, np.zeros_like(ref)) == 0.0
     # A cell near zero moving by 1e-9 is nothing on a column whose peak is 10.
-    gap = _tensor([np.array([0.0, 1e-9, 0.0])])
+    gap = _column(np.array([0.0, 1e-9, 0.0]))
     assert F.step_disagreement(ref, ref, gap) == pytest.approx(1e-10)
     # Noise: the two quotients of an unresolved column.
-    assert F.step_disagreement(ref, ref, _tensor([np.array([0.0, 6.0, 6.0])])) > 0.5
-    z = np.zeros((3, 1, 1))
+    assert F.step_disagreement(ref, ref, _column(np.array([0.0, 6.0, 6.0]))) > 0.5
+    z = np.zeros((3, 1))
     assert F.step_disagreement(z, z, z) == 0.0
 
 
 def test_step_disagreement_judges_each_species_as_the_verdict_does():
-    """The verdict judges each (species, parameter) column on its own peak, so the
-    gate does too. Species 1 peaks at 0.1, past differ's significance floor of
-    1e-3 of the tensor's 10, and its gap of 1e-3 is 1% of that; beside species
-    0, the parameter column's peak would read it as 1e-4."""
+    """The verdict judges each species of a parameter's column on its own peak,
+    so the gate does too. Species 1 peaks at 0.1, past differ's significance
+    floor of 1e-3 of the column's 10, and its gap of 1e-3 is 1% of that; beside
+    species 0, the column's peak would read it as 1e-4."""
     big, small = np.array([1.0, 5.0, 10.0]), np.array([0.02, 0.05, 0.1])
-    ref = _tensor([big, small])
-    gap = _tensor([np.zeros(3), np.array([0.0, 0.0, 1e-3])])
+    ref = _column(big, small)
+    gap = _column(np.zeros(3), np.array([0.0, 0.0, 1e-3]))
     assert F.step_disagreement(ref, ref, gap) == pytest.approx(1e-2)
     # A species under the significance floor is not one the verdict counts.
     tiny = np.array([0.0, 1e-6, 2e-6])
-    ref = _tensor([big, tiny])
-    gap = _tensor([np.zeros(3), np.array([0.0, 0.0, 2e-6])])
+    ref = _column(big, tiny)
+    gap = _column(np.zeros(3), np.array([0.0, 0.0, 2e-6]))
     assert F.step_disagreement(ref, ref, gap) == 0.0
 
 
 def test_step_disagreement_covers_the_columns_the_movement_gate_judges():
     """mm_tqssa_stiff's shape: dE/dE_0 = 1 holds still and sets the peak, so
-    differ's movement gate takes its scale from a column of 1e-12 noise, which
-    the peak test alone would skip, and fails it. The gate must see it first."""
+    differ's movement gate takes its scale from a species of 1e-12 noise, which
+    the peak test alone would skip, and fails it. The gate must see it first,
+    unless those cells are inside a noise floor the verdict forgives anyway."""
     still = np.ones(4)
     noise = np.array([0.0, -2.8e-12, 4.4e-12, 8.7e-18])
-    ref = _tensor([still, noise])
-    gap = _tensor([np.zeros(4), np.array([0.0, 2.1e-12, 3.3e-12, 6.6e-18])])
+    ref = _column(still, noise)
+    gap = _column(np.zeros(4), np.array([0.0, 2.1e-12, 3.3e-12, 6.6e-18]))
     assert F.step_disagreement(ref, ref, gap) > 0.5
+    settled = _column(np.zeros(4, bool), np.ones(4, bool))
+    assert F.step_disagreement(ref, ref, gap, settled) == 0.0
 
 
 def test_a_reference_that_is_not_finite_never_passes_the_gate():
-    ref = _tensor([np.array([1.0, np.nan, 2.0])])
+    ref = _column(np.array([1.0, np.nan, 2.0]))
     assert F.step_disagreement(ref, ref, np.zeros_like(ref)) == float("inf")
-    ok = _tensor([np.array([1.0, 2.0, 3.0])])
+    ok = _column(np.array([1.0, 2.0, 3.0]))
     assert F.step_disagreement(ok, ok, ref) == float("inf")
     # A non-finite analytic cell is the verdict's to fail, and sets no scale here.
-    bad = _tensor([np.array([1.0, np.inf, 3.0])])
+    bad = _column(np.array([1.0, np.inf, 3.0]))
     assert F.step_disagreement(bad, ok, np.zeros_like(ok)) == 0.0
 
 
 def test_only_columns_clearing_both_floors_are_judged():
-    # (n_t, n_sp, n_p): column 0 large, column 1 under the verdict's atol/|p|,
-    # column 2 over that but under the difference's own noise (a tiny parameter
-    # value makes a tiny step).
+    # (n_t, n_sp, n_p): column 0 large; column 1 under the verdict's atol/|p|;
+    # column 2 over that (1e-6 at p = 1e-4) but under the difference's own noise,
+    # 10·(1e-12·1e4)/(5e-8) = 2e-3, since a small parameter value makes a small step.
     analytic = np.zeros((3, 2, 3))
     analytic[..., 0] = 1.0
     analytic[..., 1] = 1e-12
     analytic[..., 2] = 1e-3
-    values = [2.0, 2.0, 1e-9]
+    values = [2.0, 2.0, 1e-4]
+    floors = F.asens.sens_resolution_floors(values, 1e-12)
+    assert floors[2] < 1e-3 < F.fd_noise_floor(1e4, 1e-4)
     judged = F.judgeable_columns(analytic, analytic, x_max=1e4, values=values, atol=1e-12)
     assert judged == [0]
+
+
+def _ramp(peak, n_t=21, n_sp=2):
+    """A column that rises to ``peak``, a little differently per species."""
+    t = np.linspace(0.0, 1.0, n_t)
+    return np.stack([peak * t ** (1 + k) for k in range(n_sp)], axis=-1)
+
+
+def test_each_column_is_judged_on_its_own_scale():
+    """A parameter whose sensitivities are 1e-9 of another's is still judged:
+    zeroing it is a DIFF. Through one tensor-wide scale it would PASS, as the
+    combined sens_verdict call shows."""
+    ref = np.stack([_ramp(1.0), _ramp(1e-9)], axis=-1)
+    wrong = ref.copy()
+    wrong[..., 1] = 0.0
+    gap = np.zeros_like(ref)
+    # Floors far under both columns: a tiny state scale and atol.
+    values, atol, x_max = [1.0, 1.0], 1e-30, 1e-12
+    assert F.fd_noise_floor(x_max, 1.0) < 1e-10
+    assert F.asens.sens_verdict(wrong, ref, param_values=values, atol=atol)["passed"]
+    verdicts = F.column_verdicts(wrong, ref, gap, x_max, values, atol, [0, 1])
+    assert verdicts[0]["passed"]
+    assert not verdicts[1]["passed"]
+
+
+def test_a_tensor_under_the_underflow_floor_is_still_judged():
+    """nanomolar_dimer's shape: sensitivities near 1e-20, every cell under
+    differ's absolute 1e-12 underflow floor. Scaled to its own peak, a negated
+    column fails."""
+    ref = _ramp(6e-20)[..., np.newaxis]
+    # kdis = 4e9 on a 1.5e-9 state scale: its difference resolves 5e-22.
+    assert F.fd_noise_floor(1.5e-9, 4e9) < 1e-21
+    verdicts = F.column_verdicts(-ref, ref, np.zeros_like(ref), 1.5e-9, [4e9], 1e-40, [0])
+    assert not verdicts[0]["passed"]
+
+
+def test_a_difference_inside_the_references_noise_is_not_blamed():
+    """mm_tqssa_stiff's E_0 column: dE/dE_0 = 1 holds still, and the other
+    species' true sensitivity is ~1e-16, which the difference reads as ~4e-12 of
+    noise, inside its 2e-11 floor at E_0 = 9000 on a state scale of 9000.
+    Without that floor, differ's movement gate takes those species as the ones
+    that move and fails them."""
+    still = np.ones(4)
+    analytic = _column(still, np.array([0.0, -6.6e-16, -1.8e-16, -1e-22]))[..., np.newaxis]
+    reference = _column(still, np.array([0.0, -2.8e-12, 4.4e-12, 8.7e-18]))[..., np.newaxis]
+    gap = np.zeros_like(reference)
+    assert F.fd_noise_floor(9000.0, 9000.0) > 4.4e-12
+    assert F.column_verdicts(analytic, reference, gap, 9000.0, [9000.0], 1e-30, [0])[0]["passed"]
+    bare = F.asens.sens_verdict(analytic, reference, param_values=[9000.0], atol=1e-30)
+    assert not bare["passed"]
+
+
+def test_a_difference_inside_the_references_own_error_is_not_blamed():
+    """The analytic column 2% off the difference, everywhere: a DIFF when the
+    reference is sure of itself, forgiven when its two steps are 1% apart, since
+    3x that gap covers the 2%. The gate, not the verdict, decides whether a
+    reference that unsure can stand."""
+    ref = _ramp(1.0)[..., np.newaxis]
+    analytic = 1.02 * ref
+    sure = np.zeros_like(ref)
+    unsure = 0.01 * np.abs(ref)
+    assert not F.column_verdicts(analytic, ref, sure, 1.0, [1.0], 1e-30, [0])[0]["passed"]
+    assert F.column_verdicts(analytic, ref, unsure, 1.0, [1.0], 1e-30, [0])[0]["passed"]
 
 
 def test_a_column_either_side_resolves_is_judged():
@@ -197,8 +264,8 @@ def test_a_wrong_column_is_a_diff(spec, monkeypatch):
     """The reference 5% off in one column: the verdict says DIFF."""
     real = F.fd_tensor
 
-    def off(path, params, values, job):
-        ref, dis = real(path, params, values, job)
+    def off(path, params, values, job, deadline=None):
+        ref, dis = real(path, params, values, job, deadline)
         ref = ref.copy()
         ref[..., 1] *= 1.05
         return ref, dis
@@ -210,12 +277,17 @@ def test_a_wrong_column_is_a_diff(spec, monkeypatch):
 
 
 def test_an_unconverged_reference_is_refused_not_blamed(spec, monkeypatch):
+    """A reference lost in its step's noise: off by a third of its peak, its two
+    steps half a peak apart. BAD_TEST, not a DIFF."""
     real = F.fd_tensor
 
-    def noisy(path, params, values, job):
-        ref, gap = real(path, params, values, job)
-        gap = gap.copy()
-        gap[..., 0] = 0.5 * np.abs(ref[..., 0]).max()
+    def noisy(path, params, values, job, deadline=None):
+        ref, gap = real(path, params, values, job, deadline)
+        ref, gap = ref.copy(), gap.copy()
+        peak = np.abs(ref[..., 0]).max()
+        sign = np.where(np.arange(ref.shape[0]) % 2, 1.0, -1.0)[:, np.newaxis]
+        ref[..., 0] += sign * peak / 3.0
+        gap[..., 0] = 0.5 * peak
         return ref, gap
 
     monkeypatch.setattr(F, "fd_tensor", noisy)
@@ -227,8 +299,8 @@ def test_an_unconverged_reference_is_refused_not_blamed(spec, monkeypatch):
 def test_a_reference_that_is_not_finite_is_refused_not_blamed(spec, monkeypatch):
     real = F.fd_tensor
 
-    def broken(path, params, values, job):
-        ref, gap = real(path, params, values, job)
+    def broken(path, params, values, job, deadline=None):
+        ref, gap = real(path, params, values, job, deadline)
         ref = ref.copy()
         ref[3, 0, 1] = np.nan
         return ref, gap
@@ -239,8 +311,16 @@ def test_a_reference_that_is_not_finite_is_refused_not_blamed(spec, monkeypatch)
     assert "not finite" in res["why"]
 
 
+def test_a_reference_too_slow_for_the_cap_is_the_references_failure(spec):
+    """The analytic run finishes, then the plain runs would not fit in the cap:
+    REFERENCE_FAILED, not a TIMEOUT scored against bngsim."""
+    res = _worker({**spec, "timeout": 1e-6})
+    assert res["status"] == "reference_failed", res
+    assert "past the job's cap" in res["exception"]
+
+
 def test_a_plain_run_that_raises_is_the_references_failure(spec, monkeypatch):
-    def fails(path, params, values, job):
+    def fails(path, params, values, job, deadline=None):
         raise RuntimeError("CVODE: too much work")
 
     monkeypatch.setattr(F, "fd_tensor", fails)
@@ -294,6 +374,36 @@ def test_an_analytic_column_wrong_toward_zero_is_a_diff(spec, monkeypatch, wrong
     res = _worker(spec)
     assert res["status"] == "diff", res
     assert res["n_columns_judged"] == 3, res
+
+
+def test_a_declined_analytic_rhs_is_named_and_alerts(spec, monkeypatch):
+    """A model on CVODES' difference quotient compares a difference with a
+    difference. The row says so, and its backend fails --expect-backend cc."""
+    import bngsim
+
+    real = bngsim.Simulator
+
+    class Simulator(real):
+        has_analytic_sens_rhs = False
+        sens_rhs_decline_reason = "uses unsupported construct: test"
+
+    monkeypatch.setattr(bngsim, "Simulator", Simulator)
+    res = _worker(spec)
+    bn = res["timing"]["bngsim"]
+    assert bn["backend"] == "cc+dq"
+    assert bn["config"]["sens_rhs"] == "difference_quotient"
+    assert "unsupported construct" in res["sens_rhs_decline_reason"]
+    verdicts = _load_verdicts()
+    row = F.to_result({"model_id": "m", "sens_method": "staggered"}, res, {}).to_dict()
+    assert verdicts._core_backend(row) == "cc+dq"
+
+
+def _load_verdicts():
+    path = _FD.parent / "nightly" / "verdicts.py"
+    spec = importlib.util.spec_from_file_location("nightly_verdicts", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_the_manifest_names_tracked_models_and_why_some_are_left_out():

@@ -20,7 +20,7 @@ name: nightly-parity
 #   amici-sens   AMICI forward sensitivities      48 of the 50 curated BioModels x 2 methods
 #   rr-ssa       libRoadRunner gillespie          the 269 of the 306 SSA-screen BioModels
 #                                                 candidates the corpus holds (#806)
-#   fd-sens      central differences of bngsim's  44 committed .net models x 2 methods: the
+#   fd-sens      central differences of bngsim's  45 committed .net models x 2 methods: the
 #                own trajectories                 only sensitivity oracle a .net model has,
 #                                                 and one independent of AMICI (#804)
 #
