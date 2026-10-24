@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import _core
+import bngsim
 import numpy as np
 import pytest
 
@@ -332,6 +333,91 @@ def test_analyze_keeps_incomplete_and_sweepless_rows_out_of_degenerate(tmp_path,
 
 
 # --------------------------------------------------------------------------- #
+# Issue #538 — the rows say why a model is on finite differences, and the census
+# counts them by that.
+# --------------------------------------------------------------------------- #
+def test_analyze_counts_finite_difference_rows_by_decline_kind(tmp_path, capsys):
+    rows = [
+        _row("analytical", **_swept(1.0, 10.0)),
+        _row(
+            "fd_a",
+            method="finite_difference",
+            complete=False,
+            jacobian_decline_kind="fd_mismatch",
+            **_swept(1.0, 10.0),
+        ),
+        _row(
+            "fd_b",
+            method="finite_difference",
+            complete=False,
+            jacobian_decline_kind="fd_mismatch",
+            **_swept(1.0, 10.0),
+        ),
+        _row(
+            "fd_c",
+            method="finite_difference",
+            complete=False,
+            jacobian_decline_kind="budget",
+            **_swept(1.0, 10.0),
+        ),
+        # a report from before the field: no kind recorded, which is not the model's
+        # own "unrecorded"
+        _row("fd_old", method="finite_difference", complete=False, **_swept(1.0, 10.0)),
+    ]
+    cp = tmp_path / "char.json"
+    cp.write_text(json.dumps({"results": rows}))
+    out = J.analyze(cp, None, None, horizons_path=tmp_path / "missing.json")
+    assert out["jacobian_declines"] == {
+        "fd_mismatch": ["fd_a", "fd_b"],
+        "budget": ["fd_c"],
+        "not_in_report": ["fd_old"],
+    }
+    assert out["summary"]["jacobian_decline_kind"] == {
+        "fd_mismatch": 2,
+        "budget": 1,
+        "not_in_report": 1,
+    }
+    printed = capsys.readouterr().out
+    assert "finite-difference rows by decline kind" in printed and "fd_mismatch" in printed
+
+
+_NET_MRATIO = """begin parameters
+    1 k 0.7
+end parameters
+begin species
+    1 A() 1.0
+    2 B() 0.0
+end species
+begin functions
+    1 f() k*mratio(A_tot, 1, 2)
+end functions
+begin reactions
+    1 1 2 f
+end reactions
+begin groups
+    1 A_tot 1
+    2 B_tot 2
+end groups
+"""
+
+
+def test_jacobian_evaluators_record_the_status_and_the_decline_kind(tmp_path):
+    p = tmp_path / "m.net"
+    p.write_text(_NET_MRATIO)
+    _, _, fields = J.jacobian_evaluators(bngsim.Model.from_net(str(p)))
+    assert fields["jacobian_method"] == "finite_difference"
+    assert fields["jacobian_decline_kind"] == "non_emittable"
+    assert fields["analytical_jacobian_status"].startswith("declined: the derivative")
+    _, _, fields = J.jacobian_evaluators(
+        bngsim.Model.from_net(
+            str(Path(__file__).resolve().parents[2] / "tests/data/simple_decay.net")
+        )
+    )
+    assert fields["jacobian_decline_kind"] is None
+    assert fields["analytical_jacobian_status"] == "complete"
+
+
+# --------------------------------------------------------------------------- #
 # Issue #508 — the corpus model, end to end (the vendored SBML is gitignored; skip
 # where it has not been materialized).
 # --------------------------------------------------------------------------- #
@@ -370,6 +456,11 @@ def test_characterize_model_without_a_gate_horizon_is_density_only():
     assert row["status"] == "ok_density_only" and "no horizon" in row["detail"]
     assert row["run"] is None and row["gate_outcome"] is None
     assert row["jacobian_method"] in ("native_analytical", "finite_difference")
+    # Issue #538: why, beside which.
+    assert (row["jacobian_decline_kind"] is None) == (
+        row["jacobian_method"] == "native_analytical"
+    )
+    assert row["analytical_jacobian_status"] != "pending"
     assert 0 < row["density"] <= 1 and "stiffness_ratio_max" not in row
 
 

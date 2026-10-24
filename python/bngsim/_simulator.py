@@ -2202,6 +2202,9 @@ class Simulator:
         model = model if model is not None else self._model
         if sensitivities is None:
             sensitivities = bool(self._sensitivity_params or self._sensitivity_ic)
+        from bngsim._switch_sensitivity import say_what_was_read
+
+        say_what_was_read(False)  # what a run that never took its stops left
         conditions = model.time_discontinuity_conditions()
         # A table function read on the clock breaks at its breakpoints whether
         # or not any condition names it (issue #709).
@@ -2233,6 +2236,19 @@ class Simulator:
                 # high where main, its stops a double early, was 4% (at 1e-4 and
                 # tighter the moved stops were the more accurate in every case).
                 on_the_flip=not sensitivities and float(opts.rtol) <= _FLIP_LOOSEST_RTOL,
+                # Issue #1226: looser, a double before the change. The step
+                # that ends on a stop reads the rate at its end, and where the
+                # tolerance lets it span a stretch, on the change it was taken
+                # at the next stretch's rate: `if(mod(time(), 24) < 1, 1, 0)`
+                # over 1,000 days was 14,627 for 1,000 at rtol 1e-2. A double
+                # earlier it is exact to rounding at every tolerance; tighter
+                # than this, where the step fails on the jump and the run walks
+                # the stretch before it, that walk finds a pulse inside the
+                # stretch that a step from the double before would not.
+                before_the_flip=not sensitivities and float(opts.rtol) > _FLIP_LOOSEST_RTOL,
+                # Issue #1018: a law on a line far from zero that the scan
+                # refuses or leaves alone is read tread by tread.
+                by_tread=not sensitivities,
             )
             knots = (
                 table_function_stops(model._core, float(t_start), float(t_end), table_breaks)
@@ -2294,6 +2310,7 @@ class Simulator:
                 and model._core.n_events == 0
             )
             self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+        say_what_was_read(True)
         return conditions
 
     @staticmethod
@@ -2431,6 +2448,23 @@ class Simulator:
             )
 
         for item in over_budget:
+            if item.legs is not None:
+                # Read tread by tread (issue #1018), whatever step bound is
+                # passed: the law has a stop on each change or the run is
+                # refused. A bound in their place left `100*mod(1e12 + time(),
+                # 12u)` 0.4% off at the default tolerances, and 4.5% from
+                # X(0) = 1e4, where in legs that fit it is exact to rounding.
+                from bngsim._switch_sensitivity import _three_places_down
+
+                raise SimulationError(
+                    f"The rate law switches on {item.condition!r}, which, read once on each "
+                    "stretch of time its argument holds one double (issue #1018), changes "
+                    f"{item.changes} times between t={t_start!r} and t={t_end!r}. A run places "
+                    "at most 1,000,000 stops with its other switches, and without a stop on "
+                    "each change a step bound in their place need not keep the answer within "
+                    f"the tolerance. Run it in legs of {_three_places_down(item.legs)} or "
+                    "shorter (run_until): each then has a stop on every change."
+                )
             if item.flicker is not None:
                 # Whatever step bound is passed. One no wider than half the
                 # shortest stretch between two switches would stand for the
@@ -3221,18 +3255,52 @@ class Simulator:
         is also what a row's other refusals are decided by, so a row is not
         given one of its own; it is refused, and the message says how to run it.
 
+        A backstop since issue #961: :meth:`run_batch` gives such a row a
+        Simulator built for its attachment before the rows are dispatched
+        (:meth:`_runners_for_attachments`), and that one's artifact is built
+        for the row.
+
         Refused only where a requested column is of a parameter the changed one
         reads, directly or through others: its own column and the others are
         the same code either way. Asked only where a parameter's column is
         requested at all.
         """
+        found = self._row_reads_another_build(clone)
+        if found is None:
+            return
+        changed, upstream, now_attached, names = found
+        pinned = [n for n in changed if not now_attached[names.index(n)]]
+        attached = [n for n in changed if now_attached[names.index(n)]]
+        what = []
+        if pinned:
+            what.append(f"overrides the derived parameter(s) {pinned}")
+        if attached:
+            what.append(
+                f"writes {attached} back to the value of its expression, which attaches it"
+            )
+        raise SensitivityUnsupportedError(
+            f"run_batch row {index} {' and '.join(what)}, which the requested column(s) "
+            f"{upstream} reach the model through. The sensitivity code differentiates "
+            "through a derived parameter while it follows its expression and not while "
+            "it is pinned, and the code this row was given was built for the other "
+            f"case; those columns would be that case's (issues #708, #961). {self._ROW_REMEDY}"
+        )
+
+    def _row_reads_another_build(self, clone: Model):
+        """Whether a batch row's *clone* needs other sensitivity code than the
+        artifact this Simulator holds (issue #708): where its writes pin or
+        re-attach a derived parameter that a requested column reaches the model
+        through. ``(changed, upstream, attached, names)`` where it does, else
+        ``None``. A requested column of a parameter the changed one reads,
+        directly or through others, is the one whose code differs; its own
+        column and the others are the same code either way."""
         built = self._codegen_attachment
         if built is None or not (self._codegen_so_path or self._codegen_c_source):
-            return
+            return None
         was_attached = built[0]
         now_attached = _attachment(clone)
         if now_attached == was_attached:
-            return
+            return None
         core = clone._core
         names = list(core.param_names)
         changed = [
@@ -3249,24 +3317,81 @@ class Simulator:
                     pending.append(name)
         upstream = [p for p in self._sensitivity_params if p in reads]
         if not upstream:
-            return
-        pinned = [n for n in changed if not now_attached[names.index(n)]]
-        attached = [n for n in changed if now_attached[names.index(n)]]
-        what = []
-        if pinned:
-            what.append(f"overrides the derived parameter(s) {pinned}")
-        if attached:
-            what.append(
-                f"writes {attached} back to the value of its expression, which attaches it"
+            return None
+        return changed, upstream, now_attached, names
+
+    def _runners_for_attachments(
+        self, params: Sequence[dict[str, float]], t_span: tuple[float, float]
+    ) -> dict[int, Simulator]:
+        """For each batch row whose writes need other sensitivity code than the
+        batch's artifact, the Simulator that runs it (issue #961).
+
+        Every row of a batch ran on the one artifact this Simulator holds, and
+        a row that pinned or re-attached a derived parameter a requested column
+        reaches the model through was refused (issue #708): ``{"k2": 5.0}`` over
+        ``k2 = 2*k1`` with a column of ``k1``. Rows are grouped here, before any
+        is dispatched, by which parameters their writes leave attached, and
+        each group that needs it is given a Simulator of its own, built for a
+        clone with the group's attachment and this Simulator's settings. Its
+        artifact is the code that row needs, and what a row asks of its
+        artifact (whether it holds the analytic columns, which expressions can
+        be differentiated) is answered by that one. A row that writes no
+        derived parameter is not cloned here.
+
+        That Simulator's model holds the writes of the first row of its group,
+        so each row is still cut from this Simulator's model
+        (:meth:`_run_single_batch`'s *model*): cut from that one, the next row
+        of the group ran at the first row's values.
+        """
+        core = self._model._core
+        derived = {n for n, e in zip(core.param_names, core.param_expressions, strict=False) if e}
+        if not derived:
+            return {}
+        runners: dict[tuple[bool, ...], Simulator] = {}
+        runner_of: dict[int, Simulator] = {}
+        for index, pset in enumerate(params):
+            if not derived.intersection(pset):
+                continue
+            clone = self._model.clone()
+            try:
+                clone.set_params(pset)
+            except Exception:  # noqa: BLE001 - the row's own run raises it, as it did
+                continue
+            if self._row_reads_another_build(clone) is None:
+                continue
+            attached = _attachment(clone)
+            runner = runners.get(attached)
+            if runner is None:
+                runner = Simulator(
+                    clone,
+                    method=self._method,
+                    jacobian=self._jacobian,
+                    force_dense_linear_solver=self._force_dense_linear_solver,
+                    force_sparse_linear_solver=self._force_sparse_linear_solver,
+                    codegen=self._codegen,
+                    sensitivity_params=list(self._sensitivity_params) or None,
+                    sensitivity_ic=list(self._sensitivity_ic) or None,
+                    sensitivity_method=self._sensitivity_method,
+                )
+                # A clone carries the artifact the model holds, built for the
+                # batch's attachment, and a Simulator built on it takes it up;
+                # it is built again here for the clone's own.
+                runner._rebuild_codegen_if_reattached()
+                runner._sync_codegen_with_the_conditions(t_span, runner._sensitivity_params)
+                runner._model._state_switch_roots_beside(
+                    runner._model.time_discontinuity_conditions()
+                )
+                runners[attached] = runner
+            runner_of[index] = runner
+        if runners:
+            logger.info(
+                "run_batch: %d row(s) pin or re-attach a derived parameter a requested "
+                "column reaches the model through; built sensitivity code for %d other "
+                "attachment(s) (issue #961).",
+                len(runner_of),
+                len(runners),
             )
-        raise SensitivityUnsupportedError(
-            f"run_batch row {index} {' and '.join(what)}, which the requested column(s) "
-            f"{upstream} reach the model through. The sensitivity code differentiates "
-            "through a derived parameter while it follows its expression and not while "
-            "it is pinned, and every row of a batch runs on the code built for the model "
-            "as it stood when the batch began; those columns would be the other case's "
-            f"(issue #708). {self._ROW_REMEDY}"
-        )
+        return runner_of
 
     def _rebuild_codegen_if_reattached(self) -> None:
         """Build the sensitivity code again where the model is no longer what
@@ -4392,17 +4517,43 @@ class Simulator:
             )
         return vec
 
-    def _steady_state_atol(self, atol: AtolLike | None, criterion: str) -> AtolLike | None:
-        """The march's ``atol`` for a steady-state solve (issue #1001).
+    def _steady_state_atol(
+        self, atol: AtolLike | None, criterion: str, state=None, rtol: float | None = None
+    ) -> AtolLike | None:
+        """The march's ``atol`` for a steady-state solve, which under
+        ``criterion="scaled"`` is also the run test's (issue #1001).
 
-        Under ``criterion="scaled"`` a state is accepted within each species'
-        own tolerance, the one ``atol="auto"`` derives; a march at the scalar
-        default of 1e-8 cannot reach that for a model in small units (it runs
-        through zero first), so where neither the call nor
-        :meth:`set_tolerances` gave an ``atol`` the march takes ``"auto"``.
+        Where neither the call nor :meth:`set_tolerances` gave an ``atol``, each
+        species takes the smaller of what ``atol="auto"`` derives from ``state``
+        and the scalar default. The scalar is no tolerance for a model in small
+        units (the issue's cubic at a scale of 1e-9 ran through zero), and
+        ``"auto"`` alone none for a species that starts large and settles
+        small: one decaying from 1e7 to 7e-4 was held to 0.1. ``"auto"``'s floor
+        here is the smallest species the state holds that is not ``$``-fixed,
+        but not under double precision's resolution beside the largest: a
+        species a run left at 1e-22, or one declared at -1.6e-34
+        (MODEL2307110001), held every other at 0 to that, and its march
+        failed. Where every species not ``$``-fixed starts at 0, ``"auto"``
+        takes its own floor from every species, a ``$``-fixed one too (a
+        ``$Src`` at 1e-12 holds the rest to 1e-20). Where every species takes
+        the scalar it is passed as the scalar, whose march is the residual
+        criterion's: as a vector of equal entries, BIOMD0000000252's stalled.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
-            return "auto"
+            eff_rtol = self._rtol if rtol is None else rtol
+            values = np.abs(np.asarray(state, dtype=float))
+            free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
+            largest = float(free.max(initial=0.0))
+            positive = free[free > 0.0]
+            floor = (
+                max(float(positive.min()), float(np.finfo(float).eps) * largest)
+                if positive.size
+                else None
+            )
+            own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
+            if np.all(own == self._atol):
+                return None
+            return [float(v) for v in own]
         return atol
 
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
@@ -5280,9 +5431,15 @@ class Simulator:
             # share the answer through the memo a clone shares with its parent.
             self._model._state_switch_roots_beside(self._model.time_discontinuity_conditions())
 
+        # Issue #961: a row whose writes need other sensitivity code runs on a
+        # Simulator built for it, made here before any row is dispatched.
+        runner_of: dict[int, Simulator] = {}
+        if self._method == "ode" and (self._sensitivity_params or self._sensitivity_ic):
+            runner_of = self._runners_for_attachments(params, t_span)
+
         def _run_one(i: int) -> Result:
             """Run simulation i (thread-safe, GIL released)."""
-            return self._run_single_batch(
+            return runner_of.get(i, self)._run_single_batch(
                 i,
                 params[i],
                 t_span,
@@ -5295,6 +5452,7 @@ class Simulator:
                 steady_state=bool(steady_state),
                 steady_state_tol=ss_tol_value,
                 max_step=effective_max_step,
+                model=self._model,
             )
 
         if num_processors is not None and num_processors > 1:
@@ -6334,11 +6492,17 @@ class Simulator:
         steady_state: bool = False,
         steady_state_tol: float = 0.0,
         max_step: float | None = None,
+        model: Model | None = None,
     ) -> Result:
-        """Run a single simulation in a batch (thread-safe)."""
+        """Run a single simulation in a batch (thread-safe).
+
+        *model* is the batch's model, where this Simulator is one built for the
+        row's attachment (issue #961): its own model holds the writes of the
+        row it was built for, and a row cut from it ran at that row's values.
+        """
         from bngsim._bngsim_core import TimeSpec
 
-        clone = self._model.clone()
+        clone = (self._model if model is None else model).clone()
         clone.set_params(pset)
         clone.reset()
         self._raise_if_row_is_attached_otherwise(index, clone)
@@ -6376,7 +6540,9 @@ class Simulator:
                     opts.max_step_size = max_step
                 # GH #203 — the HPC contract: every batch row reuses the ONE
                 # compiled artifact this Simulator already prepared (large/codegen
-                # models would otherwise run interpreted per row, reusing nothing),
+                # models would otherwise run interpreted per row, reusing nothing;
+                # a row of another attachment is run by a Simulator built for it,
+                # issue #961),
                 # and a Simulator built with sensitivity_params yields the full
                 # per-row output-sensitivity tensor — mirroring single-shot run()
                 # (codegen + sensitivity option-building) so a θ-matrix batch and a
@@ -7331,7 +7497,7 @@ class Simulator:
         max_steps=None,
         sensitivity_params=None,
         mask=None,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Find the steady state of the ODE system f(y) = 0.
 
@@ -7343,9 +7509,9 @@ class Simulator:
 
         Solver methods:
 
-        - ``"integration"`` (default): CVODE BDF integrated until the BNG2.pl
-          parity criterion ``||f(y)||_2 / n_species < tol``
-          (``run_network -c``).
+        - ``"integration"`` (default): CVODE BDF integrated until ``criterion``
+          is met (by default ``"scaled"``; ``"residual"`` is BNG2.pl's
+          ``||f(y)||_2 / n_species < tol``, ``run_network -c``).
         - ``"newton"``: two-tier integrate-first solver. The *same* CVODE burst
           carries the state into the physical root's basin, then KINSOL
           polishes. The polish is accepted only once it is *seed-stable*
@@ -7387,54 +7553,62 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
-            Under ``criterion="scaled"`` it is read only above 512 unknowns,
-            where that criterion falls back to it.
+            Both criteria ask it.
         criterion : str
             What ``converged`` asks of a state (issue #1001).
 
-            - ``"residual"`` (default): ``||f(y)||_2 / n_species < tol``, the
-              BNG2.pl parity test. The norm is in the model's units of
-              concentration per unit time, so a model in molar units, or a
-              slow one, passes it far from its steady state.
-            - ``"scaled"``: the Newton step ``δ = −J⁻¹f`` from the state to
-              the root is within every species' own tolerance,
-              ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-              rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration of a
-              species that is not ``$``-fixed; where none starts above 0, the
-              largest species of the state or of the root it steps to). Units
-              do not change the answer. A state where the reduced Jacobian is
-              singular is not accepted unless ``f`` is 0 there, nor one where
-              a differenced Jacobian straddles a jump in a rate law. ``mask``
-              says which species are measured, not which move: the step moves
-              every species by its own equation but a ``$``-fixed one and a
-              masked one that nothing reads or that reads nothing (a counter),
-              which is held. A species that
-              starts at 0 is held to ``rtol`` times the floor, so one whose
-              steady state is smaller than that is within tolerance of 0, as
-              under ``atol="auto"``. Above
-              512 unknowns the step is not taken, the solve is the residual
-              one, and :attr:`SteadyStateResult.criterion` says
-              ``"residual"``. Where neither ``atol``
-              nor :meth:`set_tolerances` gives one, the march takes
-              ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
-              small units.
+            - ``"scaled"`` (default): the parity test,
+              ``||f(y)||_2 / n_species < tol``, and the run test. A run taken
+              on from the state for ``max_time`` (at most 1e6) moves no species
+              by more than ``rtol·|y_i| + atol_i``: what tells a state the
+              system rests at from one under ``tol`` that a run leaves (a model
+              in small units, or a slow one). An unstable root that a run from
+              it does not leave passes (the cubic's 0.3); on the Newton path
+              :attr:`SteadyStateResult.root_stability` says so. ``atol_i`` is
+              the march's own, never more than
+              ``rtol`` times the largest species the solve starts with or
+              reaches. The Newton step ``δ = −J⁻¹f`` from the state to the
+              root, within the same tolerances, decides where the solve stops
+              (up to 512 unknowns), which takes the issue's cubic at a scale
+              of 1e-9 on from 0.894 to its root at 1, and the state it stops at
+              is polished by KINSOL; the step decides nothing about
+              ``converged``. ``mask`` says which species are measured, not
+              which move: the step moves every species but a ``$``-fixed one
+              and a masked one that nothing reads or that reads nothing (a
+              counter), which is held; the run moves every species but a
+              ``$``-fixed one. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, each species is marched at
+              the smaller of what ``atol="auto"`` gives it and the scalar
+              1e-8: the scalar is no tolerance for a model in small units, nor
+              ``"auto"`` for a species that starts large and settles small.
+            - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test
+              alone, kept for comparisons with ``run_network``. The norm is in
+              the model's units of concentration per unit time, so a model in
+              molar units, or a slow one, passes it far from its steady state:
+              the cubic ``X' = -k·x·(x - 0.3)·(x - 1)`` at a scale of 1e-9 came
+              back ``converged=True`` at x = 0.894, 1.003 and 0.131 after one
+              step, where every run ends at 1.
 
-            Under ``"scaled"`` the step is reported as
+            Under ``"scaled"`` the run test and the step are reported as
+            :attr:`SteadyStateResult.continued_run_distance` and
             :attr:`SteadyStateResult.newton_distance`.
         max_time : float
-            Max integration time for the integration path. Default 1e6.
+            Max integration time for the integration path, and how long the
+            run of ``criterion="scaled"``'s run test is taken on for, up to
+            1e6. Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
         rtol : float, optional
-            Relative tolerance for the CVODE march. Default ``1e-8``.
+            Relative tolerance for the CVODE march, and under
+            ``criterion="scaled"`` for the run test. Default ``1e-8``.
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the CVODE march — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
             :meth:`run` for the contract. This is the accuracy the march is
-            held to on the way to the root; ``tol`` above is the separate test
-            for having arrived, and stays a single norm over all species.
+            held to on the way to the root, and under ``criterion="scaled"``
+            the run test's; ``tol`` above is the separate test for having
+            arrived, a single norm over all species.
         max_steps : int, optional
             Max CVODE internal steps per output point.
         sensitivity_params : list[str], optional
@@ -7577,7 +7751,9 @@ class Simulator:
         opts.rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — scalar, per-species, or tracking for the march.
         self._resolve_atol(
-            self._steady_state_atol(atol, criterion), opts.rtol, where="steady_state(atol=...)"
+            self._steady_state_atol(atol, criterion, self._model.get_state(), opts.rtol),
+            opts.rtol,
+            where="steady_state(atol=...)",
         ).apply_to(opts)
         opts.max_steps = max_steps if max_steps is not None else self._max_steps
         # A previous solve on this Simulator already proved the closed-form
@@ -8776,7 +8952,7 @@ class Simulator:
         n_workers=None,
         mask=None,
         newton_burst: bool = True,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8807,7 +8983,7 @@ class Simulator:
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
         criterion : str
-            ``"residual"`` (default) or ``"scaled"``, as in
+            ``"scaled"`` (default) or ``"residual"``, as in
             :meth:`steady_state` (issue #1001).
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
@@ -8882,7 +9058,7 @@ class Simulator:
         # takes when no atol is given, which is each entry's own. Taken from
         # this model, an entry whose parameters put it at 1e-9 of this one
         # marched at this one's tolerance and ran through zero (x = -3.7).
-        own_auto = self._steady_state_atol(atol, criterion) is not atol
+        own_auto = atol is None and criterion == "scaled" and not self._atol_set
         eff_atol_spec = self._resolve_atol(
             None if own_auto else atol,
             eff_rtol,
@@ -8913,7 +9089,7 @@ class Simulator:
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
             if own_auto:
-                own = [float(v) for v in derive_atol(clone.get_state(), eff_rtol)]
+                own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
                 _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
             else:
                 eff_atol_spec.apply_to(opts)
@@ -10504,14 +10680,20 @@ class SteadyStateResult:
         ``max|f(y)|`` at convergence.
     newton_distance : float
         The Newton step from the state returned to the root, in each
-        species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
-        is within it (issue #1001). NaN under ``criterion="residual"``, which
-        does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular at a state that is not a root.
+        species' own tolerance, which under ``criterion="scaled"`` decided
+        where the solve stopped (issue #1001); at most 1 is within it. NaN
+        under ``criterion="residual"``, which does not take the step, and
+        above 512 unknowns; ``inf`` where the Jacobian is singular at a state
+        that is not a root, or a differenced one straddles a jump.
+    continued_run_distance : float
+        The run test of ``criterion="scaled"``: the largest move of a
+        measured species, over its tolerance, across the run taken on from
+        the state returned; at most 1 passes (issue #1001). ``inf`` where the
+        run could not be taken to its time; NaN where none was taken (under ``"residual"``,
+        where the parity test already refused, and for a burst-free Newton
+        solve).
     criterion : str
-        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``:
-        ``"residual"`` for a ``"scaled"`` request above 512 unknowns, which
-        that test falls back to.
+        The test ``converged`` was decided by, ``"scaled"`` or ``"residual"``.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool
@@ -10794,6 +10976,7 @@ class SteadyStateResult:
         "_name_to_idx",
         "residual",
         "newton_distance",
+        "continued_run_distance",
         "criterion",
         "method_used",
         "converged",
@@ -10871,6 +11054,7 @@ class SteadyStateResult:
         # each species' tolerance (at most 1 is within it; NaN where it was not
         # taken, as under "residual"), and the test `converged` was decided by.
         self.newton_distance = getattr(core, "newton_distance", float("nan"))
+        self.continued_run_distance = getattr(core, "continued_run_distance", float("nan"))
         self.criterion = getattr(core, "criterion", "residual")
         self.method_used = core.method_used
         self.converged = core.converged

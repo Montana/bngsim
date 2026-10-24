@@ -2476,6 +2476,19 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
 
 
+# Past this many characters, a new size written out through its rules reads a
+# rule more than one path reaches by a function of its own (issue #1124, item 4).
+_RESIZE_INLINE_LIMIT = 20_000
+
+# How many levels of rules ``inlined`` writes out; past them it reads a rule by
+# name, which a cycle of rules needs.
+_RESIZE_INLINE_DEPTH = 65
+
+# A name in ExprTk text, as ``_replace_exprtk_symbols`` reads one: not the
+# exponent of a number such as 1e-06.
+_EXPRTK_NAME = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+
+
 def _rule_compartments_an_event_resizes(
     rule_math: dict,
     ar_comp_targets,
@@ -2484,6 +2497,7 @@ def _rule_compartments_an_event_resizes(
     rescaled_species: dict[str, list[str]],
     to_exprtk,
     cache: dict | None = None,
+    define_helper=None,
 ) -> list[tuple[str, str]]:
     """``(compartment, new size)`` for each assignment-rule compartment an event
     resizes that ``resized_comps`` does not already hold, each after the ones
@@ -2520,6 +2534,20 @@ def _rule_compartments_an_event_resizes(
     caller from one event to the next, holds what is read from the rules
     alone, so that each rule is walked once per model rather than once per
     event.
+
+    Written out, a rule that more than one path reaches is written once per
+    path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made the text
+    exponential in its depth: 278 KB at 22 rules, 1.9 MB at 26 (issue #1124,
+    item 4). Where the text would pass ``_RESIZE_INLINE_LIMIT``, and the caller
+    gives ``define_helper(key, text) -> name``, each such rule's value after
+    the event is a function of its own instead, which the rules reaching it
+    read by name: the text is then as long as the rules are. A function reads
+    the state the event fires from, as the text does. The length counts the
+    event's values put in, not only the rules: under 16 rules, an assigned
+    value of 60 terms made the new size 720 KB. Below the limit the text is
+    written out as before, except where the rules go deeper than ``inlined``
+    writes them out: a chain of 70 rules read its deepest by name, at the
+    value before the event.
     """
     cache = {} if cache is None else cache
     reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
@@ -2587,7 +2615,7 @@ def _rule_compartments_an_event_resizes(
     def inlined(expr: str, depth: int = 0) -> str:
         """The text with each rule it reads that reaches a change written out,
         so that the event's values can be put in."""
-        if depth > 64:
+        if depth >= _RESIZE_INLINE_DEPTH:
             return expr
         inner = {}
         for name in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)):
@@ -2600,9 +2628,99 @@ def _rule_compartments_an_event_resizes(
             return expr
         return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
 
+    rule_names: dict[str, list[str]] = cache.setdefault("names", {})
+
+    def names_in(var: str) -> list[str]:
+        """The names ``var``'s rule reads, once for each reading."""
+        if var not in rule_names:
+            if var not in rule_text:
+                rule_text[var] = to_exprtk(rule_math[var])
+            rule_names[var] = _EXPRTK_NAME.findall(rule_text[var])
+        return rule_names[var]
+
+    def reached_in(var: str) -> dict[str, int]:
+        """The rules ``var``'s rule reads that reach a change, and how many
+        times it reads each."""
+        counts: dict[str, int] = {}
+        for name in names_in(var):
+            inner = rule_of.get(name)
+            if inner is not None and inner not in changed and reads(inner) & changed:
+                counts[inner] = counts.get(inner, 0) + 1
+        return counts
+
+    def through_helpers(comp: str) -> str | None:
+        """The new size of ``comp`` written out rule by rule, each rule more
+        than one path reaches read through a function of its own where the
+        text would pass the limit. None where ``inlined`` writes it in full
+        and short enough, or the rules read each other in a cycle."""
+        children: dict[str, dict[str, int]] = {}
+        written: dict[str, int] = {}  # length written out; -1 while under way
+        depth: dict[str, int] = {}  # levels of rules written out below it
+
+        def length(var: str) -> int | None:
+            if var in written:
+                return None if written[var] < 0 else written[var]
+            written[var] = -1
+            children[var] = reached_in(var)
+            # Each name read becomes its text in parentheses.
+            n = len(rule_text[var]) + sum(
+                len(replacements[name]) + 2 - len(name)
+                for name in names_in(var)
+                if name in replacements
+            )
+            d = 0
+            for inner, k in children[var].items():
+                m = length(inner)
+                if m is None:
+                    return None
+                n += k * (m + 2 - len(_safe_name(inner)))
+                d = max(d, depth[inner] + 1)
+            written[var] = n
+            depth[var] = d
+            return n
+
+        total = length(comp)
+        if total is None:
+            return None
+        share = define_helper is not None and total > _RESIZE_INLINE_LIMIT
+        if not share and depth[comp] <= _RESIZE_INLINE_DEPTH:
+            return None
+        paths: dict[str, int] = {}
+        for reads_of in children.values():
+            for inner, k in reads_of.items():
+                paths[inner] = paths.get(inner, 0) + k
+        after: dict[str, str] = {}
+
+        def value_after(var: str) -> str:
+            # The rule's text with what it reads after the event put in.
+            if var not in after:
+                subs = {name: replacements[name] for name in names_in(var) if name in replacements}
+                for inner in children[var]:
+                    subs[_safe_name(inner)] = (
+                        helper_of(inner) if share and paths[inner] > 1 else value_after(inner)
+                    )
+                after[var] = _replace_exprtk_symbols(rule_text[var], subs)
+            return after[var]
+
+        helpers: dict[str, str] = {}
+
+        def helper_of(var: str) -> str:
+            if var not in helpers:
+                helpers[var] = define_helper(
+                    f"{_safe_name(comp)}_{_safe_name(var)}", value_after(var)
+                )
+            return helpers[var]
+
+        return value_after(comp)
+
     found: list[tuple[str, str]] = []
     for comp in ordered:
-        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        through = through_helpers(comp)
+        new_size = (
+            through
+            if through is not None
+            else _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        )
         found.append((comp, new_size))
         replacements[_safe_name(comp)] = new_size
         note_rescaled(comp, new_size)
@@ -7504,14 +7622,31 @@ def _build_model_from_sbml_doc_in_context(doc):
     # and bngsim's own `.net` → SBML export writes `_rateLaw_<rid>` out as a real
     # parameter — so re-importing that file collided on the first reaction and
     # `ModelBuilder::validate` rejected the model outright. Uniquifying covers the
-    # pre-existing hazard as well.
-    _taken_param_names: set[str] = {
-        _safe_name(sbml_model.getParameter(j).getId())
-        for j in range(sbml_model.getNumParameters())
-    } | {
-        _safe_name(sbml_model.getCompartment(j).getId())
-        for j in range(sbml_model.getNumCompartments())
-    }
+    # pre-existing hazard as well. A species' id is a symbol of its own too, and
+    # a reaction's id the function its rate law is read by: a function the
+    # loader names after either overwrote it or failed to register (#1124).
+    _taken_param_names: set[str] = (
+        {
+            _safe_name(sbml_model.getParameter(j).getId())
+            for j in range(sbml_model.getNumParameters())
+        }
+        | {
+            _safe_name(sbml_model.getCompartment(j).getId())
+            for j in range(sbml_model.getNumCompartments())
+        }
+        | {_safe_name(sp.getId()) for sp in sbml_model.getListOfSpecies()}
+        | {
+            _safe_name(element.getId())
+            for rxn in sbml_model.getListOfReactions()
+            for element in (
+                rxn,
+                *rxn.getListOfReactants(),
+                *rxn.getListOfProducts(),
+                *rxn.getListOfModifiers(),
+            )
+            if element.getId()
+        }
+    )
 
     def _unique_param_name(base: str) -> str:
         name = base
@@ -8973,6 +9108,16 @@ def _build_model_from_sbml_doc_in_context(doc):
                 )
                 helper_texts = [(name, sympy_to_exprtk(body)) for name, body in helpers]
                 texts = [sympy_to_exprtk(e) for e in written]
+                # Under a name none of the model's parameters has: a function
+                # of a parameter's name is bound to it (#266) and overwrote it.
+                renamed = {name: _unique_param_name(name) for name, _ in helpers}
+                renamed = {old: new for old, new in renamed.items() if new != old}
+                if renamed and all(t is not None for _, t in helper_texts):
+                    texts = [t and _replace_exprtk_symbols(t, renamed) for t in texts]
+                    helper_texts = [
+                        (renamed.get(name, name), _replace_exprtk_symbols(t, renamed))
+                        for name, t in helper_texts
+                    ]
                 if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where {c_read} "
@@ -10192,6 +10337,47 @@ def _build_model_from_sbml_doc_in_context(doc):
     # by promoting them to species with initial value = param value,
     # adding an observable, and re-targeting the event assignment.
     n_events = sbml_model.getNumEvents()
+
+    # A rule's value after an event's resize, as a function of its own, where
+    # the new size written out through its rules would be too long (issue
+    # #1124, item 4). One function for each text, under a name nothing else
+    # has: the ids it is named by are joined by "_", and two can meet (event
+    # e and compartment c_x, event e_c and compartment x), where an event read
+    # the value of the other's function of that name. Each is added once an
+    # assignment the model keeps reads it, since every function is evaluated
+    # at every step.
+    _resize_helper_of: dict[str, str] = {}  # text -> name
+    _resize_helper_text: dict[str, str] = {}  # name -> text
+    _resize_helpers_added: set[str] = set()
+
+    def _resize_helper(key: str, text: str) -> str:
+        name = _resize_helper_of.get(text)
+        if name is None:
+            # A function named as a parameter is bound to it (#266), and wrote
+            # its value over the parameter's at every step.
+            name = _unique_param_name(f"_rsz_{_safe_name(key)}")
+            _resize_helper_of[text] = name
+            _resize_helper_text[name] = text
+        return name
+
+    def _add_resize_helpers_read_by(texts) -> None:
+        # Each helper the texts read, after the ones it reads.
+        def add(name: str) -> None:
+            if name in _resize_helpers_added:
+                return
+            _resize_helpers_added.add(name)
+            body = _resize_helper_text[name]
+            for inner in _EXPRTK_NAME.findall(body):
+                if inner in _resize_helper_text:
+                    add(inner)
+            builder.add_function(name, body)
+
+        if _resize_helper_text:
+            for text in texts:
+                for name in _EXPRTK_NAME.findall(text):
+                    if name in _resize_helper_text:
+                        add(name)
+
     if n_events > 0:
         # Track which parameters need promotion for event assignments
         event_param_promotions = {}  # param_id → species_idx
@@ -10430,6 +10616,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         event_rescaled_species,
                         lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
                         event_rule_cache,
+                        lambda key, text, _eid=eid: _resize_helper(f"{_eid}_{key}", text),
                     )
                 )
 
@@ -10519,6 +10706,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             if not assignments:
                 logger.warning(f"Event '{eid}': no valid assignments, skipping")
                 continue
+            _add_resize_helpers_read_by(expr for _, expr in assignments)
 
             builder.add_event(
                 eid,
@@ -10599,6 +10787,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             _jump_moves,
             lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
             cache,
+            lambda key, text, _k=k: _resize_helper(f"_size_jump_{_k}_{key}", text),
         )
         rescales: list[tuple[int, str]] = []
         for follower, new_size in followers:
@@ -10611,6 +10800,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                 )
                 ar_dilution_species.add(sid)
+        _add_resize_helpers_read_by(expr for _, expr in assignments)
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
             trigger,

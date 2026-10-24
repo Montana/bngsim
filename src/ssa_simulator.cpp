@@ -645,32 +645,9 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             "well-defined value in a stochastic (SSA) trajectory.");
     }
 
-    // Reject delay-bearing events: SSA and PSA run non-delayed events only, and
-    // adding the pending-execution queue the ODE engine has is issue #526.
-    // Surface a clear error here rather than at Simulator construction so the
-    // message includes the event id. run() and run_psa() both come through here.
-    // The message used to send the reader to "Phase 5c of the SBML SSA Support
-    // Plan", a planning document that is no longer in the tree (issue #526).
-    //
-    // A delay expression that reads only fixed parameters and is 0 for this
-    // run queues nothing, exactly as a literal 0 does. The SBML loader keeps
-    // `<delay><ci>d</ci></delay>` as an expression so set_param reaches it
-    // (issue #835), and before that it folded to a literal 0 that ran here.
-    {
-        const auto &evs = model.events();
-        for (std::size_t ei = 0; ei < evs.size(); ++ei) {
-            const auto &ev = evs[ei];
-            const bool delayed = ev.delay_expr_idx >= 0
-                                     ? !model.event_delay_is_fixed_zero(static_cast<int>(ei))
-                                     : ev.delay > 0.0;
-            if (delayed) {
-                throw std::runtime_error("Event '" + ev.id +
-                                         "' has a delay, which is not yet supported under SSA/PSA "
-                                         "(issue #526 tracks adding it). Use method='ode', which "
-                                         "runs delayed events, or remove the delay.");
-            }
-        }
-    }
+    // Delayed events run under SSA and PSA as under ODE (issue #526): a
+    // triggered instance with a positive delay waits in the pending queue of
+    // the event support below, and executes at its time.
 
     // Per-instance RNG with deterministic seed
     std::mt19937_64 rng(seed);
@@ -1110,10 +1087,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     // triggers can only flip at fire boundaries (state is constant during τ);
     // a post-fire trigger sweep handles those.
     //
-    // Delayed events never reach this loop: the check at the top of
-    // run_internal() raises on any event whose delay is not a fixed zero
-    // (NetworkModel::event_delay_is_fixed_zero; delay support under SSA/PSA is
-    // issue #526).
+    // A delayed event (issue #526) is queued at its trigger, as the ODE engine
+    // queues it, and its execution is one more time the loops stop at:
+    // probe_events_in_window and the continuous loop's panel end both look at
+    // the earliest pending time, and the batch there takes it up.
     std::vector<bool> trigger_was_true(n_events, false);
     auto &eval_ref = model.evaluator();
     auto &sp_vec_ref = const_cast<std::vector<Species> &>(model.species());
@@ -1365,17 +1342,57 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     //     a non-persistent event.
     //  4. CASCADE_LIMIT stops an algebraic loop (A arms B arms A ...).
     //  5. On exit trigger_was_true holds the settled truth of every trigger.
-    // Delays never reach here: run_internal refuses a delayed event up front
-    // (issue #526). Returns true if any event modified conc[].
+    //  6. Delays (issue #526), as in the ODE drain: each instance reads its
+    //     delay at its trigger time. A picked instance with a positive delay is
+    //     queued to `pending` with its frozen values and changes nothing now.
+    //     An execution that has come due joins the batch of its time, after
+    //     the instances that rise there, and waits its turn by priority like
+    //     them; a non-persistent one whose trigger has lapsed since does not
+    //     execute. Wherever a non-persistent event's trigger is read false, its
+    //     pending executions are dropped (SBML L3v2 §4.11.3).
+    // Returns true if any event modified conc[].
     struct ExecInstance {
         int event_idx;
         std::vector<double> snapshot_vals; // UVFTT frozen RHS (empty if !UVFTT)
+        double delay = 0.0;                // read at the trigger
         bool done = false;
+        // A delayed execution that has come due, taken from `pending`.
+        bool from_delay = false;
+    };
+    // Executions waiting for their time, in the order they were queued (which
+    // among equal priorities is the order the tie-break gave them).
+    struct PendingExec {
+        int event_idx;
+        double apply_time;
+        std::vector<double> frozen_values; // empty unless UVFTT
+    };
+    std::vector<PendingExec> pending;
+    // The earliest time anything in `pending` waits for (+inf with nothing
+    // waiting), read once after each change to the queue, as the ODE engine
+    // keeps it: asked for after every firing, a pass over the queue each time
+    // took a run with 4,800 executions waiting 0.79 s, against 0.06 s read
+    // once. EVERY write to `pending` sets `pending_changed`.
+    bool pending_changed = true;
+    double pending_earliest_read = std::numeric_limits<double>::infinity();
+    auto earliest_pending = [&]() -> double {
+        if (pending_changed) {
+            pending_earliest_read = std::numeric_limits<double>::infinity();
+            for (const auto &pe : pending)
+                pending_earliest_read = std::min(pending_earliest_read, pe.apply_time);
+            pending_changed = false;
+        }
+        return pending_earliest_read;
+    };
+    auto drop_pending_of = [&](int ei) {
+        pending_changed = true;
+        pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                     [ei](const PendingExec &pe) { return pe.event_idx == ei; }),
+                      pending.end());
     };
     // Far above any legitimate cascade depth (00978 fires ~11; 01533 ~106).
     constexpr int CASCADE_LIMIT = 100000;
     auto process_firing_batch = [&](double t_now, const std::vector<int> &firing_in) -> bool {
-        if (firing_in.empty())
+        if (firing_in.empty() && !(earliest_pending() <= t_now))
             return false;
 
         auto make_instance = [&](int ei) -> ExecInstance {
@@ -1389,7 +1406,42 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     inst.snapshot_vals.push_back(eval_ref.evaluate(val_expr_idx));
                 }
             }
+            // A delay must be a finite, non-negative number (SBML L3 §4.11.3),
+            // refused by name as the ODE engine refuses it (issue #762). A
+            // negative within rounding of zero reads as 0.
+            double d = ev.delay_expr_idx >= 0 ? eval_ref.evaluate(ev.delay_expr_idx) : ev.delay;
+            const double tol = 1e-9 * std::max(1.0, std::fabs(t_now));
+            if (!std::isfinite(d) || d < -tol) {
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "' fired at t=%g with delay %g", t_now, d);
+                throw std::runtime_error(std::string(use_psa ? "PSA" : "SSA") + ": event '" +
+                                         ev.id + buf +
+                                         "; an event delay must be a finite, non-negative number");
+            }
+            inst.delay = d < 0.0 ? 0.0 : d;
             return inst;
+        };
+        // Move the executions due at t_now from `pending` into the batch.
+        auto take_due = [&](std::vector<ExecInstance> &queue) -> bool {
+            bool any = false;
+            auto keep = pending.begin();
+            for (auto it = pending.begin(); it != pending.end(); ++it) {
+                if (!(t_now >= it->apply_time)) {
+                    if (keep != it)
+                        *keep = std::move(*it);
+                    ++keep;
+                    continue;
+                }
+                ExecInstance inst;
+                inst.event_idx = it->event_idx;
+                inst.snapshot_vals = std::move(it->frozen_values);
+                inst.from_delay = true;
+                queue.push_back(std::move(inst));
+                any = true;
+            }
+            pending.erase(keep, pending.end());
+            pending_changed = pending_changed || any;
+            return any;
         };
 
         std::vector<bool> prev = trigger_was_true;
@@ -1399,6 +1451,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             prev[ei] = true;
             queue.push_back(make_instance(ei));
         }
+        take_due(queue);
 
         auto eval_pri = [&](const ExecInstance &inst) -> double {
             const auto &ev = events[inst.event_idx];
@@ -1441,8 +1494,36 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     ties.push_back(k);
                 }
             }
-            if (ties.empty())
+            // A delay that rounds to nothing queued an execution due now.
+            if (ties.empty()) {
+                if (take_due(queue))
+                    continue;
                 break;
+            }
+            // As in the ODE drain: delayed executions at one priority keep the
+            // order they were queued in, the one the tie-break gave them at
+            // their trigger, so only the first of them stands in the draw; and
+            // where none of the tied events has a priority at all, an immediate
+            // one goes before a delayed one. SBML leaves that order open, and
+            // drawing it made the SSA mean of a model without priorities leave
+            // the ODE trajectory (an execution of `S = S + 100` due as an event
+            // sets S = 0: ODE 100, SSA 0 or 100).
+            const bool unprioritised = std::all_of(ties.begin(), ties.end(), [&](size_t idx) {
+                const auto &e = events[queue[idx].event_idx];
+                return e.priority_expr_idx < 0 && e.priority == 0;
+            });
+            const bool immediate_tied = std::any_of(
+                ties.begin(), ties.end(), [&](size_t idx) { return !queue[idx].from_delay; });
+            bool delayed_in_draw = unprioritised && immediate_tied;
+            ties.erase(std::remove_if(ties.begin(), ties.end(),
+                                      [&](size_t idx) {
+                                          if (!queue[idx].from_delay)
+                                              return false;
+                                          const bool drop = delayed_in_draw;
+                                          delayed_in_draw = true;
+                                          return drop;
+                                      }),
+                       ties.end());
             size_t k = ties[0];
             if (ties.size() > 1) {
                 std::uniform_int_distribution<size_t> pick(0, ties.size() - 1);
@@ -1457,6 +1538,21 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
 
             const auto &ev = events[queue[k].event_idx];
+            // A non-persistent event whose trigger has lapsed since it was
+            // triggered does not execute (§4.11.3).
+            if (queue[k].from_delay && !ev.persistent &&
+                eval_ref.evaluate(ev.trigger_expr_idx) <= 0.5)
+                continue;
+            if (!queue[k].from_delay && queue[k].delay > 0.0) {
+                // Delayed: queued for its time, no state change now, so no
+                // cascade re-check follows.
+                pending_changed = true;
+                pending.push_back(PendingExec{queue[k].event_idx, t_now + queue[k].delay,
+                                              ev.use_values_from_trigger_time
+                                                  ? queue[k].snapshot_vals
+                                                  : std::vector<double>{}});
+                continue;
+            }
             const auto &assigns = ev.assignments;
             std::vector<double> nv(assigns.size());
             if (ev.use_values_from_trigger_time) {
@@ -1571,6 +1667,7 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                     for (auto &inst : queue)
                         if (!inst.done && inst.event_idx == ei)
                             inst.done = true;
+                    drop_pending_of(ei);
                 }
                 prev[ei] = now_true;
             }
@@ -1648,6 +1745,10 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         sync_state(times.t_start);
 
         const NetworkModel::EventCarry *carry = model.event_carry_for(times.t_start, n_events);
+        if (carry != nullptr)
+            for (const auto &pe : carry->pending)
+                pending.push_back(PendingExec{pe.event_idx, pe.apply_time, pe.frozen_values});
+        pending_changed = true;
         std::vector<int> t0_firing;
         t0_firing.reserve(n_events);
         for (int i = 0; i < n_events; ++i) {
@@ -1655,6 +1756,12 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 carry != nullptr ? carry->trigger[i] != 0 : events[i].initial_value;
             double val = eval_ref.evaluate(events[i].trigger_expr_idx);
             bool now_true = (val > 0.5);
+            // A carried execution of a non-persistent event whose trigger now
+            // reads false is cancelled here, as wherever a trigger is read
+            // false (§4.11.3). Left for the next sweep, it survived an event of
+            // this start's batch raising the trigger again, and ran.
+            if (!now_true && !events[i].persistent)
+                drop_pending_of(i);
             if (now_true && !trigger_was_true[i]) {
                 t0_firing.push_back(i);
             }
@@ -1949,6 +2056,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
     std::vector<char> probe_prev, probe_cur; // the continuous loop's scan
     auto probe_events_in_window = [&](double t_lo, double t_hi) -> double {
         double t_event = std::numeric_limits<double>::infinity();
+        // A delayed execution waiting in the window stops the step at its time
+        // (issue #526), as a crossing does.
+        if (!pending.empty()) {
+            const double t_pend = earliest_pending();
+            if (t_pend > t_lo && t_pend <= std::min(t_hi, times.t_end))
+                t_event = t_pend;
+        }
         // Nothing past the run's end can fire in it. The discrete loop asks up
         // to its next firing, which with a tiny total propensity lies far past
         // t_end: the grid then ran to it (millions of looks, past the timeout,
@@ -2061,6 +2175,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 firing_scratch.push_back(ei); // the drain marks it true
             else
                 trigger_was_true[ei] = now_true;
+            if (!now_true && !events[ei].persistent && !pending.empty())
+                drop_pending_of(ei);
         }
         return process_firing_batch(t_now, firing_scratch);
     };
@@ -2736,8 +2852,14 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
             while (next_bp < bps.size() && bps[next_bp] <= t)
                 ++next_bp;
-            const double t_stop =
+            double t_stop =
                 (next_bp < bps.size() && bps[next_bp] < times.t_end) ? bps[next_bp] : times.t_end;
+            // A delayed execution ends the panel at its time (issue #526).
+            const double t_pend =
+                pending.empty() ? std::numeric_limits<double>::infinity() : earliest_pending();
+            const bool stop_at_pending = t_pend > t && t_pend <= t_stop;
+            if (stop_at_pending)
+                t_stop = t_pend;
 
             const double hmin =
                 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::fabs(t));
@@ -3051,10 +3173,14 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             // unless no trigger has changed at the row yet).
             while (next_output < n_out) {
                 const double tk = t_out[next_output];
-                const bool before = event_first
-                                        ? tk < s_cut - sample_event_tol(s_cut) ||
-                                              (tk < s_cut && row_before_event((tk - tp) / hh, tk))
-                                        : (fire_first ? tk < s_cut : tk <= s1);
+                const bool before =
+                    event_first
+                        ? tk < s_cut - sample_event_tol(s_cut) ||
+                              (tk < s_cut && row_before_event((tk - tp) / hh, tk))
+                        : (fire_first ? tk < s_cut
+                                      // A row at a delayed execution's
+                                      // time reads its effect.
+                                      : (stop_at_pending && s1 == t_stop ? tk < s1 : tk <= s1));
                 if (!before)
                     break;
                 record_at(tk, (tk - tp) / hh);
@@ -3078,6 +3204,17 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 model.set_current_time(t);
                 if (s1 == t_stop && t_stop < times.t_end)
                     fresh = true; // a breakpoint: a rate may jump here
+                if (stop_at_pending && s1 == t_stop) {
+                    // The delayed execution's time: its batch.
+                    fresh = true;
+                    sync_state(t);
+                    obs_current = true;
+                    if (fire_rising_edges(t)) {
+                        recompute_all_propensities();
+                        for (int i = 0; i < m; ++i) // an event may assign a rate-rule target
+                            y[i] = conc[rate_rule_odes[i].target0];
+                    }
+                }
                 continue;
             }
 
@@ -3168,7 +3305,13 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 for (int i = 0; i < m; ++i)
                     y[i] = conc[rate_rule_odes[i].target0];
             }
-            if (!drained && th_cut < 1.0 && fire_keeps_panel[selected]) {
+            // A delayed execution the drain has just queued inside this panel
+            // ends it: the panel's end was fixed before the execution existed,
+            // and kept, the loop stepped past it and the execution ran at the
+            // next drain, up to a panel late (issue #526). Queuing changes no
+            // state, so `drained` does not say so.
+            if (!drained && th_cut < 1.0 && fire_keeps_panel[selected] &&
+                !(earliest_pending() < s1p)) {
                 // Nothing a_d reads moved: stay in this panel.
                 carry = true;
                 fresh = false;
@@ -3447,12 +3590,15 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             species[i].concentration = conc[i];
         }
         model.set_current_time(t);
-        // ...and the event state that goes with it (issue #693). No execution
-        // is ever pending: a delayed event is refused above.
+        // ...and the event state that goes with it (issue #693), with the
+        // executions still waiting (issue #526).
         NetworkModel::EventCarry carry;
         carry.valid = true;
         carry.t = t;
         carry.trigger.assign(trigger_was_true.begin(), trigger_was_true.end());
+        for (auto &pe : pending)
+            carry.pending.push_back(NetworkModel::CarriedEventExecution{
+                pe.event_idx, pe.apply_time, std::move(pe.frozen_values)});
         const bool continued = model.event_carry_for(times.t_start, n_events) != nullptr;
         model.publish_event_carry(std::move(carry), continued);
     }
