@@ -470,22 +470,33 @@ def _nonfinite_cells_differ(trajectories: dict, traj_path: Path) -> str | None:
     platforms the checksum already differs. An allow-listed job's committed
     trajectory keeps every cell, or every stride-th row and the fresh run is cut
     the same way, and a blow-up is no rounding difference: its cells must match
-    exactly, NaN for NaN and an inf of the same sign for an inf."""
+    exactly, NaN for NaN and an inf of the same sign for an inf. Columns are
+    matched by name, the time column included, and a row is reported by its
+    index in the run."""
     payload = json.loads(traj_path.read_text())
     stride = payload.get("downsampled_stride") or 1
     fresh = _downsample_traj(trajectories, stride) if stride > 1 else trajectories
     for fn, ref in payload["artifacts"].items():
         if fn not in fresh:
             return f"{fn}: not in this run"
-        a, b = np.asarray(fresh[fn]["values"], float), np.asarray(ref["values"], float)
+        run = fresh[fn]
+        if sorted(run["names"]) != sorted(ref["names"]):
+            return f"{fn}: other variables than the golden's"
+        order = [run["names"].index(n) for n in ref["names"]]
+        a = np.column_stack([run["time"], np.asarray(run["values"], float)[:, order]])
+        b = np.column_stack([ref["time"], np.asarray(ref["values"], float)])
         if a.shape != b.shape:
             return f"{fn}: {a.shape} cells against {b.shape}"
+        rows = list(range(len(trajectories[fn]["time"])))
+        if stride > 1:  # the rows _downsample_traj kept
+            rows = rows[::stride] + ([rows[-1]] if (len(rows) - 1) % stride else [])
+        names = ["time", *ref["names"]]
         for kind, test in (("NaN", np.isnan), ("+inf", np.isposinf), ("-inf", np.isneginf)):
             one_sided = test(a) != test(b)
             if one_sided.any():
                 row, col = (int(i) for i in np.argwhere(one_sided)[0])
                 side = "this run" if test(a)[row, col] else "the golden"
-                return f"{fn}: {ref['names'][col]} row {row} is {kind} in {side} only"
+                return f"{fn}: {names[col]} row {rows[row]} is {kind} in {side} only"
     return None
 
 
@@ -567,10 +578,13 @@ def verify_against_golden(
             continue
         worst = job_fingerprint_distance(fingerprint, golden["fingerprint"], job_rtol, job_atol)
         blowup = None
-        if worst <= 1.0 and golden.get("trajectory"):
-            blowup = _nonfinite_cells_differ(
-                trajectories, golden_path.parent / golden["trajectory"]
-            )
+        traj_path = golden_path.parent / golden["trajectory"] if golden.get("trajectory") else None
+        if traj_path is not None and not traj_path.is_file():
+            rows.append((job.model_id, "NO_GOLDEN", f"{golden['trajectory']} is missing"))
+            failed += 1
+            continue
+        if worst <= 1.0 and traj_path is not None:
+            blowup = _nonfinite_cells_differ(trajectories, traj_path)
         if blowup:
             rows.append((job.model_id, "DRIFT", f"a blow-up no stat sees: {blowup}"))
             failed += 1
@@ -805,10 +819,9 @@ def main() -> int:
     pd = _load_parity_diff()
     swept = _swept_model_ids(sweep_summary)
     if swept is None:
-        if args.merge:
-            sys.exit(
-                f"ABORT: --merge replaces the jobs the sweep ran, and {summary_file} lists none."
-            )
+        if args.merge or args.gate:
+            what = "--merge replaces" if args.merge else "--gate judges"
+            sys.exit(f"ABORT: {what} the jobs the sweep ran, and {summary_file} lists none.")
         if args.verify:
             print(
                 f"WARN: {summary_file} lists no swept jobs; judging the output under "
@@ -952,7 +965,7 @@ def main() -> int:
     }
     if real_skips:
         meta["skipped"] = dict(sorted(real_skips.items())[:50])
-        print(f"WARN: {len(real_skips)} swept job(s) produced no fingerprintable artifact.")
+        print(f"WARN: {len(real_skips)} swept job(s) failed or produced nothing to fingerprint.")
 
     if args.merge:
         # Every job this sweep ran must come back with a fresh entry. One that

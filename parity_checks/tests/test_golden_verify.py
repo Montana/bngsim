@@ -405,13 +405,53 @@ def test_merge_gate_refuses_a_gated_model_the_sweep_did_not_run(tmp_path, monkey
 
 
 def test_a_summary_without_results_is_not_mistaken_for_one(tmp_path, monkeypatch, capsys):
-    """Under --gate too: the gated set is not a record of what ran."""
+    """Under --gate too: the gated set is not a record of what ran. Plain
+    --verify judges what is on disk, and says so."""
     golden = _golden(tmp_path, BASE)
     text = golden.read_text()
     _write_run(tmp_path / "sweep", BASE)
     _summary(tmp_path, [], results=False)
-    code = _main(monkeypatch, tmp_path, "--merge", "--gate")
-    assert isinstance(code, str) and "lists none" in code
+    for argv in (("--merge", "--gate"), ("--merge",), ("--verify", "--gate")):
+        code = _main(monkeypatch, tmp_path, *argv)
+        assert isinstance(code, str) and "lists none" in code, argv
     assert golden.read_text() == text
-    assert _main(monkeypatch, tmp_path, "--verify", "--gate") == 0
+    assert _main(monkeypatch, tmp_path, "--verify") == 0
     assert "WARN" in capsys.readouterr().out
+
+
+def test_a_missing_committed_trajectory_fails_without_a_traceback(tmp_path, capsys):
+    golden = _golden(tmp_path, BASE, trajectory=True)
+    (tmp_path / "trajectories/toy.json").unlink()
+    noisy = BASE.copy()
+    noisy[:, 1] *= 0.77
+    _write_run(tmp_path / "sweep", noisy)
+    code = PG.verify_against_golden(golden, tmp_path / "sweep", [JOB], LOAD, 1e-5, 1e-6, 1)
+    out = capsys.readouterr().out
+    assert code == 1 and "NO_GOLDEN" in out and "toy.json is missing" in out
+
+
+def test_the_blow_up_check_matches_columns_by_name_and_rows_by_the_run(tmp_path):
+    """A NaN in A on both sides, with the run's columns in another order, agrees;
+    a downsampled trajectory reports the run's row, not the kept row's index."""
+    t = list(np.linspace(0.0, 1.0, 9))
+    values = [[float(i), 2.0 * i] for i in range(9)]
+    ref = {"time": t, "names": ["A", "B"], "values": values}
+    path = tmp_path / "traj.json"
+    path.write_text(PG._traj_payload(JOB.model_id, "ode", "t", {"m.gdat": ref}, 4))
+    swapped = {"time": t, "names": ["B", "A"], "values": [[b, a] for a, b in values]}
+    assert PG._nonfinite_cells_differ({"m.gdat": swapped}, path) is None
+    blown = [row[:] for row in swapped["values"]]
+    blown[8][1] = float("nan")  # A, the last row: kept by the stride
+    found = PG._nonfinite_cells_differ({"m.gdat": {**swapped, "values": blown}}, path)
+    assert found == "m.gdat: A row 8 is NaN in this run only"
+
+
+def test_every_gated_model_has_a_committed_trajectory():
+    """The blow-up check reads it; without one a mid-trajectory NaN passes."""
+    golden_dir = PG.HERE / "golden"
+    committed = {
+        g["model_id"]: g for g in json.loads((golden_dir / "golden.json").read_text())["golden"]
+    }
+    for model_id in PG.GATED_MODELS:
+        rel = committed[model_id].get("trajectory")
+        assert rel and (golden_dir / rel).is_file(), model_id

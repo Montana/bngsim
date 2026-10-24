@@ -40,4 +40,7 @@ same treatment `differ` gives a one-side-non-finite cell — never forgiven
 `-inf` and `NaN` are three different outcomes, not one), and a stat that is
 non-finite on exactly one side, or a *different* non-finite on each side,
 scores `inf` from `fingerprint_distance` and `fingerprint_max_rel` — above
-any tolerance a caller could pick. Only the same blow-up on both sides is agreement.
+any tolerance a caller could pick. Only the same blow-up on both sides is agreement. That holds for the
+stats a fingerprint keeps: min/max/mean skip non-finite cells and `last` is
+one row, so a NaN mid-trajectory reaches none of them, and only a full
+trajectory (the golden gate reads the committed one) shows it.
