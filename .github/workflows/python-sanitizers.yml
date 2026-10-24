@@ -167,6 +167,20 @@ jobs:
           fi
           echo "ASan stopped the planted overflow (exit $rc), as it must."
 
+      # Deselected here, and only here (python-tests.yml still runs them):
+      #
+      #   * Wall-clock budgets. These guard against hangs and pathological
+      #     slowdowns with caps a normal build clears easily, and the 2-3x
+      #     sanitizer slowdown does not: the stall bound's 30 s took 47 s, and a
+      #     60 s run timeout fired, on this job's first full run.
+      #   * test_run_tests_sh's end-to-end check, which requires that the dev
+      #     extra's optional modules (diffrax, vivarium-core) be importable. This
+      #     job installs only the test extra.
+      #
+      # The suite is stopped with SIGINT at 80 minutes rather than by the job
+      # limit, so pytest still prints which tests failed, and any single test
+      # that runs past 5 minutes has every thread's stack dumped, so a hang
+      # names itself.
       - name: Run the Python suite under the sanitizers (this shard)
         env:
           BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
@@ -174,8 +188,13 @@ jobs:
           BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
         run: |
           set -euxo pipefail
-          LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -m pytest -p no:cacheprovider python/tests \
-            -n auto --dist worksteal -q --tb=short --durations=15 \
+          LD_PRELOAD="$SAN_PRELOAD" timeout -s INT 80m \
+            .venv/bin/python -m pytest -p no:cacheprovider python/tests \
+            -n auto --dist worksteal -q --tb=short -rfE --durations=30 \
+            -o faulthandler_timeout=300 \
+            --deselect python/tests/test_discontinuity_stall_bound.py::test_raising_max_steps_does_not_reintroduce_the_hang \
+            --deselect python/tests/test_stalled_state_switch_surface.py::test_a_slide_along_the_surface_is_not_carried_across \
+            --deselect python/tests/test_run_tests_sh.py::test_the_script_itself_runs_walk_up_dependent_tests_green \
             2>&1 | tee python-sanitizers-${{ matrix.shard }}.log
 
       # The sanitizer report is in the log, but with -n auto it can sit hundreds
