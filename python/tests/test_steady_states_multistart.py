@@ -668,14 +668,10 @@ def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path):
     assert seed.converged, seed
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#1190: Newton rebuilds the law's first member, C, as the total less "
-    "the others, and at 1e8 that round-off exceeds tol: the seed's solve ends at "
-    "3.1e-9, and on the LAPACK build steady_state()'s own at 3.5e-9",
-)
 def test_the_seed_returns_the_root_of_a_large_law_total(tmp_path):
+    """Newton rebuilt the law's first member, C, as the total less the others,
+    and at 1e8 that round-off exceeded tol: the seed's solve ended at 3.1e-9,
+    and every start failed (issue #1190). It rebuilds the largest member now."""
     sim = _pool(tmp_path, 1e8)
     roots = sim.steady_states(n_starts=20, seed=0)
     assert len(roots) == 1
