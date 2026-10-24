@@ -366,6 +366,15 @@ def test_bad_indices_are_named(tmp_path):
     }
 
 
+def test_every_field_a_gate_kind_names_is_one_the_core_reports(tmp_path):
+    """baked_volume and no_sparsity have no fixture here, so a misspelled field in
+    their _GATE_VERDICT_FIELDS rows would surface only as a KeyError at a decline."""
+    core = _model(tmp_path, _NET_SQUARE)._core
+    assert core.set_functional_jacobian([(7, False, [(0, "k")])]) is False
+    reported = set(core.last_functional_jacobian_decline())
+    assert set().union(*J._GATE_VERDICT_FIELDS.values()) <= reported - {"kind"}
+
+
 def test_a_missing_verdict_is_still_a_reason():
     """The formatter's floor, should a future refusal forget to record itself."""
 

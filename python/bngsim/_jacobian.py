@@ -4200,6 +4200,8 @@ def attach_decline_reason(core, terms=()) -> str:
 # (NetworkModel::set_functional_jacobian in src/model.cpp). Every other field
 # holds FunctionalJacobianDecline's placeholder (-1, NaN, 0 or an empty string),
 # which is no value: a -1 row read as a species index names the last species.
+# per_observable is the one default that is a value: the per-species sites leave
+# it False, which is what they are.
 _GATE_VERDICT_FIELDS: dict[str, tuple[str, ...]] = {
     "no_sparsity": (),
     "bad_reaction_index": ("rxn_idx",),
