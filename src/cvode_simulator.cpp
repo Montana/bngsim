@@ -3302,10 +3302,11 @@ struct CvodeSimulator::Impl {
             clock_states.size() >= kMarksKept) {
             return;
         }
-        const double near = 4.0 * kSwitchInstantUlps * std::numeric_limits<double>::epsilon() *
-                            std::max(std::fabs(t), 1.0);
-        const auto at = std::lower_bound(clock_instants.begin(), clock_instants.end(), t - near);
-        if (at == clock_instants.end() || !(*at <= t + near)) {
+        // Not `near`: <windef.h> defines it away, and MSVC read `const double = ...`.
+        const double slack = 4.0 * kSwitchInstantUlps * std::numeric_limits<double>::epsilon() *
+                             std::max(std::fabs(t), 1.0);
+        const auto at = std::lower_bound(clock_instants.begin(), clock_instants.end(), t - slack);
+        if (at == clock_instants.end() || !(*at <= t + slack)) {
             return;
         }
         const auto idx = static_cast<std::size_t>(at - clock_instants.begin());
