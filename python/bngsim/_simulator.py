@@ -9326,7 +9326,7 @@ class Simulator:
             # recomputes the totals from its start, reported a "root" of
             # m1_ground at a total of 0, not 100. Where nothing held moved, this
             # moves the seed by the integration's drift, a few 1e-9.
-            A, totals = _moving_laws(L, in_law, y0)
+            A, totals, law_scale = _moving_laws(L, in_law, y0)
             if A.shape[0]:
                 cols = np.flatnonzero(in_law)
                 w = np.maximum(seed_state[cols], np.finfo(float).tiny)
@@ -9335,7 +9335,7 @@ class Simulator:
                 # its way to None, which drops the seed. That is the answer, so
                 # nothing is raised or warned, and nothing non-finite is kept.
                 with np.errstate(all="ignore"):
-                    y = _project_onto_laws(w, A, totals)
+                    y = _project_onto_laws(w, A, totals, law_scale)
                 if y is None or not np.all(np.isfinite(y)):
                     seed_state = None
                 else:
@@ -10539,7 +10539,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    A, totals = _moving_laws(L, in_law, y0)
+    A, totals, own_scale = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10550,7 +10550,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     if A.shape[0]:
         cols = np.flatnonzero(in_law)
         for row in out:
-            y = _project_onto_laws(row[cols], A, totals)
+            y = _project_onto_laws(row[cols], A, totals, own_scale)
             if y is None:
                 raise SimulationError(
                     "steady_states(): the conservation laws admit no state with every "
@@ -10562,14 +10562,16 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
 
 def _moving_laws(L, in_law, y0):
     """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
-    totals the model's state ``y0`` holds (issue #524). A law over held species
-    alone constrains nothing a start moves, and is left out."""
+    totals the model's state ``y0`` holds (issue #524), and each law's own scale,
+    ``|A|·|y0|``: what its total is 0 to the round-off of (issue #1265). A law over
+    held species alone constrains nothing a start moves, and is left out."""
     A = L[:, in_law]
     A = A[(A != 0).any(axis=1)]
-    return A, A @ y0[in_law]
+    y = y0[in_law]
+    return A, A @ y, np.abs(A) @ np.abs(y)
 
 
-def _project_onto_laws(w, A, b, max_iter=200):
+def _project_onto_laws(w, A, b, scale=None, max_iter=200):
     """The point of ``{y > 0 : A·y = b}`` nearest ``w`` in relative entropy (issue #524).
 
     It is ``y = w·exp(Aᵀλ)`` at the minimum of the convex dual
@@ -10581,13 +10583,23 @@ def _project_onto_laws(w, A, b, max_iter=200):
     laws does, the iterates approach it by a factor ``e`` a step and the
     floor below takes them there. ``None`` when no step decreases ``F``: the
     laws admit no positive point.
+
+    Each law is judged on its own scale (issue #1265). A law of non-negative
+    coefficients has a positive point exactly when its total is positive, so it
+    is pinned only where the total is 0 to the round-off of its own members,
+    ``scale`` (``|A|·|y0|``, from :func:`_moving_laws`; ``|b|`` where not given,
+    which pins a total of 0 or less). And a law is met to ``1e-12`` of its own
+    total, or ``1e-15`` of its own ``scale``, not of the largest law's: beside a
+    pool of 1e8, a pool of 1e-5 was pinned to 0, and one of 1e-3 was met only
+    to 1e-7.
     """
-    ref = max(float(np.abs(b).max()), float((np.abs(A) @ w).max()))
+    b = np.asarray(b, dtype=float)
+    scale = np.abs(b) if scale is None else np.asarray(scale, dtype=float)
     out = np.array(w, dtype=float)
     live = np.ones(out.size, dtype=bool)
     rows = np.ones(A.shape[0], dtype=bool)
     while True:
-        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * ref)
+        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * scale)
         if not pin.any():
             break
         live &= ~(A[pin] != 0.0).any(axis=0)
@@ -10599,7 +10611,9 @@ def _project_onto_laws(w, A, b, max_iter=200):
     logw = np.log(w)
     lam = np.zeros(A.shape[0])
     y = w
-    floor = 1e-15 * ref
+    # Each law's own: its total, and its members' scale in the model's state,
+    # not the start's, whose weights are drawn on the largest law's scale.
+    floor = 1e-15 * np.maximum(np.abs(b), scale[rows])
     for _ in range(max_iter):
         g = A @ y - b
         if np.all(np.abs(g) <= 1e-12 * np.maximum(np.abs(b), np.abs(A) @ y) + floor):
