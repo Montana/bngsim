@@ -101,6 +101,116 @@ def test_a_stale_row_has_its_own_refusal_class():
     assert "archive_stale" not in R.SETTLED_REFUSALS  # it wants re-recording
 
 
+def test_an_unreadable_entry_is_refused_rather_than_raised(tmp_path):
+    spec = _spec(tmp_path)
+    path = R._archive_file(tmp_path / "arch", spec["key"])
+    path.parent.mkdir()
+    path.write_bytes(b"not an npz")
+    rr, exc, _t, _m = R.archive_load(tmp_path / "arch", spec)
+    assert rr is None and exc.startswith("archive_unreadable: ")
+    assert R.classify_reference_refusal(f"roadrunner (archive): {exc}") == "archive_unreadable"
+    assert "archive_unreadable" not in R.SETTLED_REFUSALS
+
+
+def test_keys_that_sanitize_alike_get_their_own_files(tmp_path):
+    assert R._archive_file(tmp_path, "a/b:ode") != R._archive_file(tmp_path, "a_b:ode")
+
+
+class _Queue(list):
+    put = list.append
+
+
+def _replay(tmp_path, monkeypatch, spec, *, bn):
+    """Drive the worker in-process on a replay, with RoadRunner's own call made
+    to fail the test and bngsim's answered by ``bn``."""
+    monkeypatch.setattr(R.rc, "measure_warmup", lambda include_roadrunner=True: {})
+    monkeypatch.setattr(R.rc, "rr_ode", lambda *a, **k: pytest.fail("RoadRunner ran on a replay"))
+    monkeypatch.setattr(R.rc, "bn_ode", bn)
+    q = _Queue()
+    R._worker(
+        {**spec, "metric": "max_rel_err", "tol": 1e-4, "reference_archive": tmp_path / "arch"}, q
+    )
+    (res,) = q
+    return res
+
+
+@pytest.mark.parametrize("kind", ["archive_stale", "archive_unreadable"])
+def test_an_unusable_entry_is_refused_before_bngsim_runs(tmp_path, monkeypatch, kind):
+    """A bngsim raise beside an unusable entry used to make the row BAD_TEST,
+    "neither engine ran", with the refusal lost; the row is never compared, so
+    bngsim is not run at all."""
+    R.archive_save(tmp_path / "arch", _spec(tmp_path), _rr(), "", None)
+    spec = _spec(tmp_path, rtol=1e-12)
+    if kind == "archive_unreadable":
+        spec = _spec(tmp_path)
+        R._archive_file(tmp_path / "arch", spec["key"]).write_bytes(b"truncated")
+    res = _replay(
+        tmp_path,
+        monkeypatch,
+        spec,
+        bn=lambda *a, **k: pytest.fail("bngsim ran for a row that is never compared"),
+    )
+    assert (res["status"], res["archive_refusal"]) == ("reference_failed", kind)
+    assert R.classify_reference_refusal(res["exception"]) == kind
+
+
+def test_a_replay_scores_the_record_and_names_the_recorded_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(R.versions, "roadrunner_version", lambda: "2.7.0")
+    R.archive_save(tmp_path / "arch", _spec(tmp_path), _rr(), "", {"integrate_sec": 0.01})
+    monkeypatch.setattr(R.versions, "roadrunner_version", lambda: "9.9.9")  # the local one
+    res = _replay(tmp_path, monkeypatch, _spec(tmp_path), bn=lambda *a, **k: (*_rr(), {}))
+    assert res["status"] == "pass" and res["reference_version"] == "2.7.0"
+    assert res["timing"]["roadrunner"]["replayed_from_archive"] is True
+    assert res["timing"]["roadrunner"]["reference_version"] == "2.7.0"
+
+
+def test_an_archive_refusal_is_judged_by_no_override(tmp_path, monkeypatch):
+    """An adjudication would turn archive_stale into a settled class, and an
+    invalid-reference entry would call itself stale and ask to be pruned; a row
+    that had no reference at all can do neither. The report also names the
+    RoadRunner version the archive recorded, not a local one."""
+    adjudicated, invalid = "BIOMD0000000003", "BIOMD0000000004"
+
+    def overrides(job):
+        if job.model_id == adjudicated:
+            return None, None, None, ("confirm", "an independent oracle agreed", "#117")
+        if job.model_id == invalid:
+            return None, None, ("RoadRunner answers NaN", "#485"), None
+        return None, None, None, None
+
+    def schedule(specs, worker, **kw):
+        rows = []
+        for s in specs:
+            row = {k: s[k] for k in ("key", "model_id", "method", "metric", "tol")}
+            if s["model_id"] == "BIOMD0000000001":
+                row.update(status="pass", value=0.0, reference_version="2.7.0")
+            else:
+                row.update(
+                    status="reference_failed",
+                    exception="roadrunner (archive): archive_stale: the job's rtol changed",
+                    archive_refusal="archive_stale",
+                )
+            rows.append(row)
+        return rows
+
+    monkeypatch.setattr(R, "_job_overrides", overrides)
+    monkeypatch.setattr(R.rc, "schedule", schedule)
+    out = tmp_path / "report.json"
+    argv = ["rr_run.py", "--jobs", str(SMOKE_JOBS), "--reference-archive", str(tmp_path / "a")]
+    monkeypatch.setattr(sys, "argv", [*argv, "--out", str(out)])
+    assert R.main() == 0
+    report = json.loads(out.read_text())
+    rows = {r["model_id"]: r for r in report["results"]}
+    for model_id in (adjudicated, invalid):
+        assert rows[model_id]["outcome"] == "REFERENCE_FAILED"
+        assert rows[model_id]["reference_refusal"] == "archive_stale"
+        assert "adjudicated" not in rows[model_id]["comment"]
+        assert "STALE" not in rows[model_id]["comment"]
+    assert rows["BIOMD0000000001"]["versions"]["roadrunner"] == "2.7.0"
+    assert rows[adjudicated]["versions"]["roadrunner"] is None
+    assert report["_meta"]["versions"]["roadrunner"] == "2.7.0"
+
+
 def test_the_two_flags_are_exclusive(tmp_path):
     proc = subprocess.run(
         [

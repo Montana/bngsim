@@ -255,14 +255,17 @@ def classify_reference_refusal(rr_exc: str) -> str:
     - ``recursive`` — RR rejected a recursive rule/assignment. Triage-worthy.
     - ``archive_stale`` — a replay found no archived reference matching the
       job (issue #805). Not RoadRunner's refusal: re-record the archive.
+    - ``archive_unreadable`` — a replay's entry for the job could not be read
+      at all (issue #805). Not RoadRunner's refusal either: re-record it.
     - ``other`` — unclassified; inspect the exception text.
     """
     e = (rr_exc or "").lower()
-    if "archive_stale" in e:
-        # Issue #805: the archived reference is no reference for the job any
-        # more (the model, its grid or its tolerances changed). Not RoadRunner's
-        # refusal; re-record the archive.
-        return "archive_stale"
+    for refusal in ARCHIVE_REFUSALS:
+        if refusal in e:
+            # Issue #805: the archive holds no usable reference for the job (the
+            # model, its grid or its tolerances changed, or the entry is
+            # unreadable). Not RoadRunner's refusal; re-record the archive.
+            return refusal
     if "missing a value" in e or "missing value" in e:
         return "overstrict_missing_value"
     if ("fast" in e and "reaction" in e) or "delay differential" in e or "dde" in e:
@@ -369,12 +372,21 @@ def _apply_invalid_reference(
 # REFERENCE_FAILED or BAD_TEST row replays as it ran. An entry whose identity no
 # longer matches the job is stale and is never compared: the row is
 # REFERENCE_FAILED with refusal class ``archive_stale``, which a nightly diff
-# alerts on where the case was good.
-ARCHIVE_FORMAT = 1
+# alerts on where the case was good. One that cannot be read at all is
+# ``archive_unreadable``, the same row, rather than a worker death blamed on
+# bngsim. Either is refused before bngsim runs. Beside the identity, an entry
+# records RoadRunner's version (``reference_version``) and the harness's git
+# revision; a replayed row reports the archived version as the reference's.
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
+ARCHIVE_REFUSALS = ("archive_stale", "archive_unreadable")
 
 
 def _archive_file(directory: str | Path, key: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", key) + ".npz")
+    # The readable part is sanitized, so the hash keeps keys such as a/b and a_b apart.
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', key)}-{digest}.npz"
 
 
 def _file_sha256(path: str | Path) -> str:
@@ -401,15 +413,10 @@ def archive_identity(spec: dict) -> dict:
 
 def archive_save(directory: str | Path, spec: dict, rr, rr_exc: str, rr_timing) -> Path:
     """Write one job's RoadRunner side (atomically)."""
-    try:
-        import roadrunner
-
-        rr_version = roadrunner.__version__
-    except Exception:  # noqa: BLE001 - provenance only
-        rr_version = None
     meta = {
         **archive_identity(spec),
-        "roadrunner": rr_version,
+        "reference_version": versions.roadrunner_version(),
+        "harness_git_rev": git_rev(str(HERE)),
         "exception": rr_exc,
         "timing": rr_timing,
     }
@@ -428,20 +435,30 @@ def archive_save(directory: str | Path, spec: dict, rr, rr_exc: str, rr_timing) 
 
 def archive_load(directory: str | Path, spec: dict):
     """One job's archived RoadRunner side: ``(rr, rr_exc, rr_timing, meta)``, or
-    ``(None, "<why stale>", None, None)`` where there is no usable entry."""
+    ``(None, "<archive refusal>: <why>", None, None)`` where there is no usable
+    entry. Never raises: a corrupt or foreign file is the archive's fault, not
+    bngsim's, so it is ``archive_unreadable`` rather than a dead worker."""
     path = _archive_file(directory, spec["key"])
     if not path.is_file():
         return None, "archive_stale: no entry for this job", None, None
-    with np.load(path, allow_pickle=False) as z:
-        meta = json.loads(bytes(z["meta"]).decode())
-        want = archive_identity(spec)
-        changed = sorted(k for k in want if meta.get(k) != want[k])
-        if changed:
-            return None, f"archive_stale: the job's {', '.join(changed)} changed", None, None
-        if "time" not in z:
-            return None, meta.get("exception") or "roadrunner: raised", meta.get("timing"), meta
-        names = json.loads(bytes(z["names"]).decode())
-        rr = (np.array(z["time"]), np.array(z["values"]), names)
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            meta = json.loads(bytes(z["meta"]).decode())
+            want = archive_identity(spec)
+            changed = sorted(k for k in want if meta.get(k) != want[k])
+            if changed:
+                return None, f"archive_stale: the job's {', '.join(changed)} changed", None, None
+            if "time" not in z:
+                return (
+                    None,
+                    meta.get("exception") or "roadrunner: raised",
+                    meta.get("timing"),
+                    meta,
+                )
+            names = json.loads(bytes(z["names"]).decode())
+            rr = (np.array(z["time"]), np.array(z["values"]), names)
+    except Exception as exc:
+        return None, f"archive_unreadable: {type(exc).__name__}: {exc}"[:400], None, None
     return rr, "", meta.get("timing"), meta
 
 
@@ -494,6 +511,23 @@ def _worker(spec: dict, q) -> None:
     # predating the field (e.g. the smoke subset) integrating from t_start as before.
     t_int = p.get("initial_time", p["t_start"])
 
+    # Issue #805: a replay reads its reference first. An entry the archive cannot
+    # stand in with (stale, missing or unreadable) is refused here, before bngsim
+    # runs: the row is never compared, and a bngsim raise beside it would
+    # otherwise read as BAD_TEST, "neither engine ran", hiding the refusal.
+    if replay:
+        archived_rr, archived_exc, archived_timing, archived = archive_load(replay, spec)
+        refusal = archived_exc.split(":", 1)[0]
+        if refusal in ARCHIVE_REFUSALS:
+            res["status"] = "reference_failed"
+            res["exception"] = f"roadrunner (archive): {archived_exc}"
+            res["archive_refusal"] = refusal
+            res["comment"] = "The archive holds no usable reference for this job; re-record it."
+            res["timing"] = {"warmup": warmup}
+            q.put(res)
+            return
+        res["reference_version"] = archived.get("reference_version")
+
     # --- bngsim side (record status; do NOT short-circuit on a generic raise) ---
     bn = None
     bn_exc = ""
@@ -525,11 +559,14 @@ def _worker(spec: dict, q) -> None:
     rr_wall = 0.0
     if replay:
         # Issue #805: the reference from the archive, RoadRunner not called.
-        rr, rr_exc, rr_timing, _meta = archive_load(replay, spec)
-        if rr_exc.startswith("archive_stale"):
-            rr_exc = f"roadrunner (archive): {rr_exc}"
+        rr, rr_exc, rr_timing = archived_rr, archived_exc, archived_timing
         if rr_timing is not None:
-            rr_timing = {**rr_timing, "replayed_from_archive": True}
+            rr_timing = {
+                **rr_timing,
+                "replayed_from_archive": True,
+                "reference_version": archived.get("reference_version"),
+                "recorded_by_harness": archived.get("harness_git_rev"),
+            }
     else:
         try:
             t0 = time.perf_counter()
@@ -851,7 +888,9 @@ def main() -> int:
             }
         )
 
-    ver = versions.stamp("roadrunner")
+    # A replay imports no RoadRunner (issue #805); its version is the one the
+    # archive entries recorded, filled in once the rows are back.
+    ver = versions.stamp(None if args.reference_archive else "roadrunner")
     # The SUNDIALS/CVODE build version (constant across the sweep), so the matrix
     # can name the exact integrator both engines share — see sundials_version().
     ver["sundials"] = rc.sundials_version()
@@ -859,7 +898,10 @@ def main() -> int:
     print("  bngsim vs RoadRunner — SBML parity (rr_parity)")
     print("=" * 72)
     print(f"  jobs: {len(specs)}   workers: {args.workers}   (ODE-only; SSA → ssa_screen.py)")
-    print(f"  bngsim {ver['bngsim']}   roadrunner {ver['roadrunner']}")
+    rr_label = (
+        f"from archive {args.reference_archive}" if args.reference_archive else ver["roadrunner"]
+    )
+    print(f"  bngsim {ver['bngsim']}   roadrunner {rr_label}")
     print(
         f"  ODE integration tol (both engines): rtol={args.rtol:g} atol={args.atol:g}   protocol: _core.differ"
     )
@@ -917,7 +959,12 @@ def main() -> int:
         # divergence, #485). A finite reference, an unestablishable one, or a
         # divergence the NaN does not cover flags the entry STALE so recovery
         # (and any real bngsim bug the override was masking) resurfaces.
-        invalid_ref = invalid_refs.get(r.get("key"))
+        # A row the reference archive refused (issue #805) had no reference at
+        # all, so it can neither confirm nor break this override's premise or the
+        # adjudication's below: both are left alone, and the row keeps its
+        # archive_* refusal so the entry gets re-recorded.
+        archive_refused = bool(r.get("archive_refusal"))
+        invalid_ref = None if archive_refused else invalid_refs.get(r.get("key"))
         if invalid_ref:
             reason, issue = invalid_ref
             outcome, comment, stale = _apply_invalid_reference(
@@ -948,7 +995,7 @@ def main() -> int:
         # ONLY while the row is genuinely REFERENCE_FAILED: if RR now runs it, or
         # bngsim's status changed, the entry is flagged STALE (the recovery / any
         # newly-surfaced bngsim defect can never be silently masked).
-        adjudication = adjudications.get(r.get("key"))
+        adjudication = None if archive_refused else adjudications.get(r.get("key"))
         if adjudication:
             verdict, reason, issue = adjudication
             tag = f" ({issue})" if issue else ""
@@ -977,7 +1024,12 @@ def main() -> int:
                 exception=r.get("exception", ""),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "roadrunner": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 reference_refusal=refusal,
                 timing=r.get("timing"),
@@ -1002,6 +1054,11 @@ def main() -> int:
         suffix = "" if args.config == "auto" else f"__{args.config}"
         out_path = HERE / "runs" / f"report_ode{suffix}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.reference_archive:
+        # The report's header names the RoadRunner the archive entries recorded
+        # (issue #805), every distinct one where they differ.
+        recorded = sorted({v for r in raw if (v := r.get("reference_version"))})
+        ver["roadrunner"] = " / ".join(recorded) or None
     meta = {
         "suite": "rr_parity",
         "reference_engine": "roadrunner",
