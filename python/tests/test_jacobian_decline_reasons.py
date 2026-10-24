@@ -82,6 +82,31 @@ def test_non_emittable_derivative_names_the_node_and_the_variable(info, monkeypa
     assert decline["reason"] in line
 
 
+def test_an_unset_volume_in_a_chain_rule_factor_is_named(info):
+    smeta = {0: (True, float("nan"))}  # amount-valued, its compartment size unset
+    assert (
+        J.build_per_species_terms("k*A_tot*A_tot", {}, {"A_tot": [(0, 1.0)]}, smeta, {"k"}) is None
+    )
+    (line,) = _decline_lines(info)
+    assert "non-finite chain-rule factor (nan)" in line
+    assert J.last_decline()["kind"] == "nonfinite_factor"
+
+
+@pytest.mark.parametrize("path", ["per_species", "per_observable"])
+def test_a_derivative_that_does_not_print_is_named(path, info, monkeypatch):
+    monkeypatch.setattr(J, "sympy_to_exprtk", lambda *a, **k: None)
+    if path == "per_species":
+        terms = J.build_per_species_terms(
+            "k*sin(A_tot)", {}, {"A_tot": [(0, 1.0)]}, {0: (False, 1.0)}, {"k"}
+        )
+    else:
+        terms = J.build_per_observable_terms("k*sin(A)", {}, {"A"}, {"k"})
+    assert terms is None
+    (line,) = _decline_lines(info)
+    assert "could not be printed as ExprTk" in line
+    assert J.last_decline()["kind"] == "unprintable"
+
+
 def test_a_derivative_that_folds_non_finite_is_its_own_kind():
     # 0^(A-1) over a state: a symbolic zoo the derivative cannot shed.
     assert J.differentiate_rate_law("k*if(B>1,B,0)^(A-1)", {}, {"A", "B"}, {"k"}) is None
@@ -112,6 +137,7 @@ def test_the_vocabulary_is_exactly_the_kinds_recorded(monkeypatch):
     gate = set(re.findall(r'case Kind::\w+:\s*return "(\w+)";', header.read_text())) - {"none"}
     assert {"non_emittable", "unexpected_error", "gate_unrecorded"} <= python, python
     assert {"fd_mismatch", "no_sparsity"} <= gate, gate
+    assert set(J._GATE_VERDICT_FIELDS) == gate  # which fields each gate kind sets
     assert python | gate == set(J.DECLINE_KINDS), (
         (python | gate) - set(J.DECLINE_KINDS),
         set(J.DECLINE_KINDS) - (python | gate),
@@ -255,3 +281,34 @@ def test_an_unexpected_error_is_its_own_kind(tmp_path, monkeypatch):
     reason = "an unexpected error during derivation: boom"
     assert m.analytical_jacobian_status == f"declined: {reason}"
     assert m.analytical_jacobian_decline == {"kind": "unexpected_error", "reason": reason}
+
+
+class _Core:
+    """A model's core with one of its methods made to raise."""
+
+    def __init__(self, core, raising: str):
+        self._core, self._raising = core, raising
+
+    def __getattr__(self, name):
+        if name == self._raising:
+
+            def fail(*args, **kwargs):
+                raise RuntimeError(f"{name} failed")
+
+            return fail
+        return getattr(self._core, name)
+
+
+@pytest.mark.parametrize(
+    ("raising", "kind", "said"),
+    [
+        ("functional_jacobian_context", "no_context", "could not provide its functional-Jacobian"),
+        ("set_functional_jacobian", "attach_raised", "the C++ attach raised RuntimeError"),
+    ],
+)
+def test_a_core_that_raises_is_a_named_decline(tmp_path, info, raising, kind, said):
+    core = _Core(_model(tmp_path, _NET_SQRT_AT_ZERO)._core, raising)
+    assert J.attach_functional_jacobian(core) is False
+    (line,) = _decline_lines(info)
+    assert said in line and f"{raising} failed" in line
+    assert J.last_decline()["kind"] == kind

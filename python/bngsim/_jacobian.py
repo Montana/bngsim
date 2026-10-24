@@ -69,7 +69,7 @@ logger = logging.getLogger("bngsim")
 # rest — an un-inlinable function, a parse failure, a symbol that survived
 # inlining, a derivative no emitter prints, the C++ attach gate — went silent at
 # every level, and a harness could record nothing but the boolean. Each decline
-# site now calls _declined(reason): one INFO line, and the reason kept on the
+# site now calls _declined(reason, kind=...): one INFO line, and the reason kept on the
 # thread so attach_functional_jacobian's caller (Model.prepare_analytical_jacobian)
 # can hand it out as Model.analytical_jacobian_status. Thread-local because a
 # derivation runs on the thread that loads the model and models load in parallel
@@ -88,6 +88,7 @@ DECLINE_KINDS: dict[str, str] = {
     "function_cycle": "a rate law's functions refer to each other in a cycle, or nest too deep",
     "unparsed": "a rate law could not be parsed into sympy",
     "unresolved_symbol": "a symbol survived inlining that is no observable, constant or time",
+    # _NONDIFFERENTIABLE_EMITTER_FUNCS is empty today, so nothing records this one.
     "nondifferentiable": "a function no emitter can differentiate is applied to the state",
     "non_emittable": "a derivative carries a node neither emitter can print",
     "nonfinite_derivative": "a derivative folds to a non-finite constant",
@@ -4195,35 +4196,40 @@ def attach_decline_reason(core, terms=()) -> str:
     return f"the C++ attach declined the derived terms ({kind})"
 
 
+# The fields each of the C++ attach gate's kinds sets on its verdict
+# (NetworkModel::set_functional_jacobian in src/model.cpp). Every other field
+# holds FunctionalJacobianDecline's placeholder (-1, NaN, 0 or an empty string),
+# which is no value: a -1 row read as a species index names the last species.
+_GATE_VERDICT_FIELDS: dict[str, tuple[str, ...]] = {
+    "no_sparsity": (),
+    "bad_reaction_index": ("rxn_idx",),
+    "bad_observable_index": ("rxn_idx", "per_observable", "target_idx"),
+    "baked_volume": ("rxn_idx", "per_observable", "row"),
+    "compile_failed": ("rxn_idx", "per_observable", "target_idx", "detail"),
+    # target_idx on the per-species path's own entry only; -1 on the other two
+    "term_outside_pattern": ("rxn_idx", "per_observable", "target_idx", "row", "col"),
+    "nonfinite_entry": ("probe", "row", "col", "analytical", "n_nonfinite"),
+    "fd_mismatch": ("probe", "row", "col", "analytical", "finite_difference"),
+}
+
+
 def attach_decline_verdict(core) -> dict:
     """The C++ attach gate's last decline on ``core`` as ``{"kind", ...}``: the
-    fields its verdict set, and the species its ``row`` and ``col`` index
-    (issue #538). ``{"kind": "gate_unrecorded"}`` where it recorded none.
-
-    A field the kind does not set holds ``FunctionalJacobianDecline``'s
-    placeholder (-1, NaN, 0 or an empty string) and is left out rather than
-    handed on as a value: a -1 ``row`` read as a species index names the last
-    species.
+    fields its kind sets (:data:`_GATE_VERDICT_FIELDS`), and the species its
+    ``row`` and ``col`` index (issue #538). ``{"kind": "gate_unrecorded"}`` where
+    it recorded none.
     """
     verdict = core.last_functional_jacobian_decline()
     if verdict is None:
         return {"kind": "gate_unrecorded"}
     v = dict(verdict)
-    out: dict = {"kind": str(v["kind"])}
-    out.update({k: v[k] for k in ("rxn_idx", "target_idx", "row", "col", "probe") if v[k] >= 0})
-    if "target_idx" in out:  # the index space target_idx is in
-        out["per_observable"] = v["per_observable"]
-    if "probe" in out:  # the self-check's entry, itself non-finite under nonfinite_entry
-        out["analytical"] = v["analytical"]
-    if not math.isnan(v["finite_difference"]):
-        out["finite_difference"] = v["finite_difference"]
-    if v["n_nonfinite"] > 0:
-        out["n_nonfinite"] = v["n_nonfinite"]
-    if v["detail"]:
-        out["detail"] = v["detail"]
+    kind = str(v["kind"])
+    out: dict = {"kind": kind, **{k: v[k] for k in _GATE_VERDICT_FIELDS.get(kind, ())}}
+    if out.get("target_idx") == -1 and kind == "term_outside_pattern":
+        del out["target_idx"]
     species = list(core.species_names)
     for key in ("row", "col"):
-        if key in out and out[key] < len(species):
+        if 0 <= out.get(key, -1) < len(species):
             out[f"{key}_species"] = species[out[key]]
     return out
 

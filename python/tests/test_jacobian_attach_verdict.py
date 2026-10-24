@@ -331,9 +331,12 @@ def test_entry_outside_the_pattern_is_named_on_the_per_observable_path(tmp_path)
     assert why["per_observable"] is True
     assert why["col"] == 2 and why["row"] in (0, 1)  # (A or B, C): C is in no rate law
     assert "/∂[C()], which has no slot" in J.attach_decline_reason(core)
-    fields = J.attach_decline_verdict(core)
-    assert set(fields) == {"kind", "rxn_idx", "row", "col", "row_species", "col_species"}
-    assert fields["col_species"] == "C()"
+    fields = J.attach_decline_verdict(core)  # no target_idx on this path: it is -1
+    assert set(fields) == {"kind", "rxn_idx", "per_observable", "row", "col"} | {
+        "row_species",
+        "col_species",
+    }
+    assert (fields["per_observable"], fields["col_species"]) == (True, "C()")
 
 
 def test_bad_indices_are_named(tmp_path):
@@ -346,6 +349,9 @@ def test_bad_indices_are_named(tmp_path):
     )
     # issue #538: per_observable is left at its default here, so it is not passed on
     assert J.attach_decline_verdict(core) == {"kind": "bad_reaction_index", "rxn_idx": 7}
+    assert core.set_functional_jacobian([(-1, False, [(0, "k")])]) is False
+    # the bad index is the verdict, even the -1 that is a placeholder elsewhere
+    assert J.attach_decline_verdict(core) == {"kind": "bad_reaction_index", "rxn_idx": -1}
     assert core.set_functional_jacobian([(0, True, [(99, "k")])]) is False
     why = core.last_functional_jacobian_decline()
     assert (why["kind"], why["rxn_idx"], why["target_idx"]) == ("bad_observable_index", 0, 99)
