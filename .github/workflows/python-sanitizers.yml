@@ -1,0 +1,191 @@
+name: python-sanitizers
+
+# The Python suite against an ASan + UBSan build of the extension.
+#
+# native-tests.yml's sanitizers job (#583) watches only the code the C++ unit
+# suite runs, which was 37% of the lines it compiles, and 17% of
+# cvode_simulator.cpp, when this was added. It never builds _bngsim_core at all,
+# so the binding layer, where #566's unchecked memcpy was, is outside it. The
+# Python suite is where the engine is actually exercised: thousands of tests,
+# every one of them through _bngsim_core. This job runs that suite with the
+# extension, and the bngsim library linked into it, compiled under
+# -fsanitize=address,undefined. A bad index anywhere on those paths then stops
+# the test with a report instead of returning a wrong number.
+#
+# How the pieces fit:
+#
+#   * The flags reach CMake through SKBUILD_CMAKE_DEFINE, so pyproject.toml is
+#     untouched. SuiteSparse's autobuild does not inherit them and stays
+#     uninstrumented, as vendored code should.
+#   * CPython is not instrumented, so the ASan runtime has to be in the process
+#     before the extension loads: LD_PRELOAD on the pytest command, not on the
+#     shell. PYTHONMALLOC=malloc routes Python's allocations through malloc,
+#     where ASan can see them.
+#   * Leak detection is off. CPython does not free everything at exit, so LSan
+#     would report the interpreter, not bngsim. native-tests.yml keeps it on for
+#     the C++ suite.
+#   * --extra test, not dev: roadrunner and jax ship large native runtimes of
+#     their own, and this job is about bngsim's. Their tests skip here.
+#
+# What it still cannot see: the C the codegen path writes and compiles at run
+# time (cc -O3, no sanitizer flags), and anything the Python suite does not run.
+#
+# Two guards, because a sanitizer job is green when nothing is reported, which
+# is also what a build the flags never reached reports. One checks that the
+# installed extension calls into both runtimes (uv caches builds, and a cached
+# plain one would otherwise pass). The other runs a known heap overflow through
+# the same interpreter and environment and requires that ASan stops it.
+#
+# Non-blocking, like the C++ sanitizer job, until it has been green for a while.
+# It runs on pull requests that touch the C++ side, nightly for everything else,
+# and on demand.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - ".github/workflows/python-sanitizers.yml"
+  schedule:
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: python-sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-sanitizers:
+    name: Python suite · ubuntu-latest · ASan + UBSan · ${{ matrix.shard }}/2
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: python-sanitizers-build
+          save: ${{ matrix.shard == 1 }}
+          max-size: 500M
+
+      # BNGSIM_BUILD_PYTHON and BNGSIM_REQUIRE_KLU are repeated from pyproject's
+      # cmake.define so this list does not depend on how scikit-build-core merges
+      # the two. --reinstall-package so uv builds bngsim here rather than reusing
+      # a cached plain build.
+      - name: Build the extension under the sanitizers
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          SKBUILD_CMAKE_BUILD_TYPE: RelWithDebInfo
+          SKBUILD_CMAKE_DEFINE: >-
+            BNGSIM_BUILD_PYTHON=ON;BNGSIM_REQUIRE_KLU=ON;CMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined;CMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined
+        run: |
+          set -euxo pipefail
+          uv sync --extra test --python 3.12 --reinstall-package bngsim
+          ccache --show-stats
+
+      - name: Guard against an uninstrumented extension
+        run: |
+          set -euo pipefail
+          mod="$(find .venv -name '_bngsim_core*.so' | head -1)"
+          if [ -z "$mod" ]; then
+            echo "::error::No _bngsim_core extension under .venv."
+            exit 1
+          fi
+          for sym in __asan_report_ __ubsan_handle_; do
+            if ! nm -D --undefined-only "$mod" | grep -q "$sym"; then
+              echo "::error::$mod makes no $sym* calls; the sanitizer flags did not reach the build."
+              exit 1
+            fi
+          done
+          echo "$mod is instrumented for ASan and UBSan."
+
+      # The environment the suite runs in, set once for the two steps that need
+      # it. LD_PRELOAD goes on each python command, never into GITHUB_ENV, so uv
+      # and the runner's own tools do not run with the ASan runtime loaded.
+      - name: Sanitizer runtime environment
+        run: |
+          set -euo pipefail
+          {
+            echo "SAN_PRELOAD=$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)"
+            echo "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1"
+            echo "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+            echo "PYTHONMALLOC=malloc"
+          } >> "$GITHUB_ENV"
+
+      - name: Guard that ASan is live in the test interpreter
+        run: |
+          set -euo pipefail
+          LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -c \
+            "import bngsim; print('bngsim', bngsim.__version__, 'HAS_KLU', bngsim.HAS_KLU)"
+          if ! LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -c "import bngsim, sys; sys.exit(0 if bngsim.HAS_KLU else 1)"; then
+            echo "::error::HAS_KLU is False; the sanitized build lost KLU and the sparse paths would go unwatched."
+            exit 1
+          fi
+          # A 128-byte read from a 64-byte heap block (64, not 8: ctypes keeps a
+          # buffer of 16 bytes or less inside the object, where reading on would
+          # not leave the allocation). Under this environment ASan must stop the
+          # interpreter; if it exits cleanly, nothing below is being watched.
+          set +e
+          LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -c "
+          import ctypes
+          src = ctypes.create_string_buffer(64)
+          dst = ctypes.create_string_buffer(128)
+          ctypes.memmove(dst, src, 128)
+          print('read past the block and nothing stopped it')
+          " > /tmp/canary.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/canary.log
+          if [ "$rc" -eq 0 ] || ! grep -q "AddressSanitizer: heap-buffer-overflow" /tmp/canary.log; then
+            echo "::error::A known heap overflow ran to completion (exit $rc); ASan is not active in the test interpreter."
+            exit 1
+          fi
+          echo "ASan stopped the planted overflow (exit $rc), as it must."
+
+      - name: Run the Python suite under the sanitizers (this shard)
+        env:
+          BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
+          BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
+          BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
+        run: |
+          set -euxo pipefail
+          LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -m pytest -p no:cacheprovider python/tests \
+            -n auto --dist worksteal -q --tb=short --durations=15 \
+            2>&1 | tee python-sanitizers-${{ matrix.shard }}.log
+
+      # The sanitizer report is in the log, but with -n auto it can sit hundreds
+      # of lines above the summary. Pull every report to the top of the step.
+      - name: Sanitizer reports
+        if: always()
+        run: |
+          set -euo pipefail
+          log="python-sanitizers-${{ matrix.shard }}.log"
+          [ -f "$log" ] || exit 0
+          if grep -nE "ERROR: AddressSanitizer|\.(c|cc|cpp|h|hh|hpp):[0-9]+:[0-9]+: runtime error:" "$log"; then
+            echo "::error::Sanitizer reports above (shard ${{ matrix.shard }})."
+          else
+            echo "No sanitizer reports in shard ${{ matrix.shard }}."
+          fi
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sanitizers-${{ matrix.shard }}
+          path: python-sanitizers-${{ matrix.shard }}.log
+          if-no-files-found: ignore
