@@ -132,6 +132,22 @@ def test_a_read_through_the_argument_is_not_an_outside_read(tmp_path):
     bngsim.NfsimSession(str(xml)).destroy()
 
 
+@pytest.mark.parametrize("ctr", ["Time", " time", "TIME()"])
+def test_a_table_read_as_the_clock_however_it_is_spelled_is_refused(tmp_path, ctr):
+    # NFsim trims and lowercases a table's counter and takes time or t as the
+    # clock before any symbol. A step table, which the linear-table refusal
+    # (#1179) lets through, read in fB(x)*tfun(..., Time) goes stale the same way:
+    # AX at t = 12 was 19.1 on nf against 69.1 on rm.
+    src = (DATA / "rate_law_time_table.xml").read_text()
+    old = 'ctrName="time" xData="0,10" yData="0.1,5" method="linear"'
+    assert src.count(old) == 1
+    xml = tmp_path / "clock_spelling.xml"
+    xml.write_text(src.replace(old, f'ctrName="{ctr}" xData="0,10" yData="0.1,5" method="step"'))
+    assert stale_local_function_reads(xml) == [("_rateLaw1", ctr.strip())]
+    with pytest.raises(ModelError, match=r"'_rateLaw1' .*reads.*#1062"):
+        bngsim.NfsimSession(str(xml))
+
+
 @pytest.mark.parametrize(
     "edit",
     [

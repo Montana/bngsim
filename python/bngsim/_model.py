@@ -103,7 +103,7 @@ class Model:
         "_interpret_sec",
         "_jac_derive_sec",
         "_jac_attempted",
-        "_jac_decline_reason",
+        "_jac_decline",
         "_net_path",
         "_ssa_issues",
         "_ar_report_map",
@@ -216,8 +216,9 @@ class Model:
         # False for all-Elementary models and for legitimate FD fallbacks, which
         # would make a non-differentiable model re-run SymPy on every solve.
         self._jac_attempted: bool = False
-        # Issue #506: why the attempt declined, for analytical_jacobian_status.
-        self._jac_decline_reason: str | None = None
+        # Issues #506/#538: why the attempt declined, {"kind", "reason", ...}, for
+        # analytical_jacobian_status and analytical_jacobian_decline.
+        self._jac_decline: dict | None = None
         # Set by Model.from_net: the .net file the model was loaded from.
         # Provenance only since #803: every backend reads the built model. It
         # used to select the .net codegen path (kept for "issue #15's
@@ -932,13 +933,20 @@ class Model:
             if derived is None:
                 try:
                     from bngsim._switch_sensitivity import (
+                        _condition_key,
                         _monotone_pieces,
                         _strip_redundant_parens,
                         time_discontinuity_conditions,
                     )
 
                     def spelled(c: str) -> str:
-                        return _strip_redundant_parens(c).replace(" ", "")
+                        # A condition reached through a function definition is
+                        # spelled `(time())` where the same one written directly
+                        # reads `time()`, and the loader registers one spelling
+                        # for both (issue #1082); compared on the same key, so
+                        # the one registered covers the other, which the
+                        # recovery otherwise added again as a stop.
+                        return _strip_redundant_parens(_condition_key(c)).replace(" ", "")
 
                     registered = {spelled(c) for c in self._time_disc_conditions}
                     # The loader registers a turning comparison as its two
@@ -1045,7 +1053,10 @@ class Model:
                 try:
                     from bngsim._switch_sensitivity import state_switch_root_conditions
 
-                    roots = state_switch_root_conditions(self._core, covered=covered)
+                    roots, guards = state_switch_root_conditions(
+                        self._core, covered=covered, with_guards=True
+                    )
+                    _remember(self._state_switch_root_memo, ("guards", covered), guards)
                 except Exception as e:  # pragma: no cover - defensive
                     # Detection is best-effort: without it a model keeps the
                     # stepping it had before issue #897, which is correct
@@ -1063,6 +1074,36 @@ class Model:
             self._state_switch_root_conditions = roots
             self._state_switch_root_covered = covered
         return self._state_switch_root_conditions
+
+    def _state_switch_guards_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
+        """Parallel to :meth:`_state_switch_roots_beside`: for each root, the
+        ``if()`` branches it switches a rate law in, as an expression that reads
+        1 where one of them is on, or ``""`` where it switches one outside any
+        branch (issue #1147). A plain run steps on through a crossing whose
+        every branch is off."""
+        roots = self._state_switch_roots_beside(covered)
+        guards = self._state_switch_root_memo.get(("guards", covered))
+        if guards is None and roots:
+            # The memo is shared with clones and cleared whole at its cap
+            # (_remember), which can take the guards while this model still
+            # holds its roots. Every later run would then restart at the
+            # crossings the guards step through, so derive them again.
+            try:
+                from bngsim._switch_sensitivity import state_switch_root_conditions
+
+                again, guards = state_switch_root_conditions(
+                    self._core, covered=covered, with_guards=True
+                )
+            except Exception:  # pragma: no cover - defensive, as for the roots
+                guards = None
+            else:
+                if tuple(again) == tuple(roots):
+                    _remember(self._state_switch_root_memo, ("guards", covered), guards)
+                else:
+                    guards = None
+        if guards is None or len(guards) != len(roots):
+            return ("",) * len(roots)
+        return guards
 
     def _state_switch_stops_beside(self, covered: tuple[str, ...]) -> tuple[str, ...]:
         """The roots :meth:`_state_switch_roots_beside` has for step and bend
@@ -1135,18 +1176,21 @@ class Model:
             return bool(self._core.analytical_jacobian_complete)
         self._jac_attempted = True
         try:
-            from bngsim._jacobian import attach_functional_jacobian, last_decline_reason
+            from bngsim._jacobian import attach_functional_jacobian, last_decline
 
             t0 = time.perf_counter()
             attach_functional_jacobian(self._core)
             self._jac_derive_sec = time.perf_counter() - t0
-            self._jac_decline_reason = last_decline_reason()
+            self._jac_decline = last_decline()
         except Exception as e:
             # attach_functional_jacobian is contractually no-raise (it falls back
             # to FD and logs over-budget / unsupported cases itself, GH #95); this
             # guard only surfaces a genuinely unexpected error without re-deriving.
             logger.debug("Analytical Functional Jacobian skipped: %s", e)
-            self._jac_decline_reason = f"an unexpected error during derivation: {e}"
+            self._jac_decline = {
+                "kind": "unexpected_error",
+                "reason": f"an unexpected error during derivation: {e}",
+            }
         return bool(self._core.analytical_jacobian_complete)
 
     @property
@@ -1172,8 +1216,31 @@ class Model:
             return "complete"
         if not self._jac_attempted:
             return "pending"
-        reason = self._jac_decline_reason or "no reason was recorded"
-        return f"declined: {reason}"
+        return f"declined: {(self._jac_decline or _NO_DECLINE_RECORD)['reason']}"
+
+    @property
+    def analytical_jacobian_decline(self) -> dict | None:
+        """Why the model runs on the finite-difference Jacobian, as a stable
+        category a census can group by (issue #538).
+
+        ``None`` while :attr:`analytical_jacobian_status` is ``"complete"`` or
+        ``"pending"``. Otherwise a dict with ``kind``, one of
+        ``bngsim._jacobian.DECLINE_KINDS``, and ``reason``, the status's text
+        after ``"declined: "``. For the C++ attach gate's kinds (``fd_mismatch``,
+        ``nonfinite_entry``, ...) it also carries the fields that kind's verdict
+        sets — of ``rxn_idx``, ``per_observable``, ``target_idx``, ``row``,
+        ``col``, ``probe``, ``analytical``, ``finite_difference``,
+        ``n_nonfinite`` and ``detail`` — and the species ``row`` and ``col``
+        name as ``row_species`` / ``col_species``. A field the kind does not
+        set is absent, not a placeholder.
+
+        The kind is what to group by: the reason embeds the rate law, names and
+        values, and its wording changes. A clone carries it, as it carries the
+        status.
+        """
+        if bool(self._core.analytical_jacobian_complete) or not self._jac_attempted:
+            return None
+        return dict(self._jac_decline or _NO_DECLINE_RECORD)
 
     # ─── Load-phase timing accessors ──────────────────────────────────────
     # Public read-only views of the per-model setup timings the SBML loader
@@ -1254,7 +1321,7 @@ class Model:
         # an un-warmed parent inherits _jac_attempted=False and derives on first
         # solve — hence warm-before-clone for parallel fitting, GH #145 §3).
         m._jac_attempted = self._jac_attempted
-        m._jac_decline_reason = self._jac_decline_reason
+        m._jac_decline = dict(self._jac_decline) if self._jac_decline is not None else None
         # GH #97: same warm-clone reasoning for the #198 output-sens analysis — a
         # clone has the parent's structure, so re-running its sympy would be N×
         # waste in parallel fitting. Shared by reference (the analysis is
@@ -2443,13 +2510,50 @@ class Model:
             if analytical:
                 vals = self._core.fill_sparse_analytical_jacobian(t, y_arr)
             else:
-                vals = gather_pattern(self._core, self._core.fill_dense_fd_jacobian(t, y_arr))
+                dense = self._core.fill_dense_fd_jacobian(t, y_arr)
+                self._warn_if_the_step_decides(t, y_arr, dense)
+                vals = gather_pattern(self._core, dense)
             return csc_from_pattern(self._core, vals, source)
         if analytical:
             dense = self._core.fill_dense_analytical_jacobian(t, y_arr)
         else:
             dense = self._core.fill_dense_fd_jacobian(t, y_arr)
+            self._warn_if_the_step_decides(t, y_arr, dense)
         return JacobianMatrix(dense, source)
+
+    def _warn_if_the_step_decides(self, t: float, y: np.ndarray, dense: np.ndarray) -> None:
+        """Warn where the difference quotient ``dense`` and the same matrix
+        with the columns of species far below the state's scale at their own
+        step differ by more than 1e-4 of a column's largest entry (issue
+        #1002). The first steps every species by 1.5e-8 of the state's largest
+        concentration, which reads a term of second order in a small species
+        as a secant across it; the second misses a term that reads it through a
+        sum with something much larger. ``steady_state`` refuses the columns
+        it would solve with such a matrix; here the matrix is returned, as it
+        was, and the warning names the entry."""
+        own, changed = self._core.fill_dense_fd_jacobian_own_step(t, y, np.asfortranarray(dense))
+        worst = None
+        for j in changed:
+            largest = float(np.max(np.abs(dense[:, j])))
+            apart = np.abs(own[:, j] - dense[:, j])
+            i = int(np.argmax(apart))
+            share = apart[i] / largest if largest > 0.0 else np.inf
+            if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):
+                worst = (share, i, j)
+        if worst is None:
+            return
+        _, i, j = worst
+        names = self.species_names
+        warnings.warn(
+            f"Model.jacobian(): the entry d(rate of {names[i]})/d{names[j]} of this "
+            f"difference quotient is {dense[i, j]:.6g} with {names[j]} stepped by 1.5e-8 of "
+            f"the state's largest concentration, and {own[i, j]:.6g} stepped by 1.5e-8 of "
+            "itself, more than 1e-4 of its column's largest entry apart (issue #1002). "
+            f"{_STEP_DECIDES_WHY} The first is returned. "
+            "steady_state(sensitivity_params=...) refuses columns solved with such a matrix.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     def propensities(self, y, t: float = 0.0) -> np.ndarray:
         """Every reaction's SSA propensity at state ``y`` and time ``t``.
@@ -2848,6 +2952,19 @@ class Model:
             f"observables={self.n_observables}, parameters={self.n_parameters})"
         )
 
+
+# Why a difference quotient's step can decide its answer (issue #1002), said
+# once for the Model.jacobian() warning and the steady-state refusal alike.
+_STEP_DECIDES_WHY = (
+    "A species far below the state's scale is stepped by many times itself at the "
+    "first, which reads a term of second order in it as a secant across it, and the "
+    "second misses a term that reads it through a sum with something much larger "
+    "(a total minus what is bound): which of the two is right is not known."
+)
+
+# A declined attempt that recorded no reason (issue #538), for
+# Model.analytical_jacobian_decline and the status read from it.
+_NO_DECLINE_RECORD = {"kind": "unrecorded", "reason": "no reason was recorded"}
 
 # How many recoveries a model and its clones keep in each of the issue #726
 # memos. Each is one parameter-dependent verdict and a model has few, so a full

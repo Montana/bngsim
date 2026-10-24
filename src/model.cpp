@@ -169,15 +169,10 @@ NetworkModel NetworkModel::clone() const {
     }
     // Species names are registered for event trigger / assignment-RHS
     // expressions (matches the post-build registration in
-    // model_builder.cpp). define_variable throws on duplicate, so guard
-    // against species names that collide with observables.
-    for (auto &sp : copy.impl_->species) {
-        try {
-            copy.impl_->evaluator->define_variable(sp.name, &sp.concentration);
-        } catch (...) {
-            // Already registered as a parameter or observable — skip.
-        }
-    }
+    // model_builder.cpp). A name already registered as a parameter or
+    // observable, or one that is no symbol (a .net species `A()`), is skipped.
+    for (auto &sp : copy.impl_->species)
+        copy.impl_->evaluator->try_define_variable(sp.name, &sp.concentration);
 
     // Re-bind the rateOf accessors (GH #106) BEFORE any expression that may
     // reference a rate_of__<species> token is re-compiled. The copy gets its own
@@ -1318,6 +1313,18 @@ const NetworkModel::StateSwitch *NetworkModel::state_switch(const std::string &c
         return nullptr;
     }
     return &it->second.first;
+}
+
+int NetworkModel::compiled_expression(const std::string &expression_src) const {
+    auto it = impl_->compiled_expression_cache.find(expression_src);
+    if (it == impl_->compiled_expression_cache.end()) {
+        // A text that does not compile throws here and is not cached; compile()
+        // appends nothing for it, so asking again costs a compile, not memory.
+        it = impl_->compiled_expression_cache
+                 .emplace(expression_src, impl_->evaluator->compile(expression_src))
+                 .first;
+    }
+    return it->second;
 }
 
 const std::vector<int> &NetworkModel::event_trigger_residual_species(int event_idx0) const {
@@ -3603,6 +3610,16 @@ void NetworkModel::fill_dense_fd_jacobian(double t, const double *conc, double *
     fd_dense_state_jacobian(
         [this](double tt, const double *y, double *f) { compute_derivs(tt, y, f); }, t, conc,
         n_species(), kNoExcluded, jac);
+}
+
+std::vector<int> NetworkModel::fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                               const double *floored, double *jac) {
+    static const std::vector<int> kNoExcluded;
+    const int ns = n_species();
+    std::vector<double> f0(static_cast<size_t>(ns));
+    compute_derivs(t, conc, f0.data());
+    return fd_own_step_columns([this, t](const double *y, double *f) { compute_derivs(t, y, f); },
+                               conc, ns, ns, kNoExcluded, f0.data(), floored, jac);
 }
 
 void NetworkModel::fill_sparse_analytical_jacobian(double t, const double *conc, double *vals) {

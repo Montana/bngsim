@@ -18,6 +18,7 @@ Properties:
 - `n_species`, `n_reactions`, `n_observables`, `n_parameters`, `n_functions`, `n_events`
 - `species_names`, `param_names`, `observable_names`, `function_names`
 - `analytical_jacobian_status` — `"complete"`, `"pending"` (functional rate laws not derived yet), or `"declined: <reason>"` when the model runs on the finite-difference Jacobian: the rate law and what stopped its derivation, the derivation budget, the C++ attach gate's verdict, or the environment switch. The gate's verdict names the entry it refused, with the probe state and both values — `∂f[B()]/∂[A()] is non-finite (inf) at probe 0 (the seed state) while the RHS is finite`, or `the finite-difference self-check found a trustworthy mismatch at probe 0 (the seed state) in ∂f[LX()]/∂[LX()]: analytical 0, finite-difference -10` (issue #534). The same reason is logged at INFO on the `bngsim` logger when it happens (issue #506)
+- `analytical_jacobian_decline` — the same decline as a dict a census can group by: `None` while the status is `"complete"` or `"pending"`, otherwise `kind` (a stable category from `bngsim._jacobian.DECLINE_KINDS`, such as `budget`, `unresolved_symbol` or the C++ gate's `fd_mismatch`) and `reason` (the status text after `declined: `). The gate's kinds also carry the fields their verdict sets (of `rxn_idx`, `per_observable`, `target_idx`, `row`, `col`, `probe`, `analytical`, `finite_difference`, `n_nonfinite` and `detail`; a field a kind does not set is absent) and the species `row` and `col` name as `row_species` / `col_species`. Group by `kind`, not by the text, whose wording changes (issue #538)
 - `primary_param_names` — the model's independent **knobs**, and the list to hand an optimizer or sampler, less `frozen_params` where a model has any. `param_names` minus two classes, one per flag: `param_is_expression` (a derived `ConstantExpression`, recomputed from the primaries underneath it) and `param_is_internal` (a slot bngsim synthesized — an SBML `_V0_<comp>`, or a function's backing slot — which `set_param` refuses to write). A constant written as arithmetic (`gamma 1/7`) is **not** in either class and is an ordinary knob (issue #227)
 - `frozen_params` — the parameters that a number the model was built with was read from. For SBML (compartment sizes, `speciesReference` ids and a kinetic law's own parameters among them): a compartment size set by an `initialAssignment` or a constant assignment rule, the initial value of a species converted by the size of a compartment that is a state, a stoichiometry, a `conversionFactor`, an initial value that could not be kept symbolic, each followed down through what it reads. For a compartmental BNGL model: the volumes BNG2.pl wrote into the rate constants (each parameter a `unit_conversion=` comment names, and what a derived parameter or a function among them reads). `set_param` refuses to change one and a sensitivity column for one is refused (issues #695, #696, #711). Empty for most models
 
@@ -105,7 +106,8 @@ Stop conditions:
 
 Steady-state (`method` ∈ `"integration"` (default), `"newton"`, `"kinsol"` alias):
 - **`steady_state(*, tol, max_time, method, rtol, atol, max_steps, sensitivity_params, mask)`** → `SteadyStateResult`
-- **`steady_state_batch(params, *, tol, max_time, method, rtol, atol, max_steps, n_workers, mask)`** → `list[SteadyStateResult]`
+- **`steady_state_batch(params=None, *, states, tol, max_time, method, rtol, atol, max_steps, n_workers, mask, newton_burst)`** → `list[SteadyStateResult]`. `states` starts each entry from a state of its own, paired row by row with `params`; `newton_burst=False` with `method="newton"` solves from that state with no integration burst and reports an unstable root instead of rejecting it (issue #524)
+- **`steady_states(*, n_starts, seed, upper, decades, dedupe_rtol, tol, n_workers, mask)`** → `SteadyStates`: every steady state multistart Newton finds from starts sampled on the conservation manifold, each with its stability (issue #524). See the user guide's steady-state page
 - Both raise `SimulationError` for a model with an event, or one that reads the time (issue #710): the solvers read the right-hand side at `t = 0` and fire no event. `run(steady_state=True)` integrates such a model to the end of its span and does not stop early.
 
   `mask` (issue #74): which species enter the convergence norm — a boolean array of length `n_species`, or the species names to keep. Default `None` tests every species (BNG2.pl parity). It also restricts the KINSOL unknown set and the `dY_ss/dp` system to the same subspace; excluded species get a NaN `dY_ss/dp` row. See `Model.is_pure_sink()`.
@@ -207,9 +209,15 @@ Session control:
   reads the clock (`time()` or a table function indexed by time) that raises
   `SimulationError`. `solver_stats["n_steps"]` counts the events since
   `initialize`, as an `NfsimSession`'s does.
-- **`step_to(time, *, timeout)`** — Advance without recording output;
-  honors the same `timeout` semantics as `simulate(...)`.
+- **`step_to(time, *, timeout)`** — Advance to `time` on the model's clock
+  without recording output; honors the same `timeout` semantics as
+  `simulate(...)`.
 - **`destroy()`** — Release the live RuleMonkey session
+
+Every time a session takes or reports (`current_time`, the clock read through
+`evaluate`, a `save_state` snapshot) is model time. A model that reads the
+clock in its functions has its events placed on time elapsed since the
+session's start, which keeps a late start's waiting times (issue #1063).
 
 Parameters and counts:
 - **`set_param(name, value)`** — Set a parameter before initialization

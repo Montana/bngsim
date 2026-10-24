@@ -296,8 +296,9 @@ class NetworkModel {
     // compartment volume it divides by, and whatever
     // expression_support() finds behind each of its rate parameters (the
     // function or expression that writes it). Sorted, into `out`. Returns false
-    // when that cannot be decided — a table function indexed by an observable,
-    // whose species no expression names — and the caller must assume every species.
+    // when that cannot be decided — a rateOf read, or a table function indexed by
+    // something that is neither the time, a parameter nor an observable — and the
+    // caller must assume every species.
     bool reaction_rate_species_support(int rxn_idx0, std::vector<int> &out) const;
 
     // Does a rate parameter of reaction `rxn_idx0` take its value from a model
@@ -376,6 +377,13 @@ class NetworkModel {
     // event_trigger_reads_time takes (issue #908)? Never by probing values: a
     // residual h(t)*(S - thr(t)) has no time derivative on its own surface.
     bool state_switch_reads_time(const StateSwitch &sw) const;
+
+    // The evaluator expression id of *expression_src*, compiled into this
+    // model's evaluator the first time it is asked for and the same id after
+    // (issue #1147: a run's state-switch guards, compiled on every run, grew the
+    // evaluator by one expression per guard per run). Cached by source text and,
+    // like state_switch(), NOT copied by clone(). Throws as compile() does.
+    int compiled_expression(const std::string &expression_src) const;
 
     // ExprTk expression-table indices of the discontinuity triggers (GH #72).
     const std::vector<int> &discontinuity_triggers() const;
@@ -495,6 +503,14 @@ class NetworkModel {
     // matrix the solver would have factored, not a different approximation.
     // Fixed-species rows come out zero because compute_derivs zeroes them.
     void fill_dense_fd_jacobian(double t, const double *conc, double *jac);
+
+    // The same matrix with the columns of species far below the state's scale
+    // taken at their own step where bngsim/fd_jacobian.hpp's rules allow
+    // (fd_own_step_columns, issue #1002), into `jac`, from the floored matrix
+    // `floored` that fill_dense_fd_jacobian wrote at the same point. Returns the
+    // species (0-based) whose columns differ; empty where none does.
+    std::vector<int> fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                     const double *floored, double *jac);
 
     // (species_idx0, param_idx0) pairs for species whose initial
     // concentration is set directly by a parameter (.net "begin species"

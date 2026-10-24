@@ -153,7 +153,7 @@
       </Observable>
     </ListOfObservables>
     <ListOfFunctions>
-      <Function id="tfun_rate" type="TFUN" mode="inline" ctrName="time" xData="0,1,2" method="linear">
+      <Function id="tfun_rate" type="TFUN" mode="inline" ctrName="time" xData="0,1,2" method="step">
         <Expression>k_base*__TFUN_VAL__</Expression>
         <ListOfReferences>
           <Reference name="k_base" type="Constant"/>

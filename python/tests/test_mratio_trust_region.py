@@ -255,8 +255,14 @@ def test_a_zero_the_series_cannot_finish_is_refused(tmp_path):
     """With b past about 5e8 and z near b the terms fall too slowly for the
     series' million-term cap (here it would need 7.1e6). It gives up with a NaN
     and the call goes on: the rule refuses a = 0 with 2*z > b, and the asymptotic
-    route refuses a = 0 outright. Were either to let it through, it would reach
-    the fraction at the a = 0 where it settles on a false limit."""
+    route refuses a = 0 outright.
+
+    The fraction would not have been wrong at this point. Before issue #768 it
+    answered 1253314.4707011, and the ratio is 1253314.4706489 (mpmath, summed
+    over 1.05e7 terms): 4.2e-11 off. So this pins a refusal, not a correction.
+    The refusal holds because nothing vouches for the fraction at a = 0 with
+    2*z > b: where it was checked (b up to 100, z from 20 to 400) it was wrong at
+    168 of 200 points, mratio(0, 1, 100) among them."""
     with pytest.raises(Exception, match=r"not reliable.*#768"):
         _value(tmp_path, 0.0, 1e12, 1e12)
 

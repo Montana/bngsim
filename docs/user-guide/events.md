@@ -115,7 +115,7 @@ rise fires. Runs without sensitivities are unaffected.
 | Priority ordering | ✅ | Real-valued priority, read when each event executes; equal-priority ties broken by seed-keyed RNG (§4.11.6) |
 | Same-instant cascade | ✅ | Delay-0 events an assignment triggers join the batch (§4.11.6) |
 | `useValuesFromTriggerTime` | ✅ | SBML L3 default (`True`): assignment RHS frozen at trigger time. `False` evaluates at firing time |
-| SSA / PSA events | ✅ | Non-delayed events only — see limitations below |
+| SSA / PSA events | ✅ | Delayed events included (issue #526) |
 
 ### Delayed events
 
@@ -151,23 +151,25 @@ model = bngsim.Model.from_antimony_string("""
     S = 100; k_decay = 0.1;
     J1: S -> ; k_decay * S;
 
-    at (time > 10): S = 200;   # bolus, no delay — supported under SSA
+    at (time > 10): S = 200;              # bolus
+    at 2 after (time > 15): S = S + 50;  # a delayed one
 """)
 
 sim = bngsim.Simulator(model, method="ssa")
 result = sim.run(t_span=(0, 20), n_points=21, seed=42)
 ```
 
-Delay-bearing events are the one gap: `method="ssa"` and `method="psa"` reject
-them at run entry with an error naming the offending event. Use `method="ode"`
-for models that need delayed events.
+Delayed events run under `method="ssa"` and `method="psa"` as under
+`method="ode"` (issue #526). The delay is read when the event triggers, and
+with `useValuesFromTriggerTime` (the default) so are the assigned values. The
+execution then waits in a queue and is taken at its own time, which stops the
+reaction step that would have passed it. A non-persistent event whose trigger
+goes false before then does not execute. A row sampled at the execution time
+reads its effect. Executions still waiting at the end of a `run_until` leg
+carry into the next.
 
 ### Known limitations
 
-- **Delays are ODE-only**: `method="ode"` supports the full event feature set.
-  `method="ssa"` and `method="psa"` support events *without* delays; a
-  delay-bearing event is rejected at run entry with an error naming the event id.
-  Use `method="ode"` or drop the `delay` attribute.
 - **`rateOf` triggers are ODE-only**: models using the SBML `rateOf` csymbol are
   rejected under SSA/PSA — the instantaneous dx/dt it refers to has no
   well-defined value in a discrete stochastic trajectory.

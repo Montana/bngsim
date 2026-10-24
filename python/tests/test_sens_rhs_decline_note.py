@@ -50,7 +50,8 @@ needs_cc = pytest.mark.skipif(_CC is None, reason="no C compiler on PATH")
 #
 #   DIFFERENTIABLE — the positive control. Nothing declines, so the artifact
 #                    carries the symbol and there is no reason to record.
-#   UNDERIVABLE    — abs() is the issue's own reproduction. The analytic RHS is
+#   UNDERIVABLE    — abs() was the issue's own reproduction, written with clamp()
+#                    since abs() has an analytic RHS (issue #1126). The analytic RHS is
 #                    declined and the difference quotient answers the same smooth
 #                    question more slowly: "slow", not "wrong".
 #   UNCOMPENSATED  — a comparison outside an if() head. The analytic RHS is
@@ -88,7 +89,7 @@ end groups
 """
 
 DIFFERENTIABLE = "beta*I"
-UNDERIVABLE = "beta*abs(I-thresh)*I"
+UNDERIVABLE = "beta*(clamp(0,I-thresh,1e300)+clamp(0,thresh-I,1e300))*I"  # abs(I-thresh)
 UNCOMPENSATED = "beta*(I>1)*I"
 
 
@@ -150,7 +151,7 @@ class TestTheVerdictIsPublished:
     def test_an_underivable_rate_law_is_not(self, tmp_path, isolated_cache):
         sim = _sim(tmp_path, UNDERIVABLE)
         assert sim.has_analytic_sens_rhs is False
-        assert "abs()" in sim.sens_rhs_decline_reason
+        assert "clamp" in sim.sens_rhs_decline_reason
 
     def test_it_is_a_plain_bool_a_consumer_can_act_on(self, tmp_path, isolated_cache):
         """Read as an attribute, not called as a method, and a ``bool`` rather than
@@ -188,7 +189,7 @@ class TestTheReasonSurvivesTheCache:
         first = _sim(tmp_path, UNDERIVABLE)
         assert first.codegen_cache_hit is False, "the first build must be the cold one"
         reason = first.sens_rhs_decline_reason
-        assert "abs()" in reason
+        assert "clamp" in reason
 
         second = _sim(tmp_path, UNDERIVABLE, name="again.net")
         assert second.codegen_cache_hit is True, "the second build must hit the cache"
@@ -267,7 +268,7 @@ class TestTheReasonSurvivesTheCache:
         assert sim.has_analytic_sens_rhs is False
         # This build derived the reason itself, so it still has it; what is lost is
         # the next build's ability to.
-        assert "abs()" in sim.sens_rhs_decline_reason
+        assert "clamp" in sim.sens_rhs_decline_reason
         assert _notes(isolated_cache) == []
 
 
@@ -280,10 +281,11 @@ class TestTheModelPathAsWell:
     path the tests above take: its own structural cache key, its own cache-hit
     branch, and its own place to write the note. The issue was filed on a model of
     exactly this kind — a rate law ``k*S*|S-Km|``, reported on the first
-    construction and silent on every one after it.
+    construction and silent on every one after it. abs() has an analytic RHS
+    since issue #1126, so a floor() stands in for it, and SBML has no clamp().
     """
 
-    LAW = "model absmod; S=10; P=0; k=0.3; Km=2.5; J0: S -> P; k*S*abs(S-Km); end"
+    LAW = "model absmod; S=10; P=0; k=0.3; Km=2.5; J0: S -> P; k*S*floor(S+Km); end"
 
     def _sim(self):
         pytest.importorskip("antimony")
@@ -298,7 +300,7 @@ class TestTheModelPathAsWell:
         cold = self._sim()
         assert cold.codegen_cache_hit is False
         assert cold.has_analytic_sens_rhs is False
-        assert "abs()" in cold.sens_rhs_decline_reason
+        assert "floor()" in cold.sens_rhs_decline_reason
 
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="bngsim"):
@@ -450,7 +452,7 @@ class TestTheJitSourcePathRecordsItToo:
         model._want_output_sens = True  # what sensitivity_params= sets
         source = cg.prepare_model_codegen_source(model)
         assert "bngsim_codegen_sens_rhs" not in source
-        assert "abs()" in model._codegen_sens_decline
+        assert "clamp" in model._codegen_sens_decline
 
     def test_a_model_that_did_not_decline_records_none(self, tmp_path, isolated_cache):
         """Recorded on every prepare, including as ``None``, so a later plain build
@@ -471,7 +473,7 @@ class TestTheJitSourcePathRecordsItToo:
         model = _model(tmp_path, UNDERIVABLE)
         model._want_output_sens = True
         cg.prepare_model_codegen_source(model)
-        assert "abs()" in cg.last_sens_rhs_decline()
+        assert "clamp" in cg.last_sens_rhs_decline()
         assert model._codegen_sens_decline == cg.last_sens_rhs_decline()
 
 

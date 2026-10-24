@@ -1,0 +1,67 @@
+# IgE.bngl (parity_checks/bng_parity/models/original/bngl_models/my_models/ode/IgE.bngl)
+# by BNG2.pl generate_network, at its initial state. R(a~1) - R(a~0) + 2*IgE_dimer is
+# conserved because both reactions out of R(a~X) run at kmx: a line of steady states
+# (issue #1001).
+# Created by BioNetGen 2.9.3
+begin parameters
+    1 NA                        6.02214076e23  # Constant
+    2 cell_density              1e9  # Constant
+    3 Vecf                      1/cell_density  # ConstantExpression
+    4 Vcyt                      1e-12  # Constant
+    5 IgE_dimer_conc            1e-9  # Constant
+    6 IgE_dimer_tot             IgE_dimer_conc*(NA*Vecf)  # ConstantExpression
+    7 R_tot                     3e5  # Constant
+    8 Lyn_tot                   3e5  # Constant
+    9 Syk_tot                   3e5  # Constant
+   10 kf                        1e8/(NA*Vecf)  # ConstantExpression
+   11 kr                        2e-1  # Constant
+   12 KxRT                      300  # Constant
+   13 kmx                       kr  # ConstantExpression
+   14 kpx                       (KxRT*kmx)/R_tot  # ConstantExpression
+   15 kpL                       1e6/(NA*Vcyt)  # ConstantExpression
+   16 kmL                       0.01  # Constant
+   17 fLyn                      0  # Constant
+   18 _InitialConc1             fLyn*R_tot  # ConstantExpression
+   19 _InitialConc2             (1-fLyn)*R_tot  # ConstantExpression
+   20 _InitialConc3             Lyn_tot-(fLyn*R_tot)  # ConstantExpression
+end parameters
+begin species
+    1 IgE_dimer() IgE_dimer_tot
+    2 R(a~0,b~ULyn,g~0) _InitialConc1
+    3 R(a~0,b~0,g~0) _InitialConc2
+    4 Lyn() _InitialConc3
+    5 Syk() Syk_tot
+    6 R(a~1,b~ULyn,g~0) 0
+    7 R(a~1,b~0,g~0) 0
+    8 R(a~X,b~ULyn,g~0) 0
+    9 R(a~X,b~0,g~0) 0
+end species
+begin reactions
+    1 1,2 6 kf #_R1
+    2 1,3 7 kf #_R1
+    3 3,4 2 kpL #_R5
+    4 2 3,4 kmL #_reverse__R5
+    5 6 1,2 kr #_reverse__R1
+    6 7 1,3 kr #_reverse__R1
+    7 2,6 8,8 kpx #_R2
+    8 2,7 8,9 kpx #_R2
+    9 3,6 8,9 kpx #_R2
+   10 3,7 9,9 kpx #_R2
+   11 4,7 6 kpL #_R5
+   12 6 4,7 kmL #_reverse__R5
+   13 8 2 kmx #_R3
+   14 9 3 kmx #_R3
+   15 8 6 kmx #_R4
+   16 9 7 kmx #_R4
+   17 4,9 8 kpL #_R5
+   18 8 4,9 kmL #_reverse__R5
+end reactions
+begin groups
+    1 free_R               2,3
+    2 monomeric_ligand_bound_R 6,7
+    3 ligand_bound_R       6,7,8,9
+    4 monomeric_R          2,3,6,7
+    5 R_in_dimers          8,9
+    6 Rtot                 2,3,6,7,8,9
+    7 Rtot_alt             2,3,6,7,8,9
+end groups
