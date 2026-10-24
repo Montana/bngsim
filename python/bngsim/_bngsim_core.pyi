@@ -847,7 +847,7 @@ class RuleMonkeySimulator:
         """
     def set_reads_clock(self, enabled: bool) -> None:
         """
-        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start, and a span too short for the doubles near its times to integrate a clock-driven rate is refused
+        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start
         """
     def set_species_count(self, pattern: str, count: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
@@ -1179,6 +1179,7 @@ class SsaSimulator:
 class SteadyStateOptions:
     codegen_c_source: str
     codegen_so_path: str
+    criterion: str
     force_dense_linear_solver: bool
     force_sparse_linear_solver: bool
     jacobian: str
@@ -1259,7 +1260,13 @@ class SteadyStateResultCore:
     def concentrations(self) -> list[float]:
         ...
     @property
+    def continued_run_distance(self) -> float:
+        ...
+    @property
     def converged(self) -> bool:
+        ...
+    @property
+    def criterion(self) -> str:
         ...
     @property
     def eigenvalues(self) -> numpy.typing.NDArray[numpy.complex128]:
@@ -1304,6 +1311,9 @@ class SteadyStateResultCore:
         ...
     @property
     def n_unstable_roots_rejected(self) -> int:
+        ...
+    @property
+    def newton_distance(self) -> float:
         ...
     @property
     def observable_names(self) -> list[str]:

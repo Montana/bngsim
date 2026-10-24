@@ -190,9 +190,50 @@ def _two_steps(a, b, *, on="time"):
     return _doc([("cv", size)], params=params)
 
 
-def _sn_at(model, times):
-    result = bngsim.Simulator(model, method="ode").run(sample_times=times, rtol=1e-10, atol=1e-12)
+def _sn_at(model, times, *, codegen=False):
+    result = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        sample_times=times, rtol=1e-10, atol=1e-12
+    )
     return np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+
+
+def _n_steps(*thresholds):
+    names = tuple(f"t{i + 1}" for i in range(len(thresholds)))
+    size = _cn(1)
+    for name in names:
+        size = _plus(size, _step_at(name))
+    params = "".join(
+        f'<parameter id="{n}" value="{v!r}" constant="true"/>'
+        for n, v in zip(names, thresholds, strict=True)
+    )
+    return _doc([("cv", size)], params=params)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    "thresholds",
+    [(2.0, 2.0, 2.0), (2.0, 2.0, 3.0), (3.0, 2.0, 2.0)],
+    ids=["three together", "two then one", "one then two"],
+)
+def test_three_jumps_on_one_instant_rescale_once(thresholds, codegen):
+    """#1132's review: the sibling rule was shown on pairs; three steps on one
+    instant are one rescale too, on both backends."""
+    times = np.array([0.0, 1.9, 2.5, 3.5])
+    got = _sn_at(bngsim.Model.from_sbml_string(_n_steps(*thresholds)), times, codegen=codegen)
+    size = 1 + sum((times >= t).astype(float) for t in thresholds)
+    np.testing.assert_allclose(got, 5 / size, rtol=1e-8)
+
+
+def test_the_reversed_spelling_of_a_sibling_is_one_jump():
+    """`piecewise(1, t >= t2, 0)` is `piecewise(0, t < t2, 1)` spelled the
+    other way round; beside `piecewise(0, t < t1, 1)` at t1 = t2 the two are
+    one instant and one rescale, 5 -> 5/3."""
+    reversed_step = _pw((_cn(1), _rel("geq", T, _ci("t2"))), otherwise=_cn(0))
+    size = _plus(_plus(_cn(1), _step_at("t1")), reversed_step)
+    params = "".join(f'<parameter id="{n}" value="2.0" constant="true"/>' for n in ("t1", "t2"))
+    times = np.array([0.0, 1.9, 2.5, 3.5])
+    got = _sn_at(bngsim.Model.from_sbml_string(_doc([("cv", size)], params=params)), times)
+    np.testing.assert_allclose(got, 5 / (1 + 2 * (times >= 2.0)), rtol=1e-8)
 
 
 @pytest.mark.parametrize(
@@ -471,14 +512,19 @@ def test_a_condition_an_event_also_moves_is_refused():
 # did, `cw := 1 + Sn`, nothing rescaled [Sw] at all.
 
 
-def _sized_doc(compartments, species, rules, *, params="", reactions=""):
+def _sized_doc(compartments, species, rules, *, params="", reactions="", functions="", amounts=()):
     comp_xml = "".join(
         f'<compartment id="{c}" size="1" constant="{str(c == "c").lower()}"/>'
         for c in compartments
     )
     sp_xml = "".join(
-        f'<species id="{s}" compartment="{c}" initialConcentration="{x}" '
-        'hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>'
+        f'<species id="{s}" compartment="{c}" '
+        + (
+            f'initialAmount="{x}" hasOnlySubstanceUnits="true" '
+            if s in amounts
+            else f'initialConcentration="{x}" hasOnlySubstanceUnits="false" '
+        )
+        + 'boundaryCondition="false" constant="false"/>'
         for s, c, x in species
     )
     rule_xml = "".join(
@@ -486,6 +532,7 @@ def _sized_doc(compartments, species, rules, *, params="", reactions=""):
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
+ <listOfFunctionDefinitions>{functions}</listOfFunctionDefinitions>
  <listOfCompartments>{comp_xml}</listOfCompartments>
  <listOfSpecies>{sp_xml}</listOfSpecies>
  <listOfParameters><parameter id="k" value="0.5" constant="true"/>{params}</listOfParameters>
@@ -786,6 +833,78 @@ def test_a_ring_of_three_through_conditions_is_refused():
         bngsim.ModelError, match=r"cu reads Sw in cw; cw reads Sn in cv; cv reads Su in cu"
     ):
         bngsim.Model.from_sbml_string(xml)
+
+
+def test_a_ring_through_a_rule_is_refused():
+    """#1134's review: cv's new size reads [Sw] through the parameter rule
+    `q := 1 + Sw`, not by name. The refusal sees through the rule."""
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cv", _step(_cn(1), BEFORE_2, _ci("q"))),
+            ("q", _plus(_cn(1), _ci("Sw"))),
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
+        params='<parameter id="q" value="4" constant="false"/>',
+    )
+    with pytest.raises(bngsim.ModelError, match=r"cv reads Sw in cw; cw reads Sn in cv"):
+        bngsim.Model.from_sbml_string(xml)
+
+
+def test_a_ring_through_a_function_definition_is_refused():
+    """The same ring with cv's read inside `plus1(Sw)`, a function definition."""
+    plus1 = (
+        '<functionDefinition id="plus1"><math '
+        + M
+        + "><lambda><bvar><ci>x</ci></bvar>"
+        + _plus(_cn(1), _ci("x"))
+        + "</lambda></math></functionDefinition>"
+    )
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cv", _step(_cn(1), BEFORE_2, f"<apply><ci>plus1</ci>{_ci('Sw')}</apply>")),
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
+        functions=plus1,
+    )
+    with pytest.raises(bngsim.ModelError, match=r"cv reads Sw in cw; cw reads Sn in cv"):
+        bngsim.Model.from_sbml_string(xml)
+
+
+def test_an_amount_link_is_no_ring():
+    """Control. Sw is an amount (hasOnlySubstanceUnits), so cw's size does not
+    dilute it and cv's read of it closes no ring: the model loads and runs."""
+    xml = _sized_doc(
+        ["cv", "cw"],
+        [("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cv", _step(_cn(1), BEFORE_2, _plus(_cn(1), _ci("Sw")))),
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
+        amounts={"Sw"},
+    )
+    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+        t_span=(0.0, 4.0), n_points=5
+    )
+    sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    assert sn[0] == 5.0 and sn[-1] == pytest.approx(5 / 4, rel=1e-6)
+
+
+def test_a_ring_of_one_runs_and_stays():
+    """The ring of one: `cv := piecewise(1, t < 2 || [Sn] > 2, 5)` alone has the
+    same two consistent states after t = 2 (stay at 1 with [Sn] = 5, or jump
+    to 5 with [Sn] = 1) as the pair #1134 refuses, and is not refused: the
+    run keeps the state it is in. Pinned here so a change in that choice is
+    seen (#1134's review; libRoadRunner refuses it as recursive)."""
+    xml = _sized_doc(["cv"], [("Sn", "cv", 5)], [("cv", _on_or_after_2("Sn", 2))])
+    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+        t_span=(0.0, 4.0), n_points=5
+    )
+    sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    np.testing.assert_allclose(sn, 5.0, rtol=1e-8)
 
 
 def test_a_condition_read_one_way_is_no_ring():

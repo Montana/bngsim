@@ -1173,7 +1173,29 @@ struct SensitivityOptions {
 // `jacobian` asks for it (issue #127); before that each differenced its own, at
 // one RHS evaluation per unknown per setup.
 struct SteadyStateOptions {
-    double tol = 1e-9;     // convergence tolerance: ||f(y)||_2 / n_species < tol
+    double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
+    // What `converged` asks of a state (issue #1001). "scaled" (the default):
+    // the parity test below, and a run taken on from the state for max_time
+    // (at most 1e6) moves no species by more than rtol·|y_i| + atol_i (the
+    // march's own tolerances): what tells a state the system rests at from one
+    // under tol that a run leaves (a model in small units, or a slow one). An
+    // unstable root a run from it does not leave passes. The Newton step
+    // from the state to the root within the same tolerances (to 512 unknowns)
+    // decides where the solve stops, not `converged`; the state it stops at is
+    // polished. A burst-free Newton solve (newton_burst false), which reports
+    // unstable roots, takes no runs and is decided by the parity test.
+    // "residual": BNG2.pl's parity test alone, ||f(y)||_2 / n_species < tol,
+    // a number in the model's units of concentration per time, kept for
+    // comparisons with run_network.
+    std::string criterion = "scaled";
+    // Set by find_steady_state, for "scaled": whether the step is taken; the
+    // largest species the solve starts with, which caps the absolute part of
+    // the criterion's tolerances; and, for a burst-free Newton solve, that
+    // its root is accepted by the residual test, at whatever iterate KINSOL
+    // ends.
+    bool criterion_by_distance = false;
+    double criterion_start_size = 0.0;
+    bool criterion_by_residual = false;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
     double atol = 1e-8;    // CVODE absolute tolerance
@@ -1297,7 +1319,21 @@ struct SteadyStateOptions {
 struct SteadyStateResult {
     std::vector<double> concentrations; // n_species steady-state values
     std::vector<std::string> species_names;
-    double residual = 0.0;   // max|f(y)| at convergence
+    double residual = 0.0; // max|f(y)| at convergence
+    // Issue #1001: the largest |δ_i| over rtol·|y_i| + atol_i at the returned
+    // state, δ the Newton step to the root, which under "scaled" decided
+    // where the solve stopped (SteadyStateOptions::criterion). Measured under
+    // "scaled" only, for a system of up to 512 unknowns; NaN under "residual"
+    // and above that, and +inf where the reduced Jacobian is singular at a
+    // state that is not a root.
+    double newton_distance = std::numeric_limits<double>::quiet_NaN();
+    // Issue #1001, the run test of "scaled": the largest move of a measured
+    // species over its tolerance, across the run taken on from the returned
+    // state; at most 1 passes. +inf where the run could not be taken to its
+    // time; NaN where none was taken (under "residual", where the parity test
+    // already refused, and for a burst-free Newton solve).
+    double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
+    std::string criterion;   // the criterion `converged` was decided by
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations

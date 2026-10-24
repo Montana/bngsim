@@ -353,4 +353,103 @@ class TestSensValueLines:
         assert cg._sens_value_lines(data) is None
 
     def test_declines_rateof(self):
+        """With no reaction list there is no rate to read in its place."""
         assert cg._sens_value_lines(_data([("fA", f"{cg._RATEOF_PREFIX}A * 2")])) is None
+
+    def test_reads_a_rate_of_as_its_rate_law(self):
+        """Issue #1124, item 7: A is lost at the rate law ``vA``, so rateOf(A)
+        is -vA, written out to what vA reads."""
+        data = _data([("vA", "kd*A"), ("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["reactions"] = [
+            {
+                "type": "functional",
+                "function_name": "vA",
+                "stat_factor": 1.0,
+                "apply_species_factor": False,
+                "per_species_volume_scaling": False,
+                "reactants": [0],
+                "products": [],
+            }
+        ]
+        _obs, func = cg._sens_value_lines(data)
+        assert func[2] == "    func[1] = (((-1.0)*(p[1]*y[0]))) * 2.0;  /* fA */"
+
+    @staticmethod
+    def _mass_action(data):
+        data["reactions"] = [
+            {
+                "type": "elementary",
+                "function_name": "k",
+                "stat_factor": 1.0,
+                "rate_param_indices": [0],
+                "reactants": [0],
+                "products": [],
+            }
+        ]
+        return data
+
+    def test_reads_a_rate_of_a_species_a_mass_action_reaction_moves(self):
+        """k·A, with A read through the observable that holds it alone, as the
+        engine's species factor reads it."""
+        data = self._mass_action(_data([("fA", f"{cg._RATEOF_PREFIX}A * 2")]))
+        _obs, func = cg._sens_value_lines(data)
+        assert func[1] == "    func[0] = (((-1.0)*p[0]*obs[0])) * 2.0;  /* fA */"
+
+    def test_declines_where_no_observable_holds_the_reactant_alone(self):
+        data = self._mass_action(_data([("fA", f"{cg._RATEOF_PREFIX}A * 2")]))
+        data["observables"] = [{"name": "Atot", "entries": [(0, 2.0)]}]
+        assert cg._sens_value_lines(data) is None
+
+    def test_declines_a_michaelis_menten_rate(self):
+        data = _data([("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["reactions"] = [
+            {
+                "type": "mm",
+                "function_name": "",
+                "stat_factor": 1.0,
+                "rate_param_indices": [0, 1],
+                "reactants": [1, 0],
+                "products": [1],
+            }
+        ]
+        assert cg._sens_value_lines(data) is None
+
+    def test_a_fixed_species_rate_is_zero_whatever_moves_it(self):
+        """The engine zeroes a fixed species' derivative last, so its rate is 0
+        even where a reaction no law can state lists it."""
+        data = _data([("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["species"][0]["fixed"] = True
+        data["reactions"] = [
+            {
+                "type": "mm",
+                "function_name": "",
+                "stat_factor": 1.0,
+                "rate_param_indices": [0, 1],
+                "reactants": [1, 0],
+                "products": [1],
+            }
+        ]
+        _obs, func = cg._sens_value_lines(data)
+        assert func[1] == "    func[0] = ((0.0)) * 2.0;  /* fA */"
+
+    def test_writes_the_rate_into_the_guarded_value_text_too(self):
+        """The value is printed from ``eval_expression`` (GH #333's zero-base
+        guard) where there is one; left there, the token was an undeclared
+        name in C."""
+        data = _data([("vA", "kd*A"), ("fA", f"{cg._RATEOF_PREFIX}A * 2")])
+        data["functions"][1]["eval_expression"] = f"if(A == 0, 0, {cg._RATEOF_PREFIX}A * 2)"
+        data["reactions"] = [
+            {
+                "type": "functional",
+                "function_name": "vA",
+                "stat_factor": 1.0,
+                "apply_species_factor": False,
+                "reactants": [0],
+                "products": [],
+            }
+        ]
+        _obs, func = cg._sens_value_lines(data)
+        assert cg._RATEOF_PREFIX not in func[2]
+        assert func[2] == (
+            "    func[1] = ((y[0] == 0.0) ? (0.0) : ((((-1.0)*(p[1]*y[0]))) * 2.0));  /* fA */"
+        )

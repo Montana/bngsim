@@ -27,13 +27,14 @@ _OFF = (
 _ON = "species S = 2; k = 0.5\nJ2: S -> ; piecewise(k*S*S/max(S, 0.001), time < 50, 0)\n"
 
 
-def _run(text, roots=True, t_end=10.0, rtol=1e-8, atol=1e-8, monkeypatch=None):
+def _run(text, roots=True, t_end=10.0, rtol=1e-8, atol=1e-8, monkeypatch=None, codegen=False):
     if not roots:
         monkeypatch.setattr(bngsim.Model, "_state_switch_roots_beside", lambda self, covered: ())
     model = bngsim.Model.from_antimony_string(text)
-    run = bngsim.Simulator(model, method="ode").run(
-        t_span=(0.0, t_end), n_points=int(t_end) + 1, rtol=rtol, atol=atol
-    )
+    sim = bngsim.Simulator(model, method="ode", codegen=codegen)
+    if codegen:
+        assert sim.codegen_backend != "none"
+    run = sim.run(t_span=(0.0, t_end), n_points=int(t_end) + 1, rtol=rtol, atol=atol)
     stats = run.solver_stats
     return (
         np.asarray(run.species)[:, 0],
@@ -97,6 +98,31 @@ def test_a_crossing_with_its_branch_on_still_restarts(monkeypatch):
     _y, counters = _run(_ON, t_end=30.0)
     _y0, counters0 = _run(_ON, roots=False, t_end=30.0, monkeypatch=monkeypatch)
     assert counters != counters0
+
+
+def _has_cc() -> bool:
+    from bngsim import _codegen
+
+    try:
+        _codegen._find_c_compiler()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _has_cc(), reason="no C compiler available")
+def test_the_compiled_backend_takes_the_guards_too(monkeypatch):
+    """The guards are read by the core, beside the roots, whatever computes the
+    right-hand side; #1148's runs were all interpreted. Compiled, the off branch
+    steps as if unrooted and the on branch still restarts."""
+    y, counters = _run(_OFF, codegen=True)
+    _y0, counters0 = _run(_OFF, roots=False, monkeypatch=monkeypatch, codegen=True)
+    assert counters == counters0
+    np.testing.assert_allclose(y, np.arange(11.0), rtol=1e-6)
+    monkeypatch.undo()
+    _y, on = _run(_ON, t_end=30.0, codegen=True)
+    _y0, on0 = _run(_ON, roots=False, t_end=30.0, monkeypatch=monkeypatch, codegen=True)
+    assert on != on0
 
 
 @pytest.mark.parametrize("text", [_OFF, _ON], ids=["off", "on"])
