@@ -2,20 +2,35 @@
 """Cross-engine trajectory agreement for the Table S4 SBML models.
 
 A timing comparison is only meaningful when the engines compute the *same*
-trajectory. This companion to ``run_s4_timing.py`` records, per model, how well the
-independent SBML engines agree at the final time with bngsim ``from_sbml`` (the
-reference): libRoadRunner (rr_parity's reference engine) and COPASI, the two
-non-BNGsim engines that complete the SBML models natively.
+trajectory. This companion to ``run_s4_timing.py`` records, per model, whether
+bngsim ``from_sbml``, libRoadRunner (rr_parity's reference engine) and COPASI, the
+two non-BNGsim engines that complete the SBML models natively, compute the same
+trajectory, and how accurate each is at the settings it was timed at.
+
+Both are measured against a converged reference: the model integrated once at
+``REF_RTOL``/``REF_ATOL`` (libRoadRunner; bngsim where libRoadRunner fails), on the
+figure's own output grid (issue #1250). The two questions need it:
+
+- **Same computation.** Each engine is run at the reference tolerances too, and
+  ``agree`` is True when every one that completes is within ``AGREE_TOL`` of the
+  reference: the engines converge to one trajectory. This verdict used to compare
+  bngsim with the others at the timing tolerance, which measures that tolerance's
+  slack, not the engines: on Koo2013 at rtol 1e-6 the final state swings by up to 7%
+  with the number of output rows, in every engine, while at rtol 1e-12 the three
+  agree to 2e-8. A 5% bar there was passed or failed by the grid.
+- **Accuracy at the timed settings.** Each engine's final-state error from the
+  reference at the figure's tolerances, ``*_error_at_timing_tolerances``. It is
+  reported, not judged: it is a fact about the settings, which a reader of the
+  timing table needs, and on Koo2013 it is several percent in every engine.
 
 Agreement uses an ORDER-INDEPENDENT comparison of the sorted final-state value
 multisets — robust for spatial models whose species share display names across grid
 cells (name alignment misaligns those and manufactures a spurious disagreement).
 COPASI's final state is read from its 148 metabolite objects, not its raw time series
 (which also carries compartments/global quantities); RoadRunner is additionally
-name-aligned where names are unique, as a cross-check. Per model, ``agree`` is True
-only if every engine that completed matches the bngsim reference within
-``DISAGREE_TOL``. All completing engines agree to solver tolerance on every model, so
-the Table S4 timings compare the same computed trajectory.
+name-aligned where names are unique, as a cross-check. The engines' differences from
+bngsim at the timing tolerances are kept as ``bngsim_vs_*`` for comparison with
+earlier reports.
 
 Cheap (bngsim + RoadRunner + COPASI; no AMICI compile); safe to run outside the
 timing sweep. Writes ``report_ode_engines_s4_agreement.json``.
@@ -67,9 +82,14 @@ MODELS = [
     ("BIOMD0000001065", "vonDassow2000", 6),
 ]
 
-# bngsim-vs-RoadRunner final-state mre above this = the engines disagree on the
-# trajectory (not mere tolerance slack); the timing row compares different solves.
-DISAGREE_TOL = 5e-2
+# The converged reference, and each engine's run for the same-computation verdict
+# (issue #1250).
+REF_RTOL, REF_ATOL = 1e-12, 1e-15
+# An engine at the reference tolerances further than this from the reference
+# computes a different trajectory: the timing row compares different solves. The
+# rr_parity oracle's tolerance (ode_jobs.json, `oracle.tol`). Converged, the S4
+# engines agree to 2e-8 or better.
+AGREE_TOL = 1e-4
 
 
 def _sedml_initial_time(sedml_path, output_start, t_end):
@@ -171,6 +191,53 @@ def _copasi_final_species(xml, t0, t1, npnt, rtol, atol):
             COPASI.CRootContainer.removeDatamodel(dm)
 
 
+def _bngsim_final(xml, span, rtol, atol):
+    """bngsim's (species names, trajectory) over *span* = (t0, t1, n_points)."""
+    import bngsim
+
+    t0, t1, n = span
+    r = bngsim.Simulator(bngsim.Model.from_sbml(str(xml)), method="ode").run(
+        t_span=(t0, t1), n_points=n, rtol=rtol, atol=atol
+    )
+    return list(r.species_names), np.asarray(r.species)
+
+
+def _roadrunner_final(xml, span, rtol, atol):
+    """libRoadRunner's (species names, trajectory) over *span*."""
+    t0, t1, n = span
+    _, values, names, _ = rc.rr_ode(str(xml), t0, t1, n, rtol, atol)
+    return list(names), np.asarray(values)
+
+
+def _copasi_final(xml, span, rtol, atol):
+    """COPASI's final species concentrations over *span*."""
+    t0, t1, n = span
+    return _copasi_final_species(xml, t0, t1, n, rtol, atol)
+
+
+def _attempt(fn, *args):
+    """``(fn(*args), None)``, or ``(None, why)`` where it raises."""
+    try:
+        return fn(*args), None
+    except Exception as e:  # noqa: BLE001 - an engine's failure is recorded, not raised
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _version(module, read):
+    """*module*'s version as *read* reads it, or why there is none."""
+    try:
+        return read(__import__(module))
+    except ImportError:
+        return "not installed"
+    except AttributeError:
+        return "?"
+
+
+def _show(rec, key):
+    v = rec.get(key)
+    return f"{v:.1e}" if v is not None else "  -    "
+
+
 def build_parser():
     """The CLI. ``--help`` must not start the agreement pass (GH #489).
 
@@ -224,75 +291,112 @@ def main(argv=None) -> int:
                 "atol": atol,
             },
         }
-        try:
-            m = bngsim.Model.from_sbml(str(xml))
-            sim = bngsim.Simulator(m, method="ode")
-            r = sim.run(t_span=(t0, t1), n_points=npnt, rtol=rtol, atol=atol)
-            bn_names, bn = list(r.species_names), np.asarray(r.species)
-        except Exception as e:  # noqa: BLE001
-            rec["error"] = f"bngsim from_sbml: {type(e).__name__}: {e}"
-            results.append(rec)
-            print(f"#{row} {label:16} bngsim FAIL: {e}")
-            continue
-        rec.update({"n_species": int(bn.shape[1]), "disagree_tol": DISAGREE_TOL})
 
-        # --- RoadRunner (sorted authoritative; name-aligned cross-check) -----------
-        try:
-            _, rrv, rrn, _ = rc.rr_ode(str(xml), t0, t1, npnt, rtol, atol)
-            rr_sorted = _sorted_mre(bn[-1], rrv[-1])
-            rr_name, ncommon = _mre_by_name(bn_names, bn, rrn, rrv)
+        span = (t0, t1, npnt)
+
+        # --- At the timing tolerances --------------------------------------------
+        timed, err = _attempt(_bngsim_final, xml, span, rtol, atol)
+        if timed is None:
+            rec["error"] = f"bngsim from_sbml: {err}"
+            results.append(rec)
+            print(f"#{row} {label:16} bngsim FAIL: {err}")
+            continue
+        bn_names, bn = timed
+        rec.update({"n_species": int(bn.shape[1]), "agree_tol": AGREE_TOL})
+        rr_timed, err = _attempt(_roadrunner_final, xml, span, rtol, atol)
+        if rr_timed is None:
+            rec["roadrunner_error"] = err
+        cop_timed, err = _attempt(_copasi_final, xml, span, rtol, atol)
+        if cop_timed is None:
+            rec["copasi_error"] = err
+        # Kept from earlier reports: each engine against bngsim at these tolerances.
+        if rr_timed is not None:
+            rr_name, ncommon = _mre_by_name(bn_names, bn, *rr_timed)
             rec.update(
                 {
-                    "bngsim_vs_roadrunner_sorted_mre": rr_sorted,
+                    "bngsim_vs_roadrunner_sorted_mre": _sorted_mre(bn[-1], rr_timed[1][-1]),
                     "bngsim_vs_roadrunner_name_mre": rr_name,
                     "n_common_species": ncommon,
                 }
             )
-        except Exception as e:  # noqa: BLE001
-            rr_sorted = None
-            rec["roadrunner_error"] = f"{type(e).__name__}: {e}"
+        if cop_timed is not None:
+            rec["bngsim_vs_copasi_sorted_mre"] = _sorted_mre(bn[-1], cop_timed)
 
-        # --- COPASI (species read from metabolite objects; sorted) ----------------
-        try:
-            cop = _copasi_final_species(xml, t0, t1, npnt, rtol, atol)
-            cop_sorted = _sorted_mre(bn[-1], cop)
-            rec["bngsim_vs_copasi_sorted_mre"] = cop_sorted
-        except Exception as e:  # noqa: BLE001
-            cop_sorted = None
-            rec["copasi_error"] = f"{type(e).__name__}: {e}"
-
-        # Overall verdict: every engine that COMPLETED must match the reference.
-        checks = [v for v in (rr_sorted, cop_sorted) if v is not None]
-        rec["agree"] = all(v <= DISAGREE_TOL for v in checks) if checks else None
-        rec["worst_mre"] = max(checks) if checks else None
+        # --- The converged reference, and each engine at its tolerances ----------
+        tight = {}
+        for engine, fn in (
+            ("roadrunner", _roadrunner_final),
+            ("bngsim", _bngsim_final),
+            ("copasi", _copasi_final),
+        ):
+            got, err = _attempt(fn, xml, span, REF_RTOL, REF_ATOL)
+            if got is None:
+                rec[f"{engine}_reference_tolerance_error"] = err
+            else:
+                tight[engine] = got if engine == "copasi" else got[1][-1]
+        ref_engine = next((e for e in ("roadrunner", "bngsim") if e in tight), None)
+        rec["reference"] = (
+            {"engine": ref_engine, "rtol": REF_RTOL, "atol": REF_ATOL} if ref_engine else None
+        )
+        if ref_engine is None:
+            rec["agree"] = None
+            results.append(rec)
+            print(f"#{row} {label:16} no converged reference")
+            continue
+        ref = tight[ref_engine]
+        # Same computation: every engine that completes, converged, on the reference.
+        converged = {e: _sorted_mre(v, ref) for e, v in tight.items() if e != ref_engine}
+        for e, v in converged.items():
+            rec[f"{e}_vs_reference_converged_mre"] = v
+        # Accuracy at the timed settings: reported, not judged.
+        for e, final in (
+            ("bngsim", bn[-1]),
+            ("roadrunner", rr_timed[1][-1] if rr_timed is not None else None),
+            ("copasi", cop_timed),
+        ):
+            if final is not None:
+                rec[f"{e}_error_at_timing_tolerances"] = _sorted_mre(final, ref)
+        rec["agree"] = all(v <= AGREE_TOL for v in converged.values()) if converged else None
+        rec["worst_converged_mre"] = max(converged.values()) if converged else None
         tag = ("AGREE" if rec["agree"] else "DISAGREE") if rec["agree"] is not None else "n/a"
-        rr_s = f"{rr_sorted:.2e}" if rr_sorted is not None else "FAIL"
-        cop_s = f"{cop_sorted:.2e}" if cop_sorted is not None else "FAIL"
-        print(f"#{row} {label:16} vs bngsim  RR={rr_s}  COPASI={cop_s}  {tag}")
+
+        print(
+            f"#{row} {label:16} converged vs {ref_engine}: "
+            + "  ".join(f"{e}={_show(rec, f'{e}_vs_reference_converged_mre')}" for e in converged)
+            + f"  {tag};  at the timing tolerances: "
+            f"bngsim {_show(rec, 'bngsim_error_at_timing_tolerances')}  "
+            f"RR {_show(rec, 'roadrunner_error_at_timing_tolerances')}  "
+            f"COPASI {_show(rec, 'copasi_error_at_timing_tolerances')}"
+        )
         results.append(rec)
 
     doc = {
         "_meta": {
             "suite": "ode_engines_s4_sbml",
             "description": (
-                "Cross-engine trajectory agreement for the Table S4 models: "
-                "bngsim from_sbml (reference) vs RoadRunner and COPASI, final "
-                "state, order-independent (sorted species multiset). A model "
-                "whose completing engines disagree would be timing different "
-                "computations; all six agree to solver tolerance."
+                "Cross-engine trajectory agreement for the Table S4 models, against "
+                "a converged reference (issue #1250): each engine at the reference "
+                "tolerances must be within agree_tol of it (agree), and each "
+                "engine's error at the figure's tolerances is reported "
+                "(*_error_at_timing_tolerances). Final state, order-independent "
+                "(sorted species multiset). bngsim_vs_* are the engines' "
+                "differences from bngsim at the timing tolerances, as earlier "
+                "reports gave them."
             ),
-            "reference": "bngsim Model.from_sbml",
-            "cross_checks": ["libRoadRunner", "COPASI"],
+            "reference": {
+                "engines": ["libRoadRunner", "bngsim where libRoadRunner fails"],
+                "rtol": REF_RTOL,
+                "atol": REF_ATOL,
+            },
+            "engines": ["bngsim Model.from_sbml", "libRoadRunner", "COPASI"],
             "metric": "sorted final-state species multiset, max relative error",
-            "disagree_tol": DISAGREE_TOL,
+            "agree_tol": AGREE_TOL,
             "versions": {
                 "bngsim": bngsim.__version__,
-                "roadrunner": __import__("roadrunner").__version__,
-                "copasi": (
-                    __import__("COPASI").CVersion.VERSION.getVersion()
-                    if hasattr(__import__("COPASI"), "CVersion")
-                    else "?"
-                ),
+                "roadrunner": _version("roadrunner", lambda m: m.__version__),
+                # Where COPASI is not installed its column is an error, and
+                # this was an ImportError after every engine had run.
+                "copasi": _version("COPASI", lambda m: m.CVersion.VERSION.getVersion()),
             },
             "hardware": rc.hardware_info(),
         },
