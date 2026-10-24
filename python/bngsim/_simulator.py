@@ -9330,8 +9330,13 @@ class Simulator:
             if A.shape[0]:
                 cols = np.flatnonzero(in_law)
                 w = np.maximum(seed_state[cols], np.finfo(float).tiny)
-                y = _project_onto_laws(w, A, totals)
-                if y is None:
+                # A law whose members the solve drained to 0 (A -> D, D held)
+                # has none to lift: the dual Newton overflows and underflows on
+                # its way to None, which drops the seed. That is the answer, so
+                # nothing is raised or warned, and nothing non-finite is kept.
+                with np.errstate(all="ignore"):
+                    y = _project_onto_laws(w, A, totals)
+                if y is None or not np.all(np.isfinite(y)):
                     seed_state = None
                 else:
                     seed_state[cols] = y

@@ -575,6 +575,57 @@ def test_a_root_on_a_law_whose_total_is_zero_is_seeded(tmp_path):
     assert any(np.allclose(y, ordinary.concentrations, rtol=1e-6) for y in roots.states), roots
 
 
+@pytest.mark.parametrize("how", ["raises", "unconverged"])
+def test_the_draws_stand_when_the_ordinary_solve_does_not(monkeypatch, how):
+    """The ordinary solve is only a seed and a scale. Where it raises, or does
+    not converge, nothing is seeded and the call returns what the draws found:
+    on Motivating_example, where every draw fails, no root at all."""
+    real = bngsim.Simulator.steady_state
+
+    def ordinary(self, **kwargs):
+        if how == "raises":
+            raise bngsim.SimulationError("the ordinary solve refused")
+        result = real(self, **kwargs)
+        result.converged = False
+        return result
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state", ordinary)
+    model = bngsim.Model.from_net(_net("Motivating_example.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(n_starts=20, seed=0)
+    assert len(roots) == 0 and roots.n_failed == 20 == roots.basins.size
+
+
+_DRAINED_NET = """begin parameters
+    1 k  1e3
+end parameters
+begin species
+    1 A() 100
+    2 D() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+end reactions
+begin groups
+    1 Dtot 2
+end groups
+"""
+
+
+def test_a_law_drained_into_a_held_sink_seeds_nothing_and_quietly(tmp_path):
+    """A -> D with D masked as a pure sink: the ordinary solve drains A to 0.0
+    exactly, so the seed has no member to lift onto the law's total of 100. The
+    projection's dual Newton overflowed there, a RuntimeWarning, and a
+    FloatingPointError under np.seterr(all="raise"); nothing is seeded and the
+    draws stand (the held chain has no root)."""
+    path = tmp_path / "drained.net"
+    path.write_text(_DRAINED_NET, encoding="utf-8")
+    model = bngsim.Model.from_net(str(path))
+    sim = bngsim.Simulator(model, method="ode")
+    with np.errstate(all="raise"):
+        roots = sim.steady_states(n_starts=20, seed=0, mask=~model.is_pure_sink())
+    assert len(roots) == 0
+
+
 _POOL_NET = """begin parameters
     1 kf   1.0
     2 kr   1.0
