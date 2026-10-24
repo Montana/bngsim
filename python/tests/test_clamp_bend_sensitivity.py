@@ -50,9 +50,13 @@ def _clock_column(model, **kw):
     return sim, float(np.asarray(run.sensitivities)[-1, 2, 1])
 
 
+# At w = 0.01 and rtol 1e-8 the analytic column is only as good as the narrow
+# pulse lets it be at that tolerance: 1.2e-4 on arm64 macOS, 7.7e-4 on x86-64
+# Linux, and 3.1e-4 for the same pulse written with max/abs. 2e-3 holds on both
+# and still separates it from the difference quotient's 7.4e-3 there (#1227).
 @pytest.mark.parametrize(
     ("w", "rtol", "rel"),
-    [(0.01, 1e-8, 5e-4), (0.01, 1e-9, 1e-4), (0.1, 1e-10, 1e-5), (1.0, 1e-10, 1e-6)],
+    [(0.01, 1e-8, 2e-3), (0.01, 1e-9, 1e-4), (0.1, 1e-10, 1e-5), (1.0, 1e-10, 1e-6)],
 )
 def test_a_clamp_pulse_has_the_analytic_column(tmp_path, w, rtol, rel):
     model = _model(tmp_path, CLAMP)
