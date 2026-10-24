@@ -12,25 +12,31 @@ Both are measured against a converged reference: the model integrated once at
 figure's own output grid (issue #1250). The two questions need it:
 
 - **Same computation.** Each engine is run at the reference tolerances too, and
-  ``agree`` is True when every one that completes is within ``AGREE_TOL`` of the
-  reference: the engines converge to one trajectory. This verdict used to compare
-  bngsim with the others at the timing tolerance, which measures that tolerance's
-  slack, not the engines: on Koo2013 at rtol 1e-6 the final state swings by up to 7%
-  with the number of output rows, in every engine, while at rtol 1e-12 the three
-  agree to 2e-8. A 5% bar there was passed or failed by the grid.
+  compared with the reference species by species, matched by SBML id: over every
+  output row where the engine returns its trajectory (bngsim, libRoadRunner), and
+  at the final time for COPASI, which this reads its final state from. ``agree`` is
+  True when every engine that completes is within ``AGREE_TOL`` of the reference.
+  This verdict used to compare bngsim with the others at the timing tolerance,
+  which measures that tolerance's slack, not the engines: on Koo2013 at rtol 1e-6
+  the final state swings by up to 7% with the number of output rows, in every
+  engine, while at rtol 1e-12 the three agree to 2e-8. A 5% bar there was passed or
+  failed by the grid.
 - **Accuracy at the timed settings.** Each engine's final-state error from the
   reference at the figure's tolerances, ``*_error_at_timing_tolerances``. It is
   reported, not judged: it is a fact about the settings, which a reader of the
   timing table needs, and on Koo2013 it is several percent in every engine.
 
-Agreement uses an ORDER-INDEPENDENT comparison of the sorted final-state value
-multisets — robust for spatial models whose species share display names across grid
-cells (name alignment misaligns those and manufactures a spurious disagreement).
-COPASI's final state is read from its 148 metabolite objects, not its raw time series
-(which also carries compartments/global quantities); RoadRunner is additionally
-name-aligned where names are unique, as a cross-check. The engines' differences from
-bngsim at the timing tolerances are kept as ``bngsim_vs_*`` for comparison with
-earlier reports.
+A comparison is a relative error, ``|a - r| / max(|a|, |r|)``, over the values above
+a floor tied to what the run resolves: ``RESOLVED`` times the reference's absolute
+tolerance for the verdict, and the timed run's own absolute tolerance for its
+accuracy (below it a solver controls only the absolute error). It never passes for
+want of a comparison: a value that is not finite is a disagreement, and species
+that cannot be matched one to one, or no value above the floor, leave agreement not
+established (``agree`` None), with the reason and how many species were compared.
+
+The earlier report's order-independent comparison, of the sorted final values, is
+kept as ``bngsim_vs_*_sorted_mre`` beside earlier reports; it cannot tell one
+species from another, so nothing is judged on it.
 
 Cheap (bngsim + RoadRunner + COPASI; no AMICI compile); safe to run outside the
 timing sweep. Writes ``report_ode_engines_s4_agreement.json``.
@@ -88,8 +94,12 @@ REF_RTOL, REF_ATOL = 1e-12, 1e-15
 # An engine at the reference tolerances further than this from the reference
 # computes a different trajectory: the timing row compares different solves. The
 # rr_parity oracle's tolerance (ode_jobs.json, `oracle.tol`). Converged, the S4
-# engines agree to 2e-8 or better.
+# engines agree to 4e-6 or better over their trajectories.
 AGREE_TOL = 1e-4
+# A value is compared where the run resolves it: above this many times the
+# absolute tolerance it was integrated at (1e-12 at REF_ATOL). Below, its
+# relative error measures the tolerance, not the engine.
+RESOLVED = 1e3
 
 
 def _sedml_initial_time(sedml_path, output_start, t_end):
@@ -126,37 +136,86 @@ def _sedml_initial_time(sedml_path, output_start, t_end):
     return first if first is not None else 0.0
 
 
-def _mre(a, x):
-    a = np.asarray(a, float)
-    x = np.asarray(x, float)
-    n = min(len(a), len(x))
-    a, x = a[:n], x[:n]
+def _canonical(names):
+    """Species ids as bngsim spells them: an SBML id that is an ExprTk reserved
+    word or builtin is renamed by the loader's own rule (``NULL`` is ``_ant_NULL``),
+    and every other id is itself."""
+    from bngsim._sbml_loader import _safe_name
+
+    return [_safe_name(str(n)) for n in names]
+
+
+def _compare(names, values, ref_names, ref_values, floor):
+    """*values* against *ref_values*, species matched by id, as a dict:
+    ``mre`` (the largest relative error over the values above *floor*, or None),
+    ``compared`` (species with a value above it), ``species`` (the reference's),
+    ``non_finite`` and ``why`` (None, or what kept it from a comparison).
+
+    Rows are output rows; an engine with one row (its final state) is compared at
+    the reference's last. The reference's species must all be reported, once each;
+    an engine's species the reference does not have are counted, not compared."""
+    keys, ref_keys = _canonical(names), _canonical(ref_names)
+    out = {"mre": None, "compared": 0, "species": len(ref_keys), "non_finite": 0, "why": None}
+    a = np.atleast_2d(np.asarray(values, float))
+    r = np.atleast_2d(np.asarray(ref_values, float))
+    if len(set(keys)) != len(keys) or len(set(ref_keys)) != len(ref_keys):
+        out["why"] = "species ids are not unique"
+        return out
+    if a.shape[1] != len(keys) or r.shape[1] != len(ref_keys):
+        out["why"] = "species ids and values do not line up"
+        return out
+    missing = [k for k in ref_keys if k not in keys]
+    if missing:
+        out["why"] = f"{len(missing)} of the reference's species are not reported: {missing[:3]}"
+        return out
+    out["extra_species"] = len(set(keys) - set(ref_keys))
+    a = a[:, [keys.index(k) for k in ref_keys]]
+    if a.shape[0] == 1:
+        r = r[-1:]
+    if a.shape != r.shape:
+        out["why"] = f"{a.shape[0]} output rows against the reference's {r.shape[0]}"
+        return out
+    bad = ~(np.isfinite(a) & np.isfinite(r))
+    if bad.any():
+        out["non_finite"] = int(bad.any(axis=0).sum())
+        out["why"] = f"{out['non_finite']} species hold a value that is not finite"
+        return out
+    scale = np.maximum(np.abs(a), np.abs(r))
+    above = scale > floor
+    out["compared"] = int(above.any(axis=0).sum())
+    if not above.any():
+        out["why"] = f"no value above {floor:g}"
+        return out
+    out["mre"] = float(np.max(np.abs(a - r)[above] / scale[above]))
+    return out
+
+
+def _status(cmp) -> str:
+    """``agree``, ``disagree`` or ``not established`` for one engine's converged
+    comparison. Only a comparison that was made and is within AGREE_TOL agrees."""
+    if cmp["non_finite"] or (cmp["mre"] is not None and cmp["mre"] > AGREE_TOL):
+        return "disagree"
+    return "agree" if cmp["mre"] is not None else "not established"
+
+
+def _legacy_sorted_mre(a_final, x_final):
+    """The earlier reports' order-independent number: sorted final values against
+    each other, over values above 1e-6. None where there is nothing to sort
+    against (different counts) or a value is not finite, which it used to drop."""
+    a, x = np.asarray(a_final, float).ravel(), np.asarray(x_final, float).ravel()
+    if a.shape != x.shape or not (np.isfinite(a).all() and np.isfinite(x).all()):
+        return None
+    a, x = np.sort(a), np.sort(x)
     scale = np.maximum(np.abs(a), np.abs(x))
     mask = scale > 1e-6
-    return float(np.max(np.abs(a - x)[mask] / scale[mask])) if mask.any() else 0.0
-
-
-def _sorted_mre(a_final, x_final):
-    """Order-independent: compare the sorted final-state value multisets. Robust to
-    species-name/order differences across engines (a spatial model's repeated display
-    names defeat name alignment)."""
-    return _mre(np.sort(np.asarray(a_final, float)), np.sort(np.asarray(x_final, float)))
-
-
-def _mre_by_name(an, a, xn, x):
-    ad = {n.lower(): float(a[-1, i]) for i, n in enumerate(an)}
-    xd = {n.lower(): float(x[-1, i]) for i, n in enumerate(xn)}
-    common = [k for k in ad if k in xd]
-    if not common:
-        return None, 0
-    return _mre([ad[k] for k in common], [xd[k] for k in common]), len(common)
+    return float(np.max(np.abs(a - x)[mask] / scale[mask])) if mask.any() else None
 
 
 def _copasi_final_species(xml, t0, t1, npnt, rtol, atol):
     """Final SPECIES concentrations from a COPASI deterministic time course, read
     from the model's metabolite objects (exactly the N species — the raw time series
     also carries compartments and global quantities, which would corrupt an
-    order-independent comparison). Returns a 1-D array of length N."""
+    order-independent comparison). Returns (SBML ids, 1-D array of length N)."""
     import COPASI
 
     dm = COPASI.CRootContainer.addDatamodel()
@@ -185,7 +244,9 @@ def _copasi_final_species(xml, t0, t1, npnt, rtol, atol):
         mod = dm.getModel()
         mod.updateInitialValues(COPASI.CCore.Framework_Concentration)
         metabs = mod.getMetabolites()
-        return np.array([metabs.get(i).getConcentration() for i in range(metabs.size())], float)
+        ids = [metabs.get(i).getSBMLId() for i in range(metabs.size())]
+        values = [metabs.get(i).getConcentration() for i in range(metabs.size())]
+        return ids, np.array(values, float)
     finally:
         with contextlib.suppress(Exception):
             COPASI.CRootContainer.removeDatamodel(dm)
@@ -210,9 +271,10 @@ def _roadrunner_final(xml, span, rtol, atol):
 
 
 def _copasi_final(xml, span, rtol, atol):
-    """COPASI's final species concentrations over *span*."""
+    """COPASI's (SBML ids, final species concentrations as one row) over *span*."""
     t0, t1, n = span
-    return _copasi_final_species(xml, t0, t1, n, rtol, atol)
+    ids, values = _copasi_final_species(xml, t0, t1, n, rtol, atol)
+    return ids, values[None, :]
 
 
 def _attempt(fn, *args):
@@ -221,6 +283,16 @@ def _attempt(fn, *args):
         return fn(*args), None
     except Exception as e:  # noqa: BLE001 - an engine's failure is recorded, not raised
         return None, f"{type(e).__name__}: {e}"
+
+
+# The engines, in the order a reference is chosen from. Looked up when called, so
+# a test can stand in for one.
+def _engines():
+    return (
+        ("roadrunner", _roadrunner_final),
+        ("bngsim", _bngsim_final),
+        ("copasi", _copasi_final),
+    )
 
 
 def _version(module, read):
@@ -236,6 +308,100 @@ def _version(module, read):
 def _show(rec, key):
     v = rec.get(key)
     return f"{v:.1e}" if v is not None else "  -    "
+
+
+def _check_model(rec, xml, span, rtol, atol):
+    """Fill *rec* with one model's comparisons (see the module docstring)."""
+    # --- At the timing tolerances ------------------------------------------------
+    timed = {}
+    for engine, fn in _engines():
+        got, err = _attempt(fn, xml, span, rtol, atol)
+        if got is None:
+            rec[f"{engine}_error"] = err
+        else:
+            timed[engine] = got
+    if "bngsim" not in timed:
+        rec["error"] = f"bngsim from_sbml: {rec.pop('bngsim_error')}"
+        rec["agree"] = None
+        return
+    bn_names, bn = timed["bngsim"]
+    rec.update({"n_species": int(bn.shape[1]), "agree_tol": AGREE_TOL})
+    # The earlier reports' numbers: each engine against bngsim, sorted final values.
+    for engine in ("roadrunner", "copasi"):
+        if engine in timed:
+            rec[f"bngsim_vs_{engine}_sorted_mre"] = _legacy_sorted_mre(
+                bn[-1], timed[engine][1][-1]
+            )
+
+    # --- The converged reference, and each engine at its tolerances -------------
+    tight = {}
+    for engine, fn in _engines():
+        got, err = _attempt(fn, xml, span, REF_RTOL, REF_ATOL)
+        if got is None:
+            rec[f"{engine}_reference_tolerance_error"] = err
+        else:
+            tight[engine] = got
+    ref_engine = next((e for e in ("roadrunner", "bngsim") if e in tight), None)
+    rec["reference"] = (
+        {"engine": ref_engine, "rtol": REF_RTOL, "atol": REF_ATOL} if ref_engine else None
+    )
+    if ref_engine is None:
+        rec["agree"] = None
+        rec["why"] = "no engine completed at the reference tolerances"
+        return
+    ref_names, ref = tight[ref_engine]
+    # Same computation: every engine that completes, converged, on the reference.
+    statuses = {}
+    for engine, (names, values) in tight.items():
+        if engine == ref_engine:
+            continue
+        cmp = _compare(names, values, ref_names, ref, RESOLVED * REF_ATOL)
+        rec[f"{engine}_vs_reference_converged"] = cmp
+        statuses[engine] = _status(cmp)
+    # Accuracy at the timed settings, at the final time: reported, not judged.
+    for engine, (names, values) in timed.items():
+        cmp = _compare(names, np.asarray(values)[-1:], ref_names, ref[-1:], atol)
+        rec[f"{engine}_error_at_timing_tolerances"] = cmp["mre"]
+        rec[f"{engine}_error_at_timing_tolerances_detail"] = cmp
+    rec["converged_status"] = statuses
+    if not statuses:
+        rec["agree"] = None
+        rec["why"] = "only the reference engine completed at the reference tolerances"
+    elif "disagree" in statuses.values():
+        rec["agree"] = False
+    elif "not established" in statuses.values():
+        rec["agree"] = None
+        rec["why"] = "; ".join(
+            f"{e}: {rec[f'{e}_vs_reference_converged']['why']}"
+            for e, st in statuses.items()
+            if st == "not established"
+        )
+    else:
+        rec["agree"] = True
+    mres = [rec[f"{e}_vs_reference_converged"]["mre"] for e in statuses]
+    rec["worst_converged_mre"] = max((m for m in mres if m is not None), default=None)
+
+
+def _summary(rec) -> str:
+    head = f"#{rec['row']} {rec['label']:16}"
+    if "error" in rec:
+        return f"{head} FAIL: {rec['error']}"
+    if rec.get("reference") is None:
+        return f"{head} {rec.get('why')}"
+    tag = {True: "AGREE", False: "DISAGREE", None: "NOT ESTABLISHED"}[rec["agree"]]
+    conv = "  ".join(
+        f"{e}={_show(rec[f'{e}_vs_reference_converged'], 'mre')}"
+        f"({rec[f'{e}_vs_reference_converged']['compared']}/"
+        f"{rec[f'{e}_vs_reference_converged']['species']})"
+        for e in rec["converged_status"]
+    )
+    timed = "  ".join(
+        f"{e} {_show(rec, f'{e}_error_at_timing_tolerances')}" for e, _ in _engines()
+    )
+    return (
+        f"{head} converged vs {rec['reference']['engine']}: {conv}  {tag};  "
+        f"at the timing tolerances: {timed}"
+    )
 
 
 def build_parser():
@@ -292,83 +458,13 @@ def main(argv=None) -> int:
             },
         }
 
-        span = (t0, t1, npnt)
-
-        # --- At the timing tolerances --------------------------------------------
-        timed, err = _attempt(_bngsim_final, xml, span, rtol, atol)
-        if timed is None:
-            rec["error"] = f"bngsim from_sbml: {err}"
-            results.append(rec)
-            print(f"#{row} {label:16} bngsim FAIL: {err}")
-            continue
-        bn_names, bn = timed
-        rec.update({"n_species": int(bn.shape[1]), "agree_tol": AGREE_TOL})
-        rr_timed, err = _attempt(_roadrunner_final, xml, span, rtol, atol)
-        if rr_timed is None:
-            rec["roadrunner_error"] = err
-        cop_timed, err = _attempt(_copasi_final, xml, span, rtol, atol)
-        if cop_timed is None:
-            rec["copasi_error"] = err
-        # Kept from earlier reports: each engine against bngsim at these tolerances.
-        if rr_timed is not None:
-            rr_name, ncommon = _mre_by_name(bn_names, bn, *rr_timed)
-            rec.update(
-                {
-                    "bngsim_vs_roadrunner_sorted_mre": _sorted_mre(bn[-1], rr_timed[1][-1]),
-                    "bngsim_vs_roadrunner_name_mre": rr_name,
-                    "n_common_species": ncommon,
-                }
-            )
-        if cop_timed is not None:
-            rec["bngsim_vs_copasi_sorted_mre"] = _sorted_mre(bn[-1], cop_timed)
-
-        # --- The converged reference, and each engine at its tolerances ----------
-        tight = {}
-        for engine, fn in (
-            ("roadrunner", _roadrunner_final),
-            ("bngsim", _bngsim_final),
-            ("copasi", _copasi_final),
-        ):
-            got, err = _attempt(fn, xml, span, REF_RTOL, REF_ATOL)
-            if got is None:
-                rec[f"{engine}_reference_tolerance_error"] = err
-            else:
-                tight[engine] = got if engine == "copasi" else got[1][-1]
-        ref_engine = next((e for e in ("roadrunner", "bngsim") if e in tight), None)
-        rec["reference"] = (
-            {"engine": ref_engine, "rtol": REF_RTOL, "atol": REF_ATOL} if ref_engine else None
-        )
-        if ref_engine is None:
+        try:
+            _check_model(rec, xml, (t0, t1, npnt), rtol, atol)
+        except Exception as e:  # noqa: BLE001 - one model's failure is recorded, not fatal
+            rec["error"] = f"{type(e).__name__}: {e}"
             rec["agree"] = None
-            results.append(rec)
-            print(f"#{row} {label:16} no converged reference")
-            continue
-        ref = tight[ref_engine]
-        # Same computation: every engine that completes, converged, on the reference.
-        converged = {e: _sorted_mre(v, ref) for e, v in tight.items() if e != ref_engine}
-        for e, v in converged.items():
-            rec[f"{e}_vs_reference_converged_mre"] = v
-        # Accuracy at the timed settings: reported, not judged.
-        for e, final in (
-            ("bngsim", bn[-1]),
-            ("roadrunner", rr_timed[1][-1] if rr_timed is not None else None),
-            ("copasi", cop_timed),
-        ):
-            if final is not None:
-                rec[f"{e}_error_at_timing_tolerances"] = _sorted_mre(final, ref)
-        rec["agree"] = all(v <= AGREE_TOL for v in converged.values()) if converged else None
-        rec["worst_converged_mre"] = max(converged.values()) if converged else None
-        tag = ("AGREE" if rec["agree"] else "DISAGREE") if rec["agree"] is not None else "n/a"
-
-        print(
-            f"#{row} {label:16} converged vs {ref_engine}: "
-            + "  ".join(f"{e}={_show(rec, f'{e}_vs_reference_converged_mre')}" for e in converged)
-            + f"  {tag};  at the timing tolerances: "
-            f"bngsim {_show(rec, 'bngsim_error_at_timing_tolerances')}  "
-            f"RR {_show(rec, 'roadrunner_error_at_timing_tolerances')}  "
-            f"COPASI {_show(rec, 'copasi_error_at_timing_tolerances')}"
-        )
         results.append(rec)
+        print(_summary(rec))
 
     doc = {
         "_meta": {
@@ -376,12 +472,14 @@ def main(argv=None) -> int:
             "description": (
                 "Cross-engine trajectory agreement for the Table S4 models, against "
                 "a converged reference (issue #1250): each engine at the reference "
-                "tolerances must be within agree_tol of it (agree), and each "
-                "engine's error at the figure's tolerances is reported "
-                "(*_error_at_timing_tolerances). Final state, order-independent "
-                "(sorted species multiset). bngsim_vs_* are the engines' "
-                "differences from bngsim at the timing tolerances, as earlier "
-                "reports gave them."
+                "tolerances is compared with it species by species, matched by SBML "
+                "id, over its trajectory (COPASI: final state), and agree is True "
+                "only when every engine that completes is within agree_tol; False "
+                "when one is not or holds a non-finite value; None when agreement "
+                "could not be established (see why). Each engine's final-state error "
+                "at the figure's tolerances is reported, not judged. "
+                "bngsim_vs_*_sorted_mre are the earlier reports' order-independent "
+                "numbers, kept for comparison."
             ),
             "reference": {
                 "engines": ["libRoadRunner", "bngsim where libRoadRunner fails"],
@@ -389,7 +487,11 @@ def main(argv=None) -> int:
                 "atol": REF_ATOL,
             },
             "engines": ["bngsim Model.from_sbml", "libRoadRunner", "COPASI"],
-            "metric": "sorted final-state species multiset, max relative error",
+            "metric": (
+                "max |a - r| / max(|a|, |r|) over values above a floor: RESOLVED x "
+                "REF_ATOL for the verdict, the timed run's atol for its accuracy"
+            ),
+            "resolved_factor": RESOLVED,
             "agree_tol": AGREE_TOL,
             "versions": {
                 "bngsim": bngsim.__version__,
