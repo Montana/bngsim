@@ -790,10 +790,21 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
     (``report_rateof_amount``) reads the sum times its compartment's size, as
     ``refresh_rateof_derivs_once_`` scales it: the size parameter by name where
     the size is writable, so a write moves it (issue #170), else the number.
+    A cross-compartment reaction (``per_species_volume_scaling``) states its
+    rate in amount per time, and the engine divides it by each species' own
+    divisor: the live volume where the species' compartment is promoted (its
+    ``ode_live_volume_idx0``), its size otherwise (issue #1266). dX/dt divides
+    the same way: by the observable that holds the promoted compartment alone,
+    by the size parameter by name where it is the species' size (a write to it
+    moves the engine's divisor, and so must move this), else by the number.
+    (Where the live volume is not positive the engine divides by the size
+    instead; no run reaches a compartment of no size with an amount in it, and
+    a condition here would be a state switch the sensitivity path refuses.)
+
     Left out, so that a law reading the token declines as before: a species a
-    reaction changes that divides by each species' volume, is
-    Michaelis–Menten, or takes a species factor of a reactant no observable
-    holds alone. ``data`` is the model's ``codegen_data()``; one with no
+    reaction changes that is Michaelis–Menten, takes a species factor of a
+    reactant no observable holds alone, or divides by a live volume no
+    observable holds alone. ``data`` is the model's ``codegen_data()``; one with no
     reaction list says nothing of any rate and gives none, and so does one
     whose functions read none.
     """
@@ -818,14 +829,17 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
         for i in rxn.get("products", ()):
             net[int(i)] = net.get(int(i), 0) + 1
         rate = _reaction_rate_text(rxn, params, alone)
+        per_species = bool(rxn.get("per_species_volume_scaling", False))
         for i, n in net.items():
             if n == 0:
                 continue
-            if rate is None:
+            divisor = _species_divisor_text(species[i], params, alone) if per_species else ""
+            if rate is None or divisor is None:
                 unreadable.add(i)
                 continue
             coeff = n * float(rxn.get("stat_factor", 1.0))
-            terms.setdefault(i, []).append(f"({coeff!r})*{rate}")
+            term = f"({coeff!r})*{rate}"
+            terms.setdefault(i, []).append(f"{term}/({divisor})" if per_species else term)
     out: dict[str, str] = {}
     for i, sp in enumerate(species):
         if sp.get("fixed", False):
@@ -845,9 +859,9 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
 def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str | None:
     """A reaction's rate before its stat factor, as ``compute_rxn_rate`` forms
     it on the ODE path, or ``None`` where :func:`rateof_rate_laws` cannot state
-    it. ``alone`` maps a species to the observable that holds it alone."""
-    if rxn.get("per_species_volume_scaling", False):
-        return None
+    it. ``alone`` maps a species to the observable that holds it alone. A
+    cross-compartment reaction's rate is in amount per time; each species'
+    divisor is :func:`_species_divisor_text`'s."""
     kind = rxn.get("type")
     if kind == "functional":
         base = rxn.get("function_name") or ""
@@ -866,6 +880,26 @@ def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str |
                 return None
             factors.append(name)
     return "*".join(factors)
+
+
+def _species_divisor_text(sp: dict, params: list, alone: dict[int, str]) -> str | None:
+    """What ``compute_derivs_core`` divides a cross-compartment reaction's rate by
+    for species *sp*: its live volume, read through the observable that holds
+    the promoted compartment alone; else its size, by the size parameter's name
+    where that is the species' size, so that a write to it, which moves the
+    engine's divisor, moves this one; else the number. ``None`` where a live
+    volume has no such observable, or a named size is not the number the
+    engine divides by."""
+    live = int(sp.get("ode_live_volume_idx0", -1))
+    if live >= 0:
+        return alone.get(live)
+    size = float(sp.get("volume_factor", 1.0))
+    k = int(sp.get("volume_param_idx0", -1))
+    if 0 <= k < len(params):
+        if float(params[k].get("value", size)) != size:
+            return None
+        return params[k]["name"]
+    return repr(size)
 
 
 def _inline_functions(

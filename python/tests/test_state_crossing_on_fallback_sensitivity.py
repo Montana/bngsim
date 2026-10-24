@@ -209,13 +209,16 @@ def test_a_table_that_steps_on_the_state_is_refused(tmp_path, method):
 # analytic RHS (test_a_rate_the_derivations_write_out_is_not_refused).
 _ACROSS = "compartment C0 = 1; compartment C2 = 3; species X in C2; X = 0\n"
 
-ISSUE_932 = {
+# Issue #932's models with A leaving for another compartment, X in C2: they read
+# rateOf(A) and were on the quotient until issue #1266 wrote out a rate divided
+# by each species' own volume. They are written out now, and checked against
+# their closed forms in test_a_rate_the_derivations_write_out_is_not_refused.
+RATEOF_ACROSS = {
     # The condition reads rateOf.
     "rateof-condition": (
         _ACROSS + "species A in C0, Y in C0; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
         "J0: A -> X; a*A*C0\n"
-        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n",
-        ["thr"],
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n"
     ),
     # rateOf is only in a rule an event's trigger reads.
     "rateof-in-a-rule": (
@@ -225,9 +228,11 @@ ISSUE_932 = {
         "r := rateOf(A)\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; Y\n"
-        "E: at (r > -thr): Y = 1\n",
-        ["a", "thr", "q"],
+        "E: at (r > -thr): Y = 1\n"
     ),
+}
+
+ISSUE_932 = {
     # No rateOf at all: any rate law the analytic path declines.
     "max-beside-it": (
         "species A, B, Z; A = 10; B = 0; Z = 0; a = 0.5; q = 3\n"
@@ -257,7 +262,9 @@ def test_a_run_that_stalled_short_of_a_jump_is_refused_by_name(model):
 def test_a_rate_the_derivations_write_out_is_not_refused():
     """Issue #1124, item 7: lost at a*A, A's rate is -a·A written out, so
     neither model is on the quotient, and the columns read across the
-    crossings as any analytic column does. A = 10·e^(-at) and rateOf(A) =
+    crossings as any analytic column does. So too where A leaves for another
+    compartment (issue #1266): its rate there is J0's over A's own volume, C0
+    = 1, -a·A again. A = 10·e^(-at) and rateOf(A) =
     -a·A cross -thr at t* = ln(10a/thr)/a; A crosses q at ln(10/q)/a.
     dY/dthr = kb/(a·thr); dZ/dthr = 1/(a·thr), dZ/da = (ln(10a/thr) − 1)/a²;
     dB/dq = 1/(a·q), dB/da = ln(10/q)/a²."""
@@ -284,6 +291,9 @@ def test_a_rate_the_derivations_write_out_is_not_refused():
             ("B", "a"): np.where(t > t_a, math.log(10 / q) / a**2, 0.0),
         },
     }
+    rate_condition, rate_in_a_rule = list(cases.values())
+    cases[RATEOF_ACROSS["rateof-condition"]] = rate_condition
+    cases[RATEOF_ACROSS["rateof-in-a-rule"]] = rate_in_a_rule
     for text, expected in cases.items():
         params = sorted({p for _sp, p in expected})
         sim = bngsim.Simulator(
