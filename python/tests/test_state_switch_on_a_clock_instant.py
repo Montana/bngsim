@@ -852,6 +852,81 @@ def test_a_long_run_of_many_crossings_and_fires_runs():
     assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(3.4779e6, rel=1e-3)
 
 
+# Issue #1025's review: what is dropped from the records the window asks.
+# S = sin(om·t) crosses 0.5 twice a period, about 4,100 times at om = 3200
+# before B = e^(−5t) falls through 1e-9 at t = 4.14, where the event halves X.
+# B's flow there is 5e-9, so the fire's window reaches back past every
+# crossing; at om = 3000 they are all kept.
+MANY_CROSSINGS = (
+    "species S, W, X, B, T, Y; S = 0; W = 0; X = 0; B = 1; T = 1; Y = 0; om = {om!r};"
+    " q = 0.7; lam = 5\n"
+    "Js: -> S; om*cos(om*time)\nJ2: -> W; piecewise(q*X, S >= 0.5, 0)\n"
+    "Jt: -> T; T\nJ3: -> Y; piecewise(q*X, T >= {once}, 0)\n"
+    "Jx: -> X; 1\nJb: B -> ; lam*B\nE1: at (B < 1e-9): X = 0.5*X\n"
+)
+EVICTION_TIMES = [float(t) for t in np.linspace(0.0, 5.0, 51)]
+
+
+def _evicted(text, param, times):
+    model = bngsim.Model.from_antimony_string(text)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(bngsim.SimulationError, match="than are kept to ask it about"):
+        sim.run(sample_times=times, rtol=1e-6, atol=1e-9, timeout=60)
+
+
+def _column(text, param, times, name):
+    model = bngsim.Model.from_antimony_string(text)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=[param]).run(
+        sample_times=times, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    return np.asarray(run.sensitivities)[-1, list(run.species_names).index(name), 0]
+
+
+def test_a_fire_past_thousands_of_one_switch_s_crossings_runs():
+    """The oldest crossings are dropped, but the fire asks only the last
+    crossing of each switch, which is kept. Refused on any one dropped, it
+    was refused where main returns 0.08282 (T never crosses here)."""
+    text = MANY_CROSSINGS.format(om=3200.0, once="1e300")
+    assert _column(text, "lam", EVICTION_TIMES, "W") == pytest.approx(0.0828239, rel=1e-5)
+
+
+def test_a_switch_whose_only_crossing_was_dropped_is_refused():
+    """T = e^t crosses once, at t = 0.1, in a law the event's write to X
+    changes. Past 4,096 crossings of S it is dropped, and it has no later
+    crossing kept to stand for it: the fire cannot be asked about it."""
+    _evicted(MANY_CROSSINGS.format(om=3200.0, once=math.exp(0.1)), "lam", EVICTION_TIMES)
+
+
+def test_a_switch_whose_only_crossing_is_kept_runs():
+    """Control: at om = 3000 it is kept, and the order is confirmed."""
+    text = MANY_CROSSINGS.format(om=3000.0, once=math.exp(0.1))
+    assert _column(text, "lam", EVICTION_TIMES, "Y") == pytest.approx(-0.954312, rel=1e-5)
+
+
+# E1 fires every 1/rate until t = 4.5, about 4,500 times at rate 1000; E2
+# fires once, at 0.1, and writes X. B = e^(−2.5t) falls through 1e-9 at 8.29
+# with a flow of 2.5e-9: the crossing's window reaches back to E2.
+MANY_FIRES = (
+    "species C, B, X, Y; C = 0; B = 1; X = 0; Y = 0; rate = {rate!r}; q = 0.7; lam = 2.5\n"
+    "Jc: -> C; rate*piecewise(1, time < 4.5, 0)\nJb: B -> ; lam*B\nJx: -> X; 1\n"
+    "J3: -> Y; piecewise(q*X, B <= 1e-9, 0)\n"
+    "E1: at (C >= 1): C = 0\nE2: at (time >= 0.1): X = X + 1\n"
+)
+FIRES_TIMES = [float(t) for t in np.linspace(0.0, 10.0, 101)]
+
+
+def test_a_crossing_whose_event_s_only_fire_was_dropped_is_refused():
+    """Past 4,096 fires of E1, E2's one fire is dropped, and no later fire of
+    E2 is kept to stand for it."""
+    _evicted(MANY_FIRES.format(rate=1000.0), "lam", FIRES_TIMES)
+
+
+def test_a_crossing_whose_event_s_only_fire_is_kept_runs():
+    """Control: at rate 800 it is kept, and the order is confirmed."""
+    text = MANY_FIRES.format(rate=800.0)
+    assert _column(text, "lam", FIRES_TIMES, "Y") == pytest.approx(20.938956, rel=1e-5)
+
+
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
     """``at (V > U·e³)`` reads V, which the switch reads, and U. It fires
     where U says, not where V is on its way through 6: the two are not on one

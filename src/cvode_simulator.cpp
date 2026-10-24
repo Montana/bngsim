@@ -3192,8 +3192,23 @@ struct CvodeSimulator::Impl {
     static constexpr std::size_t kCrossingsKept = 4096;
     static constexpr std::size_t kMarksKept = 4096;
     double state_crossings_dropped_until = -std::numeric_limits<double>::infinity();
-    double state_crossings_dropped_window_until = -std::numeric_limits<double>::infinity();
-    double fire_marks_dropped_window_until = -std::numeric_limits<double>::infinity();
+    // How far the window of a dropped crossing reaches, per switch residual,
+    // and of a dropped fire, per event. A fire asks only the last crossing of
+    // each switch, and a crossing only the last fire of each event, so one
+    // dropped is missed only where none later of its switch or its event is
+    // kept: with 4,216 crossings of one switch before an event, refusing on
+    // any one dropped refused a run main returns right.
+    std::vector<std::pair<int, double>> dropped_crossing_windows;
+    std::vector<std::pair<int, double>> dropped_fire_windows;
+    static void reach_until(std::vector<std::pair<int, double>> &dropped, int key, double until) {
+        for (auto &one : dropped) {
+            if (one.first == key) {
+                one.second = std::max(one.second, until);
+                return;
+            }
+        }
+        dropped.emplace_back(key, until);
+    }
 
     // ── Confirming an order against a tighter run (issue #1025) ───────────
     // A fire, or a clock's switch, and a state crossing outside the reach of
@@ -7492,8 +7507,15 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
                "time, or drop sensitivities for this run.";
         throw std::runtime_error(msg.str());
     }
-    if (t_evt <= state_crossings_dropped_until ||
-        t_evt - fire_window <= state_crossings_dropped_window_until) {
+    const bool dropped_in_window = std::any_of(
+        dropped_crossing_windows.begin(), dropped_crossing_windows.end(), [&](const auto &one) {
+            return t_evt - fire_window <= one.second &&
+                   std::none_of(state_crossings.begin(), state_crossings.end(),
+                                [&](const StateCrossing &kept) {
+                                    return kept.residual_expr_idx == one.first;
+                                });
+        });
+    if (t_evt <= state_crossings_dropped_until || dropped_in_window) {
         throw std::runtime_error(
             "Forward sensitivity: an event fires at t=" + std::to_string(t_evt) +
             " after more state-dependent rate-law switches than are kept to ask it about, "
@@ -7564,8 +7586,8 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
     // against: the residual of every switch where the state was.
     if (!state_switch_all.empty() && !occurrences.empty()) {
         if (fire_marks.size() >= kMarksKept) {
-            fire_marks_dropped_window_until = std::max(
-                fire_marks_dropped_window_until, fire_marks.front().t + fire_marks.front().window);
+            reach_until(dropped_fire_windows, fire_marks.front().event,
+                        fire_marks.front().t + fire_marks.front().window);
             fire_marks.erase(fire_marks.begin());
         }
         FireMark mark;
@@ -12557,7 +12579,14 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
         // there taken along the rate the state came to the surface at; a fire
         // the same, with the residual where the fire found the state.
         if (asks_window) {
-            if (t_evt - window <= fire_marks_dropped_window_until) {
+            const bool dropped_in_window = std::any_of(
+                dropped_fire_windows.begin(), dropped_fire_windows.end(), [&](const auto &one) {
+                    return t_evt - window <= one.second &&
+                           std::none_of(
+                               fire_marks.begin(), fire_marks.end(),
+                               [&](const FireMark &kept) { return kept.event == one.first; });
+                });
+            if (dropped_in_window) {
                 std::ostringstream msg;
                 msg << "Forward sensitivity: the state-dependent rate-law switch with residual '"
                     << sw.residual_source << "' crosses at t=" << t_evt
@@ -12729,8 +12758,8 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
             const StateCrossing &oldest = state_crossings.front();
             state_crossings_dropped_until =
                 std::max(state_crossings_dropped_until, oldest.t + oldest.reach);
-            state_crossings_dropped_window_until =
-                std::max(state_crossings_dropped_window_until, oldest.t + oldest.window);
+            reach_until(dropped_crossing_windows, oldest.residual_expr_idx,
+                        oldest.t + oldest.window);
             state_crossings.erase(state_crossings.begin());
         }
         if (!(residual_jumps && continuous)) {
@@ -13622,8 +13651,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // counts that name a fire to a tighter run, and the largest |x| so far.
     impl_->fire_marks.clear();
     impl_->clock_states.clear();
-    impl_->state_crossings_dropped_window_until = -std::numeric_limits<double>::infinity();
-    impl_->fire_marks_dropped_window_until = -std::numeric_limits<double>::infinity();
+    impl_->dropped_crossing_windows.clear();
+    impl_->dropped_fire_windows.clear();
     impl_->orders_to_confirm.clear();
     impl_->event_fire_counts.assign(static_cast<std::size_t>(model.n_events()), 0);
     impl_->event_fires_total = 0;
