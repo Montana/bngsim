@@ -750,6 +750,36 @@ def test_a_switch_the_tolerance_does_place_after_a_gate_in_its_law_runs():
     assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(0.0, abs=1e-8)
 
 
+# V = sin(t) comes down through δ just before π, where the event sets V to 2
+# and it never comes back. With the switch first, which is the truth, W
+# gathers q·X until the event: dW/dtau = q·2π = 4.398; with the event first
+# it is 0, and no crossing is found to ask about.
+TURNED_BACK = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; tau = 3.141592653589793\n"
+    "J0: -> X; a\nJv: -> V; cos(time)\nJ2: -> W; piecewise(q*X, V <= {d}, 0)\n"
+    "E1: at (time >= tau): V = 2\n"
+)
+
+
+@pytest.mark.parametrize("d, rtol", [("2e-5", 1e-5), ("5e-6", 3e-6)])
+def test_a_switch_the_event_turns_back_before_it_crosses_is_refused(d, rtol):
+    """V read high at π, the switch had not crossed when the event fired,
+    and after it there was nothing to cross: main returned 0 for 4.398. At
+    the event the residual is on its way to its surface, past one step's
+    tolerances and within the window, and the event writes V."""
+    _refused(TURNED_BACK.format(d=d), ["tau"], 945, EVENT_TIMES, rtol=rtol, atol=1e-9)
+
+
+def test_a_switch_the_event_turns_back_after_it_crosses_runs():
+    """Control: at rtol 1e-6 the switch is found first, as it is."""
+    model = bngsim.Model.from_antimony_string(TURNED_BACK.format(d="2e-5"))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(0.7 * 2 * math.pi, rel=1e-6)
+
+
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
     """``at (V > U·e³)`` reads V, which the switch reads, and U. It fires
     where U says, not where V is on its way through 6: the two are not on one
