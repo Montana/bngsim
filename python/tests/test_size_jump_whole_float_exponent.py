@@ -73,15 +73,12 @@ def _sbml(first, second, rules=(), params=()):
 def _power_and_expansion(x, n, c, above=None):
     """``(x + 1)^n > c`` and the same polynomial expanded, ``< c``."""
     first = _ap("gt", _ap("power", _ap("plus", x, _cn(1)), _cn(n)), above or _cn(c))
-    if n == 2:
-        terms = (_ap("power", x, _cn(2)), _ap("times", _cn(2), x), _cn(1))
-    else:
-        terms = (
-            _ap("power", x, _cn(3)),
-            _ap("times", _cn(3), _ap("power", x, _cn(2))),
-            _ap("times", _cn(3), x),
-            _cn(1),
-        )
+
+    def term(k):  # C(n, k)·x^k, as a model writes it
+        power = x if k == 1 else _ap("power", x, _cn(k))
+        return power if math.comb(n, k) == 1 else _ap("times", _cn(math.comb(n, k)), power)
+
+    terms = (*map(term, range(n, 0, -1)), _cn(1))
     return first, _ap("lt", _ap("plus", *terms), _cn(c))
 
 
@@ -122,6 +119,26 @@ def test_a_power_beside_its_expansion_at_one_run_constant():
     xml = _sbml(first, second, params=[("p1", 25, True), ("p2", 25, True)])
     for seed in SEEDS:
         np.testing.assert_allclose(_sn(xml, TIMES, seed), STEP, rtol=1e-6)
+
+
+def test_a_negative_whole_exponent_is_one_root_with_its_quotient():
+    """``(S + 1)^-1 < 0.2`` beside ``1/(S + 1) > 0.2``: sympy writes the
+    quotient with the Integer -1, so on main the two were two roots."""
+    first = _ap("lt", _ap("power", _ap("plus", _ci("S"), _cn(1)), _cn(-1)), _cn(0.2))
+    second = _ap("gt", _ap("divide", _cn(1), _ap("plus", _ci("S"), _cn(1))), _cn(0.2))
+    xml = _sbml(first, second)
+    assert len(bngsim.Model.from_sbml_string(xml)._core.event_trigger_sources()) == 2
+    for seed in SEEDS:
+        np.testing.assert_allclose(_sn(xml, TIMES, seed), STEP, rtol=1e-6)
+
+
+def test_a_zero_exponent_is_no_nan_ratio():
+    """``S^0 > 1`` beside ``S^0 < 1``: with the Integer 0 each difference is 0,
+    and their ratio, nan, was read as a number times each other: the load
+    raised "Invalid NaN comparison". Neither is ever true, so V stays 2."""
+    first = _ap("gt", _ap("power", _ci("S"), _cn(0)), _cn(1))
+    second = _ap("lt", _ap("power", _ci("S"), _cn(0)), _cn(1))
+    np.testing.assert_allclose(_sn(_sbml(first, second), TIMES, 0), [5.0] * len(TIMES))
 
 
 def _diamond(n):
@@ -165,6 +182,52 @@ def test_a_power_and_its_expansion_over_a_diamond_of_rules(n, times, seeds):
     assert want[1:] == [5.0, 15.0, 5.0]
     for seed in seeds:
         np.testing.assert_allclose(_sn(xml, times, seed), want, rtol=1e-6)
+
+
+def test_a_power_beside_its_expansion_at_one_run_constant_over_a_diamond_of_rules():
+    """The run-constant pair over the 20-rule diamond, past 5,000 tree nodes:
+    the power shares no term with its expansion, so the pair compared term by
+    term was two roots on one instant, and [Sn] came back 10 or 5 for 15 on
+    every seed. A pair whose slope is the same at three points is expanded."""
+    n, times = 20, [0.0, 0.3, 1.5, 4.5]
+    rules, params = _diamond(n)
+    first, second = _power_and_expansion(_ci(f"r{n - 1}"), 2, 5.76, above=_ci("p1"))
+    second = second.replace(_cn(5.76), _ci("p2"))
+    params += [("p1", 5.76, True), ("p2", 5.76, True)]
+    xml = _sbml(first, second, rules=rules, params=params)
+    want = [_diamond_sn(n, t) for t in times]
+    assert want[1:] == [5.0, 15.0, 5.0]
+    np.testing.assert_allclose(_sn(xml, times, 0), want, rtol=1e-6)
+
+
+_ROOT_S = _ap("power", _ci("S"), _cn(0.5))
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "times", "want"),
+    [
+        # rounded to S^1, these two would be one root, at S = 2
+        (
+            _ap("gt", _ROOT_S, _cn(2)),
+            _ap("gt", _ci("S"), _cn(2)),
+            [0, 1, 2.5, 4],
+            [5, 5, 5 / 3, 2.5],
+        ),
+        # truncated to S^0, one root that holds them equal: V never 3
+        (
+            _ap("gt", _ROOT_S, _cn(3)),
+            _ap("gt", _ROOT_S, _cn(2)),
+            [0, 0.1, 1, 3],
+            [5, 5, 5 / 3, 2.5],
+        ),
+    ],
+    ids=["beside S > 2", "beside S^0.5 > 2"],
+)
+def test_a_power_that_is_not_whole_is_not_rounded(first, second, times, want):
+    """``S^0.5`` beside a condition that flips at another instant, which a
+    power read with a whole exponent would group with it: against the closed
+    form."""
+    np.testing.assert_allclose(_sn(_sbml(first, second), times, 0), want, rtol=1e-6)
 
 
 def test_a_power_that_is_not_whole_is_left_as_written():

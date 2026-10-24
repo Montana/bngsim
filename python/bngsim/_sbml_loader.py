@@ -8884,7 +8884,41 @@ def _build_model_from_sbml_doc_in_context(doc):
                 if len(seen) == 2 and abs(seen[0] - seen[1]) > 1e-12 * max(1, abs(seen[0])):
                     return None
             ratio = _sp.cancel(d / d0)
-            return ratio if ratio.is_number and ratio != 0 else None
+            # A finite one: where `_integral_powers` makes both differences 0
+            # (`S^0 > 1` beside `S^0 < 1`), their ratio is nan, which no side
+            # compares with 0, and the load raised.
+            return ratio if ratio.is_number and ratio.is_finite and ratio != 0 else None
+
+        def _one_slope(d1, d0) -> bool:
+            # Whether d1 reads as a number times d0 plus a run constant: at
+            # three points, to 30 digits, that move what reads the run and hold
+            # the run constants, the slope of d1 against d0 from the first point
+            # to each other is the same. A read that is not a number, or raises,
+            # or a d0 that the step leaves near where it was, is a no, and the
+            # pair is left as it was: `_ratio_of` hands such a pair to
+            # `cancel`, but `expand` over a diamond of rules would take seconds
+            # for each pair the reads cannot rule out.
+            names = sorted(
+                {e for x in (d1, d0) for e in _subexpressions(x) if e.is_Symbol}, key=str
+            )
+            reads = []
+            for step in (0.6180339887, 0.4142135624, 0.7548776662):
+                at = {
+                    s: _sp.Float(0.25 + ((k + 1) * (step if str(s) in _moving else 0.5)) % 1, 30)
+                    for k, s in enumerate(names)
+                }
+                try:
+                    a, b = _xreplace_once(d1, at), _xreplace_once(d0, at)
+                except Exception:  # Max of a complex number raises
+                    return False
+                if not all(v.is_Float or v.is_Rational for v in (a, b)):
+                    return False
+                reads.append((a, b))
+            (a0, b0), *others = reads
+            if any(abs(b - b0) < 1e-8 for _, b in others):
+                return False
+            q1, q2 = ((a - a0) / (b - b0) for a, b in others)
+            return abs(q1 - q2) <= 1e-12 * max(1, abs(q1))
 
         # compartment -> the concentrations its size's jump conditions read
         _cond_reads: dict[str, set[str]] = {}
@@ -8957,7 +8991,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             # is 0 where they coincide (`2*time < t2` sits on `time < t1` where t2
             # = 2·t1); read at the run, so a set_param moves it.
             def _moving_part(d):
-                syms = [s for s in d.free_symbols if str(s) in _moving]
+                syms = [e for e in _subexpressions(d) if e.is_Symbol and str(e) in _moving]
                 return _sp.expand(d).as_independent(*syms, as_Add=True)[1]
 
             def _moving_terms(d):
@@ -8975,20 +9009,26 @@ def _build_model_from_sbml_doc_in_context(doc):
 
             def _sibling(d1, d0):
                 # (scale, rest) where d1 = scale*d0 + rest, with scale a nonzero
-                # number, else None. Past _JUMP_TEXT_NODES, `expand`, `cancel`
-                # and `free_symbols` walk the tree, which a relation over a
-                # diamond of rules makes exponential (issue #1124, item 6), so
-                # the two are compared term by term, as `_ratio_of` does.
+                # number, else None. Past _JUMP_TEXT_NODES, `expand` and
+                # `cancel` walk the tree, which a relation over a diamond of
+                # rules makes exponential (issue #1124, item 6), so the two are
+                # compared term by term, as `_ratio_of` does, and then read at
+                # points: only a pair with one slope there is expanded. A power
+                # beside its expansion, `(r19 + 1)^2 > p1` and `r19^2 + 2*r19 +
+                # 1 < p2`, shares no term with it, and with p1 = p2 the two
+                # roots fired on one instant (issue #1187).
                 if _tree_size(d0) + _tree_size(d1) > _JUMP_TEXT_NODES:
                     (m1, c1), (m0, c0) = _moving_terms(d1), _moving_terms(d0)
-                    if not m0 or m1.keys() != m0.keys() or not all(m0.values()):
+                    if not m0:
                         return None
-                    qs = [m1[m] / m0[m] for m in m0]
-                    if qs[0] == 0 or any(abs(q - qs[0]) > 1e-12 * abs(qs[0]) for q in qs):
+                    if m1.keys() == m0.keys() and all(m0.values()):
+                        qs = [m1[m] / m0[m] for m in m0]
+                        if qs[0] != 0 and all(abs(q - qs[0]) <= 1e-12 * abs(qs[0]) for q in qs):
+                            return qs[0], c1 - qs[0] * c0
+                    if not _one_slope(d1, d0):
                         return None
-                    return qs[0], c1 - qs[0] * c0
                 scale = _sp.cancel(_moving_part(d1) / _moving_part(d0))
-                if not scale.is_number or scale == 0:
+                if not scale.is_number or not scale.is_finite or scale == 0:
                     return None
                 return scale, _sp.expand(d1 - scale * d0)
 
