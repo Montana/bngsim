@@ -9168,6 +9168,21 @@ class Simulator:
         distinct root comes with the stability certificate's verdict, so the
         saddles a run of the dynamics never rests on are reported too.
 
+        The root one ordinary :meth:`steady_state` solve reaches (with the same
+        ``mask``) is solved as one more start, with each held species set as the
+        draws hold it, so the call returns that root too wherever Newton holds it
+        at ``tol`` (issue #1189). It is no draw: it adds nothing to
+        ``multiplicity`` or ``basins``, and a root only it found has
+        multiplicity 0. The seed is then put on the conservation laws at the
+        model's totals, as every draw is. Two cases return less. Where Newton
+        cannot hold the root, as at the large law totals below (issue #1190), it
+        is missed: on a three-species law at a total of ``1e8``, the call returns
+        none. And where the solve had moved a held species, it solved another
+        problem: a masked sink at the end of a chain, as the pure-sink mask below
+        makes it, moves its law's total, and a held species the rates read moves
+        the rates. Newton from the seed then reaches a root of the problem the
+        draws solve, or none, and it need not be the solve's.
+
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
         is complete. Completeness for polynomial mass-action systems is what
@@ -9233,19 +9248,27 @@ class Simulator:
             raise ValueError("n_starts must be at least 1")
         y0, L, held, in_law = _manifold_partition(self._model, mask)
         alone = ~held & ~in_law
+        # One ordinary solve, for two things. Its root is an extra start (issue
+        # #1189): on Motivating_example and fceri_ji_red every sampled start
+        # failed and the call returned no root at all, where steady_state()
+        # converges and Newton converges from its root at once. And, below, it
+        # gives the sampling bound its scale.
+        try:
+            ordinary = self.steady_state(tol=tol, mask=mask)
+        except Exception:  # noqa: BLE001 - a seed and a scale only; the draws stand
+            ordinary = None
         if upper is None and alone.any():
-            # The scale of the model's own steady state, from one ordinary
-            # solve: a model in no conservation law that starts at zero has no
-            # other (the Gardner toggle's roots sit at 53 and 144; a bound of
-            # 10 from its initial state found two of three roots). Read off the
-            # species `upper` bounds, and not off an accumulator: nothing
-            # settles it, so it ends wherever max_time leaves it, and a scale
-            # from there puts every start decades above the roots.
-            try:
-                reached = np.asarray(self.steady_state(tol=tol, mask=mask).concentrations)
+            # The scale of the model's own steady state: a model in no
+            # conservation law that starts at zero has no other (the Gardner
+            # toggle's roots sit at 53 and 144; a bound of 10 from its initial
+            # state found two of three roots). Read off the species `upper`
+            # bounds, and not off an accumulator: nothing settles it, so it ends
+            # wherever max_time leaves it, and a scale from there puts every
+            # start decades above the roots.
+            reached = np.zeros(0)
+            if ordinary is not None:
+                reached = np.asarray(ordinary.concentrations)
                 reached = reached[alone & ~self._model.is_pure_sink()]
-            except Exception:  # noqa: BLE001 - only a scale; the default stands
-                reached = np.zeros(0)
             upper = _default_sampling_bound(y0, L, reached)
         starts = _sample_on_conservation_manifold(
             self._model, n_starts, np.random.default_rng(seed), upper, mask, decades
@@ -9276,17 +9299,72 @@ class Simulator:
         # A $-fixed one has a zero row there, and the unmasked solve keeps it
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
+        solve_mask = ~held if held.any() else None
         results = self.steady_state_batch(
             states=starts,
             method="newton",
             newton_burst=False,
             tol=tol,
             n_workers=n_workers,
-            mask=~held if held.any() else None,
+            mask=solve_mask,
         )
-        return SteadyStates.cluster(
+        # The ordinary solve's root, solved as the draws are, joins them last:
+        # a root is grouped by the first result that reached it, so it moves no
+        # draw from the root it reached. It is no draw, so it adds nothing to
+        # `multiplicity` or `basins`, and a root only it found has multiplicity 0.
+        seeded = False
+        seed_state = None
+        if ordinary is not None and ordinary.converged:
+            # Its held species as every draw holds them: a masked accumulator
+            # ends wherever the ordinary solve's max_time left it, and the root
+            # came back as a fourth one beside the same toggle root, apart only
+            # in a species the solve does not move.
+            seed_state = np.asarray(ordinary.concentrations, dtype=float).copy()
+            seed_state[held] = starts[0][held]
+            # And onto the laws at the totals every draw holds, as a draw is put
+            # there. A sink masked as the docstring advises is a law member
+            # wherever a chain ends in it (m1_ground's D, SIR's R), and the solve
+            # had moved it: set back, it moved its law's total, and Newton, which
+            # recomputes the totals from its start, reported a "root" of
+            # m1_ground at a total of 0, not 100. Where nothing held moved, this
+            # moves the seed by the integration's drift, a few 1e-9.
+            A, totals = _moving_laws(L, in_law, y0)
+            if A.shape[0]:
+                cols = np.flatnonzero(in_law)
+                w = np.maximum(seed_state[cols], np.finfo(float).tiny)
+                # A law whose members the solve drained to 0 (A -> D, D held)
+                # has none to lift: the dual Newton overflows and underflows on
+                # its way to None, which drops the seed. That is the answer, so
+                # nothing is raised or warned, and nothing non-finite is kept.
+                with np.errstate(all="ignore"):
+                    y = _project_onto_laws(w, A, totals)
+                if y is None or not np.all(np.isfinite(y)):
+                    seed_state = None
+                else:
+                    seed_state[cols] = y
+        if seed_state is not None:
+            try:
+                (from_ordinary,) = self.steady_state_batch(
+                    states=[seed_state],
+                    method="newton",
+                    newton_burst=False,
+                    tol=tol,
+                    mask=solve_mask,
+                )
+            except SimulationError:
+                from_ordinary = None
+            if from_ordinary is not None and from_ordinary.converged:
+                results = [*results, from_ordinary]
+                seeded = True
+        roots = SteadyStates.cluster(
             results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol, laws=L
         )
+        if seeded:
+            k = int(roots.basins[-1])
+            roots.multiplicity[k] -= 1
+            roots.basins = roots.basins[:-1]
+            roots.n_failed = int(np.sum(roots.basins < 0))
+        return roots
 
     # ─── Stop conditions ────────────────────────────────────────────
 
@@ -10463,10 +10541,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    # A law over held species alone constrains nothing a start moves.
-    A = L[:, in_law]
-    A = A[(A != 0).any(axis=1)]
-    totals = A @ y0[in_law]
+    A, totals = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10485,6 +10560,15 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
                 )
             row[cols] = y
     return out
+
+
+def _moving_laws(L, in_law, y0):
+    """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
+    totals the model's state ``y0`` holds (issue #524). A law over held species
+    alone constrains nothing a start moves, and is left out."""
+    A = L[:, in_law]
+    A = A[(A != 0).any(axis=1)]
+    return A, A @ y0[in_law]
 
 
 def _project_onto_laws(w, A, b, max_iter=200):
@@ -10554,7 +10638,8 @@ class SteadyStates:
     ----------
     states : ndarray, shape ``(n_roots, n_species)``
         Each root's concentrations, ordered like ``species_names``: the start
-        that reached it with the smallest residual.
+        that reached it with the smallest residual, the extra start from
+        :meth:`Simulator.steady_state`'s root among them.
     stability : list[str]
         ``"stable"``, ``"unstable"`` or ``"undetermined"`` per root, from the
         stability certificate.
@@ -10562,7 +10647,10 @@ class SteadyStates:
         The reduced Jacobian's spectrum at each root (empty where the
         certificate did not compute it).
     multiplicity : ndarray of int
-        How many starts reached each root: a rough measure of its basin.
+        How many starts reached each root: a rough measure of its basin. The
+        root of :meth:`Simulator.steady_state`, solved as one more start, is
+        no draw and counts for nothing, so a root only it reached reads 0
+        (issue #1189).
     basins : ndarray of int, shape ``(n_starts,)``
         Root index per start, -1 where the solve did not converge.
     residuals : ndarray
