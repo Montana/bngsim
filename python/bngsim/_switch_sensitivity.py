@@ -3509,8 +3509,12 @@ def _held_schedule(
     Known: every event that writes it fires on ``time() >= c`` (or ``>``, or
     the same written the other way), with c a run constant, after a constant
     delay, and sets a value that reads only run constants and held species
-    known then. Such a trigger rises once, so the event fires once. Not
-    known: two writers executing at one instant, which are not ordered here;
+    known then. Such a trigger rises once, so the event fires once. A run that
+    starts where the last one ended continues its events (``event_carry``, issue
+    #693): a trigger rises in it only where it was false there, and the
+    executions the last run delayed into it are taken with the values they
+    froze. A fresh run's trigger was false before it unless its initialValue
+    says true. Not known: two writers executing at one instant, which are not ordered here;
     a delayed fire whose value, read at its trigger, reads a held species that
     another fire sets in between; and, in a run with sensitivity columns, a
     time or a value that reads a requested parameter, or one derived from
@@ -3538,9 +3542,33 @@ def _held_schedule(
         v = float(core.evaluate_over_times(text, [float(at)], 0.0)[0])
         return (v, "") if math.isfinite(v) else (None, f"which reads {v}")
 
+    # The last run's events, where this one continues it: what each trigger read
+    # where it ended, and its executions not yet applied.
+    carry = core.event_carry()
+    continued = carry is not None and float(carry[0]) == float(t_start)
+    was_true: list = list(carry[1]) if continued else []
+    events = core.events_as_written()
+
     # (execution time, trigger time, label, [(species, value text)], from trigger)
     fires: list[tuple[float, float, str, list[tuple[str, str]], bool]] = []
-    for ev in core.events_as_written():
+    if continued:
+        for i, at, frozen in carry[2]:
+            ev = events[i]
+            writes = [
+                (names_of[sp], (repr(float(frozen[k])) if frozen else text))
+                for k, (sp, text) in enumerate(ev["assignments"])
+                if sp in names_of
+            ]
+            if not writes:
+                continue
+            label = f"event {ev['id'] or '?'}, delayed from the last run"
+            if frozen and len(frozen) != len(ev["assignments"]):
+                for name, _ in writes:
+                    unknown.setdefault(name, f"{label} carries values it cannot be read by")
+                continue
+            if float(at) < t_end:
+                fires.append((float(at), t_start, label, writes, False))
+    for i, ev in enumerate(events):
         writes = [(names_of[sp], text) for sp, text in ev["assignments"] if sp in names_of]
         if not writes:
             continue
@@ -3559,7 +3587,8 @@ def _held_schedule(
                 unknown.setdefault(name, f"{label} sets it, {why}")
             continue
         true_at_start = t_start >= threshold if op in (">=", "<=") else t_start > threshold
-        if true_at_start and ev["initial_value"]:
+        true_before = bool(was_true[i]) if continued else bool(ev["initial_value"])
+        if true_at_start and true_before:
             continue  # it never rises in this run
         rises = t_start if true_at_start else threshold
         at = rises + float(ev["delay"])

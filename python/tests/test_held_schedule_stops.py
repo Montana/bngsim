@@ -150,3 +150,53 @@ def test_a_condition_that_changes_once_is_read_as_before():
 def test_a_schedule_no_event_writes_is_as_before():
     x = _x(_model(""), [0, 49, 74, 240], rtol=1e-6, atol=1e-8)
     np.testing.assert_allclose(x, [0, 3, 4, 10], rtol=1e-5)
+
+
+# ── A run that continues the last one ───────────────────────────────────────
+#
+# A run that starts where the last one ended continues its events
+# (NetworkModel.event_carry, issue #693): each trigger's truth there, and the
+# delayed executions not yet applied. The schedule was read as a fresh start's:
+# a trigger true at the start with initialValue false was taken to fire again,
+# and an execution delayed into this run was not seen, so the stops were placed
+# for a w the run never holds. Leg 2 of `w = w + 1`, t0=false, came to 17.8 for
+# 20 at rtol 1e-2, and a delayed execution carried into it to 16.6 for 19.
+
+
+def _legs(events, rtol):
+    model = _model(events)
+    sim = bngsim.Simulator(model, method="ode")
+    sim.run(sample_times=[0, 240], rtol=rtol, atol=rtol / 100)
+    x = np.asarray(sim.run(sample_times=[240, 480], rtol=rtol, atol=rtol / 100).species)[:, 0]
+    return x[-1] - x[0], model
+
+
+@pytest.mark.parametrize("rtol", [1e-2, 1e-3, 1e-8])
+@pytest.mark.parametrize("initial", ["", ", t0=false"])
+def test_a_continued_run_does_not_fire_a_trigger_that_stays_true(rtol, initial):
+    """w = 2 from 50 on, and the trigger is still true at 240: no second fire.
+    Leg 2 is ten pulses of width 2."""
+    gain, model = _legs(f"E1: at (time >= 50){initial}: w = w + 1", rtol)
+    assert model.get_concentration("w") == 2.0
+    assert gain == pytest.approx(_exact([], 480, t_start=240, w0=2.0), rel=10 * rtol)
+
+
+@pytest.mark.parametrize("rtol", [1e-2, 1e-3, 1e-8])
+def test_a_continued_run_takes_the_execution_the_last_one_delayed(rtol):
+    """Triggered at 230 with its value frozen there (w + 1 = 2), executed at
+    250, in leg 2: w = 1 until 250, then 2."""
+    gain, model = _legs("E1: at 20 after (time >= 230): w = w + 1", rtol)
+    assert model.get_concentration("w") == 2.0
+    assert gain == pytest.approx(_exact([(250, 2.0)], 480, t_start=240, w0=1.0), rel=10 * rtol)
+
+
+@pytest.mark.parametrize("rtol", [1e-2, 1e-3, 1e-8])
+def test_a_carried_execution_sets_the_value_it_froze(rtol):
+    """E1's value is frozen at its trigger, 230 (w + 1 = 2). E2 sets w to 5 at
+    245, before E1 executes at 250, so read then w + 1 would be 6: the run
+    holds 1, 5 from 245, and 2 from 250."""
+    events = "E1: at 20 after (time >= 230): w = w + 1\n  E2: at (time >= 245): w = 5"
+    gain, model = _legs(events, rtol)
+    assert model.get_concentration("w") == 2.0
+    exact = _exact([(245, 5.0), (250, 2.0)], 480, t_start=240, w0=1.0)
+    assert gain == pytest.approx(exact, rel=10 * rtol)
