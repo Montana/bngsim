@@ -127,7 +127,7 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 
 # ─── Wall-clock timeouts on a slower build ────────────────────────────────────
 #
-# python-sanitizers.yml runs this suite against an ASan + UBSan build, two to
+# sanitizers.yml runs this suite against an ASan + UBSan build, two to
 # three times slower than the one python-tests.yml runs. About 160 tests hand a
 # run a timeout of two minutes or less as a hang guard, and on that build a run
 # that is merely slow can cross one: two did, on the job's first full runs.
