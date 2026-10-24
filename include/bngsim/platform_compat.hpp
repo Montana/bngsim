@@ -46,8 +46,8 @@ inline int unsetenv(const char *name) { return _putenv_s(name, ""); }
 // The OS "bit bucket". NFsim's System::registerOutputFileLocation() and
 // SUNDIALS' SUNLogger_SetWarningFilename() open this path to discard output, and
 // NFsim treats a failed open as a hard error (throws "quitting"). The POSIX
-// spelling "/dev/null" does not exist on Windows — it resolves to <drive>:\dev\
-// null, whose parent directory is absent, so the std::ofstream open fails and
+// spelling "/dev/null" does not exist on Windows — it resolves to
+// <drive>:\dev\null, whose parent directory is absent, so the std::ofstream open fails and
 // every NFsim initialize()/simulate() aborts. "NUL" is the Windows null device
 // and is openable by std::ofstream / fopen.
 namespace bngsim {

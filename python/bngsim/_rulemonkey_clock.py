@@ -2,9 +2,9 @@
 
 Since #1022, ``method="rm"`` runs a model that reads the clock (``time()``, a
 bare ``time``, or a table function indexed by time) on absolute model time, as
-``ode`` and ``ssa`` do. RuleMonkey places each event at ``t + tau`` in doubles,
-so from a large ``t_start`` the waiting times round away once the total
-propensity times |t| nears 1e15, and the run is biased with no error: from
+``ode`` and ``ssa`` do. RuleMonkey 3.11.0 placed each event at ``t + tau`` in
+doubles, so from a large ``t_start`` the waiting times rounded away once the
+total propensity times |t| neared 1e15, and the run was biased with no error: from
 ``t_start = 1e12``, ``A(s~0) -> A(s~1)`` at 0.5 from 1e5 copies left 22743 at
 ``1e12 + 2`` against the binomial mean 36788 (z = -291). A model that reads no
 clock runs on elapsed time and is exact (#1060).
@@ -25,14 +25,14 @@ model symbol reads the symbol. BNG2.pl accepts an observable named ``time``, and
 turning that into the clock changed the rates of a model that reads no clock.
 
 A table function indexed by the clock is not rewritten, and a model with one
-runs on model time as before (the caller checks
-:func:`~bngsim._network_free_checks.time_indexed_table_functions`). Its counter
-would have to be a function that reads ``time()+__bngsim_t0``, and RuleMonkey
-3.11.0 recurses without end evaluating a table whose counter is a function:
-rebuild_eval_vars reads the counter through update_eval_vars, whose generation
-stamp is set only after the rebuild (engine.cpp), and the run fails with a
-stack overflow (richardposner/RuleMonkey#111). Offset such a table too once
-that is fixed and vendored.
+runs on model time (the caller checks
+:func:`~bngsim._network_free_checks.time_indexed_table_functions`). It needs no
+offset: since 3.12.0 RuleMonkey places its events, and its panels for a rate
+that reads the clock, on the time elapsed since each call starts
+(richardposner/RuleMonkey#110), so such a run keeps its waiting times from a
+large ``t_start`` (issue #1063). Offsetting it would have indexed the table
+through a function, which 3.11.0 could not evaluate
+(richardposner/RuleMonkey#111).
 """
 
 from __future__ import annotations

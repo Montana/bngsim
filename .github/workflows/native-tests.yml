@@ -66,7 +66,8 @@ name: native-tests
 # subsystem, and duplicating the vendored NFsim/RuleMonkey build on this Linux
 # gate would cost minutes for no new coverage. If NFsim ever needs Linux CI, add
 # a second ctest leg with NFsim ON rather than letting the pair fall through the
-# gap the way test_bngsim once did.
+# gap the way test_bngsim once did. The sanitizers job below (#583) is NFsim ON
+# for that reason: under LeakSanitizer the pair is new coverage.
 
 on:
   push:
@@ -111,12 +112,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Ninja (BLAS ${{ matrix.blas }})
+        # As python-tests.yml's LAPACK leg: a hung apt-get (79 minutes there on
+        # lanl/bngsim#1198) fails in 3 minutes a call and is tried once more,
+        # within 15 for the step; this job has no limit of its own.
+        timeout-minutes: 15
         run: |
           set -euxo pipefail
-          sudo apt-get update
+          apt_install() {
+            local opts=(-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3)
+            timeout --kill-after=30 180 sudo apt-get "${opts[@]}" update &&
+              timeout --kill-after=30 180 sudo apt-get "${opts[@]}" install -y "$@"
+          }
           # matrix.apt is empty on the stock leg — that leg installs no BLAS and
           # is the configuration the manylinux/Windows wheels ship.
-          sudo apt-get install -y ninja-build ${{ matrix.apt }}
+          apt_install ninja-build ${{ matrix.apt }} || {
+            echo "::warning::apt-get failed or hung; trying once more"
+            sleep 15
+            apt_install ninja-build ${{ matrix.apt }}
+          }
 
       - name: Configure (tests ON; KLU / NFsim / RuleMonkey OFF)
         run: |
@@ -245,3 +258,91 @@ jobs:
             fi
             echo "No BLAS backend: $skipped LAPACK cases skipped, as expected."
           fi
+
+  # Issue #583: the native suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+  # A bad index here does not crash, it returns a wrong number; this is the
+  # detector for that. Non-blocking until it has been green for a while, then
+  # drop continue-on-error.
+  #
+  # The lean configuration of the legs above, plus two things a sanitizer is
+  # most useful on. liblapack-dev, so the BLAS dgetrf path and its pivot
+  # rebasing run: on the stock runner five of test_lapack_dense_linsol's cases
+  # skip. And NFsim, so nfsim_library_test and nfsim_simulator_test run under
+  # LeakSanitizer: the NFsim path's manual new/delete is where #577's leak was,
+  # and with NFsim OFF neither test is registered.
+  sanitizers:
+    name: C++ unit suite · ubuntu-latest · ASan + UBSan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja and reference LAPACK
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build liblapack-dev
+
+      - name: Configure (sanitizers; tests ON; NFsim ON; KLU / RuleMonkey OFF)
+        run: |
+          set -euxo pipefail
+          SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBNGSIM_BUILD_TESTS=ON \
+            -DBNGSIM_ENABLE_KLU=OFF \
+            -DBNGSIM_REQUIRE_KLU=OFF \
+            -DBNGSIM_BUILD_NFSIM=ON \
+            -DBNGSIM_BUILD_RULEMONKEY=OFF \
+            "-DCMAKE_C_FLAGS=$SAN" "-DCMAKE_CXX_FLAGS=$SAN" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build the test suite
+        run: |
+          set -euxo pipefail
+          cmake --build build -j"$(nproc)"
+
+      - name: Guard against an uninstrumented build
+        run: |
+          set -euo pipefail
+          # This job is green when the sanitizers report nothing, which is also
+          # what a build the flags never reached reports. So check that the
+          # library's own code calls into both runtimes before trusting a pass.
+          lib="$(ls build/libbngsim.so* | head -1)"
+          for sym in __asan_report_ __ubsan_handle_; do
+            if ! nm -D --undefined-only "$lib" | grep -q "$sym"; then
+              echo "::error::$lib makes no $sym* calls; the sanitizer flags did not reach src/."
+              exit 1
+            fi
+          done
+          echo "$lib is instrumented for ASan and UBSan."
+
+      - name: Run the full C++ suite under the sanitizers (ctest)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build --output-on-failure --no-tests=error
+
+      # The dgetrf path above is only covered if the backend was found and its
+      # cases ran. test_lapack_dense_linsol passes either way, so ask it.
+      - name: Guard the BLAS dense backend (expected yes)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ./build/tests/test_lapack_dense_linsol 2>&1 | tee /tmp/test_lapack.log
+          if ! grep -q 'lapack_dense_available = yes' /tmp/test_lapack.log; then
+            echo "::error::test_lapack_dense_linsol does not see the BLAS backend; the dgetrf path did not run under the sanitizers."
+            exit 1
+          fi
+          skipped="$(grep -oE '[0-9]+ SKIPPED' /tmp/test_lapack.log | tail -1 \
+            | grep -oE '^[0-9]+' || echo 0)"
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::$skipped LAPACK cases skipped on the sanitizer leg; the dgetrf path did not run."
+            exit 1
+          fi
+          echo "All LAPACK dense cases ran under the sanitizers (0 skipped)."

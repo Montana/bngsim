@@ -135,16 +135,17 @@ def test_atols_flat_drops_the_state_scale_too(monkeypatch):
 def _declined_model(k: float) -> bngsim.Model:
     """``S' = -k*S``, but written so the analytic sensitivity RHS is declined.
 
-    ``abs()`` has no derivative at the origin, so codegen refuses the whole model
-    and CVODES' difference quotient carries the column. A functional rate law is
-    multiplied by its reactant concentration, so the law is ``abs(k)`` and the
-    flux is ``abs(k)*S`` — the same dynamics as the elementary model above, and
-    therefore the same closed form.
+    ``clamp()`` has no analytic derivative (``abs()`` did not either, until issue
+    #1126), so codegen refuses the whole model and CVODES' difference quotient
+    carries the column. A functional rate law is multiplied by its reactant
+    concentration, so the law is ``clamp(0, k, 1e300)`` = k and the flux is
+    ``k*S`` — the same dynamics as the elementary model above, and therefore the
+    same closed form.
     """
     b = ModelBuilder()
     b.add_parameter("k", k)
     s_idx = b.add_species("S", 1.0)
-    b.add_function("rate", "abs(k)")
+    b.add_function("rate", "clamp(0, k, 1e300)")
     b.add_reaction([s_idx], [], "functional", "rate")
     return bngsim.Model(b.build())
 
@@ -170,7 +171,7 @@ def test_the_declined_model_really_is_on_the_difference_quotient():
     """The positive control for the two tests below.
 
     They are only about the DQ probe if this model has no analytic sensitivity
-    RHS. Were ``abs()`` ever made differentiable, the assertions would still pass
+    RHS. Were ``clamp()`` ever made differentiable, the assertions would still pass
     — on the analytic path, testing nothing they claim to test — so the premise
     is checked rather than assumed.
     """

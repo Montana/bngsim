@@ -477,13 +477,17 @@ def test_the_retry_matches_the_messages_the_core_raises(
 # steps and reports unconverged — but a march that chatters at a state
 # discontinuity is its own defect with its own blast radius, so it is tracked in
 # issue #235 rather than papered over here.
+#
+# The two that ask for `converged` name the residual test (issue #1001): what
+# they pin is the march's own verdict, not the run the default criterion takes
+# from the state it stops at.
 
 
 def test_steady_state_auto_falls_back_and_converges(data_dir: Path) -> None:
     """The default config converges, on the difference quotient, and says so."""
     m = bngsim.Model.from_net(_net(data_dir))
     sim = bngsim.Simulator(m, method="ode")
-    ss = sim.steady_state(method="integration", rtol=TOL, atol=TOL)
+    ss = sim.steady_state(method="integration", rtol=TOL, atol=TOL, criterion="residual")
     assert ss.converged
     assert ss.solver_jacobian_retried
     assert ss.solver_jacobian_source == "finite-difference"
@@ -525,9 +529,9 @@ def test_steady_state_repeated_solves_skip_the_doomed_attempt(
     m = bngsim.Model.from_net(_net(data_dir))
     sim = bngsim.Simulator(m, method="ode")
     with caplog.at_level("WARNING", logger="bngsim"):
-        first = sim.steady_state(method="integration", rtol=TOL, atol=TOL)
+        first = sim.steady_state(method="integration", rtol=TOL, atol=TOL, criterion="residual")
         assert sim._ss_jacobian_fell_back is True
-        second = sim.steady_state(method="integration", rtol=TOL, atol=TOL)
+        second = sim.steady_state(method="integration", rtol=TOL, atol=TOL, criterion="residual")
     assert first.converged and second.converged
     assert first.solver_jacobian_retried
     assert not second.solver_jacobian_retried, "the second solve went straight to fd"

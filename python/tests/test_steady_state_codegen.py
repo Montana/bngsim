@@ -189,7 +189,8 @@ class TestSensitivityUsesAnalyticalRhs:
 
     def test_a_model_that_still_declines_differences_dfdp_and_says_so(self, tmp_path, caplog):
         """The FD fallback has not gone away — a Functional law with a kink
-        (``abs()``) has no analytic ∂f/∂p at any stage of #55 — and when it is
+        (``abs()`` written with ``clamp()``; abs itself has one since issue #1126)
+        has no analytic ∂f/∂p at any stage of #55 — and when it is
         taken it must still say so. Michaelis–Menten was this test's vehicle
         until MM gained its closed form."""
         text = """\
@@ -198,7 +199,7 @@ begin parameters
     2 kr     0.2  # Constant
 end parameters
 begin functions
-    1 kink() kf*abs(Atot - 1)
+    1 kink() kf*(clamp(0,Atot-1,1e300)+clamp(0,1-Atot,1e300))
 end functions
 begin species
     1 A() 5.0

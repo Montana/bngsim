@@ -147,19 +147,25 @@ NUMBER_CONDITIONS = [
     ),
     (
         "if(if((y!=1), if((x!=0), x, y), if((y!=0), 0, x)), a, b)",
-        lambda v: v["a"]
-        if ((v["x"] if v["x"] != 0 else v["y"]) if v["y"] != 1 else (0 if v["y"] != 0 else v["x"]))
-        != 0
-        else v["b"],
+        lambda v: (
+            v["a"]
+            if (
+                (v["x"] if v["x"] != 0 else v["y"])
+                if v["y"] != 1
+                else (0 if v["y"] != 0 else v["x"])
+            )
+            != 0
+            else v["b"]
+        ),
     ),
     # The inner chain's second branch is cut off by a condition that holds for
     # every x, and is a number no Boolean can stand for. sympy's set theory cut
     # it before reading it; the chain built here reads it, so the parse failed.
     (
         "if(if(((x<=3) || (x>=0)), if(((if((y>=0), y, x))<0), 1, x), (x)*2), a, b)",
-        lambda v: v["a"]
-        if (1 if (v["y"] if v["y"] >= 0 else v["x"]) < 0 else v["x"]) != 0
-        else v["b"],
+        lambda v: (
+            v["a"] if (1 if (v["y"] if v["y"] >= 0 else v["x"]) < 0 else v["x"]) != 0 else v["b"]
+        ),
     ),
 ]
 
