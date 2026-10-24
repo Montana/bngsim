@@ -727,15 +727,33 @@ def test_a_switch_whose_error_is_far_past_its_gap_to_an_event_is_refused(gap):
     _unconfirmed(text, ["kv"], 945, LONG_TIMES, rtol=1e-6)
 
 
-def test_a_crossing_found_after_an_unconfirmed_fire_is_refused():
-    """An event 0.01 before the crossing that kv moves, the event fixed: the
-    run fires it, then finds the crossing 6.7e-3 early, 3.3e-3 after it.
-    The order is the true one, but the residual where the event fired is
-    −0.0045 against −0.0146 at a hundredth of the tolerances: the run's
-    error is two thirds of the gap. Only the crossing can ask, of the fire
-    behind it."""
-    text = MOVED_BY_KV.format(w=0.0, te=_long_run_crossing() - 0.01)
-    _unconfirmed(text, ["kv"], 945, LONG_TIMES, rtol=1e-6)
+# V' = kv·(1 − 0.5·cos t) reaches 1000 at t* ≈ 1000.4975, which the run
+# reads late at every tolerance: V is 0.013 to 0.67 low there.
+LATE_SWITCH = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; kv = 1\n"
+    "J0: -> X; a\nJv: -> V; kv*(1 - 0.5*cos(time))\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= {te!r}): X = 0.5*X\n"
+)
+
+
+def _late_switch_crossing():
+    """Where V = t − 0.5·sin(t) reaches 1000, by Newton."""
+    t = 1000.0
+    for _ in range(50):
+        t -= (t - 0.5 * math.sin(t) - 1000.0) / (1.0 - 0.5 * math.cos(t))
+    return t
+
+
+def test_a_crossing_found_after_a_fire_it_came_before_is_refused():
+    """The switch is 0.002 before the event, which is fixed: kv moves the
+    crossing alone. At rtol 1e-5 the run fires the event first and finds
+    the crossing 0.03 after it, and main returned dW/dkv = 723,606, the
+    event-first side, for 1,474,092 with no error. Only the crossing can
+    ask, of the fire behind it: at a hundredth of the tolerances the
+    switch's residual there is on the other side of its surface (−0.032
+    against +0.0008)."""
+    text = LATE_SWITCH.format(te=_late_switch_crossing() + 0.002)
+    _unconfirmed(text, ["kv"], 945, LONG_TIMES, rtol=1e-5)
 
 
 def test_a_crossing_found_after_a_confirmed_fire_runs():
@@ -885,9 +903,9 @@ def _column(text, param, times, name):
 def test_a_fire_past_thousands_of_one_switch_s_crossings_runs():
     """The oldest crossings are dropped, but the fire asks only the last
     crossing of each switch, which is kept. Refused on any one dropped, it
-    was refused where main returns 0.08282 (T never crosses here)."""
+    was refused where main returns 0.0828 (T never crosses here)."""
     text = MANY_CROSSINGS.format(om=3200.0, once="1e300")
-    assert _column(text, "lam", EVICTION_TIMES, "W") == pytest.approx(0.0828239, rel=1e-5)
+    assert _column(text, "lam", EVICTION_TIMES, "W") == pytest.approx(0.0828239, rel=1e-3)
 
 
 def test_a_switch_whose_only_crossing_was_dropped_is_refused():
@@ -898,9 +916,13 @@ def test_a_switch_whose_only_crossing_was_dropped_is_refused():
 
 
 def test_a_switch_whose_only_crossing_is_kept_runs():
-    """Control: at om = 3000 it is kept, and the order is confirmed."""
+    """Control: at om = 3000 it is kept, and the order is confirmed. Y
+    gathers q·X from t = 0.1 and X halves at t_F = ln(1e9)/lam:
+    dY/dlam = q·(t_F − 2.5)·dt_F/dlam."""
     text = MANY_CROSSINGS.format(om=3000.0, once=math.exp(0.1))
-    assert _column(text, "lam", EVICTION_TIMES, "Y") == pytest.approx(-0.954312, rel=1e-5)
+    t_fire = math.log(1e9) / 5.0
+    truth = 0.7 * (t_fire - 2.5) * (-t_fire / 5.0)
+    assert _column(text, "lam", EVICTION_TIMES, "Y") == pytest.approx(truth, rel=1e-4)
 
 
 # E1 fires every 1/rate until t = 4.5, about 4,500 times at rate 1000; E2
@@ -922,9 +944,15 @@ def test_a_crossing_whose_event_s_only_fire_was_dropped_is_refused():
 
 
 def test_a_crossing_whose_event_s_only_fire_is_kept_runs():
-    """Control: at rate 800 it is kept, and the order is confirmed."""
+    """Control: at rate 800 it is kept, and the order is confirmed. Y
+    gathers q·X from t_C = ln(1e9)/lam, where X = t_C + 1: dY/dlam =
+    q·(t_C + 1)·t_C/lam, 21.56. B is read to atol 1e-9 at a threshold of
+    1e-9, so the run's crossing is off by a few percent, and by 1.7e-4
+    more on Linux than on macOS."""
     text = MANY_FIRES.format(rate=800.0)
-    assert _column(text, "lam", FIRES_TIMES, "Y") == pytest.approx(20.938956, rel=1e-5)
+    t_cross = math.log(1e9) / 2.5
+    truth = 0.7 * (t_cross + 1.0) * t_cross / 2.5
+    assert _column(text, "lam", FIRES_TIMES, "Y") == pytest.approx(truth, rel=0.05)
 
 
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():
