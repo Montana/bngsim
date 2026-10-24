@@ -19,7 +19,7 @@ MIR_DIR = BNGSIM_ROOT / "third_party" / "mir"
 MIR_VENDOR_METADATA = MIR_DIR / "VENDOR.json"
 CMAKE_LISTS = BNGSIM_ROOT / "CMakeLists.txt"
 
-PINNED_COMMIT = "99c65079038f3ba9242ef646f308c266cfd7a8e5"
+PINNED_COMMIT = "439a90a2d7d9f38a70e8d9a6ebeabd900d66e920"
 UPSTREAM_REMOTE = "https://github.com/vnmakarov/mir.git"
 
 # The three translation units CMake compiles.
@@ -81,8 +81,10 @@ def test_mir_vendor_metadata_shape():
 def test_mir_local_carries_are_still_applied():
     """Every declared local carry must still be present in the vendored file.
 
-    The tree is no longer stock upstream: issue #413 carries a bounds check in
-    mir-gen.c's ``try_spilled_reg_mem``. Checksum anchors cannot guard a carry —
+    The tree is stock upstream today — issue #413's bounds check in mir-gen.c
+    was carried here until upstream merged it (vnmakarov/mir#468), so the list
+    is empty — but the check stays for the next carry. Checksum anchors cannot
+    guard a carry —
     a refresh rewrites the file from upstream AND re-anchors it, so the patch
     vanishes with the tree still matching its own metadata. Each entry names a
     ``marker`` comment the patch itself carries; grepping for it is the one
@@ -105,18 +107,21 @@ def test_mir_local_carries_are_still_applied():
 
 
 def test_mir_gen_spill_reload_table_is_bounds_checked():
-    """Issue #413: the #413 carry, pinned to the property it restores.
+    """Issue #413: the fix, now upstream, pinned to the property it restores.
 
     ``try_spilled_reg_mem`` rewrites every operand naming one spilled register
     into a memory operand and records the rewritten indices in a fixed
-    ``op_nums[MAX_INSN_RELOAD_MEM_OPS]`` so it can undo them. Upstream sizes that
-    table at 2 and bounds the loop with ``gen_assert`` only — i.e. ``assert``,
-    which -DNDEBUG deletes from every release build — and an insn CAN name the
-    register three times: ``x = x * x`` reaches the allocator as ``dmul r, r, r``.
-    The third store then lands past the array, which glibc reports as
-    ``*** stack smashing detected ***``.
+    ``op_nums[MAX_INSN_RELOAD_MEM_OPS]`` so it can undo them. Upstream used to
+    size that table at 2 and bound the loop with ``gen_assert`` only — i.e.
+    ``assert``, which -DNDEBUG deletes from every release build — and an insn CAN
+    name the register three times: ``x = x * x`` reaches the allocator as
+    ``dmul r, r, r``. The third store then landed past the array, which glibc
+    reports as ``*** stack smashing detected ***``. BNGsim carried the fix until
+    upstream merged it as vnmakarov/mir#468; a refresh that fails here means
+    upstream lost it, and the carry has to come back (MIR_VENDORING.md, "Past
+    carries").
 
-    Both halves of the carry are asserted here, because either alone is
+    Both halves of the fix are asserted here, because either alone is
     insufficient. The table has to be 3 for the three-operand case to be handled
     rather than declined, and the runtime check has to stay because 3 is not a
     provable bound — the call site is reached for ``MIR_USE`` too, and ``MIR_USE``
@@ -127,14 +132,14 @@ def test_mir_gen_spill_reload_table_is_bounds_checked():
     half and runs only where the JIT is built.
     """
     src = (MIR_DIR / "mir-gen.c").read_text()
-    # Comments out, because the carry's own comment quotes the upstream line it
-    # replaced — matching prose here would report the fix as the bug.
+    # Comments out, so prose quoting the old line (as the #413 carry's comment
+    # did) cannot report the fix as the bug.
     code = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
     start = code.index("static int try_spilled_reg_mem")
     body = code[start : code.index("\nstatic ", start + 1)]
 
     assert "#define MAX_INSN_RELOAD_MEM_OPS 3" in code, (
-        "the #413 carry no longer sizes op_nums for a three-operand insn naming "
+        "the #413 fix no longer sizes op_nums for a three-operand insn naming "
         "one spilled register in every operand (`x = x * x`)"
     )
     assert "if (n >= MAX_INSN_RELOAD_MEM_OPS) {" in body, (

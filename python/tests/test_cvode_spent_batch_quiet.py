@@ -56,3 +56,20 @@ def test_the_message_can_be_kept(capfd, monkeypatch):
         t_span=(0.0, 10.0), n_points=3, max_steps=5, rtol=1e-10, atol=1e-12
     )
     assert "mxstep steps taken before reaching tout" in capfd.readouterr().err
+
+
+def test_the_variable_is_honoured_on_a_reused_simulator(capfd, monkeypatch):
+    """The handler was chosen only where the warm path built its persistent
+    objects, so a Simulator that had already run kept its filter whatever the
+    variable said afterwards (#1142's review). It is chosen on every run."""
+    monkeypatch.delenv("BNGSIM_LOG_SPENT_BATCHES", raising=False)
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(_DECAY), method="ode")
+    kw = dict(t_span=(0.0, 10.0), n_points=3, max_steps=5, rtol=1e-10, atol=1e-12)
+    sim.run(**kw)
+    assert "mxstep" not in capfd.readouterr().err
+    monkeypatch.setenv("BNGSIM_LOG_SPENT_BATCHES", "1")
+    sim.run(**kw)
+    assert "mxstep steps taken before reaching tout" in capfd.readouterr().err
+    monkeypatch.delenv("BNGSIM_LOG_SPENT_BATCHES")
+    sim.run(**kw)
+    assert "mxstep" not in capfd.readouterr().err

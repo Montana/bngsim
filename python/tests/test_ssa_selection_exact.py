@@ -167,6 +167,43 @@ def test_an_overflowing_total_is_refused(tmp_path, method, kw):
         bngsim.Simulator(m, method=method, **kw).run((0.0, 1.0), 3, seed=1, timeout=30)
 
 
+@pytest.mark.parametrize(("method", "kw"), METHODS)
+def test_a_refused_propensity_names_the_state_the_law_read(method, kw):
+    """Issue #1211: a law that is undefined at a state the SSA reaches (``k*A/A``
+    is 0/0 once A is 0) is refused with the species it reads and their values,
+    so the row says which count was zero without a rerun."""
+    m = bngsim.Model.from_antimony_string(
+        "model singular()\n  species A;\n  A = 1;\n  k = 1;\n  J1: A -> ; k * A / A;\nend"
+    )
+    with pytest.raises(SimulationError) as exc:
+        bngsim.Simulator(m, method=method, **kw).run((0.0, 10.0), 3, seed=1, timeout=30)
+    msg = str(exc.value)
+    assert "is nan at t = " in msg and ", with A = 0." in msg, msg
+
+
+TWELVE_NET = (
+    "begin parameters\n    1 k -1.0\nend parameters\n"
+    "begin functions\n    1 H() sqrt(k)*Atot\nend functions\n"
+    "begin species\n"
+    + "".join(f"    {i} A{i}() {0 if i == 5 else 10}\n" for i in range(1, 13))
+    + "end species\nbegin reactions\n    1 1 0 H\nend reactions\n"
+    "begin groups\n    1 Atot " + ",".join(str(i) for i in range(1, 13)) + "\nend groups\n"
+)
+
+
+@pytest.mark.parametrize(("method", "kw"), METHODS)
+def test_the_named_state_puts_zeros_first_and_caps_the_list(tmp_path, method, kw):
+    """A functional law over an observable reads every species in it: the zero
+    comes first, eight are named, and the rest are counted."""
+    m = _net(tmp_path, "twelve.net", TWELVE_NET)
+    with pytest.raises(SimulationError) as exc:
+        bngsim.Simulator(m, method=method, **kw).run((0.0, 1.0), 3, seed=1, timeout=30)
+    msg = str(exc.value)
+    assert ", with A5() = 0, A1() = 10, " in msg, msg
+    assert ", and 4 more. A rate law" in msg, msg
+    assert msg.count("() = ") == 8, msg
+
+
 def test_slow_channel_survives_deep_in_the_tree(tmp_path):
     """17 reactions make a three-level tree: the fast channel at leaf 1 and the
     slow birth at leaf 5 meet only at the root, so the recompute has to carry

@@ -78,28 +78,13 @@ static py::array_t<double> vec_to_ndarray_1d(const std::vector<double> &data) {
 // recovered from the buffer size (data.size() / (n_times * depth)) since the
 // Result class does not track it separately. An empty/unpopulated buffer yields
 // an empty (0,0,0) array, matching the species-sensitivity accessors.
-static py::array_t<double> sens_block_to_ndarray_3d(const std::vector<double> &data, int n_times,
-                                                    int depth) {
-    if (data.empty() || n_times == 0 || depth == 0) {
-        return py::array_t<double>({0, 0, 0});
-    }
-    int n_rows = static_cast<int>(data.size() / (static_cast<size_t>(n_times) * depth));
-    auto *vec = new std::vector<double>(data);
-    auto capsule = py::capsule(vec, [](void *p) { delete static_cast<std::vector<double> *>(p); });
-    return py::array_t<double>(
-        {n_times, n_rows, depth},
-        {static_cast<py::ssize_t>(static_cast<size_t>(n_rows) * depth * sizeof(double)),
-         static_cast<py::ssize_t>(static_cast<size_t>(depth) * sizeof(double)),
-         static_cast<py::ssize_t>(sizeof(double))},
-        vec->data(), capsule);
-}
-
-// Like sens_block_to_ndarray_3d but projects the middle (row) axis to ``keep``.
-// The expression output-sensitivity blocks (GH #198) are recorded with one row
-// per *raw* function (including the auto-generated _rateLawN intermediates); this
-// drops those rows so the returned block aligns with the filtered
-// ``expression_names`` a selector indexes into — exactly mirroring how
-// ``expression_data`` filters the value columns.
+//
+// The middle (row) axis is projected to ``keep``. The expression
+// output-sensitivity blocks (GH #198) are recorded with one row per *raw*
+// function (including the auto-generated _rateLawN intermediates); this drops
+// those rows so the returned block aligns with the filtered ``expression_names``
+// a selector indexes into — exactly mirroring how ``expression_data`` filters
+// the value columns.
 static py::array_t<double> sens_block_to_ndarray_3d_rows(const std::vector<double> &data,
                                                          int n_times, int depth,
                                                          const std::vector<size_t> &keep) {
@@ -3137,8 +3122,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "Block same-complex binding. Default: true.")
         .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
              "Whether the model reads the clock (default true): one-shot runs then run on "
-             "the model's clock, else on time elapsed since t_start, and a span too short "
-             "for the doubles near its times to integrate a clock-driven rate is refused")
+             "the model's clock, else on time elapsed since t_start")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
         .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
@@ -3739,6 +3723,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
         .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("continued_run_distance", &bngsim::SteadyStateResult::continued_run_distance)
         .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)

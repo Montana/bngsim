@@ -1,0 +1,37 @@
+# Issue #1058: a reversible Arrhenius binding rule with an energy pattern that
+# holds a state. B(s~1) binds A with G_AB + G_S1 = 1.5, B(s~0) with G_AB = 3.5,
+# and nothing changes s. Detailed balance gives the stationary distribution
+# prod_s w_s^n_s / n_s!, w = 1 for a monomer and exp(-G) for a complex.
+# RuleMonkey 3.11.0's load-time expansion misread a state in an energy pattern
+# (richardposner/RuleMonkey#109); 3.12.0 counts dG at each firing.
+begin model
+begin parameters
+  Ea0    0.5
+  phi    0.3
+  G_AB   3.5
+  G_S1  -2
+end parameters
+begin molecule types
+  A(b)
+  B(a,s~0~1)
+end molecule types
+begin seed species
+  A(b)        100
+  B(a,s~0)    100
+  B(a,s~1)    100
+end seed species
+begin energy patterns
+  A(b!1).B(a!1)      G_AB
+  A(b!1).B(a!1,s~1)  G_S1
+end energy patterns
+begin observables
+  Molecules AB0  A(b!1).B(a!1,s~0)
+  Molecules AB1  A(b!1).B(a!1,s~1)
+end observables
+begin reaction rules
+  A(b) + B(a) <-> A(b!1).B(a!1)  Arrhenius(phi,Ea0)
+end reaction rules
+end model
+
+generate_network({overwrite=>1})
+writeXML()

@@ -62,7 +62,7 @@ from bngsim._exceptions import (
     StopConditionMet,
 )
 from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
-from bngsim._model import Model
+from bngsim._model import _STEP_DECIDES_WHY, Model
 from bngsim._result import Result, _as_selector_list, _resolve_output_selector
 from bngsim._seed import _DEFAULT_EVENT_SEED, _resolve_seed
 from bngsim._ssa_validation import validate_for_ssa
@@ -432,6 +432,11 @@ def _finite_time(t: float) -> float:
     if not math.isfinite(t):
         raise ValueError(f"time must be finite, got {t}")
     return t
+
+
+# Issue #891: the loosest rtol at which a plain ODE run's stops are moved onto
+# the evaluator's change (see Simulator._apply_crossing_stops).
+_FLIP_LOOSEST_RTOL = 1e-4
 
 
 class Simulator:
@@ -1045,20 +1050,19 @@ class Simulator:
             from bngsim._bngsim_core import RuleMonkeySimulator
             from bngsim._network_free_checks import (
                 refuse_rulemonkey_compartments,
-                refuse_rulemonkey_energy_misreads,
                 rulemonkey_clock,
             )
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
             refuse_rulemonkey_compartments(xml_path)
-            refuse_rulemonkey_energy_misreads(xml_path)  # until issue #1058
             # Elapsed time, which keeps event times small at a large t_start. A
             # model that reads the clock reads model time (issue #1022): through
             # time(), from a copy of its XML whose clock is time() + __bngsim_t0,
             # set to each run's t_start (issue #1063), since on model time itself
-            # RuleMonkey's waiting times round away there. A table indexed by the
-            # clock cannot be offset (bngsim/_rulemonkey_clock.py), and a model
-            # with one runs on model time as before.
+            # RuleMonkey 3.11.0's waiting times rounded away there. A model with a
+            # table indexed by the clock is not offset and runs on model time,
+            # where RuleMonkey 3.12.0 keeps its waiting times (issue #1063,
+            # bngsim/_rulemonkey_clock.py).
             readers, tables = rulemonkey_clock(xml_path)
             reads_clock = bool(readers)
             self._rm_clock_offset = reads_clock and not tables
@@ -1346,15 +1350,7 @@ class Simulator:
             # codegen built the model but declined that RHS (a dilution term that
             # reads a rate, issue #1124 item 7), the run failed with "no codegen
             # .so is loaded", which a codegen=True does nothing for.
-            if self._sensitivity_ic and not self._codegen_provides_sens_rhs():
-                reason = self.sens_rhs_decline_reason
-                raise SensitivityUnsupportedError(
-                    "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
-                    "difference quotient has no parameter to perturb for an initial "
-                    "value. Codegen built this model but declined that RHS"
-                    + (f" ({str(reason).rstrip('.')})" if reason else "")
-                    + ", so the initial-value columns cannot be computed for this model."
-                )
+            self._refuse_sensitivity_ic_without_sens_rhs()
 
         # Validate and store sensitivity method
         if sensitivity_method not in ("staggered", "simultaneous"):
@@ -2206,6 +2202,9 @@ class Simulator:
         model = model if model is not None else self._model
         if sensitivities is None:
             sensitivities = bool(self._sensitivity_params or self._sensitivity_ic)
+        from bngsim._switch_sensitivity import say_what_was_read
+
+        say_what_was_read(False)  # what a run that never took its stops left
         conditions = model.time_discontinuity_conditions()
         # A table function read on the clock breaks at its breakpoints whether
         # or not any condition names it (issue #709).
@@ -2230,6 +2229,26 @@ class Simulator:
                 touches=getattr(model, "_event_disc_conditions", frozenset()),
                 over_budget=over_budget,
                 sensitivity_params=tuple(self._sensitivity_params) if sensitivities else None,
+                # Issue #891: onto the evaluator's change only where the run's
+                # tolerance can use it. At rtol 1e-3 and looser the step that
+                # reaches a stop on the new branch's first double reads the new
+                # rate at its end and passes, and a `mod` schedule came out 82%
+                # high where main, its stops a double early, was 4% (at 1e-4 and
+                # tighter the moved stops were the more accurate in every case).
+                on_the_flip=not sensitivities and float(opts.rtol) <= _FLIP_LOOSEST_RTOL,
+                # Issue #1226: looser, a double before the change. The step
+                # that ends on a stop reads the rate at its end, and where the
+                # tolerance lets it span a stretch, on the change it was taken
+                # at the next stretch's rate: `if(mod(time(), 24) < 1, 1, 0)`
+                # over 1,000 days was 14,627 for 1,000 at rtol 1e-2. A double
+                # earlier it is exact to rounding at every tolerance; tighter
+                # than this, where the step fails on the jump and the run walks
+                # the stretch before it, that walk finds a pulse inside the
+                # stretch that a step from the double before would not.
+                before_the_flip=not sensitivities and float(opts.rtol) > _FLIP_LOOSEST_RTOL,
+                # Issue #1018: a law on a line far from zero that the scan
+                # refuses or leaves alone is read tread by tread.
+                by_tread=not sensitivities,
             )
             knots = (
                 table_function_stops(model._core, float(t_start), float(t_end), table_breaks)
@@ -2291,6 +2310,7 @@ class Simulator:
                 and model._core.n_events == 0
             )
             self._bound_step_past_stop_budget(opts, over_budget, t_start, t_end, alone)
+        say_what_was_read(True)
         return conditions
 
     @staticmethod
@@ -2428,6 +2448,23 @@ class Simulator:
             )
 
         for item in over_budget:
+            if item.legs is not None:
+                # Read tread by tread (issue #1018), whatever step bound is
+                # passed: the law has a stop on each change or the run is
+                # refused. A bound in their place left `100*mod(1e12 + time(),
+                # 12u)` 0.4% off at the default tolerances, and 4.5% from
+                # X(0) = 1e4, where in legs that fit it is exact to rounding.
+                from bngsim._switch_sensitivity import _three_places_down
+
+                raise SimulationError(
+                    f"The rate law switches on {item.condition!r}, which, read once on each "
+                    "stretch of time its argument holds one double (issue #1018), changes "
+                    f"{item.changes} times between t={t_start!r} and t={t_end!r}. A run places "
+                    "at most 1,000,000 stops with its other switches, and without a stop on "
+                    "each change a step bound in their place need not keep the answer within "
+                    f"the tolerance. Run it in legs of {_three_places_down(item.legs)} or "
+                    "shorter (run_until): each then has a stop on every change."
+                )
             if item.flicker is not None:
                 # Whatever step bound is passed. One no wider than half the
                 # shortest stretch between two switches would stand for the
@@ -3218,18 +3255,52 @@ class Simulator:
         is also what a row's other refusals are decided by, so a row is not
         given one of its own; it is refused, and the message says how to run it.
 
+        A backstop since issue #961: :meth:`run_batch` gives such a row a
+        Simulator built for its attachment before the rows are dispatched
+        (:meth:`_runners_for_attachments`), and that one's artifact is built
+        for the row.
+
         Refused only where a requested column is of a parameter the changed one
         reads, directly or through others: its own column and the others are
         the same code either way. Asked only where a parameter's column is
         requested at all.
         """
+        found = self._row_reads_another_build(clone)
+        if found is None:
+            return
+        changed, upstream, now_attached, names = found
+        pinned = [n for n in changed if not now_attached[names.index(n)]]
+        attached = [n for n in changed if now_attached[names.index(n)]]
+        what = []
+        if pinned:
+            what.append(f"overrides the derived parameter(s) {pinned}")
+        if attached:
+            what.append(
+                f"writes {attached} back to the value of its expression, which attaches it"
+            )
+        raise SensitivityUnsupportedError(
+            f"run_batch row {index} {' and '.join(what)}, which the requested column(s) "
+            f"{upstream} reach the model through. The sensitivity code differentiates "
+            "through a derived parameter while it follows its expression and not while "
+            "it is pinned, and the code this row was given was built for the other "
+            f"case; those columns would be that case's (issues #708, #961). {self._ROW_REMEDY}"
+        )
+
+    def _row_reads_another_build(self, clone: Model):
+        """Whether a batch row's *clone* needs other sensitivity code than the
+        artifact this Simulator holds (issue #708): where its writes pin or
+        re-attach a derived parameter that a requested column reaches the model
+        through. ``(changed, upstream, attached, names)`` where it does, else
+        ``None``. A requested column of a parameter the changed one reads,
+        directly or through others, is the one whose code differs; its own
+        column and the others are the same code either way."""
         built = self._codegen_attachment
         if built is None or not (self._codegen_so_path or self._codegen_c_source):
-            return
+            return None
         was_attached = built[0]
         now_attached = _attachment(clone)
         if now_attached == was_attached:
-            return
+            return None
         core = clone._core
         names = list(core.param_names)
         changed = [
@@ -3246,24 +3317,81 @@ class Simulator:
                     pending.append(name)
         upstream = [p for p in self._sensitivity_params if p in reads]
         if not upstream:
-            return
-        pinned = [n for n in changed if not now_attached[names.index(n)]]
-        attached = [n for n in changed if now_attached[names.index(n)]]
-        what = []
-        if pinned:
-            what.append(f"overrides the derived parameter(s) {pinned}")
-        if attached:
-            what.append(
-                f"writes {attached} back to the value of its expression, which attaches it"
+            return None
+        return changed, upstream, now_attached, names
+
+    def _runners_for_attachments(
+        self, params: Sequence[dict[str, float]], t_span: tuple[float, float]
+    ) -> dict[int, Simulator]:
+        """For each batch row whose writes need other sensitivity code than the
+        batch's artifact, the Simulator that runs it (issue #961).
+
+        Every row of a batch ran on the one artifact this Simulator holds, and
+        a row that pinned or re-attached a derived parameter a requested column
+        reaches the model through was refused (issue #708): ``{"k2": 5.0}`` over
+        ``k2 = 2*k1`` with a column of ``k1``. Rows are grouped here, before any
+        is dispatched, by which parameters their writes leave attached, and
+        each group that needs it is given a Simulator of its own, built for a
+        clone with the group's attachment and this Simulator's settings. Its
+        artifact is the code that row needs, and what a row asks of its
+        artifact (whether it holds the analytic columns, which expressions can
+        be differentiated) is answered by that one. A row that writes no
+        derived parameter is not cloned here.
+
+        That Simulator's model holds the writes of the first row of its group,
+        so each row is still cut from this Simulator's model
+        (:meth:`_run_single_batch`'s *model*): cut from that one, the next row
+        of the group ran at the first row's values.
+        """
+        core = self._model._core
+        derived = {n for n, e in zip(core.param_names, core.param_expressions, strict=False) if e}
+        if not derived:
+            return {}
+        runners: dict[tuple[bool, ...], Simulator] = {}
+        runner_of: dict[int, Simulator] = {}
+        for index, pset in enumerate(params):
+            if not derived.intersection(pset):
+                continue
+            clone = self._model.clone()
+            try:
+                clone.set_params(pset)
+            except Exception:  # noqa: BLE001 - the row's own run raises it, as it did
+                continue
+            if self._row_reads_another_build(clone) is None:
+                continue
+            attached = _attachment(clone)
+            runner = runners.get(attached)
+            if runner is None:
+                runner = Simulator(
+                    clone,
+                    method=self._method,
+                    jacobian=self._jacobian,
+                    force_dense_linear_solver=self._force_dense_linear_solver,
+                    force_sparse_linear_solver=self._force_sparse_linear_solver,
+                    codegen=self._codegen,
+                    sensitivity_params=list(self._sensitivity_params) or None,
+                    sensitivity_ic=list(self._sensitivity_ic) or None,
+                    sensitivity_method=self._sensitivity_method,
+                )
+                # A clone carries the artifact the model holds, built for the
+                # batch's attachment, and a Simulator built on it takes it up;
+                # it is built again here for the clone's own.
+                runner._rebuild_codegen_if_reattached()
+                runner._sync_codegen_with_the_conditions(t_span, runner._sensitivity_params)
+                runner._model._state_switch_roots_beside(
+                    runner._model.time_discontinuity_conditions()
+                )
+                runners[attached] = runner
+            runner_of[index] = runner
+        if runners:
+            logger.info(
+                "run_batch: %d row(s) pin or re-attach a derived parameter a requested "
+                "column reaches the model through; built sensitivity code for %d other "
+                "attachment(s) (issue #961).",
+                len(runner_of),
+                len(runners),
             )
-        raise SensitivityUnsupportedError(
-            f"run_batch row {index} {' and '.join(what)}, which the requested column(s) "
-            f"{upstream} reach the model through. The sensitivity code differentiates "
-            "through a derived parameter while it follows its expression and not while "
-            "it is pinned, and every row of a batch runs on the code built for the model "
-            "as it stood when the batch began; those columns would be the other case's "
-            f"(issue #708). {self._ROW_REMEDY}"
-        )
+        return runner_of
 
     def _rebuild_codegen_if_reattached(self) -> None:
         """Build the sensitivity code again where the model is no longer what
@@ -3402,6 +3530,23 @@ class Simulator:
             pass
         return unrooted
 
+    def _refuse_sensitivity_ic_without_sens_rhs(self) -> None:
+        """Refuse ``sensitivity_ic`` where the attached codegen has no analytic
+        sensitivity RHS (issue #1124, item 7). Asked at construction, and again
+        after :meth:`_build_codegen_again`, since a rebuild (issue #708) can
+        decline what the first build had; otherwise the run reached the C++
+        backstop with a message about the artifact, not the model."""
+        if not self._sensitivity_ic or self._codegen_provides_sens_rhs():
+            return
+        reason = self.sens_rhs_decline_reason
+        raise SensitivityUnsupportedError(
+            "sensitivity_ic needs the analytic sensitivity RHS: CVODES' "
+            "difference quotient has no parameter to perturb for an initial "
+            "value. Codegen built this model but declined that RHS"
+            + (f" ({str(reason).rstrip('.')})" if reason else "")
+            + ", so the initial-value columns cannot be computed for this model."
+        )
+
     def _build_codegen_again(self) -> None:
         """Drop the artifact and build one for the model as it is."""
         model = self._model
@@ -3427,6 +3572,8 @@ class Simulator:
             # Back on the analytic right-hand side: nothing to watch for.
             self._codegen_watch_gate = False
             self._codegen_built_for(model)
+        # The rebuilt artifact may have declined what the first build had.
+        self._refuse_sensitivity_ic_without_sens_rhs()
 
     def _expression_sens_support(self) -> dict[str, str | None]:
         """Memoized ``{function_name: unsupported_reason_or_None}`` for GH #198
@@ -4370,17 +4517,43 @@ class Simulator:
             )
         return vec
 
-    def _steady_state_atol(self, atol: AtolLike | None, criterion: str) -> AtolLike | None:
-        """The march's ``atol`` for a steady-state solve (issue #1001).
+    def _steady_state_atol(
+        self, atol: AtolLike | None, criterion: str, state=None, rtol: float | None = None
+    ) -> AtolLike | None:
+        """The march's ``atol`` for a steady-state solve, which under
+        ``criterion="scaled"`` is also the run test's (issue #1001).
 
-        Under ``criterion="scaled"`` a state is accepted within each species'
-        own tolerance, the one ``atol="auto"`` derives; a march at the scalar
-        default of 1e-8 cannot reach that for a model in small units (it runs
-        through zero first), so where neither the call nor
-        :meth:`set_tolerances` gave an ``atol`` the march takes ``"auto"``.
+        Where neither the call nor :meth:`set_tolerances` gave an ``atol``, each
+        species takes the smaller of what ``atol="auto"`` derives from ``state``
+        and the scalar default. The scalar is no tolerance for a model in small
+        units (the issue's cubic at a scale of 1e-9 ran through zero), and
+        ``"auto"`` alone none for a species that starts large and settles
+        small: one decaying from 1e7 to 7e-4 was held to 0.1. ``"auto"``'s floor
+        here is the smallest species the state holds that is not ``$``-fixed,
+        but not under double precision's resolution beside the largest: a
+        species a run left at 1e-22, or one declared at -1.6e-34
+        (MODEL2307110001), held every other at 0 to that, and its march
+        failed. Where every species not ``$``-fixed starts at 0, ``"auto"``
+        takes its own floor from every species, a ``$``-fixed one too (a
+        ``$Src`` at 1e-12 holds the rest to 1e-20). Where every species takes
+        the scalar it is passed as the scalar, whose march is the residual
+        criterion's: as a vector of equal entries, BIOMD0000000252's stalled.
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
-            return "auto"
+            eff_rtol = self._rtol if rtol is None else rtol
+            values = np.abs(np.asarray(state, dtype=float))
+            free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
+            largest = float(free.max(initial=0.0))
+            positive = free[free > 0.0]
+            floor = (
+                max(float(positive.min()), float(np.finfo(float).eps) * largest)
+                if positive.size
+                else None
+            )
+            own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
+            if np.all(own == self._atol):
+                return None
+            return [float(v) for v in own]
         return atol
 
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
@@ -5258,9 +5431,15 @@ class Simulator:
             # share the answer through the memo a clone shares with its parent.
             self._model._state_switch_roots_beside(self._model.time_discontinuity_conditions())
 
+        # Issue #961: a row whose writes need other sensitivity code runs on a
+        # Simulator built for it, made here before any row is dispatched.
+        runner_of: dict[int, Simulator] = {}
+        if self._method == "ode" and (self._sensitivity_params or self._sensitivity_ic):
+            runner_of = self._runners_for_attachments(params, t_span)
+
         def _run_one(i: int) -> Result:
             """Run simulation i (thread-safe, GIL released)."""
-            return self._run_single_batch(
+            return runner_of.get(i, self)._run_single_batch(
                 i,
                 params[i],
                 t_span,
@@ -5273,6 +5452,7 @@ class Simulator:
                 steady_state=bool(steady_state),
                 steady_state_tol=ss_tol_value,
                 max_step=effective_max_step,
+                model=self._model,
             )
 
         if num_processors is not None and num_processors > 1:
@@ -6312,11 +6492,17 @@ class Simulator:
         steady_state: bool = False,
         steady_state_tol: float = 0.0,
         max_step: float | None = None,
+        model: Model | None = None,
     ) -> Result:
-        """Run a single simulation in a batch (thread-safe)."""
+        """Run a single simulation in a batch (thread-safe).
+
+        *model* is the batch's model, where this Simulator is one built for the
+        row's attachment (issue #961): its own model holds the writes of the
+        row it was built for, and a row cut from it ran at that row's values.
+        """
         from bngsim._bngsim_core import TimeSpec
 
-        clone = self._model.clone()
+        clone = (self._model if model is None else model).clone()
         clone.set_params(pset)
         clone.reset()
         self._raise_if_row_is_attached_otherwise(index, clone)
@@ -6354,7 +6540,9 @@ class Simulator:
                     opts.max_step_size = max_step
                 # GH #203 — the HPC contract: every batch row reuses the ONE
                 # compiled artifact this Simulator already prepared (large/codegen
-                # models would otherwise run interpreted per row, reusing nothing),
+                # models would otherwise run interpreted per row, reusing nothing;
+                # a row of another attachment is run by a Simulator built for it,
+                # issue #961),
                 # and a Simulator built with sensitivity_params yields the full
                 # per-row output-sensitivity tensor — mirroring single-shot run()
                 # (codegen + sensitivity option-building) so a θ-matrix batch and a
@@ -7309,7 +7497,7 @@ class Simulator:
         max_steps=None,
         sensitivity_params=None,
         mask=None,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Find the steady state of the ODE system f(y) = 0.
 
@@ -7321,9 +7509,9 @@ class Simulator:
 
         Solver methods:
 
-        - ``"integration"`` (default): CVODE BDF integrated until the BNG2.pl
-          parity criterion ``||f(y)||_2 / n_species < tol``
-          (``run_network -c``).
+        - ``"integration"`` (default): CVODE BDF integrated until ``criterion``
+          is met (by default ``"scaled"``; ``"residual"`` is BNG2.pl's
+          ``||f(y)||_2 / n_species < tol``, ``run_network -c``).
         - ``"newton"``: two-tier integrate-first solver. The *same* CVODE burst
           carries the state into the physical root's basin, then KINSOL
           polishes. The polish is accepted only once it is *seed-stable*
@@ -7365,44 +7553,62 @@ class Simulator:
         ----------
         tol : float
             Convergence tolerance on ``||f(y)||_2 / n_species``. Default 1e-9.
-            Under ``criterion="scaled"`` it is read only above 512 unknowns,
-            where that criterion falls back to it.
+            Both criteria ask it.
         criterion : str
             What ``converged`` asks of a state (issue #1001).
 
-            - ``"residual"`` (default): ``||f(y)||_2 / n_species < tol``, the
-              BNG2.pl parity test. The norm is in the model's units of
-              concentration per unit time, so a model in molar units, or a
-              slow one, passes it far from its steady state.
-            - ``"scaled"``: the Newton step ``δ = −J⁻¹f`` from the state to
-              the root is within every species' own tolerance,
-              ``|δ_i| ≤ rtol·|y_i| + atol_i`` with ``atol_i =
-              rtol·max(|y_i|, floor)`` as ``atol="auto"`` derives it (the
-              floor is the smallest positive initial concentration; where
-              every species starts at 0, the largest species of the state or
-              of the root it steps to). Units do not change the answer. A
-              state where the reduced Jacobian is singular is not accepted
-              unless ``f`` is 0 there. Above 512 unknowns the step is not
-              taken and the solve is the residual one. Where neither ``atol``
-              nor :meth:`set_tolerances` gives one, the march takes
-              ``atol="auto"``: the scalar 1e-8 is no tolerance for a model in
-              small units.
+            - ``"scaled"`` (default): the parity test,
+              ``||f(y)||_2 / n_species < tol``, and the run test. A run taken
+              on from the state for ``max_time`` (at most 1e6) moves no species
+              by more than ``rtol·|y_i| + atol_i``: what tells a state the
+              system rests at from one under ``tol`` that a run leaves (a model
+              in small units, or a slow one). An unstable root that a run from
+              it does not leave passes (the cubic's 0.3); on the Newton path
+              :attr:`SteadyStateResult.root_stability` says so. ``atol_i`` is
+              the march's own, never more than
+              ``rtol`` times the largest species the solve starts with or
+              reaches. The Newton step ``δ = −J⁻¹f`` from the state to the
+              root, within the same tolerances, decides where the solve stops
+              (up to 512 unknowns), which takes the issue's cubic at a scale
+              of 1e-9 on from 0.894 to its root at 1, and the state it stops at
+              is polished by KINSOL; the step decides nothing about
+              ``converged``. ``mask`` says which species are measured, not
+              which move: the step moves every species but a ``$``-fixed one
+              and a masked one that nothing reads or that reads nothing (a
+              counter), which is held; the run moves every species but a
+              ``$``-fixed one. Where neither ``atol``
+              nor :meth:`set_tolerances` gives one, each species is marched at
+              the smaller of what ``atol="auto"`` gives it and the scalar
+              1e-8: the scalar is no tolerance for a model in small units, nor
+              ``"auto"`` for a species that starts large and settles small.
+            - ``"residual"``: ``||f(y)||_2 / n_species < tol``, BNG2.pl's test
+              alone, kept for comparisons with ``run_network``. The norm is in
+              the model's units of concentration per unit time, so a model in
+              molar units, or a slow one, passes it far from its steady state:
+              the cubic ``X' = -k·x·(x - 0.3)·(x - 1)`` at a scale of 1e-9 came
+              back ``converged=True`` at x = 0.894, 1.003 and 0.131 after one
+              step, where every run ends at 1.
 
-            Under ``"scaled"`` the step is reported as
+            Under ``"scaled"`` the run test and the step are reported as
+            :attr:`SteadyStateResult.continued_run_distance` and
             :attr:`SteadyStateResult.newton_distance`.
         max_time : float
-            Max integration time for the integration path. Default 1e6.
+            Max integration time for the integration path, and how long the
+            run of ``criterion="scaled"``'s run test is taken on for, up to
+            1e6. Default 1e6.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``).
         rtol : float, optional
-            Relative tolerance for the CVODE march. Default ``1e-8``.
+            Relative tolerance for the CVODE march, and under
+            ``criterion="scaled"`` for the run test. Default ``1e-8``.
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the CVODE march — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
             :meth:`run` for the contract. This is the accuracy the march is
-            held to on the way to the root; ``tol`` above is the separate test
-            for having arrived, and stays a single norm over all species.
+            held to on the way to the root, and under ``criterion="scaled"``
+            the run test's; ``tol`` above is the separate test for having
+            arrived, a single norm over all species.
         max_steps : int, optional
             Max CVODE internal steps per output point.
         sensitivity_params : list[str], optional
@@ -7545,7 +7751,9 @@ class Simulator:
         opts.rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — scalar, per-species, or tracking for the march.
         self._resolve_atol(
-            self._steady_state_atol(atol, criterion), opts.rtol, where="steady_state(atol=...)"
+            self._steady_state_atol(atol, criterion, self._model.get_state(), opts.rtol),
+            opts.rtol,
+            where="steady_state(atol=...)",
         ).apply_to(opts)
         opts.max_steps = max_steps if max_steps is not None else self._max_steps
         # A previous solve on this Simulator already proved the closed-form
@@ -7823,13 +8031,9 @@ class Simulator:
             "result.sensitivities at the last time point"
         )
         why = (
-            "A species far below the state's scale is stepped by many times itself at "
-            "the first, which reads a term of second order in it as a secant across it, "
-            "and the second misses a term that reads it through a sum with something "
-            "much larger (a total minus what is bound): which of the two is right is not "
-            'known. A closed-form Jacobian has neither failure; jacobian="auto" uses it '
-            'where the model has one, which jacobian="fd" does not. Otherwise take the '
-            f"columns from {time_course}."
+            f"{_STEP_DECIDES_WHY} A closed-form Jacobian has neither failure; "
+            'jacobian="auto" uses it where the model has one, which jacobian="fd" does '
+            f"not. Otherwise take the columns from {time_course}."
         )
         stepped = ", ".join(result.sens_fd_own_step_species[:5])
         if len(result.sens_fd_own_step_species) > 5:
@@ -8433,9 +8637,18 @@ class Simulator:
         .net and non-AR models, and for any rule whose source block this run did
         not produce — that row stays ``NaN``, which is the honest answer and is
         already exempt from the refusal in :meth:`_warn_about_ss_sensitivity`.
+        On every AR model it records the rule targets on the result, which is how
+        :meth:`SteadyStateResult.output_sensitivities` tells them from the species
+        the caller's ``mask=`` left out (issue #1124, item 10).
         """
         model = model or self._model
         amap = getattr(model, "_ar_report_map", None)
+        if amap:
+            # Left out of the solve by _ss_mask_excluding_ar_species, not by the
+            # caller's mask, so a refusal must not blame mask= for them.
+            result._rule_target_species = [
+                i for i in result.excluded_species if result._species_names[i] in amap
+            ]
         if not amap or result._sensitivity is None or result._sensitivity.size == 0:
             return
         sens = np.array(result._sensitivity, dtype=np.float64, copy=True)
@@ -8692,14 +8905,17 @@ class Simulator:
             # above it says so). Every other row still has to be finite.
             for i in result.excluded_species:
                 finite_rows[i] = True
-            if result.excluded_species:
+            masked = result._caller_masked_species()
+            if masked:
                 logger.warning(
                     "Steady-state dY_ss/dp: %d species were excluded from the "
                     "convergence test by mask=, so they have no steady value and "
-                    "their rows are NaN (first: %s). Any observable or expression "
-                    "sensitivity summing one of them is NaN for the same reason.",
-                    len(result.excluded_species),
-                    ", ".join(result.species_names[i] for i in list(result.excluded_species)[:3]),
+                    "their rows are NaN (first: %s). output_sensitivities refuses "
+                    "an output that reads one of them, by name; the sensitivity "
+                    "tensor and the observable and expression blocks keep their "
+                    "NaN rows.",
+                    len(masked),
+                    ", ".join(masked[:3]),
                 )
             if np.all(finite_rows):
                 return
@@ -8736,7 +8952,7 @@ class Simulator:
         n_workers=None,
         mask=None,
         newton_burst: bool = True,
-        criterion: str = "residual",
+        criterion: str = "scaled",
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8767,12 +8983,14 @@ class Simulator:
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
         criterion : str
-            ``"residual"`` (default) or ``"scaled"``, as in
+            ``"scaled"`` (default) or ``"residual"``, as in
             :meth:`steady_state` (issue #1001).
         rtol, atol, max_steps : optional
             Solver options for each march, as in :meth:`steady_state`. ``atol``
             may be a per-species vector or ``"auto"`` (issue #196), resolved
-            once and applied identically to every entry.
+            once and applied identically to every entry. The ``"auto"``
+            ``criterion="scaled"`` takes when no ``atol`` is given is each
+            entry's own, from its starting state.
         n_workers : int, optional
             Number of parallel threads.
         mask : array-like of bool, or sequence of str, optional
@@ -8836,9 +9054,13 @@ class Simulator:
 
         eff_rtol = rtol if rtol is not None else self._rtol
         # Issue #196 / #213 — resolved once, applied to every entry (see
-        # run_batch).
+        # run_batch). Issue #1001: except the "auto" that criterion="scaled"
+        # takes when no atol is given, which is each entry's own. Taken from
+        # this model, an entry whose parameters put it at 1e-9 of this one
+        # marched at this one's tolerance and ran through zero (x = -3.7).
+        own_auto = atol is None and criterion == "scaled" and not self._atol_set
         eff_atol_spec = self._resolve_atol(
-            self._steady_state_atol(atol, criterion),
+            None if own_auto else atol,
             eff_rtol,
             where="steady_state_batch(atol=...)",
         )
@@ -8866,7 +9088,11 @@ class Simulator:
             opts.method = method
             opts.newton_burst = newton_burst
             opts.rtol = eff_rtol
-            eff_atol_spec.apply_to(opts)
+            if own_auto:
+                own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
+                _ResolvedAtol(self._atol, own, 0.0).apply_to(opts)
+            else:
+                eff_atol_spec.apply_to(opts)
             opts.max_steps = eff_max_steps
             # Read (and, below, set) the same memo `steady_state()` keeps, so a
             # sweep over a model whose closed-form Jacobian CVODE cannot use pays
@@ -8940,6 +9166,21 @@ class Simulator:
         distinct root comes with the stability certificate's verdict, so the
         saddles a run of the dynamics never rests on are reported too.
 
+        The root one ordinary :meth:`steady_state` solve reaches (with the same
+        ``mask``) is solved as one more start, with each held species set as the
+        draws hold it, so the call returns that root too wherever Newton holds it
+        at ``tol`` (issue #1189). It is no draw: it adds nothing to
+        ``multiplicity`` or ``basins``, and a root only it found has
+        multiplicity 0. The seed is then put on the conservation laws at the
+        model's totals, as every draw is. Two cases return less. Where Newton
+        cannot hold the root, as at the large law totals below (issue #1190), it
+        is missed: on a three-species law at a total of ``1e8``, the call returns
+        none. And where the solve had moved a held species, it solved another
+        problem: a masked sink at the end of a chain, as the pure-sink mask below
+        makes it, moves its law's total, and a held species the rates read moves
+        the rates. Newton from the seed then reaches a root of the problem the
+        draws solve, or none, and it need not be the solve's.
+
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
         is complete. Completeness for polynomial mass-action systems is what
@@ -9007,19 +9248,27 @@ class Simulator:
             raise ValueError("n_starts must be at least 1")
         y0, L, held, in_law = _manifold_partition(self._model, mask)
         alone = ~held & ~in_law
+        # One ordinary solve, for two things. Its root is an extra start (issue
+        # #1189): on Motivating_example and fceri_ji_red every sampled start
+        # failed and the call returned no root at all, where steady_state()
+        # converges and Newton converges from its root at once. And, below, it
+        # gives the sampling bound its scale.
+        try:
+            ordinary = self.steady_state(tol=tol, mask=mask)
+        except Exception:  # noqa: BLE001 - a seed and a scale only; the draws stand
+            ordinary = None
         if upper is None and alone.any():
-            # The scale of the model's own steady state, from one ordinary
-            # solve: a model in no conservation law that starts at zero has no
-            # other (the Gardner toggle's roots sit at 53 and 144; a bound of
-            # 10 from its initial state found two of three roots). Read off the
-            # species `upper` bounds, and not off an accumulator: nothing
-            # settles it, so it ends wherever max_time leaves it, and a scale
-            # from there puts every start decades above the roots.
-            try:
-                reached = np.asarray(self.steady_state(tol=tol, mask=mask).concentrations)
+            # The scale of the model's own steady state: a model in no
+            # conservation law that starts at zero has no other (the Gardner
+            # toggle's roots sit at 53 and 144; a bound of 10 from its initial
+            # state found two of three roots). Read off the species `upper`
+            # bounds, and not off an accumulator: nothing settles it, so it ends
+            # wherever max_time leaves it, and a scale from there puts every
+            # start decades above the roots.
+            reached = np.zeros(0)
+            if ordinary is not None:
+                reached = np.asarray(ordinary.concentrations)
                 reached = reached[alone & ~self._model.is_pure_sink()]
-            except Exception:  # noqa: BLE001 - only a scale; the default stands
-                reached = np.zeros(0)
             upper = _default_sampling_bound(y0, L, reached)
         starts = _sample_on_conservation_manifold(
             self._model, n_starts, np.random.default_rng(seed), upper, mask, decades
@@ -9050,17 +9299,72 @@ class Simulator:
         # A $-fixed one has a zero row there, and the unmasked solve keeps it
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
+        solve_mask = ~held if held.any() else None
         results = self.steady_state_batch(
             states=starts,
             method="newton",
             newton_burst=False,
             tol=tol,
             n_workers=n_workers,
-            mask=~held if held.any() else None,
+            mask=solve_mask,
         )
-        return SteadyStates.cluster(
+        # The ordinary solve's root, solved as the draws are, joins them last:
+        # a root is grouped by the first result that reached it, so it moves no
+        # draw from the root it reached. It is no draw, so it adds nothing to
+        # `multiplicity` or `basins`, and a root only it found has multiplicity 0.
+        seeded = False
+        seed_state = None
+        if ordinary is not None and ordinary.converged:
+            # Its held species as every draw holds them: a masked accumulator
+            # ends wherever the ordinary solve's max_time left it, and the root
+            # came back as a fourth one beside the same toggle root, apart only
+            # in a species the solve does not move.
+            seed_state = np.asarray(ordinary.concentrations, dtype=float).copy()
+            seed_state[held] = starts[0][held]
+            # And onto the laws at the totals every draw holds, as a draw is put
+            # there. A sink masked as the docstring advises is a law member
+            # wherever a chain ends in it (m1_ground's D, SIR's R), and the solve
+            # had moved it: set back, it moved its law's total, and Newton, which
+            # recomputes the totals from its start, reported a "root" of
+            # m1_ground at a total of 0, not 100. Where nothing held moved, this
+            # moves the seed by the integration's drift, a few 1e-9.
+            A, totals = _moving_laws(L, in_law, y0)
+            if A.shape[0]:
+                cols = np.flatnonzero(in_law)
+                w = np.maximum(seed_state[cols], np.finfo(float).tiny)
+                # A law whose members the solve drained to 0 (A -> D, D held)
+                # has none to lift: the dual Newton overflows and underflows on
+                # its way to None, which drops the seed. That is the answer, so
+                # nothing is raised or warned, and nothing non-finite is kept.
+                with np.errstate(all="ignore"):
+                    y = _project_onto_laws(w, A, totals)
+                if y is None or not np.all(np.isfinite(y)):
+                    seed_state = None
+                else:
+                    seed_state[cols] = y
+        if seed_state is not None:
+            try:
+                (from_ordinary,) = self.steady_state_batch(
+                    states=[seed_state],
+                    method="newton",
+                    newton_burst=False,
+                    tol=tol,
+                    mask=solve_mask,
+                )
+            except SimulationError:
+                from_ordinary = None
+            if from_ordinary is not None and from_ordinary.converged:
+                results = [*results, from_ordinary]
+                seeded = True
+        roots = SteadyStates.cluster(
             results, list(self._model.species_names), dedupe_rtol=dedupe_rtol, atol=tol, laws=L
         )
+        if seeded:
+            k = int(roots.basins[-1])
+            roots.multiplicity[k] -= 1
+            roots.basins = roots.basins[:-1]
+            roots.n_failed = int(np.sum(roots.basins < 0))
+        return roots
 
     # ─── Stop conditions ────────────────────────────────────────────
 
@@ -10237,10 +10541,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    # A law over held species alone constrains nothing a start moves.
-    A = L[:, in_law]
-    A = A[(A != 0).any(axis=1)]
-    totals = A @ y0[in_law]
+    A, totals = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10259,6 +10560,15 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
                 )
             row[cols] = y
     return out
+
+
+def _moving_laws(L, in_law, y0):
+    """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
+    totals the model's state ``y0`` holds (issue #524). A law over held species
+    alone constrains nothing a start moves, and is left out."""
+    A = L[:, in_law]
+    A = A[(A != 0).any(axis=1)]
+    return A, A @ y0[in_law]
 
 
 def _project_onto_laws(w, A, b, max_iter=200):
@@ -10328,7 +10638,8 @@ class SteadyStates:
     ----------
     states : ndarray, shape ``(n_roots, n_species)``
         Each root's concentrations, ordered like ``species_names``: the start
-        that reached it with the smallest residual.
+        that reached it with the smallest residual, the extra start from
+        :meth:`Simulator.steady_state`'s root among them.
     stability : list[str]
         ``"stable"``, ``"unstable"`` or ``"undetermined"`` per root, from the
         stability certificate.
@@ -10336,7 +10647,10 @@ class SteadyStates:
         The reduced Jacobian's spectrum at each root (empty where the
         certificate did not compute it).
     multiplicity : ndarray of int
-        How many starts reached each root: a rough measure of its basin.
+        How many starts reached each root: a rough measure of its basin. The
+        root of :meth:`Simulator.steady_state`, solved as one more start, is
+        no draw and counts for nothing, so a root only it reached reads 0
+        (issue #1189).
     basins : ndarray of int, shape ``(n_starts,)``
         Root index per start, -1 where the solve did not converge.
     residuals : ndarray
@@ -10456,12 +10770,20 @@ class SteadyStateResult:
         ``max|f(y)|`` at convergence.
     newton_distance : float
         The Newton step from the state returned to the root, in each
-        species' own tolerance, as ``criterion="scaled"`` asks it: at most 1
-        is within it (issue #1001). NaN under ``criterion="residual"``, which
-        does not take the step, and above 512 unknowns; ``inf`` where the
-        Jacobian is singular at a state that is not a root.
+        species' own tolerance, which under ``criterion="scaled"`` decided
+        where the solve stopped (issue #1001); at most 1 is within it. NaN
+        under ``criterion="residual"``, which does not take the step, and
+        above 512 unknowns; ``inf`` where the Jacobian is singular at a state
+        that is not a root, or a differenced one straddles a jump.
+    continued_run_distance : float
+        The run test of ``criterion="scaled"``: the largest move of a
+        measured species, over its tolerance, across the run taken on from
+        the state returned; at most 1 passes (issue #1001). ``inf`` where the
+        run could not be taken to its time; NaN where none was taken (under ``"residual"``,
+        where the parity test already refused, and for a burst-free Newton
+        solve).
     criterion : str
-        The test ``converged`` was decided by, ``"residual"`` or ``"scaled"``.
+        The test ``converged`` was decided by, ``"scaled"`` or ``"residual"``.
     method_used : str
         ``"integration"`` or ``"newton"``.
     converged : bool
@@ -10744,6 +11066,7 @@ class SteadyStateResult:
         "_name_to_idx",
         "residual",
         "newton_distance",
+        "continued_run_distance",
         "criterion",
         "method_used",
         "converged",
@@ -10807,6 +11130,7 @@ class SteadyStateResult:
         "_expression_sens_missing",
         "_observable_values",
         "_expression_values",
+        "_rule_target_species",
     )
 
     def __init__(self, core) -> None:
@@ -10820,6 +11144,7 @@ class SteadyStateResult:
         # each species' tolerance (at most 1 is within it; NaN where it was not
         # taken, as under "residual"), and the test `converged` was decided by.
         self.newton_distance = getattr(core, "newton_distance", float("nan"))
+        self.continued_run_distance = getattr(core, "continued_run_distance", float("nan"))
         self.criterion = getattr(core, "criterion", "residual")
         self.method_used = core.method_used
         self.converged = core.converged
@@ -10830,6 +11155,9 @@ class SteadyStateResult:
         # Issue #74 — what the convergence test covered, and why it failed.
         self.n_residual_species = getattr(core, "n_residual_species", len(self._species_names))
         self.excluded_species = list(getattr(core, "excluded_species", []))
+        # The assignment-rule targets among them, which the solve leaves out by
+        # itself (GH #247); Simulator._apply_ss_ar_sensitivity_map fills it in.
+        self._rule_target_species: list[int] = []
         self.unconverged_pure_sinks = list(getattr(core, "unconverged_pure_sinks", []))
         # Issue #78 — the linear-stability verdict on a Newton root, and how many
         # candidate roots were thrown out for failing it.
@@ -11108,7 +11436,81 @@ class SteadyStateResult:
         if not meta:
             return np.empty((0, n_params), dtype=np.float64)
         rows = [self._output_sensitivity_row(m) for m in meta]
+        # Every selector without a derivative is named at once, so a caller
+        # fixes its selection in one pass rather than one refusal at a time.
+        reasons = [
+            reason
+            for m, row in zip(meta, rows, strict=True)
+            if (reason := self._no_derivative_reason(m, row)) is not None
+        ]
+        if reasons:
+            raise ValueError("\n".join(reasons))
         return np.stack(rows, axis=0)
+
+    def _caller_masked_species(self) -> list[str]:
+        """The species the caller's ``mask=`` left out of the solve: the excluded
+        ones less the assignment-rule targets the solve leaves out by itself."""
+        targets = set(self._rule_target_species)
+        return [self._species_names[i] for i in self.excluded_species if i not in targets]
+
+    def _no_derivative_reason(self, meta: dict[str, Any], row: np.ndarray) -> str | None:
+        """Why an output's row is not finite, by name, or None where it is (issue
+        #1124, item 10). :meth:`output_sensitivities` refuses with every reason.
+
+        A species ``mask=`` left out of the solve has no steady value, so neither
+        has anything that reads it, and its row is NaN by construction (issue
+        #74). Returned here, the NaN reached a fitter as a row, and the only word
+        of it was the warning at the solve. The mask is named only for an output
+        that reads a species the caller's mask left out: an assignment-rule
+        target is left out of the solve too, by the solve itself and with its
+        rule's row (GH #247), and an expression can have no finite derivative
+        for a reason of its own, such as ``log10(L)`` at L = 0. The
+        :attr:`sensitivity` tensor and the two blocks keep their NaN rows.
+        """
+        if np.all(np.isfinite(row)):
+            return None
+        kind = meta["kind"]
+        values = self._expression_values if kind == "expression" else self._observable_values
+        if kind != "species" and meta["index"] < values.size:
+            value = float(values[meta["index"]])
+            if not np.isfinite(value):
+                # A non-finite value has no derivative, whatever it reads: the
+                # value is the reason, not the mask.
+                return (
+                    f"output_sensitivities: {meta['selector']!r} has no steady-state "
+                    f"derivative: its value at the steady state is {value}, which is "
+                    "not finite."
+                )
+        masked = self._caller_masked_species()
+        if kind == "species":
+            named = [meta["name"]] if meta["name"] in masked else []
+        elif kind == "expression" and meta["index"] < len(self._expression_sens_missing):
+            # The first species with no row that its derivative read, as the
+            # solve recorded it (function_sens_missing_species).
+            missing = self._expression_sens_missing[meta["index"]]
+            named = [missing] if missing in masked else []
+        else:
+            # Which species an observable sums is not recorded here, so every
+            # species the mask left out is named.
+            named = masked
+        if not named:
+            return (
+                f"output_sensitivities: {meta['selector']!r} has no finite "
+                "steady-state derivative: its row is not finite, and it reads no "
+                "species mask= left out of the solve."
+            )
+        if kind == "species":
+            reads = f"is {named[0]}, which"
+        elif len(named) == 1:
+            reads = f"reads {named[0]}, which"
+        else:
+            reads = f"reads one or more of {', '.join(named)}, which"
+        return (
+            f"output_sensitivities: {meta['selector']!r} has no steady-state "
+            f"derivative: it {reads} mask= left out of the solve, so it has no "
+            "steady value (issue #74). Select outputs that do not read it, or keep "
+            "it in the mask."
+        )
 
     def _resolve_one_output(self, selector: str) -> dict[str, Any]:
         """Resolve one selector to its metadata dict via the shared resolver."""
