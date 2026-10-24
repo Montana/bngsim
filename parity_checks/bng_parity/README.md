@@ -291,6 +291,8 @@ The archive is one `.npz` per job. It holds:
 
 An entry matching neither is never compared. The row is REFERENCE_FAILED, `archive_stale`; an entry that cannot be read is `archive_unreadable`, the same row. Beside the identity an entry records the reference engine's version and the harness's git revision at recording; a replayed row reports the archived version in `versions.bng`. `ARCHIVE_FORMAT` must be bumped when the harness's own network rules change (the state prefix, the netgen caps, an injected `generate_network`), because the archived `.net` was made under the recording run's rules. On six fast models, one of them carry-over, a replay with no BNG2.pl or run_network reachable gave the live run's outcome, value and comment on every job.
 
+In CI the nightly replays this archive Monday to Saturday (both the interpreter and the compiled arm read it) and runs BNG2.pl live on Sundays; recording and publishing it, and what may go in it, are in [`nightly/README.md`](../nightly/README.md#the-reference-archive-issue-805).
+
 ## Stochastic timing + parity matrix (`bng_stoch_run.py` → `generate_bng_matrix.py`)
 
 The stochastic sibling of the ODE track: one runner, two tracks (`--track ssa|nf`),
@@ -395,6 +397,8 @@ An entry also records the BioNetGen version that made it, and a replayed row's
 changes a live verdict: an entry that cannot be written is reported on stderr,
 and the replay then finds it missing or short. The two flags are mutually
 exclusive, and `_meta.config.reference_source` records which side was used.
+
+In CI the nightly replays this archive Monday to Saturday and runs the engine live on Sundays; recording and publishing it, and what may go in it, are in [`nightly/README.md`](../nightly/README.md#the-reference-archive-issue-805).
 
 ## Emitting golden references
 

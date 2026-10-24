@@ -126,6 +126,8 @@ one installed where the replay ran. Neither kind of row
 is compared; re-record to clear them. The two flags are mutually exclusive, and
 the native report's `config.reference_source` records which side was used.
 
+In CI the nightly replays this archive Monday to Saturday and runs the engine live on Sundays; recording and publishing it, and what may go in it, are in [`nightly/README.md`](../nightly/README.md#the-reference-archive-issue-805).
+
 ### SSA timing (GH #135)
 
 Each screen case also records a **measurement-only** per-engine timing dict
@@ -497,12 +499,7 @@ The archive is one compressed `.npz` per job:
 
 An entry whose identity no longer matches its job is never compared. That covers a changed model, grid or tolerance, the way #1099 tightened BIOMD0000000374's rtol, and a missing entry. Such a row is REFERENCE_FAILED with refusal class `archive_stale`, and the nightly diff alerts wherever that turns a good case bad. An entry that cannot be read at all is the same row with refusal class `archive_unreadable`. Both are refused before bngsim runs, and neither is resolved against an INVALID_REFERENCE or NO_ORACLE_ADJUDICATED override, since there was no reference to judge it by. A replayed row's `timing.roadrunner.replayed_from_archive` is true, its `versions.roadrunner` is the version the entry recorded, and the report's `_meta.reference_source` names the archive. On the committed smoke subset, a replay with RoadRunner blocked from importing gives the live run's outcome, value and comment on every job.
 
-Still to do before the nightly replays instead of running RoadRunner (issue #805):
-
-1. Publish a full-corpus archive as a release asset, with a committed sha256 manifest.
-2. Add a CI fetch step that verifies it.
-3. Move the live RoadRunner run to a weekly schedule that refreshes the archive.
-4. Leave out the models whose license does not allow redistribution, for example the 300 of the 317 CI cannot fetch that carry no recorded license.
+The nightly replays from a published archive Monday to Saturday and runs RoadRunner live on Sundays; recording a new archive, the sha256-pinned manifest the nightly fetches it by, and the licensing rule for what goes in are in [`../nightly/README.md`](../nightly/README.md#the-reference-archive-issue-805).
 
 ## Emitting golden references (`rr_golden.py`)
 
