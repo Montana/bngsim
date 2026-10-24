@@ -124,16 +124,24 @@ jobs:
           done
           echo "$mod is instrumented for ASan and UBSan."
 
-      # The environment the suite runs in, set once for the two steps that need
-      # it. LD_PRELOAD goes on each python command, never into GITHUB_ENV, so uv
-      # and the runner's own tools do not run with the ASan runtime loaded.
+      # The environment the suite runs in, set once for the steps that need it.
+      # LD_PRELOAD goes on each python command, never into GITHUB_ENV, so uv and
+      # the runner's own tools do not run with the ASan runtime loaded.
+      #
+      # Reports go to files (log_path), not stderr. pytest-xdist does not pass a
+      # worker's stderr through, so on this job's first run with a planted bug
+      # the log said only "worker 'gw3' crashed while running ..." and the report
+      # that named the line was gone. Each process writes <log_path>.<pid>; the
+      # last step prints them all.
       - name: Sanitizer runtime environment
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/san"
           {
             echo "SAN_PRELOAD=$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)"
-            echo "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1"
-            echo "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+            echo "SAN_LOG_DIR=$RUNNER_TEMP/san"
+            echo "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:log_path=$RUNNER_TEMP/san/asan"
+            echo "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:log_path=$RUNNER_TEMP/san/ubsan"
             echo "PYTHONMALLOC=malloc"
           } >> "$GITHUB_ENV"
 
@@ -149,7 +157,8 @@ jobs:
           # A 128-byte read from a 64-byte heap block (64, not 8: ctypes keeps a
           # buffer of 16 bytes or less inside the object, where reading on would
           # not leave the allocation). Under this environment ASan must stop the
-          # interpreter; if it exits cleanly, nothing below is being watched.
+          # interpreter and write its report where the last step looks; if it
+          # exits cleanly, or the report is not there, nothing below is watched.
           set +e
           LD_PRELOAD="$SAN_PRELOAD" .venv/bin/python -c "
           import ctypes
@@ -157,22 +166,27 @@ jobs:
           dst = ctypes.create_string_buffer(128)
           ctypes.memmove(dst, src, 128)
           print('read past the block and nothing stopped it')
-          " > /tmp/canary.log 2>&1
+          "
           rc=$?
           set -e
-          cat /tmp/canary.log
-          if [ "$rc" -eq 0 ] || ! grep -q "AddressSanitizer: heap-buffer-overflow" /tmp/canary.log; then
-            echo "::error::A known heap overflow ran to completion (exit $rc); ASan is not active in the test interpreter."
+          if [ "$rc" -eq 0 ] || ! grep -qs "AddressSanitizer: heap-buffer-overflow" "$SAN_LOG_DIR"/asan.*; then
+            echo "::error::A known heap overflow ran to completion (exit $rc) or left no report in $SAN_LOG_DIR; ASan is not watching the test interpreter."
             exit 1
           fi
-          echo "ASan stopped the planted overflow (exit $rc), as it must."
+          echo "ASan stopped the planted overflow (exit $rc) and reported it:"
+          grep -h -m1 "ERROR: AddressSanitizer" "$SAN_LOG_DIR"/asan.*
+          rm -f "$SAN_LOG_DIR"/*
 
       # Deselected here, and only here (python-tests.yml still runs them):
       #
-      #   * Wall-clock budgets. These guard against hangs and pathological
-      #     slowdowns with caps a normal build clears easily, and the 2-3x
-      #     sanitizer slowdown does not: the stall bound's 30 s took 47 s, and a
-      #     60 s run timeout fired, on this job's first full run.
+      #   * Wall-clock budgets. They guard against hangs and pathological
+      #     slowdowns with caps a normal build clears easily and the 2-3x
+      #     sanitizer slowdown does not: on this job's first runs a 30 s stall
+      #     bound took 47 s, a 5 s cap took 5.7 s, and a 60 s run timeout fired.
+      #     Each surfaces only when a run lands near its cap, so all of them are
+      #     listed, not just the ones seen failing: every test that asserts an
+      #     elapsed time below a budget, plus the one that hands the simulator a
+      #     60 s timeout on a run a normal build finishes in seconds.
       #   * test_run_tests_sh's end-to-end check, which requires that the dev
       #     extra's optional modules (diffrax, vivarium-core) be importable. This
       #     job installs only the test extra.
@@ -186,35 +200,61 @@ jobs:
           BNGSIM_TEST_DATA: ${{ github.workspace }}/tests/data
           BNGSIM_TEST_CACHE_DIR: ${{ runner.temp }}/bngsim-test-cache
           BNGSIM_TEST_SHARD: ${{ matrix.shard }}/2
+          DESELECT: |
+            test_codegen_gen_scaling.py::test_large_model_generation_is_not_quadratic
+            test_codegen_gen_scaling.py::test_function_heavy_generation_is_not_quadratic
+            test_codegen_power_denominator.py::test_a_real_derivative_prints_fast
+            test_delayed_event_priority.py::test_many_idle_non_persistent_events_cost_one_pass_over_what_waits
+            test_delayed_event_priority.py::test_many_waiting_executions_are_not_passed_over_at_every_stop
+            test_discontinuity_stall_bound.py::test_stall_raises_quickly_instead_of_hanging
+            test_discontinuity_stall_bound.py::test_raising_max_steps_does_not_reintroduce_the_hang
+            test_sbml_event_chatter_biomd711.py::test_biomd711_event_chatter_does_not_stall
+            test_sbml_jacobian_budget_biomd496.py::test_large_functional_build_solve_under_budget
+            test_stalled_state_switch_surface.py::test_a_slide_along_the_surface_is_not_carried_across
+            test_timeout.py::test_ssa_timeout_raises_simulation_timeout
+            test_timeout.py::test_rulemonkey_stateless_timeout_raises
+            test_timeout.py::test_rulemonkey_session_simulate_timeout_raises
+            test_timeout.py::test_nfsim_session_simulate_timeout_raises
+            test_run_tests_sh.py::test_the_script_itself_runs_walk_up_dependent_tests_green
         run: |
           set -euxo pipefail
+          deselect=()
+          while read -r t; do
+            [ -n "$t" ] && deselect+=(--deselect "python/tests/$t")
+          done <<< "$DESELECT"
           LD_PRELOAD="$SAN_PRELOAD" timeout -s INT 80m \
             .venv/bin/python -m pytest -p no:cacheprovider python/tests \
             -n auto --dist worksteal -q --tb=short -rfE --durations=30 \
-            -o faulthandler_timeout=300 \
-            --deselect python/tests/test_discontinuity_stall_bound.py::test_raising_max_steps_does_not_reintroduce_the_hang \
-            --deselect python/tests/test_stalled_state_switch_surface.py::test_a_slide_along_the_surface_is_not_carried_across \
-            --deselect python/tests/test_run_tests_sh.py::test_the_script_itself_runs_walk_up_dependent_tests_green \
+            -o faulthandler_timeout=300 "${deselect[@]}" \
             2>&1 | tee python-sanitizers-${{ matrix.shard }}.log
 
-      # The sanitizer report is in the log, but with -n auto it can sit hundreds
-      # of lines above the summary. Pull every report to the top of the step.
+      # Every report, in full, whatever wrote it: an xdist worker the suite saw
+      # crash, or a subprocess (python -m bngsim.cache, the codegen compiler)
+      # whose test passed anyway. Any report fails the job.
       - name: Sanitizer reports
         if: always()
         run: |
           set -euo pipefail
-          log="python-sanitizers-${{ matrix.shard }}.log"
-          [ -f "$log" ] || exit 0
-          if grep -nE "ERROR: AddressSanitizer|\.(c|cc|cpp|h|hh|hpp):[0-9]+:[0-9]+: runtime error:" "$log"; then
-            echo "::error::Sanitizer reports above (shard ${{ matrix.shard }})."
-          else
+          shopt -s nullglob
+          reports=("$SAN_LOG_DIR"/*)
+          if [ "${#reports[@]}" -eq 0 ]; then
             echo "No sanitizer reports in shard ${{ matrix.shard }}."
+            exit 0
           fi
+          for r in "${reports[@]}"; do
+            echo "::group::$(basename "$r"): $(grep -m1 -hE 'ERROR: AddressSanitizer|runtime error:' "$r" || head -1 "$r")"
+            cat "$r"
+            echo "::endgroup::"
+          done
+          echo "::error::${#reports[@]} sanitizer report(s) in shard ${{ matrix.shard }}; each is above, and uploaded with the log."
+          exit 1
 
-      - name: Upload the log
+      - name: Upload the log and reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: python-sanitizers-${{ matrix.shard }}
-          path: python-sanitizers-${{ matrix.shard }}.log
+          path: |
+            python-sanitizers-${{ matrix.shard }}.log
+            ${{ runner.temp }}/san/
           if-no-files-found: ignore
