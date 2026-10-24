@@ -9167,12 +9167,19 @@ class Simulator:
         saddles a run of the dynamics never rests on are reported too.
 
         The root one ordinary :meth:`steady_state` solve reaches (with the same
-        ``mask``) is solved as one more start, so the call returns that root too
-        wherever Newton holds it at ``tol`` (issue #1189). It is no draw: it adds
-        nothing to ``multiplicity`` or ``basins``, and a root only it found has
-        multiplicity 0. Where Newton cannot hold it, as at the large law totals
-        below (issue #1190), the call can still return fewer roots than that
-        solve: on a three-species law at a total of ``1e8``, none.
+        ``mask``) is solved as one more start, with each held species set as the
+        draws hold it, so the call returns that root too wherever Newton holds it
+        at ``tol`` (issue #1189). It is no draw: it adds nothing to
+        ``multiplicity`` or ``basins``, and a root only it found has
+        multiplicity 0. Three cases return less. Where Newton cannot hold it, as
+        at the large law totals below (issue #1190), that root is missed: on a
+        three-species law at a total of ``1e8``, the call returns none. Where
+        setting a held species moves a conservation law off the model's total (a
+        masked sink at the end of a chain, as the pure-sink mask below makes it),
+        the solve's root is no root of the problem the draws solve, and nothing
+        is seeded. And where a held species the rates read had moved, Newton
+        from the seed reaches a root with that species held, which need not be
+        the solve's.
 
         This is a search, not a proof: a root with a small basin, or a saddle
         KINSOL never lands on, can be missed, and nothing here claims the list
@@ -9304,6 +9311,7 @@ class Simulator:
         # draw from the root it reached. It is no draw, so it adds nothing to
         # `multiplicity` or `basins`, and a root only it found has multiplicity 0.
         seeded = False
+        seed_state = None
         if ordinary is not None and ordinary.converged:
             # Its held species as every draw holds them: a masked accumulator
             # ends wherever the ordinary solve's max_time left it, and the root
@@ -9311,6 +9319,16 @@ class Simulator:
             # in a species the solve does not move.
             seed_state = np.asarray(ordinary.concentrations, dtype=float).copy()
             seed_state[held] = starts[0][held]
+            # Unless that moves a law off the model's total: then the root is no
+            # root of this problem. A sink masked as the docstring advises is a
+            # law member wherever the chain ends in it (m1_ground's D, SIR's R),
+            # and the solve had moved it: with it put back, Newton recomputed the
+            # totals from the seed and reported a "root" of m1_ground at a total
+            # of 0, not 100. An integration holds the totals to a few 1e-9.
+            drift = np.abs(L @ seed_state - L @ y0)
+            if np.any(drift > 1e-6 * (np.abs(L) @ np.abs(y0)) + tol):
+                seed_state = None
+        if seed_state is not None:
             try:
                 (from_ordinary,) = self.steady_state_batch(
                     states=[seed_state],
