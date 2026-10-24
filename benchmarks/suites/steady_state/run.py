@@ -845,6 +845,14 @@ def main():
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument(
+        "--out",
+        type=lambda p: Path(p).resolve(),
+        default=RESULTS_DIR,
+        help="Directory for steady_state_results.json and steady_state_results.md "
+        "(default: results/ beside this script). A caller aims a run elsewhere with it "
+        "(issue #551).",
+    )
+    ap.add_argument(
         "--n-steps-long",
         type=int,
         default=100,
@@ -1008,12 +1016,12 @@ def main():
         },
         "models": all_results,
     }
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = RESULTS_DIR / "steady_state_results.json"
+    args.out.mkdir(parents=True, exist_ok=True)
+    json_path = args.out / "steady_state_results.json"
     json_path.write_text(json.dumps(payload, indent=2, default=str))
-    generate_markdown(payload, RESULTS_DIR / "steady_state_results.md")
+    generate_markdown(payload, args.out / "steady_state_results.md")
     print(f"\nResults: {json_path}")
-    print(f"Report:  {RESULTS_DIR / 'steady_state_results.md'}")
+    print(f"Report:  {args.out / 'steady_state_results.md'}")
 
 
 if __name__ == "__main__":

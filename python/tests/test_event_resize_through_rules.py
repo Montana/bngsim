@@ -333,3 +333,403 @@ def test_a_piecewise_size_an_event_and_a_reaction_both_flip_is_refused():
         bngsim.Model.from_antimony_string(
             _KW + "J: Kw => ; 0.01*Kw; cv := piecewise(2, Kw > 7, 1); at (time > 1): ce = 2;"
         )
+
+
+# ── Issue #1124, item 4: a diamond of rules ─────────────────────────────────
+# r0 := k*p, r1 := p + 1, r_i := r_{i-1} + r_{i-2}, and cv := 1 + 1e-6*r_{n-1}.
+# Written out through its rules, the new size read every rule once per path,
+# and its text was exponential in n: 278 KB at 22 rules, 1.9 MB at 26. Past a
+# limit, a rule more than one path reaches is now a function of its own.
+
+
+def _diamond(n):
+    # r_{n-1} = A*k*p + B*(p + 1)
+    coef = [(1, 0), (0, 1)]
+    for _ in range(2, n):
+        coef.append((coef[-1][0] + coef[-2][0], coef[-1][1] + coef[-2][1]))
+    return coef[n - 1]
+
+
+def _diamond_doc(n, k=1.0):
+    rules = _rule("r0", _apply("times", _ci("k"), _ci("p"))) + _rule(
+        "r1", _apply("plus", _ci("p"), _cn(1))
+    )
+    rules += "".join(
+        _rule(f"r{i}", _apply("plus", _ci(f"r{i - 1}"), _ci(f"r{i - 2}"))) for i in range(2, n)
+    )
+    rules += _rule("cv", _apply("plus", _cn(1), _apply("times", _cn(1e-6), _ci(f"r{n - 1}"))))
+    return _doc(
+        _comp("cv"),
+        _species("Sn", "cv", 5),
+        _param("p", 1)
+        + _param("k", k, constant=True)
+        + "".join(_param(f"r{i}", 0) for i in range(n)),
+        rules,
+        _set("p", 2),
+        "true",
+    )
+
+
+def _diamond_size(n, k, p):
+    a, b = _diamond(n)
+    return 1 + 1e-6 * (a * k * p + b * (p + 1))
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize("n", [10, 26])
+def test_a_diamond_of_rules_is_rescaled(n, codegen):
+    """At 10 rules the size is written out as before; at 26 it reads
+    functions of its own. Each gives 5·V(p = 1)/V(p = 2) after the event."""
+    model = bngsim.Model.from_sbml_string(_diamond_doc(n))
+    helpers = [f for f in model.function_names if f.startswith("_rsz_")]
+    assert bool(helpers) == (n == 26)
+    result = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0.0, 4.0), n_points=9
+    )
+    sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    want = 5 * _diamond_size(n, 1.0, 1) / _diamond_size(n, 1.0, 2)
+    np.testing.assert_allclose(sn[3:], want, rtol=1e-12)
+    np.testing.assert_allclose(sn[:3], 5.0, rtol=1e-12)
+
+
+def test_the_sensitivity_through_a_diamond_of_rules():
+    """d[Sn]/dk after the event, through the functions: with
+    V1 = V(k, p = 1) and V2 = V(k, p = 2), 5·(dV1/dk·V2 − V1·dV2/dk)/V2²."""
+    n = 26
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(_diamond_doc(n)), method="ode", sensitivity_params=["k"]
+    ).run(t_span=(0.0, 4.0), n_points=9, rtol=1e-10, atol=1e-12)
+    a, _ = _diamond(n)
+    v1, v2 = _diamond_size(n, 1.0, 1), _diamond_size(n, 1.0, 2)
+    want = 5 * (1e-6 * a * v2 - v1 * 2e-6 * a) / v2**2
+    w = list(result.species_names).index("Sn")
+    np.testing.assert_allclose(np.asarray(result.sensitivities)[-1, w, 0], want, rtol=1e-6)
+
+
+def test_a_size_jump_followed_through_a_diamond_of_rules():
+    """cv := piecewise(1, t < 2, 5) takes [Sn] 5 -> 1, and cw := 1 + 1e-9·r25
+    reads it through 26 rules (r0 := [Sn], r1 := [Sn] + 1): the jump's
+    rescale of [Sw] goes through functions of its own too."""
+    n = 26
+    lt2 = f"<apply><lt/>{T}<cn>2</cn></apply>"
+    step = (
+        f"<piecewise><piece><cn>1</cn>{lt2}</piece><otherwise><cn>5</cn></otherwise></piecewise>"
+    )
+    rules = (
+        _rule("cv", step) + _rule("r0", _ci("Sn")) + _rule("r1", _apply("plus", _ci("Sn"), _cn(1)))
+    )
+    rules += "".join(
+        _rule(f"r{i}", _apply("plus", _ci(f"r{i - 1}"), _ci(f"r{i - 2}"))) for i in range(2, n)
+    )
+    rules += _rule("cw", _apply("plus", _cn(1), _apply("times", _cn(1e-9), _ci(f"r{n - 1}"))))
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
+ <listOfCompartments>{_comp("cv")}{_comp("cw")}</listOfCompartments>
+ <listOfSpecies>{_species("Sn", "cv", 5)}{_species("Sw", "cw", 3)}</listOfSpecies>
+ <listOfParameters>{"".join(_param(f"r{i}", 0) for i in range(n))}</listOfParameters>
+ <listOfRules>{rules}</listOfRules>
+</model></sbml>"""
+    model = bngsim.Model.from_sbml_string(xml)
+    assert any(f.startswith("_rsz_") for f in model.function_names)
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 4.0), n_points=9)
+    t = np.asarray(result.time)
+    sw = np.asarray(result.species)[:, list(result.species_names).index("Sw")]
+    a, b = _diamond(n)  # r25 = a·r0 + b·r1 = (a + b)·[Sn] + b
+
+    def cw(sn):
+        return 1 + 1e-9 * ((a + b) * sn + b)
+
+    np.testing.assert_allclose(sw, np.where(t < 2, 3.0, 3 * cw(5) / cw(1)), rtol=1e-12)
+
+
+# The engine forms each rescale itself, from the compartment's size read by
+# name before and after the event (#936), so the trajectory reads none of
+# these functions: the tests above pass with every one of them wrong. Only a
+# sensitivity reads them, through the new size's text. So each case below is
+# checked by its sensitivity.
+
+
+def _diamond_rules(n, r0, r1):
+    """``r0``, ``r1`` and r_i := r_{i-1} + r_{i-2}, up to r_{n-1}."""
+    return (
+        _rule("r0", r0)
+        + _rule("r1", r1)
+        + "".join(
+            _rule(f"r{i}", _apply("plus", _ci(f"r{i - 1}"), _ci(f"r{i - 2}"))) for i in range(2, n)
+        )
+    )
+
+
+def _size_of(name, scale):
+    """``1 + scale·name``."""
+    return _apply("plus", _cn(1), _apply("times", _cn(scale), _ci(name)))
+
+
+def _event(eid, at, assignments):
+    after = f"<math {M}><apply><gt/>{T}<cn>{at}</cn></apply></math>"
+    return f"""<event id="{eid}" useValuesFromTriggerTime="true">
+  <trigger initialValue="false" persistent="true">{after}</trigger>
+  <listOfEventAssignments>{assignments}</listOfEventAssignments>
+ </event>"""
+
+
+def _model(comps, species, params, rules, events=""):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2"><model id="m">
+ <listOfCompartments>{comps}</listOfCompartments>
+ <listOfSpecies>{species}</listOfSpecies>
+ <listOfParameters>{params}</listOfParameters>
+ <listOfRules>{rules}</listOfRules>
+ <listOfEvents>{events}</listOfEvents>
+</model></sbml>"""
+
+
+def _final_sensitivity(model, *species):
+    """d[species]/dk at t = 4, after the events."""
+    result = bngsim.Simulator(model, method="ode", sensitivity_params=["k"]).run(
+        t_span=(0.0, 4.0), n_points=9, rtol=1e-10, atol=1e-12
+    )
+    names = list(result.species_names)
+    return np.asarray(result.sensitivities)[-1, [names.index(s) for s in species], 0]
+
+
+def _rsz(model):
+    return [f for f in model.function_names if f.startswith("_rsz_")]
+
+
+def test_the_sensitivity_through_a_size_jump_followed_through_a_diamond_of_rules():
+    """With r0 := k·[Sn], the jump's rescale of [Sw] reads k through
+    functions of its own: d[Sw]/dk after the jump is 3·(W5'·W1 − W5·W1')/W1²,
+    W_s being cw at [Sn] = s."""
+    n = 26
+    lt2 = f"<apply><lt/>{T}<cn>2</cn></apply>"
+    step = (
+        f"<piecewise><piece><cn>1</cn>{lt2}</piece><otherwise><cn>5</cn></otherwise></piecewise>"
+    )
+    rules = _rule("cv", step) + _diamond_rules(
+        n, _apply("times", _ci("k"), _ci("Sn")), _apply("plus", _ci("Sn"), _cn(1))
+    )
+    model = bngsim.Model.from_sbml_string(
+        _model(
+            _comp("cv") + _comp("cw"),
+            _species("Sn", "cv", 5) + _species("Sw", "cw", 3),
+            _param("k", 1.0, constant=True) + "".join(_param(f"r{i}", 0) for i in range(n)),
+            rules + _rule("cw", _size_of(f"r{n - 1}", 1e-9)),
+        )
+    )
+    assert _rsz(model)
+    a, b = _diamond(n)
+
+    def w(sn):
+        return 1 + 1e-9 * (a * sn + b * (sn + 1))
+
+    def dw(sn):
+        return 1e-9 * a * sn
+
+    want = 3 * (dw(5) * w(1) - w(5) * dw(1)) / w(1) ** 2
+    np.testing.assert_allclose(_final_sensitivity(model, "Sw"), want, rtol=1e-6)
+
+
+def _two_compartments_two_events(n, event_ids, comp_ids, values):
+    """Each compartment reads the same diamond from p, and each event sets
+    p: so each event resizes both."""
+    rules = _diamond_rules(
+        n, _apply("times", _ci("k"), _ci("p")), _apply("plus", _ci("p"), _cn(1))
+    ) + "".join(_rule(c, _size_of(f"r{n - 1}", 1e-6)) for c in comp_ids)
+    return _model(
+        "".join(_comp(c) for c in comp_ids),
+        _species("A", comp_ids[0], 5) + _species("B", comp_ids[1], 7),
+        _param("p", 1)
+        + _param("k", 1.0, constant=True)
+        + "".join(_param(f"r{i}", 0) for i in range(n)),
+        rules,
+        "".join(
+            _event(eid, at, _set("p", v))
+            for eid, at, v in zip(event_ids, (1, 2), values, strict=True)
+        ),
+    )
+
+
+def test_two_events_whose_ids_meet_read_their_own_functions():
+    """Event e with compartment c_x and event e_c with compartment x both
+    name their functions _rsz_e_c_x_…: one name held two functions, and the
+    sensitivity of the first event was refused as a second fire of its
+    instant. After both, [A] = 5·V(1)/V(3) for V(p) = 1 + 1e-6·(a·k·p +
+    b·(p + 1))."""
+    n = 26
+    model = bngsim.Model.from_sbml_string(
+        _two_compartments_two_events(n, ("e", "e_c"), ("c_x", "x"), (2, 3))
+    )
+    names = _rsz(model)
+    assert names and len(set(names)) == len(names)
+    a, b = _diamond(n)
+
+    def v(p):
+        return 1 + 1e-6 * (a * p + b * (p + 1))
+
+    def dv(p):
+        return 1e-6 * a * p
+
+    want = [c0 * (dv(1) * v(3) - v(1) * dv(3)) / v(3) ** 2 for c0 in (5, 7)]
+    np.testing.assert_allclose(_final_sensitivity(model, "A", "B"), want, rtol=1e-6)
+
+
+def test_events_that_put_in_the_same_values_share_their_functions():
+    """Every function is evaluated at every step, so a text two events
+    write is one function, not two."""
+    n = 26
+    one = len(_rsz(bngsim.Model.from_sbml_string(_diamond_doc(n))))
+    both = bngsim.Model.from_sbml_string(
+        _two_compartments_two_events(n, ("e1", "e2"), ("cv", "cw"), (2, 2))
+    )
+    # Two compartments read the diamond, through the same rules.
+    assert len(_rsz(both)) == one
+
+
+def test_no_function_is_kept_that_no_rescale_reads():
+    """A species with hasOnlySubstanceUnits keeps its amount with no
+    rescale, so nothing reads its compartment's new size: its functions were
+    added all the same, and evaluated at every step for nothing. [Sn] is
+    reported as 5/V, from 5/V(p = 1) to 5/V(p = 2)."""
+    hosu = (
+        '<species id="Sn" compartment="cv" initialAmount="5" hasOnlySubstanceUnits="true" '
+        'boundaryCondition="false" constant="false"/>'
+    )
+    xml = _diamond_doc(26).replace(_species("Sn", "cv", 5), hosu)
+    assert hosu in xml
+    model = bngsim.Model.from_sbml_string(xml)
+    assert _rsz(model) == []
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 4.0), n_points=9)
+    sn = np.asarray(result.species)[:, list(result.species_names).index("Sn")]
+    np.testing.assert_allclose(sn[:3], 5 / _diamond_size(26, 1.0, 1), rtol=1e-12)
+    np.testing.assert_allclose(sn[3:], 5 / _diamond_size(26, 1.0, 2), rtol=1e-12)
+
+
+def test_the_limit_counts_the_values_an_event_puts_in():
+    """16 rules write out in 15 KB, but each of their 987 readings of p is
+    given p's new value: one of 60 terms made the new size 720 KB, under a
+    limit of 20,000 characters that counted the rules alone."""
+    n, terms = 16, 60
+    value = _apply(
+        "plus", _cn(2), *(_apply("times", _cn(0.001), _ci(f"q{j}")) for j in range(terms))
+    )
+    xml = _doc(
+        _comp("cv"),
+        _species("Sn", "cv", 5),
+        _param("p", 1)
+        + _param("k", 1.0, constant=True)
+        + "".join(_param(f"q{j}", 1.0, constant=True) for j in range(terms))
+        + "".join(_param(f"r{i}", 0) for i in range(n)),
+        _diamond_rules(n, _apply("times", _ci("k"), _ci("p")), _apply("plus", _ci("p"), _cn(1)))
+        + _rule("cv", _size_of(f"r{n - 1}", 1e-6)),
+        _assign("p", value),
+        "true",
+    )
+    model = bngsim.Model.from_sbml_string(xml)
+    assert _rsz(model)
+    a, b = _diamond(n)
+    p2 = 2 + 0.001 * terms
+
+    def v(p):
+        return 1 + 1e-6 * (a * p + b * (p + 1))
+
+    want = 5 * (1e-6 * a * v(p2) - v(1) * 1e-6 * a * p2) / v(p2) ** 2
+    np.testing.assert_allclose(_final_sensitivity(model, "Sn"), want, rtol=1e-6)
+
+
+def test_the_sensitivity_through_a_chain_of_rules_deeper_than_was_written_out():
+    """r0 := k·p, r_i := r_{i-1} + 1 up to r69, cv := 1 + 1e-3·r69: the new
+    size was written out 65 rules deep and read the rest by name, at their
+    value before the event. Its sensitivity was refused as a second fire of
+    the instant (#936)."""
+    n = 70
+    rules = _rule("r0", _apply("times", _ci("k"), _ci("p")))
+    rules += "".join(_rule(f"r{i}", _apply("plus", _ci(f"r{i - 1}"), _cn(1))) for i in range(1, n))
+    model = bngsim.Model.from_sbml_string(
+        _doc(
+            _comp("cv"),
+            _species("Sn", "cv", 5),
+            _param("p", 1)
+            + _param("k", 1.0, constant=True)
+            + "".join(_param(f"r{i}", 0) for i in range(n)),
+            rules + _rule("cv", _size_of(f"r{n - 1}", 1e-3)),
+            _set("p", 2),
+            "true",
+        )
+    )
+
+    def v(p):
+        return 1 + 1e-3 * (p + n - 1)
+
+    want = 5 * (1e-3 * v(2) - v(1) * 2e-3) / v(2) ** 2
+    np.testing.assert_allclose(_final_sensitivity(model, "Sn"), want, rtol=1e-6)
+
+
+def test_the_limit_is_the_length_written_out(monkeypatch):
+    """Functions start one character past the limit. Each name read was
+    counted beside the text put in for it, and they started near 17,000."""
+    import bngsim._sbml_loader as loader
+
+    sizes = []
+    real = loader._rule_compartments_an_event_resizes
+
+    def spy(*args, **kwargs):
+        found = real(*args, **kwargs)
+        sizes.extend(len(text) for _, text in found)
+        return found
+
+    monkeypatch.setattr(loader, "_rule_compartments_an_event_resizes", spy)
+    xml = _diamond_doc(16)
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", 10**9)
+    assert not _rsz(bngsim.Model.from_sbml_string(xml))
+    (written,) = sizes
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", written)
+    assert not _rsz(bngsim.Model.from_sbml_string(xml))
+    monkeypatch.setattr(loader, "_RESIZE_INLINE_LIMIT", written - 1)
+    assert _rsz(bngsim.Model.from_sbml_string(xml))
+
+
+@pytest.mark.parametrize("kind", ["parameter", "reaction", "species"])
+def test_a_function_is_not_named_as_one_of_the_model_s_symbols(kind):
+    """``_rsz_e_cv_r1``, 0.25, read by J: A -> B as a parameter, as the
+    reaction's own id, or as a species. A function of that name was bound to
+    the parameter (#266), or took the place of the reaction's rate law, and
+    wrote r1's value after the event, 3, over it: B(4) = 12 for 1. Beside a
+    species of that name the model failed to load."""
+    taken = "_rsz_e_cv_r1"
+    assert taken in _rsz(bngsim.Model.from_sbml_string(_diamond_doc(26)))
+    a, b = (f'<speciesReference species="{s}" stoichiometry="1" constant="true"/>' for s in "AB")
+    held = (
+        '<species id="{}" compartment="c0" initialConcentration="{}" '
+        'hasOnlySubstanceUnits="false" boundaryCondition="true" constant="true"/>'
+    )
+    species = held.format("A", 1) + _species("B", "c0", 0)
+    params = ""
+    rid, law = "J", _apply("times", _ci(taken), _ci("A"))
+    if kind == "parameter":
+        params = _param(taken, 0.25, True)
+    elif kind == "species":
+        species += held.format(taken, 0.25)
+    else:
+        rid, law = taken, _apply("times", _cn(0.25), _ci("A"))
+    reaction = f"""<listOfReactions><reaction id="{rid}" reversible="false">
+  <listOfReactants>{a}</listOfReactants><listOfProducts>{b}</listOfProducts>
+  <kineticLaw><math {M}>{law}</math></kineticLaw>
+ </reaction></listOfReactions>"""
+    xml = (
+        _diamond_doc(26)
+        .replace(_comp("cv"), _comp("cv") + '<compartment id="c0" size="1" constant="true"/>')
+        .replace(_species("Sn", "cv", 5), _species("Sn", "cv", 5) + species)
+        .replace("<listOfParameters>", f"<listOfParameters>{params}")
+        .replace("<listOfEvents>", reaction + "<listOfEvents>")
+    )
+    model = bngsim.Model.from_sbml_string(xml)
+    # The helper takes a name of its own; a reaction's rate law keeps its id.
+    assert f"{taken}_1" in model.function_names
+    assert model.function_names.count(taken) == (kind == "reaction")
+    result = bngsim.Simulator(model, method="ode").run(t_span=(0.0, 4.0), n_points=9)
+    names = list(result.species_names)
+    values = np.asarray(result.species)
+    np.testing.assert_allclose(values[:, names.index("B")], 0.25 * result.time, rtol=1e-8)
+    sn = values[:, names.index("Sn")]
+    np.testing.assert_allclose(sn[3:], 5 * _diamond_size(26, 1.0, 1) / _diamond_size(26, 1.0, 2))

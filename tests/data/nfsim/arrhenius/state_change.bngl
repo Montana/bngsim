@@ -1,6 +1,5 @@
-# Issue #1022: an Arrhenius state-change rule, which RuleMonkey 3.11.0 refuses
-# itself at load ("not a supported 2-reactant binding/unbinding shape"). bngsim
-# leaves the refusal to it, rather than blaming richardposner/RuleMonkey#109.
+# Issue #1022: an Arrhenius state-change rule, which RuleMonkey refuses itself at
+# load ("outside the shapes RM runs: it changes a state"), naming the rule.
 begin model
 begin parameters
   Ea0 0.2

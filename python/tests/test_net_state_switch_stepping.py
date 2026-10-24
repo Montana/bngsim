@@ -580,6 +580,54 @@ def test_a_crossing_on_a_curved_residual_restarts(tmp_path, rtol, max_step):
     assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1000 * rtol)
 
 
+@pytest.mark.parametrize("rtol", [1e-6, 1e-8, 1e-10])
+@pytest.mark.parametrize(
+    ("t_end", "n_points"),
+    [
+        (3.6, 3),
+        (4.0, 3),
+        (5.0, 101),
+        (6.0, 3),
+        (7.0, 3),
+        (8.0, 3),
+        (10.0, 3),
+        (10.0, 101),
+        (20.0, 3),
+        (20.0, 11),
+        (50.0, 3),
+    ],
+)
+def test_a_curved_residual_restarts_whatever_the_run_length(tmp_path, t_end, n_points, rtol):
+    """Issue #907, case 1: the test above passed over (0, 5) with 3 points, and
+    the window was lost on every grid here. CVODE grows its step about tenfold
+    over this smooth stretch, so the step after the opening root ran many times
+    the width of the cubic's hump, and the restart test's sixteen even samples
+    of it straddled the hump: the crossing read as unresolved, the run stepped
+    on, and Y came out 0. The test samples halving toward the root as well."""
+    model = _write(tmp_path, _CUBIC_NET)
+    result = bngsim.Simulator(model).run(
+        t_span=(0.0, t_end), n_points=n_points, rtol=rtol, atol=rtol * 1e-2
+    )
+    assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1000 * rtol)
+
+
+@pytest.mark.parametrize("rtol", [4.9e-4, 5e-4])
+@pytest.mark.parametrize("t_end", [4.0, 5.0, 8.0, 10.0, 12.0, 15.0, 20.0])
+def test_a_hump_that_only_just_clears_its_band_restarts(tmp_path, t_end, rtol):
+    """At rtol 5e-4 the cubic's hump, 0.029 at its top, clears the 10*sqrt(2)
+    bands the restart test asks of it (0.0283 there) only over a core from
+    0.042 to 0.058 time units past the root. The halvings toward the root, a
+    factor of two apart, and the even samples fell either side of that core
+    on 25 runs of 242 near this tolerance, eleven of these fourteen among them,
+    and Y came out 0. The best sample is now refined between its two
+    neighbours."""
+    model = _write(tmp_path, _CUBIC_NET)
+    result = bngsim.Simulator(model).run(
+        t_span=(0.0, t_end), n_points=3, rtol=rtol, atol=rtol * 1e-2
+    )
+    assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1e-2)
+
+
 def test_a_residual_too_deep_to_print_keeps_every_root(tmp_path):
     """A rate law over a sum of 400 observables has a residual that nests too
     deep for ``ast.unparse``. The RecursionError escaped the dedupe key, the
@@ -1214,14 +1262,16 @@ def test_a_held_slide_prints_nothing(tmp_path):
 
 def _batch_ends_between(path, hold, start, stop):
     """The times CVODE logs a batch ending at, between ``start`` and ``stop``,
-    in a run of ``path`` with holding on or off; in a subprocess, as above."""
+    in a run of ``path`` with holding on or off; in a subprocess, as above.
+    A spent batch is logged only under BNGSIM_LOG_SPENT_BATCHES=1 (issue #1124,
+    item 13), which leaves SUNDIALS' handler, and the hold's mute, as they were."""
     script = textwrap.dedent(f"""
         import bngsim
         m = bngsim.Model.from_net({str(path)!r})
         bngsim.Simulator(m).run(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8,
                                 max_step=0.05, max_steps=20)
     """)
-    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold)
+    env = dict(os.environ, BNGSIM_STATE_SWITCH_HOLD=hold, BNGSIM_LOG_SPENT_BATCHES="1")
     done = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
     )
@@ -1240,3 +1290,74 @@ def test_a_released_hold_logs_what_main_logs(tmp_path):
     path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
     assert _batch_ends_between(path, "0", 1.0, 2.4)
     assert _batch_ends_between(path, "1", 1.0, 2.4)
+
+
+# Issue #1064: a slide along S = 1 written over a scale H. Each spelling is the
+# same surface at every H.
+_SCALED_SLIDE_NET = """\
+begin parameters
+    1 H {H}
+    2 dlt 0.01
+end parameters
+begin functions
+    1 f() if({cond},1,-1)
+    2 up() dlt
+end functions
+begin species
+    1 S() 27.95
+end species
+begin reactions
+    1 0 1 f
+    2 0 1 up
+end reactions
+begin groups
+    1 Sobs 1
+end groups
+"""
+
+
+def _scaled_slide(tmp_path, H, cond, hold):
+    """n_steps, S(29.5) to the bit, and what CVODE logged, in a subprocess as
+    above."""
+    path = tmp_path / f"scaled_{H}.net"
+    path.write_text(_SCALED_SLIDE_NET.format(H=H, cond=cond))
+    script = textwrap.dedent(f"""
+        import bngsim
+        m = bngsim.Model.from_net({str(path)!r})
+        r = bngsim.Simulator(m).run(sample_times=[0.0, 28.0, 29.5], rtol=1e-3, atol=1e-5)
+        print("RUN", r.solver_stats["n_steps"], float(r.species[-1][0]).hex())
+    """)
+    env = dict(os.environ)
+    if hold is None:  # the default, whatever the caller's shell sets
+        env.pop("BNGSIM_STATE_SWITCH_HOLD", None)
+    else:
+        env["BNGSIM_STATE_SWITCH_HOLD"] = hold
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, env=env
+    )
+    run = re.search(r"^RUN (\d+) (\S+)$", done.stdout, re.MULTILINE)
+    assert run is not None, done.stdout + done.stderr
+    return int(run.group(1)), run.group(2), done.stdout.replace(run.group(0), "") + done.stderr
+
+
+@pytest.mark.parametrize(
+    "cond, hold",
+    [("Sobs*H<H", "0"), ("Sobs*H<H+0*time()", None)],
+    ids=["every crossing tested", "reads the time"],
+)
+def test_a_residual_scaled_by_a_constant_steps_alike(tmp_path, cond, hold):
+    """A residual that reads exactly 0.0 while a run steps on past its root is
+    reported as a tiny value on the side it is held to (#897). That value was
+    DBL_MIN. CVODE's root search ranks a sign change by g(tmid) over
+    g(tmid) - g(tlo), and against a residual past ~9e15 that ratio underflowed
+    to 0: the search took the sign change for none, moved the wrong end of its
+    bracket, and asked for times outside the step. At H = 5.18e21 this run took
+    51,990 steps where H = 1 takes 55,002, and logged 105 "Illegal value for t"
+    errors; at 1e23, 47,424 and 280. The surface is the same at every H, so the
+    steps and the answer are too."""
+    reference = _scaled_slide(tmp_path, "1", cond, hold)
+    assert reference[2].strip() == ""
+    for H in ("5.18e21", "1e23", "1e100", "1e-20"):
+        steps, bits, log = _scaled_slide(tmp_path, H, cond, hold)
+        assert "Illegal value for t" not in log, H
+        assert (steps, bits) == reference[:2], H

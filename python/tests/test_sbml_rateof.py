@@ -1151,7 +1151,8 @@ def test_rateof_of_something_nothing_changes_is_zero_wherever_it_is_read(where, 
 # in a compartment an assignmentRule sizes (rule 10225), rateOf of anything but a
 # symbol (10223), and a call to a functionDefinition whose body reads rateOf.
 # None occurs in the semantic suite, the rr_parity BioModels or the events set;
-# all are now refused by name, in the same up-front check as #1046.
+# the first two are now refused by name, in the same up-front check as #1046,
+# and the call is written out with its argument put in (issue #1124, item 8).
 
 _SILENT_FUNCS = {
     # f(x) := rateOf(x), the csymbol (libsbml rejects it in a lambda, 20304, and
@@ -1162,6 +1163,20 @@ _SILENT_FUNCS = {
     # g(z) := 2*f(z), rateOf through another function.
     "g": "<lambda><bvar><ci>z</ci></bvar><apply><times/><cn>2</cn><apply><ci>f</ci><ci>z</ci>"
     "</apply></apply></lambda>",
+    # sw(x, S) := rateOf(x)*S, a parameter named like the species: called as
+    # sw(S, k), it is rateOf(S)*k.
+    "sw": "<lambda><bvar><ci>x</ci></bvar><bvar><ci>S</ci></bvar><apply><times/>"
+    "<apply><ci>rateOf</ci><ci>x</ci></apply><ci>S</ci></apply></lambda>",
+    # tc(y, t) := rateOf(y)*time, where the time csymbol's text is the
+    # parameter's name: the csymbol is still the time.
+    "tc": "<lambda><bvar><ci>y</ci></bvar><bvar><ci>t</ci></bvar><apply><times/>"
+    f"<apply><ci>rateOf</ci><ci>y</ci></apply>{_TIME_CSYMBOL}</apply></lambda>",
+    # r(y) := rateOf(y) + r(y), recursive (invalid SBML, rule 20512).
+    "r": "<lambda><bvar><ci>y</ci></bvar><apply><plus/><apply><ci>rateOf</ci><ci>y</ci>"
+    "</apply><apply><ci>r</ci><ci>y</ci></apply></apply></lambda>",
+    # u(y) := y*rateOf(q), with q declared nowhere (invalid SBML, rule 20304).
+    "u": "<lambda><bvar><ci>y</ci></bvar><apply><times/><ci>y</ci><apply><ci>rateOf</ci>"
+    "<ci>q</ci></apply></apply></lambda>",
 }
 
 
@@ -1227,30 +1242,42 @@ def _silent_rateof_model(read: str, where: str, funcs: tuple[str, ...] = ()) -> 
 
 
 _RATE_2S = "<apply><times/><cn>2</cn><ci>S</ci></apply>"
-_FUNC_WHY = "reads rateOf of a parameter of its own"
 
 
 @pytest.mark.parametrize("where", ["initialAssignment:p2", "assignmentRule:p2"])
 @pytest.mark.parametrize(
     ("read", "funcs", "shown", "why"),
     [
+        # A function that reads rateOf is written out at the call (issue #1124,
+        # item 8): h(2*S) reads rateOf(2*S), refused as a direct read is.
         (
-            "<apply><ci>f</ci><ci>S</ci></apply>",
-            ("f",),
-            "f(S)",
-            f"functionDefinition f {_FUNC_WHY}",
-        ),
-        (
-            "<apply><ci>h</ci><ci>S</ci></apply>",
+            f"<apply><ci>h</ci>{_RATE_2S}</apply>",
             ("h",),
-            "h(S)",
-            f"functionDefinition h {_FUNC_WHY}",
+            "rateOf(2 * S)",
+            "not a single symbol (validation rule 10223)",
+        ),
+        # The same through the csymbol, which libsbml will not hold written out.
+        (
+            f"<apply><ci>f</ci>{_RATE_2S}</apply>",
+            ("f",),
+            "rateOf(2 * S)",
+            "not a single symbol (validation rule 10223)",
+        ),
+        # A call that cannot be written out is left, and refused by name.
+        (
+            "<apply><ci>h</ci></apply>",
+            ("h",),
+            "h()",
+            "functionDefinition h reads rateOf, and bngsim cannot write this call to it "
+            "out with what is passed: it takes 1 argument(s), not 0",
         ),
         (
-            "<apply><ci>g</ci><ci>S</ci></apply>",
-            ("f", "g"),
-            "g(S)",
-            f"functionDefinition g {_FUNC_WHY} (or calls one that does)",
+            "<apply><ci>r</ci><ci>S</ci></apply>",
+            ("r",),
+            "r(S)",
+            "functionDefinition r reads rateOf, and bngsim cannot write this call to it "
+            "out with what is passed: it calls itself, directly or through another "
+            "(validation rule 20512)",
         ),
         (
             f"<apply>{_RATEOF_CSYMBOL}{_RATE_2S}</apply>",
@@ -1282,9 +1309,10 @@ _FUNC_WHY = "reads rateOf of a parameter of its own"
         ),
     ],
     ids=[
-        "csymbol-in-function",
-        "idiom-in-function",
-        "through-a-function",
+        "function-of-2S",
+        "csymbol-function-of-2S",
+        "too-few-arguments",
+        "recursive-function",
         "csymbol-of-2S",
         "idiom-of-2S",
         "10225",
@@ -1312,11 +1340,25 @@ def test_a_rateof_with_no_value_is_refused_by_name(read, funcs, shown, why, wher
         # A concentration there whose rate its own rate rule states, whatever
         # the compartment does.
         (f"<apply>{_RATEOF_CSYMBOL}<ci>Sr</ci></apply>", (), 3.0),
+        # A call to a function that reads rateOf takes the rate of what is
+        # passed (issue #1124, item 8): each was refused by name.
+        ("<apply><ci>f</ci><ci>S</ci></apply>", ("f",), -5.0),
+        ("<apply><ci>h</ci><ci>S</ci></apply>", ("h",), -5.0),
+        ("<apply><ci>g</ci><ci>S</ci></apply>", ("f", "g"), -10.0),
+        # Every argument is put in at once: one parameter at a time read
+        # rateOf(k)*k = 0 here, and a time of 0 as k.
+        ("<apply><ci>sw</ci><ci>S</ci><ci>k</ci></apply>", ("sw",), -2.5),
+        ("<apply><ci>tc</ci><ci>S</ci><ci>k</ci></apply>", ("tc",), 0.0),
     ],
     ids=[
         "uncalled-function",
         "amount-in-a-sized-compartment",
         "rate-ruled-concentration",
+        "csymbol-in-function",
+        "idiom-in-function",
+        "through-a-function",
+        "argument-named-like-a-parameter",
+        "time-named-like-a-parameter",
     ],
 )
 def test_a_rateof_with_a_value_still_loads(read, funcs, value):
@@ -1324,6 +1366,93 @@ def test_a_rateof_with_a_value_still_loads(read, funcs, value):
         _sbml(_silent_rateof_model(read, "initialAssignment:p2", funcs))
     )
     assert model.get_param("p2") == pytest.approx(value)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    ("args", "funcs", "want"),
+    [
+        ("<ci>h</ci><ci>S</ci>", ("h",), lambda t: -5.0 * np.exp(-0.5 * t)),
+        ("<ci>g</ci><ci>S</ci>", ("f", "g"), lambda t: -10.0 * np.exp(-0.5 * t)),
+        ("<ci>sw</ci><ci>S</ci><ci>k</ci>", ("sw",), lambda t: -2.5 * np.exp(-0.5 * t)),
+        ("<ci>tc</ci><ci>S</ci><ci>k</ci>", ("tc",), lambda t: -5.0 * t * np.exp(-0.5 * t)),
+    ],
+    ids=[
+        "idiom-in-function",
+        "through-a-function",
+        "argument-named-like-a-parameter",
+        "time-named-like-a-parameter",
+    ],
+)
+def test_a_rule_that_calls_a_function_reading_rateof(args, funcs, want, codegen):
+    """p2 := h(S) is rateOf(S) = -0.5·S = -5·e^(-t/2), g(S) twice that,
+    sw(S, k) k = 0.5 times it, and tc(S, k) t times it."""
+    model = bngsim.Model.from_sbml_string(
+        _sbml(_silent_rateof_model(f"<apply>{args}</apply>", "assignmentRule:p2", funcs))
+    )
+    result = bngsim.Simulator(model, method="ode", codegen=codegen).run(
+        t_span=(0.0, 2.0), n_points=5, rtol=1e-10, atol=1e-12
+    )
+    t = np.asarray(result.time)
+    p2 = np.asarray(result.expressions)[:, list(result.expression_names).index("p2")]
+    np.testing.assert_allclose(p2, want(t), rtol=1e-7, atol=1e-12)
+
+
+@pytest.mark.parametrize("where", ["initialAssignment:p2", "assignmentRule:p2"])
+def test_a_name_a_function_reading_rateof_reads_is_checked_where_it_is_written_out(where):
+    """u(y) := y*rateOf(q), q declared nowhere, called as u(S): the undefined
+    symbol is refused by name, where the initialAssignment loaded as 0 and the
+    rule failed in ExprTk."""
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(
+            _sbml(_silent_rateof_model("<apply><ci>u</ci><ci>S</ci></apply>", where, ("u",)))
+        )
+    msg = str(exc.value)
+    assert f"'q' [{where}]" in msg
+    assert "rate_of__" not in msg
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+def test_a_kinetic_law_and_a_trigger_that_call_a_function_reading_rateof(codegen):
+    """P is made at -g(S) = 10·e^(-t/2), in a law whose local parameters are
+    named like g's and f's own, so P = 20·(1 - e^(-t/2)). E sets p2 = 1 when
+    h(S) = -5·e^(-t/2) rises past -3, at t = 2·ln(5/3) ≈ 1.0217."""
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    reaction = (
+        '<reaction id="make" reversible="false"><listOfProducts>'
+        '<speciesReference species="P" stoichiometry="1" constant="true"/></listOfProducts>'
+        f"<kineticLaw>{m}<apply><minus/><apply><ci>g</ci><ci>S</ci></apply></apply></math>"
+        '<listOfLocalParameters><localParameter id="z" value="3"/>'
+        '<localParameter id="x" value="4"/></listOfLocalParameters></kineticLaw></reaction>'
+    )
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><gt/>'
+        "<apply><ci>h</ci><ci>S</ci></apply><cn>-3</cn></apply></math></trigger>"
+        f'<listOfEventAssignments><eventAssignment variable="p2">{m}<cn>1</cn></math>'
+        "</eventAssignment></listOfEventAssignments></event></listOfEvents>"
+    )
+    body = (
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", ("f", "g", "h"))
+        .replace(
+            "</listOfSpecies>",
+            '<species id="P" compartment="c" initialAmount="0" hasOnlySubstanceUnits="true" '
+            'boundaryCondition="false" constant="false"/></listOfSpecies>',
+        )
+        .replace("</listOfReactions>", reaction + "</listOfReactions>")
+        .replace("</model>", event + "</model>")
+    )
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(_sbml(body)), method="ode", codegen=codegen
+    ).run(t_span=(0.0, 2.0), n_points=201, rtol=1e-10, atol=1e-12)
+    t = np.asarray(result.time)
+    names = list(result.state_names)
+    state = np.asarray(result.state)
+    np.testing.assert_allclose(
+        state[:, names.index("P")], 20.0 * (1.0 - np.exp(-0.5 * t)), rtol=1e-7, atol=1e-9
+    )
+    fired = t > 2.0 * np.log(5.0 / 3.0)
+    np.testing.assert_array_equal(state[:, names.index("p2")], np.where(fired, 1.0, 7.0))
 
 
 # ─── GH #231 sub-cluster 2: rateOf in an event trigger (atol-robust firing) ────
@@ -1823,3 +1952,148 @@ def test_rateof_hosu_in_an_ar_compartment_is_the_amount_rate(size_rule, driver, 
     h = 6.0 * np.exp(-0.2 * t)
     np.testing.assert_allclose(values[:, names.index("R")], -0.2 * h, rtol=1e-7)
     np.testing.assert_allclose(values[:, names.index("Z")], h - 6.0, rtol=1e-7, atol=1e-9)
+
+
+def test_an_event_that_calls_a_function_reading_rateof():
+    """p2 = h(S) at t = 1, with h(y) = rateOf(y) (issue #1124, item 8):
+    rateOf(S) there is -5·e^(-1/2)."""
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><geq/>{_TIME_CSYMBOL}'
+        "<cn>1</cn></apply></math></trigger><listOfEventAssignments>"
+        f'<eventAssignment variable="p2">{m}<apply><ci>h</ci><ci>S</ci></apply></math>'
+        "</eventAssignment></listOfEventAssignments></event></listOfEvents>"
+    )
+    xml = _sbml(
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", ("h",)).replace(
+            "</model>", event + "</model>"
+        )
+    )
+    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+        t_span=(0.0, 2.0), n_points=3, rtol=1e-10, atol=1e-12
+    )
+    p2 = np.asarray(result.state)[:, list(result.state_names).index("p2")]
+    np.testing.assert_allclose(p2, [7.0, -5 * np.exp(-0.5), -5 * np.exp(-0.5)], rtol=1e-7)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+@pytest.mark.parametrize(
+    ("read", "funcs"),
+    [
+        ("<apply><ci>h</ci><ci>S</ci></apply>", ("h",)),
+        ("<apply><ci>f</ci><ci>S</ci></apply>", ("f",)),
+        ("<apply><ci>rateOf</ci><ci>S</ci></apply>", ()),
+        (f"<apply>{_RATEOF_CSYMBOL}<ci>S</ci></apply>", ()),
+    ],
+    ids=["idiom-in-function", "csymbol-in-function", "idiom", "csymbol"],
+)
+def test_an_event_delay_and_priority_that_read_rateof(read, funcs, codegen):
+    """E triggers at t = 1 with delay rateOf(S) + 6 = 6 - 5·e^(-1/2) there, so
+    p2 = 1 from t ≈ 3.967; its priority reads rateOf(S) as well. The idiom's
+    load-time fold gave NaN: the delay was refused as "nan", and the priority
+    failed in ExprTk (issue #1124)."""
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><geq/>{_TIME_CSYMBOL}'
+        f"<cn>1</cn></apply></math></trigger><delay>{m}<apply><plus/>{read}<cn>6</cn>"
+        f"</apply></math></delay><priority>{m}{read}</math></priority>"
+        f'<listOfEventAssignments><eventAssignment variable="p2">{m}<cn>1</cn></math>'
+        "</eventAssignment></listOfEventAssignments></event></listOfEvents>"
+    )
+    xml = _sbml(
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", funcs).replace(
+            "</model>", event + "</model>"
+        )
+    )
+    result = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", codegen=codegen
+    ).run(t_span=(0.0, 5.0), n_points=501, rtol=1e-10, atol=1e-12)
+    t = np.asarray(result.time)
+    p2 = np.asarray(result.state)[:, list(result.state_names).index("p2")]
+    np.testing.assert_array_equal(p2, np.where(t > 7.0 - 5.0 * np.exp(-0.5), 1.0, 7.0))
+
+
+_L2_STOICHIOMETRY_RATEOF = """<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+  <model id="m">
+    <listOfFunctionDefinitions>
+      <functionDefinition id="rateOf"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>a</ci></bvar><notanumber/></lambda></math></functionDefinition>
+      <functionDefinition id="h"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>y</ci></bvar><apply><ci>rateOf</ci><ci>y</ci></apply></lambda>
+      </math></functionDefinition>
+      <functionDefinition id="h2"><math xmlns="http://www.w3.org/1998/Math/MathML">
+        <lambda><bvar><ci>z</ci></bvar><apply><times/><cn>2</cn>
+        <apply><ci>h</ci><ci>z</ci></apply></apply></lambda></math></functionDefinition>
+    </listOfFunctionDefinitions>
+    <listOfCompartments><compartment id="c" size="1"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="S" compartment="c" initialAmount="10"/>
+      <species id="R" compartment="c" initialAmount="0" boundaryCondition="true"/>
+    </listOfSpecies>
+    <listOfParameters><parameter id="k" value="0.5"/></listOfParameters>
+    <listOfRules>
+      <rateRule variable="R"><math xmlns="http://www.w3.org/1998/Math/MathML"><cn>3</cn>
+      </math></rateRule>
+    </listOfRules>
+    <listOfReactions>
+      <reaction id="deg" reversible="false">
+        <listOfReactants><speciesReference species="S"><stoichiometryMath>
+          <math xmlns="http://www.w3.org/1998/Math/MathML">CALL</math>
+        </stoichiometryMath></speciesReference></listOfReactants>
+        <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+          <apply><times/><ci>k</ci><ci>S</ci></apply></math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>
+"""
+
+
+@pytest.mark.parametrize(("fid", "stoichiometry"), [("h", 3.0), ("h2", 6.0)], ids=["h", "h2"])
+def test_a_stoichiometry_math_that_calls_a_function_reading_rateof(fid, stoichiometry):
+    """Level 2: S's stoichiometry in deg is h(R) = rateOf(R) = 3 (R's rate
+    rule), or h2(R) twice that, so S = 10·e^(-0.5·n·t). Neither the write-out
+    nor the check saw a stoichiometryMath, and the inliner read the rate of h's
+    own parameter: n = 0 and S held at 10."""
+    xml = _L2_STOICHIOMETRY_RATEOF.replace("CALL", f"<apply><ci>{fid}</ci><ci>R</ci></apply>")
+    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+        t_span=(0.0, 2.0), n_points=5, rtol=1e-10, atol=1e-12
+    )
+    t = np.asarray(result.time)
+    s = np.asarray(result.state)[:, list(result.state_names).index("S")]
+    np.testing.assert_allclose(s, 10.0 * np.exp(-0.5 * stoichiometry * t), rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    ("read", "funcs"),
+    [("<apply><ci>u</ci><ci>S</ci></apply>", ("u",)), (_RATEOF_CSYMBOL, ())],
+    ids=["through-a-function", "csymbol"],
+)
+def test_a_rateof_of_an_undeclared_name_in_an_event_is_refused_by_name(read, funcs):
+    """rateOf(q), q declared nowhere, in an event assignment (directly, or
+    written out from u(S)): ExprTk refused `rate_of__q`, which names nothing in
+    the model. The undefined-symbol check covers only rules and
+    initialAssignments."""
+    if not funcs:
+        read = f"<apply>{read}<ci>q</ci></apply>"
+    m = '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+    event = (
+        '<listOfEvents><event id="E" useValuesFromTriggerTime="true">'
+        f'<trigger initialValue="false" persistent="true">{m}<apply><geq/>{_TIME_CSYMBOL}'
+        "<cn>1</cn></apply></math></trigger><listOfEventAssignments>"
+        f'<eventAssignment variable="p2">{m}{read}</math></eventAssignment>'
+        "</listOfEventAssignments></event></listOfEvents>"
+    )
+    xml = _sbml(
+        _silent_rateof_model("<cn>7</cn>", "initialAssignment:p2", funcs).replace(
+            "</model>", event + "</model>"
+        )
+    )
+    with pytest.raises(bngsim.ModelError) as exc:
+        bngsim.Model.from_sbml_string(xml)
+    msg = str(exc.value)
+    assert "rateOf(q) [event:E:assignment:p2]: q is declared nowhere in the model" in msg
+    assert "rate_of__" not in msg

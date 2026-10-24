@@ -24,6 +24,7 @@ from typing import IO
 import libsbml
 
 from bngsim import _sbml_unsupported
+from bngsim._switch_sensitivity import _ATOMIC_TOKEN, _condition_key, _fully_parenthesised
 
 logger = logging.getLogger("bngsim")
 
@@ -175,24 +176,6 @@ def _atomic(expr: str) -> str:
     if _ATOMIC_TOKEN.fullmatch(expr) or _fully_parenthesised(expr):
         return expr
     return f"({expr})"
-
-
-_ATOMIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
-
-
-def _fully_parenthesised(expr: str) -> bool:
-    """Whether the opening ``(`` of *expr* is closed by its last character."""
-    if not (expr.startswith("(") and expr.endswith(")")):
-        return False
-    depth = 0
-    for i, ch in enumerate(expr):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i == len(expr) - 1
-    return False
 
 
 def _ia_value_changed(new: float, old: float | None) -> bool:
@@ -362,8 +345,8 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     """True iff any math container references rateOf (csymbol or a *called*
     COPASI idiom). Walks rules, reactions, every event math, and initial
     assignments — plus non-idiom funcDef bodies, which still count here,
-    although the load refuses a call to one that reads rateOf
-    (``_check_rateof_targets``)."""
+    although the load writes a call to one that reads rateOf out first
+    (``_expand_rated_function_calls``)."""
 
     def _scan(n):
         return _ast_has_rateof(n, rateof_funcdef_names)
@@ -398,7 +381,139 @@ def _model_uses_rateof(sbml_model, func_defs: dict, rateof_funcdef_names: set[st
     return False
 
 
-def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
+def _rated_functions(func_defs: dict) -> dict[str, set[str]]:
+    """The functionDefinitions whose body reads ``rateOf``, through the COPASI
+    idiom or the csymbol, directly or through another they call, each with the
+    ones of them it calls."""
+    idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
+    rated: set[str] = set()
+    calls: dict[str, set[str]] = {}
+    for fid, (_p, body) in func_defs.items():
+        if body is _RATEOF_FUNCDEF:
+            continue
+        calls[fid] = set()
+        for n in _iter_ast_subtree(body):
+            t = n.getType()
+            if t == libsbml.AST_FUNCTION_RATE_OF or (
+                t == libsbml.AST_FUNCTION and n.getName() in idiom_names
+            ):
+                rated.add(fid)
+            elif t == libsbml.AST_FUNCTION:
+                calls[fid].add(n.getName())
+    grew = True
+    while grew:
+        grew = False
+        for fid, called in calls.items():
+            if fid not in rated and not called.isdisjoint(rated):
+                rated.add(fid)
+                grew = True
+    return {fid: calls[fid] & rated for fid in rated}
+
+
+def _expand_rated_function_calls(sbml_model, func_defs: dict, rated: dict[str, set[str]]) -> None:
+    """Write each call to a functionDefinition whose body reads ``rateOf`` out
+    in place, with the caller's arguments put in for the parameters (issue
+    #1124, item 8). ``rated`` is :func:`_rated_functions` of ``func_defs``.
+
+    ``f(y) = 2*rateOf(y)`` called as ``f(S)`` then reads ``2*rateOf(S)``, the
+    rate of what was passed, and the checks, the initial-value fold and the
+    emitter take it as they take a call written there. Inside the body the
+    argument is the function's own parameter, which none of them follows into
+    the caller: the load refused every such call. A rate of an argument that
+    is not a single symbol is refused by the check after this (rule 10223).
+
+    Two calls are left as they are, for :func:`_check_rateof_targets` to refuse
+    by name: one whose arguments do not match the parameters one for one, where
+    a parameter would be left unbound or an argument dropped, and one to a
+    function that calls itself, directly or through another (invalid SBML, rule
+    20512), which has no end to write out.
+    """
+    if not rated:
+        return
+    recursive = set()
+    for fid in rated:
+        todo, seen = list(rated[fid]), set()
+        while todo:
+            callee = todo.pop()
+            if callee == fid:
+                recursive.add(fid)
+                break
+            if callee not in seen:
+                seen.add(callee)
+                todo.extend(rated[callee])
+
+    def is_rated_call(n) -> bool:
+        return n.getType() == libsbml.AST_FUNCTION and n.getName() in rated
+
+    def can_write_out(n) -> bool:
+        return (
+            is_rated_call(n)
+            and n.getName() not in recursive
+            and n.getNumChildren() == len(func_defs[n.getName()][0])
+        )
+
+    def written_out(call):
+        # Every argument is put in at once, so one that names another parameter
+        # is not replaced again: sw(x, S) = rateOf(x)*S called as sw(S, k) is
+        # rateOf(S)*k, where one parameter at a time gave rateOf(k)*k. Only a
+        # <ci> is a parameter, as for the inliner (_substitute_ast); the time
+        # csymbol is not, whatever its text. The body reads rateOf, so it is not
+        # a bare parameter, and the root is never replaced.
+        params, body = func_defs[call.getName()]
+        args = {p: call.getChild(j) for j, p in enumerate(params)}
+        out = body.deepCopy()
+        reads = [
+            (n, j)
+            for n in _iter_ast_subtree(out)
+            for j in range(n.getNumChildren())
+            if n.getChild(j).getType() == libsbml.AST_NAME and n.getChild(j).getName() in args
+        ]
+        for n, j in reads:
+            n.replaceChild(j, args[n.getChild(j).getName()].deepCopy(), True)
+        return out
+
+    def expanded(root):
+        # One pass, top down: a call is written out where it stands, then the
+        # pass goes on into what was put there, the arguments with it. A
+        # function left out of `recursive` cannot reach itself, so a run of
+        # write-outs at one place ends.
+        while can_write_out(root):
+            root = written_out(root)
+        stack = [root]
+        while stack:
+            parent = stack.pop()
+            for j in range(parent.getNumChildren()):
+                while can_write_out(parent.getChild(j)):
+                    parent.replaceChild(j, written_out(parent.getChild(j)), True)
+                stack.append(parent.getChild(j))
+        return root
+
+    for holder, where in _iter_math_holders(sbml_model):
+        math = holder.getMath()
+        if not any(is_rated_call(n) for n in _iter_ast_subtree(math)):
+            continue
+        out = expanded(math.deepCopy())
+        if holder.setMath(out) == libsbml.LIBSBML_OPERATION_SUCCESS:
+            continue
+        # libsbml holds no math it finds ill-formed, and the csymbol rateOf of
+        # anything but a single symbol is: f(2*S), for f(x) = rateOf(x), reads
+        # rateOf(2*S). The element would keep the call, so it is refused here,
+        # as the check refuses one written there (rule 10223).
+        offenders = {
+            (libsbml.formulaToL3String(n), where): (
+                "its argument is not a single symbol (validation rule 10223)"
+            )
+            for n in _iter_ast_subtree(out)
+            if n.getType() == libsbml.AST_FUNCTION_RATE_OF
+            and (n.getNumChildren() != 1 or n.getChild(0).getType() != libsbml.AST_NAME)
+        }
+        _refuse_rateof_reads(
+            offenders
+            or {(libsbml.formulaToL3String(out), where): "libsbml refuses it written out"}
+        )
+
+
+def _check_rateof_targets(sbml_model, func_defs: dict, rated_funcs: dict[str, set[str]]) -> None:
     """Refuse, by name, a ``rateOf`` that the model has no value for.
 
     One check before either the initial-value fold or the emitter runs, for the
@@ -424,13 +539,19 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
     * ``rateOf`` of anything but a single symbol (rule 10223 for the
       csymbol). Unchecked, the fold refused the csymbol's but took the idiom's
       for NaN, and a rule read either as 0 with a warning.
+    * ``rateOf(q)`` of a ``q`` the model declares nowhere. An initialAssignment
+      or rule is refused before this (``_check_undefined_symbols``); in a
+      kinetic law or an event, ExprTk refused the ``rate_of__q`` accessor,
+      which names nothing in the model.
     * a call to a functionDefinition whose body reads ``rateOf``, directly or
-      through another it calls. The argument there is the function's own
-      parameter: both paths took the rate of that name, 0 unless a model
-      symbol shares it, rather than of what the caller passed. libsbml rejects
-      the csymbol in a function body (rule 20304); a call to the idiom there is
-      valid SBML, but bngsim does not follow the caller's argument into it. A
-      function nothing calls is left alone.
+      through another it calls (``rated_funcs``, :func:`_rated_functions`),
+      that is still there. :func:`_expand_rated_function_calls` writes every
+      such call out first (issue #1124, item 8), and leaves one only where its
+      arguments do not match the parameters one for one, or where the function
+      calls itself (rule 20512). Inside the body the argument is the function's
+      own parameter: both paths took the rate of that name, 0 unless a model
+      symbol shares it, rather than of what the caller passed. A function
+      nothing calls is left alone.
 
     A kinetic law's own local parameter shadows a global of its id, so
     ``rateOf(q)`` in that law reads the constant local (0, suites 01459/01460)
@@ -446,23 +567,12 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
             rate_ruled.add(rule.getVariable())
     idiom_names = {name for name, (_p, body) in func_defs.items() if body is _RATEOF_FUNCDEF}
 
-    def _reads_rateof(n, called) -> bool:
+    def _reads_rateof(n) -> bool:
         t = n.getType()
         return t == libsbml.AST_FUNCTION_RATE_OF or (
-            t == libsbml.AST_FUNCTION and (n.getName() in idiom_names or n.getName() in called)
+            t == libsbml.AST_FUNCTION and n.getName() in idiom_names
         )
 
-    # functionDefinitions whose body reads rateOf, directly or through a call.
-    rated_funcs: set[str] = set()
-    grew = True
-    while grew:
-        grew = False
-        for fid, (_p, body) in func_defs.items():
-            if fid in rated_funcs or body is _RATEOF_FUNCDEF:
-                continue
-            if any(_reads_rateof(n, rated_funcs) for n in _iter_ast_subtree(body)):
-                rated_funcs.add(fid)
-                grew = True
     # A species held as a concentration, by its compartment (rule 10225), but
     # not one whose rate a rate rule of its own states.
     conc_compartment = {
@@ -485,18 +595,24 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
 
     # (what is read, location) → why the model has no value for it, in model order
     offenders: dict[tuple[str, str], str] = {}
+    declared: dict[str, bool] = {}  # an argument's name → whether the model has it
     for math, where in _iter_model_math(sbml_model):
         shadowed = law_locals.get(where, ())
         for n in _iter_ast_subtree(math):
             t = n.getType()
             if t == libsbml.AST_FUNCTION and n.getName() in rated_funcs:
+                fid = n.getName()
+                nparams = len(func_defs[fid][0])
+                if n.getNumChildren() != nparams:
+                    why = f"it takes {nparams} argument(s), not {n.getNumChildren()}"
+                else:
+                    why = "it calls itself, directly or through another (validation rule 20512)"
                 offenders[(libsbml.formulaToL3String(n), where)] = (
-                    f"the functionDefinition {n.getName()} reads rateOf of a parameter "
-                    "of its own (or calls one that does), and bngsim does not take the "
-                    "rate of what is passed for it"
+                    f"the functionDefinition {fid} reads rateOf, and bngsim cannot "
+                    f"write this call to it out with what is passed: {why}"
                 )
                 continue
-            if not _reads_rateof(n, ()):
+            if not _reads_rateof(n):
                 continue
             arg = n.getChild(0) if n.getNumChildren() >= 1 else None
             if arg is None or arg.getType() != libsbml.AST_NAME:
@@ -507,7 +623,11 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
             name = arg.getName()
             if name in shadowed:
                 continue
-            if name in ar_rules:
+            if name not in declared:
+                declared[name] = _model_declares_symbol(sbml_model, name)
+            if not declared[name]:
+                offenders[(f"rateOf({name})", where)] = f"{name} is declared nowhere in the model"
+            elif name in ar_rules:
                 offenders[(f"rateOf({name})", where)] = (
                     f"{name} is set by the assignmentRule {_rule_text(name)} "
                     "(validation rule 10224)"
@@ -518,9 +638,12 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
                     f"{name} is a concentration in compartment {cid}, which the "
                     f"assignmentRule {_rule_text(cid)} sizes (validation rule 10225)"
                 )
-    if not offenders:
-        return
+    if offenders:
+        _refuse_rateof_reads(offenders)
 
+
+def _refuse_rateof_reads(offenders: dict[tuple[str, str], str]) -> None:
+    """Raise the load's refusal of each ``(what is read, location) → why``."""
     from bngsim._exceptions import ModelError
 
     bullets = "\n".join(
@@ -535,8 +658,8 @@ def _check_rateof_targets(sbml_model, func_defs: dict) -> None:
         "reports each, and RoadRunner refuses them. Earlier bngsim releases loaded "
         "most of these with a wrong rate, or failed with an ExprTk error that "
         "named none of it. Make such a variable a rateRule target, or write its "
-        "rate from the rule's own inputs; call rateOf directly rather than "
-        "inside a functionDefinition."
+        "rate from the rule's own inputs; pass rateOf a single symbol, and a "
+        "functionDefinition that reads it one argument per parameter."
     )
 
 
@@ -860,47 +983,64 @@ def _model_declares_symbol(sbml_model, name: str) -> bool:
 
 def _iter_model_math(sbml_model):
     """Yield ``(math_node, location)`` for every MathML container that feeds the
-    integrated system: rules, kinetic laws, initial assignments, and every
-    event trigger / delay / priority / assignment. ``location`` is a short
-    human-readable tag used in diagnostics."""
+    integrated system: rules, kinetic laws, Level 2 stoichiometryMath, initial
+    assignments, and every event trigger / delay / priority / assignment.
+    ``location`` is a short human-readable tag used in diagnostics."""
+    for holder, where in _iter_math_holders(sbml_model):
+        yield holder.getMath(), where
+
+
+def _iter_math_holders(sbml_model):
+    """Yield ``(element, location)`` for each element whose math
+    :func:`_iter_model_math` yields, for a caller that sets it."""
     for i in range(sbml_model.getNumRules()):
         rule = sbml_model.getRule(i)
-        m = rule.getMath()
-        if m is None:
+        if rule.getMath() is None:
             continue
         if rule.isRate():
-            yield m, f"rateRule:{rule.getVariable()}"
+            yield rule, f"rateRule:{rule.getVariable()}"
         elif rule.isAssignment():
-            yield m, f"assignmentRule:{rule.getVariable()}"
+            yield rule, f"assignmentRule:{rule.getVariable()}"
         elif rule.isAlgebraic():
-            yield m, "algebraicRule"
+            yield rule, "algebraicRule"
         else:
-            yield m, "rule"
+            yield rule, "rule"
     for i in range(sbml_model.getNumReactions()):
         rxn = sbml_model.getReaction(i)
         kl = rxn.getKineticLaw()
         if kl is not None and kl.isSetMath():
-            yield kl.getMath(), f"reaction:{rxn.getId()}"
+            yield kl, f"reaction:{rxn.getId()}"
+        # Level 2's <stoichiometryMath>, which libSBML keeps on the
+        # speciesReference (modifiers carry no stoichiometry).
+        for getter, n_refs in (
+            (rxn.getReactant, rxn.getNumReactants()),
+            (rxn.getProduct, rxn.getNumProducts()),
+        ):
+            for j in range(n_refs):
+                sr = getter(j)
+                sm = sr.getStoichiometryMath() if sr.isSetStoichiometryMath() else None
+                if sm is not None and sm.isSetMath():
+                    yield sm, f"reaction:{rxn.getId()}:stoichiometryMath:{sr.getSpecies()}"
     for i in range(sbml_model.getNumInitialAssignments()):
         ia = sbml_model.getInitialAssignment(i)
         if ia.isSetMath():
-            yield ia.getMath(), f"initialAssignment:{ia.getSymbol()}"
+            yield ia, f"initialAssignment:{ia.getSymbol()}"
     for i in range(sbml_model.getNumEvents()):
         ev = sbml_model.getEvent(i)
         eid = ev.getId() or f"event{i}"
         trig = ev.getTrigger()
         if trig is not None and trig.isSetMath():
-            yield trig.getMath(), f"event:{eid}:trigger"
+            yield trig, f"event:{eid}:trigger"
         delay = ev.getDelay()
         if delay is not None and delay.isSetMath():
-            yield delay.getMath(), f"event:{eid}:delay"
+            yield delay, f"event:{eid}:delay"
         prio = ev.getPriority()
         if prio is not None and prio.isSetMath():
-            yield prio.getMath(), f"event:{eid}:priority"
+            yield prio, f"event:{eid}:priority"
         for j in range(ev.getNumEventAssignments()):
             ea = ev.getEventAssignment(j)
             if ea.isSetMath():
-                yield ea.getMath(), f"event:{eid}:assignment:{ea.getVariable()}"
+                yield ea, f"event:{eid}:assignment:{ea.getVariable()}"
 
 
 def _check_bare_time_symbol(sbml_model) -> None:
@@ -1991,16 +2131,15 @@ def _eval_ast_numeric(
             # COPASI rateOf idiom (GH #106): the instantaneous dx/dt. When a
             # resolver is supplied (the section-0 IA/AR fold), resolve the call's
             # bare-symbol argument to its initial derivative; otherwise the value
-            # is unknown at fold time, so return NaN as it did pre-#106 (matches
-            # the funcDef's NaN body — no numerically-folded context relied on it).
+            # is unknown at fold time, so None, as for the csymbol above. (It was
+            # the funcDef's NaN body, which an event delay folded to "delay nan"
+            # and a priority emitted as an undefined `nan`, issue #1124.)
             if body is _RATEOF_FUNCDEF:
                 if rateof_resolver is not None and nc >= 1:
                     arg = node.getChild(0)
                     if arg.getType() == libsbml.AST_NAME and arg.getName():
-                        r = rateof_resolver(arg.getName(), ctx)
-                        if r is not None:
-                            return r
-                return float("nan")
+                        return rateof_resolver(arg.getName(), ctx)
+                return None
             args = [_c(i) for i in range(nc)]
             if any(a is None for a in args):
                 return None
@@ -2188,9 +2327,10 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         if sp is None:
             # A parameter / compartment with no rate rule is constant ⇒ 0. One
             # an assignmentRule sets is not; the load refuses a rateOf of it
-            # first (_check_rateof_targets, issue #1046), and a call to a
-            # functionDefinition whose body reads rateOf, which would reach
-            # here with the body's own argument name.
+            # first (_check_rateof_targets, issue #1046). A call to a
+            # functionDefinition whose body reads rateOf reaches here with the
+            # caller's argument, written out at load (issue #1124, item 8), or
+            # is refused there.
             return 0.0
         # 2) species — reactions do not change a boundary or constant species, so
         # its amount holds. Held as a concentration in a compartment a rate rule
@@ -2233,7 +2373,12 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
             if sp.isSetConversionFactor()
             else (sbml_model.getConversionFactor() if sbml_model.isSetConversionFactor() else "")
         )
-        if cf_id:
+        # (Not where the reactions do nothing to it: 0 is 0 at any factor, and
+        # a factor that reads this rate, `cf := 1 + rateOf(S3)` with S3 in no
+        # reaction, had no value for it, issue #1124 item 9. `!= 0.0` on
+        # purpose: a NaN sum, an unevaluable law, is not 0 and still reads the
+        # factor and fails as before; do not tighten this to `> 0`.)
+        if cf_id and amt_rate != 0.0:
             # A factor with no value yet fails the fold: the initialAssignment
             # or rule that gives it one refolds this on a later pass, and C2c
             # refuses one the model never gives.
@@ -2276,6 +2421,12 @@ def _make_rateof_initial_resolver(sbml_model, func_defs):
         return known[name]
 
     return resolver
+
+
+# Past this many nodes, the texts of a size's jump (its condition both ways and
+# the size on either side) read what more than one path reaches through
+# functions of their own (issue #1124, item 6). About 20,000 characters.
+_JUMP_TEXT_NODES = 5_000
 
 
 # ── Periodic floor()/modulo dosing-discontinuity resolution (GH #88) ──────
@@ -2325,6 +2476,19 @@ def _replace_exprtk_symbols(expr: str, replacements: dict[str, str]) -> str:
     return pat.sub(lambda m: f"({replacements[m.group(1)]})", expr)
 
 
+# Past this many characters, a new size written out through its rules reads a
+# rule more than one path reaches by a function of its own (issue #1124, item 4).
+_RESIZE_INLINE_LIMIT = 20_000
+
+# How many levels of rules ``inlined`` writes out; past them it reads a rule by
+# name, which a cycle of rules needs.
+_RESIZE_INLINE_DEPTH = 65
+
+# A name in ExprTk text, as ``_replace_exprtk_symbols`` reads one: not the
+# exponent of a number such as 1e-06.
+_EXPRTK_NAME = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+
+
 def _rule_compartments_an_event_resizes(
     rule_math: dict,
     ar_comp_targets,
@@ -2333,6 +2497,7 @@ def _rule_compartments_an_event_resizes(
     rescaled_species: dict[str, list[str]],
     to_exprtk,
     cache: dict | None = None,
+    define_helper=None,
 ) -> list[tuple[str, str]]:
     """``(compartment, new size)`` for each assignment-rule compartment an event
     resizes that ``resized_comps`` does not already hold, each after the ones
@@ -2369,6 +2534,20 @@ def _rule_compartments_an_event_resizes(
     caller from one event to the next, holds what is read from the rules
     alone, so that each rule is walked once per model rather than once per
     event.
+
+    Written out, a rule that more than one path reaches is written once per
+    path, and a diamond of rules (``r_i := r_{i-1} + r_{i-2}``) made the text
+    exponential in its depth: 278 KB at 22 rules, 1.9 MB at 26 (issue #1124,
+    item 4). Where the text would pass ``_RESIZE_INLINE_LIMIT``, and the caller
+    gives ``define_helper(key, text) -> name``, each such rule's value after
+    the event is a function of its own instead, which the rules reaching it
+    read by name: the text is then as long as the rules are. A function reads
+    the state the event fires from, as the text does. The length counts the
+    event's values put in, not only the rules: under 16 rules, an assigned
+    value of 60 terms made the new size 720 KB. Below the limit the text is
+    written out as before, except where the rules go deeper than ``inlined``
+    writes them out: a chain of 70 rules read its deepest by name, at the
+    value before the event.
     """
     cache = {} if cache is None else cache
     reads_memo: dict[str, frozenset] = cache.setdefault("reads", {})
@@ -2436,7 +2615,7 @@ def _rule_compartments_an_event_resizes(
     def inlined(expr: str, depth: int = 0) -> str:
         """The text with each rule it reads that reaches a change written out,
         so that the event's values can be put in."""
-        if depth > 64:
+        if depth >= _RESIZE_INLINE_DEPTH:
             return expr
         inner = {}
         for name in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr)):
@@ -2449,9 +2628,99 @@ def _rule_compartments_an_event_resizes(
             return expr
         return inlined(_replace_exprtk_symbols(expr, inner), depth + 1)
 
+    rule_names: dict[str, list[str]] = cache.setdefault("names", {})
+
+    def names_in(var: str) -> list[str]:
+        """The names ``var``'s rule reads, once for each reading."""
+        if var not in rule_names:
+            if var not in rule_text:
+                rule_text[var] = to_exprtk(rule_math[var])
+            rule_names[var] = _EXPRTK_NAME.findall(rule_text[var])
+        return rule_names[var]
+
+    def reached_in(var: str) -> dict[str, int]:
+        """The rules ``var``'s rule reads that reach a change, and how many
+        times it reads each."""
+        counts: dict[str, int] = {}
+        for name in names_in(var):
+            inner = rule_of.get(name)
+            if inner is not None and inner not in changed and reads(inner) & changed:
+                counts[inner] = counts.get(inner, 0) + 1
+        return counts
+
+    def through_helpers(comp: str) -> str | None:
+        """The new size of ``comp`` written out rule by rule, each rule more
+        than one path reaches read through a function of its own where the
+        text would pass the limit. None where ``inlined`` writes it in full
+        and short enough, or the rules read each other in a cycle."""
+        children: dict[str, dict[str, int]] = {}
+        written: dict[str, int] = {}  # length written out; -1 while under way
+        depth: dict[str, int] = {}  # levels of rules written out below it
+
+        def length(var: str) -> int | None:
+            if var in written:
+                return None if written[var] < 0 else written[var]
+            written[var] = -1
+            children[var] = reached_in(var)
+            # Each name read becomes its text in parentheses.
+            n = len(rule_text[var]) + sum(
+                len(replacements[name]) + 2 - len(name)
+                for name in names_in(var)
+                if name in replacements
+            )
+            d = 0
+            for inner, k in children[var].items():
+                m = length(inner)
+                if m is None:
+                    return None
+                n += k * (m + 2 - len(_safe_name(inner)))
+                d = max(d, depth[inner] + 1)
+            written[var] = n
+            depth[var] = d
+            return n
+
+        total = length(comp)
+        if total is None:
+            return None
+        share = define_helper is not None and total > _RESIZE_INLINE_LIMIT
+        if not share and depth[comp] <= _RESIZE_INLINE_DEPTH:
+            return None
+        paths: dict[str, int] = {}
+        for reads_of in children.values():
+            for inner, k in reads_of.items():
+                paths[inner] = paths.get(inner, 0) + k
+        after: dict[str, str] = {}
+
+        def value_after(var: str) -> str:
+            # The rule's text with what it reads after the event put in.
+            if var not in after:
+                subs = {name: replacements[name] for name in names_in(var) if name in replacements}
+                for inner in children[var]:
+                    subs[_safe_name(inner)] = (
+                        helper_of(inner) if share and paths[inner] > 1 else value_after(inner)
+                    )
+                after[var] = _replace_exprtk_symbols(rule_text[var], subs)
+            return after[var]
+
+        helpers: dict[str, str] = {}
+
+        def helper_of(var: str) -> str:
+            if var not in helpers:
+                helpers[var] = define_helper(
+                    f"{_safe_name(comp)}_{_safe_name(var)}", value_after(var)
+                )
+            return helpers[var]
+
+        return value_after(comp)
+
     found: list[tuple[str, str]] = []
     for comp in ordered:
-        new_size = _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        through = through_helpers(comp)
+        new_size = (
+            through
+            if through is not None
+            else _replace_exprtk_symbols(inlined(to_exprtk(rule_math[comp])), replacements)
+        )
         found.append((comp, new_size))
         replacements[_safe_name(comp)] = new_size
         note_rescaled(comp, new_size)
@@ -3280,15 +3549,20 @@ _MASS_ACTION_MAX_POWER = 1000
 
 def _math_names(node) -> tuple[set[str], bool]:
     """The names a math AST reads, and whether it reads the clock (the time
-    csymbol, ``delay``, ``rateOf``). Iterative: a rule over a thousand terms is
-    a thousand-deep tree."""
+    csymbol, ``delay``). Iterative: a rule over a thousand terms is a
+    thousand-deep tree.
+
+    ``rateOf(x)`` reads ``x``: its rate moves where ``x`` does, and is 0 where
+    nothing changes ``x``. Counted as the clock, `cf := 1 + rateOf(S3)` with S3
+    in no reaction was refused as a conversion factor that moves, where
+    libRoadRunner runs it with cf = 1 (issue #1124, item 9)."""
     names: set[str] = set()
     clock = False
     stack = [node] if node is not None else []
     while stack:
         n = stack.pop()
         t = n.getType()
-        if t in (libsbml.AST_NAME_TIME, libsbml.AST_FUNCTION_DELAY, libsbml.AST_FUNCTION_RATE_OF):
+        if t in (libsbml.AST_NAME_TIME, libsbml.AST_FUNCTION_DELAY):
             clock = True
         elif t == libsbml.AST_NAME:
             names.add(n.getName())
@@ -3366,11 +3640,31 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     # matter here, and the reactions are scanned only for those.
     read = set().union(*reads.values(), *law_reads.values())
     candidates = {sp.getId() for sp in species if not sp.getConstant()} & read
+    # A species a reaction changes: listed with a net stoichiometry that is not
+    # 0. A catalyst written as reactant and product, `S3 -> S3`, is left as it
+    # was, and its rate is 0 (the load-time fold skips such a reaction too);
+    # `cf := 1 + rateOf(S3)` beside one was refused as moving, where
+    # libRoadRunner runs it with cf = 1 (#1138's review). A stoichiometry that
+    # is not a plain finite number (set by math, by a rule, or not constant) is
+    # taken as moving the species, as before.
     changed_by_reaction: set[str] = set()
     for j in range(sbml_model.getNumReactions() if candidates - sources else 0):
         rxn = sbml_model.getReaction(j)
-        for lst in (rxn.getListOfReactants(), rxn.getListOfProducts()):
-            changed_by_reaction |= {lst.get(k).getSpecies() for k in range(lst.size())}
+        net: dict[str, float] = {}
+        for lst, sign in ((rxn.getListOfReactants(), -1.0), (rxn.getListOfProducts(), 1.0)):
+            for k in range(lst.size()):
+                sr = lst.get(k)
+                sid = sr.getSpecies()
+                stoich = sr.getStoichiometry()
+                if (
+                    sr.isSetStoichiometryMath()
+                    or not sr.getConstant()
+                    or not _math.isfinite(stoich)
+                ):
+                    changed_by_reaction.add(sid)
+                    continue
+                net[sid] = net.get(sid, 0.0) + sign * stoich
+        changed_by_reaction |= {sid for sid, v in net.items() if v != 0.0}
     sources |= {
         sp.getId()
         for sp in species
@@ -4885,6 +5179,13 @@ def _build_model_from_sbml_doc_in_context(doc):
         else:
             func_defs[fid] = (param_names, body)
 
+    # A call to a functionDefinition that reads rateOf is written out in place,
+    # with the caller's arguments, so its rate is of what was passed (issue
+    # #1124, item 8). First, so every check below sees what will run: a name the
+    # body reads is then checked where it is put.
+    rated_funcs = _rated_functions(func_defs)
+    _expand_rated_function_calls(sbml_model, func_defs, rated_funcs)
+
     # ── 0a. Refuse unsupported ODE constructs (GH #113) ────────────────
     # Fail fast — before any further processing — on delay() / AlgebraicRule,
     # which bngsim would otherwise drop silently and integrate as a different
@@ -4908,9 +5209,10 @@ def _build_model_from_sbml_doc_in_context(doc):
     # ── 0d. Refuse a rateOf the model has no value for ─────────────────
     # rateOf of an assignmentRule variable (issue #1046, rule 10224), of a
     # concentration in a rule-sized compartment (10225), of anything but a
-    # symbol (10223), and through a functionDefinition. Checked once, before
-    # the fold below or the emitter would give any of them a wrong rate.
-    _check_rateof_targets(sbml_model, func_defs)
+    # symbol (10223), and through a call to a functionDefinition that could
+    # not be written out above. Checked once, before the fold below or the
+    # emitter would give any of them a wrong rate.
+    _check_rateof_targets(sbml_model, func_defs, rated_funcs)
     # What no rule sets has rate 0 wherever it is read (see _rateof_call).
     _RATEOF_CONSTANT_SYMBOLS.set(_rateof_constant_symbols(sbml_model))
 
@@ -7320,14 +7622,31 @@ def _build_model_from_sbml_doc_in_context(doc):
     # and bngsim's own `.net` → SBML export writes `_rateLaw_<rid>` out as a real
     # parameter — so re-importing that file collided on the first reaction and
     # `ModelBuilder::validate` rejected the model outright. Uniquifying covers the
-    # pre-existing hazard as well.
-    _taken_param_names: set[str] = {
-        _safe_name(sbml_model.getParameter(j).getId())
-        for j in range(sbml_model.getNumParameters())
-    } | {
-        _safe_name(sbml_model.getCompartment(j).getId())
-        for j in range(sbml_model.getNumCompartments())
-    }
+    # pre-existing hazard as well. A species' id is a symbol of its own too, and
+    # a reaction's id the function its rate law is read by: a function the
+    # loader names after either overwrote it or failed to register (#1124).
+    _taken_param_names: set[str] = (
+        {
+            _safe_name(sbml_model.getParameter(j).getId())
+            for j in range(sbml_model.getNumParameters())
+        }
+        | {
+            _safe_name(sbml_model.getCompartment(j).getId())
+            for j in range(sbml_model.getNumCompartments())
+        }
+        | {_safe_name(sp.getId()) for sp in sbml_model.getListOfSpecies()}
+        | {
+            _safe_name(element.getId())
+            for rxn in sbml_model.getListOfReactions()
+            for element in (
+                rxn,
+                *rxn.getListOfReactants(),
+                *rxn.getListOfProducts(),
+                *rxn.getListOfModifiers(),
+            )
+            if element.getId()
+        }
+    )
 
     def _unique_param_name(base: str) -> str:
         name = base
@@ -8014,6 +8333,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         import re as _re
 
         import sympy as _sp
+        from sympy.functions.elementary.piecewise import ExprCondPair as _ExprCondPair
 
         from bngsim._codegen import _PY_KEYWORD_PARAM_NAMES, _alias_keyword_param
         from bngsim._jacobian import _TIME_SYM, _exprtk_to_sympy, sympy_to_exprtk
@@ -8436,7 +8756,66 @@ def _build_model_from_sbml_doc_in_context(doc):
                     if inner is None:
                         return None
                     subs[s] = inner
-            return g.xreplace(subs)
+            return _xreplace_once(g, subs)
+
+        def _lattice(func, args):
+            # And(*args) or Or(*args), put together as they are: the
+            # constructor sorts its arguments by their size as trees
+            # (`ordered`). An argument that decides it decides it, and one
+            # that cannot is dropped, as there.
+            kept: dict = {}
+            for a in args:
+                if a is func.zero:
+                    return a
+                if a is not func.identity:
+                    kept.update(dict.fromkeys(a.args if a.func is func else (a,)))
+            if len(kept) < 2:
+                return next(iter(kept), func.identity)
+            obj = _sp.Basic.__new__(func, *kept)
+            obj._argset = frozenset(kept)
+            return obj
+
+        def _rebuilt(e, args):
+            # e.func(*args), with a Piecewise and its pieces put together
+            # without the constructors' walk of each condition (`replace`,
+            # `has`): a condition over a diamond of rules (`r21 > 0.5`) is
+            # exponentially longer as a tree than in memory (issue #1124, item
+            # 6). As the constructor has them, a piece whose condition is false
+            # is dropped, one whose condition is true ends it, and pieces in a
+            # row that read alike are one, on either condition: `piecewise(r0,
+            # S > 3, r1)` with r0 and r1 both S is S, and its S > 3 no root.
+            # Except a condition that reads a piecewise: the pair's own
+            # constructor folds it into relations of their own (`r > 5` under
+            # `r := piecewise(S, S > 3, 2*S)` into S > 5 and 2*S > 5), each
+            # continuous. Left as it was, `r > 5` jumped at S = 3 itself, and
+            # its root fired there beside S > 3's: two rescales at one instant,
+            # the one drawn last kept.
+            if isinstance(e, (_sp.And, _sp.Or)):
+                return _lattice(e.func, args)
+            if isinstance(e, _ExprCondPair):
+                if any(isinstance(x, _sp.Piecewise) for x in _subexpressions(args[1])):
+                    return e.func(*args)
+                return _sp.Basic.__new__(_ExprCondPair, *args)
+            if isinstance(e, _sp.Piecewise):
+                pieces = []
+                for p in args:
+                    if p.cond is _sp.false:
+                        continue
+                    last = pieces[-1].expr if pieces else None
+                    if last is not None and (
+                        last is p.expr or (hash(last) == hash(p.expr) and last == p.expr)
+                    ):
+                        p = _rebuilt(p, (last, _lattice(_sp.Or, (pieces[-1].cond, p.cond))))
+                        pieces[-1] = p
+                    else:
+                        pieces.append(p)
+                    if p.cond is _sp.true:
+                        break
+                if pieces and pieces[0].cond is _sp.true:
+                    return pieces[0].expr
+                if pieces:
+                    return _sp.Basic.__new__(_sp.Piecewise, *pieces)
+            return e.func(*args)
 
         def _xreplace_once(expr, rule: dict):
             # expr.xreplace(rule), each distinct node rebuilt once: sympy's own
@@ -8451,7 +8830,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                     else:
                         args = tuple(go(a) for a in e.args)
                         changed = any(a is not b for a, b in zip(args, e.args, strict=True))
-                        done[id(e)] = e.func(*args) if changed else e
+                        done[id(e)] = _rebuilt(e, args) if changed else e
                 return done[id(e)]
 
             return go(expr)
@@ -8472,6 +8851,102 @@ def _build_model_from_sbml_doc_in_context(doc):
                 )
             }
 
+        def _names_in(expr) -> set[str]:
+            # free_symbols, each distinct node visited once: sympy's walks the
+            # tree, which a size read through shared rules makes exponential.
+            return {str(e) for e in _subexpressions(expr) if e.is_Symbol}
+
+        def _through_functions(exprs: list, prefix: str) -> tuple[list, list[tuple[str, object]]]:
+            # ``exprs`` with each large node that more than one path reaches read
+            # through a function of its own, and those functions, each after the
+            # ones it reads, as (name, body) (issue #1124, item 6). A jump's
+            # condition and sizes are written from the size through its rules,
+            # and a diamond of rules under a condition, or a condition under a
+            # diamond, was written out once per path: exponential in the depth.
+            # Only where the texts would be long; only numbers, for a function
+            # returns one, so a condition stays where it is read.
+            size: dict[int, int] = {}
+            refs: dict[int, int] = {}
+            order: list = []
+            seen: set[int] = set()
+            for root in exprs:
+                refs[id(root)] = refs.get(id(root), 0) + 1
+                stack = [(root, False)]
+                while stack:
+                    e, expanded = stack.pop()
+                    if expanded:
+                        size[id(e)] = 1 + sum(size[id(a)] for a in e.args)
+                        order.append(e)
+                        continue
+                    if id(e) in seen:
+                        continue
+                    seen.add(id(e))
+                    for a in e.args:
+                        refs[id(a)] = refs.get(id(a), 0) + 1
+                    stack.append((e, True))
+                    stack.extend((a, False) for a in e.args if id(a) not in seen)
+            if sum(size[id(e)] for e in exprs) <= _JUMP_TEXT_NODES:
+                return list(exprs), []
+            helpers: list[tuple[str, object]] = []
+            built: dict[int, object] = {}
+            for e in order:  # each node after its arguments
+                args = tuple(built[id(a)] for a in e.args)
+                changed = any(a is not b for a, b in zip(args, e.args, strict=True))
+                new = _rebuilt(e, args) if changed else e
+                if (
+                    refs.get(id(e), 0) > 1
+                    and size[id(e)] >= 16
+                    and isinstance(e, _sp.Expr)  # a number; a relation or an And is not one
+                ):
+                    name = f"{prefix}{len(helpers)}"
+                    helpers.append((name, new))
+                    new = _sp.Symbol(name)
+                built[id(e)] = new
+            return [built[id(e)] for e in exprs], helpers
+
+        def _ratio_of(d, d0):
+            # d / d0 where that is a nonzero number, else None. `cancel` walks
+            # the tree, which a relation over a diamond of rules makes
+            # exponential (issue #1124, item 6): `r17 > 0.5` beside `r17 <
+            # -0.5`, or beside `S > 3`, took a second to load at 18 rules, x2.6
+            # for every two more. So two long differences are first compared
+            # term by term, as relations that share a root are written (`r21 >
+            # 1.4` beside `2*r21 < 2.8`), then read at two points, to 30
+            # digits, and only a pair whose ratio is the same at both is
+            # cancelled; a read that is not a number, or raises, or a d0 near 0
+            # there, leaves the pair to `cancel` too.
+            if _tree_size(d) + _tree_size(d0) > _JUMP_TEXT_NODES:
+                terms: list[dict] = [{}, {}]
+                for x, out in zip((d, d0), terms, strict=True):
+                    for t in _sp.Add.make_args(x):
+                        k, m = t.as_coeff_Mul()
+                        out[m] = out.get(m, 0) + k
+                if terms[0].keys() == terms[1].keys() and all(terms[1].values()):
+                    qs = [terms[0][m] / terms[1][m] for m in terms[1]]
+                    if qs[0] != 0 and all(abs(q - qs[0]) <= 1e-12 * abs(qs[0]) for q in qs):
+                        return qs[0]
+                names = sorted(
+                    {e for x in (d, d0) for e in _subexpressions(x) if e.is_Symbol}, key=str
+                )
+                seen = []
+                for step in (0.6180339887, 0.4142135624):
+                    at = {
+                        s: _sp.Float(0.25 + ((k + 1) * step) % 1, 30) for k, s in enumerate(names)
+                    }
+                    try:
+                        a, b = _xreplace_once(d, at), _xreplace_once(d0, at)
+                    except Exception:  # Max of a complex number raises
+                        break
+                    if not all(v.is_Float or v.is_Rational for v in (a, b)) or abs(b) < 1e-8:
+                        break
+                    seen.append(a / b)
+                if len(seen) == 2 and abs(seen[0] - seen[1]) > 1e-12 * max(1, abs(seen[0])):
+                    return None
+            ratio = _sp.cancel(d / d0)
+            return ratio if ratio.is_number and ratio != 0 else None
+
+        # compartment -> the concentrations its size's jump conditions read
+        _cond_reads: dict[str, set[str]] = {}
         for comp, vdot in _comp_vdot.items():
             if vdot is None:
                 continue
@@ -8491,9 +8966,14 @@ def _build_model_from_sbml_doc_in_context(doc):
             )
             relations: set = set()
             for c in conds:
-                names = {str(s) for s in c.free_symbols}
+                names = _names_in(c)
                 if not names & _moving:
                     continue
+                _cond_reads.setdefault(comp, set()).update(
+                    _species_alias[n]
+                    for n in names
+                    if n in _species_alias and _diluted(_species_alias[n])
+                )
                 if names & _event_targets:
                     _refusals.append(
                         f"compartment {comp} ({_size_text(comp)}) jumps where "
@@ -8505,22 +8985,84 @@ def _build_model_from_sbml_doc_in_context(doc):
                     continue
                 relations |= {
                     r
-                    for r in c.atoms(_sp.core.relational.Relational)
-                    if {str(s) for s in r.free_symbols} & _moving
+                    for r in _subexpressions(c)
+                    if isinstance(r, _sp.core.relational.Relational) and _names_in(r) & _moving
                 }
             # (difference, [(relation, its difference over that one)])
             roots: list[tuple[object, list]] = []
             for r in sorted(relations, key=_sp.default_sort_key):
                 d = r.lhs - r.rhs
                 for d0, rels in roots:
-                    ratio = _sp.cancel(d / d0)
-                    if ratio.is_number and ratio != 0:
+                    ratio = _ratio_of(d, d0)
+                    if ratio is not None:
                         rels.append((r, ratio))
                         break
                 else:
                     roots.append((d, [(r, _sp.Integer(1))]))
             by_name = _rules_by_name() if roots else {}
-            for _, rels in roots:
+
+            # Roots that a run constant puts on one instant (#1124): `time < t1`
+            # and `time < t2` with t1 = t2, or `S > a` and `S > b` with a = b. The
+            # two jump events read the state from their trigger time, so the last
+            # one's rescale is what stays, and each read the other's condition
+            # as already flipped: [Sn] kept 2/3 of itself for 1/3. Each now
+            # rescales by the whole instant, every coinciding condition read on
+            # the side it leaves and the side it reaches, and a sibling whose
+            # root is elsewhere is read as it stands, as before. A sibling's
+            # difference is this one's times a number plus a run constant, which
+            # is 0 where they coincide (`2*time < t2` sits on `time < t1` where t2
+            # = 2·t1); read at the run, so a set_param moves it.
+            def _moving_part(d):
+                syms = [s for s in d.free_symbols if str(s) in _moving]
+                return _sp.expand(d).as_independent(*syms, as_Add=True)[1]
+
+            def _moving_terms(d):
+                # d's terms that read the run, {term over its coefficient:
+                # coefficient}, and the rest of d, a run constant
+                moving: dict = {}
+                rest = []
+                for t in _sp.Add.make_args(d):
+                    if _names_in(t) & _moving:
+                        k, m = t.as_coeff_Mul()
+                        moving[m] = moving.get(m, 0) + k
+                    else:
+                        rest.append(t)
+                return moving, _sp.Add(*rest)
+
+            def _sibling(d1, d0):
+                # (scale, rest) where d1 = scale*d0 + rest, with scale a nonzero
+                # number, else None. Past _JUMP_TEXT_NODES, `expand`, `cancel`
+                # and `free_symbols` walk the tree, which a relation over a
+                # diamond of rules makes exponential (issue #1124, item 6), so
+                # the two are compared term by term, as `_ratio_of` does.
+                if _tree_size(d0) + _tree_size(d1) > _JUMP_TEXT_NODES:
+                    (m1, c1), (m0, c0) = _moving_terms(d1), _moving_terms(d0)
+                    if not m0 or m1.keys() != m0.keys() or not all(m0.values()):
+                        return None
+                    qs = [m1[m] / m0[m] for m in m0]
+                    if qs[0] == 0 or any(abs(q - qs[0]) > 1e-12 * abs(qs[0]) for q in qs):
+                        return None
+                    return qs[0], c1 - qs[0] * c0
+                scale = _sp.cancel(_moving_part(d1) / _moving_part(d0))
+                if not scale.is_number or scale == 0:
+                    return None
+                return scale, _sp.expand(d1 - scale * d0)
+
+            def _siblings(d0, roots=roots) -> list[tuple[list, object, object]]:
+                out = []
+                for d1, rels1 in roots:
+                    if d1 is d0:
+                        continue
+                    got = _sibling(d1, d0)
+                    if (
+                        got is not None
+                        and not got[1].is_number
+                        and not _names_in(got[1]) & _moving
+                    ):
+                        out.append((rels1, *got))
+                return out
+
+            for k_root, (d0, rels) in enumerate(roots):
                 # A side is the sign of the difference there, and an inequality
                 # in the set, where it has one, says which side is true: an
                 # equality holds at the root alone, so it reads false on both.
@@ -8534,23 +9076,56 @@ def _build_model_from_sbml_doc_in_context(doc):
                 else:
                     side_true = -1 if c.func(-q, 0) else 1
                     side_false = -side_true
-                v_false, v_true = (
-                    _xreplace_once(g, {r: r.func(rq * side, 0) for r, rq in rels})
-                    for side in (side_false, side_true)
-                )
+                siblings = _siblings(d0)
+
+                def _at(side, siblings=siblings, rels=rels, g=g):
+                    subs = {r: r.func(rq * side, 0) for r, rq in rels}
+                    for rels1, scale, rest in siblings:
+                        for r, rq in rels1:
+                            # its side where rest = 0, else as it stands; as a
+                            # Piecewise this costs sympy a canonicalisation per
+                            # sibling, which a size of many roots pays N² times
+                            subs[r] = (
+                                _lattice(_sp.Or, (_sp.Eq(rest, 0), r))
+                                if r.func(rq * scale * side, 0)
+                                else _lattice(_sp.And, (_sp.Ne(rest, 0), r))
+                            )
+                    return _xreplace_once(g, subs)
+
+                v_false, v_true = (_at(side) for side in (side_false, side_true))
                 # Written out in full, a size that reads shared rules is as
                 # exponential as the rates were; it reads those of its rules
                 # that hold no condition by name where that is shorter.
                 v_false, v_true = (
                     min((v, _xreplace_once(v, by_name)), key=_tree_size) for v in (v_false, v_true)
                 )
-                texts = [sympy_to_exprtk(e) for e in (c, _sp.Not(c), v_false, v_true)]
-                if any(t is None for t in texts):
+                # And so does the condition (issue #1124, item 6): `r21 > 0.5`
+                # under a diamond of rules was printed written out in full.
+                c_read = min((c, _xreplace_once(c, by_name)), key=_tree_size)
+                written, helpers = _through_functions(
+                    [c_read, _sp.Not(c_read), v_false, v_true],
+                    f"_szj_{_safe_name(comp)}_{k_root}_",
+                )
+                helper_texts = [(name, sympy_to_exprtk(body)) for name, body in helpers]
+                texts = [sympy_to_exprtk(e) for e in written]
+                # Under a name none of the model's parameters has: a function
+                # of a parameter's name is bound to it (#266) and overwrote it.
+                renamed = {name: _unique_param_name(name) for name, _ in helpers}
+                renamed = {old: new for old, new in renamed.items() if new != old}
+                if renamed and all(t is not None for _, t in helper_texts):
+                    texts = [t and _replace_exprtk_symbols(t, renamed) for t in texts]
+                    helper_texts = [
+                        (renamed.get(name, name), _replace_exprtk_symbols(t, renamed))
+                        for name, t in helper_texts
+                    ]
+                if any(t is None for t in texts) or any(t is None for _, t in helper_texts):
                     _refusals.append(
-                        f"compartment {comp} ({_size_text(comp)}) jumps where {c} "
+                        f"compartment {comp} ({_size_text(comp)}) jumps where {c_read} "
                         "flips, and bngsim cannot write the size on either side"
                     )
                     continue
+                for name, text in helper_texts:
+                    builder.add_function(name, _unalias(text))
                 rises, falls, v_false, v_true = (_unalias(t) for t in texts)
                 _jump_species[comp] = [
                     s for s, sc in species_comp.items() if sc == comp and _diluted(s)
@@ -8570,34 +9145,41 @@ def _build_model_from_sbml_doc_in_context(doc):
         # A concentration the size reads in a compartment whose own size reads a
         # rate: each compartment's rate needs the next one's, so a ring of them
         # (a compartment reading its own concentration is one) has no first.
-        def _reads_in(a: str, b: str) -> list[str]:
-            return sorted(
-                leaf for leaf in _comp_rated[a] if _diluted(leaf) and species_comp[leaf] == b
-            )
+        def _reads_in(a: str, b: str, reads: dict[str, set[str]] | None = None) -> list[str]:
+            # The diluted concentrations in compartment b that a's rate (or, over
+            # `reads`, a's conditions) reads.
+            source = _comp_rated if reads is None else reads
+            return sorted(leaf for leaf in source[a] if _diluted(leaf) and species_comp[leaf] == b)
 
-        _needs = {
-            comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
-            for comp, rated in _comp_rated.items()
-            if rated
-        }
-        _state: dict[str, int] = {}  # 1 on the walk, 2 finished
-        _ring: list[str] = []
-        for start in sorted(_needs):
-            if _state.get(start) or _ring:
-                continue
-            path, walk = [start], [iter(_needs[start])]
-            _state[start] = 1
-            while walk and not _ring:
-                nxt = next(walk[-1], None)
-                if nxt is None:
-                    _state[path.pop()] = 2
-                    walk.pop()
-                elif _state.get(nxt) == 1:
-                    _ring = path[path.index(nxt) :] + [nxt]
-                elif not _state.get(nxt) and nxt in _needs:
-                    _state[nxt] = 1
-                    path.append(nxt)
-                    walk.append(iter(_needs[nxt]))
+        def _first_ring(needs: dict[str, list[str]]) -> list[str]:
+            # The first ring of compartments, each needing the next, as a path
+            # that ends where it starts; [] where there is none.
+            state: dict[str, int] = {}  # 1 on the walk, 2 finished
+            for start in sorted(needs):
+                if state.get(start):
+                    continue
+                path, walk = [start], [iter(needs[start])]
+                state[start] = 1
+                while walk:
+                    nxt = next(walk[-1], None)
+                    if nxt is None:
+                        state[path.pop()] = 2
+                        walk.pop()
+                    elif state.get(nxt) == 1:
+                        return path[path.index(nxt) :] + [nxt]
+                    elif not state.get(nxt) and nxt in needs:
+                        state[nxt] = 1
+                        path.append(nxt)
+                        walk.append(iter(needs[nxt]))
+            return []
+
+        _ring = _first_ring(
+            {
+                comp: sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)})
+                for comp, rated in _comp_rated.items()
+                if rated
+            }
+        )
         if len(_ring) == 2:  # a compartment reading its own concentration
             c = _ring[0]
             _refusals.append(
@@ -8615,6 +9197,35 @@ def _build_model_from_sbml_doc_in_context(doc):
                     for a, b in zip(_ring, _ring[1:], strict=False)
                 )
                 + "), so the sizes define each other, and bngsim does not solve that"
+            )
+        # The same ring through the sizes' jump conditions alone (issue #1124,
+        # item 3). Each size's condition reads the next one's concentration,
+        # which that size's own jump moves: where a jump flips them, the sizes
+        # after it may be read more than one way (all jumped, or none), each
+        # consistent with the concentrations it leaves, and nothing in the
+        # model says which. libRoadRunner refuses the model.
+        # bngsim kept the sizes from before the instant, with no word of it.
+        # (A ring with a link through a size's value as well is ordered by
+        # that link, and runs.)
+        _cond_ring = _first_ring(
+            {
+                comp: sorted({species_comp[leaf] for leaf in read} - {comp})
+                for comp, read in _cond_reads.items()
+                if {species_comp[leaf] for leaf in read} - {comp}
+            }
+        )
+
+        if _cond_ring:
+            _refusals.append(
+                "the sizes of compartments "
+                + ", ".join(f"{c} ({_size_text(c)})" for c in _cond_ring[:-1])
+                + " each jump on a condition that reads a concentration in the next ("
+                + "; ".join(
+                    f"{a} reads {', '.join(_reads_in(a, b, _cond_reads))} in {b}"
+                    for a, b in zip(_cond_ring, _cond_ring[1:], strict=False)
+                )
+                + "), so where a jump flips those conditions the sizes after it can be read "
+                "more than one way, and bngsim does not choose"
             )
         if _refusals:
             from bngsim._exceptions import ModelError
@@ -9726,6 +10337,47 @@ def _build_model_from_sbml_doc_in_context(doc):
     # by promoting them to species with initial value = param value,
     # adding an observable, and re-targeting the event assignment.
     n_events = sbml_model.getNumEvents()
+
+    # A rule's value after an event's resize, as a function of its own, where
+    # the new size written out through its rules would be too long (issue
+    # #1124, item 4). One function for each text, under a name nothing else
+    # has: the ids it is named by are joined by "_", and two can meet (event
+    # e and compartment c_x, event e_c and compartment x), where an event read
+    # the value of the other's function of that name. Each is added once an
+    # assignment the model keeps reads it, since every function is evaluated
+    # at every step.
+    _resize_helper_of: dict[str, str] = {}  # text -> name
+    _resize_helper_text: dict[str, str] = {}  # name -> text
+    _resize_helpers_added: set[str] = set()
+
+    def _resize_helper(key: str, text: str) -> str:
+        name = _resize_helper_of.get(text)
+        if name is None:
+            # A function named as a parameter is bound to it (#266), and wrote
+            # its value over the parameter's at every step.
+            name = _unique_param_name(f"_rsz_{_safe_name(key)}")
+            _resize_helper_of[text] = name
+            _resize_helper_text[name] = text
+        return name
+
+    def _add_resize_helpers_read_by(texts) -> None:
+        # Each helper the texts read, after the ones it reads.
+        def add(name: str) -> None:
+            if name in _resize_helpers_added:
+                return
+            _resize_helpers_added.add(name)
+            body = _resize_helper_text[name]
+            for inner in _EXPRTK_NAME.findall(body):
+                if inner in _resize_helper_text:
+                    add(inner)
+            builder.add_function(name, body)
+
+        if _resize_helper_text:
+            for text in texts:
+                for name in _EXPRTK_NAME.findall(text):
+                    if name in _resize_helper_text:
+                        add(name)
+
     if n_events > 0:
         # Track which parameters need promotion for event assignments
         event_param_promotions = {}  # param_id → species_idx
@@ -9964,6 +10616,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                         event_rescaled_species,
                         lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
                         event_rule_cache,
+                        lambda key, text, _eid=eid: _resize_helper(f"{_eid}_{key}", text),
                     )
                 )
 
@@ -10053,6 +10706,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             if not assignments:
                 logger.warning(f"Event '{eid}': no valid assignments, skipping")
                 continue
+            _add_resize_helpers_read_by(expr for _, expr in assignments)
 
             builder.add_event(
                 eid,
@@ -10133,6 +10787,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             _jump_moves,
             lambda node: _ast_to_exprtk_with_funcdefs(node, func_defs),
             cache,
+            lambda key, text, _k=k: _resize_helper(f"_size_jump_{_k}_{key}", text),
         )
         rescales: list[tuple[int, str]] = []
         for follower, new_size in followers:
@@ -10145,6 +10800,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                     )
                 )
                 ar_dilution_species.add(sid)
+        _add_resize_helpers_read_by(expr for _, expr in assignments)
         builder.add_event(
             f"_size_jump_{_safe_name(comp)}_{k}",
             trigger,
@@ -10340,10 +10996,18 @@ def _build_model_from_sbml_doc_in_context(doc):
                 _kinetic_law_local_values(kl),
             )
 
+    # Every spelling met (GH #274's check below asks after the text it emits),
+    # and one root per crossing: a condition reached through a function
+    # definition is spelled `(time())` where the same one written directly is
+    # `time()`, and both were registered (issue #1082). The first spelling met
+    # is the one registered, so a model with no such pair registers what it did.
     seen_disc: set[str] = set()
+    registered_disc: dict[str, str] = {}
     for cond in disc_conditions:
-        if cond not in seen_disc:
-            seen_disc.add(cond)
+        seen_disc.add(cond)
+        key = _condition_key(cond)
+        if key not in registered_disc:
+            registered_disc[key] = cond
             builder.add_discontinuity_trigger(cond)
 
     # Periodic floor()/modulo dosing schedules (GH #88) that the monotonic roots
@@ -10702,8 +11366,19 @@ def _build_model_from_sbml_doc_in_context(doc):
     # set itself, rather than re-deriving one from the rule text, is what keeps
     # the stops a subset of the roots.
     # ...and, beside the roots, the trigger equalities, which are stops alone.
-    model._time_disc_conditions = tuple(sorted(seen_disc | set(trigger_equalities)))
-    model._event_disc_conditions = frozenset((event_disc & seen_disc) | set(trigger_equalities))
+    # Both in the spelling registered (issue #1082).
+    # An equality reached through a function definition beside the same one
+    # written directly is one stop too, in the first spelling met (#1106's review).
+    registered_eq: dict[str, str] = {}
+    for eq in trigger_equalities:
+        registered_eq.setdefault(_condition_key(eq), eq)
+    model._time_disc_conditions = tuple(
+        sorted(set(registered_disc.values()) | set(registered_eq.values()))
+    )
+    model._event_disc_conditions = frozenset(
+        {registered_disc[k] for k in map(_condition_key, event_disc) if k in registered_disc}
+        | set(registered_eq.values())
+    )
 
     # AR-target species report map. An AssignmentRule target species is
     # emitted ``fixed`` (its ODE derivative is zeroed), so the integrator

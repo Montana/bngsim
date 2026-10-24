@@ -228,6 +228,35 @@ def test_the_workflow_runs_every_shard_the_variable_names():
     assert f"for shard in {' '.join(map(str, values))}; do" in text
 
 
+def test_the_coverage_job_reads_the_one_leg_that_measures_it():
+    """Issue #585: one leg records coverage, one data file per shard, and the
+    report job combines that leg's. A rename on one side would leave the job
+    reporting nothing, which it does with a warning and not a failure."""
+    if not WORKFLOW.is_file():
+        pytest.skip(".github/ is not in this checkout")
+    text = WORKFLOW.read_text(encoding="utf-8")
+    legs = re.split(r"^\s+- os: ", text.split("    steps:", 1)[0], flags=re.M)[1:]
+    measured = []
+    for leg in legs:
+        label = re.search(r"^\s+label: ([\w.-]+)", leg, re.M)
+        flag = re.search(r'^\s+coverage: "(true|false)"', leg, re.M)
+        assert label and flag, f"a leg without a label or a coverage flag:\n{leg}"
+        if flag.group(1) == "true":
+            measured.append(label.group(1))
+    assert measured == ["ubuntu-latest"], measured
+    assert f"pattern: python-coverage-{measured[0]}-?" in text
+    assert "name: python-coverage-${{ matrix.leg.label }}-${{ matrix.shard }}" in text
+    assert "--cov=bngsim --cov-report=" in text
+    # The interpreters the tests spawn are measured too: the leg names the config
+    # coverage's start-up hook reads, and that config asks for parallel data files
+    # of bngsim, which pytest-cov's end-of-session combine sweeps up.
+    assert "COVERAGE_PROCESS_START: ${{ matrix.leg.coverage == 'true' &&" in text
+    assert "format('{0}/ci/subprocess.coveragerc', github.workspace)" in text
+    body = (REPO_ROOT / "ci" / "subprocess.coveragerc").read_text(encoding="utf-8")
+    assert re.search(r"^parallel = true$", body, re.M)
+    assert re.search(r"^source = bngsim$", body, re.M)
+
+
 def _durations_script():
     spec = importlib.util.spec_from_file_location("bngsim_ci_test_durations", SCRIPT)
     assert spec and spec.loader

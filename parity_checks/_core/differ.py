@@ -82,7 +82,8 @@ MOVE_CEILING = 1e-2
 # zero. On rr_ode (atol 1e-12, BioModels in molar units) the gate without that
 # floor failed 8 current PASSes on species at 1e-11 to 1e-15, 1.0 to 3.8 atol
 # apart (BIOMD0000000186/187 the widest); the real divergence it found there
-# (BIOMD0000000285, an event bngsim never fires) is 2e13 atol apart.
+# (BIOMD0000000285, an event bngsim did not fire until issue #934) is 2e13 atol
+# apart.
 MOVE_ATOL_FACTOR = 10.0
 # Stochastic ensemble verdict.
 ENSEMBLE_K = 3.0  # per-cell sigma threshold on the difference of means (calibrated at N=10)
