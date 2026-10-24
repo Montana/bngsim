@@ -588,10 +588,19 @@ def _run_escalation(
 # that record with neither BNG2.pl nor the legacy binary installed. An entry whose
 # inputs no longer match the job (the BNGL's and any injected action block's
 # sha256, replicates, seed base, NF binding mode) or whose derived run (interval,
-# steps, molecule limit, segment mode) differs is stale (``archive_stale``). A
-# replay that asks for an ensemble the recorded run never ran is
-# ``archive_unreplayable``. Neither is compared: both are REFERENCE_FAILED.
-ARCHIVE_FORMAT = 1
+# steps, molecule limit, segment mode) differs is stale (``archive_stale``); one
+# that cannot be read at all is ``archive_unreadable``. A replay that asks for an
+# ensemble the recorded run never ran, or for a failure recorded under a shorter
+# timeout than the replay allows (given longer, the legacy run might have
+# finished), is ``archive_unreplayable``. None is compared: all are
+# REFERENCE_FAILED. Beside the identity, an entry records BioNetGen's version
+# (``reference_version``) and the harness's git revision; a replayed row reports
+# the archived version as the reference's. Recording never changes a live
+# verdict: an entry that cannot be written is reported on stderr, and the row is
+# what the live run made it.
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
 
 
 class ArchiveMiss(Exception):
@@ -599,7 +608,9 @@ class ArchiveMiss(Exception):
 
 
 def _archive_file(directory, key: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", key) + ".npz")
+    # The readable part is sanitized, so the hash keeps keys such as a/b and a_b apart.
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', key)}-{digest}.npz"
 
 
 def _sha256(text: str | None) -> str | None:
@@ -642,17 +653,39 @@ class Legacy:
     reference ensemble, keyed by what it was asked for. Recording rewrites the
     job's entry after every call, so a worker killed mid-escalation still leaves
     what it ran. Replaying raises :class:`ArchiveMiss` for anything the entry
-    does not hold."""
+    does not hold. With neither, both pass straight through, holding nothing."""
 
     def __init__(self, spec: dict, bngl_text: str, *, replay=None, record_to=None):
         self.spec, self.replay, self.record_to = spec, replay, record_to
-        self.meta = archive_identity(spec, bngl_text)
-        self.meta["calls"] = {}
+        self.identity = archive_identity(spec, bngl_text)
+        self.meta = {**self.identity, "calls": {}}
+        if record_to:
+            self.meta["reference_version"] = versions.bng_version(spec.get("bng2_pl"))
+            self.meta["harness_git_rev"] = git_rev(str(HERE))
         self.arrays: dict[str, tuple] = {}
         self.stale = ""
+        self.refusal = ""  # archive_stale / archive_unreadable, where self.stale says why
+        self.write_error = ""
         self.last_wall = 0.0
         if replay:
             self._load()
+
+    @property
+    def reference_version(self) -> str | None:
+        return self.meta.get("reference_version")
+
+    def _refuse(self, refusal: str, why: str) -> None:
+        self.refusal, self.stale = refusal, why
+
+    def _unreplayable_failure(self, what: str, recorded_timeout) -> None:
+        """A failure recorded under a shorter timeout than this run allows is no
+        record of what this run would do: given longer, it might have finished."""
+        now = self.spec.get("sub_timeout")
+        if recorded_timeout is not None and now is not None and now > recorded_timeout:
+            raise ArchiveMiss(
+                f"the recorded {what} failed under a {recorded_timeout:g}s timeout, and this "
+                f"run allows {now:g}s"
+            )
 
     def build(self, build, workdir: Path, suffix: str):
         """``(artifact, build_sec, build_err)`` as ``build()`` returns them."""
@@ -666,26 +699,31 @@ class Legacy:
             if b.get("artifact_text") is not None:
                 artifact = workdir / f"model{suffix}"
                 artifact.write_text(b["artifact_text"])
+            else:
+                self._unreplayable_failure("build", b.get("sub_timeout"))
             return artifact, b["build_sec"], b.get("build_err", "")
         artifact, build_sec, build_err = build()
-        self.meta["build"] = {
-            "build_sec": build_sec,
-            "build_err": build_err,
-            "artifact_text": None if artifact is None else Path(artifact).read_text(),
-        }
-        self._save()
+        if self.record_to:
+            self.meta["build"] = {
+                "build_sec": build_sec,
+                "build_err": build_err,
+                "artifact_text": None if artifact is None else Path(artifact).read_text(),
+                "sub_timeout": self.spec.get("sub_timeout"),
+            }
+            self._save()
         return artifact, build_sec, build_err
 
     def check_run(self, sspec: dict, multiseg: bool) -> None:
         want = run_identity(sspec, multiseg)
         if not self.replay:
-            self.meta["run"] = want
-            self._save()
+            if self.record_to:
+                self.meta["run"] = want
+                self._save()
             return
         got = self.meta.get("run") or {}
         changed = [k for k in want if got.get(k) != want[k]]
         if changed:
-            self.stale = f"the run's {', '.join(changed)} changed"
+            self._refuse("archive_stale", f"the run's {', '.join(changed)} changed")
             raise ArchiveMiss(self.stale)
 
     def call(self, key: str, fn, *args, **kwargs):
@@ -699,18 +737,34 @@ class Legacy:
                 )
             self.last_wall = c.get("wall_sec", 0.0)
             if "error" in c:
+                self._unreplayable_failure(f"{key} ensemble", c.get("sub_timeout"))
                 raise type(c["error_type"], (RuntimeError,), {})(c["error"])
             if c.get("none"):
                 return None
             t, v, n = self.arrays[key]
-            if "timing" in c:
-                return t, v, n, {**c["timing"], "replayed_from_archive": True}
+            if c.get("timing") is not None:
+                return (
+                    t,
+                    v,
+                    n,
+                    {
+                        **c["timing"],
+                        "replayed_from_archive": True,
+                        "reference_version": self.reference_version,
+                    },
+                )
             return t, v, n
+        if not self.record_to:
+            return fn(*args, **kwargs)
         t0 = time.perf_counter()
         try:
             out = fn(*args, **kwargs)
         except Exception as exc:
-            self.meta["calls"][key] = {"error": str(exc), "error_type": type(exc).__name__}
+            self.meta["calls"][key] = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "sub_timeout": self.spec.get("sub_timeout"),
+            }
             self._save()
             raise
         c = {"wall_sec": round(time.perf_counter() - t0, 6)}
@@ -725,46 +779,63 @@ class Legacy:
         return out
 
     def _save(self) -> None:
-        if not self.record_to:
-            return
-        out = _archive_file(self.record_to, self.spec["key"])
-        out.parent.mkdir(parents=True, exist_ok=True)
-        arrays = {}
-        keys = list(self.meta["calls"])
-        for key, (t, v, n) in self.arrays.items():
-            i = keys.index(key)
-            arrays[f"time_{i}"] = np.asarray(t, dtype=float)
-            arrays[f"obs_{i}"] = np.asarray(v, dtype=float)
-            arrays[f"names_{i}"] = _json_bytes(list(n))
-        tmp = out.with_name(out.name + ".tmp.npz")
-        np.savez_compressed(tmp, meta=_json_bytes(self.meta), **arrays)
-        tmp.replace(out)
+        """Rewrite the job's entry. A write that fails is the archive's problem,
+        never the legacy run's: it must not reach a caller that would read it as
+        the legacy ensemble failing, so it is reported and the run goes on (a
+        later save rewrites the whole entry, and clears it)."""
+        try:
+            out = _archive_file(self.record_to, self.spec["key"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            arrays = {}
+            keys = list(self.meta["calls"])
+            for key, (t, v, n) in self.arrays.items():
+                i = keys.index(key)
+                arrays[f"time_{i}"] = np.asarray(t, dtype=float)
+                arrays[f"obs_{i}"] = np.asarray(v, dtype=float)
+                arrays[f"names_{i}"] = _json_bytes(list(n))
+            tmp = out.with_name(out.name + ".tmp.npz")
+            np.savez_compressed(tmp, meta=_json_bytes(self.meta), **arrays)
+            tmp.replace(out)
+        except Exception as exc:
+            if not self.write_error:
+                print(
+                    f"  [archive] {self.spec['key']}: entry not written: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            self.write_error = f"{type(exc).__name__}: {exc}"
+        else:
+            self.write_error = ""
 
     def _load(self) -> None:
         path = _archive_file(self.replay, self.spec["key"])
-        want = self.meta
         if not path.is_file():
-            self.stale = "no entry for this job"
+            self._refuse("archive_stale", "no entry for this job")
             return
-        with np.load(path, allow_pickle=False) as z:
-            got = json.loads(bytes(z["meta"]).decode())
-            changed = [k for k in want if k != "calls" and got.get(k) != want[k]]
-            if changed:
-                self.stale = f"the job's {', '.join(changed)} changed"
-                return
-            self.meta = got
-            for i, key in enumerate(got["calls"]):
-                if f"obs_{i}" in z:
-                    self.arrays[key] = (
-                        np.array(z[f"time_{i}"]),
-                        np.array(z[f"obs_{i}"]),
-                        json.loads(bytes(z[f"names_{i}"]).decode()),
-                    )
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                got = json.loads(bytes(z["meta"]).decode())
+                changed = [k for k in self.identity if got.get(k) != self.identity[k]]
+                if changed:
+                    self._refuse("archive_stale", f"the job's {', '.join(changed)} changed")
+                    return
+                arrays = {}
+                for i, key in enumerate(got["calls"]):
+                    if f"obs_{i}" in z:
+                        arrays[key] = (
+                            np.array(z[f"time_{i}"]),
+                            np.array(z[f"obs_{i}"]),
+                            json.loads(bytes(z[f"names_{i}"]).decode()),
+                        )
+        except Exception as exc:  # a corrupt or foreign file: the archive's fault
+            self._refuse("archive_unreadable", f"{type(exc).__name__}: {exc}"[:300])
+            return
+        self.meta, self.arrays = got, arrays
 
 
 def _not_from_archive(res: dict, legacy: Legacy, miss: ArchiveMiss, label: str) -> dict:
     """Stamp a replay that could not use the archive. Never compared."""
-    kind = "archive_stale" if legacy.stale else "archive_unreplayable"
+    kind = legacy.refusal or "archive_unreplayable"
     for k in ("value", "escalation", "subclass"):
         res.pop(k, None)
     res["value"] = None
@@ -878,6 +949,8 @@ def _worker(spec: dict, q) -> None:
         return
 
     legacy = Legacy(spec, bngl_text, replay=replay, record_to=spec.get("write_reference_archive"))
+    if replay:
+        res["reference_version"] = legacy.reference_version
     # An injected-action fixture (rehab/action_inject) REPLACES a dud model's
     # actions, so it — not the raw BNGL — is the source of both the SSA netgen caps
     # and the simulate horizon. Non-injected SSA jobs preserve the model's own
@@ -1146,7 +1219,13 @@ def _worker(spec: dict, q) -> None:
             timing["bngsim"] = bn_timing
         if leg_timing:
             timing["legacy"] = (
-                {**leg_timing, "replayed_from_archive": True} if replay else leg_timing
+                {
+                    **leg_timing,
+                    "replayed_from_archive": True,
+                    "reference_version": legacy.reference_version,
+                }
+                if replay
+                else leg_timing
             )
         timing["warmup"] = warmup
         res["timing"] = _with_settings(timing)
@@ -1573,7 +1652,12 @@ def main() -> int:
     print(f"  bngsim vs {legacy_label} — BNGL {track.upper()} parity + timing (bng_parity)")
     print("=" * 72)
     print(f"  jobs: {len(specs)}   workers: {args.workers}   track: {track}")
-    print(f"  bngsim {ver['bngsim']}   BNG {ver.get('bng')}   {legacy_label}: {legacy_bin}")
+    bng_label = (
+        f"from archive {args.reference_archive}"
+        if args.reference_archive
+        else f"{ver.get('bng')}   {legacy_label}: {legacy_bin}"
+    )
+    print(f"  bngsim {ver['bngsim']}   BNG {bng_label}")
     print(
         f"  ensemble: n_rep={args.n_rep} seed_base={args.seed_base}   "
         f"oracle: _core.differ.ensemble_verdict (K={differ.ensemble_k_for(args.n_rep):.2f} "
@@ -1618,7 +1702,12 @@ def main() -> int:
                 exception=r.get("exception", ""),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "bng": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 reference_refusal=r.get("reference_refusal"),
                 subclass=r.get("subclass"),
@@ -1631,6 +1720,11 @@ def main() -> int:
     default_out = HERE / "runs" / f"report_{track}.json"
     out_path = Path(args.out).resolve() if args.out else default_out
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.reference_archive:
+        # The report's header names the BioNetGen the archive entries recorded
+        # (issue #805), every distinct one where they differ.
+        recorded = sorted({v for r in raw if (v := r.get("reference_version"))})
+        ver["bng"] = " / ".join(recorded) or None
     meta = {
         "suite": "bng_parity",
         "reference_engine": "bng",

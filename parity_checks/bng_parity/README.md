@@ -378,16 +378,23 @@ The replay rebuilds nothing and re-runs bngsim, plus the in-repo `.net`
 Gillespie oracle where the legacy reference failed. It walks the same
 escalation, so it reaches the same verdicts unless bngsim's own behaviour
 changed. A replay that asks for an ensemble the record does not hold, such as a
-rung the recorded run never reached, is `archive_unreplayable`.
+rung the recorded run never reached, is `archive_unreplayable`. So is a build or
+ensemble failure recorded under a shorter `--timeout` than the replay allows:
+given longer, the legacy run might have finished.
 
 An entry is used only while it still describes the job: the BNGL's and any
 injected action block's sha256, `--n-rep`, `--seed-base` and (NF) `--nf-bscb`
 must match, and so must the run derived from the artifact (interval, steps,
 molecule limit, segment mode). Otherwise, or with no entry, the row is
-`archive_stale` and names what changed. Both kinds of row are
-`REFERENCE_FAILED`, carry the kind in `reference_refusal`, and are never
-compared; re-record to clear them. The two flags are mutually exclusive, and
-`_meta.config.reference_source` records which side was used.
+`archive_stale` and names what changed; an entry that cannot be read at all is
+`archive_unreadable`. All three kinds of row are `REFERENCE_FAILED`, carry the
+kind in `reference_refusal`, and are never compared; re-record to clear them.
+
+An entry also records the BioNetGen version that made it, and a replayed row's
+`versions.bng` is that version, as is the report header's. Recording never
+changes a live verdict: an entry that cannot be written is reported on stderr,
+and the replay then finds it missing or short. The two flags are mutually
+exclusive, and `_meta.config.reference_source` records which side was used.
 
 ## Emitting golden references
 

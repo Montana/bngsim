@@ -77,7 +77,11 @@ def test_everything_the_live_run_recorded_comes_back(tmp_path):
     replay.check_run({"t_start": 0.0, "t_end": 1.0, "n_steps": 4}, False)
     t, v, n, timing = replay.call("legacy:10:1", pytest.fail)
     np.testing.assert_array_equal(v, _ens(10, 3.0)[1])
-    assert n == ["A", "B"] and timing == {"ensemble_sec": 0.2, "replayed_from_archive": True}
+    assert n == ["A", "B"] and timing == {
+        "ensemble_sec": 0.2,
+        "replayed_from_archive": True,
+        "reference_version": replay.reference_version,
+    }
     assert replay.call("roadrunner:5:10:1", pytest.fail) is None
     # A recorded failure is raised again under its class name, as the live one was.
     with pytest.raises(RuntimeError) as exc:
@@ -132,7 +136,74 @@ def test_an_entry_that_no_longer_matches_its_job_is_stale(tmp_path):
     replay = bsr.Legacy(_spec(tmp_path), "the model", replay=arch)
     with pytest.raises(bsr.ArchiveMiss, match="the run's t_end, mode changed"):
         replay.check_run({"t_start": 0.0, "t_end": 2.0, "n_steps": 4}, True)
-    assert replay.stale  # so the row is archive_stale, not unreplayable
+    assert replay.refusal == "archive_stale"  # not unreplayable
+
+
+def test_an_unreadable_entry_is_refused_rather_than_raised(tmp_path):
+    """np.load used to raise in Legacy(), outside the worker's try, so the worker
+    died and the row was EXCEPTION blamed on bngsim."""
+    spec = _spec(tmp_path)
+    path = bsr._archive_file(tmp_path / "arch", spec["key"])
+    path.parent.mkdir()
+    path.write_bytes(b"not an npz")
+    replay = bsr.Legacy(spec, "the model", replay=tmp_path / "arch")
+    with pytest.raises(bsr.ArchiveMiss) as miss:
+        replay.build(lambda: pytest.fail("built on a replay"), tmp_path, ".net")
+    res = bsr._not_from_archive({}, replay, miss.value, "run_network")
+    assert res["reference_refusal"] == "archive_unreadable"
+    assert res["exception"].startswith("run_network (archive): archive_unreadable: ")
+
+
+def test_keys_that_sanitize_alike_get_their_own_files(tmp_path):
+    assert bsr._archive_file(tmp_path, "a/b.bngl:ssa") != bsr._archive_file(
+        tmp_path, "a_b.bngl:ssa"
+    )
+
+
+def test_a_replay_names_the_bng_version_the_entry_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(bsr.versions, "bng_version", lambda bng2_pl=None: "2.9.3")
+    spec = _spec(tmp_path)
+    arch = _record(tmp_path, spec)
+    monkeypatch.setattr(bsr.versions, "bng_version", lambda bng2_pl=None: None)  # none here
+    replay = bsr.Legacy(spec, "the model", replay=arch)
+    assert replay.reference_version == "2.9.3"
+    *_ens, timing = replay.call("legacy:10:1", pytest.fail)
+    assert timing["reference_version"] == "2.9.3" and timing["replayed_from_archive"] is True
+
+
+def test_a_failed_write_never_reads_as_the_legacy_run_failing(tmp_path, capsys):
+    """The write used to raise out of call(), into the caller's ``except
+    Exception``, which took it for the legacy ensemble failing."""
+    (tmp_path / "arch").write_text("a file where the archive directory should be")
+    live = bsr.Legacy(_spec(tmp_path), "the model", record_to=tmp_path / "arch")
+    out = live.call("legacy:10:1", lambda: (*_ens(10, 3.0), {"ensemble_sec": 0.2}))
+    np.testing.assert_array_equal(out[1], _ens(10, 3.0)[1])
+    assert live.write_error
+    assert "entry not written" in capsys.readouterr().err
+
+
+def test_a_failure_recorded_under_a_shorter_timeout_is_unreplayable(tmp_path):
+    spec = _spec(tmp_path, sub_timeout=60.0)
+    arch = _record(tmp_path, spec)  # legacy:20:11 raised, under 60 s
+    same = bsr.Legacy(spec, "the model", replay=arch)
+    with pytest.raises(RuntimeError, match="edgepop"):
+        same.call("legacy:20:11", pytest.fail)
+    longer = bsr.Legacy({**spec, "sub_timeout": 600.0}, "the model", replay=arch)
+    with pytest.raises(
+        bsr.ArchiveMiss, match="failed under a 60s timeout, and this run allows 600s"
+    ):
+        longer.call("legacy:20:11", pytest.fail)
+    # A result that came back is a reference whatever the timeout.
+    assert longer.call("legacy:10:1", pytest.fail)[1].shape == (10, 5, 2)
+
+
+def test_with_neither_flag_the_legacy_side_passes_straight_through(tmp_path):
+    live = bsr.Legacy(_spec(tmp_path), "the model")
+    gone = tmp_path / "removed.net"  # built, then cleaned up: never read back
+    assert live.build(lambda: (gone, 1.0, ""), tmp_path, ".net") == (gone, 1.0, "")
+    live.check_run({"t_start": 0.0, "t_end": 1.0, "n_steps": 4}, False)
+    out = live.call("legacy:10:1", lambda: _ens(10, 3.0))
+    assert out[2] == ["A", "B"] and live.arrays == {} and live.meta["calls"] == {}
 
 
 def test_the_two_flags_are_exclusive():
