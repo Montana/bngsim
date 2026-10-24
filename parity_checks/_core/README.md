@@ -11,7 +11,7 @@ regenerates our golden references imports from here so reports stay comparable.
 | `schema.py` | the **spec** (`Job`, `Oracle`, `Override`) and **results** (`JobResult`) and **golden** (`Golden`) records, with compact JSON I/O (`write_manifest`/`read_manifest`, `write_report`/`read_report`, `write_golden`/`read_golden`). |
 | `oracles.py` | cross-engine comparison **metrics** (single scalars): `max_rel_err` (ODE), `mean_zscore` (SSA/NF), `ensemble_stats`. Registry: `oracles.METRICS`. |
 | `differ.py` | the cross-engine **pass/fail protocol** the suites gate on (lifted from bng_parity's tuned `parity_diff.py`): `deterministic_verdict` (combined abs+rel per-cell tol + fail-fraction budget + hard ceilings) and `ensemble_verdict` (K-sigma frac-pass). Use this for the verdict; `oracles` for a headline scalar. |
-| `fingerprint.py` | golden tooling: `checksum` (byte-identity within a pinned cell), `fingerprint` (cross-platform numeric fallback), `fingerprint_max_rel`. |
+| `fingerprint.py` | golden tooling: `checksum` (byte-identity within a pinned cell), `fingerprint` (cross-platform numeric fallback), `fingerprint_distance` (the mixed `rtol·|y| + atol` comparison the golden gate runs, issue #582), `fingerprint_max_rel` (purely relative). |
 | `versions.py` | best-effort version probes (`bngsim`, `roadrunner`, `amici`, `libsbml`, legacy `bng`) and `stamp(reference_engine)` for report provenance. |
 
 ## Three-file separation (settled principle)
@@ -29,13 +29,15 @@ regenerates our golden references imports from here so reports stay comparable.
 
 - **Cross-engine, here**: always a numeric `tol` (engines never go byte-identical).
 - **Consumer regeneration**: byte-identical `checksum` within a pinned
-  `(version, platform, seed)` cell; `fingerprint_max_rel` is the cross-platform
-  fallback when checksums legitimately differ (BLAS/rounding).
+  `(version, platform, seed)` cell; `fingerprint_distance` is the cross-platform
+  fallback when checksums legitimately differ (BLAS/rounding). It is mixed,
+  `|x - y| <= rtol·|y| + atol`, because `fingerprint_max_rel` alone reads
+  noise on a species resting near zero as large relative drift.
 
 Both are asked about a run that already disagrees, so a **blow-up** gets the
 same treatment `differ` gives a one-side-non-finite cell — never forgiven
 (issue #572). The three modes hash to three different `checksum`s (`+inf`,
 `-inf` and `NaN` are three different outcomes, not one), and a stat that is
 non-finite on exactly one side, or a *different* non-finite on each side,
-scores `inf` from `fingerprint_max_rel` — above any tolerance a caller could
-pick. Only the same blow-up on both sides is agreement.
+scores `inf` from `fingerprint_distance` and `fingerprint_max_rel` — above
+any tolerance a caller could pick. Only the same blow-up on both sides is agreement.

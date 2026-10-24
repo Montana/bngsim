@@ -155,3 +155,130 @@ def test_every_override_is_a_gated_model_with_a_reason():
         assert model_id in PG.GATED_MODELS, model_id
         assert rtol > 0 and atol > 0
         assert len(reason) > 40, f"{model_id}: give the measurement, not a label"
+
+
+def test_every_gated_model_is_deterministic_in_the_manifest():
+    """--gate sweeps --regime ode, so a stochastic gated model would never run
+    and every pull request's gate would fail on a count."""
+    _meta, jobs = PG.read_manifest(PG.HERE / "jobs.json")
+    method = {j.model_id: j.method for j in jobs}
+    assert PG.GATED_MODELS
+    for model_id in PG.GATED_MODELS:
+        assert method.get(model_id) == "ode", (model_id, method.get(model_id))
+
+
+def test_a_run_that_ends_elsewhere_is_drift():
+    """Same rows, same values (a model at rest), another end time."""
+
+    def fp(t_last):
+        return {
+            "artifacts": {
+                "m.gdat": {
+                    "n_time": 2,
+                    "t_last": t_last,
+                    "vars": {"A": {"last": 1.0, "min": 1.0, "max": 1.0, "mean": 1.0}},
+                }
+            }
+        }
+
+    assert PG.job_fingerprint_distance(fp(500.0), fp(500.0), 1e-5, 1e-6) == 0.0
+    assert PG.job_fingerprint_distance(fp(1000.0), fp(500.0), 1e-5, 1e-6) > 1.0
+
+
+def _stale_toy2(tmp: Path, values: np.ndarray) -> SimpleNamespace:
+    """An earlier run's output for a second job, left in the sweep root."""
+    toy2 = tmp / "sweep/fast/x/toy/toy2/det"
+    toy2.mkdir(parents=True)
+    src = _write_run(tmp / "stale_src", values)
+    for f in ("model.gdat", "_run.log"):
+        (toy2 / f).write_text((src / f).read_text())
+    return SimpleNamespace(model_id="fast/x/toy/toy2.bngl", method="ode")
+
+
+def test_output_the_sweep_did_not_produce_is_not_judged(tmp_path, capsys):
+    """The default sweep root keeps every earlier run's output: verify judged
+    all 895 jobs of a July sweep under a nine-model --gate run."""
+    golden = _golden(tmp_path, BASE)
+    _write_run(tmp_path / "sweep", BASE)
+    stale = _stale_toy2(tmp_path, BASE * 2.0)  # would be NO_GOLDEN if judged
+    code = PG.verify_against_golden(
+        golden, tmp_path / "sweep", [JOB, stale], LOAD, 1e-5, 1e-6, 1, swept={JOB.model_id}
+    )
+    out = capsys.readouterr().out
+    assert code == 0 and "1 compared" in out and "toy2" not in out
+
+
+def test_stale_output_does_not_fill_the_compared_floor(tmp_path, capsys):
+    golden = _golden(tmp_path, BASE)
+    _write_run(tmp_path / "sweep", BASE)
+    stale = _stale_toy2(tmp_path, BASE)
+    code = PG.verify_against_golden(
+        golden, tmp_path / "sweep", [JOB, stale], LOAD, 1e-5, 1e-6, 2, swept={JOB.model_id}
+    )
+    assert code == 1 and "too little" in capsys.readouterr().out
+
+
+def test_an_expected_model_the_sweep_left_nothing_for_fails_by_name(tmp_path, capsys):
+    golden = _golden(tmp_path, BASE)
+    _write_run(tmp_path / "sweep", BASE)
+    gone = "fast/x/toy/gone.bngl"
+    code = PG.verify_against_golden(
+        golden, tmp_path / "sweep", [JOB], LOAD, 1e-5, 1e-6, 1, expected=[JOB.model_id, gone]
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert code == 1
+    assert [ln.split()[1] for ln in lines if ln.startswith(gone)] == ["NOT_SWEPT"]
+
+
+def test_the_swept_set_is_the_sweeps_own_results():
+    summary = {
+        "root": "/m",
+        "results": [
+            {"bngl": "/m/fast/a/b.bngl", "role": "det"},
+            {"bngl": "/m/slow/c/d.bngl", "role": "seed1"},
+            {"bngl": "/elsewhere/e.bngl", "role": "det"},
+        ],
+    }
+    assert PG._swept_model_ids(summary) == {"fast/a/b.bngl", "slow/c/d.bngl"}
+    assert PG._swept_model_ids({"root": "/m"}) is None
+    assert PG._swept_model_ids({}) is None
+
+
+def _g(model_id: str, checksum: str, trajectory=None):
+    return PG.Golden(model_id, "ode", checksum, {"artifacts": {}}, trajectory)
+
+
+def test_merge_replaces_only_the_fresh_entries_and_their_replay_verdicts():
+    old_meta = {
+        "generated": "2026-07-22",
+        "versions": {"bngsim": "0.11.35"},
+        "protocol_replay": {
+            "a": {"dirty_carryover": True, "replayed": True},
+            "b": {"dirty_carryover": True, "replayed": True},
+            "c": {"dirty_carryover": True, "replayed": False},
+        },
+        "regenerations": [{"models": ["a"]}],
+    }
+    old = [_g("a", "a0", "trajectories/a.json"), _g("b", "b0"), _g("c", "c0")]
+    fresh = [_g("b", "b1"), _g("c", "c1")]
+    meta = {
+        "git_rev": "abc",
+        "versions": {"bngsim": "0.16.0"},
+        "bionetgen_commit": "bng",
+        "bngsim_build_commit": "abc",
+    }
+    # b fell back this run; c recorded no verdict this run.
+    replay = {"b": {"dirty_carryover": True, "replayed": False}}
+    merged, golden = PG.merge_regeneration(old_meta, old, fresh, meta, replay)
+    assert [(g.model_id, g.checksum) for g in golden] == [("a", "a0"), ("b", "b1"), ("c", "c1")]
+    assert merged["generated"] == "2026-07-22" and merged["versions"] == {"bngsim": "0.11.35"}
+    assert merged["protocol_replay"] == {
+        "a": {"dirty_carryover": True, "replayed": True},
+        "b": {"dirty_carryover": True, "replayed": False},
+    }
+    assert merged["protocol_replay_summary"]["fallback"] == 1
+    assert merged["protocol_replay_summary"]["models"] == 2
+    assert merged["n_trajectories"] == 1
+    assert merged["regenerations"][0] == {"models": ["a"]}
+    last = merged["regenerations"][-1]
+    assert last["models"] == ["b", "c"] and last["versions"] == {"bngsim": "0.16.0"}
