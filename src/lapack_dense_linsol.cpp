@@ -42,32 +42,6 @@ bool env_opt_in() {
     return !(s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE");
 }
 
-// ── Adaptive factorization-count gate (GH #132) ─────────────────────────────
-// The custom solver delegates its first `kDefaultSwitchAfter` factorizations to
-// the built-in dense GETRF and only switches to the BLAS dgetrf once a run has
-// refactored more often than that — the signature of a stiff / long-horizon,
-// factorization-bound integration where the O(N^3) factor finally dominates.
-// `kDefaultMinN` keeps tiny systems on the built-in factor regardless of count
-// (below it, dgetrf is pure call overhead). See the gate rationale below and
-// dev/notes/gh84_lapack_dense_findings.md for the tuning data.
-//
-// Both are overridable via env (BNGSIM_LAPACK_DENSE_K / _MIN_N) so the large
-// dense corpus can be re-swept to confirm the crossover; the defaults are the
-// values that gate is shipped with.
-constexpr long kDefaultSwitchAfter = 5; // built-in for the first 5 factorizations
-constexpr long kDefaultMinN = 256;      // never take the BLAS path below this N
-
-[[maybe_unused]] long env_long(const char *name, long fallback) {
-    const char *v = std::getenv(name);
-    if (!v || !*v)
-        return fallback;
-    char *end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end == v || *end != '\0' || parsed < 0)
-        return fallback;
-    return parsed;
-}
-
 } // namespace
 
 bool lapack_dense_available() {
@@ -104,6 +78,34 @@ extern "C" void dgetrf_(const lapack_int *m, const lapack_int *n, double *a, con
                         lapack_int *ipiv, lapack_int *info);
 
 namespace {
+
+// ── Adaptive factorization-count gate (GH #132) ─────────────────────────────
+// The custom solver delegates its first `kDefaultSwitchAfter` factorizations to
+// the built-in dense GETRF and only switches to the BLAS dgetrf once a run has
+// refactored more often than that — the signature of a stiff / long-horizon,
+// factorization-bound integration where the O(N^3) factor finally dominates.
+// `kDefaultMinN` keeps tiny systems on the built-in factor regardless of count
+// (below it, dgetrf is pure call overhead). See the gate rationale below and
+// dev/notes/gh84_lapack_dense_findings.md for the tuning data.
+//
+// Both are overridable via env (BNGSIM_LAPACK_DENSE_K / _MIN_N) so the large
+// dense corpus can be re-swept to confirm the crossover; the defaults are the
+// values that gate is shipped with. Only the BLAS solver reads them, so they
+// live inside its #ifdef: outside it, a build without LAPACK warns that all
+// three are unused.
+constexpr long kDefaultSwitchAfter = 5; // built-in for the first 5 factorizations
+constexpr long kDefaultMinN = 256;      // never take the BLAS path below this N
+
+long env_long(const char *name, long fallback) {
+    const char *v = std::getenv(name);
+    if (!v || !*v)
+        return fallback;
+    char *end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || parsed < 0)
+        return fallback;
+    return parsed;
+}
 
 // Solver content: SUNDIALS 0-based pivots consumed by denseGETRS, plus a scratch
 // LAPACK 1-based pivot array filled by dgetrf, plus the GH #132 adaptive-gate

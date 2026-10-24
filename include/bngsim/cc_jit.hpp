@@ -29,8 +29,10 @@
 #include <cstdint>
 #include <cstdio>  // std::snprintf, std::rename, std::remove
 #include <cstdlib> // std::getenv, std::system
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>
+#include <system_error>
 #include <unistd.h> // getpid
 #endif
 
@@ -63,11 +65,10 @@ class CcJit {
         const std::string so = cache_path(src, tag);
         struct stat st;
         if (stat(so.c_str(), &st) != 0) {
-            const std::string dir = so.substr(0, so.find_last_of('/'));
             // A failed mkdir surfaces as the failed write below, which says
-            // which file; GCC will not let a (void) cast drop system()'s result.
-            if (std::system(("mkdir -p '" + dir + "'").c_str()) != 0) {
-            }
+            // which file.
+            std::error_code ec;
+            std::filesystem::create_directories(so.substr(0, so.find_last_of('/')), ec);
             // Process-unique temps so concurrent ensembles don't collide; the
             // finished .so is renamed into place atomically.
             const std::string stem =

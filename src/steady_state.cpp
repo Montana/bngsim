@@ -1556,8 +1556,7 @@ static void ss_reduce_jacobian(const double *J, int ns, const ConservationLaws &
 
 // Reconstruct full y from independent species y_ind using conservation laws
 static void reconstruct_full(const double *y_ind, double *y_full, int ns,
-                             const ConservationLaws &cl,
-                             [[maybe_unused]] const std::vector<Species> &species) {
+                             const ConservationLaws &cl) {
 
     // First, copy independent species into full vector
     for (size_t k = 0; k < cl.independent.size(); ++k) {
@@ -1598,7 +1597,7 @@ static int kinsol_reduced_rhs_body(N_Vector y_ind, N_Vector fval, void *ud) {
     const auto &species = model->species();
     for (int i = 0; i < ns; ++i)
         y_full[i] = species[i].concentration;
-    reconstruct_full(y_ind_data, y_full.data(), ns, cl, species);
+    reconstruct_full(y_ind_data, y_full.data(), ns, cl);
 
     // Compute full f(y)
     std::vector<double> f_full(ns, 0.0);
@@ -1642,7 +1641,7 @@ static int kinsol_reduced_jac_body(N_Vector y_ind, N_Vector /*fval*/, SUNMatrix 
     for (int i = 0; i < ns; ++i) {
         data->jac_y_full[static_cast<size_t>(i)] = species[i].concentration;
     }
-    reconstruct_full(N_VGetArrayPointer(y_ind), data->jac_y_full.data(), ns, cl, species);
+    reconstruct_full(N_VGetArrayPointer(y_ind), data->jac_y_full.data(), ns, cl);
 
     // Every fill_dense_jacobian branch memsets its buffer, so resize (not assign)
     // is enough — the zeroing is not skipped, it is done once instead of twice.
@@ -2135,7 +2134,7 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
         std::vector<double> y_full(ns, 0.0);
         for (int i = 0; i < ns; ++i)
             y_full[i] = model.species()[i].concentration;
-        reconstruct_full(y_data, y_full.data(), ns, cl_copy, model.species());
+        reconstruct_full(y_data, y_full.data(), ns, cl_copy);
         for (int i = 0; i < ns; ++i)
             result.concentrations[i] = y_full[i];
     } else {
