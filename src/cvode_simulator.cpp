@@ -12661,8 +12661,10 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
                 std::find(state_switch_all.begin(), state_switch_all.end(), &sw) -
                 state_switch_all.begin());
             // Of each event, its last fire alone whose order with this
-            // crossing a column moves: the crossing cannot change sides of an
-            // earlier one without coming through the last first.
+            // crossing matters: the crossing cannot change sides of an earlier
+            // one without coming through the last first. One that commutes
+            // with it, writing nothing the switch's jump reads, is passed
+            // through harmlessly, and the one before it is asked.
             auto keep_fire = [&](const FireMark *mark) {
                 if (!(moves || mark->moves)) {
                     return false;
@@ -12686,7 +12688,7 @@ void CvodeSimulator::Impl::apply_state_switch_sensitivity_jump(
                     sync(x, t_evt);
                 }
                 if (!composed) {
-                    return true;
+                    return false;
                 }
                 if (slot >= mark->g.size()) {
                     std::ostringstream msg;
