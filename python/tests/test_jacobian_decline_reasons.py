@@ -82,21 +82,40 @@ def test_non_emittable_derivative_names_the_node_and_the_variable(info, monkeypa
     assert decline["reason"] in line
 
 
-def test_a_derivative_that_folds_non_finite_is_its_own_kind(monkeypatch):
-    monkeypatch.setattr(J, "_non_emittable_reason", lambda e: J._NON_FINITE_REASON)
-    assert J.differentiate_rate_law("k*exp(A)", {}, {"A"}, {"k"}) is None
-    assert J.last_decline()["kind"] == "nonfinite_derivative"
+def test_a_derivative_that_folds_non_finite_is_its_own_kind():
+    # 0^(A-1) over a state: a symbolic zoo the derivative cannot shed.
+    assert J.differentiate_rate_law("k*if(B>1,B,0)^(A-1)", {}, {"A", "B"}, {"k"}) is None
+    decline = J.last_decline()
+    assert decline["kind"] == "nonfinite_derivative"
+    assert "zoo / oo / nan" in decline["reason"]
 
 
-def test_every_kind_a_site_records_is_in_the_vocabulary():
-    # The sites pass their kinds as literals; the vocabulary is what a census
-    # documents them by.
+def test_the_vocabulary_is_exactly_the_kinds_recorded(monkeypatch):
+    """Every kind a site records is in DECLINE_KINDS, and every entry there is a
+    kind something records: the Python sites' literals, whether passed to
+    _declined, assigned first, or written into a dict, and the C++ gate's
+    kind_name() tokens, which pass through under their own names."""
     import inspect
     import re
 
-    used = set(re.findall(r'kind="(\w+)"', inspect.getsource(J)))
-    assert used, "no _declined site found"
-    assert used <= set(J.DECLINE_KINDS), used - set(J.DECLINE_KINDS)
+    from bngsim import _model
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent))
+    from _source_root import bngsim_source_root
+
+    root = bngsim_source_root()
+    header = None if root is None else root / "include" / "bngsim" / "types.hpp"
+    if header is None or not header.exists():
+        pytest.skip("include/bngsim/types.hpp is not in this checkout")
+    literal = r'(?:\bkind\s*=\s*|"kind":\s*)"(\w+)"'
+    python = {k for mod in (J, _model) for k in re.findall(literal, inspect.getsource(mod))}
+    gate = set(re.findall(r'case Kind::\w+:\s*return "(\w+)";', header.read_text())) - {"none"}
+    assert {"non_emittable", "unexpected_error", "gate_unrecorded"} <= python, python
+    assert {"fd_mismatch", "no_sparsity"} <= gate, gate
+    assert python | gate == set(J.DECLINE_KINDS), (
+        (python | gate) - set(J.DECLINE_KINDS),
+        set(J.DECLINE_KINDS) - (python | gate),
+    )
 
 
 def test_a_rate_law_that_derives_logs_nothing(info):
@@ -209,3 +228,30 @@ def test_env_switch_is_a_named_decline(tmp_path, monkeypatch, info):
     expected = "declined: disabled by BNGSIM_ANALYTICAL_FUNCTIONAL_JAC=0"
     assert m.analytical_jacobian_status == expected
     assert m.analytical_jacobian_decline["kind"] == "disabled"
+
+
+def test_a_decline_that_recorded_nothing_still_has_a_kind(tmp_path, monkeypatch):
+    def silent(core):  # an attach that declines without saying why
+        J._reset_decline()
+        return False
+
+    monkeypatch.setattr(J, "attach_functional_jacobian", silent)
+    m = _model(tmp_path, _NET_MRATIO)
+    assert m.prepare_analytical_jacobian() is False
+    assert m.analytical_jacobian_status == "declined: no reason was recorded"
+    assert m.analytical_jacobian_decline == {
+        "kind": "unrecorded",
+        "reason": "no reason was recorded",
+    }
+
+
+def test_an_unexpected_error_is_its_own_kind(tmp_path, monkeypatch):
+    def boom(core):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(J, "attach_functional_jacobian", boom)
+    m = _model(tmp_path, _NET_MRATIO)
+    assert m.prepare_analytical_jacobian() is False
+    reason = "an unexpected error during derivation: boom"
+    assert m.analytical_jacobian_status == f"declined: {reason}"
+    assert m.analytical_jacobian_decline == {"kind": "unexpected_error", "reason": reason}

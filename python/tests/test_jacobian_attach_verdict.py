@@ -188,6 +188,16 @@ def test_fd_mismatch_names_the_entry_the_probe_and_both_values(tmp_path, gate):
     assert why["analytical"] == pytest.approx(2 * 2.8, rel=1e-9)  # the doubled derivative
     assert why["finite_difference"] == pytest.approx(2.8, rel=1e-6)  # the slope itself
     assert J.attach_decline_reason(core) == _MISMATCH_REASON
+    fields = J.attach_decline_verdict(core)  # issue #538: what the verdict set, by name
+    assert set(fields) == {"kind", "probe", "row", "col", "analytical", "finite_difference"} | {
+        "row_species",
+        "col_species",
+    }
+    assert (fields["kind"], fields["row_species"], fields["col_species"]) == (
+        "fd_mismatch",
+        "B()",
+        "A()",
+    )
 
 
 def test_nonfinite_entry_names_the_entry_and_counts_the_rest(tmp_path, gate):
@@ -201,6 +211,12 @@ def test_nonfinite_entry_names_the_entry_and_counts_the_rest(tmp_path, gate):
     assert why["n_nonfinite"] == 1
     assert math.isnan(why["finite_difference"])  # no finite difference is involved
     assert J.attach_decline_reason(core) == _NONFINITE_REASON
+    fields = J.attach_decline_verdict(core)  # issue #538: no NaN placeholder handed on
+    assert set(fields) == {"kind", "probe", "row", "col", "analytical", "n_nonfinite"} | {
+        "row_species",
+        "col_species",
+    }
+    assert math.isinf(fields["analytical"])  # the entry's own value, kept though not finite
 
 
 # ─── The status and the log carry the verdict ────────────────────────────────
@@ -221,6 +237,10 @@ def test_status_names_the_mismatching_entry(tmp_path, monkeypatch, info):
     assert m.analytical_jacobian_status == f"declined: {_MISMATCH_REASON}"
     assert any(_MISMATCH_REASON in line for line in _decline_lines(info))
     assert m.clone().analytical_jacobian_status == f"declined: {_MISMATCH_REASON}"
+    decline = m.analytical_jacobian_decline  # issue #538: the kind beside the reason
+    assert (decline["kind"], decline["reason"]) == ("fd_mismatch", _MISMATCH_REASON)
+    assert (decline["probe"], decline["row_species"], decline["col_species"]) == (0, "B()", "A()")
+    assert m.clone().analytical_jacobian_decline == decline
 
 
 def test_status_names_the_nonfinite_entry(tmp_path, monkeypatch, info):
@@ -256,6 +276,13 @@ def test_compile_failure_names_the_term_and_quotes_the_compiler(tmp_path):
         "the derivative of reaction 0's rate law with respect to A(), 'k*(', did not compile: "
     ), reason
     assert " ".join(why["detail"].split()) in reason
+    assert J.attach_decline_verdict(core) == {  # issue #538: no -1 row, col or probe
+        "kind": "compile_failed",
+        "rxn_idx": 0,
+        "target_idx": 0,
+        "per_observable": False,
+        "detail": why["detail"],
+    }
 
 
 def test_per_observable_compile_failure_names_the_observable(tmp_path):
@@ -268,6 +295,9 @@ def test_per_observable_compile_failure_names_the_observable(tmp_path):
     assert J.attach_decline_reason(core, terms).startswith(
         "the derivative of reaction 0's rate law with respect to A_tot, 'k*(', did not compile: "
     )
+    fields = J.attach_decline_verdict(core)
+    assert set(fields) == {"kind", "rxn_idx", "target_idx", "per_observable", "detail"}
+    assert fields["per_observable"] is True  # target_idx is an observable index
 
 
 def test_entry_outside_the_pattern_is_named_on_the_per_species_path(tmp_path):
@@ -280,6 +310,16 @@ def test_entry_outside_the_pattern_is_named_on_the_per_species_path(tmp_path):
         "the derivative of reaction 0's rate law lands in ∂f[B()]/∂[B()], which has no slot "
         "in the Jacobian sparsity pattern"
     )
+    assert J.attach_decline_verdict(core) == {
+        "kind": "term_outside_pattern",
+        "rxn_idx": 0,
+        "target_idx": 1,
+        "per_observable": False,
+        "row": 1,
+        "col": 1,
+        "row_species": "B()",
+        "col_species": "B()",
+    }
 
 
 def test_entry_outside_the_pattern_is_named_on_the_per_observable_path(tmp_path):
@@ -291,6 +331,9 @@ def test_entry_outside_the_pattern_is_named_on_the_per_observable_path(tmp_path)
     assert why["per_observable"] is True
     assert why["col"] == 2 and why["row"] in (0, 1)  # (A or B, C): C is in no rate law
     assert "/∂[C()], which has no slot" in J.attach_decline_reason(core)
+    fields = J.attach_decline_verdict(core)
+    assert set(fields) == {"kind", "rxn_idx", "row", "col", "row_species", "col_species"}
+    assert fields["col_species"] == "C()"
 
 
 def test_bad_indices_are_named(tmp_path):
@@ -301,12 +344,20 @@ def test_bad_indices_are_named(tmp_path):
     assert J.attach_decline_reason(core) == (
         "a derived term names reaction 7, which the model does not have"
     )
+    # issue #538: per_observable is left at its default here, so it is not passed on
+    assert J.attach_decline_verdict(core) == {"kind": "bad_reaction_index", "rxn_idx": 7}
     assert core.set_functional_jacobian([(0, True, [(99, "k")])]) is False
     why = core.last_functional_jacobian_decline()
     assert (why["kind"], why["rxn_idx"], why["target_idx"]) == ("bad_observable_index", 0, 99)
     assert J.attach_decline_reason(core) == (
         "a derived term of reaction 0 names observable 99, which the model does not have"
     )
+    assert J.attach_decline_verdict(core) == {
+        "kind": "bad_observable_index",
+        "rxn_idx": 0,
+        "target_idx": 99,
+        "per_observable": True,
+    }
 
 
 def test_a_missing_verdict_is_still_a_reason():
@@ -321,6 +372,7 @@ def test_a_missing_verdict_is_still_a_reason():
     assert J.attach_decline_reason(Mute()).startswith(
         "the C++ attach declined the derived terms without recording why"
     )
+    assert J.attach_decline_verdict(Mute()) == {"kind": "gate_unrecorded"}  # issue #538
 
 
 # ─── The record describes the last call only, and a clone carries it ─────────

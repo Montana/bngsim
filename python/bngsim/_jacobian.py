@@ -117,7 +117,6 @@ def _declined(reason: str, *, kind: str, verdict: dict | None = None, log: bool 
     ``kind`` is one of :data:`DECLINE_KINDS`; ``verdict``, for the C++ gate's
     kinds, its fields with the species they name.
     """
-    _decline_state.reason = reason
     _decline_state.decline = {"kind": kind, "reason": reason, **(verdict or {})}
     if log:
         logger.info(
@@ -127,13 +126,13 @@ def _declined(reason: str, *, kind: str, verdict: dict | None = None, log: bool 
 
 
 def _reset_decline() -> None:
-    _decline_state.reason = None
     _decline_state.decline = None
 
 
 def last_decline_reason() -> str | None:
     """The reason recorded by the most recent decline on this thread, or ``None``."""
-    return getattr(_decline_state, "reason", None)
+    decline = getattr(_decline_state, "decline", None)
+    return decline["reason"] if decline is not None else None
 
 
 def last_decline() -> dict | None:
@@ -4196,26 +4195,36 @@ def attach_decline_reason(core, terms=()) -> str:
     return f"the C++ attach declined the derived terms ({kind})"
 
 
-def attach_decline_kind(core) -> str:
-    """The C++ attach gate's ``kind`` for ``core``'s last decline, or
-    ``"gate_unrecorded"`` where it recorded none (issue #538)."""
-    verdict = core.last_functional_jacobian_decline()
-    return str(verdict["kind"]) if verdict is not None else "gate_unrecorded"
-
-
 def attach_decline_verdict(core) -> dict:
-    """The C++ attach gate's verdict fields for ``core``'s last decline, with
-    the species its ``row`` and ``col`` index (issue #538). Empty where it
-    recorded none."""
+    """The C++ attach gate's last decline on ``core`` as ``{"kind", ...}``: the
+    fields its verdict set, and the species its ``row`` and ``col`` index
+    (issue #538). ``{"kind": "gate_unrecorded"}`` where it recorded none.
+
+    A field the kind does not set holds ``FunctionalJacobianDecline``'s
+    placeholder (-1, NaN, 0 or an empty string) and is left out rather than
+    handed on as a value: a -1 ``row`` read as a species index names the last
+    species.
+    """
     verdict = core.last_functional_jacobian_decline()
     if verdict is None:
-        return {}
-    out = {k: v for k, v in dict(verdict).items() if k != "kind"}
+        return {"kind": "gate_unrecorded"}
+    v = dict(verdict)
+    out: dict = {"kind": str(v["kind"])}
+    out.update({k: v[k] for k in ("rxn_idx", "target_idx", "row", "col", "probe") if v[k] >= 0})
+    if "target_idx" in out:  # the index space target_idx is in
+        out["per_observable"] = v["per_observable"]
+    if "probe" in out:  # the self-check's entry, itself non-finite under nonfinite_entry
+        out["analytical"] = v["analytical"]
+    if not math.isnan(v["finite_difference"]):
+        out["finite_difference"] = v["finite_difference"]
+    if v["n_nonfinite"] > 0:
+        out["n_nonfinite"] = v["n_nonfinite"]
+    if v["detail"]:
+        out["detail"] = v["detail"]
     species = list(core.species_names)
     for key in ("row", "col"):
-        i = out.get(key)
-        if isinstance(i, int) and 0 <= i < len(species):
-            out[f"{key}_species"] = species[i]
+        if key in out and out[key] < len(species):
+            out[f"{key}_species"] = species[out[key]]
     return out
 
 
@@ -4426,9 +4435,8 @@ def attach_functional_jacobian(core) -> bool:
         # non-finite where the RHS is finite, a derivative term outside the
         # sparsity pattern, or a term that did not compile — and records which,
         # so the status names the entry instead of pointing at BNGSIM_JAC_DEBUG=1.
+        verdict = attach_decline_verdict(core)
         _declined(
-            attach_decline_reason(core, all_terms),
-            kind=attach_decline_kind(core),
-            verdict=attach_decline_verdict(core),
+            attach_decline_reason(core, all_terms), kind=verdict.pop("kind"), verdict=verdict
         )
     return attached

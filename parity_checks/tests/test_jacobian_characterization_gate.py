@@ -360,7 +360,8 @@ def test_analyze_counts_finite_difference_rows_by_decline_kind(tmp_path, capsys)
             jacobian_decline_kind="budget",
             **_swept(1.0, 10.0),
         ),
-        # a report from before the field: no kind recorded
+        # a report from before the field: no kind recorded, which is not the model's
+        # own "unrecorded"
         _row("fd_old", method="finite_difference", complete=False, **_swept(1.0, 10.0)),
     ]
     cp = tmp_path / "char.json"
@@ -369,12 +370,12 @@ def test_analyze_counts_finite_difference_rows_by_decline_kind(tmp_path, capsys)
     assert out["jacobian_declines"] == {
         "fd_mismatch": ["fd_a", "fd_b"],
         "budget": ["fd_c"],
-        "unrecorded": ["fd_old"],
+        "not_in_report": ["fd_old"],
     }
     assert out["summary"]["jacobian_decline_kind"] == {
         "fd_mismatch": 2,
         "budget": 1,
-        "unrecorded": 1,
+        "not_in_report": 1,
     }
     printed = capsys.readouterr().out
     assert "finite-difference rows by decline kind" in printed and "fd_mismatch" in printed

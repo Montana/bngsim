@@ -719,11 +719,12 @@ def analyze(
     for p in pts:
         methods[str(p["jacobian_method"])] = methods.get(str(p["jacobian_method"]), 0) + 1
     # Issue #538: the finite-difference rows by why they are on it. A report from
-    # before the field existed files them under "unrecorded".
+    # before the field existed files them under "not_in_report", apart from the
+    # model's own "unrecorded" (a decline that recorded no reason, a bngsim bug).
     declines: dict[str, list[str]] = {}
     for p in pts:
         if p["jacobian_method"] == "finite_difference":
-            kind = str(p.get("jacobian_decline_kind") or "unrecorded")
+            kind = str(p.get("jacobian_decline_kind") or "not_in_report")
             declines.setdefault(kind, []).append(p["model_id"])
     declines = {
         k: sorted(v) for k, v in sorted(declines.items(), key=lambda kv: (-len(kv[1]), kv[0]))
