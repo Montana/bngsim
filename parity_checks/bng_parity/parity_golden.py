@@ -763,6 +763,9 @@ def main() -> int:
     _meta, jobs = read_manifest(jobs_path)
     pd = _load_parity_diff()
     swept = _swept_model_ids(sweep_summary)
+    if args.gate:
+        # The gated set, whatever else a consumed (--no-run-sweep) sweep ran.
+        swept = set(GATED_MODELS) if swept is None else swept & set(GATED_MODELS)
 
     if args.verify:
         if swept is None:

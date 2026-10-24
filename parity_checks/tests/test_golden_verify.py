@@ -44,8 +44,9 @@ def _write_run(sweep: Path, values: np.ndarray, status: str = "ok") -> Path:
     return out
 
 
-def _golden(tmp: Path, values: np.ndarray) -> Path:
-    """golden.json for JOB, built from `values` the way the generator builds it."""
+def _golden(tmp: Path, values: np.ndarray, model_ids=(JOB.model_id,)) -> Path:
+    """golden.json giving each of `model_ids` the entry built from `values`, the
+    way the generator builds it."""
     out = _write_run(tmp / "golden_src", values)
     (checksum, fingerprint, _), _ = PG.build_golden_for_job(out, LOAD)
     path = tmp / "golden.json"
@@ -55,11 +56,12 @@ def _golden(tmp: Path, values: np.ndarray) -> Path:
                 "_meta": {},
                 "golden": [
                     {
-                        "model_id": JOB.model_id,
+                        "model_id": model_id,
                         "method": "ode",
                         "checksum": checksum,
                         "fingerprint": fingerprint,
                     }
+                    for model_id in model_ids
                 ],
             }
         )
@@ -185,35 +187,37 @@ def test_a_run_that_ends_elsewhere_is_drift():
     assert PG.job_fingerprint_distance(fp(1000.0), fp(500.0), 1e-5, 1e-6) > 1.0
 
 
-def _stale_toy2(tmp: Path, values: np.ndarray) -> SimpleNamespace:
-    """An earlier run's output for a second job, left in the sweep root."""
+STALE = SimpleNamespace(model_id="fast/x/toy/toy2.bngl", method="ode")
+
+
+def _stale_toy2(tmp: Path, values: np.ndarray) -> None:
+    """An earlier run's output for STALE, left in the sweep root."""
     toy2 = tmp / "sweep/fast/x/toy/toy2/det"
     toy2.mkdir(parents=True)
     src = _write_run(tmp / "stale_src", values)
     for f in ("model.gdat", "_run.log"):
         (toy2 / f).write_text((src / f).read_text())
-    return SimpleNamespace(model_id="fast/x/toy/toy2.bngl", method="ode")
 
 
 def test_output_the_sweep_did_not_produce_is_not_judged(tmp_path, capsys):
     """The default sweep root keeps every earlier run's output: verify judged
     all 895 jobs of a July sweep under a nine-model --gate run."""
-    golden = _golden(tmp_path, BASE)
+    golden = _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
     _write_run(tmp_path / "sweep", BASE)
-    stale = _stale_toy2(tmp_path, BASE * 2.0)  # would be NO_GOLDEN if judged
+    _stale_toy2(tmp_path, BASE * 2.0)  # DRIFT, if it were judged
     code = PG.verify_against_golden(
-        golden, tmp_path / "sweep", [JOB, stale], LOAD, 1e-5, 1e-6, 1, swept={JOB.model_id}
+        golden, tmp_path / "sweep", [JOB, STALE], LOAD, 1e-5, 1e-6, 1, swept={JOB.model_id}
     )
     out = capsys.readouterr().out
     assert code == 0 and "1 compared" in out and "toy2" not in out
 
 
 def test_stale_output_does_not_fill_the_compared_floor(tmp_path, capsys):
-    golden = _golden(tmp_path, BASE)
+    golden = _golden(tmp_path, BASE, (JOB.model_id, STALE.model_id))
     _write_run(tmp_path / "sweep", BASE)
-    stale = _stale_toy2(tmp_path, BASE)
+    _stale_toy2(tmp_path, BASE)  # IDENTICAL, and a second compared, if it were judged
     code = PG.verify_against_golden(
-        golden, tmp_path / "sweep", [JOB, stale], LOAD, 1e-5, 1e-6, 2, swept={JOB.model_id}
+        golden, tmp_path / "sweep", [JOB, STALE], LOAD, 1e-5, 1e-6, 2, swept={JOB.model_id}
     )
     assert code == 1 and "too little" in capsys.readouterr().out
 
