@@ -75,6 +75,16 @@ STATUS_TO_OUTCOME: dict[str, Outcome] = {
     "extended": Outcome.DIFF,
     "attribution_incomplete": Outcome.DIFF,
     "too_slow": Outcome.TIMEOUT,
+    # A replay from a reference archive (issue #805) that could not stand in for
+    # RoadRunner: the entry no longer matches the model, or the model needs an
+    # adjudication that runs RoadRunner live. Never compared; the refusal names it.
+    "archive_stale": Outcome.REFERENCE_FAILED,
+    "archive_unreplayable": Outcome.REFERENCE_FAILED,
+    # bngsim refused a NaN or infinite propensity (issue #809), and RoadRunner's
+    # gillespie, on the same seeds, reaches a non-finite rate too, or cannot run the
+    # model at all (issue #1211). The rate law is undefined at a state the SSA
+    # reaches, so neither engine has a trajectory: the model is the problem.
+    "nonfinite_rate": Outcome.BAD_TEST,
     "error": Outcome.EXCEPTION,
     "skip": Outcome.SKIP,
 }
@@ -202,10 +212,19 @@ def _comment(case: dict, status: str) -> str:
     elif status in ("rr_time_event", "rr_time_event_unverified"):
         h = case.get("extended_horizon")
         n_cmp = int(case.get("n_compared", 0) or 0)
-        if status == "rr_time_event":
+        reval = case.get("revalidation")
+        # "validated" only where the re-validation ran and bngsim tracked its ODE:
+        # a row whose re-validation never finished (or never ran) compared nothing.
+        if status == "rr_time_event" and case.get("bn_tracks_own_ode") is True:
             hs = f" over t=0→{h:g}" if isinstance(h, (int, float)) else ""
             body = (
                 f"bngsim SSA tracks its own ODE on all {n_cmp} above-floor cells{hs} (validated)"
+            )
+        elif reval or status == "rr_time_event":
+            why = f" ({reval})" if reval else ""
+            body = (
+                f"the bngsim-vs-own-ODE re-validation gave no verdict{why}, so bngsim is "
+                "neither confirmed nor faulted here"
             )
         elif n_cmp == 0:
             body = "bngsim was quiet at every tried horizon, so it could not be validated either"
@@ -220,6 +239,46 @@ def _comment(case: dict, status: str) -> str:
             "'time is not treated continuously in a gillespie simulation') — RR cannot anchor "
             f"this model and is not used as the reference; {body}"
         )
+    elif status in ("archive_stale", "archive_unreplayable"):
+        why = str(case.get("error") or "").split(f"{status}: ", 1)[-1]
+        parts.append(f"not compared: the reference archive cannot stand in for RoadRunner ({why})")
+    elif status == "nonfinite_rate":
+        found = case.get("nonfinite_rate") or {}
+        if found.get("roadrunner_error"):
+            parts.append(
+                "bngsim refuses a NaN or infinite rate law at a state its SSA reaches, and "
+                f"RoadRunner's gillespie cannot run the model ({found['roadrunner_error']}) — "
+                "neither engine has a trajectory"
+            )
+        else:
+            hit = found.get("match") or {}
+            parts.append(
+                "a rate law is NaN or infinite at a state the SSA reaches: bngsim refuses it, "
+                f"and RoadRunner's gillespie reaches a {hit.get('rate')} rate of the same "
+                f"reaction, {hit.get('reaction')} (seed {found.get('seed')}), where it fires "
+                "nothing more and raises nothing — neither engine has a trajectory, so the "
+                "model is the problem"
+            )
+    elif status == "error" and case.get("nonfinite_rate"):
+        found = case["nonfinite_rate"]
+        if found.get("roadrunner_error"):
+            parts.append(
+                f"RoadRunner's gillespie raised ({found['roadrunner_error']}), which does not "
+                "show the rate law bngsim refused is undefined in the model"
+            )
+        elif found.get("nonfinite"):
+            others = ", ".join(hit["reaction"] for hit in found["nonfinite"])
+            parts.append(
+                f"RoadRunner's gillespie reaches a non-finite rate of {others} (seed "
+                f"{found.get('seed')}), not of the reaction bngsim refused, so nothing shows "
+                "that rate law is undefined in the model"
+            )
+        else:
+            parts.append(
+                f"RoadRunner's gillespie kept every rate finite on the same "
+                f"{found.get('replicates')} seeds, so nothing shows the rate law bngsim "
+                "refused is undefined in the model"
+            )
     elif status == "attribution_incomplete":
         parts.append(
             "SSA ensembles diverged, but the deterministic-ODE oracle that assigns fault "
@@ -310,9 +369,11 @@ def case_to_job_result(
     ):
         subclass = "vacuous_lowcount"
     reference_refusal = None
+    if status in ("archive_stale", "archive_unreplayable"):
+        reference_refusal = status
     if status == "error":
         outcome, reference_refusal = _classify_error(str(case.get("error") or ""))
-    compared = "max_mean_z" in case
+    compared = "max_mean_z" in case and status not in ("archive_stale", "archive_unreplayable")
     return JobResult(
         model_id=case["name"],
         method=METHOD,
@@ -324,7 +385,7 @@ def case_to_job_result(
         exception=str(case.get("error") or ""),
         wall_sec=_wall_sec(case),
         timestamp=timestamp,
-        versions=dict(versions or {}),
+        versions=_row_versions(case, versions),
         comment=_comment(case, status),
         reference_refusal=reference_refusal,
         subclass=subclass,
@@ -335,6 +396,16 @@ def case_to_job_result(
         # instead of a cold/warm-reuse split) — the renderer keys off the shape.
         timing=case.get("timing"),
     )
+
+
+def _row_versions(case: dict, versions: dict | None) -> dict:
+    """The run's versions, with RoadRunner's taken from the reference archive on a
+    replayed row: the RoadRunner that ran here (if any) made none of its results."""
+    out = dict(versions or {})
+    rr = (case.get("timing") or {}).get("roadrunner") or {}
+    if rr.get("replayed_from_archive"):
+        out["roadrunner"] = rr.get("reference_version")
+    return out
 
 
 def _versions_of(machine: dict) -> dict:

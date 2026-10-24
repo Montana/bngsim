@@ -169,15 +169,10 @@ NetworkModel NetworkModel::clone() const {
     }
     // Species names are registered for event trigger / assignment-RHS
     // expressions (matches the post-build registration in
-    // model_builder.cpp). define_variable throws on duplicate, so guard
-    // against species names that collide with observables.
-    for (auto &sp : copy.impl_->species) {
-        try {
-            copy.impl_->evaluator->define_variable(sp.name, &sp.concentration);
-        } catch (...) {
-            // Already registered as a parameter or observable — skip.
-        }
-    }
+    // model_builder.cpp). A name already registered as a parameter or
+    // observable, or one that is no symbol (a .net species `A()`), is skipped.
+    for (auto &sp : copy.impl_->species)
+        copy.impl_->evaluator->try_define_variable(sp.name, &sp.concentration);
 
     // Re-bind the rateOf accessors (GH #106) BEFORE any expression that may
     // reference a rate_of__<species> token is re-compiled. The copy gets its own
@@ -297,11 +292,6 @@ NetworkModel NetworkModel::clone() const {
     // cache is left empty for the identical reason — it is keyed by condition
     // text, so the clone re-resolves the same conditions into its own evaluator.
     copy.impl_->events = impl_->events;
-    {
-        std::lock_guard<std::mutex> lock(impl_->rateof_reads_mutex);
-        copy.impl_->event_trigger_residual_reads = impl_->event_trigger_residual_reads;
-        copy.impl_->event_trigger_residual_reads_done = impl_->event_trigger_residual_reads_done;
-    }
     for (auto &ev : copy.impl_->events) {
         if (ev.trigger_expr_idx >= 0) {
             const auto &cached = impl_->evaluator->preprocessed_expr(ev.trigger_expr_idx);
@@ -1200,12 +1190,6 @@ int NetworkModel::event_trigger_residual_expr(int event_idx0, std::string *why) 
         cache.assign(events.size(), -2);
         impl_->event_trigger_residual_species.assign(events.size(), {});
         impl_->event_trigger_residual_reason.assign(events.size(), std::string());
-        // (What each residual reads is indices, and a clone comes with its
-        // original's: kept where it is for as many events as there are.)
-        if (impl_->event_trigger_residual_reads.size() != events.size()) {
-            impl_->event_trigger_residual_reads.clear();
-            impl_->event_trigger_residual_reads_done = false;
-        }
     }
     if (cache[event_idx0] == -2) {
         cache[event_idx0] = -1;
@@ -1329,6 +1313,18 @@ const NetworkModel::StateSwitch *NetworkModel::state_switch(const std::string &c
         return nullptr;
     }
     return &it->second.first;
+}
+
+int NetworkModel::compiled_expression(const std::string &expression_src) const {
+    auto it = impl_->compiled_expression_cache.find(expression_src);
+    if (it == impl_->compiled_expression_cache.end()) {
+        // A text that does not compile throws here and is not cached; compile()
+        // appends nothing for it, so asking again costs a compile, not memory.
+        it = impl_->compiled_expression_cache
+                 .emplace(expression_src, impl_->evaluator->compile(expression_src))
+                 .first;
+    }
+    return it->second;
 }
 
 const std::vector<int> &NetworkModel::event_trigger_residual_species(int event_idx0) const {
@@ -1558,57 +1554,6 @@ void NetworkModel::expression_reads_(const std::vector<std::vector<int>> &groups
         rateof_out[g].assign(rated.begin(), rated.end());
         std::sort(rateof_out[g].begin(), rateof_out[g].end());
     }
-}
-
-bool NetworkModel::event_trigger_residual_reads(int event_idx0, std::vector<int> &species_out,
-                                                std::vector<int> &rateof_out) const {
-    species_out.clear();
-    rateof_out.clear();
-    const int n_events = static_cast<int>(impl_->events.size());
-    if (event_idx0 < 0 || event_idx0 >= n_events) {
-        return false;
-    }
-    // Every event's at the first ask: what the walk sets up is the size of
-    // the model, and a run asks for each resting trigger in turn.
-    std::lock_guard<std::mutex> lock(impl_->rateof_reads_mutex);
-    std::vector<int> residual(static_cast<std::size_t>(n_events), -1);
-    for (int ei = 0; ei < n_events; ++ei) {
-        residual[static_cast<std::size_t>(ei)] = event_trigger_residual_expr(ei);
-    }
-    auto &memo = impl_->event_trigger_residual_reads;
-    if (!impl_->event_trigger_residual_reads_done || memo.size() != impl_->events.size()) {
-        std::vector<std::vector<int>> groups(static_cast<std::size_t>(n_events));
-        for (int ei = 0; ei < n_events; ++ei) {
-            if (residual[static_cast<std::size_t>(ei)] >= 0) {
-                groups[static_cast<std::size_t>(ei)].push_back(
-                    residual[static_cast<std::size_t>(ei)]);
-            }
-        }
-        std::vector<std::vector<int>> named;
-        std::vector<std::vector<int>> rated;
-        std::vector<char> known;
-        expression_reads_(groups, named, rated, known);
-        memo.assign(static_cast<std::size_t>(n_events), {});
-        for (int ei = 0; ei < n_events; ++ei) {
-            const auto u = static_cast<std::size_t>(ei);
-            memo[u].known = residual[u] >= 0 && known[u] != 0;
-            memo[u].species = std::move(named[u]);
-            memo[u].rateof = std::move(rated[u]);
-        }
-        impl_->event_trigger_residual_reads_done = true;
-    }
-    const auto &reads = memo[static_cast<std::size_t>(event_idx0)];
-    if (!reads.known) {
-        return false;
-    }
-    species_out = reads.species;
-    rateof_out = reads.rateof;
-    return true;
-}
-
-const std::vector<std::vector<int>> *NetworkModel::derivative_rateof_reads() const {
-    ensure_rateof_reads_();
-    return impl_->derivative_rateof_reads_state == 1 ? &impl_->derivative_rateof_reads : nullptr;
 }
 
 int NetworkModel::rateof_flow_nesting() const {
@@ -3665,6 +3610,16 @@ void NetworkModel::fill_dense_fd_jacobian(double t, const double *conc, double *
     fd_dense_state_jacobian(
         [this](double tt, const double *y, double *f) { compute_derivs(tt, y, f); }, t, conc,
         n_species(), kNoExcluded, jac);
+}
+
+std::vector<int> NetworkModel::fill_dense_fd_jacobian_own_step(double t, const double *conc,
+                                                               const double *floored, double *jac) {
+    static const std::vector<int> kNoExcluded;
+    const int ns = n_species();
+    std::vector<double> f0(static_cast<size_t>(ns));
+    compute_derivs(t, conc, f0.data());
+    return fd_own_step_columns([this, t](const double *y, double *f) { compute_derivs(t, y, f); },
+                               conc, ns, ns, kNoExcluded, f0.data(), floored, jac);
 }
 
 void NetworkModel::fill_sparse_analytical_jacobian(double t, const double *conc, double *vals) {

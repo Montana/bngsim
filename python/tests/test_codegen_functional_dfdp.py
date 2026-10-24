@@ -326,9 +326,7 @@ class TestDeclinesLoudly:
             # `gamma` as its gamma function (issue #757); #418 solves it now.
             (_UNBRACKETABLE, "neither a recognized clock threshold"),
             ("beta*(I > 1)", "is not inside an if() condition"),
-            ("beta*abs(I)", "abs()"),
-            ("beta*max(I, 1)", "max()"),
-            ("beta*min(I, 1)", "min()"),
+            ("beta*clamp(1, I, 4)", "clamp"),
             ("beta*floor(I)", "floor()"),
             ("beta*ceil(I)", "ceil()"),
         ],
@@ -425,23 +423,32 @@ class TestDeclinesLoudly:
 
     def test_a_construct_hidden_inside_a_nested_function_is_still_caught(self):
         """The scan runs on the *inlined* text; a rate law that looks smooth but
-        calls a function containing ``abs()`` must not slip through."""
-        scope = _scope(func_map={"inner": "abs(Itot - 1)"})
+        calls a function containing ``floor()`` must not slip through."""
+        scope = _scope(func_map={"inner": "floor(Itot - 1)"})
         terms, decline = cg._functional_rate_law_partials("beta*inner", scope)
-        assert terms is None and "abs()" in decline
+        assert terms is None and "floor()" in decline
 
     def test_one_bad_law_declines_the_whole_model(self, tmp_path):
         """``CVodeSensInit1`` is all-or-nothing, so a second, perfectly
         differentiable Functional reaction must not survive on its own."""
         text = SIR.replace(
             "    1 betaI() beta*I\n",
-            "    1 betaI() beta*I\n    2 bad() gamma*abs(R)\n",
+            "    1 betaI() beta*I\n    2 bad() gamma*floor(R)\n",
         ).replace("    2 2 3 gamma #_R2\n", "    2 2 3 gamma #_R2\n    3 3 1 bad #_R3\n")
         model = _model(tmp_path, text)
         core = model._core
         terms, decline = cg._functional_dfdp_terms(core, core.codegen_data())
-        assert terms == {} and "abs()" in decline
+        assert terms == {} and "floor()" in decline
         assert cg.generate_sens_from_model(model, functional=True) is None
+
+    @pytest.mark.parametrize("body", ["beta*abs(I)", "beta*max(I, 1)", "beta*min(I, 1)"])
+    def test_a_bend_is_differentiated(self, tmp_path, body):
+        """Issue #1126: abs, min and max bend without a jump, so their
+        derivative has no delta and the analytic RHS is exact on both sides."""
+        model = _model(tmp_path, _with_rate_law(body))
+        core = model._core
+        terms, decline = cg._functional_dfdp_terms(core, core.codegen_data())
+        assert decline is None and terms
 
     def test_michaelis_menten_is_no_longer_out_of_scope(self, tmp_path):
         """#66 declined MM on rate-law type; #55's MM stage supplies its closed

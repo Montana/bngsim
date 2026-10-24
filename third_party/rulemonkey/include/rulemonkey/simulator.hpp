@@ -48,8 +48,10 @@ public:
   // reads time() reads that clock, absolute model time, as BNG's network
   // simulate does with a nonzero t_start (issue #98).  Before #98, a
   // nonzero `t_start` started the clock at 0 and simulated [0, t_start]
-  // before the first row.  Throws std::runtime_error if `ts.t_end` is
-  // earlier than `ts.t_start`.
+  // before the first row.  Events are placed on the time elapsed since
+  // `ts.t_start`, so a late start loses no resolution: only the clock a
+  // rate law reads is rounded (issue #110).  Throws std::runtime_error if
+  // `ts.t_end` is not finite or is earlier than `ts.t_start`.
   //
   // Each call seeds a new RNG from `seed`; repeated calls with the same XML,
   // method, TimeSpec, overrides, molecule limit, and seed are reproducible
@@ -62,6 +64,48 @@ public:
   // in a usable state and a subsequent run() may be issued.
   Result run(const TimeSpec& ts, std::uint64_t seed = 42,
              const CancelCallback& should_continue = {});
+
+  // Runs `spec.n_reps` independent replicates of run(ts, ...) across
+  // `spec.n_threads` worker threads and returns their per-time-point mean
+  // and sample standard deviation (issue #113).
+  //
+  // Replicate `i` is seeded with `base_seed + i` and is bit-identical to
+  // run(ts, base_seed + i), so any one replicate can be reproduced alone.
+  // Statistics are accumulated in replicate order whatever order the
+  // workers finish in, so the result is bit-identical for every
+  // `n_threads`.  Parameter overrides, initial-amount overrides, the
+  // molecule limit and the bscb setting apply to every replicate, as they
+  // would to run().  Like run(), it may be called while a session is
+  // active and leaves the session untouched.
+  //
+  // This is the supported way to run replicates of one simulator in
+  // parallel: run() itself must not be called concurrently on the same
+  // instance, because it re-applies overrides to the shared parsed model.
+  //
+  // `should_continue`, if non-empty, is polled from the worker threads,
+  // one call at a time under a lock, so it need not be thread-safe itself.
+  // A `false` return stops every replicate and throws
+  // `rulemonkey::Cancelled` (or a replicate's own exception, if one had
+  // already failed); no partial result is returned.
+  //
+  // If replicates throw (an unsorted `ts.sample_times`, an allocation
+  // failure, or an exception escaping `should_continue`, including a
+  // `Cancelled` it throws itself),
+  // replicates numbered above the lowest failing one are stopped, every
+  // replicate below it runs to completion, and the lowest-numbered
+  // replicate's exception is rethrown — the same error whatever the thread
+  // count or timing.  The simulator stays usable after either kind of
+  // throw.  The molecule limit is not an error: a replicate that exceeds
+  // it stops firing and holds that state for its remaining samples, as in
+  // run(), and is averaged in like any other.  A rule's "propensity clamped
+  // to 0" warning prints once for the whole ensemble, from whichever
+  // replicate clamps it first.
+  //
+  // Throws std::runtime_error if `spec.n_reps < 1`, `spec.n_threads < 0`,
+  // or `ts.t_end` is earlier than `ts.t_start`.
+  EnsembleResult run_ensemble(const TimeSpec& ts, const EnsembleSpec& spec,
+                              std::uint64_t base_seed = 42,
+                              const CancelCallback& should_continue = {});
 
   // Runs a parameter sweep: for each value of `spec.parameter`, simulates the
   // model over `spec.per_point` and records the endpoint observable and
@@ -115,7 +159,7 @@ public:
   // `time`) — the in-process engine has no zero-sample fast path —
   // but the caller sees no `Result`.  Suitable for "equilibrate then
   // perturb then sample" flows where the equilibration trajectory
-  // is uninteresting.
+  // is uninteresting.  `time` must be finite (issue #110).
   //
   // `should_continue`, if non-empty, enables cooperative cancellation; a
   // `false` return throws `rulemonkey::Cancelled` mid-advance.  The session's
@@ -125,7 +169,10 @@ public:
   void step_to(double time, const CancelCallback& should_continue = {});
 
   // Samples a segment from the active session starting at the current session
-  // time and ending at `t_end`.
+  // time and ending at `t_end`.  Like step_to, it leaves `current_time()` at
+  // `t_end`, also when nothing is left to fire (issue #110), unless the
+  // molecule limit, a cancellation or an error stops it first.  Throws
+  // std::runtime_error if `t_end` is not finite.
   //
   // `should_continue` has the same cooperative-cancellation semantics as on
   // `run()`; if it returns false mid-segment, `Cancelled` is thrown and the
@@ -141,8 +188,10 @@ public:
   // reset) and routes through the same `run_ssa` path, which already honors
   // `TimeSpec::sample_times` (see issue #16).  The segment must start at the
   // current session time: `ts.sample_times.front()` — or `ts.t_start` when
-  // `sample_times` is empty — must equal `current_time()`.  `should_continue`
-  // has the same cooperative-cancellation semantics as the other session calls.
+  // `sample_times` is empty — must equal `current_time()`, and `ts.t_end`,
+  // which bounds the run, must be finite and not earlier than it.
+  // `should_continue` has the same cooperative-cancellation semantics as the
+  // other session calls.
   Result simulate(const TimeSpec& ts, const CancelCallback& should_continue = {});
 
   // Adds `count` default, unbound molecules of the named imported

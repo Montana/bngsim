@@ -1,9 +1,7 @@
 """Tests for SBML event support under SSA (Phase 5b).
 
-Mirrors the CVODE event tests in `test_events.py` for the cases that are
-in scope for Phase 5b: EventNoDelay only. Delay-bearing events are gated
-in C++ at SSA-run entry (delay support under SSA/PSA is issue #526); the
-rejection is also exercised here.
+Mirrors the CVODE event tests in `test_events.py`. Delayed events run under
+SSA and PSA through the same pending queue as under ODE (issue #526).
 """
 
 import math
@@ -349,57 +347,193 @@ def test_ssa_event_re_arms_after_self_falsifying_assignment():
     assert jumps >= 3, f"expected >=3 re-fires; got {jumps} (S trace max={S.max()}, min={S.min()})"
 
 
-def test_ssa_event_with_delay_is_rejected():
-    """Issue #526 tracks delay support; until then SSA must raise a clear
-    error rather than silently ignoring the delay.
-    """
-    b = ModelBuilder()
-    s_idx = b.add_species("S", 0.0)
-    b.add_event("delayed", "time() >= 1", [(s_idx, "100")], delay=0.5)
-    model = b.build()
-
-    sim = SsaSimulator(model)
-    with pytest.raises(RuntimeError, match=r"delay.*not yet supported") as excinfo:
-        sim.run(_ts(t_end=2.0, n_points=21), 1)
-    _assert_the_rejection_points_somewhere_real(str(excinfo.value), "delayed")
+# ─── Delayed events (issue #526) ────────────────────────────────────────────
+#
+# A triggered instance with a positive delay waits in a pending queue and
+# executes at its time, as under ODE: the delay read at the trigger, the values
+# frozen there (useValuesFromTriggerTime), a non-persistent event cancelled if
+# its trigger lapses first, and a row at the execution time reading its effect.
 
 
-def _assert_the_rejection_points_somewhere_real(message: str, event_id: str) -> None:
-    """Issue #526: the message named the event and the remedy, and then sent the
-    reader to "Phase 5c of the SBML SSA Support Plan", a planning document that
-    is no longer in the tree. It points at the issue that tracks the work now."""
-    assert f"Event '{event_id}'" in message
-    assert "issue #526" in message
-    assert "method='ode'" in message
-    assert "Support Plan" not in message and "Phase 5c" not in message
+def _conc(ant: str, method: str, times, seed: int = 7, species: str = "S"):
+    # The run starts at the first sample time, so every list here starts at 0.
+    model = bngsim.Model.from_antimony_string(ant)
+    kw = {"poplevel": 10} if method == "psa" else {}
+    run = bngsim.Simulator(model, method=method, **kw).run(sample_times=list(times), seed=seed)
+    return np.asarray(run.as_roadrunner([species])[species], dtype=float)
 
 
-def test_psa_event_with_delay_is_rejected_with_the_same_message():
-    """PSA reaches the same run-entry check, so it says the same thing."""
-    b = ModelBuilder()
-    s_idx = b.add_species("S", 0.0)
-    b.add_event("delayed", "time() >= 1", [(s_idx, "100")], delay=0.5)
-    model = b.build()
-
-    sim = SsaSimulator(model)
-    with pytest.raises(RuntimeError, match=r"delay.*not yet supported") as excinfo:
-        sim.run_psa(_ts(t_end=2.0, n_points=21), 1, 100.0, 0.0)
-    _assert_the_rejection_points_somewhere_real(str(excinfo.value), "delayed")
+_BOLUS_ROWS = [0.0, 1.0, 1.25, 1.5 - 5e-10, 1.5, 2.0]
 
 
-def test_ssa_event_with_delay_expression_is_rejected():
-    """Same gate as the static-delay case for state-dependent delay
-    expressions.
-    """
-    b = ModelBuilder()
-    s_idx = b.add_species("S", 1.0)
-    b.add_event("delayed_expr", "time() >= 1", [(s_idx, "100")], delay_expr="S")
-    model = b.build()
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_a_delayed_bolus_lands_at_its_time(method):
+    """Triggered at 1, executed 0.5 later: nothing before 1.5, and the row at
+    1.5 reads the effect, as a row at a `>=` event's time does."""
+    ant = "S = 0; E: at 0.5 after (time >= 1), t0=false: S = 100"
+    np.testing.assert_array_equal(_conc(ant, method, _BOLUS_ROWS), [0, 0, 0, 0, 100, 100])
 
-    sim = SsaSimulator(model)
-    with pytest.raises(RuntimeError, match=r"delay.*not yet supported") as excinfo:
-        sim.run(_ts(t_end=2.0, n_points=21), 1)
-    _assert_the_rejection_points_somewhere_real(str(excinfo.value), "delayed_expr")
+
+@pytest.mark.parametrize("method", ["ssa", "psa"])
+def test_a_delayed_execution_between_reaction_firings(method):
+    """The step a reaction would take past 1.5 stops there for the execution,
+    and the firings go on after it."""
+    ant = "species S = 0, Y = 0; J: -> Y; 20; E: at 0.5 after (time >= 1), t0=false: S = 100"
+    times = [0.0, 1.0, 1.5 - 5e-10, 1.5, 3.0]
+    np.testing.assert_array_equal(_conc(ant, method, times), [0, 0, 0, 100, 100])
+    Y = _conc(ant, method, times, species="Y")
+    assert Y[-1] > Y[2] > 0
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa"])
+def test_the_delay_is_read_at_the_trigger(method):
+    """`delay = D`, with D set to 2 by an event at 1.5: the bolus triggered at
+    1 waits the 0.5 D held then, not 2."""
+    ant = (
+        "S = 0; D = 0.5; E: at D after (time >= 1), t0=false: S = 100\n"
+        "F: at (time >= 1.2), t0=false: D = 2"
+    )
+    np.testing.assert_array_equal(_conc(ant, method, [0.0, 1.4, 1.5, 3.4]), [0, 0, 100, 100])
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa"])
+def test_values_are_frozen_at_the_trigger(method):
+    """useValuesFromTriggerTime: `S = X` executes at 2 with the X of 1 (5),
+    though an event at 1.5 has made it 9."""
+    ant = (
+        "S = 0; X = 5; E: at 1 after (time >= 1), t0=false: S = X\n"
+        "F: at (time >= 1.5), t0=false: X = 9"
+    )
+    np.testing.assert_array_equal(_conc(ant, method, [0.0, 1.9, 2.0]), [0, 0, 5])
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_a_non_persistent_event_whose_trigger_lapses_is_cancelled(method):
+    """True on [1, 1.2) only: the execution due at 1.5 does not happen. The
+    persistent event with the same trigger executes."""
+    window = "(time >= 1) && (time < 1.2)"
+    gone = f"S = 0; E: at 0.5 after {window}, t0=false, persistent=false: S = 100"
+    kept = f"S = 0; E: at 0.5 after {window}, t0=false, persistent=true: S = 100"
+    np.testing.assert_array_equal(_conc(gone, method, [1.0, 1.5, 2.0]), [0, 0, 0])
+    np.testing.assert_array_equal(_conc(kept, method, [1.0, 1.5, 2.0]), [0, 100, 100])
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa"])
+def test_a_pending_execution_carries_across_run_until(method):
+    """Triggered in the first leg, due in the second: it executes there."""
+    model = bngsim.Model.from_antimony_string(
+        "S = 0; E: at 0.5 after (time >= 1), t0=false: S = 100"
+    )
+    sim = bngsim.Simulator(model, method=method)
+    first = sim.run_until(t=1.2)
+    assert first.as_roadrunner(["S"])["S"][-1] == 0
+    second = sim.run_until(t=2.0)
+    assert second.as_roadrunner(["S"])["S"][-1] == 100
+
+
+@pytest.mark.parametrize("method", ["ssa", "psa"])
+@pytest.mark.parametrize("rate", ["2", "2 + sin(time)"], ids=["discrete", "continuous"])
+def test_a_delay_queued_by_a_firing_executes_at_its_time(rate, method):
+    """`X >= 3` rises at a firing of J1. Twins with that trigger and delay 1e-3
+    record the trigger time (frozen) and the execution time (read then), so
+    their difference is the delay. J2's time-dependent rate puts the run on the
+    continuous loop, where a firing that queues an execution and changes nothing
+    else kept its panel, whose end was fixed before the execution existed: the
+    execution ran at the next drain, a median 0.08 late over 20 seeds."""
+    d = 1e-3
+    ant = (
+        "species X = 0, Y = 0, Trig = 0, Exec = 0\n"
+        "J1: => X; 5\n"
+        f"J2: => Y; {rate}\n"
+        f"Z1: at {d} after (X >= 3), t0=false, fromTrigger=true: Trig = 1e6*time\n"
+        f"Z2: at {d} after (X >= 3), t0=false, fromTrigger=false: Exec = 1e6*time"
+    )
+    for seed in range(10):
+        trig = _conc(ant, method, [0.0, 10.0], seed=seed, species="Trig")[-1] / 1e6
+        execd = _conc(ant, method, [0.0, 10.0], seed=seed, species="Exec")[-1] / 1e6
+        assert trig > 0
+        assert execd - trig == pytest.approx(d, abs=1e-6), seed
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa"])
+def test_a_carried_execution_whose_trigger_falls_at_the_leg_start_is_cancelled(method):
+    """E (non-persistent) triggered at 0.5 waits for 1.5. Between legs G := 0
+    reads its trigger false, which cancels that execution, and p := 1 raises H
+    at the leg start, which sets G = 1 again: a new instance, due 2.0. Left for
+    the next sweep, the cancellation never came, and the old execution ran at
+    1.5 under SSA."""
+    model = bngsim.Model.from_antimony_string(
+        "species S = 0, G = 0; p = 0\n"
+        "E: at 1 after (G > 0.5), t0=false, persistent=false: S = 100\n"
+        "F: at (time >= 0.5), t0=false: G = 1\n"
+        "H: at (p > 0.5), t0=false: G = 1"
+    )
+    sim = bngsim.Simulator(model, method=method)
+    sim.run_until(t=1.0)
+    model.set_concentration("G", 0.0)
+    model.set_param("p", 1.0)
+    assert sim.run_until(t=1.75).as_roadrunner(["S"])["S"][-1] == 0
+    assert sim.run_until(t=2.25).as_roadrunner(["S"])["S"][-1] == 100
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_an_unprioritised_event_goes_before_an_execution_due_with_it(method):
+    """At 2, E's execution (`S = S + 100`, frozen at 1 as 100) comes due as F
+    rises (`S = 0`). Neither has a priority, so the immediate F goes first, as
+    under ODE, and S(3) is 100 for every seed, not 0 or 100 at random."""
+    ant = (
+        "species S = 0, Y = 0; J: => Y; 2\n"
+        "E: at 1 after (time >= 1), t0=false: S = S + 100\n"
+        "F: at (time >= 2), t0=false: S = 0"
+    )
+    seeds = range(12) if method != "ode" else [7]
+    assert [_conc(ant, method, [0.0, 3.0], seed=s)[-1] for s in seeds] == [100.0] * len(seeds)
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+def test_a_delayed_execution_raises_an_event_at_its_time(method):
+    """E's execution at 1.5 sets G, which raises F there: the row at 1.5 reads
+    both, and the one just before it neither."""
+    ant = (
+        "species S = 0, G = 0, Y = 0; J: => Y; 20\n"
+        "E: at 0.5 after (time >= 1), t0=false: G = 1\n"
+        "F: at (G > 0.5), t0=false: S = 50"
+    )
+    times = [0.0, 1.5 - 5e-10, 1.5, 2.0]
+    np.testing.assert_array_equal(_conc(ant, method, times, species="G"), [0, 0, 1, 1])
+    np.testing.assert_array_equal(_conc(ant, method, times), [0, 0, 50, 50])
+
+
+@pytest.mark.parametrize("method", ["ode", "ssa", "psa"])
+@pytest.mark.parametrize(
+    "reaction",
+    ["", "J: => Y; 20", "J: => Y; 2 + sin(time)"],
+    ids=["idle", "discrete", "continuous"],
+)
+def test_an_execution_on_the_runs_end_is_in_its_last_row(method, reaction):
+    """Due at 1.5 with the run ending there: the last row reads it, on every loop."""
+    ant = f"species S = 0, Y = 0; {reaction}\nE: at 0.5 after (time >= 1), t0=false: S = 100"
+    np.testing.assert_array_equal(_conc(ant, method, [0.0, 1.0, 1.5]), [0, 0, 100])
+
+
+def test_a_negative_delay_is_refused_by_name():
+    ant = "S = 0; D = -1; E: at D after (time >= 1), t0=false: S = 100"
+    with pytest.raises(Exception, match=r"event 'E'.*delay -1.*non-negative"):
+        _conc(ant, "ssa", [0.0, 2.0])
+
+
+def test_the_ensemble_mean_follows_the_ode_through_a_delayed_bolus():
+    """A -> at rate 1 from 100; at 1, a bolus of A + 100 frozen then, executed
+    at 2: A(3) = (100/e + 100)/e = 50.32 under ODE. The SSA mean over 400
+    seeds is within 4 standard errors of it."""
+    ant = "A = 100; J: A -> ; A; E: at 1 after (time >= 1), t0=false: A = A + 100"
+    want = _conc(ant, "ode", [0.0, 3.0], species="A")[-1]
+    assert want == pytest.approx((100 / math.e + 100) / math.e, rel=1e-5)
+    samples = np.array(
+        [_conc(ant, "ssa", [0.0, 3.0], seed=s, species="A")[-1] for s in range(400)]
+    )
+    se = samples.std(ddof=1) / math.sqrt(samples.size)
+    assert abs(samples.mean() - want) < 4 * se, (samples.mean(), want, se)
 
 
 def test_ssa_no_events_zero_overhead():

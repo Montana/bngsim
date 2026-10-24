@@ -21,11 +21,15 @@
 #include <bngsim/wallclock.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
+#include <type_traits>
 
 namespace py = pybind11;
 
@@ -233,6 +237,631 @@ static bngsim::NetworkModel::EventCarry event_carry_from_py(const py::object &ca
 // ═══════════════════════════════════════════════════════════════════════════════
 // Module definition
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Codegen structure: one walk, two outputs (issue #820) ───────────────────
+//
+// codegen_data(), codegen_jacobian_plan() and functional_jacobian_context() are
+// what the code generator reads, and the structural codegen cache key (#174) is
+// a hash of the same three. The key used to be made by walking the Python dicts
+// a value at a time (_codegen._canon_update): ~40 values a reaction, 2 s at
+// 58k reactions, on every Simulator construction that compiles. Each accessor
+// below is written once, over a sink: PySink builds the dict the generator
+// reads, KeySink writes the bytes _canon_update would feed the hasher for it.
+// A field cannot reach one without the other, so the key cannot miss a field of
+// these three that the generator reads. The two exceptions are deliberate and
+// named where they are made (kKeyStream): a parameter's value and a species'
+// initial_amount reach the dict and not the key.
+//
+// The two are equal byte for byte, not merely both injective, so a key is the
+// same whichever way it is made, and the Python walk stays as the test's
+// reference (test_codegen_key_stream.py).
+//
+// KeySink writes in place, so a walk builds one container at a time: a list
+// says how many items it will hold when it is opened, and a value is made
+// where it is pushed or set, not ahead of time. KeySink throws if a walk
+// breaks either rule. Nothing falls back to the Python walk then:
+// compute_model_codegen_hash raises, and its callers key the .so on the
+// generated source instead (#174's fallback), which is slow but never a wrong
+// key.
+
+namespace codegen_visit {
+
+template <class> inline constexpr bool always_false = false;
+
+// Builds the Python objects the accessors have always returned.
+struct PySink {
+    // Every field is built; KeySink leaves out the values the key drops.
+    static constexpr bool kKeyStream = false;
+    using Obj = py::object;
+    using List = py::list;
+    using Dict = py::dict;
+
+    Obj boolean(bool v) { return py::bool_(v); }
+    template <class I> Obj integer(I v) { return py::int_(v); }
+    Obj real(double v) { return py::float_(v); }
+    Obj str(std::string_view v) { return py::str(v.data(), v.size()); }
+    List list(size_t) { return py::list(); }
+    void push(List &l, Obj o) { l.append(std::move(o)); }
+    Obj done(List &l) { return std::move(l); }
+    Obj done_tuple(List &l) { return py::tuple(l); }
+    Dict dict() { return py::dict(); }
+    void set(Dict &d, std::string_view k, Obj o) { d[py::str(k.data(), k.size())] = std::move(o); }
+    Obj done(Dict &d) { return std::move(d); }
+    // Copied, so the emitter never materializes a Python int per entry.
+    Obj int64_array(const std::vector<int64_t> &v) {
+        return py::array_t<int64_t>(static_cast<py::ssize_t>(v.size()), v.data());
+    }
+};
+
+// Writes what _codegen._canon_update feeds the hasher for the object PySink
+// builds: type-tagged, length-prefixed, dict keys sorted, a float as its
+// little-endian IEEE-754 bits.
+class KeySink {
+  public:
+    static constexpr bool kKeyStream = true;
+    struct Obj {}; // the value is already in the stream
+    struct List {
+        size_t id;
+        size_t declared;
+        size_t n = 0;
+    };
+    struct Dict {
+        size_t id;
+        size_t start;      // where the dict's fields begin in the stream
+        size_t first;      // its first entry in fields_
+        size_t cursor = 0; // where its next value begins
+    };
+
+    std::string out;
+
+    Obj boolean(bool v) {
+        out += v ? 'T' : 'F';
+        return {};
+    }
+    template <class I> Obj integer(I v) {
+        char buf[32];
+        auto res = std::to_chars(buf, buf + sizeof buf, v);
+        tagged('i', std::string_view(buf, static_cast<size_t>(res.ptr - buf)));
+        return {};
+    }
+    Obj real(double v) {
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof bits);
+        char buf[9] = {'f'};
+        for (int i = 0; i < 8; ++i)
+            buf[1 + i] = static_cast<char>((bits >> (8 * i)) & 0xffu);
+        out.append(buf, sizeof buf);
+        return {};
+    }
+    Obj str(std::string_view v) {
+        tagged('s', v);
+        return {};
+    }
+
+    List list(size_t n) {
+        out += '[';
+        count(n);
+        out += ':';
+        open_.push_back(++serial_);
+        return {serial_, n};
+    }
+    void push(List &l, Obj) {
+        require_top(l.id);
+        ++l.n;
+    }
+    Obj done(List &l) {
+        require_top(l.id);
+        if (l.n != l.declared)
+            throw std::logic_error("codegen key stream: a list held a different number of items "
+                                   "than it said it would");
+        open_.pop_back();
+        return {};
+    }
+    Obj done_tuple(List &l) { return done(l); }
+
+    Dict dict() {
+        open_.push_back(++serial_);
+        return {serial_, out.size(), fields_.size(), out.size()};
+    }
+    // The value was just written, from where the last one ended.
+    void set(Dict &d, std::string_view k, Obj) {
+        require_top(d.id);
+        fields_.push_back({k, d.cursor, out.size()});
+        d.cursor = out.size();
+    }
+    // Sorted by key as Python sorts str: UTF-8 byte order is code point order.
+    // A key set twice keeps the last value, as a dict does.
+    Obj done(Dict &d) {
+        require_top(d.id);
+        if (d.cursor != out.size())
+            throw std::logic_error("codegen key stream: a dict was closed with a value not set");
+        open_.pop_back();
+        auto first = fields_.begin() + static_cast<std::ptrdiff_t>(d.first);
+        // Stable either way. Most dicts here have a handful of fields, which an
+        // insertion sort orders without the buffer stable_sort allocates; a
+        // function map can have tens of thousands.
+        if (fields_.end() - first <= 32) {
+            for (auto it = first; it != fields_.end(); ++it)
+                for (auto j = it; j != first && j->key < (j - 1)->key; --j)
+                    std::iter_swap(j, j - 1);
+        } else {
+            std::stable_sort(first, fields_.end(),
+                             [](const Field &a, const Field &b) { return a.key < b.key; });
+        }
+        size_t n = 0;
+        for (auto it = first; it != fields_.end(); ++it)
+            if (it + 1 == fields_.end() || (it + 1)->key != it->key)
+                ++n;
+        scratch_.clear();
+        scratch_ += '{';
+        std::swap(out, scratch_);
+        count(n);
+        std::swap(out, scratch_);
+        scratch_ += ':';
+        for (auto it = first; it != fields_.end(); ++it) {
+            if (it + 1 != fields_.end() && (it + 1)->key == it->key)
+                continue;
+            scratch_ += 's';
+            std::swap(out, scratch_);
+            count(it->key.size());
+            std::swap(out, scratch_);
+            scratch_ += ':';
+            scratch_ += it->key;
+            scratch_.append(out, it->begin, it->end - it->begin);
+        }
+        fields_.resize(d.first);
+        out.resize(d.start);
+        out += scratch_;
+        return {};
+    }
+    // An array goes in as its dtype, its shape and its values.
+    Obj int64_array(const std::vector<int64_t> &v) {
+        out += 'a';
+        str("int64");
+        auto shape = list(1);
+        push(shape, integer(v.size()));
+        done(shape);
+        auto vals = list(v.size());
+        for (int64_t x : v)
+            push(vals, integer(x));
+        done(vals);
+        return {};
+    }
+
+    bool closed() const { return open_.empty(); }
+
+  private:
+    struct Field {
+        std::string_view key;
+        size_t begin, end;
+    };
+    std::vector<Field> fields_;
+    std::vector<size_t> open_;
+    size_t serial_ = 0;
+    std::string scratch_;
+
+    void count(size_t n) {
+        char buf[32];
+        auto res = std::to_chars(buf, buf + sizeof buf, n);
+        out.append(buf, static_cast<size_t>(res.ptr - buf));
+    }
+    void tagged(char tag, std::string_view payload) {
+        out += tag;
+        count(payload.size());
+        out += ':';
+        out += payload;
+    }
+    void require_top(size_t id) const {
+        if (open_.empty() || open_.back() != id)
+            throw std::logic_error("codegen key stream: a walk wrote into a container that was "
+                                   "not the innermost one open");
+    }
+};
+
+// One value, by its C++ type, as pybind11 would cast it.
+template <class S, class T> typename S::Obj val(S &s, const T &v) {
+    if constexpr (std::is_same_v<T, bool>)
+        return s.boolean(v);
+    else if constexpr (std::is_integral_v<T>)
+        return s.integer(v);
+    else if constexpr (std::is_floating_point_v<T>)
+        return s.real(static_cast<double>(v));
+    else if constexpr (std::is_convertible_v<const T &, std::string_view>)
+        return s.str(std::string_view(v));
+    else
+        static_assert(always_false<T>, "no codegen_visit encoding for this type");
+}
+
+template <class S, class T> typename S::Obj seq(S &s, const std::vector<T> &v) {
+    auto l = s.list(v.size());
+    for (const auto &x : v)
+        s.push(l, val(s, x));
+    return s.done(l);
+}
+
+// A two-tuple. Its items are made one after the other, not as two arguments of
+// one call, whose order C++ leaves open.
+template <class S, class A, class B> typename S::Obj pair(S &s, const A &a, const B &b) {
+    if constexpr (S::kKeyStream) {
+        auto t = s.list(2);
+        s.push(t, val(s, a));
+        s.push(t, val(s, b));
+        return s.done_tuple(t);
+    } else {
+        return py::make_tuple(val(s, a), val(s, b));
+    }
+}
+
+// codegen_data(): the model as the code generator reads it.
+template <class S> typename S::Obj codegen_data(const bngsim::NetworkModel &m, S &s) {
+    auto d = s.dict();
+
+    // Parameters: [{name, value, is_const, expression}, ...]
+    // is_const / expression let the model-based sensitivity codegen
+    // chain-rule through derived rate constants like the .net path
+    // does (closes #15).
+    const auto &params = m.parameters();
+    auto param_list = s.list(params.size());
+    for (const auto &p : params) {
+        auto pd = s.dict();
+        s.set(pd, "name", val(s, p.name));
+        // The one value the key leaves out: the generated C reads a parameter
+        // from p[] at run time, which is what lets one .so serve every point of
+        // a fit. (The issue #68 switch gate, the one place a value can still
+        // decide the source, goes into the key as its verdict instead.)
+        if constexpr (!S::kKeyStream)
+            s.set(pd, "value", val(s, p.value));
+        s.set(pd, "is_const", val(s, !p.is_expression));
+        s.set(pd, "expression", val(s, p.expression));
+        s.push(param_list, s.done(pd));
+    }
+    s.set(d, "parameters", s.done(param_list));
+
+    // Species: [(name, fixed, volume_factor, amount_valued), ...]
+    const auto &species = m.species();
+    auto sp_list = s.list(species.size());
+    for (const auto &sp : species) {
+        auto sd = s.dict();
+        s.set(sd, "name", val(s, sp.name));
+        s.set(sd, "fixed", val(s, sp.fixed));
+        s.set(sd, "volume_factor", val(s, sp.volume_factor));
+        s.set(sd, "amount_valued", val(s, sp.amount_valued));
+        s.set(sd, "reported", val(s, sp.reported));                         // GH #71
+        s.set(sd, "ode_live_volume_idx0", val(s, sp.ode_live_volume_idx0)); // GH #144 case 4
+        s.set(sd, "report_rateof_amount", val(s, sp.report_rateof_amount)); // GH #231 sub-cluster 3
+        s.set(sd, "continuous", val(s, sp.continuous));                     // issue #718
+        // (#170) Which parameter `volume_factor` IS, so the emitter can
+        // write `p[k]` where it used to write the number. -1 ⇒ no
+        // parameter (a `.net` species, or a promoted compartment).
+        s.set(sd, "volume_param_idx0", val(s, sp.volume_param_idx0));
+        // The declared amount a volume write re-divides (#170), only when set.
+        // It is exported for make_subset_model; no emitter reads it, and as a
+        // value it would split one source into a key per initial condition.
+        if constexpr (!S::kKeyStream)
+            if (!std::isnan(sp.initial_amount))
+                s.set(sd, "initial_amount", val(s, sp.initial_amount));
+        s.push(sp_list, s.done(sd));
+    }
+    s.set(d, "species", s.done(sp_list));
+
+    // Observables: [(name, [(species_idx_0based, factor), ...]), ...]
+    const auto &observables = m.observables();
+    auto obs_list = s.list(observables.size());
+    for (const auto &o : observables) {
+        auto od = s.dict();
+        s.set(od, "name", val(s, o.name));
+        auto entries = s.list(o.entries.size());
+        // Convert 1-based species index to 0-based
+        for (const auto &e : o.entries)
+            s.push(entries, pair(s, e.species_index - 1, e.factor));
+        s.set(od, "entries", s.done(entries));
+        s.push(obs_list, s.done(od));
+    }
+    s.set(d, "observables", s.done(obs_list));
+
+    // Functions: [(name, expression), ...]
+    const auto &functions = m.functions();
+    auto func_list = s.list(functions.size());
+    for (const auto &f : functions) {
+        auto fd = s.dict();
+        s.set(fd, "name", val(s, f.name));
+        s.set(fd, "expression", val(s, f.expression));
+        // GH #333: the expression the VALUE is computed from, when it
+        // differs from the declared one. Empty for every function the
+        // zero-base logarithm guard did not rewrite. The RHS emitter
+        // prefers it; every emitter that DIFFERENTIATES keeps reading
+        // "expression", which is the smooth declared law.
+        s.set(fd, "eval_expression", val(s, f.eval_expression));
+        s.push(func_list, s.done(fd));
+    }
+    s.set(d, "functions", s.done(func_list));
+    // How many probes more than one the right-hand side makes for
+    // a derivative that reads a nested rateOf, which the emitted
+    // one has to make as well (lanl/bngsim#991); and how many more
+    // a refresh of the rateOf buffer makes at a row, a stop or an
+    // event, which counts what anything reads.
+    s.set(d, "rateof_flow_nesting", val(s, m.rateof_flow_nesting()));
+    s.set(d, "rateof_nesting", val(s, m.rateof_nesting()));
+    // ...and why there is no right-hand side to emit at all, where
+    // derivatives read each other's rateOf in a ring.
+    s.set(d, "rateof_ring_refusal", val(s, m.rateof_ring_refusal()));
+
+    // Reactions: [(type, function_name, stat_factor, reactants_0based,
+    // products_0based), ...]
+    const auto &reactions = m.reactions();
+    auto rxn_list = s.list(reactions.size());
+    const auto present = [](const std::vector<int> &v) {
+        return static_cast<size_t>(std::count_if(v.begin(), v.end(), [](int i) { return i > 0; }));
+    };
+    for (const auto &r : reactions) {
+        auto rd = s.dict();
+        // Rate law type as string
+        switch (r.rate_law_type) {
+        case bngsim::RateLawType::Elementary:
+            s.set(rd, "type", s.str("elementary"));
+            break;
+        case bngsim::RateLawType::Functional:
+            s.set(rd, "type", s.str("functional"));
+            break;
+        case bngsim::RateLawType::MichaelisMenten:
+            s.set(rd, "type", s.str("mm"));
+            break;
+        }
+        s.set(rd, "function_name", val(s, r.function_name));
+        s.set(rd, "stat_factor", val(s, r.stat_factor));
+        s.set(rd, "apply_species_factor", val(s, r.apply_species_factor));
+        s.set(rd, "ssa_volume_factor", val(s, r.ssa_volume_factor));
+        s.set(rd, "per_species_volume_scaling", val(s, r.per_species_volume_scaling));
+        s.set(rd, "is_rate_rule_ode", val(s, r.is_rate_rule_ode));
+        s.set(rd, "ssa_live_volume_idx0", val(s, r.ssa_live_volume_idx0));
+        s.set(rd, "ssa_live_volume_exp", val(s, r.ssa_live_volume_exp));
+        // GH #144 case 4: cross-compartment SSA live-volume terms.
+        auto live_terms = s.list(r.ssa_live_volume_terms.size());
+        for (const auto &lt : r.ssa_live_volume_terms) {
+            auto td = s.dict();
+            s.set(td, "live_idx0", val(s, lt.live_idx0));
+            s.set(td, "v_static", val(s, lt.v_static));
+            s.set(td, "exp", val(s, lt.exp));
+            s.push(live_terms, s.done(td));
+        }
+        s.set(rd, "ssa_live_volume_terms", s.done(live_terms));
+        // Exported only when set, so a model without them keeps its
+        // structural codegen key.
+        if (r.ssa_volume_param_idx0 >= 0)
+            s.set(rd, "ssa_volume_param_idx0", val(s, r.ssa_volume_param_idx0)); // #170
+        if (!r.ssa_falling_factorial.empty()) {
+            auto ff = s.list(r.ssa_falling_factorial.size());
+            for (const auto &[si, mult] : r.ssa_falling_factorial)
+                s.push(ff, pair(s, si, mult));
+            s.set(rd, "ssa_falling_factorial", s.done(ff));
+        }
+        s.set(rd, "ode_only", val(s, r.ode_only));
+        // Convert 1-based indices to 0-based, filter nulls (0 in 1-based)
+        auto reactants = s.list(present(r.reactant_indices));
+        for (int idx : r.reactant_indices)
+            if (idx > 0)
+                s.push(reactants, val(s, idx - 1));
+        s.set(rd, "reactants", s.done(reactants));
+        auto products = s.list(present(r.product_indices));
+        for (int idx : r.product_indices)
+            if (idx > 0)
+                s.push(products, val(s, idx - 1));
+        s.set(rd, "products", s.done(products));
+        // Rate law parameter indices (0-based) for Elementary/MM
+        auto rate_params = s.list(r.rate_law_param_indices.size());
+        for (int idx : r.rate_law_param_indices)
+            s.push(rate_params, val(s, idx - 1)); // 1-based to 0-based
+        s.set(rd, "rate_param_indices", s.done(rate_params));
+        s.push(rxn_list, s.done(rd));
+    }
+    s.set(d, "reactions", s.done(rxn_list));
+
+    // Table functions: [{name, index_kind, index_param_idx,
+    // index_obs_idx, index_func_idx, step}, ...] in dispatch-id
+    // order. Lets the model-based codegen path emit
+    //   data->tfun_eval(tf_id, idx_c, data->tfun_ctx)
+    // for any BNGL function whose name appears here. Empty
+    // for SBML/Antimony models without tfuns.
+    const auto specs = m.table_function_specs();
+    auto tf_list = s.list(specs.size());
+    for (const auto &spec : specs) {
+        auto td = s.dict();
+        s.set(td, "name", val(s, spec.name));
+        s.set(td, "index_kind", val(s, spec.index_kind));
+        s.set(td, "index_param_idx", val(s, spec.index_param_idx));
+        s.set(td, "index_obs_idx", val(s, spec.index_obs_idx));
+        s.set(td, "index_func_idx", val(s, spec.index_func_idx));
+        s.set(td, "step", val(s, spec.step));
+        s.push(tf_list, s.done(td));
+    }
+    s.set(d, "table_functions", s.done(tf_list));
+
+    return s.done(d);
+}
+
+// codegen_jacobian_plan(): dense analytical-Jacobian scatter plan for the
+// codegen .so (GH #76 Task 4). Serializes exactly what NetworkModel::
+// fill_dense_analytical_jacobian iterates for the Elementary + MM blocks — rows
+// pre-resolved through the CSC sparsity so the Python emitter never sees CSC
+// indices. The Functional contributions are NOT serialized here: the codegen
+// emitter reconstructs them from functional_jacobian_context() the same way
+// attach_functional_jacobian does (the derivative *math* lives in the Python
+// symbolic core, not in the compiled ExprTk eval_ids). `available` mirrors
+// analytical_jacobian_complete() so the emitter only emits when the
+// interpreted analytical Jacobian is itself complete; nnz/density/has_klu let
+// the emitter skip models that take the sparse KLU path (dense codegen
+// Jacobian is the only path wired so far).
+template <class S> typename S::Obj codegen_jacobian_plan(const bngsim::NetworkModel &self, S &s) {
+    auto out = s.dict();
+    const bool avail = self.analytical_jacobian_complete();
+    const int ns = self.n_species();
+    const auto &sp = self.jacobian_sparsity();
+    s.set(out, "available", val(s, avail));
+    s.set(out, "n_species", val(s, ns));
+    s.set(out, "nnz", val(s, sp.nnz));
+    s.set(out, "density", val(s, sp.density));
+#ifdef BNGSIM_HAS_KLU
+    s.set(out, "has_klu", s.boolean(true));
+#else
+    s.set(out, "has_klu", s.boolean(false));
+#endif
+    // The route the solver takes with default options — the shared rule,
+    // LU-fill test included — so the emitter builds the Jacobian shape
+    // that will be factored rather than re-deriving the rule.
+    s.set(out, "routes_sparse",
+          val(s, bngsim::route_to_sparse_linear_solver(sp, ns, "auto", false, false,
+                                                       bngsim::routing_lu_fill(self, ns, "auto"))));
+    if (!avail) {
+        for (const char *k : {"elementary", "mm", "fixed_rows"}) {
+            auto empty = s.list(0);
+            s.set(out, k, s.done(empty));
+        }
+        return s.done(out);
+    }
+    // GH #162: CSC structure for the sparse codegen emitter. The
+    // Functional scatter and fixed-row zeroing map (col, row) →
+    // data index — the dense path's pre-resolved rows discard the
+    // index, and Elementary/MM carry theirs via affected_csc below.
+    // Exposed as int64 arrays (copied) so the emitter never
+    // materializes nnz Python ints for the columns it skips.
+    s.set(out, "col_ptrs", s.int64_array(sp.col_ptrs));
+    s.set(out, "row_indices", s.int64_array(sp.row_indices));
+
+    const auto &ajd = self.analytical_jacobian();
+    // Elementary mass-action closed-form scatter (mirrors the
+    // first block of fill_dense_analytical_jacobian).
+    const auto scattered = [](const auto &rt) {
+        return rt.rate_param_idx0 >= 0 && !rt.reactants.empty();
+    };
+    auto elem = s.list(
+        static_cast<size_t>(std::count_if(ajd.reactions.begin(), ajd.reactions.end(), scattered)));
+    for (const auto &rt : ajd.reactions) {
+        if (!scattered(rt))
+            continue;
+        auto rd = s.dict();
+        s.set(rd, "rate_param_idx0", val(s, rt.rate_param_idx0));
+        s.set(rd, "stat_factor", val(s, rt.stat_factor));
+        s.set(rd, "amount_factor", val(s, rt.amount_factor));
+        // (#170 stage 2) The same amount factors, in the same fold
+        // order, tagged with the compartment-size parameter each
+        // came from — so the emitted C can read a written volume
+        // instead of baking this load's. Empty (the pre-#170 shape)
+        // unless at least one is live, in which case the emitter
+        // keeps using the folded `amount_factor` above.
+        auto avt = s.list(rt.amount_volume_terms.size());
+        for (const auto &[k, v] : rt.amount_volume_terms)
+            s.push(avt, pair(s, k, v));
+        s.set(rd, "amount_volume_terms", s.done(avt));
+        auto reactants = s.list(rt.reactants.size());
+        for (const auto &pr : rt.reactants) {
+            auto prd = s.dict();
+            s.set(prd, "species_idx", val(s, pr.species_idx));
+            s.set(prd, "multiplicity", val(s, pr.multiplicity));
+            auto others = s.list(pr.others.size());
+            for (const auto &o : pr.others)
+                s.push(others, pair(s, o.species_idx, o.multiplicity));
+            s.set(prd, "others", s.done(others));
+            auto affected = s.list(pr.affected.size());
+            for (const auto &[csc, stoich] : pr.affected)
+                s.push(affected, pair(s, static_cast<int>(sp.row_indices[csc]), stoich));
+            s.set(prd, "affected", s.done(affected));
+            // GH #162: raw CSC data index for the sparse emitter
+            // (jac_data[csc] += …) — the dense path keeps the
+            // pre-resolved row above.
+            auto affected_csc = s.list(pr.affected.size());
+            for (const auto &[csc, stoich] : pr.affected)
+                s.push(affected_csc, pair(s, static_cast<int64_t>(csc), stoich));
+            s.set(prd, "affected_csc", s.done(affected_csc));
+            s.push(reactants, s.done(prd));
+        }
+        s.set(rd, "reactants", s.done(reactants));
+        s.push(elem, s.done(rd));
+    }
+    s.set(out, "elementary", s.done(elem));
+
+    // Michaelis–Menten (tQSSA) closed-form scatter (second block).
+    auto mm = s.list(ajd.mm_reactions.size());
+    for (const auto &mt : ajd.mm_reactions) {
+        auto md = s.dict();
+        s.set(md, "e_idx", val(s, mt.e_idx));
+        s.set(md, "s_idx", val(s, mt.s_idx));
+        s.set(md, "kcat_param_idx0", val(s, mt.kcat_param_idx0));
+        s.set(md, "km_param_idx0", val(s, mt.km_param_idx0));
+        s.set(md, "stat_factor", val(s, mt.stat_factor));
+        const auto rows = [&](const auto &affected) {
+            auto l = s.list(affected.size());
+            for (const auto &[csc, coeff] : affected)
+                s.push(l, pair(s, static_cast<int>(sp.row_indices[csc]), coeff));
+            return s.done(l);
+        };
+        const auto cscs = [&](const auto &affected) {
+            auto l = s.list(affected.size());
+            for (const auto &[csc, coeff] : affected)
+                s.push(l, pair(s, static_cast<int64_t>(csc), coeff));
+            return s.done(l);
+        };
+        s.set(md, "e_affected", rows(mt.e_affected));
+        s.set(md, "s_affected", rows(mt.s_affected));
+        s.set(md, "e_affected_csc", cscs(mt.e_affected));
+        s.set(md, "s_affected_csc", cscs(mt.s_affected));
+        s.push(mm, s.done(md));
+    }
+    s.set(out, "mm", s.done(mm));
+
+    // Fixed (boundary-condition) species rows (final block).
+    const auto &species = self.species();
+    auto fixed_rows = s.list(static_cast<size_t>(std::count_if(
+        species.begin(), species.end(), [](const auto &x) { return static_cast<bool>(x.fixed); })));
+    for (int i = 0; i < static_cast<int>(species.size()); ++i)
+        if (species[i].fixed)
+            s.push(fixed_rows, val(s, i));
+    s.set(out, "fixed_rows", s.done(fixed_rows));
+    return s.done(out);
+}
+
+// functional_jacobian_context(): what the Python differentiator reads (GH #76).
+template <class S>
+typename S::Obj functional_jacobian_context(const bngsim::NetworkModel &self, S &s) {
+    const auto ctx = self.functional_jacobian_context();
+    auto out = s.dict();
+    auto rxns = s.list(ctx.functional_reactions.size());
+    for (const auto &r : ctx.functional_reactions) {
+        auto d = s.dict();
+        s.set(d, "rxn_idx", val(s, r.rxn_idx));
+        s.set(d, "rate_expr", val(s, r.rate_expr));
+        s.set(d, "apply_species_factor", val(s, r.apply_species_factor));
+        s.set(d, "reactant_idx0", seq(s, r.reactant_idx0));
+        s.set(d, "product_idx0", seq(s, r.product_idx0));
+        s.set(d, "stat_factor", val(s, r.stat_factor));
+        s.set(d, "per_species_volume_scaling", val(s, r.per_species_volume_scaling));
+        s.push(rxns, s.done(d));
+    }
+    s.set(out, "functional_reactions", s.done(rxns));
+    auto fmap = s.dict();
+    for (const auto &kv : ctx.function_map)
+        s.set(fmap, kv.first, val(s, kv.second));
+    s.set(out, "function_map", s.done(fmap));
+    auto obs = s.list(ctx.observables.size());
+    for (const auto &ob : ctx.observables) {
+        auto t = s.list(2);
+        s.push(t, val(s, ob.first));
+        auto entries = s.list(ob.second.size());
+        for (const auto &e : ob.second)
+            s.push(entries, pair(s, e.first, e.second));
+        s.push(t, s.done(entries));
+        s.push(obs, s.done_tuple(t));
+    }
+    s.set(out, "observables", s.done(obs));
+    auto smeta = s.list(ctx.species_meta.size());
+    for (const auto &sm : ctx.species_meta)
+        s.push(smeta, pair(s, sm.first, sm.second));
+    s.set(out, "species_meta", s.done(smeta));
+    s.set(out, "species_volume_param", seq(s, ctx.species_volume_param));
+    s.set(out, "constant_names", seq(s, ctx.constant_names));
+    return s.done(out);
+}
+
+} // namespace codegen_visit
 
 PYBIND11_MODULE(_bngsim_core, m) {
     m.doc() = "bngsim C++ engine bindings (low-level)";
@@ -623,6 +1252,17 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "judged over the whole right-hand side, as before; an empty entry means "
             "no listed rate law reads it, so the crossing is continuous. A jump the "
             "listed reactions do not account for is judged as before.")
+        .def(
+            "set_state_switch_guards",
+            [](bngsim::SolverOptions &self, const std::vector<std::string> &guards) {
+                self.sensitivity.state_switch_guards = guards;
+            },
+            py::arg("guards"),
+            "Parallel to set_state_switch_conditions (issue #1147): for each, the "
+            "if() branches its step or bend calls switch a rate law in, as an "
+            "expression that reads 1 where one of them is on, or an empty string "
+            "where one of its readings stands in no branch. A plain run steps on "
+            "through a crossing whose every branch is off rather than restart.")
         .def(
             "set_state_switch_conditions",
             [](bngsim::SolverOptions &self, const std::vector<std::string> &conditions) {
@@ -1595,40 +2235,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def(
             "functional_jacobian_context",
             [](const bngsim::NetworkModel &self) {
-                auto ctx = self.functional_jacobian_context();
-                py::list rxns;
-                for (const auto &r : ctx.functional_reactions) {
-                    py::dict d;
-                    d["rxn_idx"] = r.rxn_idx;
-                    d["rate_expr"] = r.rate_expr;
-                    d["apply_species_factor"] = r.apply_species_factor;
-                    d["reactant_idx0"] = py::cast(r.reactant_idx0);
-                    d["product_idx0"] = py::cast(r.product_idx0);
-                    d["stat_factor"] = r.stat_factor;
-                    d["per_species_volume_scaling"] = r.per_species_volume_scaling;
-                    rxns.append(std::move(d));
-                }
-                py::dict fmap;
-                for (const auto &kv : ctx.function_map)
-                    fmap[py::str(kv.first)] = kv.second;
-                py::list obs;
-                for (const auto &ob : ctx.observables) {
-                    py::list entries;
-                    for (const auto &e : ob.second)
-                        entries.append(py::make_tuple(e.first, e.second));
-                    obs.append(py::make_tuple(ob.first, std::move(entries)));
-                }
-                py::list smeta;
-                for (const auto &m : ctx.species_meta)
-                    smeta.append(py::make_tuple(m.first, m.second));
-                py::dict out;
-                out["functional_reactions"] = std::move(rxns);
-                out["function_map"] = std::move(fmap);
-                out["observables"] = std::move(obs);
-                out["species_meta"] = std::move(smeta);
-                out["species_volume_param"] = py::cast(ctx.species_volume_param);
-                out["constant_names"] = py::cast(ctx.constant_names);
-                return out;
+                codegen_visit::PySink sink;
+                return py::dict(codegen_visit::functional_jacobian_context(self, sink));
             },
             "Read-only context for the Python analytical-Jacobian differentiator (GH #76).")
 
@@ -1816,6 +2424,31 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, "
             "stepped by the steady-state solver's own rule. Issue #523.")
         .def(
+            "fill_dense_fd_jacobian_own_step",
+            [](bngsim::NetworkModel &self, double t,
+               py::array_t<double, py::array::c_style | py::array::forcecast> conc,
+               py::array_t<double, py::array::f_style | py::array::forcecast> floored) {
+                const double *y = state_arg(self, conc, "fill_dense_fd_jacobian_own_step");
+                const int ns = self.n_species();
+                if (floored.ndim() != 2 || floored.shape(0) != ns || floored.shape(1) != ns) {
+                    throw py::value_error("fill_dense_fd_jacobian_own_step: floored must be "
+                                          "(n_species, n_species)");
+                }
+                std::vector<double> jac(static_cast<size_t>(ns) * ns, 0.0);
+                std::vector<int> changed;
+                if (ns > 0) {
+                    py::gil_scoped_release release;
+                    changed =
+                        self.fill_dense_fd_jacobian_own_step(t, y, floored.data(), jac.data());
+                }
+                return py::make_tuple(colmajor_to_ndarray_2d(jac, ns), changed);
+            },
+            py::arg("t"), py::arg("conc"), py::arg("floored"),
+            "The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the "
+            "same point) with the columns of species far below the state's scale taken "
+            "at their own step where the rules of fd_own_step_columns allow, and the "
+            "species (0-based) whose columns that changed. Issue #1002.")
+        .def(
             "fill_sparse_analytical_jacobian",
             [](bngsim::NetworkModel &self, double t,
                py::array_t<double, py::array::c_style | py::array::forcecast> conc) {
@@ -1924,130 +2557,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "updates. Issue #523.")
 
         // Dense analytical-Jacobian scatter plan for the codegen .so (GH #76
-        // Task 4). Serializes exactly what NetworkModel::fill_dense_analytical_
-        // jacobian iterates for the Elementary + MM blocks — rows pre-resolved
-        // through the CSC sparsity so the Python emitter never sees CSC indices.
-        // The Functional contributions are NOT serialized here: the codegen
-        // emitter reconstructs them from functional_jacobian_context() the same
-        // way attach_functional_jacobian does (the derivative *math* lives in the
-        // Python symbolic core, not in the compiled ExprTk eval_ids). `available`
-        // mirrors analytical_jacobian_complete() so the emitter only emits when
-        // the interpreted analytical Jacobian is itself complete; nnz/density/
-        // has_klu let the emitter skip models that take the sparse KLU path
-        // (dense codegen Jacobian is the only path wired so far).
+        // Task 4); see codegen_visit::codegen_jacobian_plan.
         .def(
             "codegen_jacobian_plan",
             [](const bngsim::NetworkModel &self) {
-                py::dict out;
-                const bool avail = self.analytical_jacobian_complete();
-                const int ns = self.n_species();
-                const auto &sp = self.jacobian_sparsity();
-                out["available"] = avail;
-                out["n_species"] = ns;
-                out["nnz"] = sp.nnz;
-                out["density"] = sp.density;
-#ifdef BNGSIM_HAS_KLU
-                out["has_klu"] = true;
-#else
-                out["has_klu"] = false;
-#endif
-                // The route the solver takes with default options — the shared rule,
-                // LU-fill test included — so the emitter builds the Jacobian shape
-                // that will be factored rather than re-deriving the rule.
-                out["routes_sparse"] = bngsim::route_to_sparse_linear_solver(
-                    sp, ns, "auto", false, false, bngsim::routing_lu_fill(self, ns, "auto"));
-                py::list elem, mm, fixed_rows;
-                if (avail) {
-                    const auto &ajd = self.analytical_jacobian();
-                    // Elementary mass-action closed-form scatter (mirrors the
-                    // first block of fill_dense_analytical_jacobian).
-                    for (const auto &rt : ajd.reactions) {
-                        if (rt.rate_param_idx0 < 0 || rt.reactants.empty())
-                            continue;
-                        py::dict rd;
-                        rd["rate_param_idx0"] = rt.rate_param_idx0;
-                        rd["stat_factor"] = rt.stat_factor;
-                        rd["amount_factor"] = rt.amount_factor;
-                        // (#170 stage 2) The same amount factors, in the same fold
-                        // order, tagged with the compartment-size parameter each
-                        // came from — so the emitted C can read a written volume
-                        // instead of baking this load's. Empty (the pre-#170 shape)
-                        // unless at least one is live, in which case the emitter
-                        // keeps using the folded `amount_factor` above.
-                        py::list avt;
-                        for (const auto &[k, v] : rt.amount_volume_terms)
-                            avt.append(py::make_tuple(k, v));
-                        rd["amount_volume_terms"] = std::move(avt);
-                        py::list reactants;
-                        for (const auto &pr : rt.reactants) {
-                            py::dict prd;
-                            prd["species_idx"] = pr.species_idx;
-                            prd["multiplicity"] = pr.multiplicity;
-                            py::list others;
-                            for (const auto &o : pr.others)
-                                others.append(py::make_tuple(o.species_idx, o.multiplicity));
-                            prd["others"] = others;
-                            py::list affected;
-                            py::list affected_csc;
-                            for (const auto &[csc, stoich] : pr.affected) {
-                                affected.append(
-                                    py::make_tuple(static_cast<int>(sp.row_indices[csc]), stoich));
-                                // GH #162: raw CSC data index for the sparse emitter
-                                // (jac_data[csc] += …) — the dense path keeps the
-                                // pre-resolved row above.
-                                affected_csc.append(
-                                    py::make_tuple(static_cast<int64_t>(csc), stoich));
-                            }
-                            prd["affected"] = affected;
-                            prd["affected_csc"] = affected_csc;
-                            reactants.append(std::move(prd));
-                        }
-                        rd["reactants"] = std::move(reactants);
-                        elem.append(std::move(rd));
-                    }
-                    // Michaelis–Menten (tQSSA) closed-form scatter (second block).
-                    for (const auto &mt : ajd.mm_reactions) {
-                        py::dict md;
-                        md["e_idx"] = mt.e_idx;
-                        md["s_idx"] = mt.s_idx;
-                        md["kcat_param_idx0"] = mt.kcat_param_idx0;
-                        md["km_param_idx0"] = mt.km_param_idx0;
-                        md["stat_factor"] = mt.stat_factor;
-                        py::list ea, sa, ea_csc, sa_csc;
-                        for (const auto &[csc, coeff] : mt.e_affected) {
-                            ea.append(py::make_tuple(static_cast<int>(sp.row_indices[csc]), coeff));
-                            ea_csc.append(py::make_tuple(static_cast<int64_t>(csc), coeff));
-                        }
-                        for (const auto &[csc, coeff] : mt.s_affected) {
-                            sa.append(py::make_tuple(static_cast<int>(sp.row_indices[csc]), coeff));
-                            sa_csc.append(py::make_tuple(static_cast<int64_t>(csc), coeff));
-                        }
-                        md["e_affected"] = std::move(ea);
-                        md["s_affected"] = std::move(sa);
-                        md["e_affected_csc"] = std::move(ea_csc);
-                        md["s_affected_csc"] = std::move(sa_csc);
-                        mm.append(std::move(md));
-                    }
-                    // Fixed (boundary-condition) species rows (final block).
-                    const auto &species = self.species();
-                    for (int i = 0; i < static_cast<int>(species.size()); ++i)
-                        if (species[i].fixed)
-                            fixed_rows.append(i);
-                    // GH #162: CSC structure for the sparse codegen emitter. The
-                    // Functional scatter and fixed-row zeroing map (col, row) →
-                    // data index — the dense path's pre-resolved rows discard the
-                    // index, and Elementary/MM carry theirs via affected_csc above.
-                    // Exposed as int64 arrays (copied) so the emitter never
-                    // materializes nnz Python ints for the columns it skips.
-                    out["col_ptrs"] = py::array_t<int64_t>(
-                        static_cast<py::ssize_t>(sp.col_ptrs.size()), sp.col_ptrs.data());
-                    out["row_indices"] = py::array_t<int64_t>(
-                        static_cast<py::ssize_t>(sp.row_indices.size()), sp.row_indices.data());
-                }
-                out["elementary"] = std::move(elem);
-                out["mm"] = std::move(mm);
-                out["fixed_rows"] = std::move(fixed_rows);
-                return out;
+                codegen_visit::PySink sink;
+                return py::dict(codegen_visit::codegen_jacobian_plan(self, sink));
             },
             "Dense analytical-Jacobian scatter plan (Elementary + MM, rows "
             "resolved) for the codegen .so. GH #76 Task 4.")
@@ -2329,184 +2844,26 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def(
             "codegen_data",
             [](const bngsim::NetworkModel &m) {
-                py::dict d;
-
-                // Parameters: [{name, value, is_const, expression}, ...]
-                // is_const / expression let the model-based sensitivity codegen
-                // chain-rule through derived rate constants like the .net path
-                // does (closes #15).
-                const auto &params = m.parameters();
-                py::list param_list;
-                for (const auto &p : params) {
-                    py::dict pd;
-                    pd["name"] = p.name;
-                    pd["value"] = p.value;
-                    pd["is_const"] = !p.is_expression;
-                    pd["expression"] = p.expression;
-                    param_list.append(pd);
-                }
-                d["parameters"] = param_list;
-
-                // Species: [(name, fixed, volume_factor, amount_valued), ...]
-                const auto &species = m.species();
-                py::list sp_list;
-                for (const auto &s : species) {
-                    py::dict sd;
-                    sd["name"] = s.name;
-                    sd["fixed"] = s.fixed;
-                    sd["volume_factor"] = s.volume_factor;
-                    sd["amount_valued"] = s.amount_valued;
-                    sd["reported"] = s.reported;                         // GH #71
-                    sd["ode_live_volume_idx0"] = s.ode_live_volume_idx0; // GH #144 case 4
-                    sd["report_rateof_amount"] = s.report_rateof_amount; // GH #231 sub-cluster 3
-                    sd["continuous"] = s.continuous;                     // issue #718
-                    // (#170) Which parameter `volume_factor` IS, so the emitter can
-                    // write `p[k]` where it used to write the number. -1 ⇒ no
-                    // parameter (a `.net` species, or a promoted compartment).
-                    sd["volume_param_idx0"] = s.volume_param_idx0;
-                    // The declared amount a volume write re-divides (#170). Only
-                    // when set, so a model without one keeps its codegen key.
-                    if (!std::isnan(s.initial_amount))
-                        sd["initial_amount"] = s.initial_amount;
-                    sp_list.append(sd);
-                }
-                d["species"] = sp_list;
-
-                // Observables: [(name, [(species_idx_0based, factor), ...]), ...]
-                const auto &observables = m.observables();
-                py::list obs_list;
-                for (const auto &o : observables) {
-                    py::dict od;
-                    od["name"] = o.name;
-                    py::list entries;
-                    for (const auto &e : o.entries) {
-                        // Convert 1-based species index to 0-based
-                        entries.append(py::make_tuple(e.species_index - 1, e.factor));
-                    }
-                    od["entries"] = entries;
-                    obs_list.append(od);
-                }
-                d["observables"] = obs_list;
-
-                // Functions: [(name, expression), ...]
-                const auto &functions = m.functions();
-                py::list func_list;
-                for (const auto &f : functions) {
-                    py::dict fd;
-                    fd["name"] = f.name;
-                    fd["expression"] = f.expression;
-                    // GH #333: the expression the VALUE is computed from, when it
-                    // differs from the declared one. Empty for every function the
-                    // zero-base logarithm guard did not rewrite. The RHS emitter
-                    // prefers it; every emitter that DIFFERENTIATES keeps reading
-                    // "expression", which is the smooth declared law.
-                    fd["eval_expression"] = f.eval_expression;
-                    func_list.append(fd);
-                }
-                d["functions"] = func_list;
-                // How many probes more than one the right-hand side makes for
-                // a derivative that reads a nested rateOf, which the emitted
-                // one has to make as well (lanl/bngsim#991); and how many more
-                // a refresh of the rateOf buffer makes at a row, a stop or an
-                // event, which counts what anything reads.
-                d["rateof_flow_nesting"] = m.rateof_flow_nesting();
-                d["rateof_nesting"] = m.rateof_nesting();
-                // ...and why there is no right-hand side to emit at all, where
-                // derivatives read each other's rateOf in a ring.
-                d["rateof_ring_refusal"] = m.rateof_ring_refusal();
-
-                // Reactions: [(type, function_name, stat_factor, reactants_0based,
-                // products_0based), ...]
-                const auto &reactions = m.reactions();
-                py::list rxn_list;
-                for (const auto &r : reactions) {
-                    py::dict rd;
-                    // Rate law type as string
-                    switch (r.rate_law_type) {
-                    case bngsim::RateLawType::Elementary:
-                        rd["type"] = "elementary";
-                        break;
-                    case bngsim::RateLawType::Functional:
-                        rd["type"] = "functional";
-                        break;
-                    case bngsim::RateLawType::MichaelisMenten:
-                        rd["type"] = "mm";
-                        break;
-                    }
-                    rd["function_name"] = r.function_name;
-                    rd["stat_factor"] = r.stat_factor;
-                    rd["apply_species_factor"] = r.apply_species_factor;
-                    rd["ssa_volume_factor"] = r.ssa_volume_factor;
-                    rd["per_species_volume_scaling"] = r.per_species_volume_scaling;
-                    rd["is_rate_rule_ode"] = r.is_rate_rule_ode;
-                    rd["ssa_live_volume_idx0"] = r.ssa_live_volume_idx0;
-                    rd["ssa_live_volume_exp"] = r.ssa_live_volume_exp;
-                    // GH #144 case 4: cross-compartment SSA live-volume terms.
-                    py::list live_terms;
-                    for (const auto &lt : r.ssa_live_volume_terms) {
-                        py::dict td;
-                        td["live_idx0"] = lt.live_idx0;
-                        td["v_static"] = lt.v_static;
-                        td["exp"] = lt.exp;
-                        live_terms.append(td);
-                    }
-                    rd["ssa_live_volume_terms"] = live_terms;
-                    // Exported only when set, so a model without them keeps its
-                    // structural codegen key (the key hashes this whole dict).
-                    if (r.ssa_volume_param_idx0 >= 0)
-                        rd["ssa_volume_param_idx0"] = r.ssa_volume_param_idx0; // #170
-                    if (!r.ssa_falling_factorial.empty()) {
-                        py::list ff;
-                        for (const auto &[si, m] : r.ssa_falling_factorial)
-                            ff.append(py::make_tuple(si, m));
-                        rd["ssa_falling_factorial"] = ff;
-                    }
-                    rd["ode_only"] = r.ode_only;
-                    // Convert 1-based indices to 0-based, filter nulls (0 in 1-based)
-                    py::list reactants;
-                    for (int idx : r.reactant_indices) {
-                        if (idx > 0)
-                            reactants.append(idx - 1);
-                    }
-                    rd["reactants"] = reactants;
-                    py::list products;
-                    for (int idx : r.product_indices) {
-                        if (idx > 0)
-                            products.append(idx - 1);
-                    }
-                    rd["products"] = products;
-                    // Rate law parameter indices (0-based) for Elementary/MM
-                    py::list rate_params;
-                    for (int idx : r.rate_law_param_indices) {
-                        rate_params.append(idx - 1); // 1-based to 0-based
-                    }
-                    rd["rate_param_indices"] = rate_params;
-                    rxn_list.append(rd);
-                }
-                d["reactions"] = rxn_list;
-
-                // Table functions: [{name, index_kind, index_param_idx,
-                // index_obs_idx, index_func_idx, step}, ...] in dispatch-id
-                // order. Lets the model-based codegen path emit
-                //   data->tfun_eval(tf_id, idx_c, data->tfun_ctx)
-                // for any BNGL function whose name appears here. Empty
-                // for SBML/Antimony models without tfuns.
-                py::list tf_list;
-                for (const auto &spec : m.table_function_specs()) {
-                    py::dict td;
-                    td["name"] = spec.name;
-                    td["index_kind"] = spec.index_kind;
-                    td["index_param_idx"] = spec.index_param_idx;
-                    td["index_obs_idx"] = spec.index_obs_idx;
-                    td["index_func_idx"] = spec.index_func_idx;
-                    td["step"] = spec.step;
-                    tf_list.append(td);
-                }
-                d["table_functions"] = tf_list;
-
-                return d;
+                codegen_visit::PySink sink;
+                return py::dict(codegen_visit::codegen_data(m, sink));
             },
             "Return model data for code generation")
+        .def(
+            "codegen_key_stream",
+            [](const bngsim::NetworkModel &m) {
+                codegen_visit::KeySink sink;
+                codegen_visit::codegen_data(m, sink);
+                codegen_visit::codegen_jacobian_plan(m, sink);
+                codegen_visit::functional_jacobian_context(m, sink);
+                if (!sink.closed())
+                    throw std::logic_error("codegen key stream: a container was left open");
+                return py::bytes(sink.out);
+            },
+            "The bytes the structural codegen cache key hashes for codegen_data() (less "
+            "each parameter's value and species' initial_amount), codegen_jacobian_plan() "
+            "and functional_jacobian_context(), in that order: what "
+            "bngsim._codegen._canon_update writes for them, made from the same walk "
+            "(issue #820).")
 
         .def("__repr__", [](const bngsim::NetworkModel &m) {
             std::ostringstream os;
@@ -2780,8 +3137,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "Block same-complex binding. Default: true.")
         .def("set_reads_clock", &bngsim::RuleMonkeySimulator::set_reads_clock, py::arg("enabled"),
              "Whether the model reads the clock (default true): one-shot runs then run on "
-             "the model's clock, else on time elapsed since t_start, and a span too short "
-             "for the doubles near its times to integrate a clock-driven rate is refused")
+             "the model's clock, else on time elapsed since t_start")
         .def_property_readonly("xml_path", &bngsim::RuleMonkeySimulator::xml_path,
                                "Path to the XML file")
         .def("unsupported_warnings", &bngsim::RuleMonkeySimulator::unsupported_warnings,
@@ -3330,7 +3686,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
     py::class_<bngsim::SteadyStateOptions>(m, "SteadyStateOptions")
         .def(py::init<>())
         .def_readwrite("tol", &bngsim::SteadyStateOptions::tol)
+        // Issue #1001 — what `converged` asks: "residual" or "scaled".
+        .def_readwrite("criterion", &bngsim::SteadyStateOptions::criterion)
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
+        // Issue #524 — "newton" from the given state, no burst, stability reported.
+        .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty
@@ -3377,6 +3737,9 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("concentrations", &bngsim::SteadyStateResult::concentrations)
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
+        .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("continued_run_distance", &bngsim::SteadyStateResult::continued_run_distance)
+        .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)
         .def_readonly("n_steps", &bngsim::SteadyStateResult::n_steps)
@@ -3464,6 +3827,20 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("n_state_switch_roots", &bngsim::SteadyStateResult::n_state_switch_roots)
         .def_readonly("state_switch_roots_dropped",
                       &bngsim::SteadyStateResult::state_switch_roots_dropped)
+        .def_readonly("sens_fd_own_step_species",
+                      &bngsim::SteadyStateResult::sens_fd_own_step_species)
+        .def_readonly("sens_fd_disagree_species",
+                      &bngsim::SteadyStateResult::sens_fd_disagree_species)
+        .def_readonly("sens_fd_disagree_param", &bngsim::SteadyStateResult::sens_fd_disagree_param)
+        .def_readonly("sens_fd_floored", &bngsim::SteadyStateResult::sens_fd_floored)
+        .def_readonly("sens_fd_own_step", &bngsim::SteadyStateResult::sens_fd_own_step)
+        .def_readonly("sens_fd_disagree_function",
+                      &bngsim::SteadyStateResult::sens_fd_disagree_function)
+        .def_readonly("sens_fd_function_param", &bngsim::SteadyStateResult::sens_fd_function_param)
+        .def_readonly("sens_fd_function_floored",
+                      &bngsim::SteadyStateResult::sens_fd_function_floored)
+        .def_readonly("sens_fd_function_own_step",
+                      &bngsim::SteadyStateResult::sens_fd_function_own_step)
         .def_property_readonly(
             "sensitivity_data",
             [](const bngsim::SteadyStateResult &r) {

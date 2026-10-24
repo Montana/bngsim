@@ -259,6 +259,14 @@ namespace NFcore
 			void setHasTimeDependentFunctions(bool val) { hasTimeDependentFunctions = val; }
 			bool getHasTimeDependentFunctions() const { return hasTimeDependentFunctions; }
 
+			// The breakpoints of every table indexed by the time (bngsim GH #892).
+			// stepTo() reads the tables again at each one, whether or not a
+			// reaction has fired since: a table refreshed only when something
+			// fires never turned on a rate that was 0 at the start.
+			void addTimeBreakpoints(const vector<double> &xs);
+			double nextTimeBreakpoint(double t) const;
+			void refreshTimeDependentPropensities();
+
 			int getMolObsCount(int moleculeTypeIndex, int observableIndex) const;
 			Observable * getObservableByName(const string& obsName);
 			/* Index-based access to the ordered output observable list. Allows
@@ -583,6 +591,7 @@ namespace NFcore
 		    bool outputEventCounter; /*< set to true to output the cumulative number of events at each output step */
 
 			bool hasTimeDependentFunctions;
+			vector<double> timeBreakpoints; /*< sorted, distinct; see addTimeBreakpoints() */
 		    bool anyRxnTagged; /*< sets whether any reaction is tagged for output when it fires */
 		    bool connectivityFlag; /* Whether to infer and use reaction connectivity  for updating molecule rxn membership*/
 		    bool nfsimV1143Compatibility = false; /* Preserve NFsim v1.14.3 selector double-draw behavior */

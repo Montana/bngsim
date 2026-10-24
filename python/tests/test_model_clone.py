@@ -19,7 +19,8 @@ class of regression this file is meant to catch.
   * `evaluator` (rebinding) — every test compiles expressions in clones
   * `table_functions`       — `test_clone_with_table_function`
   * `events`                — `test_clone_with_events_full_l3_flags`
-  * Species variable rebind — `test_clone_event_trigger_references_species`
+  * Species variable rebind — `test_clone_event_trigger_references_species`,
+                              `test_clone_skips_species_names_it_cannot_register`
   * `ic_state_dirty` +
     `pending_sens_seed`     — `test_clone_carries_pending_sensitivity_seed`
   * `baseline_sens_seed`    — `test_clone_carries_baseline_sensitivity_seed`
@@ -380,6 +381,33 @@ def test_clone_event_trigger_references_species():
     # Both must keep S bounded by 5 (event re-fires)
     assert np.array(r_orig.species_data).max() <= 5.0 + 1e-9
     assert np.array(r_clone.species_data).max() <= 5.0 + 1e-9
+
+
+def test_clone_skips_species_names_it_cannot_register():
+    """A species name that is no symbol (a .net species `A()`) or that an
+    observable already holds is left out of the evaluator, by build() and by
+    clone() alike, and the rest are registered. Each used to be refused by a
+    thrown and caught exception, 2 ms of a clone of a 300-species model
+    (issue #919); now a refusal is a return value, and the same names are left
+    out.
+    """
+    b = ModelBuilder()
+    b.add_parameter("k", 1.0)
+    a_idx = b.add_species("A()", 1.0)
+    x_idx = b.add_species("X", 0.0)
+    s_idx = b.add_species("S", 0.0)
+    b.add_observable("X", [(x_idx, 1.0)])  # holds the name before species are registered
+    b.add_reaction([a_idx], [x_idx], "elementary", "k")
+    b.add_reaction([], [s_idx], "elementary", "k")
+    b.add_event("threshold", "S >= 5", [(s_idx, "0")], initial_value=False)
+    model = b.build()
+
+    clone = model.clone()
+    r_orig = SsaSimulator(model).run(_ts(20.0, 21), 1)  # build()'s registration
+    r_clone = SsaSimulator(clone).run(_ts(20.0, 21), 1)
+    np.testing.assert_array_equal(np.array(r_orig.species_data), np.array(r_clone.species_data))
+    # S is registered in both, so the event that reads it fires in both.
+    assert np.array(r_clone.species_data)[:, s_idx].max() <= 5.0 + 1e-9
 
 
 # ─── current_time / evaluator time pointer ───────────────────────────────────

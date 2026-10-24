@@ -54,7 +54,7 @@ Modified:      No source changes. The CLI, tests, and examples are pruned and on
 MIR — lightweight JIT compiler (optional micro-JIT backend, default OFF)
 --------------------------------------------------------------------------------
 Upstream:      https://github.com/vnmakarov/mir
-Version:       99c65079
+Version:       439a90a2
 License:       MIT — Copyright (c) 2018-2024 Vladimir Makarov
 In repository: third_party/mir/
 License text:  third_party/mir/LICENSE

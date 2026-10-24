@@ -1,0 +1,202 @@
+From 9eb11325e05e81fda324553934edd92351d0e6fb Mon Sep 17 00:00:00 2001
+From: Montana <montana@linux.com>
+Date: Sun, 18 Oct 2026 04:23:05 -0700
+Subject: [PATCH] bngsim: read time-indexed tables at their breakpoints in
+ stepTo
+
+stepTo() drew each waiting time from the total propensity and read the
+propensities again only after a reaction fired. A table function indexed
+by the time changes value at its breakpoints whether or not anything
+fires, so a rate that was 0 until a later breakpoint never turned on:
+with a_tot at 0 the run jumped to the stopping time, and with a_tot tiny
+the stale value held until the next firing.
+
+The system now keeps the breakpoints of every table whose counter is the
+time. A draw that passes the next one is dropped there, the propensities
+are read again and the waiting time is drawn anew, which is exact for a
+step table because the waiting time is memoryless; with a_tot at 0 the
+run advances to the next breakpoint instead of the stopping time. A
+linear table is read at its breakpoints too, and between them holds the
+value it was last read at, as before. A breakpoint on the stopping time
+is read there.
+
+A table listed in decreasing time, which only a file can give, is read
+one ulp past each breakpoint: tfun_interpolate_value() reads such a
+table from the other side, so at the breakpoint itself a step still
+gives the value from before it. The refresh after a firing calls the
+same helper.
+---
+ src/NFcore/NFcore.hh         |  9 ++++++
+ src/NFcore/system.cpp        | 61 +++++++++++++++++++++++++++++++++---
+ src/NFfunction/NFfunction.hh |  4 +++
+ src/NFinput/parseFuncXML.cpp |  1 +
+ 4 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/src/NFcore/NFcore.hh b/src/NFcore/NFcore.hh
+index 487de97..3e2192a 100644
+--- a/src/NFcore/NFcore.hh
++++ b/src/NFcore/NFcore.hh
+@@ -259,6 +259,14 @@ namespace NFcore
+ 			void setHasTimeDependentFunctions(bool val) { hasTimeDependentFunctions = val; }
+ 			bool getHasTimeDependentFunctions() const { return hasTimeDependentFunctions; }
+ 
++			// The breakpoints of every table indexed by the time (bngsim GH #892).
++			// stepTo() reads the tables again at each one, whether or not a
++			// reaction has fired since: a table refreshed only when something
++			// fires never turned on a rate that was 0 at the start.
++			void addTimeBreakpoints(const vector<double> &xs);
++			double nextTimeBreakpoint(double t) const;
++			void refreshTimeDependentPropensities();
++
+ 			int getMolObsCount(int moleculeTypeIndex, int observableIndex) const;
+ 			Observable * getObservableByName(const string& obsName);
+ 			/* Index-based access to the ordered output observable list. Allows
+@@ -583,6 +591,7 @@ namespace NFcore
+ 		    bool outputEventCounter; /*< set to true to output the cumulative number of events at each output step */
+ 
+ 			bool hasTimeDependentFunctions;
++			vector<double> timeBreakpoints; /*< sorted, distinct; see addTimeBreakpoints() */
+ 		    bool anyRxnTagged; /*< sets whether any reaction is tagged for output when it fires */
+ 		    bool connectivityFlag; /* Whether to infer and use reaction connectivity  for updating molecule rxn membership*/
+ 		    bool nfsimV1143Compatibility = false; /* Preserve NFsim v1.14.3 selector double-draw behavior */
+diff --git a/src/NFcore/system.cpp b/src/NFcore/system.cpp
+index 36a2552..25eae9e 100644
+--- a/src/NFcore/system.cpp
++++ b/src/NFcore/system.cpp
+@@ -10,6 +10,9 @@
+ #include <math.h>
+ #include <fstream>
+ #include <stdexcept>
++#include <algorithm>
++#include <cmath>
++#include <limits>
+ #include "../NFscheduler/NFstream.h"
+ #include "../NFscheduler/Scheduler.h"
+ 
+@@ -1154,10 +1157,52 @@ double System::sim(double duration, long int sampleTimes, bool verbose)
+ 	return current_time;
+ }
+ 
++void System::addTimeBreakpoints(const vector<double> &xs)
++{
++	// tfun_interpolate_value() reads a table listed in decreasing order from
++	// the other side: at one of its x values a step gives the value from before
++	// that time, not after. Read there, the run would keep the old rate for a
++	// whole segment, so such a table is read one ulp past each x instead.
++	const bool decreasing = xs.size() > 1 && xs[1] < xs[0];
++	for(unsigned int i=0; i<xs.size(); i++) {
++		timeBreakpoints.push_back(decreasing
++			? std::nextafter(xs[i], std::numeric_limits<double>::infinity()) : xs[i]);
++	}
++	std::sort(timeBreakpoints.begin(), timeBreakpoints.end());
++	timeBreakpoints.erase(std::unique(timeBreakpoints.begin(), timeBreakpoints.end()),
++		timeBreakpoints.end());
++}
++
++double System::nextTimeBreakpoint(double t) const
++{
++	vector<double>::const_iterator it =
++		std::upper_bound(timeBreakpoints.begin(), timeBreakpoints.end(), t);
++	return it == timeBreakpoints.end() ? std::numeric_limits<double>::infinity() : *it;
++}
++
++void System::refreshTimeDependentPropensities()
++{
++	for(unsigned int r=0; r<allReactions.size(); r++) {
++		allReactions.at(r)->update_a();
++	}
++	recompute_A_tot();
++}
++
+ double System::stepTo(double stoppingTime)
+ {
+ 	while(current_time < stoppingTime)
+ 	{
++		// A table indexed by the time changes its value at its breakpoints
++		// whether or not anything fires (bngsim GH #892). The propensities were
++		// read again only after a firing, so a rate that is 0 until a later
++		// breakpoint never turned on, and one that was tiny turned on late. A
++		// draw that passes the next breakpoint is dropped there, the tables are
++		// read again and the waiting time is drawn anew, which is exact for a
++		// step table because the waiting time is memoryless. A linear table is
++		// read at its breakpoints too; between them it holds the value it was
++		// last read at, as it did before. A breakpoint on the stopping time is
++		// read there: the next call starts on it and looks past it.
++		const double nextBreak = nextTimeBreakpoint(current_time);
+ 		if(!pendingStepEventValid) {
+ 			// Preserve the pending waiting-time draw across output boundaries so
+ 			// repeated stepTo() calls consume the same RNG stream as sim().
+@@ -1165,6 +1210,10 @@ double System::stepTo(double stoppingTime)
+ 				pendingStepEventTime =
+ 					current_time + (-log(rng_.random_open()) / a_tot);
+ 				pendingStepEventValid = true;
++			} else if(nextBreak <= stoppingTime) {
++				current_time = nextBreak;
++				refreshTimeDependentPropensities();
++				continue;
+ 			} else {
+ 				current_time = stoppingTime;
+ 				cout << "Total propensity is zero, no further rxns can fire in this step." << endl;
+@@ -1172,6 +1221,13 @@ double System::stepTo(double stoppingTime)
+ 			}
+ 		}
+ 
++		if(pendingStepEventTime > nextBreak && nextBreak <= stoppingTime) {
++			current_time = nextBreak;
++			invalidateStepToCache();
++			refreshTimeDependentPropensities();
++			continue;
++		}
++
+ 		// Check if we've reached stopping time
+ 		if(pendingStepEventTime >= stoppingTime) {
+ 			break;
+@@ -1195,10 +1251,7 @@ double System::stepTo(double stoppingTime)
+ 
+ 		// Recompute all propensities at each step to ensure time-dependent functions are updated correctly
+ 		if (hasTimeDependentFunctions) {
+-			for(unsigned int r=0; r<allReactions.size(); r++) {
+-				allReactions.at(r)->update_a();
+-			}
+-			recompute_A_tot();
++			refreshTimeDependentPropensities();
+ 		}
+ 	}
+ 
+diff --git a/src/NFfunction/NFfunction.hh b/src/NFfunction/NFfunction.hh
+index 2cf9607..b50ac88 100644
+--- a/src/NFfunction/NFfunction.hh
++++ b/src/NFfunction/NFfunction.hh
+@@ -203,6 +203,8 @@ namespace NFcore {
+ 			void setCounterFromParameter(System *s, string paramName);
+ 			void addSystemPointer(System *s);
+ 			string getCtrType() const { return ctrType; }
++			// The table's counter values, its breakpoints (bngsim GH #892).
++			const vector<double> &getTfunXs() const { return data.at(0); }
+ 			bool fileFunc;
+ 			// AS-2021
+ 
+@@ -423,6 +425,8 @@ namespace NFcore {
+ 				void setCounterFromTime(System *s);
+ 				void setCounterFromParameter(System *s, string paramName);
+ 				void addSystemPointer(System *s);
++				// The table's counter values, its breakpoints (bngsim GH #892).
++				const vector<double> &getTfunXs() const { return data.at(0); }
+ 				bool fileFunc;
+ 				// AS-2021
+ 
+diff --git a/src/NFinput/parseFuncXML.cpp b/src/NFinput/parseFuncXML.cpp
+index a52d495..bfa4c45 100644
+--- a/src/NFinput/parseFuncXML.cpp
++++ b/src/NFinput/parseFuncXML.cpp
+@@ -620,6 +620,7 @@ static bool processTfunFunction(
+ 		if (gf) gf->setCounterFromTime(system);
+ 		if (cf) cf->setCounterFromTime(system);
+ 		system->setHasTimeDependentFunctions(true);
++		system->addTimeBreakpoints(gf ? gf->getTfunXs() : cf->getTfunXs());
+ 	} else if (ctrType == "Parameter") {
+ 		if (gf) gf->setCounterFromParameter(system, ctrName);
+ 		if (cf) cf->setCounterFromParameter(system, ctrName);
+-- 
+2.54.0 (Apple Git-157)
+
