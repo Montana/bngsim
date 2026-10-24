@@ -407,13 +407,20 @@ def test_sir_v5_keeps_both_derivatives():
 
 
 @pytest.mark.skipif(not _SIR_V4_BNGL.exists(), reason="bng_parity corpus not present")
-def test_sir_v4_keeps_both_derivatives_now_its_model_is_fixed():
+def test_sir_v4_keeps_both_derivatives_now_its_model_is_fixed(monkeypatch):
     """Issue #543: re-sourced from BNGL-Models after its year-selection chains stopped
     ending in 0 and each season began opening on ``t>t_start()``. The onset column
     ``d_2023`` at rtol 1e-10 / atol 1e-12 is the case #545 found failing before the
-    strict onset, with ``a_2023 = 1.5``."""
+    strict onset, with ``a_2023 = 1.5``.
+
+    The derivations run unbudgeted: what is asked is whether the derivatives are
+    kept, not how fast they are found. Beside the suite's other workers the ∂f/∂p
+    derivation ran past its 20 s, the analytic RHS was declined, and ``d_2023``
+    was refused for the difference quotient."""
     from bngsim._bngpath import resolve_bng
 
+    monkeypatch.setenv("BNGSIM_JAC_DERIV_BUDGET_S", "inf")
+    monkeypatch.setenv("BNGSIM_SENS_DERIV_BUDGET_S", "inf")
     bng = resolve_bng()
     if not bng.ok:
         pytest.skip(f"BNG2.pl unavailable: {bng.why_not()}")

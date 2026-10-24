@@ -146,25 +146,50 @@ initial state at t = 5, and `time()` reads 5 there. RuleMonkey integrates a rate
 that reads the clock between events, so a rate such as `if(time()>=6, k, 0)`,
 which is 0 at the start, turns on at t = 6 (issue #1022).
 
+RuleMonkey reads the clock as `time()`, a bare `time`, or its alias `t` (or
+`t()`). A bare `time` or `t` that names a parameter, observable or function is
+that symbol instead: BNG2.pl accepts an observable named `time`, and `k*time`
+then reads its count, while `time()` is still the clock. bngsim reads a model
+the same way when it decides whether the model reads the clock.
+
 NFsim cannot prepare a function that reads `time()`, so `method="nf"` refuses
 one when the simulator or session is built, naming the function (issue #862).
 Use `method="rm"`, or `method="ode"` or `method="ssa"` on the generated network.
 NFsim runs a table function indexed by time, on **time elapsed since
-`t_start`**, as BNG2.pl's `simulate_nf` does, and refreshes its value only when
-a reaction fires. So a rate that is 0 at the start, or that changes while
-nothing fires, is not seen until something does, and until then the run is flat
-(issue #892).
+`t_start`**, as BNG2.pl's `simulate_nf` does. It reads the table again at each
+of the table's x values, whether or not a reaction has fired, and draws the next
+waiting time from there. That is exact for a step table (`method=>"step"`): a
+rate that is 0 at the start turns on at the step that turns it on (issue #892).
+A linear table changes between those reads, and NFsim would hold the value it
+last read, so where little fires the run would lag the ramp: with 100 `X(p~1)`
+leaving at a rate that rises from 0 at t = 0 to 10 at t = 1, none would have
+left by t = 1, where about 70 have left by t = 0.5. So `method="nf"` refuses a
+model whose rate laws read a linear table indexed by time, directly or through
+the functions they call, and names the tables (issue #1179). Use `method="rm"`,
+which integrates the ramp, or `method="ssa"` on the generated network. To stay
+on NFsim, make the table a step on a grid fine enough for the ramp, each step
+holding the ramp's value at its middle: steps of a tenth of the ramp matched the
+exact mean within sampling noise. A linear table that no rate law reads is
+not refused; NFsim reads it correctly at each output time.
 
 A model that reads neither `time()` nor a time-indexed table cannot tell the
 two clocks apart, and runs on elapsed time on both backends, which keeps event
-times small at a large `t_start`. RuleMonkey integrates a rate that reads the
-clock on panels of a thousandth of a run's span, so `method="rm"` refuses a run
-whose span is too short for the doubles near its times to place them (a span of
-2 at t = 1e13), rather than return a run that never fires. A model that reads
-the clock still places its events on absolute time, so once the total
-propensity times |t| nears 1e15 its waiting times are rounded and the run is
-biased with no error, as `method="ssa"` is on any model there (issue #1059).
-Keep such a run's times moderate.
+times small at a large `t_start`. So does a `method="rm"` run or a
+`RuleMonkeySession` of a model that reads the clock in its functions: wherever
+RuleMonkey reads the clock, it reads `time()` plus the run's or the session's
+start, and its events are placed on elapsed time, while every time it takes or
+reports is model time (issue #1063). Before that its waiting times were rounded
+once the total propensity times |t| neared 1e15, and from t = 1e12 a run or a
+session was biased with no error.
+
+A model with a table indexed by time is not offset, and runs on model time.
+Since RuleMonkey 3.12.0 that keeps its waiting times too: RuleMonkey places its
+events, and the panels on which it integrates a rate that reads the clock, on
+the time elapsed since each call starts (richardposner/RuleMonkey#110), and only
+the clock a rate reads is rounded to the doubles near it. From t = 1e13 a step
+table's run matches its closed form, where bngsim used to refuse a span that
+short (issue #1063). `method="ssa"` keeps the rounding limit on a rate that
+reads `time()` (issue #1059).
 
 ### Arrhenius (energy) rules
 
@@ -174,15 +199,27 @@ reverse half of a reversible rule. Energies are in units of RT: there is no RT
 in the formula, and a parameter named `RT` is an ordinary parameter, which a
 model in kJ/mol divides by where it uses it (issue #1022).
 
-RuleMonkey expands each energy rule at load, and reads only some energy
-patterns as BNG2 does: the bonded pair of sites a rule joins or parts, alone or
-with one more bond to a molecule of a third type whose site binds nothing else,
-on a rule that names only those two sites. That covers pair and cooperativity
-patterns. It drops or misapplies a state, a site that must be free, a wildcard
-bond, a site named twice, context further out, and context in the rule itself
-(richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
-until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
-`method="ssa"` on the generated network.
+RuleMonkey runs an energy rule that makes one bond between two reactant
+patterns, or breaks one within one, between molecules of two types, with no
+other operation. It expands the rule at load where that is exact, as for pair
+and cooperativity patterns, and everywhere else counts `dG` at each firing as
+BNG2's network does per reaction: an energy pattern with a state, a site that
+must be free, wildcard bonds, a site named twice or context further out, and
+context in the rule's own reactant pattern all run at BNG2's rate
+(richardposner/RuleMonkey#109; `method="rm"` refused these until issue #1058).
+Counting at each firing costs more per event, and more the larger the complexes
+an event touches.
+
+RuleMonkey refuses at load, naming the rule and the reason, an energy rule that
+changes a state or adds or deletes a molecule, makes or breaks more than one
+bond, closes a ring, binds two molecules of one type, has more than two
+reactants, or carries include or exclude constraints, and a rule it cannot
+expand whose bond can reach an energy pattern joined only by `.`. Simulate such
+a model with `method="ode"` or `method="ssa"` on the generated network. BNG2
+writes the reverse half of a reversible rule `X` as a rule named `_reverse_X`,
+so two unidirectional rules, `X` and a mirror image named `_reverse_X` with the
+same `phi` and `Ea0` parameters, read as one reversible rule, and RuleMonkey
+gives the second `1-phi` where BNG2 gives it `phi`.
 
 ### Compartments
 
@@ -272,8 +309,11 @@ with RuleMonkeySession("model.xml") as rm:
     result = rm.simulate(0, 100, n_points=101)
 ```
 
-A RuleMonkey session's clock is model time. `initialize(seed, t_start=5)` puts
-the seed state at t = 5; left unset, the first `simulate` sets it from its own
+A RuleMonkey session's clock is model time: `current_time`, `step_to`, the
+clock read through `evaluate`, and the time a `save_state` snapshot holds are
+all model time, though its events are placed on elapsed time where the model
+allows (see "Rate laws that read `time()`" above). `initialize(seed,
+t_start=5)` puts the seed state at t = 5; left unset, the first `simulate` sets it from its own
 start for a model that reads the clock, provided nothing has moved the session
 first. A segment that starts at `current_time` runs on the clock. One that
 starts elsewhere continues from `current_time` and is labelled with the times

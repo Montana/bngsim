@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 
 import numpy as np
 
@@ -43,6 +44,33 @@ def _check_jax():
             "JAX is required for bngsim.jax.differentiable_solve(). "
             "Install with: pip install 'bngsim[jax]'"
         ) from None
+
+
+# One analytical-Jacobian derivation at a time on a caller's model, and no clone
+# of it while one runs: the calls that need it may come from several threads at
+# once.
+_WARM_LOCK = threading.Lock()
+
+
+def _warm_clone(model):
+    """A clone of *model* that inherits its analytical Jacobian (issue #919).
+
+    Every call solves on a fresh clone, and a clone of a model that has not
+    derived its analytical Jacobian derives it for itself: the same SymPy work
+    on every call, ~1.2 ms of a 10 ms gradient on a 30-species functional
+    model. Derived once on *model*, the terms go to each clone without SymPy
+    (warm-before-clone, GH #145 §3), which is what the first
+    ``Simulator(model).run()`` would leave *model* holding anyway.
+
+    The lock is taken on every call, not only while ``_jac_attempted`` is
+    False: the derivation sets that sentinel before it starts, so a call that
+    read it unlocked during another thread's derivation cloned a model with no
+    terms yet, marked attempted, and that clone solved on the finite-difference
+    Jacobian. Once *model* is warm, the call under the lock is a no-op.
+    """
+    with _WARM_LOCK:
+        model.prepare_analytical_jacobian()
+    return model.clone()
 
 
 def _write_params(clone, names, values, flat: bool) -> None:
@@ -198,6 +226,10 @@ def differentiable_solve(
 
     **Thread safety**: Each call clones the model internally, so
     concurrent ``jax.grad`` calls are safe.
+
+    **The model's analytical Jacobian**: the first call derives it on
+    ``model``, as a first ``Simulator(model).run()`` would, so that each
+    call's clone inherits it rather than deriving it again.
     """
     _check_jax()
     import jax.numpy as jnp
@@ -336,7 +368,7 @@ def _run_primal(model, params_jnp, t_span, n_points, opts):
     flat = bool(opts[6]) if len(opts) > 6 else False
 
     # Clone for thread safety
-    clone = model.clone()
+    clone = _warm_clone(model)
 
     # Set the requested parameters in order. ``set_param`` re-evaluates
     # remaining ``is_expression`` parameters so derived parameters track
@@ -410,7 +442,7 @@ def _run_with_sensitivity(model, params_jnp, t_span, n_points, opts):
         # primaries in order via set_param so derived parameters track — or pin
         # every parameter as its own axis under ``flat=True`` (issue #188; see
         # ``_solve_impl``).
-        clone = model.clone()
+        clone = _warm_clone(model)
         _write_params(clone, diff_param_names, params_np, flat)
         clone.reset()
 
@@ -443,7 +475,7 @@ def _run_with_sensitivity(model, params_jnp, t_span, n_points, opts):
     # those jumps sit on.
     from bngsim._simulator import Simulator
 
-    clone = model.clone()
+    clone = _warm_clone(model)
     _write_params(clone, diff_param_names, params_np, flat)
     clone.reset()
 

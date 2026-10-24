@@ -2,6 +2,7 @@
 
 #include "canonical.hpp"
 #include "engine_profile.hpp"
+#include "expr_eval.hpp"
 #include "model.hpp"
 #include "table_function.hpp"
 
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -896,6 +898,38 @@ public:
 
 private:
   RemoveBondProfile remove_profile_;
+};
+
+// The molecule pool as the energy-pattern matcher reads it (energy_match.hpp):
+// a component's name is its molecule type's slot name, interned.
+class PoolView {
+public:
+  PoolView(const AgentPool& pool, const std::vector<std::vector<int>>& slot_names)
+      : pool_(pool), slot_names_(slot_names) {}
+  int type_of(int mol) const { return pool_.molecule(mol).type_index; }
+  int mol_of(int comp) const { return pool_.mol_of_comp(comp); }
+  int name_of(int comp) const {
+    const MoleculeInstance& m = pool_.molecule(pool_.mol_of_comp(comp));
+    for (std::size_t k = 0; k < m.comp_ids.size(); ++k)
+      if (m.comp_ids[k] == comp)
+        return slot_names_[m.type_index][k];
+    return -1;
+  }
+  int state_of(int comp) const { return pool_.component(comp).state_index; }
+  int partner_of(int comp) const { return pool_.component(comp).bond_partner; }
+  void comps_named(int mol, int name, std::vector<int>& out) const {
+    const MoleculeInstance& m = pool_.molecule(mol);
+    const auto& names = slot_names_[m.type_index];
+    for (std::size_t k = 0; k < m.comp_ids.size(); ++k)
+      if (names[k] == name)
+        out.push_back(m.comp_ids[k]);
+  }
+
+private:
+  // Not owned: a view lives for one weight or one firing.
+  const AgentPool& pool_; // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
+  const std::vector<std::vector<int>>&
+      slot_names_; // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
 };
 
 // ===========================================================================
@@ -3273,7 +3307,8 @@ struct RuleState {
   // and been clamped to 0 once, further negative evaluations are silent
   // (otherwise an oscillator with a state-dependent rate would spam the
   // log).  Default-constructed false; never reset, so the warning fires
-  // at most once per rule per simulator lifetime.
+  // at most once per rule per engine (one run() or session), and once per
+  // rule for a whole run_ensemble, whose engines share a latch.
   bool clamp_warned = false;
   bool b_mask_complete = false;
 };
@@ -3924,12 +3959,21 @@ struct Engine::Impl {
   std::vector<BindInfo> bind_infos; // per rule
   std::vector<double> obs_values;
   double total_propensity = 0;
+  // The model's clock: what time(), a TFUN's time counter and the saved
+  // state read.  Within run_ssa it is `clock_origin + clock_elapsed`, and
+  // events are placed on the elapsed clock (issue #110); see set_elapsed.
   double current_time = 0;
+  double clock_origin = 0;
+  double clock_elapsed = 0;
   int64_t event_count = 0;
   int64_t null_event_count = 0;
+  bool arrhenius_bound_warned_ = false;
   int molecule_limit;
   std::mt19937_64 rng;
   bool initialized = false;
+  // run_ensemble's shared "propensity clamped to 0" latch, one flag per
+  // rule; null outside an ensemble (see Engine::share_clamp_warnings).
+  std::atomic<bool>* shared_clamp_latch = nullptr;
 
   // Cached-incremental canonical-label layer (issue #9 §2 step 5, plan
   // decision #6).  Maps a live complex id to its last-computed canonical
@@ -4251,6 +4295,15 @@ struct Engine::Impl {
   uint64_t eval_vars_gen = 1;
   uint64_t eval_vars_seen_gen = 0;
 
+  // The order rebuild_eval_vars settles the function table in: each
+  // function after every function it reads, and a TFUN after the function
+  // that is its counter (issue #111).  Declaration order wherever that
+  // already is one.  BNG2 does not promise it: 2.9.3's writeXML moves only
+  // a function's direct references ahead of it, so `a() = b()`,
+  // `b() = 2*c()`, `c() = k` comes out as b, a, c, and a tfun() index is
+  // not a reference at all, since BNG2 parses the call as a placeholder.
+  std::vector<int> eval_settle_order_;
+
   // Eval-layout slots of the `reactant_N()` placeholders the model
   // declares, as (N, slot) pairs in declaration order (issue #59).  The
   // placeholder is an ordinary named slot — nothing else writes it, since
@@ -4261,15 +4314,35 @@ struct Engine::Impl {
   std::vector<std::pair<int, int>> eval_reactant_slots;
 
   // Which rule's counts a function should be evaluated against when the
-  // whole function table is settled (rebuild_eval_vars).  A rate law that
-  // reads a placeholder has no value outside the rule that owns it, so the
-  // settle pass binds that rule's counts first; -1 means the function does
-  // not read one.  Two rules sharing one rate function is not a shape BNG2
-  // writes — it names a fresh `_rateLawN` per rule — but if it happened the
-  // first owner wins and the settled value is that rule's.  Only the
-  // reported value is affected: evaluate_rate always binds the counts of
-  // the rule it was called for.
+  // whole function table is settled (rebuild_eval_vars).  A function that
+  // reads a placeholder, directly or through other functions, has no value
+  // outside a rule, so the settle pass binds a rule's counts first; -1 means
+  // no rule reads the function.  A rule's own rate law is owned by that
+  // rule, and a helper it reads on the way to a placeholder by the first
+  // rule whose rate law reads it.  Rules share a function when a helper
+  // serves two rate laws, or when two rules both name a function as their
+  // whole rate law; the first owner wins and the settled value is that
+  // rule's.  Only the reported value is affected: evaluate_rate always
+  // binds the counts of the rule it was called for.
   std::vector<int> gf_reactant_owner_rule_;
+
+  // Per function (indexed like model.functions): whether it reads a
+  // `reactant_N()` placeholder, itself or through the functions it reads,
+  // and the functions on that path — every function it reads, directly or
+  // not, that reads a placeholder in turn, in settle order, the
+  // placeholders themselves left out since nothing evaluates one.  A rate
+  // law that reaches a placeholder through a helper, `2*g()` with
+  // `g() = reactant_1()*k`, reads the helper's slot, and the slot holds
+  // whichever rule's counts it was last evaluated against, so evaluate_rate
+  // re-evaluates the chain against its own rule before the rate law
+  // (issue #59).  Empty for every function of a model that does not use
+  // the construct, and for a rate law that reads the placeholder directly.
+  std::vector<char> gf_reads_reactant_;
+  std::vector<std::vector<int>> gf_reactant_chain_;
+  // Save buffer for the chain's settled values, so evaluating one rule's
+  // rate leaves the table as the settle pass left it (see
+  // evaluate_against_rule).  Sized once to the longest chain.
+  std::vector<double> reactant_chain_save_;
 
   // Slot index for each LOCAL function, precomputed once so
   // evaluate_local_rate can save/restore its overrides without
@@ -4381,6 +4454,48 @@ struct Engine::Impl {
       }
     }
 
+    // Settle order (eval_settle_order_): a depth-first walk in declaration
+    // order, emitting each function after the functions it reads.  A cycle,
+    // a function reading itself included, leaves some function reading a
+    // value not yet settled, so it is a model error rather than a silently
+    // lagged rate.  BNG2 writes the XML for one.
+    int const nf = static_cast<int>(model.functions.size());
+    std::vector<std::vector<int>> reads(nf);
+    {
+      for (int i = 0; i < nf; ++i) {
+        const auto& gf = model.functions[i];
+        for (const auto& tok : expr::collect_variables(gf.expression_text)) {
+          auto const it = model.function_index.find(tok);
+          if (it != model.function_index.end())
+            reads[i].push_back(it->second);
+        }
+        if (gf.is_tfun && gf.tfun_counter_source == TfunCounterSource::Function) {
+          auto const it = model.function_index.find(gf.tfun_counter_name);
+          if (it != model.function_index.end())
+            reads[i].push_back(it->second);
+        }
+      }
+      enum class Visit { New, Open, Done };
+      std::vector<Visit> visit(nf, Visit::New);
+      eval_settle_order_.clear();
+      eval_settle_order_.reserve(nf);
+      auto settle = [&](int i, auto& self) -> void {
+        if (visit[i] == Visit::Done)
+          return;
+        if (visit[i] == Visit::Open)
+          throw std::runtime_error("function '" + model.functions[i].name +
+                                   "' depends on itself, through the functions it reads or "
+                                   "its table counter");
+        visit[i] = Visit::Open;
+        for (int const j : reads[i])
+          self(j, self);
+        visit[i] = Visit::Done;
+        eval_settle_order_.push_back(i);
+      };
+      for (int i = 0; i < nf; ++i)
+        settle(i, settle);
+    }
+
     // Cache the global-function output list once: it depends only on the
     // model (which function entries have local arguments), never on run
     // state, so embedders see a stable name vector across runs.
@@ -4393,28 +4508,85 @@ struct Engine::Impl {
       }
     }
 
+    // In settle order, since evaluate_local_factor re-evaluates the local
+    // chain sequentially from this list.
     eval_local_fn_slots.clear();
-    for (int i = 0; i < static_cast<int>(model.functions.size()); ++i) {
+    for (int const i : eval_settle_order_) {
       if (model.functions[i].is_local() && gf_expr_id_[i] >= 0)
         eval_local_fn_slots.push_back(i);
     }
 
-    // `reactant_N()` placeholders and the rate laws that read them (#59).
+    // `reactant_N()` placeholders and the functions that read them (#59).
     eval_reactant_slots.clear();
-    gf_reactant_owner_rule_.assign(model.functions.size(), -1);
-    for (int i = 0; i < static_cast<int>(model.functions.size()); ++i) {
+    gf_reactant_owner_rule_.assign(nf, -1);
+    gf_reads_reactant_.assign(nf, 0);
+    gf_reactant_chain_.assign(nf, {});
+    reactant_chain_save_.clear();
+    for (int i = 0; i < nf; ++i) {
       int const n = model.functions[i].reactant_count_index;
       if (n > 0)
         eval_reactant_slots.emplace_back(n, eval_gf_main_slot[i]);
     }
     if (!eval_reactant_slots.empty()) {
+      // Settle order puts every function after the ones it reads, so one
+      // pass in it sees each function's reads already marked.
+      for (int const i : eval_settle_order_) {
+        bool reads_placeholder = model.functions[i].reactant_count_index > 0;
+        for (int const j : reads[i])
+          reads_placeholder = reads_placeholder || gf_reads_reactant_[j] != 0;
+        gf_reads_reactant_[i] = reads_placeholder ? 1 : 0;
+      }
+      std::vector<int> settle_rank(nf);
+      for (int p = 0; p < nf; ++p)
+        settle_rank[eval_settle_order_[p]] = p;
+      std::vector<int> seen(nf, -1);
+      std::vector<int> stack;
+      std::size_t longest = 0;
+      for (int i = 0; i < nf; ++i) {
+        if (gf_reads_reactant_[i] == 0)
+          continue;
+        auto& chain = gf_reactant_chain_[i];
+        seen[i] = i;
+        stack.assign(1, i);
+        while (!stack.empty()) {
+          int const f = stack.back();
+          stack.pop_back();
+          for (int const j : reads[f]) {
+            if (seen[j] == i || gf_reads_reactant_[j] == 0)
+              continue;
+            seen[j] = i;
+            stack.push_back(j);
+            if (model.functions[j].reactant_count_index == 0)
+              chain.push_back(j);
+          }
+        }
+        std::sort(chain.begin(), chain.end(),
+                  [&](int a, int b) { return settle_rank[a] < settle_rank[b]; });
+        longest = std::max(longest, chain.size());
+      }
+      reactant_chain_save_.resize(longest);
+
+      // Each rule owns its own rate law first, so a function that is some
+      // rule's whole rate law reports that rule's value, and only then the
+      // helpers its rate law reads.
+      std::vector<int> head(model.rules.size(), -1);
       for (int ri = 0; ri < static_cast<int>(model.rules.size()); ++ri) {
         const auto& rl = model.rules[ri].rate_law;
         if (rl.max_reactant_count_index == 0 || rl.function_name.empty())
           continue;
         auto fit = model.function_index.find(rl.function_name);
-        if (fit != model.function_index.end() && gf_reactant_owner_rule_[fit->second] < 0)
-          gf_reactant_owner_rule_[fit->second] = ri;
+        if (fit == model.function_index.end())
+          continue;
+        head[ri] = fit->second;
+        if (gf_reactant_owner_rule_[head[ri]] < 0)
+          gf_reactant_owner_rule_[head[ri]] = ri;
+      }
+      for (int ri = 0; ri < static_cast<int>(model.rules.size()); ++ri) {
+        if (head[ri] < 0)
+          continue;
+        for (int const j : gf_reactant_chain_[head[ri]])
+          if (gf_reactant_owner_rule_[j] < 0)
+            gf_reactant_owner_rule_[j] = ri;
       }
     }
   }
@@ -4508,24 +4680,27 @@ struct Engine::Impl {
       // rule_states[ri] or iterates the vector), so pointer arithmetic to
       // recover the index is well-defined for vector elements.
       auto const ri = static_cast<size_t>(&rs - rule_states.data());
-      auto const& rule = model.rules[ri];
-      const char* fn = rule.rate_law.function_name.c_str();
-      // Name the cause when we know it: an MM rule reporting NaN with a
-      // negative Km is that Km, not an arithmetic accident downstream.
-      bool const mm_domain =
-          std::isnan(new_value) && rule.rate_law.type == RateLawType::MM && rule.rate_law.mm_Km < 0;
-      if (mm_domain) {
-        fprintf(stderr,
-                "WARN: rule '%s' (%s) propensity clamped to 0 — MM Km=%g is outside "
-                "the rate law's domain (Km must be > 0) at t=%g; further clamps on "
-                "this rule are silent\n",
-                rule.id.c_str(), rule.name.c_str(), rule.rate_law.mm_Km, current_time);
-      } else {
-        fprintf(stderr,
-                "WARN: rule '%s' (%s) propensity clamped to 0 — rate%s%s%s "
-                "evaluated to %g at t=%g; further clamps on this rule are silent\n",
-                rule.id.c_str(), rule.name.c_str(), (fn[0] != 0 ? " function '" : ""), fn,
-                (fn[0] != 0 ? "'" : ""), new_value, current_time);
+      // In an ensemble only the first replicate to clamp the rule warns.
+      if (shared_clamp_latch == nullptr || !shared_clamp_latch[ri].exchange(true)) {
+        auto const& rule = model.rules[ri];
+        const char* fn = rule.rate_law.function_name.c_str();
+        // Name the cause when we know it: an MM rule reporting NaN with a
+        // negative Km is that Km, not an arithmetic accident downstream.
+        bool const mm_domain = std::isnan(new_value) && rule.rate_law.type == RateLawType::MM &&
+                               rule.rate_law.mm_Km < 0;
+        if (mm_domain) {
+          fprintf(stderr,
+                  "WARN: rule '%s' (%s) propensity clamped to 0 — MM Km=%g is outside "
+                  "the rate law's domain (Km must be > 0) at t=%g; further clamps on "
+                  "this rule are silent\n",
+                  rule.id.c_str(), rule.name.c_str(), rule.rate_law.mm_Km, current_time);
+        } else {
+          fprintf(stderr,
+                  "WARN: rule '%s' (%s) propensity clamped to 0 — rate%s%s%s "
+                  "evaluated to %g at t=%g; further clamps on this rule are silent\n",
+                  rule.id.c_str(), rule.name.c_str(), (fn[0] != 0 ? " function '" : ""), fn,
+                  (fn[0] != 0 ? "'" : ""), new_value, current_time);
+        }
       }
     }
     if (!(new_value >= 0))
@@ -4545,13 +4720,33 @@ struct Engine::Impl {
     events_since_propensity_rebaseline = 0;
   }
 
+  // --- The clock (issue #110) ---
+  //
+  // run_ssa places events on a clock that starts at 0 where the call starts,
+  // at `clock_origin`, and reads the model's clock off it as
+  // origin + elapsed.  A waiting time is then added to the time since the
+  // call started, not to the model's clock: from a late t_start the doubles
+  // near t are too far apart to hold it, and t + tau rounded it away or up
+  // to a whole spacing (at t = 1e13 they are 2e-3 apart).  The only
+  // rounding left is in the clock a rate law reads, which BNG's network
+  // simulate has too.
+
+  // Move the clock to `e` past clock_origin.
+  void set_elapsed(double e) {
+    clock_elapsed = e;
+    current_time = clock_origin + e;
+    ++eval_vars_gen; // time moved → invalidate cached eval_vars_flat
+  }
+
   // --- Clock-driven propensities (issue #86) ---
   //
   // Invariant: between calls to run_ssa's event loop, every rule in
   // clock_rules holds its propensity at `current_time`.  init_rule_states
   // establishes it, incremental_update keeps it after an event, and
   // next_clocked_event_time leaves the clock and these rules together
-  // wherever it stops.
+  // wherever it stops.  At the end of a call, to within an ulp: the rules
+  // were evaluated at origin + (t_end - origin), and the clock is put at
+  // t_end itself.
 
   // Re-evaluate one clock-driven rule's propensity at the current time.  A
   // local rate is rescanned in full, as incremental_update does for it after
@@ -4567,11 +4762,10 @@ struct Engine::Impl {
     set_rule_propensity(rs, compute_propensity(rs, rule, rate, percx_a(ri), percx_b(ri)));
   }
 
-  // Move the clock to `s` and return the clock-driven rules' summed
-  // propensity there.
+  // Move the clock to `s`, on the elapsed clock, and return the
+  // clock-driven rules' summed propensity there.
   double clock_propensity_at(double s) {
-    current_time = s;
-    ++eval_vars_gen; // time moved → invalidate cached eval_vars_flat
+    set_elapsed(s);
     double a = 0.0;
     for (int const ri : clock_rules) {
       refresh_clock_rule(ri);
@@ -4581,12 +4775,12 @@ struct Engine::Impl {
   }
 
   // Place the next event when some propensity moves with the clock: the
-  // time τ in (current_time, t_lim] at which the hazard integrated from
-  // current_time reaches `E`, or +inf if it does not get there by t_lim.
-  // Leaves the clock at τ (at t_lim for +inf) with every clock-driven rule
-  // evaluated there.  The rest of the propensity is constant between
-  // events, so it is integrated exactly and only the clock-driven part is
-  // sampled.  See HazardPanel for the scheme; the step control, its
+  // time τ in (clock_elapsed, t_lim] at which the hazard integrated from
+  // clock_elapsed reaches `E`, or +inf if it does not get there by t_lim,
+  // both on the elapsed clock.  Leaves the clock at τ (at t_lim for +inf)
+  // with every clock-driven rule evaluated there.  The rest of the
+  // propensity is constant between events, so it is integrated exactly and
+  // only the clock-driven part is sampled.  See HazardPanel for the scheme; the step control, its
   // tolerances and its two give-ups are bngsim's.
   double next_clocked_event_time(double E, double t_lim) {
     constexpr int kN = HazardPanel::kNodes;
@@ -4610,7 +4804,7 @@ struct Engine::Impl {
     for (int ri = 0; ri < static_cast<int>(rule_states.size()); ++ri)
       (is_clock_rule[ri] != 0 ? a0 : a_static) += rule_states[ri].propensity;
 
-    double t = current_time;
+    double t = clock_elapsed;
     double hazard = 0.0;
     double h = std::min(clock_h, clock_hmax);
     int floor_steps = 0;
@@ -4618,9 +4812,9 @@ struct Engine::Impl {
     double av[kN];
     double c[kN];
     while (t < t_lim) {
-      // A few dozen ulps of t.  No step is shorter: a thousandth of a short
-      // call made late in a run can be under an ulp, and t + h would then
-      // round back to t, crediting hazard to a clock that never moves.
+      // A few dozen ulps of t, on the elapsed clock.  No step is shorter, so
+      // t + h always moves t rather than crediting hazard to a clock that
+      // never moves, and a jump in a rate is crossed by a step this long.
       double const hmin =
           64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::fabs(t));
       h = std::max(h, hmin);
@@ -4652,7 +4846,8 @@ struct Engine::Impl {
         if (hh <= hmin) {
           std::ostringstream msg;
           msg << std::setprecision(17)
-              << "a rate law that reads time() cannot be integrated past t=" << t << ": ";
+              << "a rate law that reads time() cannot be integrated past t=" << (clock_origin + t)
+              << ": ";
           if (finite)
             msg << kMaxFloorSteps << " steps of " << std::setprecision(3) << hmin
                 << " in a row failed the error test";
@@ -4667,8 +4862,9 @@ struct Engine::Impl {
       if (hh <= 2.0 * hmin && hh < t_lim - t) {
         if (++tiny_panels > kMaxTinyPanels) {
           std::ostringstream msg;
-          msg << std::setprecision(17) << "a rate law that reads time() makes no headway at t=" << t
-              << ": " << kMaxTinyPanels << " integration steps in a row shorter than "
+          msg << std::setprecision(17)
+              << "a rate law that reads time() makes no headway at t=" << (clock_origin + t) << ": "
+              << kMaxTinyPanels << " integration steps in a row shorter than "
               << std::setprecision(3) << 2.0 * hmin << ", so the rate is singular there";
           throw std::runtime_error(msg.str());
         }
@@ -7035,40 +7231,92 @@ struct Engine::Impl {
 
     update_eval_vars();
 
-    // `reactant_N()` stands for this rule's own reactant counts, so bind
-    // them before the expression is evaluated (issue #59).  `rule` is always
-    // an element of model.rules — every call site indexes through it — so
-    // recovering its index by pointer arithmetic is well-defined here, the
-    // same trick set_rule_propensity uses on rule_states.
-    if (rule.rate_law.max_reactant_count_index > 0)
-      bind_reactant_counts(static_cast<int>(&rule - model.rules.data()));
-
     if (!rule.rate_law.function_name.empty()) {
       auto fit = model.function_index.find(rule.rate_law.function_name);
       if (fit != model.function_index.end()) {
         int const gi = fit->second;
-        auto& gf = model.functions[gi];
-        if (gf.is_tfun && gf.tfun) {
-          double const ctr_val = get_tfun_counter_value(gf);
-          double const tfun_val = gf.tfun->evaluate(ctr_val);
-          if (gf_expr_id_[gi] >= 0) {
-            // Patch the magic __tfun_NAME__ slot for this rule's
-            // own tfun result (update_eval_vars wrote it from the
-            // function's own counter, but BNG2 emits the rate-law
-            // wrapper expecting it pre-patched on each call).
-            eval_vars_flat[eval_gf_tfun_slot[gi]] = tfun_val;
-            return expr_eval_.evaluate(gf_expr_id_[gi]);
-          }
-          return tfun_val;
-        }
-        if (gf_expr_id_[gi] >= 0)
-          return expr_eval_.evaluate(gf_expr_id_[gi]);
+        // `reactant_N()` stands for this rule's own reactant counts, so the
+        // rate law is evaluated against them (issue #59).  `rule` is always
+        // an element of model.rules — every call site indexes through it —
+        // so recovering its index by pointer arithmetic is well-defined
+        // here, the same trick set_rule_propensity uses on rule_states.
+        if (rule.rate_law.max_reactant_count_index > 0)
+          return evaluate_against_rule(static_cast<int>(&rule - model.rules.data()), gi,
+                                       [&] { return rate_function_value(rule, gi); });
+        return rate_function_value(rule, gi);
       }
     }
 
     return rule.rate_law.rate_value;
   }
 
+  // The value of function `gi` as `rule`'s rate law, against the layout as
+  // it stands.
+  double rate_function_value(const Rule& rule, int gi) {
+    auto& gf = model.functions[gi];
+    if (gf.is_tfun && gf.tfun) {
+      double const ctr_val = get_tfun_counter_value(gf);
+      double const tfun_val = gf.tfun->evaluate(ctr_val);
+      if (gf_expr_id_[gi] >= 0) {
+        // Patch the magic __tfun_NAME__ slot for this rule's
+        // own tfun result (update_eval_vars wrote it from the
+        // function's own counter, but BNG2 emits the rate-law
+        // wrapper expecting it pre-patched on each call).
+        eval_vars_flat[eval_gf_tfun_slot[gi]] = tfun_val;
+        return expr_eval_.evaluate(gf_expr_id_[gi]);
+      }
+      return tfun_val;
+    }
+    if (gf_expr_id_[gi] >= 0)
+      return expr_eval_.evaluate(gf_expr_id_[gi]);
+    // The placeholder itself as the whole rate law, `reactant_1() TotalRate`,
+    // which BNG2 names as the rate function directly: the count bound into
+    // its slot (issue #59).  It has no expression, so this read the rule's
+    // static rate, zero.
+    if (gf.reactant_count_index > 0)
+      return eval_vars_flat[eval_gf_main_slot[gi]];
+    return rule.rate_law.rate_value;
+  }
+
+  // Run `eval` with rule `ri`'s reactant counts bound and function `gi`'s
+  // placeholder chain (gf_reactant_chain_) re-settled against them, then put
+  // the table back as it was: the chain's functions at their settled values
+  // and the placeholders at zero.  A rate law that reads `reactant_N()` through a
+  // helper reads the helper's slot, so binding the counts alone left it
+  // reading whatever the helper was last settled against, zero outside a
+  // rule, and the rule never fired (issue #59).  The chain is re-evaluated
+  // on every call because the counts move within one generation of the
+  // cached layout: firing a rule changes match counts without moving the
+  // clock or, unless an observable counts them, the observables.  ri = -1
+  // evaluates against no rule, every placeholder zero.
+  template <typename Eval> double evaluate_against_rule(int ri, int gi, const Eval& eval) {
+    auto const& chain = gf_reactant_chain_[gi];
+    for (std::size_t k = 0; k < chain.size(); ++k)
+      reactant_chain_save_[k] = eval_vars_flat[eval_gf_main_slot[chain[k]]];
+    auto const restore = [&] {
+      for (std::size_t k = 0; k < chain.size(); ++k)
+        eval_vars_flat[eval_gf_main_slot[chain[k]]] = reactant_chain_save_[k];
+      bind_reactant_counts(-1);
+    };
+    bind_reactant_counts(ri);
+    double value = 0.0;
+    try {
+      for (int const j : chain)
+        settle_function(j);
+      value = eval();
+    } catch (...) {
+      restore();
+      throw;
+    }
+    restore();
+    return value;
+  }
+
+  // The value a TFUN's table is read at.  A function counter is read off the
+  // settled layout, not re-evaluated: evaluate_rate refreshes the layout on
+  // entry, and rebuild_eval_vars settles the counter ahead of every table
+  // that reads it (eval_settle_order_).  Refreshing the layout from here
+  // re-entered the rebuild that called it, without end (issue #111).
   double get_tfun_counter_value(const GlobalFunction& gf) {
     switch (gf.tfun_counter_source) {
     case TfunCounterSource::Time:
@@ -7086,11 +7334,8 @@ struct Engine::Impl {
     }
     case TfunCounterSource::Function: {
       auto fit = model.function_index.find(gf.tfun_counter_name);
-      if (fit != model.function_index.end() && gf_expr_id_[fit->second] >= 0) {
-        update_eval_vars();
-        return expr_eval_.evaluate(gf_expr_id_[fit->second]);
-      }
-      return 0.0;
+      return (fit != model.function_index.end()) ? eval_vars_flat[eval_gf_main_slot[fit->second]]
+                                                 : 0.0;
     }
     default:
       return 0.0;
@@ -7106,12 +7351,10 @@ struct Engine::Impl {
   // constant for the lifetime of the engine and were written into
   // eval_vars_flat once by init_eval_layout.
   //
-  // Function evaluation order matches the engine's internal
-  // declaration order — BNG2 emits in dependency order, so earlier
-  // functions are settled before later ones reference them.  The
-  // seen-gen update is deferred to AFTER the loop so a recursive
-  // call (TFUN counter source = Function) still does a full rebuild
-  // and sees later function values written, matching prior behavior.
+  // Functions are settled in eval_settle_order_, so each one is settled
+  // before any function that reads it and every function counter before
+  // the tables it indexes.  The seen-gen update is deferred to AFTER the
+  // loop, so a rebuild that throws part way leaves the layout marked stale.
   void update_eval_vars() {
     if constexpr (kExprEvalProfile)
       expr_eval_profile_.update_eval_vars_calls++;
@@ -7144,39 +7387,57 @@ struct Engine::Impl {
           (i < static_cast<int>(obs_values.size())) ? obs_values[i] : 0.0;
     }
 
-    for (int i = 0; i < static_cast<int>(model.functions.size()); ++i) {
-      auto& gf = model.functions[i];
-      if (gf.is_tfun && gf.tfun) {
-        if constexpr (kExprEvalProfile)
-          expr_eval_profile_.tfun_evals++;
-        double const ctr = get_tfun_counter_value(gf);
-        double const val = gf.tfun->evaluate(ctr);
-        eval_vars_flat[eval_gf_main_slot[i]] = val;
-        eval_vars_flat[eval_gf_tfun_slot[i]] = val;
-      } else if (gf_expr_id_[i] >= 0) {
-        if constexpr (kExprEvalProfile)
-          expr_eval_profile_.global_fn_ast_evals++;
-        // A rate law that reads `reactant_N()` is only meaningful against
-        // the rule that owns it, so settle it against that rule's counts
-        // rather than against whatever was last bound (issue #59).
-        if (!eval_reactant_slots.empty() && gf_reactant_owner_rule_[i] >= 0 &&
-            gf_reactant_owner_rule_[i] < static_cast<int>(rule_states.size()))
-          bind_reactant_counts(gf_reactant_owner_rule_[i]);
-        try {
-          eval_vars_flat[eval_gf_main_slot[i]] = expr_eval_.evaluate(gf_expr_id_[i]);
-        } catch (...) {
-          eval_vars_flat[eval_gf_main_slot[i]] = 0.0;
-        }
+    for (int const i : eval_settle_order_) {
+      // A function that reads `reactant_N()`, itself or through a helper,
+      // is only meaningful against a rule, so settle it against the rule
+      // that owns it, its helpers with it, rather than against whatever
+      // was last bound (issue #59).  The placeholders themselves have no
+      // value outside a rule and are left at zero, so a settled function
+      // table reads the same however the rules happen to be ordered.
+      if (gf_reads_reactant_[i] == 0 || model.functions[i].reactant_count_index > 0) {
+        settle_function(i);
+        continue;
       }
+      int owner = gf_reactant_owner_rule_[i];
+      if (owner >= static_cast<int>(rule_states.size()))
+        owner = -1;
+      evaluate_against_rule(owner, i, [&] {
+        settle_function(i);
+        return 0.0;
+      });
     }
 
-    // The placeholders themselves have no value outside a rule; leave them
-    // at zero so a settled function table reads the same however the rules
-    // above happen to be ordered.
-    if (!eval_reactant_slots.empty())
-      bind_reactant_counts(-1);
-
     eval_vars_seen_gen = eval_vars_gen;
+  }
+
+  // Settle function `i` into its slot against the layout as it stands: the
+  // settle pass's step for one function, which evaluate_against_rule also
+  // takes for each function of a placeholder chain.
+  void settle_function(int i) {
+    auto& gf = model.functions[i];
+    if (gf.is_tfun && gf.tfun) {
+      if constexpr (kExprEvalProfile)
+        expr_eval_profile_.tfun_evals++;
+      double const val = gf.tfun->evaluate(get_tfun_counter_value(gf));
+      eval_vars_flat[eval_gf_tfun_slot[i]] = val;
+      // The function's value is its expression around the table value,
+      // `k*__TFUN_VAL__` say, as evaluate_rate computes it; only a table
+      // with no expression is the bare value.  A function reading this
+      // one reads that value.
+      if (gf_expr_id_[i] < 0) {
+        eval_vars_flat[eval_gf_main_slot[i]] = val;
+        return;
+      }
+    } else if (gf_expr_id_[i] < 0) {
+      return;
+    }
+    if constexpr (kExprEvalProfile)
+      expr_eval_profile_.global_fn_ast_evals++;
+    try {
+      eval_vars_flat[eval_gf_main_slot[i]] = expr_eval_.evaluate(gf_expr_id_[i]);
+    } catch (...) {
+      eval_vars_flat[eval_gf_main_slot[i]] = 0.0;
+    }
   }
 
   // Settle every function against the current observable values and
@@ -8408,6 +8669,8 @@ struct Engine::Impl {
   // For pattern-level argument binding: evaluates observables across the
   // molecule's entire complex (complex-wide scope).
   double evaluate_local_rate(const Rule& rule, int mol_id) {
+    if (rule.rate_law.arrhenius)
+      return arrhenius_weight(rule, mol_id, 0);
     // DOR1 (issue #34): this side carries no per-instance factor, so it
     // weighs in at its plain embedding count.  Returning 1 here — rather than
     // branching at every call site — keeps local_propensity = count_a/corr_a.
@@ -8419,10 +8682,130 @@ struct Engine::Impl {
 
   // FunctionProduct B-side factor f2 evaluated at a reactant-B molecule.
   double evaluate_local_rate_b(const Rule& rule, int mol_id) {
+    if (rule.rate_law.arrhenius)
+      return arrhenius_weight(rule, mol_id, 1);
     if (rule.rate_law.unity_factor_b)
       return 1.0;
     return evaluate_local_factor(rule.rate_law.function_name_b,
                                  rule.rate_law.local_arg_is_molecule_b, mol_id);
+  }
+
+  // The weight an Arrhenius rule on the exact path keeps on a molecule at one
+  // end of its bond (issue #109), an upper bound on the rate of any firing
+  // there; arrhenius_accepts thins each firing down to its own rate.
+  //  - Unbinding: the largest rate among the molecule's bonds of the rule's
+  //    kind, each counted exactly.
+  //  - Binding: dG splits into a term each end's own complex decides
+  //    (em_delta_g_end) and, for each pattern bond of the rule's kind, a
+  //    product of matches on the two sides (ArrheniusExact::Cut).  Each
+  //    end's weight carries its own term, and a product whose other side is
+  //    the cut site alone, which is then exactly this side's matches.  The
+  //    end-0 weight also carries exp(-Ea0).  A product with context on both
+  //    sides is split by class (ArrheniusExact::split): this rule takes the
+  //    pairs whose end 1 matches side 1 a given number of ways, end 1's
+  //    weight is 0 for any other, and end 0's carries the product exactly.
+  //    One with too many classes to split is carried at its largest where
+  //    that raises the rate, and not at all where it lowers it.  So end-0
+  //    weight * end-1 weight bounds every pair's rate, and equals it unless
+  //    a product is left unsplit.
+  double arrhenius_weight(const Rule& rule, int mol, int end) const {
+    const ArrheniusExact& ax = *rule.rate_law.arrhenius;
+    const RateLaw& rl = rule.rate_law;
+    const ArrheniusModel& am = model.arrhenius;
+    double const coef = ax.reverse_half ? 1.0 - rl.arr_phi : rl.arr_phi;
+    PoolView const view(pool, am.slot_names);
+    const MoleculeInstance& m = pool.molecule(mol);
+    const auto& names = am.slot_names[m.type_index];
+    double best = 0.0;
+    for (std::size_t k = 0; k < m.comp_ids.size(); ++k) {
+      if (names[k] != ax.name[end])
+        continue;
+      int const c = m.comp_ids[k];
+      int const partner = pool.component(c).bond_partner;
+      if (!ax.binding) {
+        if (partner < 0 || view.type_of(view.mol_of(partner)) != ax.type[1] ||
+            view.name_of(partner) != ax.name[1])
+          continue;
+        double const dg = em_delta_g_bond(am, ax.patterns, view, c, partner, false);
+        best = std::max(best, em_arrhenius_rate(rl.arr_ea0, rl.arr_phi, dg, ax.reverse_half));
+        continue;
+      }
+      if (partner != -1)
+        continue;
+      double dg = em_delta_g_end(am, ax.patterns, view, c);
+      bool in_class = true;
+      for (std::size_t i = 0; i < ax.cuts.size() && in_class; ++i) {
+        const auto& cut = ax.cuts[i];
+        const EmPattern& p = am.patterns[cut.pattern];
+        double const per_match = p.energy / p.automorphisms;
+        // The class this rule takes for a split cut: how many ways side 1
+        // matches, which end 0 multiplies by exactly and end 1 must have.
+        int cls = -1;
+        for (std::size_t k = 0; k < ax.split.size(); ++k)
+          if (ax.split[k] == static_cast<int>(i))
+            cls = ax.split_class[k];
+        if (end == 1) {
+          if (cls >= 0)
+            in_class = em_count_rooted(cut.side1, view, cut.root_mol1, cut.root_comp1, c) == cls;
+          else if (cut.single0 && !cut.single1)
+            dg += per_match * static_cast<double>(em_count_rooted(cut.side1, view, cut.root_mol1,
+                                                                  cut.root_comp1, c));
+          continue;
+        }
+        if (cut.single0 && !cut.single1 && cls < 0)
+          continue; // end 1 carries it
+        if (cls < 0 && !cut.single1 && -coef * p.energy <= 0)
+          continue; // the product can only lower the rate: bound it by none
+        long const left = em_count_rooted(cut.side0, view, cut.root_mol0, cut.root_comp0, c);
+        double const right = cls >= 0 ? cls : (cut.single1 ? 1.0 : cut.bound1);
+        dg += per_match * static_cast<double>(left) * right;
+      }
+      if (!in_class)
+        continue;
+      double const ea0 = end == 0 ? rl.arr_ea0 : 0.0;
+      best = std::max(best, std::exp(-(ea0 + (coef * dg))));
+    }
+    return best;
+  }
+
+  // Whether a drawn firing of an Arrhenius rule on the exact path fires
+  // (issue #109): with probability its own rate, counted on the complexes it
+  // joins or parts, over the weights it was drawn against.  A binding rule
+  // joins two complexes, as BNG2 applies a rule with two reactant patterns,
+  // so a pair already in one complex never fires, under -no-bscb too.
+  bool arrhenius_accepts(int ri, const ReactionMatch& match) {
+    const Rule& rule = model.rules[ri];
+    const ArrheniusExact& ax = *rule.rate_law.arrhenius;
+    const RateLaw& rl = rule.rate_law;
+    int const c = match.comp_ids[ax.flat[0]];
+    int const d = match.comp_ids[ax.flat[1]];
+    int const x = pool.mol_of_comp(c);
+    int const y = pool.mol_of_comp(d);
+    if (ax.binding && pool.complex_of(x) == pool.complex_of(y))
+      return false;
+    PoolView const view(pool, model.arrhenius.slot_names);
+    // A rule split by class takes only the pairs whose end-1 site is in its
+    // class (ArrheniusExact::split); a molecule with sites in several
+    // classes is drawn by each class's rule, which keeps only its own.
+    for (std::size_t k = 0; k < ax.split.size(); ++k) {
+      const ArrheniusExact::Cut& cut = ax.cuts[ax.split[k]];
+      if (em_count_rooted(cut.side1, view, cut.root_mol1, cut.root_comp1, d) != ax.split_class[k])
+        return false;
+    }
+    double const dg = em_delta_g_bond(model.arrhenius, ax.patterns, view, c, d, ax.binding);
+    double const rate = em_arrhenius_rate(rl.arr_ea0, rl.arr_phi, dg, ax.reverse_half);
+    const RuleState& rs = rule_states[ri];
+    double const bound = ax.binding ? rs.mol_aux[x].local_rate * rs.mol_aux[y].local_rate_b
+                                    : rs.mol_aux[x].local_rate;
+    if (rate > bound * (1 + 1e-9) && !arrhenius_bound_warned_) {
+      // Cannot happen if the weights are right; say so rather than run on.
+      arrhenius_bound_warned_ = true;
+      fprintf(stderr,
+              "WARN: rule '%s': an Arrhenius firing's rate %g exceeds the weight %g it was "
+              "drawn against, so the rule runs slow; please report this\n",
+              rule.name.c_str(), rate, bound);
+    }
+    return uniform() * bound < rate;
   }
 
   // Evaluate one named local-function factor at a molecule.  Backs both the
@@ -8490,8 +8873,8 @@ struct Engine::Impl {
       }
     }
 
-    // Re-evaluate local functions only.  Functions are stored in
-    // dependency order so sequential evaluation resolves the chain
+    // Re-evaluate local functions only.  eval_local_fn_slots is in
+    // settle order, so sequential evaluation resolves the chain
     // correctly.  Global functions were already settled by the
     // top-of-call update_eval_vars and DO NOT depend on local
     // observables (BNG2 emits local arg references only inside
@@ -11409,29 +11792,55 @@ struct Engine::Impl {
         result.function_data[i].push_back(fvals[i]);
     };
 
+    // The call's events go on an elapsed clock from 0 here (issue #110; see
+    // set_elapsed).  The clock stands at t_end once the call is over.
+    clock_origin = current_time;
+    clock_elapsed = 0.0;
+    double const t_end_el = ts.t_end - clock_origin;
+    auto stop_at_t_end = [&]() {
+      clock_elapsed = t_end_el;
+      current_time = ts.t_end; // exact, where origin + t_end_el may be an ulp off
+      ++eval_vars_gen;         // time moved → invalidate cached eval_vars_flat
+    };
+
     // Compute sample times.  An explicit `ts.sample_times` list (issue #16)
     // overrides the uniform grid entirely; the recorder below walks a generic
     // sorted vector either way, so only the construction of `sample_times`
-    // changes here.
+    // changes here.  `sample_times` are the labels, on the model's clock;
+    // `sample_at` places each on the elapsed clock.  A grid point is placed
+    // at i*dt from t_start, so a late t_start samples the same instants as
+    // an early one even where its labels cannot tell them apart.
     std::vector<double> sample_times;
+    std::vector<double> sample_at;
     if (!ts.sample_times.empty()) {
       // Honor the caller's exact output instants (e.g. an experimental
       // dataset's time points).  The recorder advances a single cursor and
       // never looks back, so the list must be sorted ascending — validate and
-      // throw rather than silently dropping or mis-ordering samples.
-      for (std::size_t i = 1; i < ts.sample_times.size(); ++i) {
-        if (ts.sample_times[i] < ts.sample_times[i - 1])
+      // throw rather than silently dropping or mis-ordering samples.  A NaN
+      // passes any ordering test and then stalls the cursor, so every later
+      // sample recorded the final state; it is refused on its own.
+      for (std::size_t i = 0; i < ts.sample_times.size(); ++i) {
+        if (std::isnan(ts.sample_times[i]))
+          throw std::runtime_error("TimeSpec::sample_times must not contain NaN");
+        if (i > 0 && ts.sample_times[i] < ts.sample_times[i - 1])
           throw std::runtime_error("TimeSpec::sample_times must be sorted in "
                                    "ascending order");
       }
       sample_times = ts.sample_times;
+      for (double const t : sample_times)
+        sample_at.push_back(t - clock_origin);
     } else if (ts.n_points > 0) {
       double const dt = (ts.t_end - ts.t_start) / ts.n_points;
-      for (int i = 0; i <= ts.n_points; ++i)
+      double const start_el = ts.t_start - clock_origin;
+      for (int i = 0; i <= ts.n_points; ++i) {
         sample_times.push_back(ts.t_start + (i * dt));
+        sample_at.push_back(start_el + (i * dt));
+      }
     } else {
       sample_times.push_back(ts.t_start);
       sample_times.push_back(ts.t_end);
+      sample_at.push_back(ts.t_start - clock_origin);
+      sample_at.push_back(t_end_el);
     }
 
     int next_sample = 0;
@@ -11441,10 +11850,13 @@ struct Engine::Impl {
     // a t_end of 1e6 has FP grid spacing ≈ 1.16e-10 between adjacent
     // doubles, so 1e-15 is below the resolution of `current_time` and
     // a sample exactly at t_end could miss its bucket.  Use a relative
-    // tolerance (max(1e-15, 1e-12 * |t_end|)) so the check tracks the
-    // representable spacing of the time grid at any scale.  Computed
-    // once outside the SSA loop because t_end doesn't change mid-run.
-    const double t_eps = std::max(1e-15, 1e-12 * std::fabs(ts.t_end));
+    // tolerance (max(1e-15, 1e-12 * span)) so the check tracks the
+    // representable spacing of the time grid at any scale.  The grid is
+    // the elapsed clock's, so the span is the call's, not |t_end|: from
+    // t_start = 1e13, 1e-12 * |t_end| is 10 time units, and a sample at
+    // t_start + 2 recorded the seed state (issue #110).  Computed once
+    // outside the SSA loop because t_end doesn't change mid-run.
+    const double t_eps = std::max(1e-15, 1e-12 * std::fabs(t_end_el));
 
     auto wall_t0 = std::chrono::steady_clock::now();
 
@@ -11475,7 +11887,7 @@ struct Engine::Impl {
 
     // Record samples up to current time
     while (next_sample < static_cast<int>(sample_times.size()) &&
-           sample_times[next_sample] <= current_time + t_eps) {
+           sample_at[next_sample] <= clock_elapsed + t_eps) {
       record_at(sample_times[next_sample]);
       ++next_sample;
     }
@@ -11488,12 +11900,12 @@ struct Engine::Impl {
     // node gap, about a third of a panel, can still fall between nodes.
     // bngsim caps its panels the same way.
     if (!clock_rules.empty()) {
-      clock_hmax = (ts.t_end - current_time) / 1000.0;
+      clock_hmax = t_end_el / 1000.0;
       clock_h = clock_hmax;
     }
 
     // Main SSA loop
-    while (current_time < ts.t_end) {
+    while (clock_elapsed < t_end_el) {
       // Cooperative cancellation: between-event safe point.  Throwing
       // before any state advances this iteration means the session is
       // left at the last completed event's time/pool state — safe to
@@ -11523,11 +11935,16 @@ struct Engine::Impl {
         // declaring the absorbing state.
         recompute_total_propensity();
         if (total_propensity <= 0) {
-          // Absorbing state — record remaining samples at current values
+          // Absorbing state — record remaining samples at current values.
+          // Nothing happens before t_end, so the clock goes there, as it
+          // does when a draw outlasts the call.  It used to stay at the last
+          // event, and a session's next simulate() from t_end was refused
+          // for starting after the session's time.
           while (next_sample < static_cast<int>(sample_times.size())) {
             record_at(sample_times[next_sample]);
             ++next_sample;
           }
+          stop_at_t_end();
           break;
         }
       }
@@ -11539,25 +11956,25 @@ struct Engine::Impl {
         u1 = uniform(); // avoid log(0)
       double next_time;
       if (clock_rules.empty()) {
-        next_time = current_time + (-std::log(u1) / total_propensity);
+        next_time = clock_elapsed + (-std::log(u1) / total_propensity);
       } else {
         // The same Exp(1) draw, spent against the integrated hazard instead
         // of the one held at this instant.  The search leaves the clock at
         // next_time, or at t_end when the draw outlasts the run, with the
         // clock-driven rules evaluated there; the running total took a
         // delta per evaluation, so re-sum it for the selection below.
-        next_time = next_clocked_event_time(-std::log(u1), ts.t_end);
+        next_time = next_clocked_event_time(-std::log(u1), t_end_el);
         recompute_total_propensity();
       }
 
       // Record samples before this reaction
       while (next_sample < static_cast<int>(sample_times.size()) &&
-             sample_times[next_sample] <= next_time) {
+             sample_at[next_sample] <= next_time) {
         record_at(sample_times[next_sample]);
         ++next_sample;
       }
 
-      if (next_time > ts.t_end) {
+      if (next_time > t_end_el) {
         // The draw outlasts the call, and it is spent: the next call takes a
         // fresh one from t_end.  That is exact because the pool and the
         // clock at t_end are the whole state and the waiting time has no
@@ -11569,12 +11986,11 @@ struct Engine::Impl {
         // firing (issue #89).  The RNG is left past the draw, which is the
         // state save_state writes, so a continuation in process and one
         // from a saved state still take the same next number.
-        current_time = ts.t_end;
+        stop_at_t_end();
         break;
       }
 
-      current_time = next_time;
-      ++eval_vars_gen; // time advanced → invalidate cached eval_vars_flat
+      set_elapsed(next_time);
 
       // Select reaction
       double const u2 = uniform() * total_propensity;
@@ -11805,6 +12221,15 @@ struct Engine::Impl {
       // draws, so rejecting them as null events realizes BNG2's rate exactly.
       if (model.rules[selected].checks_product_split &&
           !products_split_as_written(model.rules[selected], match)) {
+        timing_sample += std::chrono::duration<double>(t1 - t0).count();
+        ++null_event_count;
+        continue;
+      }
+
+      // An Arrhenius rule on the exact path (issue #109) was drawn against
+      // weights that bound its rate; keeping the firing with probability
+      // rate / bound leaves it firing at the rate BNG2 counts for it.
+      if (model.rules[selected].rate_law.arrhenius && !arrhenius_accepts(selected, match)) {
         timing_sample += std::chrono::duration<double>(t1 - t0).count();
         ++null_event_count;
         continue;
@@ -12213,7 +12638,20 @@ void Engine::initialize(double t_start) {
   impl_->initialized = true;
 }
 
+void Engine::share_clamp_warnings(std::atomic<bool>* latch) { impl_->shared_clamp_latch = latch; }
+
 Result Engine::run(const TimeSpec& ts, const CancelCallback& should_continue) {
+  // Every run, simulate(), step_to(), ensemble replicate and scan point
+  // comes through here.  An infinite t_end has no grid to sample, and once
+  // nothing can fire, no time to leave the clock at (issue #110).  A grid
+  // over [0, inf] was labelled NaN, inf, ..., inf with every row at the end
+  // state, and step_to(inf) would now leave `current_time()` at inf, a state
+  // load_state cannot read back.
+  if (!std::isfinite(ts.t_end)) {
+    std::ostringstream msg;
+    msg << "run: t_end must be finite, got " << ts.t_end;
+    throw std::runtime_error(msg.str());
+  }
   if (!impl_->initialized)
     initialize(ts.t_start);
   return impl_->run_ssa(ts, should_continue);
