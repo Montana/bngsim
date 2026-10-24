@@ -3435,7 +3435,282 @@ class _OverStopBudget(Exception):
         self.legs = legs
 
 
+class StopsMoveWithAnEvent(Exception):
+    """A rate law's condition reads a species only events write, at times or
+    to values not known before the run, and it changes more than once in it
+    (issue #1244): no stop can be placed for it, and a step can lie across a
+    whole window of it."""
+
+
+# Times or values an event's schedule is read from: ``time() >= c`` and its
+# spellings, with c the run's constant.
+_TIME_TRIGGER = re.compile(r"^time\(\)\s*(>=|>)\s*(.+)$|^(.+?)\s*(<=|<)\s*time\(\)$")
+# Stretches a schedule is placed over, at most; past it the run is refused as
+# one whose schedule is not known.
+_HELD_STRETCHES_MOST = 512
+
+
+def _event_held_species(core, conditions=None) -> dict[str, int]:
+    """The species events assign and nothing else moves: no reaction, rate rule
+    or rescale reads them as a reactant or a product. Between two of those
+    events each holds its value. Name to 0-based index; of those *conditions*
+    read, where they are given."""
+    assigned = set(core.event_assigned_species)
+    if not assigned:
+        return {}
+    names = list(core.species_names)
+    if conditions is not None:
+        read = {m.group(0) for cond in conditions for m in _IDENTIFIER.finditer(cond)}
+        assigned = {i for i in assigned if names[i] in read}
+        if not assigned:
+            return {}  # the model as a dict is not built for a run that asks nothing of it
+    data = core.codegen_data()
+    for rxn in data["reactions"]:
+        assigned -= set(rxn["reactants"]) | set(rxn["products"])
+    return {names[i]: i for i in sorted(assigned)}
+
+
+def _reads_run_constants_alone(text: str, scope: SwitchConditionScope) -> bool:
+    """True when *text* reads no clock, no state and no model function: only
+    numbers, builtins and run constants."""
+    if not _clock_free(text, scope.clock_symbols):
+        return False
+    for m in _IDENTIFIER.finditer(text):
+        name = m.group(0)
+        if name in scope.function_names:
+            return False
+        if text[m.end() :].lstrip().startswith("("):
+            continue  # an engine builtin; its arguments are read by this loop
+        if name in scope.run_constants or name in _BUILTIN_CONSTANT_VALUES:
+            continue
+        return False
+    return True
+
+
+def _with_values(text: str, values: Mapping[str, float]) -> str:
+    """*text* with each name in *values* written as its number."""
+    return _IDENTIFIER.sub(
+        lambda m: f"({values[m.group(0)]!r})" if m.group(0) in values else m.group(0), text
+    )
+
+
+def _held_schedule(
+    core,
+    scope: SwitchConditionScope,
+    held: Mapping[str, int],
+    t_start: float,
+    t_end: float,
+    sensitivity_params,
+) -> tuple[list[tuple[float, dict[str, float]]], dict[str, str]]:
+    """When each held species changes in ``(t_start, t_end)``, and to what, as
+    ``[(t_start, values), (t1, values from t1), ...]``; and, for each held
+    species whose changes are not known before the run, why.
+
+    Known: every event that writes it fires on ``time() >= c`` (or ``>``, or
+    the same written the other way), with c a run constant, after a constant
+    delay, and sets a value that reads only run constants and held species
+    known then. Such a trigger rises once, so the event fires once. Not
+    known: two writers executing at one instant, which are not ordered here;
+    a delayed fire whose value, read at its trigger, reads a held species that
+    another fire sets in between; and, in a run with sensitivity columns, a
+    time or a value that reads a requested parameter, or one derived from
+    them, whose stops would move with it."""
+    names_of = {i: name for name, i in held.items()}
+    unknown: dict[str, str] = {}
+    requested = set(sensitivity_params or ())
+    moved = requested | set(scope.derived_exprs)
+    param_names = list(core.param_names)
+    if sensitivity_params is not None:
+        for sp, p in core.species_ic_param_refs:
+            if sp in names_of and param_names[p] in moved:
+                unknown[names_of[sp]] = (
+                    f"its initial value is {param_names[p]}, which a requested "
+                    "sensitivity parameter moves"
+                )
+
+    def value_of(text: str, at: float) -> tuple[float | None, str]:
+        """The number *text* reads, or None and why not."""
+        if not _reads_run_constants_alone(text, scope):
+            return None, "which is not known before the run"
+        hit = sorted(set(_IDENTIFIER.findall(text)) & moved) if sensitivity_params else []
+        if hit:
+            return None, f"which a requested sensitivity parameter moves ({', '.join(hit)})"
+        v = float(core.evaluate_over_times(text, [float(at)], 0.0)[0])
+        return (v, "") if math.isfinite(v) else (None, f"which reads {v}")
+
+    # (execution time, trigger time, label, [(species, value text)], from trigger)
+    fires: list[tuple[float, float, str, list[tuple[str, str]], bool]] = []
+    for ev in core.events_as_written():
+        writes = [(names_of[sp], text) for sp, text in ev["assignments"] if sp in names_of]
+        if not writes:
+            continue
+        trigger = _strip_redundant_parens(ev["trigger"])
+        label = f"event {ev['id'] or '?'} on {trigger}"
+        m = _TIME_TRIGGER.match(trigger.replace(" ", ""))
+        threshold, why = None, "a trigger that is no fixed time"
+        if m is not None and ev["delay_expr"]:
+            why = f"after a delay of {ev['delay_expr']}, not a constant"
+        elif m is not None:
+            op, c = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+            threshold, why = value_of(c, t_start)
+            why = f"at time {c}, {why}"
+        if threshold is None:
+            for name, _ in writes:
+                unknown.setdefault(name, f"{label} sets it, {why}")
+            continue
+        true_at_start = t_start >= threshold if op in (">=", "<=") else t_start > threshold
+        if true_at_start and ev["initial_value"]:
+            continue  # it never rises in this run
+        rises = t_start if true_at_start else threshold
+        at = rises + float(ev["delay"])
+        if at < t_end:
+            from_trigger = float(ev["delay"]) > 0 and ev["use_values_from_trigger_time"]
+            fires.append((at, rises, label, writes, from_trigger))
+    fires.sort(key=lambda f: f[0])
+    for a, b in zip(fires, fires[1:], strict=False):
+        if abs(b[0] - a[0]) <= 1e-12 * max(1.0, abs(a[0])):
+            for name, _ in a[3] + b[3]:
+                unknown.setdefault(name, f"{a[2]} and {b[2]} set it at one instant")
+    if len(fires) > _HELD_STRETCHES_MOST:
+        for f in fires:
+            for name, _ in f[3]:
+                unknown.setdefault(name, f"events set it {len(fires)} times in the run")
+
+    values = {name: float(core.get_concentration(name)) for name in held}
+    schedule = [(t_start, dict(values))]
+    for at, rises, label, writes, from_trigger in fires:
+        if from_trigger and any(rises < other[0] < at for other in fires):
+            # Its value is read at its trigger, before a fire it would read.
+            for name, _ in writes:
+                unknown.setdefault(
+                    name, f"{label} reads its value at its trigger, before another event sets it"
+                )
+            continue
+        new = {}
+        for name, text in writes:
+            v, why = value_of(_with_values(text, values), at)
+            if v is None:
+                unknown.setdefault(name, f"{label} sets it to {text}, {why}")
+            else:
+                new[name] = v
+        if new:
+            values = {**values, **new}
+            if at > t_start:
+                schedule.append((at, dict(values)))
+            else:
+                schedule[0] = (t_start, dict(values))
+    return schedule, unknown
+
+
 def _resolve_crossings(
+    core,
+    t_start: float,
+    t_end: float,
+    conditions,
+    periodic: bool,
+    touches=frozenset(),
+    over_budget=None,
+    sensitivity_params=None,
+    on_the_flip=False,
+    before_the_flip=False,
+    by_tread=False,
+) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
+    """:func:`_resolve_flat`, with a condition that reads a species only events
+    write resolved stretch by stretch between their executions (issue #1244).
+
+    Such a species is no run constant, so a condition that reads it was given
+    no stop at all, and a schedule of pulses whose width an event writes was
+    stepped over before the event as well as after: X(240) came to 1 for 17.
+    Between two of the events it holds, and where when they execute and what
+    they set is known before the run (:func:`_held_schedule`), each stretch is
+    resolved with the species written as its number there. Where it is not
+    known, a condition that changes more than once over the run, as its start
+    reads it, is refused by name (:class:`StopsMoveWithAnEvent`): a step can
+    lie across a whole window of it. One that changes once is a root's sign
+    change, and an event's trigger is located as a root, so both are read as
+    before."""
+    kw = dict(
+        periodic=periodic,
+        over_budget=over_budget,
+        sensitivity_params=sensitivity_params,
+        on_the_flip=on_the_flip,
+        before_the_flip=before_the_flip,
+        by_tread=by_tread,
+    )
+    held = _event_held_species(core, [c for c in conditions if c not in touches])
+    reads = {
+        cond: sorted(set(_IDENTIFIER.findall(cond)) & held.keys())
+        for cond in conditions
+        if cond not in touches
+    }
+    reads = {cond: names for cond, names in reads.items() if names}
+    if not reads:
+        return _resolve_flat(core, t_start, t_end, conditions, touches=touches, **kw)
+    ctx = core.functional_jacobian_context()
+    scope = switch_condition_scope(core, ctx)
+    schedule, unknown = _held_schedule(core, scope, held, t_start, t_end, sensitivity_params)
+    known = {cond: names for cond, names in reads.items() if not set(names) & unknown.keys()}
+    # What is not known is read as before: given no stop, or refused below.
+    rest = [cond for cond in conditions if cond not in known]
+    for cond, names in reads.items():
+        if cond in known:
+            continue
+        # As its start reads it: more than one change over the run and a step
+        # can lie across one of its windows, as across a pulse.
+        start = _with_values(cond, schedule[0][1])
+        quiet: list = []
+        stops = [
+            stop
+            for part in _resolve_flat(
+                core, t_start, t_end, [start], periodic=True, over_budget=quiet
+            )[:2]
+            for stop in part
+        ]
+        if len(stops) > 1 or quiet:
+            name = next(n for n in names if n in unknown)
+            how_often = f"{len(stops)} times" if not quiet else "more often than stops are placed"
+            raise StopsMoveWithAnEvent(
+                f"A rate law switches at {_strip_redundant_parens(cond.strip())!r}, which "
+                f"reads {name}, and only events set {name}: {unknown[name]}. So its stops "
+                f"cannot be placed before the run, and as the run starts the condition "
+                f"changes {how_often}: a step can lie across a whole window of it with "
+                "nothing said (issue #1244). bngsim refuses rather than step over it. An "
+                f"event that sets {name} at a fixed time (`time >= c`) to a constant, "
+                "with no requested sensitivity parameter in either, has the condition's "
+                "stops placed stretch by stretch."
+            )
+    found = list(_resolve_flat(core, t_start, t_end, rest, touches=touches, **kw))
+    if known:
+        # Past the budget in a stretch is reported as the condition the model
+        # holds, which is what the run's switches are matched against, once.
+        past: dict[str, StopsOverBudget] = {}
+        ends = [at for at, _ in schedule[1:]] + [t_end]
+        for (lo, values), hi in zip(schedule, ends, strict=True):
+            if hi <= lo:
+                continue
+            asked = {_with_values(cond, values): cond for cond in known}
+            here: list[StopsOverBudget] = []
+            part = _resolve_flat(
+                core, lo, hi, list(asked), touches=touches, **{**kw, "over_budget": here}
+            )
+            for k in range(3):
+                found[k] = [*found[k], *part[k]]
+            for item in here:
+                cond = asked.get(item.condition, item.condition)
+                was = past.get(cond)
+                past[cond] = item._replace(
+                    condition=cond, changes=item.changes + (was.changes if was else 0)
+                )
+        for item in past.values():
+            if over_budget is None:
+                _warn_over_budget(item.condition, item.changes, t_start, t_end)
+            else:
+                over_budget.append(item)
+    fixed, stops, crossings = (sorted(f, key=lambda stop: stop.time) for f in found)
+    return fixed, stops, crossings
+
+
+def _resolve_flat(
     core,
     t_start: float,
     t_end: float,
