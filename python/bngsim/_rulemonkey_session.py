@@ -101,12 +101,10 @@ class RuleMonkeySession:
 
         from bngsim._network_free_checks import (
             refuse_rulemonkey_compartments,
-            refuse_rulemonkey_energy_misreads,
             rulemonkey_clock,
         )
 
         refuse_rulemonkey_compartments(self._xml_path)
-        refuse_rulemonkey_energy_misreads(self._xml_path)  # until issue #1058
         # The functions that read the clock, for which a segment's labels must
         # be the session clock (see simulate). Where the model reads it through
         # its functions alone, the core reads it as time() + __bngsim_t0, set

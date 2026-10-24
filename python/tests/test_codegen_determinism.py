@@ -294,7 +294,7 @@ static void bngsim_dfdp(int iP, double t, const double* y,
     double v;
     switch (iP) {
     case 0:
-        v = (-p[2]*p[1]/pow(p[0], 2)) * y[0];
+        v = (-p[2]*p[1]/pow(p[0], 2.0)) * y[0];
         dfdp_out[0] -= v;
         dfdp_out[1] += v;
         dfdp_out[2] += v;

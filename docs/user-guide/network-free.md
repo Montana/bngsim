@@ -182,15 +182,14 @@ reports is model time (issue #1063). Before that its waiting times were rounded
 once the total propensity times |t| neared 1e15, and from t = 1e12 a run or a
 session was biased with no error.
 
-A model with a table indexed by time still places its events on absolute time,
-so the same rounding applies there, as it does to `method="ssa"` on any model
-(issue #1059): keep such a run's times moderate. (Offsetting a table's clock
-would index it through a function, and RuleMonkey 3.11.0 recurses without end on
-a table whose counter is a function, richardposner/RuleMonkey#111.) RuleMonkey
-integrates a rate that reads the clock on panels of a thousandth of a span, so
-on absolute time `method="rm"` refuses a span too short for the doubles near its
-times to place them (a span of 2 at t = 1e13), rather than return a run that
-never fires.
+A model with a table indexed by time is not offset, and runs on model time.
+Since RuleMonkey 3.12.0 that keeps its waiting times too: RuleMonkey places its
+events, and the panels on which it integrates a rate that reads the clock, on
+the time elapsed since each call starts (richardposner/RuleMonkey#110), and only
+the clock a rate reads is rounded to the doubles near it. From t = 1e13 a step
+table's run matches its closed form, where bngsim used to refuse a span that
+short (issue #1063). `method="ssa"` keeps the rounding limit on a rate that
+reads `time()` (issue #1059).
 
 ### Arrhenius (energy) rules
 
@@ -200,15 +199,27 @@ reverse half of a reversible rule. Energies are in units of RT: there is no RT
 in the formula, and a parameter named `RT` is an ordinary parameter, which a
 model in kJ/mol divides by where it uses it (issue #1022).
 
-RuleMonkey expands each energy rule at load, and reads only some energy
-patterns as BNG2 does: the bonded pair of sites a rule joins or parts, alone or
-with one more bond to a molecule of a third type whose site binds nothing else,
-on a rule that names only those two sites. That covers pair and cooperativity
-patterns. It drops or misapplies a state, a site that must be free, a wildcard
-bond, a site named twice, context further out, and context in the rule itself
-(richardposner/RuleMonkey#109), so `method="rm"` refuses such a model by name
-until that is fixed upstream (issue #1058). Simulate it with `method="ode"` or
-`method="ssa"` on the generated network.
+RuleMonkey runs an energy rule that makes one bond between two reactant
+patterns, or breaks one within one, between molecules of two types, with no
+other operation. It expands the rule at load where that is exact, as for pair
+and cooperativity patterns, and everywhere else counts `dG` at each firing as
+BNG2's network does per reaction: an energy pattern with a state, a site that
+must be free, wildcard bonds, a site named twice or context further out, and
+context in the rule's own reactant pattern all run at BNG2's rate
+(richardposner/RuleMonkey#109; `method="rm"` refused these until issue #1058).
+Counting at each firing costs more per event, and more the larger the complexes
+an event touches.
+
+RuleMonkey refuses at load, naming the rule and the reason, an energy rule that
+changes a state or adds or deletes a molecule, makes or breaks more than one
+bond, closes a ring, binds two molecules of one type, has more than two
+reactants, or carries include or exclude constraints, and a rule it cannot
+expand whose bond can reach an energy pattern joined only by `.`. Simulate such
+a model with `method="ode"` or `method="ssa"` on the generated network. BNG2
+writes the reverse half of a reversible rule `X` as a rule named `_reverse_X`,
+so two unidirectional rules, `X` and a mirror image named `_reverse_X` with the
+same `phi` and `Ea0` parameters, read as one reversible rule, and RuleMonkey
+gives the second `1-phi` where BNG2 gives it `phi`.
 
 ### Compartments
 

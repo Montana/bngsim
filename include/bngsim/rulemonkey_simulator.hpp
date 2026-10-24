@@ -98,13 +98,11 @@ class RuleMonkeySimulator {
 
     // Whether the model reads the clock (time(), or a table function indexed
     // by time); true by default. If it does, `run` puts the seed state at
-    // `times.t_start` on the model's clock, and a run, segment or step whose
-    // span the doubles near its times are too coarse to integrate a clock-
-    // driven rate over is refused. If not, `run` runs on time elapsed since
-    // t_start and labels the rows back, which no such model can tell apart and
-    // which keeps event times small: on absolute time a waiting time is rounded
-    // away once the total propensity times |t| nears 1e15. Sessions always run
-    // on the model's clock.
+    // `times.t_start` on the model's clock; RuleMonkey places its events on the
+    // time elapsed since each call starts (richardposner/RuleMonkey#110), so its
+    // waiting times hold at a large t_start. If not, `run` runs on time elapsed
+    // since t_start and labels the rows back, which no such model can tell
+    // apart. Sessions always run on the model's clock.
     void set_reads_clock(bool enabled);
 
     // RuleMonkey's Severity::Warn load diagnostics, each "element: feature".

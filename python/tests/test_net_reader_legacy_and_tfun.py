@@ -182,13 +182,13 @@ class TestMichaelisMenten:
         assert rxn["rate_law"] == "kcat,Km"
         assert rxn["legacy_constants"] == ["kcat", "Km"]
 
-    def test_short_mm_line_falls_through_to_elementary(self, tmp_path: Path) -> None:
-        """`MM` with no operands is a rate-law *name*, as in the C++ loader.
-
-        `parse_reactions` gates the MM branch on `tokens.size() >= 6` and lets a
-        shorter line reach the elementary branch, where `MM` is just an
-        (unresolvable) parameter name. Both doors refuse the line for that
-        reason, rather than one inventing an MM rate law out of a truncated one.
+    def test_a_short_mm_line_is_refused_as_one(self, tmp_path: Path) -> None:
+        """`MM kcat` is an MM rate law missing its Km, as run_network reads it
+        ("Incorrect number of rate constants"). Both doors refuse it, rather than
+        one inventing an MM rate law out of a truncated one. Until issue #1231 it
+        reached the elementary branch and was refused at build as an unknown
+        parameter named `MM`, which named the wrong thing. (A bare `MM`, four
+        tokens, is still a rate constant named MM.)
         """
         net = tmp_path / "short_mm.net"
         net.write_text(
@@ -210,9 +210,10 @@ class TestMichaelisMenten:
             ).strip()
             + "\n"
         )
-        with pytest.raises(ValueError, match="unknown parameter 'MM'"):
+        message = "an MM rate law takes two constants, 'MM kcat Km'"
+        with pytest.raises(ValueError, match=message):
             parse_net_file(net)
-        with pytest.raises(bngsim.ModelError, match="unknown parameter 'MM'"):
+        with pytest.raises(bngsim.ModelError, match=message):
             bngsim.Model.from_net(str(net))
 
 

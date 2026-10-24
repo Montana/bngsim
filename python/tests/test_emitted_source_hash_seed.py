@@ -44,6 +44,20 @@ def ccode(expr):
     return ccode(expr)
 
 
+def sympy_ccode(expr):
+    """``sp.ccode(expr)`` with the one difference ``_term_order.ccode`` makes
+    on purpose: an integer prints as a double literal (``2.0``), because a bare
+    one past 2^64 is a different number in C, or none. The controls below are
+    about order, so they compare against sympy's printer with that one rule."""
+    from sympy.printing.c import C99CodePrinter
+
+    class _Doubles(C99CodePrinter):
+        def _print_Integer(self, expr):
+            return f"{int(expr)}.0"
+
+    return _Doubles().doprint(expr)
+
+
 # The rate of A -> B is a*Aobs^2.0 + b*Aobs^2. Its derivative in Aobs is
 # 2.0*a*Aobs**1.0 + 2*b*Aobs: two terms, over the generators Aobs**1.0, Aobs,
 # a and b, the first two of which tie.
@@ -154,7 +168,7 @@ def test_the_partials_of_a_derived_parameter_are_the_same_under_every_hash_seed(
         assert done.returncode == 0, done.stderr[-2000:]
         emitted[seed] = done.stdout.strip().splitlines()[-1]
     assert len(set(emitted.values())) == 1, emitted
-    assert "2.0*pow(p[0], 1.0)*p[1] + 2*p[0]*p[2]" in emitted[0]
+    assert "2.0*pow(p[0], 1.0)*p[1] + 2.0*p[0]*p[2]" in emitted[0]
 
 
 def _tied_sum():
@@ -189,7 +203,7 @@ def test_a_tie_is_broken_by_what_the_generators_are():
     terms = ordered_terms(expr)
     assert len(terms) == 2
     assert terms[0].has(sp.Float(1.0)) and not terms[1].has(sp.Float(1.0))
-    assert ccode(expr) == "2.0*pow(A, 1.0)*p + 2*A*q"
+    assert ccode(expr) == "2.0*pow(A, 1.0)*p + 2.0*A*q"
 
 
 def _from_every_set_order(expr, monkeypatch, read=None):
@@ -345,7 +359,7 @@ def test_a_sum_with_no_tie_is_ordered_as_sympy_orders_it(text):
 
     expr = sp.sympify(text)
     assert ordered_terms(expr) == expr.as_ordered_terms()
-    assert ccode(expr) == sp.ccode(expr)
+    assert ccode(expr) == sympy_ccode(expr)
     assert _term_order.srepr(expr) == sp.srepr(expr)
     for part in sp.preorder_traversal(expr):
         assert _term_order.stable_key(part) == part.sort_key()
@@ -690,7 +704,7 @@ def test_expressions_with_no_tie_are_printed_as_sympy_prints_them():
         if not isinstance(expr, sp.Basic) or expr.has(sp.zoo, sp.nan):
             continue
         assert _term_order.stable_key(expr) == expr.sort_key(), expr
-        assert _term_order.ccode(expr) == sp.ccode(expr), expr
+        assert _term_order.ccode(expr) == sympy_ccode(expr), expr
         assert _term_order.srepr(expr) == sp.srepr(expr), expr
 
 

@@ -9,6 +9,7 @@
 #include "bngsim/bngsim.hpp"
 
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -192,15 +193,17 @@ static const char *reserved_functions_[] = {
     "abs",  "floor", "ceil",  "round", "rint", "trunc", "min",    "max",    "clamp", "avg",
     "sum",  "erf",   "erfc",  "sign",  "sgn",  "if",    "mratio", "tgamma", nullptr};
 
+// The counts come from the arrays (less the nullptr terminator), so adding a
+// name cannot leave a hand-typed count behind.
 const char **bng_reserved_constants(int *count) {
     if (count)
-        *count = 7;
+        *count = static_cast<int>(std::size(reserved_constants_)) - 1;
     return reserved_constants_;
 }
 
 const char **bng_reserved_functions(int *count) {
     if (count)
-        *count = 38;
+        *count = static_cast<int>(std::size(reserved_functions_)) - 1;
     return reserved_functions_;
 }
 

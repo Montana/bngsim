@@ -89,18 +89,28 @@ def _dropped_events(rep) -> bool:
     return any("event" in str(x).lower() for x in (rep.dropped or []))
 
 
-def convert_bngl(m) -> dict:
+def _shown(path: Path) -> str:
+    """A written path as the log records it: relative to this suite when it is
+    under it (the committed default), absolute when --out aimed it elsewhere
+    (``--out`` is resolved when parsed, so a relative one is absolute here too)."""
+    try:
+        return str(path.relative_to(HERE))
+    except ValueError:
+        return str(path)
+
+
+def convert_bngl(m, out: Path = OUT) -> dict:
     """net -> SBML for one BNGL model; returns a coverage/report record."""
     from bngsim.convert import net_to_sbml
 
     name = m["name"]
     net = HERE / m["file"]
-    xml = OUT / f"{name}.xml"
+    xml = out / f"{name}.xml"
     rec = {
         "name": name,
         "direction": "net_to_sbml",
         "src": m["file"],
-        "out": str(xml.relative_to(HERE)),
+        "out": _shown(xml),
     }
     try:
         with warnings.catch_warnings():
@@ -139,18 +149,18 @@ def convert_bngl(m) -> dict:
     return rec
 
 
-def convert_sbml(m) -> dict:
+def convert_sbml(m, out: Path = OUT) -> dict:
     """SBML -> .net for one SBML model; returns a coverage/report record for run_network."""
     from bngsim.convert import sbml_to_net
 
     mid = m["id"]
     xml = HERE / m["file"]
-    net = OUT / f"{mid}.net"
+    net = out / f"{mid}.net"
     rec = {
         "name": mid,
         "direction": "sbml_to_net",
         "src": m["file"],
-        "out": str(net.relative_to(HERE)),
+        "out": _shown(net),
     }
     try:
         with warnings.catch_warnings():
@@ -204,27 +214,37 @@ def build_parser():
 
     This step re-converts all 14 models and rewrites `results/converted/`
     plus the `conversion_log.json` that `_ssa_config.COVERAGE` is checked
-    against. It takes no options -- the corpus and the tolerances are
-    declared in `corpus.json` / `_ssa_config.py` -- but ``--help`` has to
-    answer rather than start converting.
+    against. The corpus and the tolerances are declared in `corpus.json` /
+    `_ssa_config.py`; ``--out`` aims the conversion somewhere other than
+    `results/converted/` (issue #551).
     """
-    return argparse.ArgumentParser(
+    ap = argparse.ArgumentParser(
         prog=Path(__file__).name,
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument(
+        "--out",
+        type=lambda p: Path(p).resolve(),
+        default=OUT,
+        help="Directory for the converted models and conversion_log.json "
+        "(default: results/converted/ beside this script). The ssa_table5 runners read "
+        "the default only (_ssa_config.CONVERTED): a conversion aimed elsewhere is for "
+        "the caller, not for them.",
+    )
+    return ap
 
 
 def main(argv=None):
-    build_parser().parse_args(argv)
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = build_parser().parse_args(argv).out
+    out.mkdir(parents=True, exist_ok=True)
     import bngsim
 
     log = {"bngsim_version": bngsim.__version__, "rhs_tol": RHS_TOL, "bngl": [], "sbml": []}
     print(f"convert_all  bngsim {bngsim.__version__}\n")
     print("== BNGL -> SBML (feeds RoadRunner + COPASI) ==")
     for m in CORPUS["bngl"]:
-        rec = convert_bngl(m)
+        rec = convert_bngl(m, out)
         log["bngl"].append(rec)
         print(
             f"  {rec['name']:24} ok={rec.get('ok')} delta={rec.get('max_rhs_delta')} "
@@ -233,15 +253,15 @@ def main(argv=None):
         )
     print("\n== SBML -> .net (feeds run_network) ==")
     for m in CORPUS["sbml"]:
-        rec = convert_sbml(m)
+        rec = convert_sbml(m, out)
         log["sbml"].append(rec)
         print(
             f"  {rec['name']:20} ok={rec.get('ok')} delta={rec.get('max_rhs_delta')} "
             f"dropped={rec.get('dropped')} run_network={rec['run_network'][:40]}"
             + (f"  ERR {rec['error']}" if not rec.get("ok") else "")
         )
-    (OUT / "conversion_log.json").write_text(json.dumps(log, indent=2))
-    print(f"\n-> {OUT / 'conversion_log.json'}")
+    (out / "conversion_log.json").write_text(json.dumps(log, indent=2))
+    print(f"\n-> {out / 'conversion_log.json'}")
 
     problems = check_coverage(log)
     if problems:
