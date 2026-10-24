@@ -86,13 +86,23 @@ jobs:
       # cmake.define so this list does not depend on how scikit-build-core merges
       # the two. --reinstall-package so uv builds bngsim here rather than reusing
       # a cached plain build.
+      #
+      # The first run of this job ran the runner out of memory 12 minutes into
+      # the build (both shards: "the runner has received a shutdown signal").
+      # Ninja's default is nproc + 2 = 6 compiles at once, pybind11 adds -flto,
+      # and RelWithDebInfo's -O2 -g on the ExprTk-heavy translation units under
+      # ASan is the heaviest compile in the tree. So: 3 at a time, no LTO
+      # (CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF is what pybind11 defers to), and
+      # -O1 -g1, which is ASan's recommended level and keeps the line tables a
+      # report needs at a fraction of full debug info.
       - name: Build the extension under the sanitizers
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CMAKE_BUILD_PARALLEL_LEVEL: "3"
           SKBUILD_CMAKE_BUILD_TYPE: RelWithDebInfo
           SKBUILD_CMAKE_DEFINE: >-
-            BNGSIM_BUILD_PYTHON=ON;BNGSIM_REQUIRE_KLU=ON;CMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined;CMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined
+            BNGSIM_BUILD_PYTHON=ON;BNGSIM_REQUIRE_KLU=ON;CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF;CMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g1 -DNDEBUG;CMAKE_CXX_FLAGS_RELWITHDEBINFO=-O1 -g1 -DNDEBUG;CMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer;CMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined;CMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined
         run: |
           set -euxo pipefail
           uv sync --extra test --python 3.12 --reinstall-package bngsim
