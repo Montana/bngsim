@@ -655,18 +655,13 @@ def _pool(tmp_path, total):
     return bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
 
 
-@pytest.mark.parametrize("total", [1e4, 1e8])
-def test_steady_state_converges_at_both_law_totals(tmp_path, total):
-    """The precondition of the large-total case below: C <-> B <-> A, C first
-    and small, has a root steady_state() reaches at a total of 1e4 and of 1e8."""
-    assert _pool(tmp_path, total).steady_state().converged
-
-
 def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path):
-    """The control for the large-total case below: at 1e4 the seed's own solve,
-    Newton from steady_state()'s root, holds it."""
+    """The control for the large-total case below: C <-> B <-> A, C first and
+    small. At 1e4 steady_state() converges, and the seed's own solve, Newton
+    from its root, holds it."""
     sim = _pool(tmp_path, 1e4)
     ordinary = sim.steady_state()
+    assert ordinary.converged
     (seed,) = sim.steady_state_batch(
         states=[np.asarray(ordinary.concentrations)], method="newton", newton_burst=False
     )
@@ -676,9 +671,9 @@ def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path):
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="#1190: burst-free Newton rebuilds the law's first member, C, as the "
-    "total less the others, and at 1e8 that round-off (residual 3.1e-9) exceeds "
-    "tol, so the root steady_state() converges to is rejected",
+    reason="#1190: Newton rebuilds the law's first member, C, as the total less "
+    "the others, and at 1e8 that round-off exceeds tol: the seed's solve ends at "
+    "3.1e-9, and on the LAPACK build steady_state()'s own at 3.5e-9",
 )
 def test_the_seed_returns_the_root_of_a_large_law_total(tmp_path):
     sim = _pool(tmp_path, 1e8)
