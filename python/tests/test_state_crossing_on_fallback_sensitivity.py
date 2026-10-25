@@ -205,20 +205,20 @@ def test_a_table_that_steps_on_the_state_is_refused(tmp_path, method):
         sim.run(t_span=(0.0, T_END), n_points=3, rtol=1e-6, atol=1e-8, timeout=60)
 
 
-# A leaves for X, in a compartment of another size: a reaction that divides by
-# each species' volume, so A's rate is not one the derivations write out from
-# its rate laws, and rateOf(A) keeps the model on the quotient. Lost at a*A in
-# one compartment, A's rate is written out, and the same models run on the
-# analytic RHS (test_a_rate_the_derivations_write_out_is_not_refused).
+# Issue #932's rateOf models with A leaving for X, in a compartment of another
+# size: a reaction that divides by each species' volume. rateOf(A) kept them on
+# the quotient until issue #1266 wrote out such a rate, divided by each
+# species' own volume. Over C0 = 1 it is -a·A, as in their one-compartment
+# twins, and they are checked against the twins' closed forms in
+# test_a_rate_the_derivations_write_out_is_not_refused.
 _ACROSS = "compartment C0 = 1; compartment C2 = 3; species X in C2; X = 0\n"
 
-ISSUE_932 = {
+RATEOF_ACROSS = {
     # The condition reads rateOf.
     "rateof-condition": (
         _ACROSS + "species A in C0, Y in C0; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
         "J0: A -> X; a*A*C0\n"
-        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n",
-        ["thr"],
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n"
     ),
     # rateOf is only in a rule an event's trigger reads.
     "rateof-in-a-rule": (
@@ -228,39 +228,55 @@ ISSUE_932 = {
         "r := rateOf(A)\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; Y\n"
-        "E: at (r > -thr): Y = 1\n",
-        ["a", "thr", "q"],
+        "E: at (r > -thr): Y = 1\n"
     ),
-    # No rateOf at all: any rate law the analytic path declines.
+}
+
+# Each kept on the quotient by a law the analytic path declines, max() beside a
+# crossing that moves, with the crossing it is refused by.
+ISSUE_932 = {
+    # No rateOf at all.
     "max-beside-it": (
         "species A, B, Z; A = 10; B = 0; Z = 0; a = 0.5; q = 3\n"
         "J0: A -> ; a*A\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; max(A, 0.1)\n",
         ["a", "q"],
+        "A<q",
+    ),
+    # The condition reads rateOf: a crossing on A's rate, not on a species.
+    "rateof-condition-beside-it": (
+        "species A, Y, Z; A = 10; Y = 0; Z = 0; a = 0.5; thr = 1; kb = 3\n"
+        "J0: A -> ; a*A\n"
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n"
+        "J2: -> Z; max(A, 0.1)\n",
+        ["thr"],
+        "rate_of__A>(-thr)",
     ),
 }
 
 
 @pytest.mark.parametrize("model", sorted(ISSUE_932))
 def test_a_run_that_stalled_short_of_a_jump_is_refused_by_name(model):
-    """The models of issue #932. Each ended in ``CVODE made no progress`` just
-    before the crossing, as a solver failure. It is a refusal now, before the
-    run, and it names the crossing and what was declined. The plain run of each
-    is right."""
-    text, params = ISSUE_932[model]
+    """The models of issue #932 ended in ``CVODE made no progress`` just
+    before the crossing, as a solver failure. Such a run is refused now,
+    before it starts, by the crossing it names: one that reads rateOf too."""
+    text, params, crossing = ISSUE_932[model]
     sim = bngsim.Simulator(
         bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=params
     )
     assert not sim.has_analytic_sens_rhs
-    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#932"):
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#932") as caught:
         sim.run(sample_times=np.linspace(0.0, 6.0, 7), rtol=1e-10, atol=1e-12, timeout=10)
+    assert f"holds {crossing!r}" in str(caught.value)
 
 
 def test_a_rate_the_derivations_write_out_is_not_refused():
     """Issue #1124, item 7: lost at a*A, A's rate is -a·A written out, so
     neither model is on the quotient, and the columns read across the
-    crossings as any analytic column does. A = 10·e^(-at) and rateOf(A) =
+    crossings as any analytic column does. So too where A leaves for another
+    compartment (issue #1266): its rate there is J0's over A's own volume, C0
+    = 1, -a·A again. A = 10·e^(-at) and rateOf(A) =
     -a·A cross -thr at t* = ln(10a/thr)/a; A crosses q at ln(10/q)/a.
     dY/dthr = kb/(a·thr); dZ/dthr = 1/(a·thr), dZ/da = (ln(10a/thr) − 1)/a²;
     dB/dq = 1/(a·q), dB/da = ln(10/q)/a²."""
@@ -269,23 +285,25 @@ def test_a_rate_the_derivations_write_out_is_not_refused():
     t_rate = math.log(10 * a / thr) / a
     t_a = math.log(10 / q) / a
     after = t > t_rate
+    rate_condition = {("Y", "thr"): np.where(after, kb / (a * thr), 0.0)}
+    rate_in_a_rule = {
+        ("Z", "thr"): np.where(after, 1 / (a * thr), 0.0),
+        ("Z", "a"): np.where(after, (math.log(10 * a / thr) - 1) / a**2, 0.0),
+        ("B", "q"): np.where(t > t_a, 1 / (a * q), 0.0),
+        ("B", "a"): np.where(t > t_a, math.log(10 / q) / a**2, 0.0),
+    }
     cases = {
         "species A, Y; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
         "J0: A -> ; a*A\n"
-        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n": {
-            ("Y", "thr"): np.where(after, kb / (a * thr), 0.0),
-        },
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n": rate_condition,
         "species A, Y, Z, B; A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
         "J0: A -> ; a*A\n"
         "r := rateOf(A)\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; Y\n"
-        "E: at (r > -thr): Y = 1\n": {
-            ("Z", "thr"): np.where(after, 1 / (a * thr), 0.0),
-            ("Z", "a"): np.where(after, (math.log(10 * a / thr) - 1) / a**2, 0.0),
-            ("B", "q"): np.where(t > t_a, 1 / (a * q), 0.0),
-            ("B", "a"): np.where(t > t_a, math.log(10 / q) / a**2, 0.0),
-        },
+        "E: at (r > -thr): Y = 1\n": rate_in_a_rule,
+        RATEOF_ACROSS["rateof-condition"]: rate_condition,
+        RATEOF_ACROSS["rateof-in-a-rule"]: rate_in_a_rule,
     }
     for text, expected in cases.items():
         params = sorted({p for _sp, p in expected})

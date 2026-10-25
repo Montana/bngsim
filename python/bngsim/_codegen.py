@@ -6327,8 +6327,10 @@ def _psvs_row_divisor(species: list[dict], si: int) -> tuple[int, float, int]:
 
     One lookup for every emitter that scatters such a row: the RHS
     (:func:`generate_rhs_from_model`, which *defines* the divide), the Jacobian /
-    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`) and the
-    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`). Deriving it twice is
+    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`), the
+    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`), and the dX/dt that
+    :func:`bngsim._jacobian.rateof_rate_laws` writes out for a ``rateOf`` to be
+    differentiated through (issue #1266). Deriving it twice is
     how a row the RHS divides ends up with a derivative that does not — the defect
     family GH #119 is about, one scale factor wide and invisible at V = 1. Mirrors
     ``compute_derivs_core``'s ``species_divisor`` and
