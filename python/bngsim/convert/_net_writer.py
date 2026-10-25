@@ -209,6 +209,19 @@ def capability_report(model: Model) -> dict[str, list[str]]:
             "would fail to compile (undefined symbol)"
         )
 
+    unjoined = [
+        f"{where}: {why}"
+        for where, expr in _expressions_written(data)
+        if (why := _one_token(expr)[1]) is not None
+    ]
+    if unjoined:
+        lossy.append(
+            f"{len(unjoined)} expression(s) cannot be written as one .net field (e.g. "
+            f"{'; '.join(unjoined[:3])}{'; …' if len(unjoined) > 3 else ''}) — joined, "
+            "two words would be one name, and spaced, run_network refuses the "
+            "parameters block or runs the function as its first word"
+        )
+
     return {"dropped": dropped, "lossy": lossy}
 
 
@@ -242,7 +255,8 @@ def _apply_capability_policy(
 # (#498). ExprTk's `and` and `or` are written `&&` and `||`, which bngsim and
 # run_network both read with that meaning and C's precedence, as ExprTk gives
 # `and` and `or`; any other operator spelled as a word there (`xor`, `nand`,
-# `nor`) has no such spelling.
+# `nor`) has no such spelling, and capability_report names the expression as
+# lossy, so strict refuses it as it does any other construct the .net cannot carry.
 
 # One token of an ExprTk expression: whitespace, a name, a number (with an
 # exponent), a two-character operator, or any one other character.
@@ -267,30 +281,28 @@ def _one_token(expr: str) -> tuple[str, str | None]:
             continue
         token = _WORD_OPERATORS.get(token, token)
         if spaced and out and _is_word(out[-1]) and _is_word(token):
-            return expr, (
-                f"`{out[-1]} {token}` is two words a space separates, and joined they "
-                "would be one name; run_network reads an expression as one field"
-            )
+            return expr, f"`{out[-1]} {token}` is two words a space separates"
         out.append(token)
         spaced = False
     return "".join(out), None
 
 
-def _written(expr: str, where: str, *, strict: bool, model_name: str) -> str:
-    """*expr* as the .net writes it: one token, or, where it cannot be, refused
-    under strict and written as it is, with a warning, otherwise."""
-    text, why = _one_token(expr)
-    if why is None:
-        return text
-    msg = (
-        f"{model_name}: {where} `{expr}` cannot be written as one .net field: {why}. "
-        "run_network would refuse the parameters block or run the function as its "
-        "first word."
-    )
-    if strict:
-        raise ConversionError(msg + " Pass strict=False (--allow-lossy) to write it as it is.")
-    warnings.warn(msg, ConversionWarning, stacklevel=3)
-    return text
+def _expressions_written(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(where, expression)`` for each of the model's own expressions write_net
+    writes: a non-constant parameter's, and each function's. A parameter that
+    holds a function's value is not written (see write_net)."""
+    func_names = {f["name"] for f in data["functions"]}
+    return [
+        (f"parameter {p['name']}", p["expression"])
+        for p in data["parameters"]
+        if not p.get("is_const", True) and p.get("expression") and p["name"] not in func_names
+    ] + [(f"function {f['name']}()", f["expression"]) for f in data["functions"]]
+
+
+def _written(expr: str) -> str:
+    """*expr* as the .net writes it: one token, or, where it cannot be, as it is.
+    capability_report names the second as lossy, so strict has refused it."""
+    return _one_token(expr)[0]
 
 
 # ─── Rate-token construction ──────────────────────────────────────────────
@@ -575,9 +587,7 @@ def write_net(
     # so anything an expression refers to is already declared above it.
     #
     # Each expression is one field (issue #1249, see _one_token).
-    def one_field(expr: str, where: str) -> str:
-        return _written(expr, where, strict=strict, model_name=str(name))
-
+    #
     # A function's value is held in a parameter of its name, which bngsim's
     # reader makes again from the function. Written, it shadowed the function
     # in run_network, which read the parameter's number (0, or the value at
@@ -590,8 +600,7 @@ def write_net(
         i += 1
         expression = p.get("expression")
         if not p.get("is_const", True) and expression:
-            text = one_field(expression, f"parameter {p['name']}")
-            lines.append(f"    {i} {p['name']} {text}")
+            lines.append(f"    {i} {p['name']} {_written(expression)}")
         else:
             lines.append(f"    {i} {p['name']} {_fmt(p['value'])}")
     lines.append("end parameters")
@@ -646,14 +655,10 @@ def write_net(
     # reaction wrappers, each expression one field
     if functions or flux_helpers or wrappers:
         lines.append("begin functions")
-        k = 0
-        for fname, fexpr in [
-            *((f["name"], f["expression"]) for f in functions),
-            *flux_helpers,
-            *wrappers,
-        ]:
-            k += 1
-            lines.append(f"    {k} {fname}() {one_field(fexpr, f'function {fname}()')}")
+        for k, (fname, fexpr) in enumerate(
+            [*((f["name"], f["expression"]) for f in functions), *flux_helpers, *wrappers], 1
+        ):
+            lines.append(f"    {k} {fname}() {_written(fexpr)}")
         lines.append("end functions")
         lines.append("")
 

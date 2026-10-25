@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from bngsim import ConversionError, ConversionWarning
 from bngsim._bngpath import resolve_bng
-from bngsim.convert import write_net
+from bngsim.convert import capability_report, write_net
 
 _SPACED_NET = """begin parameters
     1 k    0.5
@@ -46,6 +46,7 @@ begin reactions
     1 1 2 f
     2 2 0 g
     3 0 1 h
+    4 1,1 2 0.5*k2
 end reactions
 begin groups
     1 Aobs 1
@@ -98,12 +99,15 @@ def test_every_expression_written_is_one_token(tmp_path):
     reads included, and the trajectory is the model's."""
     model = _load(tmp_path, _SPACED_NET)
     net = write_net(model)
-    seen = 0
+    names = []
     for _, line in _expression_lines(net):
         assert len(line.split()) == 3, line
-        seen += 1
-    # 3 parameters, 3 functions, and the flux helpers the writer adds
-    assert seen >= 6
+        names.append(line.split()[1])
+    # 3 parameters and 3 functions, then the writer's own: a flux helper for
+    # h's zero-reactant reaction, and a wrapper carrying the 0.5 stat factor
+    assert len(names) >= 8
+    assert any(n.startswith("__flux") for n in names), names
+    assert any(n.startswith("__s2n_rxn") for n in names), names
     again = _load(tmp_path, net, "again.net")
     times = np.linspace(0, 5, 21)
     np.testing.assert_allclose(_trajectory(again, times), _trajectory(model, times), rtol=1e-9)
@@ -135,18 +139,21 @@ def test_precedence_is_kept_where_and_and_or_meet(tmp_path):
 
 def test_an_operator_with_no_one_token_spelling_is_refused(tmp_path):
     """`xor` between two words: joined it is another name, and run_network has
-    no spelling of it. Refused under strict; written as it is, with a
-    warning, otherwise."""
+    no spelling of it. The capability report names it as lossy, so it is
+    refused under strict, and written as it is, with a warning at the caller,
+    otherwise."""
     text = _SPACED_NET.replace("Aobs > thr and k > 0.1", "Aobs > thr xor k > 0.1")
     model = _load(tmp_path, text)
+    assert any("`thr xor`" in note for note in capability_report(model)["lossy"])
     with pytest.raises(ConversionError, match="xor"):
         write_net(model)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         net = write_net(model, strict=False)
-    assert any(
-        issubclass(w.category, ConversionWarning) and "xor" in str(w.message) for w in caught
-    )
+    warned = [
+        w for w in caught if issubclass(w.category, ConversionWarning) and "xor" in str(w.message)
+    ]
+    assert warned and all(w.filename == __file__ for w in warned)
     assert "Aobs > thr xor k > 0.1" in net
 
 
