@@ -10158,7 +10158,9 @@ void CvodeSimulator::Impl::refuse_slide_along_state_switch(
 //     out before the surface;
 //   - that the flow would have carried across in the time it has been seen
 //     there. A residual four ulp short of a surface it approaches at 1e-20 is
-//     not pinned, whatever else has used the batch up.
+//     not pinned, whatever else has used the batch up. Unless the steps can
+//     no longer move the time at all, t + h == t: no time passes for that to
+//     be read in, and none will (issue #1283).
 //
 // The residual is then put the few ulp to its far side, by moving each species
 // it reads that the flow moves by the same few ulp of that species' own: one
@@ -10262,7 +10264,13 @@ bool CvodeSimulator::Impl::carry_across_stalled_state_switch(
                 (*since_steps)[k] = steps_now;
             }
         }
-        if (!(std::fabs(flow) * (t - since[k]) >= std::fabs(g) + reach)) {
+        // Issue #1283: a step under half an ulp of the time leaves it where it
+        // was, so `t - since` stays 0 however many steps are spent. A narrow
+        // pulse's foot beside a decaying species stalled at h = 1.1e-15 by
+        // t = 25.0025 and was never carried or refused: the batch ran out on
+        // the no-progress guard, and with jacobian="fd" the run failed.
+        const bool frozen = h > 0.0 && t + h == t;
+        if (!frozen && !(std::fabs(flow) * (t - since[k]) >= std::fabs(g) + reach)) {
             continue; // the flow would not have brought it across yet
         }
         Stalled one{sw, flow > 0.0 ? 1.0 : -1.0, std::fabs(g), reach, {}};
