@@ -30,7 +30,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
 
@@ -2213,6 +2213,7 @@ class Simulator:
             return conditions
         from bngsim._switch_sensitivity import (
             _PLAIN_INSTANT_FLOOR,
+            StopsMoveWithAnEvent,
             TriggerEqualityNeverHolds,
             crossings_with_periodic,
             merge_crossing_stops,
@@ -2265,7 +2266,7 @@ class Simulator:
             )
             if periodic_at:
                 crossings = sorted([*crossings, *periodic_at], key=lambda stop: stop.time)
-        except TriggerEqualityNeverHolds as e:
+        except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
             raise SimulationError(str(e)) from None
         except SensitivityUnsupportedError:
             raise
@@ -2560,6 +2561,7 @@ class Simulator:
             conditions = model.time_discontinuity_conditions()
             if conditions:
                 from bngsim._switch_sensitivity import (
+                    StopsMoveWithAnEvent,
                     TriggerEqualityNeverHolds,
                     crossings_with_periodic,
                     merge_crossing_stops,
@@ -2580,7 +2582,7 @@ class Simulator:
                     # whose window a step can otherwise lie across unseen.
                     if periodic:
                         times = sorted(set(times) | {float(stop.time) for stop in periodic})
-                except TriggerEqualityNeverHolds as e:
+                except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
                     raise SimulationError(str(e)) from None
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning(
@@ -8953,6 +8955,7 @@ class Simulator:
         mask=None,
         newton_burst: bool = True,
         criterion: str = "scaled",
+        certify: bool | Literal["start"] = True,
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8979,6 +8982,15 @@ class Simulator:
             A ``$``-fixed species is then left out of the unknowns, whose
             Newton system it would make singular. Default ``True``, the
             two-tier solver of :meth:`steady_state`.
+        certify : bool or "start"
+            With ``newton_burst=False``, ``False`` skips the stability
+            certificate, a dense eigendecomposition of the reduced Jacobian,
+            and a converged result then has ``root_stability == ""`` and no
+            ``eigenvalues``. ``"start"`` takes no Newton step: each starting
+            state is the result, converged where it passes ``tol``, and
+            certified there. :meth:`steady_states` solves its starts with
+            ``False`` and certifies each distinct root once with ``"start"``
+            (issue #1191). Default ``True``. Ignored otherwise.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
@@ -9033,6 +9045,8 @@ class Simulator:
                 )
         if not params:
             raise ValueError("params must be non-empty")
+        if not (certify is True or certify is False or certify == "start"):
+            raise ValueError(f'certify must be True, False or "start", not {certify!r}')
         # Issue #710 — a row sets parameter values, not what the rates read.
         self._raise_if_no_steady_state_to_solve_for("steady_state_batch()")
 
@@ -9087,6 +9101,8 @@ class Simulator:
             opts.max_time = max_time
             opts.method = method
             opts.newton_burst = newton_burst
+            opts.certify_root = certify is not False
+            opts.certify_start = certify == "start"
             opts.rtol = eff_rtol
             if own_auto:
                 own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
@@ -9173,9 +9189,8 @@ class Simulator:
         ``multiplicity`` or ``basins``, and a root only it found has
         multiplicity 0. The seed is then put on the conservation laws at the
         model's totals, as every draw is. Two cases return less. Where Newton
-        cannot hold the root, as at the large law totals below (issue #1190), it
-        is missed: on a three-species law at a total of ``1e8``, the call returns
-        none. And where the solve had moved a held species, it solved another
+        cannot hold the root at ``tol``, as at the large rates below, it is
+        missed. And where the solve had moved a held species, it solved another
         problem: a masked sink at the end of a chain, as the pure-sink mask below
         makes it, moves its law's total, and a held species the rates read moves
         the rates. Newton from the seed then reaches a root of the problem the
@@ -9208,11 +9223,16 @@ class Simulator:
         solve, though a law's dependent species is rebuilt from the law.
 
         ``tol`` is absolute, as in :meth:`steady_state`. A model at so small a
-        scale that most starts are already under it is refused; at law totals
-        above about ``1e7`` the law's round-off alone can exceed it, and a
-        root is then reported as a failed start. Below concentrations of about
-        ``1e-9``, KINSOL's step limits are absolute too, and most starts fail
-        even with a ``tol`` scaled to match.
+        scale that most starts are already under it is refused. Each solve
+        rebuilds, from each conservation law, the member that carries the most
+        of the law's total where the solve is, so a large total's round-off
+        lands in a species at its own scale rather than in a small one (issue
+        #1190). Where a root's rates are themselves large, their own rounding
+        can still exceed ``tol``, and the root is then reported as a failed
+        start: ``A <-> B`` at rates 1 and 2 and a total of ``1e8`` ends at a
+        residual of ``5e-9`` when Newton starts at the root itself. Below
+        concentrations of about ``1e-9``, KINSOL's step limits are absolute
+        too, and most starts fail even with a ``tol`` scaled to match.
 
         Parameters
         ----------
@@ -9298,10 +9318,18 @@ class Simulator:
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
         solve_mask = ~held if held.any() else None
+        # The certificate is a dense eigendecomposition of the reduced Jacobian,
+        # and every start that converged paid it for the root it reached: on
+        # egfr_net 91 of 200 starts converged to one root, and the call took
+        # 7.2 s where certifying each distinct root once takes 2.7 s (issue
+        # #1191). Each root's representative is certified as it stands, with
+        # no Newton step: solved again from there, 6 of fceri_ji's 15 roots did
+        # not converge a second time and came back with no verdict.
         results = self.steady_state_batch(
             states=starts,
             method="newton",
             newton_burst=False,
+            certify=False,
             tol=tol,
             n_workers=n_workers,
             mask=solve_mask,
@@ -9326,7 +9354,7 @@ class Simulator:
             # recomputes the totals from its start, reported a "root" of
             # m1_ground at a total of 0, not 100. Where nothing held moved, this
             # moves the seed by the integration's drift, a few 1e-9.
-            A, totals = _moving_laws(L, in_law, y0)
+            A, totals, law_scale = _moving_laws(L, in_law, y0)
             if A.shape[0]:
                 cols = np.flatnonzero(in_law)
                 w = np.maximum(seed_state[cols], np.finfo(float).tiny)
@@ -9335,7 +9363,7 @@ class Simulator:
                 # its way to None, which drops the seed. That is the answer, so
                 # nothing is raised or warned, and nothing non-finite is kept.
                 with np.errstate(all="ignore"):
-                    y = _project_onto_laws(w, A, totals)
+                    y = _project_onto_laws(w, A, totals, law_scale)
                 if y is None or not np.all(np.isfinite(y)):
                     seed_state = None
                 else:
@@ -9346,6 +9374,7 @@ class Simulator:
                     states=[seed_state],
                     method="newton",
                     newton_burst=False,
+                    certify=False,
                     tol=tol,
                     mask=solve_mask,
                 )
@@ -9362,6 +9391,20 @@ class Simulator:
             roots.multiplicity[k] -= 1
             roots.basins = roots.basins[:-1]
             roots.n_failed = int(np.sum(roots.basins < 0))
+        if len(roots):
+            certified = self.steady_state_batch(
+                states=roots.states,
+                method="newton",
+                newton_burst=False,
+                certify="start",
+                tol=tol,
+                n_workers=n_workers,
+                mask=solve_mask,
+            )
+            for k, r in enumerate(certified):
+                if r.converged:
+                    roots.stability[k] = r.root_stability or "undetermined"
+                    roots.eigenvalues[k] = np.asarray(r.eigenvalues)
         return roots
 
     # ─── Stop conditions ────────────────────────────────────────────
@@ -10539,7 +10582,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    A, totals = _moving_laws(L, in_law, y0)
+    A, totals, own_scale = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10550,7 +10593,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     if A.shape[0]:
         cols = np.flatnonzero(in_law)
         for row in out:
-            y = _project_onto_laws(row[cols], A, totals)
+            y = _project_onto_laws(row[cols], A, totals, own_scale)
             if y is None:
                 raise SimulationError(
                     "steady_states(): the conservation laws admit no state with every "
@@ -10562,14 +10605,16 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
 
 def _moving_laws(L, in_law, y0):
     """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
-    totals the model's state ``y0`` holds (issue #524). A law over held species
-    alone constrains nothing a start moves, and is left out."""
+    totals the model's state ``y0`` holds (issue #524), and each law's own scale,
+    ``|A|·|y0|``: what its total is 0 to the round-off of (issue #1265). A law over
+    held species alone constrains nothing a start moves, and is left out."""
     A = L[:, in_law]
     A = A[(A != 0).any(axis=1)]
-    return A, A @ y0[in_law]
+    y = y0[in_law]
+    return A, A @ y, np.abs(A) @ np.abs(y)
 
 
-def _project_onto_laws(w, A, b, max_iter=200):
+def _project_onto_laws(w, A, b, scale=None, max_iter=200):
     """The point of ``{y > 0 : A·y = b}`` nearest ``w`` in relative entropy (issue #524).
 
     It is ``y = w·exp(Aᵀλ)`` at the minimum of the convex dual
@@ -10581,13 +10626,23 @@ def _project_onto_laws(w, A, b, max_iter=200):
     laws does, the iterates approach it by a factor ``e`` a step and the
     floor below takes them there. ``None`` when no step decreases ``F``: the
     laws admit no positive point.
+
+    Each law is judged on its own scale (issue #1265). A law of non-negative
+    coefficients has a positive point exactly when its total is positive, so it
+    is pinned only where the total is 0 to the round-off of its own members,
+    ``scale`` (``|A|·|y0|``, from :func:`_moving_laws`; ``|b|`` where not given,
+    which pins a total of 0 or less). And a law is met to ``1e-12`` of its own
+    total, or ``1e-15`` of its own ``scale``, not of the largest law's: beside a
+    pool of 1e8, a pool of 1e-5 was pinned to 0, and one of 1e-3 was met only
+    to 1e-7.
     """
-    ref = max(float(np.abs(b).max()), float((np.abs(A) @ w).max()))
+    b = np.asarray(b, dtype=float)
+    scale = np.abs(b) if scale is None else np.asarray(scale, dtype=float)
     out = np.array(w, dtype=float)
     live = np.ones(out.size, dtype=bool)
     rows = np.ones(A.shape[0], dtype=bool)
     while True:
-        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * ref)
+        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * scale)
         if not pin.any():
             break
         live &= ~(A[pin] != 0.0).any(axis=0)
@@ -10599,7 +10654,9 @@ def _project_onto_laws(w, A, b, max_iter=200):
     logw = np.log(w)
     lam = np.zeros(A.shape[0])
     y = w
-    floor = 1e-15 * ref
+    # Each law's own: its members' scale in the model's state, at least its
+    # total, not the start's, whose weights are drawn on the largest law's scale.
+    floor = 1e-15 * scale[rows]
     for _ in range(max_iter):
         g = A @ y - b
         if np.all(np.abs(g) <= 1e-12 * np.maximum(np.abs(b), np.abs(A) @ y) + floor):
@@ -10822,7 +10879,9 @@ class SteadyStateResult:
         ``"undetermined"`` (the certificate declined — more than 512 unknowns, or
         a Jacobian whose spectrum it could not compute), or ``"unstable"``.
         ``""`` when the result came from integration, which needs no certificate:
-        a trajectory cannot come to rest on an unstable equilibrium.
+        a trajectory cannot come to rest on an unstable equilibrium. ``""`` too
+        from a burst-free solve told to skip it
+        (``steady_state_batch(newton_burst=False, certify=False)``, issue #1191).
         ``"unstable"`` is returned only when the *initial condition itself* was
         that root; a polish that lands on one is discarded instead.
     n_unstable_roots_rejected : int
