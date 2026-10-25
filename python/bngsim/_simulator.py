@@ -2794,7 +2794,9 @@ class Simulator:
         """
         self._codegen_sens_rhs_available = None
 
-    def _apply_state_switch_sens(self, opts, core, model=None, covered=None) -> None:
+    def _apply_state_switch_sens(
+        self, opts, core, model=None, covered=None, t_start: float = 0.0
+    ) -> None:
         """Register the state-dependent rate-law switches to jump at (issue #150).
 
         The rate-law twin of :meth:`_apply_event_time_sens`. A condition that
@@ -2821,6 +2823,10 @@ class Simulator:
         RHS, so the columns are CVODES' difference quotient, which can still
         read a narrow one wrong (issue #1126).
 
+        A rate-law equality over state that the run starts on, at *t_start*, and
+        stays on is refused first (issue #1228): leaving it is a switch nothing
+        locates.
+
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
         untouched.
@@ -2835,9 +2841,13 @@ class Simulator:
 
         # A rate-law equality the run starts on holds for a stretch, and leaving
         # it is a switch nothing locates (issue #1228): refused by name, as the
-        # same switch written `<=` is refused at its tangency.
+        # same switch written `<=` is refused at its tangency. The context is
+        # built once for this and the conditions below.
+        ctx = None
         try:
-            held = equalities_held_at_start(core)
+            if core.n_functions:
+                ctx = core.functional_jacobian_context()
+            held = equalities_held_at_start(core, ctx, t0=t_start)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Equality-at-start detection failed (%s) (issue #1228).", e)
             held = []
@@ -2850,13 +2860,15 @@ class Simulator:
                 "bngsim does not locate: an equality is rooted only where it is crossed, "
                 "and either side of its surface reads false, so the columns of whatever "
                 "ends the stretch would come back 0 with no jump (issue #1228). Write the "
-                "switch as the condition that ends it, or as an inequality, which is "
-                "located (`X<=c` for `X==c`, `X>c` for `X!=c`); or drop sensitivities for "
-                "this run."
+                "switch as the crossing that ends the stretch, which is located and "
+                "jumped (`if(Aobs>q, kb, 0)` for `if(Bobs==0, kb, 0)` in that issue's "
+                "model, where B is made only once A falls to q). The same switch as an "
+                "inequality, `Bobs<=0`, is refused at its tangency. Or drop sensitivities "
+                "for this run."
             )
 
         try:
-            conditions = state_switch_conditions(core)
+            conditions = state_switch_conditions(core, ctx)
         except Exception as e:  # pragma: no cover - defensive
             # Detection is best-effort: failing it leaves the pre-#150 behavior
             # (columns short by the crossing jump), which the codegen gate still
@@ -5133,7 +5145,9 @@ class Simulator:
                     # Outside the parameter guard on purpose: a *state* crossing
                     # moves every column, initial conditions included (issue
                     # #150 / #144), so an IC-only request needs the jump too.
-                    self._apply_state_switch_sens(opts, self._model._core, self._model, covered)
+                    self._apply_state_switch_sens(
+                        opts, self._model._core, self._model, covered, t_start
+                    )
                 else:
                     self._apply_state_switch_roots(opts, self._model, covered)
 
@@ -6605,7 +6619,7 @@ class Simulator:
                     self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1])
                     # See the note at the single-shot site: keyed on "any
                     # sensitivity at all", not on a parameter request.
-                    self._apply_state_switch_sens(opts, clone._core, clone, covered)
+                    self._apply_state_switch_sens(opts, clone._core, clone, covered, t_span[0])
                 else:
                     self._apply_state_switch_roots(opts, clone, covered)
                 # The GH #176 retry, as run() places it. Without it a row raised
@@ -7107,6 +7121,11 @@ class Simulator:
                     "(issue #708). A Simulator built at these values is refused too: it has "
                     "no analytic right-hand side for the condition (issues #414, #961)."
                 ) from None
+            if isinstance(exc, SensitivityUnsupportedError):
+                # A refusal of the model, raised as a chunk sets up (issue
+                # #1228's held equality): no column runs alone either, and
+                # retrying them reported it as a tolerance failure, untyped.
+                raise exc
             return self._recover_failed_chunk(
                 chunk_idx,
                 chunks,
@@ -7333,7 +7352,7 @@ class Simulator:
         # must be built against that subset rather than the full request.
         self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
         self._apply_event_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
-        self._apply_state_switch_sens(opts, clone._core, clone, covered)
+        self._apply_state_switch_sens(opts, clone._core, clone, covered, t_span[0])
         opts.set_sensitivity_method(self._sensitivity_method)
 
         try:

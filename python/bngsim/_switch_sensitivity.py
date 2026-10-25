@@ -9298,7 +9298,7 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
     return conditions
 
 
-def equalities_held_at_start(core, ctx=None) -> list[str]:
+def equalities_held_at_start(core, ctx=None, t0: float = 0.0) -> list[str]:
     """The rate-law equalities over model state that the run starts on (issue #1228).
 
     :func:`state_switch_conditions` roots no equality: a trajectory that crosses
@@ -9324,8 +9324,19 @@ def equalities_held_at_start(core, ctx=None) -> list[str]:
     order, still at the start, is taken as staying, which refuses a run that
     would have been right; it never passes one that would not. An equality over a step
     or bend call (``floor(T/24) == 3``) is a window like any other and is not
-    one, and nor is a residual that reads the clock, since the run's start time
-    is not known here.
+    one.
+
+    The start is read at *t0*, the run's start time, and the step lands at *t0*
+    plus the step: a rate or a residual that reads the clock is read where the
+    run is. Read at t = 0, ``if(time()<1, 1, 0)`` in B's rate made B leave 0 at
+    once in a run over (5, 20) that held it there until t*, and the columns came
+    back 0 again. The species, and a pending carry-over dx/dθ seed, are put back
+    as found, since ``set_state`` drops the seed (GH #210) that a
+    ``carry_sensitivities=True`` run starts from. The observables and functions
+    are left refreshed from the start state.
+
+    Only the start is read. A state that an event puts on the surface mid-run
+    is not seen here (issue #1279).
     """
     import numpy as np
 
@@ -9339,48 +9350,66 @@ def equalities_held_at_start(core, ctx=None) -> list[str]:
         return []
     func_map = _scan_function_map(ctx)
     memo: dict[str, str] = {}
-    held: list[str] = []
-    seen: set[str] = set()
-    synced = False
-    x0 = core.get_state()
-    stepped: list = []
-
-    def value_at(residual, state):
-        # With the species at *state*, and the observables and functions
-        # refreshed from them; the start state is put back by the caller.
-        core.set_state(state)
-        core.compute_derivs(0.0, state)
-        return _evaluate_over(core, residual, [0.0])
-
     # The rate laws, with the functions they reach written in: an equality in a
-    # function that only an output reads moves no trajectory and no column.
-    for rxn in ctx["functional_reactions"]:
-        law = _scan_rate_law(rxn)
+    # function that only an output reads moves no trajectory and no column. Each
+    # law and each atom is read once, however many reactions share it.
+    atoms: dict[str, None] = {}
+    for law in dict.fromkeys(_scan_rate_law(rxn) for rxn in ctx["functional_reactions"]):
         flat = _inline_functions(law, func_map, memo=memo) or law
-        if not _IF_CALL.search(flat):
+        if _IF_CALL.search(flat):
+            atoms.update(dict.fromkeys(_iter_condition_atoms(flat)))
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for whole in atoms:
+        if not is_equality_atom(whole) or _STEP_CALL.search(whole) or _BEND_CALL.search(whole):
             continue
-        for whole in _iter_condition_atoms(flat):
-            if not is_equality_atom(whole) or _STEP_CALL.search(whole) or _BEND_CALL.search(whole):
-                continue
-            residual = state_switch_residual(core, whole)
-            if not residual or residual in seen or _TIME_REF.search(residual):
-                continue
+        residual = state_switch_residual(core, whole)
+        if residual and residual not in seen:
             seen.add(residual)
-            synced = True
+            candidates.append((whole, residual))
+    if not candidates:
+        return []
+
+    step = 1e-6
+    x0 = core.get_state()
+    seed = (
+        (
+            np.array(core.pending_sensitivity_seed(), dtype=np.float64),
+            list(core.pending_sensitivity_seed_param_names),
+        )
+        if core.has_pending_sensitivity_seed
+        else None
+    )
+
+    def value_at(residual, t, state):
+        # With the species at *state*, and the observables and functions
+        # refreshed from them at *t*; the start is put back below.
+        core.set_state(state)
+        core.compute_derivs(t, state)
+        return _evaluate_over(core, residual, [t])
+
+    held: list[str] = []
+    stepped = None
+    try:
+        for whole, residual in candidates:
             try:
-                if not np.all(value_at(residual, x0) == 0.0):
+                if not np.all(value_at(residual, t0, x0) == 0.0):
                     continue
-                if not stepped:
+                if stepped is None:
                     # One step along the flow: a residual every rate it reads
                     # leaves at exactly 0 stays at exactly 0.
-                    stepped.append(x0 + 1e-6 * core.compute_derivs(0.0, x0))
-                if np.all(value_at(residual, stepped[0]) == 0.0):
+                    stepped = x0 + step * core.compute_derivs(t0, x0)
+                if np.all(value_at(residual, t0 + step, stepped) == 0.0):
                     held.append(whole)
             except Exception:  # noqa: BLE001 - a residual the evaluator cannot read is not asked
                 continue
-    if synced:
+    finally:
         core.set_state(x0)
-        core.compute_derivs(0.0, x0)
+        if seed is not None:
+            core.set_pending_sensitivity_seed(*seed)
+        # The run refreshes them anyway, and says why where it cannot.
+        with contextlib.suppress(Exception):
+            core.compute_derivs(t0, x0)
     return held
 
 
