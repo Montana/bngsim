@@ -44,6 +44,7 @@ NET = """begin parameters
     5 kc 5.0
     6 tau 3.4
     7 P 1.3
+    8 big 1e300
 end parameters
 begin functions
     1 fY() {fy}
@@ -64,9 +65,11 @@ begin groups
 end groups
 """
 
-# clamp(0.5, A, 1e300) is max(A, 0.5). min, max and abs have an analytic
-# sensitivity RHS since issue #1126; clamp is still declined.
-DECLINED = "kc*clamp(0.5,Aobs,1e300)"
+# clamp(0.5, A, big) with big = 1e300 is max(A, 0.5). min, max and abs have an
+# analytic sensitivity RHS since issue #1126, and so does a clamp with numbers for
+# bounds since issue #1227. With its upper bound a parameter, this clamp is not
+# known to bend, and stays declined.
+DECLINED = "kc*clamp(0.5,Aobs,big)"
 T_END = 6.0
 
 
@@ -116,12 +119,12 @@ def test_a_counter_against_a_literal_is_moved_too(tmp_path):
 
 @pytest.mark.parametrize("kc", ["1e6", "1e8"])
 def test_a_counter_beside_a_flux_a_million_times_the_jump_is_refused(tmp_path, kc):
-    """The declined rate law is ``kc·clamp(0.5, Aobs, 1e300)`` with kc at 1e6 and 1e8.
+    """The declined rate law is ``kc·clamp(0.5, Aobs, big)`` with kc at 1e6 and 1e8.
     A cut that refused at the crossing asked whether the rate law jumps there
     by more than a millionth of the largest flux in the model, and read a jump
     of 3 beside 4.4e6 as none: dY/dk came back 28.75 at rtol 1e-4 and 14.56 at
     1e-10, for 10.2."""
-    sim = _simulator(tmp_path, "if(Aobs>thr,kb,0)", f"{kc}*clamp(0.5,Aobs,1e300)", ["k", "thr"])
+    sim = _simulator(tmp_path, "if(Aobs>thr,kb,0)", f"{kc}*clamp(0.5,Aobs,big)", ["k", "thr"])
     _refused(sim, "Aobs>thr")
 
 
@@ -167,7 +170,7 @@ def test_a_step_call_on_the_state_is_refused(tmp_path):
 def test_a_step_call_on_the_state_inside_a_condition_is_refused(tmp_path):
     """``if(floor(Aobs/P) > 2, 1, 2)``: the condition's atom reads the state
     through a step call. dZ/dk came back −67.9 for −49.5."""
-    law = "kc*clamp(0.5,Aobs,1e300)*if(floor(Aobs/P)>2,1,2)"
+    law = "kc*clamp(0.5,Aobs,big)*if(floor(Aobs/P)>2,1,2)"
     sim = _simulator(tmp_path, "kb", law, ["k"], decays=True)
     _refused(sim, "floor(Aobs/P)", rtol=1e-4)
 
@@ -202,18 +205,26 @@ def test_a_table_that_steps_on_the_state_is_refused(tmp_path, method):
         sim.run(t_span=(0.0, T_END), n_points=3, rtol=1e-6, atol=1e-8, timeout=60)
 
 
+# A leaves for X, in a compartment of another size: a reaction that divides by
+# each species' volume, so A's rate is not one the derivations write out from
+# its rate laws, and rateOf(A) keeps the model on the quotient. Lost at a*A in
+# one compartment, A's rate is written out, and the same models run on the
+# analytic RHS (test_a_rate_the_derivations_write_out_is_not_refused).
+_ACROSS = "compartment C0 = 1; compartment C2 = 3; species X in C2; X = 0\n"
+
 ISSUE_932 = {
     # The condition reads rateOf.
     "rateof-condition": (
-        "species A, Y; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
-        "J0: A -> ; a*A\n"
+        _ACROSS + "species A in C0, Y in C0; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
+        "J0: A -> X; a*A*C0\n"
         "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n",
         ["thr"],
     ),
     # rateOf is only in a rule an event's trigger reads.
     "rateof-in-a-rule": (
-        "species A, Y, Z, B; A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
-        "J0: A -> ; a*A\n"
+        _ACROSS + "species A in C0, Y in C0, Z in C0, B in C0\n"
+        "A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
+        "J0: A -> X; a*A*C0\n"
         "r := rateOf(A)\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; Y\n"
@@ -246,6 +257,50 @@ def test_a_run_that_stalled_short_of_a_jump_is_refused_by_name(model):
         sim.run(sample_times=np.linspace(0.0, 6.0, 7), rtol=1e-10, atol=1e-12, timeout=10)
 
 
+def test_a_rate_the_derivations_write_out_is_not_refused():
+    """Issue #1124, item 7: lost at a*A, A's rate is -a·A written out, so
+    neither model is on the quotient, and the columns read across the
+    crossings as any analytic column does. A = 10·e^(-at) and rateOf(A) =
+    -a·A cross -thr at t* = ln(10a/thr)/a; A crosses q at ln(10/q)/a.
+    dY/dthr = kb/(a·thr); dZ/dthr = 1/(a·thr), dZ/da = (ln(10a/thr) − 1)/a²;
+    dB/dq = 1/(a·q), dB/da = ln(10/q)/a²."""
+    t = np.linspace(0.0, 6.0, 7)
+    a, thr, q, kb = 0.5, 1.0, 3.0, 3.0
+    t_rate = math.log(10 * a / thr) / a
+    t_a = math.log(10 / q) / a
+    after = t > t_rate
+    cases = {
+        "species A, Y; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
+        "J0: A -> ; a*A\n"
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n": {
+            ("Y", "thr"): np.where(after, kb / (a * thr), 0.0),
+        },
+        "species A, Y, Z, B; A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
+        "J0: A -> ; a*A\n"
+        "r := rateOf(A)\n"
+        "J1: -> B; piecewise(1, A < q, 0)\n"
+        "J2: -> Z; Y\n"
+        "E: at (r > -thr): Y = 1\n": {
+            ("Z", "thr"): np.where(after, 1 / (a * thr), 0.0),
+            ("Z", "a"): np.where(after, (math.log(10 * a / thr) - 1) / a**2, 0.0),
+            ("B", "q"): np.where(t > t_a, 1 / (a * q), 0.0),
+            ("B", "a"): np.where(t > t_a, math.log(10 / q) / a**2, 0.0),
+        },
+    }
+    for text, expected in cases.items():
+        params = sorted({p for _sp, p in expected})
+        sim = bngsim.Simulator(
+            bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=params
+        )
+        assert sim.has_analytic_sens_rhs
+        result = sim.run(sample_times=t, rtol=1e-10, atol=1e-12, timeout=20)
+        names = list(result.species_names)
+        sens = np.asarray(result.sensitivities)
+        for (sp, p), want in expected.items():
+            got = sens[:, names.index(sp), params.index(p)]
+            np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7, err_msg=f"d{sp}/d{p}")
+
+
 def test_a_jump_no_requested_column_moves_is_refused_all_the_same(tmp_path):
     """kb and kc move neither A nor thr, so neither column reads across the
     surface, and main returns them: dY/dkb = T − t* and dY/dkc = 0. Whether a
@@ -270,6 +325,7 @@ WIDER = """begin parameters
    11 g 1e-4
    12 idx 2*n
    13 near 1.001
+   14 big 1e300
 end parameters
 begin functions
 {funcs}
@@ -536,7 +592,7 @@ def test_the_same_bend_written_with_a_choice_runs(tmp_path, law):
 )
 def test_a_magnitude_runs(tmp_path, law):
     """Control. ``kb·abs(Aobs − thr)`` is continuous where A is thr, and so is
-    the declined law beside it, ``kc·clamp(0.5, Aobs, 1e300)``: bends, which the
+    the declined law beside it, ``kc·clamp(0.5, Aobs, big)``: bends, which the
     quotient is right across. Written as a condition, both branches are 0
     where it flips. dY/dk in closed form."""
     sim = _simulator(tmp_path, law, DECLINED, ["k"])
@@ -600,7 +656,12 @@ def test_a_sign_of_the_time_that_a_requested_parameter_moves_is_refused(tmp_path
 
 
 CHOICES_THAT_BEND = {
-    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.01)",
+    # A reaches the floor at t = ln(100) ≈ 4.6, before T: dY/dk = −11.61. Under
+    # a floor it never reaches, Y = kb·T and dY/dk is 0, as it is for a max()
+    # that ignores the floor, and the column is only rounding: (kb·A)/A is 3
+    # to an ulp, and the quotient divides that by a move in A of about rtol·A.
+    # It came back 1.04e-8 at rtol 1e-10 on x86-64, past abs=1e-8.
+    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.1)",
     "a-magnitude-in-a-sum-it-divides-by": "kb/(1+abs(Aobs-thr))",
     "a-root-of-what-is-above-zero": "kb*Aobs/(1+0.5*(Aobs+sqrt(1+abs(Aobs*Aobs-thr))))",
     "a-clamp": "kb*max(0,min(Aobs,thr))",
@@ -1428,11 +1489,12 @@ DERIVED = """begin parameters
     5 kc 5.0
     6 one 1.0
     7 n {n!r}
+    8 big 1e300
 {params}
 end parameters
 begin functions
     1 fY() {fy}
-    2 fZ() kc*clamp(0.5,Aobs,1e300)
+    2 fZ() kc*clamp(0.5,Aobs,big)
 end functions
 begin species
     1 A() A0
@@ -1460,7 +1522,7 @@ def _with_derived(tmp_path, fy, params=(), reactions=(), n=0.0):
             fy=fy,
             A0=10.0,
             n=n,
-            params="\n".join(f"   {8 + i} {text}" for i, text in enumerate(params)),
+            params="\n".join(f"   {9 + i} {text}" for i, text in enumerate(params)),
             reactions="\n".join(f"    {4 + i} {text}" for i, text in enumerate(reactions)),
         )
     )
@@ -1561,7 +1623,7 @@ def test_a_derived_parameter_that_is_in_no_rate_is_not_asked_about(tmp_path):
         fy="kb",
         A0=10.0,
         n=1.001,
-        params="    8 kd if(n>1,3,0)\n    9 c0 rint(4.4*n)",
+        params="    9 kd if(n>1,3,0)\n    10 c0 rint(4.4*n)",
         reactions="",
     ).replace("    3 Z() 0\n", "    3 Z() c0\n")
     path = tmp_path / "unused.net"
@@ -2131,6 +2193,7 @@ DECLARED = """begin parameters
     3 tau 3.4
     4 one 1.0
     5 n 0.5
+    6 big 1e300
 end parameters
 begin functions
     1 fY() if(Cobs>tau,kb,0)
