@@ -55,6 +55,7 @@ from bngsim._codegen import (
     _alias_keyword_param,
     _coerce_booleans_used_as_numbers,
     _normalize_exprtk_operators,
+    _psvs_row_divisor,
     _rewrite_logicals,
     _translate_bngl_if_to_piecewise,
     builtin_constant_bindings,
@@ -852,8 +853,9 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
 
     Left out, so that a law reading the token declines as before: a species a
     reaction changes that is Michaelis–Menten, takes a species factor of a
-    reactant no observable holds alone, or divides by a live volume no
-    observable holds alone. ``data`` is the model's ``codegen_data()``; one with no
+    reactant no observable holds alone, divides by a live volume no observable
+    holds alone, or divides by a size parameter whose value is not the size the
+    engine divides by. ``data`` is the model's ``codegen_data()``; one with no
     reaction list says nothing of any rate and gives none, and so does one
     whose functions read none.
     """
@@ -882,7 +884,7 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
         for i, n in net.items():
             if n == 0:
                 continue
-            divisor = _species_divisor_text(species[i], params, alone) if per_species else ""
+            divisor = _species_divisor_text(species, i, params, alone) if per_species else ""
             if rate is None or divisor is None:
                 unreadable.add(i)
                 continue
@@ -931,21 +933,22 @@ def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str |
     return "*".join(factors)
 
 
-def _species_divisor_text(sp: dict, params: list, alone: dict[int, str]) -> str | None:
+def _species_divisor_text(
+    species: list, i: int, params: list, alone: dict[int, str]
+) -> str | None:
     """What ``compute_derivs_core`` divides a cross-compartment reaction's rate by
-    for species *sp*: its live volume, read through the observable that holds
-    the promoted compartment alone; else its size, by the size parameter's name
-    where that is the species' size, so that a write to it, which moves the
-    engine's divisor, moves this one; else the number. ``None`` where a live
-    volume has no such observable, or a named size is not the number the
-    engine divides by."""
-    live = int(sp.get("ode_live_volume_idx0", -1))
+    for species *i*, from the lookup every emitter that scatters such a row
+    reads (:func:`bngsim._codegen._psvs_row_divisor`): its live volume, read
+    through the observable that holds the promoted compartment alone; else its
+    size, by the size parameter's name where that is the species' size, so that
+    a write to it, which moves the engine's divisor, moves this one; else the
+    number. ``None`` where a live volume has no such observable, or a named size
+    is not the number the engine divides by."""
+    live, size, k = _psvs_row_divisor(species, i)
     if live >= 0:
         return alone.get(live)
-    size = float(sp.get("volume_factor", 1.0))
-    k = int(sp.get("volume_param_idx0", -1))
     if 0 <= k < len(params):
-        if float(params[k].get("value", size)) != size:
+        if float(params[k]["value"]) != float(species[i].get("volume_factor", 1.0)):
             return None
         return params[k]["name"]
     return repr(size)

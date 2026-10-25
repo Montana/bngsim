@@ -45,7 +45,8 @@ def _run(text, params, *, rtol=1e-10, atol=1e-14, sets=()):
 def _central(text, name, rel=1e-4, sets=()):
     """Central difference of plain runs, with respect to *name*, after *sets*.
     At rtol 1e-12 a run is good to about 1e-12, so the difference is good to
-    about 1e-12 / (2·rel·|p|): 7e-9 here, under the 1e-7 it is judged to."""
+    about 1e-12 / (2·rel·|p|): 1.7e-8 at most here (for k = 0.3), under the
+    1e-7 it is judged to."""
 
     def run(scale):
         model = bngsim.Model.from_antimony_string(text)
