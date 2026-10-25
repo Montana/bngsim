@@ -179,20 +179,21 @@ class _Options:
         pass
 
 
-@pytest.mark.parametrize("rtol, moved", [(1e-2, False), (1e-3, False), (1e-4, True), (1e-8, True)])
-def test_a_run_at_a_loose_tolerance_keeps_its_stops_as_placed(tmp_path, rtol, moved):
+@pytest.mark.parametrize(
+    "rtol, before", [(1e-2, True), (1e-3, True), (1e-4, False), (1e-8, False)]
+)
+def test_a_run_at_a_loose_tolerance_stops_a_double_before_each_change(tmp_path, rtol, before):
     """Moved onto its change at rtol 1e-2, the step reaching a stop read the
     new rate at its end and passed: ``mod(time(), 0.03) < 0.01`` came out 82%
-    high where main, its stops a double early, was 4% (main's error at such
-    tolerances is issue #1226)."""
+    high where main, its stops a double early, was 4%. A double before each
+    change it is exact to rounding (issue #1226); at 1e-4 and tighter the
+    stops stay on the change."""
     model = _model(tmp_path, _SPELLINGS["remainder"], 0.3, 0.1)
     conds = model.time_discontinuity_conditions()
-    placed, _, _ = crossings_with_periodic(model._core, 0.0, 30.0, conds)
     flipped, _, _ = crossings_with_periodic(model._core, 0.0, 30.0, conds, on_the_flip=True)
-    assert [s.time for s in placed] != [s.time for s in flipped]
     opts = _Options(rtol)
     bngsim.Simulator(model, method="ode")._apply_crossing_stops(opts, 0.0, 30.0)
-    assert opts.stops == [s.time for s in (flipped if moved else placed)]
+    assert opts.stops == [math.nextafter(s.time, -math.inf) if before else s.time for s in flipped]
 
 
 # ── A threshold on a counter ────────────────────────────────────────────────

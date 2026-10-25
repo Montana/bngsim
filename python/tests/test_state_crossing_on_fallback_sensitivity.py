@@ -652,7 +652,12 @@ def test_a_sign_of_the_time_that_a_requested_parameter_moves_is_refused(tmp_path
 
 
 CHOICES_THAT_BEND = {
-    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.01)",
+    # A reaches the floor at t = ln(100) ≈ 4.6, before T: dY/dk = −11.61. Under
+    # a floor it never reaches, Y = kb·T and dY/dk is 0, as it is for a max()
+    # that ignores the floor, and the column is only rounding: (kb·A)/A is 3
+    # to an ulp, and the quotient divides that by a move in A of about rtol·A.
+    # It came back 1.04e-8 at rtol 1e-10 on x86-64, past abs=1e-8.
+    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.1)",
     "a-magnitude-in-a-sum-it-divides-by": "kb/(1+abs(Aobs-thr))",
     "a-root-of-what-is-above-zero": "kb*Aobs/(1+0.5*(Aobs+sqrt(1+abs(Aobs*Aobs-thr))))",
     "a-clamp": "kb*max(0,min(Aobs,thr))",

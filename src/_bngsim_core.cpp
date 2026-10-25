@@ -78,28 +78,13 @@ static py::array_t<double> vec_to_ndarray_1d(const std::vector<double> &data) {
 // recovered from the buffer size (data.size() / (n_times * depth)) since the
 // Result class does not track it separately. An empty/unpopulated buffer yields
 // an empty (0,0,0) array, matching the species-sensitivity accessors.
-static py::array_t<double> sens_block_to_ndarray_3d(const std::vector<double> &data, int n_times,
-                                                    int depth) {
-    if (data.empty() || n_times == 0 || depth == 0) {
-        return py::array_t<double>({0, 0, 0});
-    }
-    int n_rows = static_cast<int>(data.size() / (static_cast<size_t>(n_times) * depth));
-    auto *vec = new std::vector<double>(data);
-    auto capsule = py::capsule(vec, [](void *p) { delete static_cast<std::vector<double> *>(p); });
-    return py::array_t<double>(
-        {n_times, n_rows, depth},
-        {static_cast<py::ssize_t>(static_cast<size_t>(n_rows) * depth * sizeof(double)),
-         static_cast<py::ssize_t>(static_cast<size_t>(depth) * sizeof(double)),
-         static_cast<py::ssize_t>(sizeof(double))},
-        vec->data(), capsule);
-}
-
-// Like sens_block_to_ndarray_3d but projects the middle (row) axis to ``keep``.
-// The expression output-sensitivity blocks (GH #198) are recorded with one row
-// per *raw* function (including the auto-generated _rateLawN intermediates); this
-// drops those rows so the returned block aligns with the filtered
-// ``expression_names`` a selector indexes into — exactly mirroring how
-// ``expression_data`` filters the value columns.
+//
+// The middle (row) axis is projected to ``keep``. The expression
+// output-sensitivity blocks (GH #198) are recorded with one row per *raw*
+// function (including the auto-generated _rateLawN intermediates); this drops
+// those rows so the returned block aligns with the filtered ``expression_names``
+// a selector indexes into — exactly mirroring how ``expression_data`` filters
+// the value columns.
 static py::array_t<double> sens_block_to_ndarray_3d_rows(const std::vector<double> &data,
                                                          int n_times, int depth,
                                                          const std::vector<size_t> &keep) {
@@ -2682,6 +2667,45 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "differentiates the trigger's threshold symbolically, so it needs "
             "the model's own spelling rather than the evaluator's preprocessed "
             "form.")
+        .def(
+            "events_as_written",
+            [](bngsim::NetworkModel &self) {
+                // The evaluator keeps each compiled expression's text; '' where
+                // it is not the ExprTk one, or the expression is not compiled.
+                const auto *exprtk =
+                    dynamic_cast<const bngsim::ExprTkEvaluator *>(&self.evaluator());
+                const auto text = [&](int idx) {
+                    return exprtk != nullptr && idx >= 0 ? exprtk->preprocessed_expr(idx)
+                                                         : std::string();
+                };
+                py::list out;
+                for (const auto &ev : self.events()) {
+                    py::list assignments;
+                    for (const auto &[sp, expr] : ev.assignments)
+                        assignments.append(py::make_tuple(sp, text(expr)));
+                    py::dict d;
+                    d["id"] = ev.id;
+                    d["trigger"] = ev.trigger_source;
+                    d["assignments"] = assignments;
+                    d["delay"] = ev.delay;
+                    d["delay_expr"] = text(ev.delay_expr_idx);
+                    d["priority"] = ev.priority;
+                    d["priority_expr"] = text(ev.priority_expr_idx);
+                    d["persistent"] = ev.persistent;
+                    d["initial_value"] = ev.initial_value;
+                    d["use_values_from_trigger_time"] = ev.use_values_from_trigger_time;
+                    d["size_jump_compartment"] = ev.size_jump_compartment;
+                    out.append(d);
+                }
+                return out;
+            },
+            "Each event as the run reads it, in events() order (issue #1244): {id, "
+            "trigger (as written), assignments [(0-based species index, value text)], "
+            "delay, delay_expr, priority, priority_expr, persistent, initial_value, "
+            "use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, "
+            "'' where none is "
+            "compiled. A schedule that reads a species only events write has its stops "
+            "placed from when those events set it.")
         .def_property_readonly("n_discontinuity_triggers",
                                &bngsim::NetworkModel::n_discontinuity_triggers)
         .def(
@@ -3691,6 +3715,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
         // Issue #524 — "newton" from the given state, no burst, stability reported.
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
+        // Issue #1191 — the burst-free solve without its stability certificate.
+        .def_readwrite("certify_root", &bngsim::SteadyStateOptions::certify_root)
+        // Issue #1191 — certify the given state as the root, with no Newton step.
+        .def_readwrite("certify_start", &bngsim::SteadyStateOptions::certify_start)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty
@@ -3738,6 +3766,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
         .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("continued_run_distance", &bngsim::SteadyStateResult::continued_run_distance)
         .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)

@@ -5,7 +5,6 @@
 
 #include "bngsim/bngsim_api.h"
 
-#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -22,22 +21,29 @@ static int passed = 0, failed = 0;
 #define FAIL(msg) \
     printf("FAIL: %s\n", msg); failed++;
 
+// Not CHECK(): every CI build defines NDEBUG (Release, RelWithDebInfo), which
+// compiles CHECK() out, so these checks ran nowhere and a stale one (the
+// reserved-function count) went unnoticed. CHECK always runs, and a failed
+// check fails the binary.
+#define CHECK(cond) \
+    if (!(cond)) { FAIL(#cond); return; }
+
 // ─── Test 1: Null input safety ──────────────────────────────────────────────
 static void test_null_safety() {
     TEST(null_safety);
     BNGModel* m = bng_model_create(nullptr);
-    assert(m == nullptr);
+    CHECK(m == nullptr);
     const char* err = bng_last_error();
-    assert(err && strlen(err) > 0);
+    CHECK(err && strlen(err) > 0);
 
     // Null model operations should not crash
     bng_model_free(nullptr);
     bng_result_free(nullptr);
-    assert(bng_n_species(nullptr) == 0);
-    assert(bng_set_param(nullptr, "k", 1.0) == -1);
+    CHECK(bng_n_species(nullptr) == 0);
+    CHECK(bng_set_param(nullptr, "k", 1.0) == -1);
 
     double v;
-    assert(bng_get_param(nullptr, "k", &v) == -1);
+    CHECK(bng_get_param(nullptr, "k", &v) == -1);
     PASS();
 }
 
@@ -47,9 +53,9 @@ static void test_lifecycle() {
     BNGModel* m = bng_model_create(NET_FILE);
     if (!m) { FAIL(bng_last_error()); return; }
 
-    assert(bng_n_species(m) > 0);
-    assert(bng_n_reactions(m) > 0);
-    assert(bng_n_parameters(m) > 0);
+    CHECK(bng_n_species(m) > 0);
+    CHECK(bng_n_reactions(m) > 0);
+    CHECK(bng_n_parameters(m) > 0);
 
     bng_model_free(m);
     PASS();
@@ -67,7 +73,7 @@ static void test_param_roundtrip() {
     int rc = bng_get_param(m, "kp1", &orig);
     if (rc != 0) {
         // Model may not have kp1 — that's fine, test the error path
-        assert(bng_last_error() && strlen(bng_last_error()) > 0);
+        CHECK(bng_last_error() && strlen(bng_last_error()) > 0);
         bng_model_free(m);
         PASS();
         return;
@@ -75,16 +81,16 @@ static void test_param_roundtrip() {
 
     // Set to new value
     rc = bng_set_param(m, "kp1", orig * 2.0);
-    assert(rc == 0);
+    CHECK(rc == 0);
 
     double readback;
     rc = bng_get_param(m, "kp1", &readback);
-    assert(rc == 0);
-    assert(std::abs(readback - orig * 2.0) < 1e-12);
+    CHECK(rc == 0);
+    CHECK(std::abs(readback - orig * 2.0) < 1e-12);
 
     // Not-found parameter
     rc = bng_set_param(m, "__nonexistent__", 42.0);
-    assert(rc == -1);
+    CHECK(rc == -1);
 
     bng_model_free(m);
     PASS();
@@ -99,17 +105,17 @@ static void test_simulate_ode() {
     BNGResult* r = bng_simulate_ode(m, 0.0, 10.0, 11, 1e-8, 1e-8);
     if (!r) { FAIL(bng_last_error()); bng_model_free(m); return; }
 
-    assert(bng_result_n_times(r) == 11);
-    assert(bng_result_n_species(r) == bng_n_species(m));
-    assert(bng_result_n_observables(r) == bng_n_observables(m));
+    CHECK(bng_result_n_times(r) == 11);
+    CHECK(bng_result_n_species(r) == bng_n_species(m));
+    CHECK(bng_result_n_observables(r) == bng_n_observables(m));
 
     const double* t = bng_result_time(r);
-    assert(t != nullptr);
-    assert(std::abs(t[0] - 0.0) < 1e-12);
-    assert(std::abs(t[10] - 10.0) < 1e-12);
+    CHECK(t != nullptr);
+    CHECK(std::abs(t[0] - 0.0) < 1e-12);
+    CHECK(std::abs(t[10] - 10.0) < 1e-12);
 
     const double* sp = bng_result_species(r);
-    assert(sp != nullptr);
+    CHECK(sp != nullptr);
 
     bng_result_free(r);
     bng_model_free(m);
@@ -125,8 +131,8 @@ static void test_simulate_ssa() {
     BNGResult* r = bng_simulate_ssa(m, 0.0, 10.0, 11, 12345ULL);
     if (!r) { FAIL(bng_last_error()); bng_model_free(m); return; }
 
-    assert(bng_result_n_times(r) == 11);
-    assert(bng_result_n_species(r) > 0);
+    CHECK(bng_result_n_times(r) == 11);
+    CHECK(bng_result_n_species(r) > 0);
 
     bng_result_free(r);
     bng_model_free(m);
@@ -140,8 +146,8 @@ static void test_clone() {
     if (!m) { FAIL(bng_last_error()); return; }
 
     BNGModel* c = bng_model_clone(m);
-    assert(c != nullptr);
-    assert(bng_n_species(c) == bng_n_species(m));
+    CHECK(c != nullptr);
+    CHECK(bng_n_species(c) == bng_n_species(m));
 
     bng_model_free(c);
     bng_model_free(m);
@@ -153,12 +159,12 @@ static void test_reserved_constants() {
     TEST(reserved_constants);
     int count = 0;
     const char** names = bng_reserved_constants(&count);
-    assert(names != nullptr);
-    assert(count == 7);
+    CHECK(names != nullptr);
+    CHECK(count == 7);
     // Check _pi is first
-    assert(strcmp(names[0], "_pi") == 0);
+    CHECK(strcmp(names[0], "_pi") == 0);
     // NULL-terminated
-    assert(names[count] == nullptr);
+    CHECK(names[count] == nullptr);
     PASS();
 }
 
@@ -167,10 +173,10 @@ static void test_reserved_functions() {
     TEST(reserved_functions);
     int count = 0;
     const char** names = bng_reserved_functions(&count);
-    assert(names != nullptr);
-    assert(count == 37);
-    assert(strcmp(names[0], "time") == 0);
-    assert(names[count] == nullptr);
+    CHECK(names != nullptr);
+    CHECK(count == 38);
+    CHECK(strcmp(names[0], "time") == 0);
+    CHECK(names[count] == nullptr);
     PASS();
 }
 
