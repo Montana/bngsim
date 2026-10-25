@@ -236,16 +236,16 @@ def test_replicates_list_parallel_and_roundtrip(net_path: Path, tmp_path: Path) 
     sim = bngsim.Simulator(_model(net_path), method="ssa", reaction_stats=True)
     reps = sim.run_replicates(3, t_span=T_SPAN, n_points=N_POINTS, seed=5)
     assert all(r.reaction_firing_counts.shape == (N_POINTS, 2) for r in reps)
-    # The parallel path builds its own simulator per worker; the flag follows it,
-    # and the answer is invariant to it. Counts are exact; the integrals are
-    # sums of dwell increments whose order depends on which loop ran (the
-    # worker's bare SsaSimulator has no propensity library and takes the
-    # incremental loop), so they agree to rounding, not bit-for-bit.
+    # The parallel path builds its own simulator per worker; the flag and the
+    # propensity library follow it, so each worker runs the loop the sequential
+    # path runs and the answer is the same bit for bit. Before the library
+    # followed, the workers took the incremental loop, whose dwell increments
+    # sum in another order.
     par = sim.run_replicates(3, t_span=T_SPAN, n_points=N_POINTS, seed=5, num_processors=2)
     for a, b in zip(reps, par, strict=True):
         np.testing.assert_array_equal(a.reaction_firing_counts, b.reaction_firing_counts)
-        np.testing.assert_allclose(
-            a.reaction_propensity_integrals, b.reaction_propensity_integrals, rtol=1e-12
+        np.testing.assert_array_equal(
+            a.reaction_propensity_integrals, b.reaction_propensity_integrals
         )
 
     pytest.importorskip("h5py")
@@ -264,6 +264,23 @@ def test_replicates_list_parallel_and_roundtrip(net_path: Path, tmp_path: Path) 
     back = bngsim.Result.load(path)
     assert not back.has_reaction_stats
     assert back.reaction_labels == []
+
+
+def test_batch_rows_carry_the_blocks(net_path: Path) -> None:
+    """run_batch built its per-row engine without the flag, so every row came
+    back with no blocks. A row at the model's own values is the run at the
+    row's seed, blocks included."""
+    sim = bngsim.Simulator(_model(net_path), method="ssa", reaction_stats=True)
+    rows = sim.run_batch(T_SPAN, N_POINTS, params=[{"k1": 5.0}, {"k1": 2.0}], seed=5)
+    one = bngsim.Simulator(_model(net_path), method="ssa", reaction_stats=True).run(
+        t_span=T_SPAN, n_points=N_POINTS, seed=5
+    )
+    assert [r.has_reaction_stats for r in rows] == [True, True]
+    assert rows[0].reaction_labels == one.reaction_labels
+    np.testing.assert_array_equal(rows[0].reaction_firing_counts, one.reaction_firing_counts)
+    np.testing.assert_array_equal(
+        rows[0].reaction_propensity_integrals, one.reaction_propensity_integrals
+    )
 
 
 def test_squeezed_batch_reports_its_backend(net_path: Path) -> None:
