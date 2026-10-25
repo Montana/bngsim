@@ -2554,6 +2554,197 @@ def _instants(edges: np.ndarray, lo: float, hi: float) -> int:
     return 1 + int(np.count_nonzero(np.diff(edges) > _instant(lo, hi)))
 
 
+def lines_holding_the_clock(
+    text: str, constants: Collection[str] = frozenset(), at: int = 0
+) -> list[str]:
+    """The parts of *text* that hold its read of the clock (the first from
+    *at*) and are lines in time by their spelling, innermost first: each in
+    parentheses, or the argument of a call the clock is in, and *text* itself
+    where it is one. `floor((1e10 + time())/(0.01))`, as SBML's `quotient`
+    loads, is read through `1e10 + time()`, though its argument is no line (a
+    number in parentheses is no piece of one)."""
+    clock = _READS_CLOCK.search(text, at)
+    if clock is None:
+        return []
+    at = clock.start()
+    opened: list[int] = []
+    parts: list[str] = []
+    for i, ch in enumerate(text):
+        if ch == "(":
+            opened.append(i)
+        elif ch == ")" and opened:
+            begin = opened.pop()
+            # Around the clock, and not its own: `time()` is no part of a line.
+            if not (begin < at and i > clock.end()):
+                continue
+            # The piece of the parentheses, between two of their commas, that
+            # the clock is in.
+            depth, start = 0, begin + 1
+            for j in range(begin + 1, i + 1):
+                c = text[j] if j < i else ","
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                elif c == "," and depth == 0:
+                    if start <= at < j:
+                        part = text[start:j].strip()
+                        if _reads_of_the_clock_in_a_line(part, constants) == 1:
+                            parts.append(part)
+                        break
+                    start = j + 1
+    if _reads_of_the_clock_in_a_line(text.strip(), constants) == 1:
+        parts.append(text.strip())
+    parts.sort(key=len)
+    return list(dict.fromkeys(parts))
+
+
+# The treads of a line :func:`tread_changes` reads for one law in one run, at
+# a read each: half a second of the evaluator at the most, and 250 MB, once for
+# a run and its memo. (At 2^24, a gigabyte.)
+TREAD_READS = 1 << 22
+# CVODE takes a stop as reached once a step ends within 100*uround*t of it, and
+# does not integrate what is left. Stops that close together are each reached
+# a step after the one before, and the rest of the stretch is never
+# integrated: with treads of `3e9 + time()` 0.7 to 1.8 of those apart, late in
+# a run, `1e4*mod(3e9 + time(), 40u)` read on each came out 18% to 69% low,
+# where main is 1.2% over. From 3.6 apart it was 1.3e-4 to 3e-4, and at 217,
+# 8.9e-6. A reading whose changes are closer than this many of those
+# tolerances is declined.
+_TREAD_CLEARANCE = 16.0
+_CVODE_STOP_ROUNDOFF = 100.0 * float(np.finfo(float).eps)
+# Times evaluated at a time.
+_TREAD_BLOCK = 1 << 20
+
+
+class Treads(NamedTuple):
+    """What :func:`tread_changes` read of a window.
+
+    *stops* is a stop for each change, or ``None`` where there are more than
+    the budget (*changes* is then how many), or where *read* is false: the
+    line holds more doubles in the window than :data:`TREAD_READS`, and
+    *changes* is how many. *shortest* is the shortest stretch between two
+    changes, and *fits* the longest leg of the run that holds no more than
+    the budget of them, nor more than :data:`TREAD_READS` treads."""
+
+    stops: np.ndarray | None
+    changes: int
+    shortest: float
+    read: bool = True
+    fits: float = math.inf
+
+
+def tread_changes(
+    ev: Evaluate, text: str, line: str, lo: float, hi: float, budget: int
+) -> Treads | None:
+    """The changes of *text* in ``(lo, hi)``, a text that reads the clock once,
+    inside *line*, a line in time by its spelling (:func:`_a_line_in_time`)
+    (issue #1018).
+
+    The evaluator's value of such a line holds each of its doubles for a
+    stretch of time, a tread (1.2e-4 at `1e12 + time()`), and *text* is the
+    same all along one. So it is read once on each tread, in its middle, and
+    where two treads read differently the change is bisected to the
+    evaluator's own double: a read for each tread, where the scan's comb reads
+    the run every quarter instant (6e-8 at a time of 240) and ran out of
+    reads in all but the shortest runs, and where a stop on each wrap of a
+    sawtooth is not a stop on each of its steps.
+
+    Each stop is the last double of the value that ends, not the first of the
+    next. A step ends on a stop, and the implicit step reads the rate at its
+    end: on the first double of the next tread, the whole step was taken at
+    the next tread's rate, and `floor(mod(1e10 + time(), 0.01)/0.01 + 0.25)`
+    came out 5.6e-7 off at rtol = atol = 1e-8. A double earlier it is exact to
+    rounding, in a tenth of the steps.
+
+    The middle of each tread is where the line is that double in real
+    arithmetic, from the first change of the line and its last, and the line
+    is read there to see that it is: ``None`` where it is not (a line that
+    skips doubles, as `(1.1e12 + time())/0.0048828125` does, whose treads are
+    not one to a double), where the line crosses zero, where its doubles are
+    too fine to read, or where two changes are closer than CVODE can stop
+    apart (:data:`_TREAD_CLEARANCE`).
+    """
+    x = np.asarray(ev(f"({line})", np.array([lo, hi], dtype=float)), dtype=float)
+    if not np.all(np.isfinite(x)) or x[0] == 0.0 or x[1] == 0.0 or (x[0] < 0.0) != (x[1] < 0.0):
+        return None
+    bits = np.abs(x).view(np.int64)
+    n = abs(int(bits[1]) - int(bits[0]))
+    if n + 1 > TREAD_READS:
+        # (Each tread at the most a change: a leg of as many of the shortest
+        # treads as both budgets allow fits.)
+        tread = float(np.spacing(np.min(np.abs(x)))) * (hi - lo) / abs(float(x[1] - x[0]))
+        return Treads(None, n, 0.0, read=False, fits=min(TREAD_READS, budget) * tread)
+    if n == 0:
+        return Treads(np.empty(0), 0, math.inf)
+    # The doubles the line takes, in the order it takes them.
+    k = np.arange(n + 1, dtype=np.int64)
+    held = math.copysign(1.0, float(x[0])) * (
+        int(bits[0]) + (1 if bits[1] > bits[0] else -1) * k
+    ).view(np.float64)
+
+    def line_is(target: float, equal: bool):
+        return lambda at, _which: (np.asarray(ev(f"({line})", at), dtype=float) == target) == equal
+
+    def first_double(side) -> float:
+        """The first double after *lo* where *side* is false."""
+        return float(_bisect(side, np.array([lo]), np.array([hi]), np.ones(1, dtype=bool))[0])
+
+    # Where the line leaves its first double, and where it takes its last.
+    first = first_double(line_is(float(held[0]), True))
+    last = first_double(line_is(float(held[-1]), False))
+    # Where it is half way between two doubles in real arithmetic, and how
+    # fast it moves there. (As differences from its first double, which are
+    # exact: half the sum of two doubles of `1.1e12 + time()` rounds where the
+    # sum is past 2^41, half a tread off.)
+    off = held - held[0]
+    at_first = 0.5 * float(off[1])
+    slope = (
+        (float(off[-2]) + 0.5 * float(off[-1] - off[-2]) - at_first) / (last - first)
+        if n > 1 and last > first
+        else (float(x[1]) - float(x[0])) / (hi - lo)
+    )
+    middle = np.empty(n + 1)
+    middle[0], middle[-1] = lo, hi
+    middle[1:-1] = first + (off[1:-1] - at_first) / slope
+    if np.any(np.diff(middle) <= 0.0):
+        return None
+    value = np.empty(n + 1)
+    for begin in range(0, n + 1, _TREAD_BLOCK):
+        end = min(begin + _TREAD_BLOCK, n + 1)
+        at = middle[begin:end]
+        if not np.array_equal(np.asarray(ev(f"({line})", at), dtype=float), held[begin:end]):
+            return None
+        value[begin:end] = np.asarray(ev(text, at), dtype=float)
+    if np.isnan(value).any():
+        return None
+    changed = np.nonzero(value[1:] != value[:-1])[0]
+    count = int(changed.size)
+    # Each change at the middle of the tread it opens, the first and last
+    # treads' too (`middle` has the run's ends there: a run that ended a few
+    # doubles into a tread made its last stretch that short, and the reading
+    # was declined or not by where the run ended).
+    at_change = first + (off[changed + 1] - at_first) / slope
+    shortest = float(np.min(np.diff(at_change))) if count > 1 else math.inf
+    if shortest < _TREAD_CLEARANCE * _CVODE_STOP_ROUNDOFF * max(abs(lo), abs(hi)):
+        return None
+    if count > budget:
+        # The shortest stretch holding one change more than the budget: where
+        # the line crosses a power of two its treads double, and a leg of the
+        # run times the budget over the count held 1,277,952.
+        fits = float(np.min(at_change[budget:] - at_change[:-budget]))
+        return Treads(None, count, shortest, fits=fits)
+    before = value[changed]
+    flips = _bisect(
+        lambda at, which: np.asarray(ev(text, at), dtype=float) == before[which],
+        middle[changed],
+        middle[changed + 1],
+        np.ones(count, dtype=bool),
+    )
+    stops = np.nextafter(flips, -np.inf)
+    return Treads(stops[stops > _start(lo, hi)], count, shortest)
+
+
 def scan_changes(
     ev: Evaluate,
     text: str,

@@ -203,10 +203,18 @@ def test_ssa_runs_a_zero_constant_parameter_delay():
     assert list(result.species[:, 0]) == [0.0, 0.0, 5.0]
 
 
-@pytest.mark.parametrize(("load", "set_to"), [(1.0, None), (0.0, 0.5)])
-def test_ssa_refuses_a_nonzero_constant_parameter_delay(load, set_to):
-    model = bngsim.Model.from_antimony_string(_SSA_DELAY_ANT.format(d=load))
-    if set_to is not None:
-        model.set_param("d", set_to)
-    with pytest.raises(bngsim.SimulationError, match="not yet supported under SSA"):
-        bngsim.Simulator(model, method="ssa").run(t_span=(0, 2), n_points=3, seed=1)
+@pytest.mark.parametrize(
+    ("load", "set_to", "want"), [(1.0, None, [0, 0, 0, 5]), (0.0, 0.5, [0, 0, 5, 5])]
+)
+def test_ssa_runs_a_nonzero_constant_parameter_delay(load, set_to, want):
+    # Issue #526: a delay runs under SSA as under ODE, including one a
+    # set_param gives after load. `time > 1` fires just after 1, so a delay of
+    # 1 lands just after the row at 2.
+    rows = {}
+    for method in ("ode", "ssa"):
+        model = bngsim.Model.from_antimony_string(_SSA_DELAY_ANT.format(d=load))
+        if set_to is not None:
+            model.set_param("d", set_to)
+        run = bngsim.Simulator(model, method=method).run(t_span=(0, 3), n_points=4, seed=1)
+        rows[method] = list(run.species[:, 0])
+    assert rows["ssa"] == rows["ode"] == want

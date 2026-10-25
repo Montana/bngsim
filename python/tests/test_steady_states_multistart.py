@@ -439,3 +439,436 @@ def test_the_building_block_leaves_a_fixed_species_out_too(tmp_path):
     (r,) = sim.steady_state_batch(states=[[1.0, 3.0]], method="newton", newton_burst=False)
     assert r.converged, r
     np.testing.assert_allclose(r.concentrations, [1.0, 4.0], rtol=1e-9)
+
+
+def test_steady_states_returns_at_least_the_root_steady_state_reaches():
+    """Issue #1189: on Motivating_example every sampled start fails, and the
+    call returned no root where ``steady_state()`` converges. Its root is now
+    solved as an extra start: found by it alone, it is reported with
+    multiplicity 0, since no draw reached it, and the draws' counts are as
+    they were."""
+    model = bngsim.Model.from_net(_net("Motivating_example.net"))
+    sim = bngsim.Simulator(model, method="ode")
+    ordinary = sim.steady_state()
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert ordinary.converged
+    assert roots.n_failed == 20 and roots.basins.size == 20
+    assert len(roots) == 1 and roots.multiplicity.tolist() == [0]
+    assert roots.stability == ["stable"]
+    np.testing.assert_allclose(roots.states[0], ordinary.concentrations, rtol=1e-6, atol=1e-9)
+
+
+def test_the_extra_start_adds_nothing_to_a_root_the_draws_found(monkeypatch):
+    """Where the draws already reach steady_state()'s root, the seed joins it
+    and counts for nothing: every start is still one draw or one failure."""
+    calls = []
+    real = bngsim.Simulator.steady_state_batch
+
+    def spy(self, **kwargs):
+        out = real(self, **kwargs)
+        calls.append((kwargs, out))
+        return out
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state_batch", spy)
+    sim, _ = _toggle()
+    roots = sim.steady_states(seed=0)
+    # Told apart by what each solves, not by their order: the draws, the seed
+    # (one state, uncertified, as the draws are), and each distinct root's
+    # certificate, solved once after the clustering (issue #1191).
+    (draws,) = [out for kw, out in calls if len(kw["states"]) == 200]
+    (seed,) = [out for kw, out in calls if len(kw["states"]) == 1 and kw.get("certify") is False][
+        0
+    ]
+    (certified,) = [out for kw, out in calls if kw.get("certify", True)]
+    assert len(certified) == len(roots)
+    # The seed was solved, converged, and landed on a root the draws found.
+    assert len(draws) == 200 and seed.converged
+    assert any(np.allclose(seed.concentrations, y, rtol=1e-6) for y in roots.states)
+    assert len(roots) == 3
+    assert int(roots.multiplicity.sum()) + roots.n_failed == 200 == roots.basins.size
+    assert (roots.multiplicity > 0).all()
+
+
+_TINY_CHAIN_NET = """begin parameters
+    1 k1  300
+    2 k2  200
+    3 k3  100
+end parameters
+begin species
+    1 A() 5e-10
+    2 B() 0
+    3 C() 0
+    4 D() 0
+end species
+begin reactions
+    1 1 2 k1 #_R1
+    2 2 3 k2 #_R2
+    3 3 4 k3 #_R3
+end reactions
+begin groups
+    1 Dtot 4
+end groups
+"""
+
+
+def _held_sink_case(case, tmp_path):
+    """(model, steady_states kwargs) for a sink masked as the docstring advises."""
+    if case == "tiny_chain":
+        path = tmp_path / "tiny_chain.net"
+        path.write_text(_TINY_CHAIN_NET, encoding="utf-8")
+        return bngsim.Model.from_net(str(path)), {}
+    model = bngsim.Model.from_net(_net(case.split(":")[0] + ".net"))
+    if case == "SIR:gamma=2":
+        model.set_param("gamma", 2.0)
+        return model, {"dedupe_rtol": 1e-8}
+    return model, {}
+
+
+@pytest.mark.parametrize("case", ["m1_ground", "SIR", "tiny_chain", "SIR:gamma=2"])
+def test_no_root_leaves_the_models_conservation_laws(tmp_path, case):
+    """Masked as the docstring advises a pure sink, m1_ground's D (A -> B -> C
+    -> D, total 100) and SIR's R are law members the ordinary solve moves. Set
+    back as the draws hold them, they moved the seed's law totals, and a "root"
+    came back at a total of 0 (m1_ground) and 18355 of 2e7 (SIR). The seed is
+    now put on the model's totals: every root holds them. tiny_chain is
+    m1_ground at a total of 5e-10, below tol, and SIR at gamma = 2 moves R by
+    only 2 of 2e7, under a looser dedupe_rtol: a threshold on the drift let both
+    through. m1_ground's held chain has no root at all, as on main."""
+    from bngsim._simulator import _manifold_partition
+
+    model, kwargs = _held_sink_case(case, tmp_path)
+    y0, L, _, _ = _manifold_partition(model, None)
+    assert L.shape[0] >= 1
+    sim = bngsim.Simulator(model, method="ode")
+    roots = sim.steady_states(n_starts=20, seed=0, mask=~model.is_pure_sink(), **kwargs)
+    for y in roots.states:
+        np.testing.assert_allclose(L @ y, L @ y0, rtol=1e-9)
+    if case in ("m1_ground", "tiny_chain"):
+        assert len(roots) == 0
+
+
+_ZERO_TOTAL_NET = """begin parameters
+    1 ks   1e8
+    2 kac  1.0
+    3 kd   1.0
+end parameters
+begin species
+    1 A() 0
+    2 B() 0
+    3 C() 0
+end species
+begin reactions
+    1 0 1,2 ks #_R1
+    2 1 3 kac #_R2
+    3 2,3 0 kd #_R3
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+def test_a_root_on_a_law_whose_total_is_zero_is_seeded(tmp_path):
+    """0 -> A + B, A -> C, B + C -> 0 holds A - B + C = 0, a row-reduced law at a
+    total of 0 from a zero state. steady_state() reaches A = 1e8, B = 1e8 + 1,
+    C = 1, where the law is held to ~5e-17 of its members. A threshold on the
+    drift scaled by the zero state dropped that seed, and with every draw
+    failing the call returned no root."""
+    path = tmp_path / "zero_total.net"
+    path.write_text(_ZERO_TOTAL_NET, encoding="utf-8")
+    sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+    ordinary = sim.steady_state()
+    assert ordinary.converged
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert any(np.allclose(y, ordinary.concentrations, rtol=1e-6) for y in roots.states), roots
+
+
+@pytest.mark.parametrize("how", ["raises", "unconverged"])
+def test_the_draws_stand_when_the_ordinary_solve_does_not(monkeypatch, how):
+    """The ordinary solve is only a seed and a scale. Where it raises, or does
+    not converge, nothing is seeded and the call returns what the draws found:
+    on Motivating_example, where every draw fails, no root at all."""
+    real = bngsim.Simulator.steady_state
+
+    def ordinary(self, **kwargs):
+        if how == "raises":
+            raise bngsim.SimulationError("the ordinary solve refused")
+        result = real(self, **kwargs)
+        result.converged = False
+        return result
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state", ordinary)
+    model = bngsim.Model.from_net(_net("Motivating_example.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(n_starts=20, seed=0)
+    assert len(roots) == 0 and roots.n_failed == 20 == roots.basins.size
+
+
+_DRAINED_NET = """begin parameters
+    1 k  1e3
+end parameters
+begin species
+    1 A() 100
+    2 D() 0
+end species
+begin reactions
+    1 1 2 k #_R1
+end reactions
+begin groups
+    1 Dtot 2
+end groups
+"""
+
+
+def test_a_law_drained_into_a_held_sink_seeds_nothing_and_quietly(tmp_path):
+    """A -> D with D masked as a pure sink: the ordinary solve drains A to 0.0
+    exactly, so the seed has no member to lift onto the law's total of 100. The
+    projection's dual Newton overflowed there, a RuntimeWarning, and a
+    FloatingPointError under np.seterr(all="raise"); nothing is seeded and the
+    draws stand (the held chain has no root)."""
+    path = tmp_path / "drained.net"
+    path.write_text(_DRAINED_NET, encoding="utf-8")
+    model = bngsim.Model.from_net(str(path))
+    sim = bngsim.Simulator(model, method="ode")
+    with np.errstate(all="raise"):
+        roots = sim.steady_states(n_starts=20, seed=0, mask=~model.is_pure_sink())
+    assert len(roots) == 0
+
+
+_POOL_NET = """begin parameters
+    1 kf   1.0
+    2 kr   1.0
+    3 kc   1e-12
+    4 kcr  1.0
+end parameters
+begin species
+    1 C() 0
+    2 A() {total}
+    3 B() 0
+end species
+begin reactions
+    1 2 3 kf #_R1
+    2 3 2 kr #_R2
+    3 3 1 kc #_R3
+    4 1 3 kcr #_R4
+end reactions
+begin groups
+    1 Ctot 1
+end groups
+"""
+
+
+def _pool(tmp_path, total):
+    path = tmp_path / "pool.net"
+    path.write_text(_POOL_NET.format(total=total), encoding="utf-8")
+    return bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
+
+
+def test_newton_holds_the_ordinary_root_at_a_small_law_total(tmp_path):
+    """The control for the large-total case below: C <-> B <-> A, C first and
+    small. At 1e4 steady_state() converges, and the seed's own solve, Newton
+    from its root, holds it."""
+    sim = _pool(tmp_path, 1e4)
+    ordinary = sim.steady_state()
+    assert ordinary.converged
+    (seed,) = sim.steady_state_batch(
+        states=[np.asarray(ordinary.concentrations)], method="newton", newton_burst=False
+    )
+    assert seed.converged, seed
+
+
+def test_the_seed_returns_the_root_of_a_large_law_total(tmp_path):
+    """Newton rebuilt the law's first member, C, as the total less the others,
+    and at 1e8 that round-off exceeded tol: the seed's solve ended at 3.1e-9,
+    and every start failed (issue #1190). It rebuilds the largest member now."""
+    sim = _pool(tmp_path, 1e8)
+    roots = sim.steady_states(n_starts=20, seed=0)
+    assert len(roots) == 1
+
+
+# The toggle with its production drawn from a conserved pool P and divided by
+# P, so its dynamics are the toggle's: R1 + R2 + P = Ptot, and the law's own
+# pivot is R1 (issue #1190).
+_POOL_TOGGLE_NET = """begin parameters
+    1 alpha_1     156.25
+    2 alpha_2     53.526315789473685
+    3 beta        2.5
+    4 gamma       1.0
+    5 k_deg       1.0
+    6 Ptot        {ptot}
+end parameters
+begin functions
+    1 syn_R1() alpha_1/(1+(Obs_Tot_R2^beta))/Obs_P
+    2 syn_R2() alpha_2/(1+(Obs_Tot_R1^gamma))/Obs_P
+end functions
+begin species
+    1 R1() 0
+    2 R2() 0
+    3 P() Ptot
+end species
+begin reactions
+    1 3 1 syn_R1 #_R1
+    2 3 2 syn_R2 #_R2
+    3 1 3 k_deg #_R3
+    4 2 3 k_deg #_R4
+end reactions
+begin groups
+    1 Obs_Tot_R1           1
+    2 Obs_Tot_R2           2
+    3 Obs_P               3
+end groups
+"""
+
+
+def _pool_toggle(tmp_path, ptot):
+    path = tmp_path / "pool_toggle.net"
+    path.write_text(_POOL_TOGGLE_NET.format(ptot=ptot), encoding="utf-8")
+    model = bngsim.Model.from_net(str(path))
+    return bngsim.Simulator(model, method="ode"), model
+
+
+@pytest.mark.parametrize("ptot", [1e3, 1e8, 1e9])
+def test_a_root_under_a_large_conservation_total_converges(tmp_path, ptot):
+    """Issue #1190: R1, ~28, was rebuilt from the law as Ptot − R2 − P, and the
+    subtraction's ~1e-16·Ptot of round-off put the saddle's residual at 2.2e-9
+    over tol = 1e-9 from Ptot = 1e8. Rebuilt from P, the largest member, the
+    residual stays at round-off of the toggle's own scale."""
+    sim, model = _pool_toggle(tmp_path, ptot)
+    assert [model.species_names[i] for i in model.conservation_laws["dependent"]] == ["R1()"]
+    near = _SADDLE * 1.01
+    (r,) = sim.steady_state_batch(
+        states=[[*near, ptot - near.sum()]], method="newton", newton_burst=False
+    )
+    assert r.converged and r.residual < 1e-13
+    np.testing.assert_allclose(np.asarray(r.concentrations)[:2], _SADDLE, rtol=1e-8)
+    assert r.root_stability == "unstable"
+
+
+def test_steady_states_finds_the_three_roots_under_a_pool_of_1e8(tmp_path):
+    """Every start failed, and the call returned no root, at Ptot = 1e8."""
+    sim, _ = _pool_toggle(tmp_path, 1e8)
+    roots = sim.steady_states(seed=0, decades=10)
+    assert len(roots) == 3
+    assert sorted(roots.stability) == ["stable", "stable", "unstable"]
+    np.testing.assert_allclose(
+        roots.states[_row(roots, np.append(_SADDLE, 1e8 - _SADDLE.sum()))][:2], _SADDLE, rtol=1e-8
+    )
+
+
+# A <-> B, one law A + B = T, whose own pivot is A (issue #1190).
+_EXCHANGE_NET = """begin parameters
+    1 kf  {kf}
+    2 kr  {kr}
+end parameters
+begin species
+    1 A() {total}
+    2 B() 0
+end species
+begin reactions
+    1 1 2 kf #_R1
+    2 2 1 kr #_R2
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+def _exchange(tmp_path, total, kf, kr):
+    path = tmp_path / "exchange.net"
+    path.write_text(_EXCHANGE_NET.format(total=total, kf=kf, kr=kr), encoding="utf-8")
+    model = bngsim.Model.from_net(str(path))
+    return bngsim.Simulator(model, method="ode"), model
+
+
+@pytest.mark.parametrize("total", [1e8, 1e9])
+def test_a_start_crosses_its_large_total_to_the_root(tmp_path, total):
+    """From A = 1 to a root at A ≈ T: re-pivoted on B, the start's largest
+    member, Newton's longest step was sized by A alone, 1e6, and KINSOL gave up
+    after five of them at A = 5e6, where the model's pivots converge in two
+    steps. 16 of 50 starts of steady_states(decades=10) failed so."""
+    kf, kr = 1e-3, 1e6
+    sim, _ = _exchange(tmp_path, total, kf, kr)
+    (r,) = sim.steady_state_batch(states=[[1.0, total - 1.0]], method="newton", newton_burst=False)
+    assert r.converged, r
+    np.testing.assert_allclose(
+        r.concentrations, [total * kr / (kf + kr), total * kf / (kf + kr)], rtol=1e-9
+    )
+    roots = sim.steady_states(n_starts=50, seed=0, decades=10)
+    assert len(roots) == 1 and roots.n_failed == 0
+
+
+def test_a_law_whose_pivot_the_mask_leaves_out_is_still_solved(tmp_path):
+    """The mask leaves out A, the law's own pivot, which the solve rebuilds
+    from the law. Re-pivoted on B, A was held, no unknown was left, and the
+    start failed at a residual of 0.7 where the model's pivot converges."""
+    sim, model = _exchange(tmp_path, 1.0, 1.0, 2.0)
+    assert [model.species_names[i] for i in model.conservation_laws["dependent"]] == ["A()"]
+    (r,) = sim.steady_state_batch(
+        states=[[0.9, 0.1]], method="newton", newton_burst=False, mask=["B()"]
+    )
+    assert r.converged, r
+    np.testing.assert_allclose(r.concentrations, [2 / 3, 1 / 3], rtol=1e-12)
+
+
+def test_a_burst_free_solve_can_leave_the_certificate_out():
+    """``certify=False`` skips the eigendecomposition (issue #1191): the root is
+    the same, with no verdict and no spectrum on it."""
+    sim, _ = _toggle()
+    start = _SADDLE[None, :] * 1.001
+    kw = {"states": start, "method": "newton", "newton_burst": False}
+    (full,) = sim.steady_state_batch(**kw)
+    (bare,) = sim.steady_state_batch(certify=False, **kw)
+    assert full.converged and bare.converged
+    np.testing.assert_array_equal(bare.concentrations, full.concentrations)
+    assert full.root_stability == "unstable" and len(full.eigenvalues) == 2
+    assert bare.root_stability == "" and len(bare.eigenvalues) == 0
+
+
+def test_each_distinct_root_is_certified_once(monkeypatch):
+    """Issue #1191: the starts are solved without the certificate, and only one
+    representative of each distinct root gets it, not every start that reached
+    that root. The verdicts are the ones certifying every start gave."""
+    sim, _ = _toggle()
+    certified: list[int] = []
+    batch = bngsim.Simulator.steady_state_batch
+
+    def counting(self, *a, **k):
+        if k.get("certify", True):
+            certified.append(len(k["states"]))
+        return batch(self, *a, **k)
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state_batch", counting)
+    roots = sim.steady_states(seed=0)
+    assert certified == [len(roots)] == [3]
+    assert int(roots.multiplicity.sum()) > len(roots)  # starts shared roots
+    assert sorted(roots.stability) == ["stable", "stable", "unstable"]
+    assert roots.stability[_row(roots, _SADDLE)] == "unstable"
+    assert all(len(e) == 2 for e in roots.eigenvalues)
+
+
+def test_certify_start_certifies_the_state_it_is_given():
+    """``certify="start"`` takes no Newton step (issue #1191): the saddle comes
+    back as it was given, certified there, and a state that is no root comes
+    back unconverged with no verdict."""
+    sim, _ = _toggle()
+    kw = {"method": "newton", "newton_burst": False, "certify": "start"}
+    (at, off) = sim.steady_state_batch(states=np.array([_SADDLE, _SADDLE * 1.01]), **kw)
+    assert at.converged and at.n_steps == 0
+    np.testing.assert_array_equal(at.concentrations, _SADDLE)
+    assert at.root_stability == "unstable" and len(at.eigenvalues) == 2
+    assert not off.converged and off.root_stability == "" and len(off.eigenvalues) == 0
+    np.testing.assert_array_equal(off.concentrations, _SADDLE * 1.01)
+    with pytest.raises(ValueError, match="certify"):
+        sim.steady_state_batch(states=_SADDLE[None, :], **{**kw, "certify": "no"})
+
+
+def test_every_root_keeps_its_verdict_when_each_is_certified_once():
+    """fceri_ji_red's continuum of roots, each certified once (issue #1191).
+    Solved again from its representative, one of its 8 roots did not converge
+    a second time and came back "undetermined" with no spectrum, where
+    certifying every start called all 8 stable."""
+    model = bngsim.Model.from_net(_net("fceri_ji_red.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(seed=0)
+    assert len(roots) > 1
+    assert set(roots.stability) == {"stable"}, roots.stability
+    assert all(len(e) for e in roots.eigenvalues)

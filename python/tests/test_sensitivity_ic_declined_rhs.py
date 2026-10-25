@@ -2,13 +2,15 @@
 declined is refused with the reason (issue #1124, item 7).
 
 ``C := 1 + P``, with P a species and S a concentration in C: S's dilution
-term reads P's rate, ``rate_of__P``, which codegen does not differentiate, so
-the analytic sensitivity RHS is declined and a parameter column runs on
-CVODES' difference quotient. A column of an initial value has no parameter for
-that quotient to perturb, and the run failed with "sensitivity_ic requires
-codegen sensitivity RHS, but no codegen .so is loaded. Build the model with
-codegen enabled": codegen was enabled, and had built the model. It is now
-refused at construction, naming what was declined.
+term reads P's rate, ``rate_of__P``. P leaves for X in a compartment of
+another size, a reaction that divides by each species' volume, so P's rate is
+not one the derivations write out from its rate laws (they do for P's own
+laws, issue #1124 item 7's fix), the analytic sensitivity RHS is declined, and
+a parameter column runs on CVODES' difference quotient. A column of an initial
+value has no parameter for that quotient to perturb, and the run failed with
+"sensitivity_ic requires codegen sensitivity RHS, but no codegen .so is loaded.
+Build the model with codegen enabled": codegen was enabled, and had built the
+model. It is now refused at construction, naming what was declined.
 """
 
 from __future__ import annotations
@@ -18,9 +20,9 @@ import numpy as np
 import pytest
 
 _READS_A_RATE = """
-compartment C0 = 1; compartment C; C := 1 + P;
-species P in C0 = 1; species S in C = 5;
-J1: P -> ; 0.5*P*C0; J2: S -> ; 0.2*S*C;
+compartment C0 = 1; compartment C2 = 3; compartment C; C := 1 + P;
+species P in C0 = 1; species X in C2 = 0; species S in C = 5;
+J1: P -> X; 0.5*P*C0; J2: S -> ; 0.2*S*C;
 """
 
 # Control: the size reads a parameter, so no rate, and the RHS builds.

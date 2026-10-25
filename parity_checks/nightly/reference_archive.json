@@ -1,0 +1,144 @@
+{
+ "schema_version": "1.0",
+ "corpus": "nightly/reference_archive",
+ "generated": "2026-10-24",
+ "upstream_pin": {
+  "release": "reference-data-v1",
+  "recorded_by": "https://github.com/lanl/bngsim/actions/runs/40125305877",
+  "commit": "2b5a602fba5b2f981aa0b11cbc93ebe4e65279d3"
+ },
+ "records": [
+  {
+   "id": "rr_ode",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-rr_ode.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "f7237e2342cea22ae1246b93f368c8add10ac3524cc23b98506639f7ed93596e",
+   "vendored": null,
+   "license": {
+    "spdx": "CC0-1.0",
+    "notice": null
+   },
+   "reference_engine": "roadrunner",
+   "reference_versions": [
+    "2.9.2"
+   ],
+   "n_entries": 1318,
+   "n_excluded": 0,
+   "bytes": 106157281
+  },
+  {
+   "id": "bng_ode",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-bng_ode.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "cab5ebb44cee50d1da1d0f058047231b9ccea54d3d8988bdd4fdb8f1cd4975d4",
+   "vendored": null,
+   "license": {
+    "spdx": "CC-BY-4.0 AND MIT",
+    "notice": "NOTICE"
+   },
+   "reference_engine": "bng",
+   "reference_versions": [
+    "2.9.3"
+   ],
+   "n_entries": 592,
+   "n_excluded": 0,
+   "bytes": 241914059
+  },
+  {
+   "id": "bng_ssa",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-bng_ssa.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "4cb009151a00f91a2af79201b2c3bcb0f537f0fda6593d03656f1c8490122a69",
+   "vendored": null,
+   "license": {
+    "spdx": "CC-BY-4.0 AND MIT",
+    "notice": "NOTICE"
+   },
+   "reference_engine": "bng",
+   "reference_versions": [
+    "2.9.3"
+   ],
+   "n_entries": 110,
+   "n_excluded": 0,
+   "bytes": 2333354
+  },
+  {
+   "id": "bng_nf",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-bng_nf.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "1d487dc948a44f83aaff76304266143b697fb7d98736cb0545fa515f90750bd5",
+   "vendored": null,
+   "license": {
+    "spdx": "CC-BY-4.0 AND MIT",
+    "notice": "NOTICE"
+   },
+   "reference_engine": "bng",
+   "reference_versions": [
+    "2.9.3"
+   ],
+   "n_entries": 235,
+   "n_excluded": 0,
+   "bytes": 6940116
+  },
+  {
+   "id": "amici_sens",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-amici_sens.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "bc3ad624ae1f0528372eec22e234e7baf229460639195f60a05be55719921ec2",
+   "vendored": null,
+   "license": {
+    "spdx": "CC0-1.0",
+    "notice": null
+   },
+   "reference_engine": "amici",
+   "reference_versions": [
+    "1.0.1"
+   ],
+   "n_entries": 96,
+   "n_excluded": 0,
+   "bytes": 1057201801
+  },
+  {
+   "id": "rr_ssa",
+   "source": "reference-archive",
+   "origin": {
+    "kind": "url",
+    "url": "https://github.com/lanl/bngsim/releases/download/reference-data-v1/reference-rr_ssa.tar.gz",
+    "retrieved": "2026-10-24"
+   },
+   "sha256": "e561b5a49177483de4cefc06f5172ece9cfbc6976e163f36d43f886f27edc5ee",
+   "vendored": null,
+   "license": {
+    "spdx": "CC0-1.0",
+    "notice": null
+   },
+   "reference_engine": "roadrunner",
+   "reference_versions": [
+    "2.9.2"
+   ],
+   "n_entries": 223,
+   "n_excluded": 0,
+   "bytes": 2540081
+  }
+ ]
+}

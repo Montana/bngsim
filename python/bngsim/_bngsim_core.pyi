@@ -215,6 +215,10 @@ class NetworkModel:
         """
         Each event's trigger expression as the loader wrote it, in events() order (issue #49). The event-time sensitivity detector differentiates the trigger's threshold symbolically, so it needs the model's own spelling rather than the evaluator's preprocessed form.
         """
+    def events_as_written(self) -> list:
+        """
+        Each event as the run reads it, in events() order (issue #1244): {id, trigger (as written), assignments [(0-based species index, value text)], delay, delay_expr, priority, priority_expr, persistent, initial_value, use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, '' where none is compiled. A schedule that reads a species only events write has its stops placed from when those events set it.
+        """
     def events_with_runtime_event_time_sens(self) -> list[int]:
         """
         0-based indices of the events whose ∂t*/∂p the solver differentiates at each fire, by the implicit function theorem on the trigger's residual (issue #144). These are the state-dependent triggers — `v > 30` and friends — that reduce to a single relational comparison. The Python guard subtracts them from its own blocked set, so the core stays the one authority on which crossings are differentiable.
@@ -847,7 +851,7 @@ class RuleMonkeySimulator:
         """
     def set_reads_clock(self, enabled: bool) -> None:
         """
-        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start, and a span too short for the doubles near its times to integrate a clock-driven rate is refused
+        Whether the model reads the clock (default true): one-shot runs then run on the model's clock, else on time elapsed since t_start
         """
     def set_species_count(self, pattern: str, count: typing.SupportsInt | typing.SupportsIndex) -> None:
         """
@@ -1177,6 +1181,8 @@ class SsaSimulator:
         GH #616: record each reaction's cumulative firing count and integrated propensity at every output time (Result.reaction_firing_counts / reaction_propensity_integrals). Exact SSA only; run_psa ignores it. Off by default, and enabling it changes no trajectory.
         """
 class SteadyStateOptions:
+    certify_root: bool
+    certify_start: bool
     codegen_c_source: str
     codegen_so_path: str
     criterion: str
@@ -1258,6 +1264,9 @@ class SteadyStateResultCore:
         ...
     @property
     def concentrations(self) -> list[float]:
+        ...
+    @property
+    def continued_run_distance(self) -> float:
         ...
     @property
     def converged(self) -> bool:

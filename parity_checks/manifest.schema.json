@@ -42,7 +42,7 @@
           "enum": [
             "rulehub", "rulemonkey", "bngl_models", "bngl_library", "curated",
             "biomodels", "temp-biomodels", "dsmts", "sbml-test-suite",
-            "d2d", "petab"
+            "d2d", "petab", "reference-archive"
           ]
         },
         "origin": { "$ref": "#/$defs/origin" },

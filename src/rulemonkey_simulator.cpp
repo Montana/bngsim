@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
-#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -136,16 +135,17 @@ Result convert_rulemonkey_result(const rulemonkey::Result &rm_result,
     return result;
 }
 
-// RuleMonkey 3.11.0 puts the seed state at ts.t_start on the model's clock
+// RuleMonkey puts the seed state at ts.t_start on the model's clock
 // (richardposner/RuleMonkey#98), so a run on model time is handed through as
 // is: it starts from the initial state at t_start and never sees [0, t_start]
 // (issue #703), and a rate law that reads time() reads absolute model time, as
-// ode and ssa do (issue #1022). A model that reads no clock cannot tell model
-// time from time elapsed since t_start, and is run on the latter, shifted to
-// t_start -> 0 and labelled back: event times stay small, where on absolute time
-// a waiting time is rounded away once the total propensity times |t| nears
-// 1e15, and such a run is the one 3.10.1 gave. NFsim stays on elapsed time,
-// BNG2.pl's simulate_nf semantics.
+// ode and ssa do (issue #1022). Since 3.12.0 RuleMonkey places its events, and
+// its panels for a rate that reads the clock, on the time elapsed since each
+// call starts (richardposner/RuleMonkey#110), so a large t_start no longer
+// rounds its waiting times away (issue #1063). A model that reads no clock
+// cannot tell model time from time elapsed since t_start, and is run on the
+// latter, shifted to t_start -> 0 and labelled back, which is the run 3.10.1
+// gave. NFsim stays on elapsed time, BNG2.pl's simulate_nf semantics.
 rulemonkey::TimeSpec to_rulemonkey_times(const TimeSpec &times, bool model_time) {
     rulemonkey::TimeSpec rm_times;
     const double t0 = model_time ? 0.0 : times.t_start;
@@ -172,27 +172,6 @@ void require_finite_span(const char *where, double t_from, double t_to) {
         std::ostringstream os;
         os << std::setprecision(17) << where << ": t_start and t_end must be finite, got " << t_from
            << " and " << t_to;
-        throw std::runtime_error(os.str());
-    }
-}
-
-// RuleMonkey integrates a rate that reads the clock on panels of at most a
-// thousandth of a call's span, placed at t + k*h (engine.cpp, issue #86).
-// Where the doubles near t cannot place them to one part in a thousand, the
-// integral comes out wrong or never advances, with no error: a span of 2 at
-// t = 1e13, panels of one spacing each, fired nothing (issue #1022). Refuse such
-// a call.
-void require_resolvable_clock(double t_from, double t_to) {
-    const double h = (t_to - t_from) / 1000.0;
-    const double t = std::max(std::fabs(t_from), std::fabs(t_to));
-    const double spacing = std::nextafter(t, std::numeric_limits<double>::infinity()) - t;
-    if (h > 0.0 && spacing > h * 0x1p-10) {
-        std::ostringstream os;
-        os << std::setprecision(17)
-           << "RuleMonkey cannot integrate a rate that reads the clock from t = " << t_from
-           << " to " << t_to << ": the doubles near t = " << t << " are " << std::setprecision(3)
-           << spacing << " apart, too coarse for its integration panels of " << h
-           << ". Run a longer span, or one nearer t = 0 (issue #1022).";
         throw std::runtime_error(os.str());
     }
 }
@@ -267,8 +246,6 @@ Result RuleMonkeySimulator::run(const TimeSpec &times, uint64_t seed, double tim
         // with the requested time, so convert_rulemonkey_result needs no explicit
         // time labels and solver_stats().n_steps now reports for both paths.
         require_finite_span("RuleMonkeySimulator::run", times.t_start, times.t_end);
-        if (impl_->reads_clock)
-            require_resolvable_clock(times.t_start, times.t_end);
         auto rm_result = impl_->sim->run(to_rulemonkey_times(times, impl_->reads_clock), seed,
                                          make_cancel_callback(budget));
         // The requested instants themselves, as every other backend reports
@@ -299,8 +276,6 @@ void RuleMonkeySimulator::step_to(double time, double timeout_seconds) {
     WallClockBudget budget(timeout_seconds);
     const double now = impl_->sim->current_time();
     require_finite_span("RuleMonkeySimulator::step_to", now, time);
-    if (impl_->reads_clock)
-        require_resolvable_clock(now, time);
     try {
         impl_->sim->step_to(time, make_cancel_callback(budget));
     } catch (const rulemonkey::Cancelled &) {
@@ -325,8 +300,6 @@ Result RuleMonkeySimulator::simulate(double t_start, double t_end, int n_points,
     auto to_session = [&](double t) { return on_clock ? t : internal_start + (t - origin); };
     const double end = sample_times.empty() ? t_end : sample_times.back();
     require_finite_span("RuleMonkeySimulator::simulate", origin, end);
-    if (impl_->reads_clock)
-        require_resolvable_clock(to_session(origin), to_session(end));
 
     try {
         if (!sample_times.empty()) {

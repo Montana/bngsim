@@ -161,15 +161,17 @@ newly loaded model gets the analytic code.
 Only conditions in rate laws count. One in an expression that is reported and
 that no reaction reads has no bearing on the code.
 
-A `run_batch` row is the exception. Every row runs on the code built for the
-model as the batch found it. A row whose own writes pin or re-attach a derived
-parameter is refused with `SensitivityUnsupportedError` where a requested
-column is of a parameter that one is derived from; its own column, and columns
-that do not reach the model through it, are the same code either way and run. A
-row at whose values a condition's switch time no longer resolves is refused
-likewise. Make the write on the model with `set_param` before the batch, so
-that every row agrees with it, or run that row with `set_params` and `run()`.
-A batch after such a write on the model is asked what a `run()` after it is.
+A `run_batch` row runs on the code built for the model as the batch found it,
+unless its own writes pin or re-attach a derived parameter that a requested
+column is derived through. Such a row runs on code built for that attachment
+before any row starts, shared by the rows that pin or attach the same
+parameters, each at its own values; its own column, and columns that do not
+reach the model through it, are the same code either way. A row at whose values
+a condition's switch time no longer resolves is refused with
+`SensitivityUnsupportedError`. Make the write on the model with `set_param`
+before the batch, so that every row agrees with it, or run that row with
+`set_params` and `run()`. A batch after such a write on the model is asked what
+a `run()` after it is.
 
 ## Parameters that set *when*, not *how fast*
 
@@ -512,6 +514,17 @@ step to cross (issue #952): `if(A > thr, kb, 0)` with `A` rising at 1e-10 a unit
 of time. The step that moves `A` by one ulp fails its error test on the jump,
 so no crossing is located and there is no crossing time for the sensitivities
 to move with. A run without sensitivities is carried across.
+So is a run that starts on an equality's surface and stays on it (issue #1228):
+`if(Bobs == 0, kb, 0)` with B held at 0 until A falls to q holds the branch
+for a stretch. An equality is not rooted, since one the state crosses holds
+for an instant, and either side of its surface reads false, so leaving it is
+a switch nothing locates. Write the switch as the crossing that ends the stretch,
+`if(Aobs > q, kb, 0)` there. `Bobs <= 0` names the same surface and is refused
+at its tangency. The start is read at the run's start time. A state that an
+event puts on the surface mid-run is not yet seen. A stretch is refused all
+the same where nothing in the run ends it, where only an event ends it (the
+event's own jump would have been right), or where the rest of a conjunction
+never holds (issue #1279).
 A conjunction or a negation is split into its comparisons first. What the
 analytic path declines is a crossing nothing can locate: a comparison outside any
 `if()`, such as `k*(X > 1)`, and one whose sides

@@ -10,7 +10,8 @@ corpora:
     n_steps from ``suite_ssa.json``); and
   * ``biomodels`` -- the SSA-compatible BioModels subset listed in
     ``benchmarks/biomodels_ssa/ssa_candidates.json`` (built by
-    ``build_ssa_candidates.py``), SBML resolved from ``$BIOMODELS_SBML_DIR``.
+    ``build_ssa_candidates.py``), SBML resolved from ``$BIOMODELS_SBML_DIR``, else the rr_parity
+    materialization (``BIOMODELS_SBML_DIR`` below says the order).
 
 For each model we run ``--n`` replicates per engine at a shared seed
 schedule and check that every (t>0, species) cell's mean z-score
@@ -81,8 +82,16 @@ and whether the two ODEs agree, then label:
     or an unexplained residual. THIS is the only status that means "look at
     bngsim".
 
+NaN attribution (issue #1211). bngsim refuses a propensity that is NaN or
+infinite (issue #809). Where RoadRunner's gillespie, on the same seeds, reaches
+a non-finite rate of the same reaction, or declines the model for a feature it
+does not simulate (a rate rule), the rate law is undefined at a state the SSA
+reaches and neither engine has a trajectory: ``nonfinite_rate``, a BAD_TEST.
+Any other such refusal stays an ``error``.
+
 Only ``fail`` / ``diff_ode_level`` / ``error`` fail the exit code; the
-explained-not-bngsim statuses (``diff_not_bngsim`` / ``rr_known``) are green.
+explained-not-bngsim statuses (``diff_not_bngsim`` / ``rr_known``) and
+``nonfinite_rate`` are green.
 ``--self-z-tol`` tunes the per-engine SSA-vs-own-ODE z tolerance (default 7.30,
 the #30 discriminator). The attribution runs each engine's ODE only for the
 handful of fails, so its cost is negligible.
@@ -133,12 +142,50 @@ SUITE_SSA = Path(
     os.environ.get("SUITE_SSA_JSON", BNGSIM_DIR / "benchmarks" / "_dev" / "suite_ssa.json")
 )
 BIOMODELS_MANIFEST = Path(os.environ.get("SSA_CANDIDATES_JSON", HERE / "ssa_candidates.json"))
-BIOMODELS_SBML_DIR = Path(
-    os.environ.get(
-        "BIOMODELS_SBML_DIR",
-        os.path.expanduser("~/Code/ssys/biomodels_batch/data/sbml_downloads"),
-    )
+# Where a BioModels candidate's SBML is read from (issue #806). ONE source for
+# the whole run, chosen once at import:
+#   1. $BIOMODELS_SBML_DIR/<name>.xml, when the variable is set;
+#   2. else the flat directory this screen was first run from, when it exists;
+#   3. else the rr_parity materialization (models/<id>/..., the path
+#      ode_jobs.json gives), which the nightly restores from the corpus job's
+#      cache. 269 of the 306 candidates are there; the other 37 have no pinned
+#      provenance.
+# A candidate missing from the chosen source is reported absent (--present-only
+# drops it) and is never looked up in another source, so one run never mixes
+# SBML of two provenances.
+_BIOMODELS_SBML_ENV = os.environ.get("BIOMODELS_SBML_DIR")
+LEGACY_BIOMODELS_SBML_DIR = Path(
+    os.path.expanduser("~/Code/ssys/biomodels_batch/data/sbml_downloads")
 )
+BIOMODELS_SBML_DIR = (
+    Path(_BIOMODELS_SBML_ENV)
+    if _BIOMODELS_SBML_ENV
+    else LEGACY_BIOMODELS_SBML_DIR
+    if LEGACY_BIOMODELS_SBML_DIR.is_dir()
+    else None
+)
+RR_ODE_JOBS = HERE / "ode_jobs.json"
+
+
+def _materialized_sbml() -> dict[str, Path]:
+    """model_id -> the SBML path ode_jobs.json gives under this directory."""
+    import json
+
+    raw = json.loads(RR_ODE_JOBS.read_text())
+    jobs = raw if isinstance(raw, list) else raw.get("jobs", [])
+    return {j["model_id"]: HERE / j["model"] for j in jobs}
+
+
+def biomodels_sbml_path(name: str, materialized: dict[str, Path] | None = None) -> Path:
+    """Where candidate ``name``'s SBML is read from: the run's one source, see
+    BIOMODELS_SBML_DIR. ``materialized`` is consulted only when no directory was
+    chosen for the run."""
+    if BIOMODELS_SBML_DIR is not None:
+        return BIOMODELS_SBML_DIR / f"{name}.xml"
+    found = (materialized if materialized is not None else _materialized_sbml()).get(name)
+    return found if found is not None else HERE / "models" / name / f"{name}_url.xml"
+
+
 # Fresh-run output lands in the gitignored runs/ dir; the committed baseline the
 # regression diffs against is authored separately (GH #108 follow-up steps).
 DEFAULT_OUT = HERE / "runs" / "ssa_screen.json"
@@ -938,11 +985,14 @@ def _time_event_verdict(
             )
         except bngsim.SimulationTimeout:
             # bngsim itself grew intractable while hunting for signal — stop.
+            # Nothing was compared, so this is not a validation: bngsim is
+            # neither confirmed nor faulted (``rr_time_event`` reads as validated).
             return {
-                "status": "rr_time_event",
+                "status": "rr_time_event_unverified",
                 "n_compared": 0,
                 "extended_horizon": round(h, 6),
                 "bn_tracks_own_ode": None,
+                "revalidation": "bngsim timed out while growing the horizon for signal",
                 "timing": {"bngsim": last_timing} if last_timing else {},
             }
         last_timing = btiming
@@ -992,6 +1042,14 @@ def _time_event_verdict(
         h *= 10.0
 
 
+def _revalidate_worker(spec: dict, q) -> None:
+    """One time-event re-validation in a child process (issue #806)."""
+    try:
+        q.put({"key": spec["key"], **_time_event_verdict(**spec["call"])})
+    except Exception as e:  # noqa: BLE001 - the worker's classification stands
+        q.put({"key": spec["key"], "error": f"{type(e).__name__}: {e}"[:300]})
+
+
 def _revalidate_time_events(cases: list, specs: list, args) -> None:
     """SERIAL bngsim-vs-ODE self-validation for the time-event models the parallel
     workers tagged ``rr_time_event`` (RR can't anchor them). Run here, single-file,
@@ -999,9 +1057,13 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     propensity-codegen compile complete (under parallel contention they overrun a
     per-rep cap and falsely report no signal). Mutates each case in place: fills
     ``bn_tracks_own_ode`` / ``n_compared`` / ``extended_horizon`` and sets the status
-    to ``rr_time_event`` (bngsim validated against its own ODE) or
-    ``rr_time_event_unverified`` (mean-vs-ODE gap from nonlinearity/heavy tails, or
-    no signal — explicitly NOT a bngsim defect). GH #190."""
+    to ``rr_time_event`` (bngsim validated against its own ODE),
+    ``rr_time_event_unverified`` (mean-vs-ODE gap from nonlinearity/heavy tails, no
+    signal, or a re-validation that did not finish under the cap — explicitly NOT a
+    bngsim defect; ``revalidation`` says why when it did not finish) or ``error``
+    (the child died or bngsim raised on the model: a bngsim defect, as the worker
+    reports one). A row is never left reading as validated when nothing was
+    compared. GH #190, #806."""
     spec_by_name = {s["name"]: s for s in specs}
     todo = [
         c
@@ -1010,32 +1072,83 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
     ]
     if not todo:
         return
+    cap = float(getattr(args, "revalidate_timeout", 0) or 0)
     print(
         f"  re-validating {len(todo)} time-event model(s) bngsim-vs-own-ODE "
-        "(serial; RoadRunner cannot anchor time-triggered events)…"
+        "(serial; RoadRunner cannot anchor time-triggered events"
+        + (f"; {cap:g}s cap each" if cap else "")
+        + ")…"
     )
+    # One at a time, as before, and each in a child under a wall cap (issue #806):
+    # the tail used to have none, so one model whose ensemble kept growing could
+    # hold the run past a job's time limit (30 s per replicate x replicates x up
+    # to EXTENDED_MAX_MULTIPLE horizons). On overrun the row becomes
+    # ``rr_time_event_unverified`` and says the re-validation timed out.
+    rspecs = []
     for c in todo:
         spec = spec_by_name.get(c["name"])
         if not spec:
             continue
-        try:
-            tev = _time_event_verdict(
-                spec["sbml_path"],
-                float(spec["t_end"]),
-                int(spec["n_steps"]),
-                args.n,
-                args.seed_base,
-                args.min_mean_count,
-                args.self_z_tol,
-                # Serial (no parallel contention, no per-model wall): give the
-                # extended-horizon ensemble + cold codegen compile ample headroom so
-                # residual post-screen system load can't trip a false "no signal".
-                rep_timeout=30.0,
-            )
-        except Exception:
+        rspecs.append(
+            {
+                "key": c["name"],
+                "call": {
+                    "xml": spec["sbml_path"],
+                    "t_end": float(spec["t_end"]),
+                    "n_steps": int(spec["n_steps"]),
+                    "n": args.n,
+                    "seed_base": args.seed_base,
+                    "min_mean_count": args.min_mean_count,
+                    "self_z_tol": args.self_z_tol,
+                    # No parallel contention here: give the extended-horizon
+                    # ensemble + cold codegen compile ample headroom so residual
+                    # post-screen load can't trip a false "no signal".
+                    "rep_timeout": 30.0,
+                },
+            }
+        )
+    by_name = {c["name"]: c for c in todo}
+    results = rc.schedule(
+        rspecs,
+        _revalidate_worker,
+        workers=1,
+        timeout_of=lambda _s: cap if cap else 1e9,
+    )
+    for rs, tev in zip(rspecs, results, strict=True):
+        c = by_name[rs["key"]]
+        st = tev.get("status")
+        # A re-validation that gave no verdict validated nothing, so the row must
+        # not keep the worker's ``rr_time_event`` (it renders as "tracks its own
+        # ODE ... (validated)", green). A child that died is a bngsim crash on the
+        # model: ``error`` (EXCEPTION) naming the exit code, as the worker reports
+        # a bngsim raise; so is an exception the child reported, under the
+        # worker's own ``bngsim:`` prefix so it classifies the same way. A cap
+        # overrun leaves bngsim neither confirmed nor faulted:
+        # ``rr_time_event_unverified``, with the reason on the row.
+        if st == "dead":
+            c["status"] = "error"
+            c["error"] = f"bngsim: the time-event re-validation died (exit {tev.get('exitcode')})"
+            c["revalidation"] = "dead"
+            continue
+        if st == "timeout":
+            c["status"] = "rr_time_event_unverified"
+            c["revalidation"] = "timeout"
+            continue
+        if "error" in tev:
+            c["status"] = "error"
+            c["error"] = f"bngsim: {tev['error']}"[:300]
+            c["revalidation"] = "error"
+            continue
+        if st not in ("rr_time_event", "rr_time_event_unverified"):
             continue  # keep the worker's rr_time_event / no-signal classification
-        c["status"] = tev["status"]
-        for k in ("n_compared", "bn_tracks_own_ode", "extended_horizon", "bngsim_ode_worst"):
+        c["status"] = st
+        for k in (
+            "n_compared",
+            "bn_tracks_own_ode",
+            "extended_horizon",
+            "bngsim_ode_worst",
+            "revalidation",
+        ):
             if k in tev:
                 c[k] = tev[k]
 
@@ -1045,14 +1158,18 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
 # A live run can record, per model, every RoadRunner result the screen used: the
 # gillespie ensemble (or the error it raised) at each horizon it ran — the full
 # horizon, and the rungs of the partial- or extended-horizon ladders it walked —
-# and, when a fail was attributed, RoadRunner's ODE on the screen's grid. A later
+# and, when a fail was attributed, RoadRunner's ODE on the screen's grid, and,
+# when bngsim refused a NaN or infinite propensity, whether RoadRunner's gillespie
+# reaches a non-finite rate on the same seeds (issue #1211). A later
 # run replays from that record with no RoadRunner. An entry whose inputs no longer
 # match the model (the SBML's sha256, horizon, output steps, replicate count, seed
 # base) is stale (``archive_stale``). A replay that needs a RoadRunner result the
 # recorded run never produced — bngsim now walks a ladder rung the record did not
 # reach — is ``archive_unreplayable``. Neither is compared: both are
 # REFERENCE_FAILED rows, and re-recording clears them.
-ARCHIVE_FORMAT = 1
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
 
 
 class ArchiveMiss(Exception):
@@ -1060,7 +1177,9 @@ class ArchiveMiss(Exception):
 
 
 def _archive_file(directory, name: str) -> Path:
-    return Path(directory) / (re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".npz")
+    # The readable part is sanitized, so the hash keeps names such as a/b and a_b apart.
+    digest = hashlib.sha256(name.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', name)}-{digest}.npz"
 
 
 def archive_identity(spec: dict, n: int, seed_base: int) -> dict:
@@ -1082,7 +1201,8 @@ def _json_bytes(obj) -> np.ndarray:
 class Reference:
     """RoadRunner's side of one model: live, live and recorded, or replayed.
 
-    ``ssa`` and ``ode`` have the signatures of :func:`_rr_common.rr_ssa` and
+    ``ssa``, ``nonfinite_rate`` and ``ode`` have the signatures of
+    :func:`_rr_common.rr_ssa`, :func:`_rr_common.rr_ssa_nonfinite_rate` and
     :func:`_rr_ode`. Recording rewrites the model's entry after every RoadRunner
     call, so a worker killed mid-ladder still leaves what it ran. Replaying
     raises :class:`ArchiveMiss` for a call the entry does not hold."""
@@ -1093,6 +1213,7 @@ class Reference:
         self.runs: dict[str, dict] = {}  # repr(horizon) -> {timing, elapsed_sec | error}
         self.ensembles: dict[str, tuple] = {}  # repr(horizon) -> (times, arr, names)
         self.rr_ode = None
+        self.nonfinite = None  # {"result": ...} | {"error", "error_type"}
         self.stale = ""
         # Which RoadRunner made the record: kept beside the identity, not in it.
         self.reference_version = None
@@ -1145,6 +1266,28 @@ class Reference:
     def elapsed_sec(self, t_end) -> float | None:
         return self.runs.get(repr(float(t_end)), {}).get("elapsed_sec")
 
+    def nonfinite_rate(self, xml, t_start, t_end, n_points, n, seed_base) -> dict:
+        if self.replay:
+            if self.nonfinite is None:
+                raise ArchiveMiss(
+                    "the replay needs RoadRunner's rates where bngsim refused a NaN or "
+                    "infinite propensity, and the archive holds none for this model"
+                )
+            if "error" in self.nonfinite:
+                raise type(self.nonfinite["error_type"], (RuntimeError,), {})(
+                    self.nonfinite["error"]
+                )
+            return self.nonfinite["result"]
+        try:
+            result = rc.rr_ssa_nonfinite_rate(xml, t_start, t_end, n_points, n, seed_base)
+        except Exception as exc:
+            self.nonfinite = {"error": str(exc), "error_type": type(exc).__name__}
+            self._save()
+            raise
+        self.nonfinite = {"result": result}
+        self._save()
+        return result
+
     def ode(self, xml, t_end, n_steps):
         if self.replay:
             if self.rr_ode is None:
@@ -1169,6 +1312,8 @@ class Reference:
             "reference_version": self.reference_version,
             "runs": {},
         }
+        if self.nonfinite is not None:
+            meta["nonfinite_rate"] = self.nonfinite
         arrays = {}
         for i, (key, run) in enumerate(self.runs.items()):
             meta["runs"][key] = {**run, "index": i}
@@ -1198,6 +1343,7 @@ class Reference:
                     self.stale = f"the model's {', '.join(changed)} changed"
                     return
                 self.reference_version = meta.get("reference_version")
+                self.nonfinite = meta.get("nonfinite_rate")
                 for key, run in meta["runs"].items():
                     i = run.pop("index")
                     self.runs[key] = run
@@ -1216,7 +1362,7 @@ class Reference:
             # An entry that cannot be read is no reference either. Refused like a
             # stale one, rather than killing the worker, whose row would then read
             # as a bngsim crash.
-            self.runs, self.ensembles, self.rr_ode = {}, {}, None
+            self.runs, self.ensembles, self.rr_ode, self.nonfinite = {}, {}, None, None
             self.stale = f"the entry could not be read ({type(exc).__name__}: {exc})"[:300]
 
 
@@ -1228,6 +1374,73 @@ def _not_from_archive(entry: dict, ref: Reference, miss: ArchiveMiss) -> dict:
     entry["status"] = status
     entry["error"] = f"roadrunner (archive): {status}: {miss}"
     return entry
+
+
+# bngsim's refusal of a NaN or infinite propensity (issue #809), from
+# throw_nonfinite_propensity in src/ssa_simulator.cpp.
+NONFINITE_PROPENSITY = "A rate law that evaluates to NaN or infinity has no stochastic meaning"
+# The reaction that refusal names, as reaction_label writes it there: "R<n> (A + B
+# -> C)", species ids joined by " + " (a stoichiometry of 2 as the id twice), and
+# "0" for no species. The total propensity's refusal names no reaction.
+_REFUSED_REACTION = re.compile(r"the propensity of reaction R\d+ \((.*?) -> (.*?)\) is ")
+# RoadRunner's gillespie declining a model for a feature it does not simulate.
+GILLESPIE_REFUSAL = "The gillespie integrator is unable to simulate a model with"
+
+
+def _refused_net(message: str) -> dict[str, float] | None:
+    """The net change of each species in the reaction bngsim's refusal names, or
+    None when it names none (the total propensity) or names a species it could not."""
+    m = _REFUSED_REACTION.search(message)
+    if m is None:
+        return None
+    net: dict[str, float] = {}
+    for side, sign in ((m.group(1), -1.0), (m.group(2), 1.0)):
+        if side == "0":
+            continue
+        for sid in side.split(" + "):
+            if sid == "?":
+                return None
+            net[sid] = net.get(sid, 0.0) + sign
+    return {sid: v for sid, v in net.items() if v != 0.0}
+
+
+def _judge_nonfinite(
+    entry: dict, ref: Reference, xml: str, t_end: float, n_steps: int, message: str
+) -> None:
+    """Whose NaN or infinite propensity bngsim refused (issue #1211).
+
+    RoadRunner's gillespie runs on the same seeds. Where its own rate of the same
+    reaction (the same net change of each floating species) turns non-finite too,
+    the rate law is undefined at a state the SSA reaches, which is the model's, not
+    bngsim's: the row is ``nonfinite_rate`` (BAD_TEST), since RoadRunner, which
+    raises nothing there and holds the state to ``t_end``, has no trajectory
+    either. Where RoadRunner's gillespie declines the model for a feature it does
+    not simulate (a rate rule), neither engine runs it, which is ``nonfinite_rate``
+    too. Everything else stays a red ``error``: every rate finite, a non-finite rate
+    of another reaction, any other RoadRunner error, a refusal that names no
+    reaction, and a replay whose record holds no such run, so a bngsim defect is
+    never hidden. Mutates ``entry``.
+    """
+    want = _refused_net(message)
+    if want is None:
+        return
+    try:
+        found = ref.nonfinite_rate(xml, 0.0, t_end, n_steps + 1, ref.n, ref.seed_base)
+    except ArchiveMiss:
+        return
+    except Exception as exc:
+        entry["nonfinite_rate"] = {"roadrunner_error": f"{type(exc).__name__}: {exc}"[:300]}
+        if GILLESPIE_REFUSAL in str(exc):
+            entry["status"] = "nonfinite_rate"
+        return
+    entry["nonfinite_rate"] = found
+    boundary = set(found["boundary"])
+    want = {sid: v for sid, v in want.items() if sid not in boundary}
+    for hit in found["nonfinite"]:
+        if hit["net"] == want:
+            entry["nonfinite_rate"] = {**found, "match": hit}
+            entry["status"] = "nonfinite_rate"
+            return
 
 
 def _worker(
@@ -1326,7 +1539,7 @@ def _worker(
             incompatible = True  # fall through to the normal UNSUPPORTED path
         except Exception as exc:
             entry["status"] = "error"
-            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
             q.put(entry)
             return
         if not incompatible:
@@ -1363,7 +1576,13 @@ def _worker(
         full = False
     except Exception as exc:
         entry["status"] = "error"
-        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
+        if NONFINITE_PROPENSITY in str(exc):
+            # The red row first: RoadRunner's run can outlast the per-model cap, and
+            # the parent recovers a killed worker's last row rather than marking it
+            # too_slow, which this suite counts as expected.
+            q.put(dict(entry))
+            _judge_nonfinite(entry, ref, xml, t_end, n_steps, str(exc))
         q.put(entry)
         return
 
@@ -1587,9 +1806,10 @@ def _build_corpus(args) -> list[dict]:
         import json
 
         manifest = json.loads(BIOMODELS_MANIFEST.read_text())
+        materialized = _materialized_sbml() if BIOMODELS_SBML_DIR is None else {}
         for m in manifest["models"]:
             name = m["name"]
-            xml = BIOMODELS_SBML_DIR / f"{name}.xml"
+            xml = biomodels_sbml_path(name, materialized)
             specs.append(
                 {
                     "name": name,
@@ -1608,6 +1828,13 @@ def _build_corpus(args) -> list[dict]:
     if args.models:
         wanted = {x.strip() for x in args.models.split(",") if x.strip()}
         specs = [s for s in specs if s["name"] in wanted]
+    if getattr(args, "present_only", False):
+        # Issue #806: a candidate with no SBML on this machine is not a model
+        # the run lost, so it is left out rather than reported as a skip.
+        absent = [s["name"] for s in specs if not s["exists"]]
+        specs = [s for s in specs if s["exists"]]
+        if absent:
+            print(f"  (--present-only: {len(absent)} candidate(s) with no SBML here left out)")
     if args.max_models:
         # Keep all roundtrip, then cheapest biomodels up to the cap.
         rt = [s for s in specs if s["source"] == "roundtrip"]
@@ -1770,6 +1997,7 @@ def _print_progress(finished: int, total: int, res: dict) -> None:
         "diff_ode_level": "DIFFo",
         "partial": "PART ",
         "attribution_incomplete": "ATTR?",
+        "nonfinite_rate": "NaN ",
     }.get(st, st)
     extra = ""
     if st == "partial":
@@ -1791,7 +2019,14 @@ def _print_progress(finished: int, total: int, res: dict) -> None:
             )
             if w:
                 extra += f" worst={w.get('species')}"
-    elif st in ("error", "too_slow", "skip", "archive_stale", "archive_unreplayable"):
+    elif st in (
+        "error",
+        "too_slow",
+        "skip",
+        "archive_stale",
+        "archive_unreplayable",
+        "nonfinite_rate",
+    ):
         extra = f" {res.get('error', '')[:70]}"
     print(f"  [{finished}/{total}] {tag} {res['name']} ({res['source']}){extra}", flush=True)
 
@@ -1826,6 +2061,18 @@ def main() -> int:
         "Default 7.30 (4.0 scaled by sqrt(N/30) at N=100).",
     )
     p.add_argument("--models", type=str, default="", help="Comma-separated name filter.")
+    p.add_argument(
+        "--present-only",
+        action="store_true",
+        help="Leave out candidates whose SBML is not on this machine instead of "
+        "reporting them as skips (the nightly, which holds 269 of the 306).",
+    )
+    p.add_argument(
+        "--revalidate-timeout",
+        type=float,
+        default=300.0,
+        help="Wall cap (s) on each time-event model's serial re-validation; 0 = none.",
+    )
     p.add_argument(
         "--out",
         type=Path,
@@ -1900,7 +2147,15 @@ def main() -> int:
     too_slow_models = sorted(c["name"] for c in cases if c["status"] == "too_slow")
     error_models = sorted(c["name"] for c in cases if c["status"] == "error")
     skip_models = sorted(c["name"] for c in cases if c["status"] == "skip")
-    not_compared = ("too_slow", "error", "skip", "archive_stale", "archive_unreplayable")
+    nonfinite_models = sorted(c["name"] for c in cases if c["status"] == "nonfinite_rate")
+    not_compared = (
+        "too_slow",
+        "error",
+        "skip",
+        "archive_stale",
+        "archive_unreplayable",
+        "nonfinite_rate",
+    )
     n_compared_models = sum(1 for c in cases if c["status"] not in not_compared)
     total_lowcount_skips = sum(int(c.get("n_skipped_lowcount", 0)) for c in cases)
     # DIFF attribution (GH #107 follow-up): each surviving cross-engine fail is
@@ -1953,6 +2208,12 @@ def main() -> int:
         print(f"    {', '.join(error_models)}")
     if skip_models:
         print(f"  skip (DROPPED, sbml missing): {len(skip_models)}")
+    if nonfinite_models:
+        print(
+            "  nonfinite_rate (DROPPED, a rate law is NaN or infinite where the SSA goes; "
+            f"neither engine has a trajectory): {len(nonfinite_models)}"
+        )
+        print(f"    {', '.join(nonfinite_models)}")
     if vacuous_lowcount:
         print(
             f"  pass-but-uncompared (every cell below the low-count floor): "
@@ -1985,7 +2246,11 @@ def main() -> int:
             "seed_base": args.seed_base,
             "mean_z_tol": args.mean_z_tol,
             "min_mean_count": args.min_mean_count,
-            "biomodels_sbml_dir": str(BIOMODELS_SBML_DIR),
+            "biomodels_sbml_dir": (
+                str(BIOMODELS_SBML_DIR)
+                if BIOMODELS_SBML_DIR is not None
+                else "rr_parity materialization (ode_jobs.json paths)"
+            ),
             "reference_source": (
                 f"archive:{args.reference_archive}"
                 if args.reference_archive
@@ -1999,6 +2264,7 @@ def main() -> int:
             "too_slow": too_slow_models,
             "error": error_models,
             "skip": skip_models,
+            "nonfinite_rate": nonfinite_models,
             "pass_but_uncompared_lowcount": vacuous_lowcount,
             "diff_not_bngsim": sorted(
                 c["name"] for c in cases if c["status"] == "diff_not_bngsim"
