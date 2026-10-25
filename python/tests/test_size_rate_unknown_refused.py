@@ -63,12 +63,14 @@ def _compartment(cid, size):
     return f'<compartment id="{cid}" size="{size}" constant="false"/>'
 
 
-def doc(rules, params="", comps=None, s3_decays=True):
+def doc(rules, params="", comps=None, s3_decays=True, rate_rules=()):
     """S3 in c (decaying at 0.1·S3 unless told not to), X in cv at 0.25·X·cv,
     and the rules given."""
     comps = comps or _compartment("cv", 2)
     rule_xml = "".join(
         f'<assignmentRule variable="{v}"><math {_M}>{m}</math></assignmentRule>' for v, m in rules
+    ) + "".join(
+        f'<rateRule variable="{v}"><math {_M}>{m}</math></rateRule>' for v, m in rate_rules
     )
     reactions = _decay("dX", "X", a("times", cn(0.25), ci("X"), ci("cv")))
     if s3_decays:
@@ -84,15 +86,33 @@ def doc(rules, params="", comps=None, s3_decays=True):
     )
 
 
-def _x(xml):
+def _x(xml, times=(0, 1, 2)):
     model = bngsim.Model.from_sbml_string(xml)
-    result = bngsim.Simulator(model, method="ode").run(sample_times=[0, 1, 2])
+    result = bngsim.Simulator(model, method="ode").run(sample_times=list(times))
     return np.asarray(result.species)[:, list(result.species_names).index("X")]
 
 
-HELD = 4 * np.exp(-np.array([0, 1, 2]) / 4)  # [X] where cv holds: X' = -0.25·X·cv / cv
-ROF_S3 = f"<apply>{_ROF}<ci>S3</ci></apply>"
+T = np.array([0, 1, 2])
+HELD = 4 * np.exp(-T / 4)  # [X] where cv holds: X' = -0.25·X·cv / cv
+S3_T = 2 * np.exp(-0.1 * T)  # S3 decaying from 2 at 0.1·S3
+
+
+def _amount_over(cv):
+    """[X] that keeps X's amount, 4·cv(0)·e^(-t/4), over the size cv(t)."""
+    return 4 * cv[0] * np.exp(-T / 4) / cv
+
+
+def rof(x):
+    return f"<apply>{_ROF}<ci>{x}</ci></apply>"
+
+
+ROF_S3 = rof("S3")
 CYCLE = _compartment("cv", 1) + _compartment("cw", 1)
+# P' = -0.1·P from 2, so rateOf(P) = -0.2·e^(-t/10), as rateOf(S3) is
+P_DECAYS = {
+    "params": '<parameter id="P" value="2" constant="false"/>',
+    "rate_rules": [("P", a("times", cn(-0.1), ci("P")))],
+}
 
 
 def _refused(xml, *names):
@@ -140,7 +160,7 @@ def test_a_cycle_of_constant_sizes_loads():
 def test_a_size_that_reads_a_species_is_still_diluted():
     """#1052's case, cv := 2 + 0.1*S3: its rate is known, and it is diluted."""
     x = _x(doc([("cv", a("plus", cn(2), a("times", cn(0.1), ci("S3"))))]))
-    assert not np.allclose(x, HELD, rtol=1e-3)
+    np.testing.assert_allclose(x, _amount_over(2 + 0.1 * S3_T), rtol=1e-5)
 
 
 def test_a_cycle_of_sizes_through_conditions_is_refused_by_name():
@@ -153,3 +173,84 @@ def test_a_cycle_of_sizes_through_conditions_is_refused_by_name():
         return f"<piecewise><piece>{cn(1)}{cond}</piece><otherwise>{cn(5)}</otherwise></piecewise>"
 
     _refused(doc([("cv", pw("cw")), ("cw", pw("cv"))], comps=CYCLE), "a cycle of rules")
+
+
+def test_a_size_that_reads_the_rate_of_a_rate_rule_variable_is_refused_by_name():
+    """rateOf of a rate-rule parameter was read as a constant too: cv := 2 +
+    rateOf(P), P' = -0.1*P, gave the held trajectory, 4, 3.1152, 2.4261, where
+    the amount over cv(t) gives 4, 3.0826, 2.3782."""
+    _refused(doc([("cv", a("plus", cn(2), rof("P")))], **P_DECAYS), "rateOf(P)")
+
+
+def test_the_reason_named_is_the_first_in_a_fixed_order_with_each_rule_on_the_way():
+    """Two unknown rates: the reason no longer moves with the hash seed. And a
+    rate read through two rules names both."""
+    params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in "qr")
+    rules = [("r", ROF_S3), ("q", ROF_S3), ("cv", a("plus", cn(2), ci("r"), ci("q")))]
+    _refused(doc(rules, params=params), "rate: through q, it reads rateOf(S3)")
+    params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in ("r1", "r2"))
+    rules = [("r2", ROF_S3), ("r1", ci("r2")), ("cv", a("plus", cn(2), ci("r1")))]
+    _refused(doc(rules, params=params), "rate: through r1 and r2, it reads rateOf(S3)")
+
+
+def _piecewise(cond):
+    return f"<piecewise><piece>{cn(1)}{cond}</piece><otherwise>{cn(2)}</otherwise></piecewise>"
+
+
+# rateOf(S3) and rateOf(P) are -0.2·e^(-t/10), below -0.15 until t = 10·ln(4/3)
+# = 2.877, where cv steps from 1 to 2 and [X] halves, the amount kept
+JUMP_T = np.array([0, 1, 2, 3, 4])
+JUMPED = np.where(10 * np.log(4 / 3) > JUMP_T, 4, 2) * np.exp(-JUMP_T / 4)
+
+
+@pytest.mark.parametrize(
+    "rules, extra",
+    [
+        ([("cv", _piecewise(a("lt", ROF_S3, cn(-0.15))))], {}),
+        (
+            [("r", ROF_S3), ("cv", _piecewise(a("lt", ci("r"), cn(-0.15))))],
+            {"params": '<parameter id="r" value="0" constant="false"/>'},
+        ),
+        ([("cv", _piecewise(a("lt", rof("P"), cn(-0.15))))], P_DECAYS),
+    ],
+    ids=["rateOf", "through-a-rule", "rate-rule-variable"],
+)
+def test_a_rate_read_only_where_it_picks_a_piece_moves_the_size_at_the_flip(rules, extra):
+    """A rate the size reads only in a condition moves it only where the
+    condition flips, which the jump event rescales (#1054); between flips the
+    size holds. Read as unknown, the first two were refused, though the jump
+    alone is right; the third ran with no jump at all, [X](3) = 1.8895."""
+    np.testing.assert_allclose(_x(doc(rules, **extra), JUMP_T), JUMPED, rtol=1e-5)
+
+
+def test_a_rate_read_in_a_piece_as_well_is_refused():
+    piece = f"<piecewise><piece>{a('plus', cn(1), ROF_S3)}{a('lt', ROF_S3, cn(-0.15))}</piece>"
+    _refused(doc([("cv", piece + f"<otherwise>{cn(2)}</otherwise></piecewise>")]), "rateOf(S3)")
+
+
+@pytest.mark.parametrize(
+    "op, value",
+    [
+        ("abs", lambda s: np.abs(s - 1)),
+        ("max", lambda s: np.maximum(s - 1, 0.5)),
+    ],
+)
+def test_a_size_over_abs_or_max_is_diluted(op, value):
+    """sympy's derivatives of abs and max did not print, and the size was left
+    undiluted with no word: [X](1) was 3.1152, the held trajectory."""
+    arg = (
+        a(op, a("minus", ci("S3"), cn(1)))
+        if op == "abs"
+        else a(op, a("minus", ci("S3"), cn(1)), cn(0.5))
+    )
+    x = _x(doc([("cv", a("plus", cn(2), a("times", cn(0.1), arg)))]))
+    np.testing.assert_allclose(x, _amount_over(2 + 0.1 * value(S3_T)), rtol=1e-5)
+
+
+def test_a_size_whose_rate_does_not_print_is_refused_by_name():
+    """floor's derivative is left unevaluated by sympy, so V̇ has no ExprTk
+    form; the size was left out of the dilution after the refusals, silently."""
+    _refused(
+        doc([("cv", a("plus", cn(2), a("times", cn(0.1), a("floor", ci("S3")))))]),
+        "cannot write the rate of its size",
+    )
