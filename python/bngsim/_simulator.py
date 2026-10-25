@@ -10611,9 +10611,9 @@ def _project_onto_laws(w, A, b, scale=None, max_iter=200):
     logw = np.log(w)
     lam = np.zeros(A.shape[0])
     y = w
-    # Each law's own: its total, and its members' scale in the model's state,
-    # not the start's, whose weights are drawn on the largest law's scale.
-    floor = 1e-15 * np.maximum(np.abs(b), scale[rows])
+    # Each law's own: its members' scale in the model's state, at least its
+    # total, not the start's, whose weights are drawn on the largest law's scale.
+    floor = 1e-15 * scale[rows]
     for _ in range(max_iter):
         g = A @ y - b
         if np.all(np.abs(g) <= 1e-12 * np.maximum(np.abs(b), np.abs(A) @ y) + floor):
