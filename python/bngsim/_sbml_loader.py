@@ -11874,6 +11874,38 @@ def _unsupported_ast_error(node, t):
     )
 
 
+def _is_truth(node, func_defs: dict, _seen: frozenset = frozenset()) -> bool:
+    """Whether a MathML node is a condition, whose ExprTk text is already 1 or
+    0: a comparison, a logical operator, ``true`` / ``false``, or a call to a
+    functionDefinition whose body is one (``xor(lt15(S), gt1(S))``)."""
+    if node.isBoolean():
+        return True
+    name = node.getName() if node.getType() == libsbml.AST_FUNCTION else None
+    if name not in func_defs or name in _seen:
+        return False
+    body = func_defs[name][1]
+    return body is not _RATEOF_FUNCDEF and _is_truth(body, func_defs, _seen | {name})
+
+
+def _xor_text(truths: list[str]) -> str:
+    """The xor of ExprTk truth values, written with ``and`` / ``or`` / ``not``.
+
+    It was a fold of ``!=``, which the engine evaluates alike, but which reads
+    as one comparison of two conditions to everything that reads a condition
+    for where it flips: a size that jumps on ``xor(S < 1.5, S > 1)`` failed to
+    load (the jump pass subtracted one condition from the other), and a rate
+    law that branches on one was refused forward sensitivities, as no single
+    comparison it could root on. The connectives are split into their
+    comparisons by both. Halved rather than folded, so n operands are written
+    O(n²) times, not 2ⁿ; SBML models write it over two or three.
+    """
+    if len(truths) == 1:
+        return truths[0]
+    a = _xor_text(truths[: len(truths) // 2])
+    b = _xor_text(truths[len(truths) // 2 :])
+    return f"(({a} and (not({b}))) or ((not({a})) and {b}))"
+
+
 def _ast_to_exprtk_recursive(node, func_defs, local_params):
     """Convert a libsbml MathML AST node to an ExprTk expression string,
     supporting inlined function definitions and local-parameter remapping.
@@ -11974,6 +12006,17 @@ def _ast_to_exprtk_recursive(node, func_defs, local_params):
         if nc < 2:
             # A 0/1-arg relational is vacuously true (matches _eval_ast_numeric).
             return "1"
+        if (
+            nc == 2
+            and op in ("==", "!=")
+            and all(_is_truth(node.getChild(i), func_defs) for i in (0, 1))
+        ):
+            # Two conditions compared are their xnor or xor, written as one,
+            # for the reason _xor_text gives.
+            a, b = _r(0), _r(1)
+            if op == "!=":
+                return _xor_text([a, b])
+            return f"(({a} and {b}) or ((not({a})) and (not({b}))))"
         if nc == 2:
             return f"({_r(0)}{op}{_r(1)})"
         # N-ary relational (MathML allows 3+ args, GH #229): chained-pairwise.
@@ -12000,16 +12043,18 @@ def _ast_to_exprtk_recursive(node, func_defs, local_params):
     if t == libsbml.AST_LOGICAL_NOT:
         return f"(not({_r(0)}))"
     if t == libsbml.AST_LOGICAL_XOR:
-        # n-ary xor = odd parity of the true operands. Boolean-normalise each
-        # operand (``x != 0``) then left-fold ``!=``; a 1-child xor is just the
-        # single operand's truth value. Mirrors the numeric folder.
+        # n-ary xor = odd parity of the true operands; a 1-child xor is just
+        # the single operand's truth value. Mirrors the numeric folder. A
+        # condition is its own truth value, and anything else is read as
+        # ``x != 0``.
         if nc == 0:
             return "0"
-        terms = [f"(({_r(i)})!=0)" for i in range(nc)]
-        result = terms[0]
-        for term in terms[1:]:
-            result = f"({result}!={term})"
-        return result
+        return _xor_text(
+            [
+                _r(i) if _is_truth(node.getChild(i), func_defs) else f"(({_r(i)})!=0)"
+                for i in range(nc)
+            ]
+        )
 
     # Math functions — direct ExprTk equivalents
     _funcs = {

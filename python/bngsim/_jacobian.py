@@ -553,6 +553,49 @@ def _piecewise_of_if(sp):
     return piecewise
 
 
+_truth_comparisons_cache: dict = {}
+
+
+def _truth_comparisons(sp) -> dict:
+    """``{"Eq": ..., "Ne": ...}`` for the parse: sympy's own, except between two
+    truth values, which are written with the connectives instead.
+
+    ``a != b`` over two conditions is their xor, and ``a == b`` their xnor.
+    sympy keeps such a pair as an ``Unequality`` / ``Equality`` whose sides are
+    themselves relations, and what reads a relation as the sign of ``lhs -
+    rhs`` takes it for one comparison: a size that jumps on one failed to load
+    (``StrictLessThan - StrictGreaterThan``). The SBML loader writes ``xor``,
+    and ``eq`` / ``neq`` of two conditions, with the connectives itself
+    (``_xor_text``); this is for such a pair from anywhere else, an ExprTk
+    ``(A > 1) != (B > 1)`` or an operand the loader could not tell was a
+    condition. An n-ary nest doubles the text of its first operands at each
+    level.
+
+    A sympy ``Symbol`` is a ``Boolean`` too, so a truth value is told by what
+    it is: a comparison, a connective, or ``true`` / ``false``. Built once, for
+    the reason :func:`engine_sympy_bindings` gives."""
+    bound = _truth_comparisons_cache.get("bound")
+    if bound is None:
+        from sympy.core.relational import Relational
+        from sympy.logic.boolalg import BooleanAtom, BooleanFunction
+
+        truth = (Relational, BooleanAtom, BooleanFunction)
+
+        def eq(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, b), sp.And(sp.Not(a), sp.Not(b)))
+            return sp.Eq(a, b, **options)
+
+        def ne(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, sp.Not(b)), sp.And(sp.Not(a), b))
+            return sp.Ne(a, b, **options)
+
+        bound = {"Eq": eq, "Ne": ne}
+        _truth_comparisons_cache["bound"] = bound
+    return bound
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -587,8 +630,7 @@ def _build_local_dict(preprocessed: str, sp):
         # ``Eq`` / ``Ne`` are the call form ``_rewrite_logicals`` produces for
         # ``==`` / ``!=`` (GH #335). Bound here — like the connectives — so the
         # round trip does not lean on ``parse_expr``'s implicit sympy global dict.
-        "Eq": sp.Eq,
-        "Ne": sp.Ne,
+        **_truth_comparisons(sp),
     }
     alias_of: dict[str, str] = {}
 
