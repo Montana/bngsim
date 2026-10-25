@@ -65,8 +65,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -280,6 +282,14 @@ def make_specs(
     return specs, n_tol_ov
 
 
+def _with_archive(specs: list[dict], args) -> list[dict]:
+    """Issue #805: point every spec at the archive to read or to record."""
+    for s in specs:
+        s["reference_archive"] = args.reference_archive or None
+        s["write_reference_archive"] = args.write_reference_archive or None
+    return specs
+
+
 def _classify_failure(
     bn_exc: str,
     am_exc: str,
@@ -326,10 +336,103 @@ def _join_cls(first: str, second: str) -> str:
 _is_declared_refusal = asens.is_declared_refusal
 
 
+# ─── The reference archive (issue #805) ─────────────────────────────────────
+#
+# A live run can record, per (model, method) job, AMICI's side: its free
+# parameter ids (which define the shared parameter list, so the alignment
+# replays without AMICI), the shared list it ran with, and its state and
+# sensitivity tensors, or the build or run failure. A later run replays from
+# that record with no AMICI. An entry whose inputs no longer match the job (the
+# model file's sha256, grid, tolerances, method, step budget, parameter caps),
+# or whose shared list differs from the one a replay negotiates, is stale and
+# never compared: the row is REFERENCE_FAILED, refusal ``archive_stale``. One
+# that cannot be read at all is ``archive_unreadable``, the same row, rather
+# than a worker death blamed on bngsim. Both are refused before bngsim's
+# sensitivity run. Beside the identity, an entry records AMICI's version
+# (``reference_version``) and the harness's git revision; a replayed row
+# reports the archived version as the reference's.
+# 2: the file name carries a hash of the key, so two keys that sanitize alike
+# no longer share a file.
+ARCHIVE_FORMAT = 2
+
+
+def _archive_file(directory, key: str) -> Path:
+    # The readable part is sanitized, so the hash keeps keys such as a/b and a_b apart.
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return Path(directory) / f"{re.sub(r'[^A-Za-z0-9._-]', '_', key)}-{digest}.npz"
+
+
+def archive_identity(spec: dict) -> dict:
+    p = spec["params"]
+    return {
+        "format": ARCHIVE_FORMAT,
+        "model_id": spec["model_id"],
+        "method": spec["method"],
+        "model_sha256": hashlib.sha256(Path(spec["xml"]).read_bytes()).hexdigest(),
+        "t_start": float(p["t_start"]),
+        "t_end": float(p["t_end"]),
+        "n_points": int(p["n_points"]),
+        "rtol": float(p["rtol"]),
+        "atol": float(p["atol"]),
+        "max_steps": int(spec.get("max_steps", asens.DEFAULT_SENS_MAX_STEPS)),
+        "param_cap": int(spec["param_cap"]),
+        "param_budget": int(spec["param_budget"]),
+    }
+
+
+def archive_save(directory, spec: dict, record: dict, am=None) -> Path:
+    """Write one job's archived AMICI side (atomically). ``am`` is
+    ``(time, x, sx, state_ids)`` where AMICI's sensitivity run returned one."""
+    out = _archive_file(directory, spec["key"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {"meta": np.frombuffer(json.dumps(record).encode(), dtype=np.uint8)}
+    if am is not None:
+        arrays["time"] = np.asarray(am[0], dtype=float)
+        arrays["x"] = np.asarray(am[1], dtype=float)
+        arrays["sx"] = np.asarray(am[2], dtype=float)
+        arrays["state_ids"] = np.frombuffer(json.dumps(list(am[3])).encode(), dtype=np.uint8)
+    tmp = out.with_name(out.name + ".tmp.npz")
+    np.savez_compressed(tmp, **arrays)
+    tmp.replace(out)
+    return out
+
+
+def archive_load(directory, spec: dict):
+    """``(record, am)``, or ``(None, None)`` with no entry."""
+    path = _archive_file(directory, spec["key"])
+    if not path.is_file():
+        return None, None
+    with np.load(path, allow_pickle=False) as z:
+        record = json.loads(bytes(z["meta"]).decode())
+        am = None
+        if "time" in z:
+            am = (
+                np.array(z["time"]),
+                np.array(z["x"]),
+                np.array(z["sx"]),
+                json.loads(bytes(z["state_ids"]).decode()),
+            )
+    return record, am
+
+
+def _stale(res: dict, why: str, kind: str = "archive_stale") -> dict:
+    """Stamp a row the archive cannot stand in for (``archive_stale`` or
+    ``archive_unreadable``). Never compared."""
+    res["status"] = "reference_failed"
+    res["exception"] = f"amici (archive): {kind}: {why}"[:400]
+    res["exception_class"] = f"amici-archive:{kind.removeprefix('archive_')}"
+    res["reference_refusal"] = kind
+    return res
+
+
 def _worker(spec: dict, q) -> None:
     """Run BOTH engines' forward sensitivities for one (model, method) job."""
-    warmup = asens.measure_warmup()
-    asens.set_amici_quiet()
+    replay = spec.get("reference_archive")
+    record_to = spec.get("write_reference_archive")
+    # A replay from a reference archive needs no AMICI at all (issue #805).
+    warmup = asens.measure_warmup(include_amici=not replay)
+    if not replay:
+        asens.set_amici_quiet()
     for _k, _v in spec.get("config_env", {}).items():
         os.environ[_k] = _v
 
@@ -356,23 +459,66 @@ def _worker(spec: dict, q) -> None:
     am_cls = ""
     am_full = ""
     am_wall = 0.0
-    try:
-        t0 = time.perf_counter()
-        am_ids, built = asens.amici_free_parameter_ids(xml)
-        am_wall = time.perf_counter() - t0
-    except Exception as exc:
-        cap = capture_exception("amici-build", exc)
-        res["status"] = "reference_failed"
-        res["exception"] = cap.text
-        res["exception_class"] = cap.cls
-        # Issue #324 — classify from the FULL message, here, rather than from the
-        # capped one in the parent. The keyword that names an AMICI refusal
-        # subclass is not guaranteed to sit inside the head budget.
-        res["reference_refusal"] = asens.classify_reference_refusal(cap.full)
-        res["wall_sec"] = round(time.perf_counter() - t0, 3)
-        res["timing"] = {"warmup": warmup}
-        q.put(res)
-        return
+    archived, archived_am = (None, None)
+    record: dict = {}
+    if record_to:
+        record = {
+            **archive_identity(spec),
+            "reference_version": versions.amici_version(),
+            "harness_git_rev": git_rev(str(HERE)),
+        }
+    if replay:
+        try:
+            archived, archived_am = archive_load(replay, spec)
+        except Exception as exc:  # a corrupt or foreign file: the archive's fault
+            q.put(_stale(res, f"{type(exc).__name__}: {exc}", kind="archive_unreadable"))
+            return
+        if archived is None:
+            q.put(_stale(res, "no entry for this job"))
+            return
+        want = archive_identity(spec)
+        changed = sorted(k for k in want if archived.get(k) != want[k])
+        if changed:
+            q.put(_stale(res, f"the job's {', '.join(changed)} changed"))
+            return
+        res["reference_version"] = archived.get("reference_version")
+        if "build_error" in archived:
+            res["status"] = "reference_failed"
+            res["exception"] = archived["build_error"]["text"]
+            res["exception_class"] = archived["build_error"]["cls"]
+            res["reference_refusal"] = asens.classify_reference_refusal(
+                archived["build_error"]["full"]
+            )
+            res["timing"] = {"warmup": warmup}
+            q.put(res)
+            return
+        am_ids = list(archived["amici_free_ids"])
+    else:
+        try:
+            t0 = time.perf_counter()
+            am_ids, built = asens.amici_free_parameter_ids(xml)
+            am_wall = time.perf_counter() - t0
+        except Exception as exc:
+            cap = capture_exception("amici-build", exc)
+            res["status"] = "reference_failed"
+            res["exception"] = cap.text
+            res["exception_class"] = cap.cls
+            # Issue #324 — classify from the FULL message, here, rather than from the
+            # capped one in the parent. The keyword that names an AMICI refusal
+            # subclass is not guaranteed to sit inside the head budget.
+            res["reference_refusal"] = asens.classify_reference_refusal(cap.full)
+            res["wall_sec"] = round(time.perf_counter() - t0, 3)
+            res["timing"] = {"warmup": warmup}
+            if record_to:
+                record["build_error"] = {"text": cap.text, "cls": cap.cls, "full": cap.full}
+                archive_save(record_to, spec, record)
+            q.put(res)
+            return
+        if record_to:
+            record["amici_free_ids"] = list(am_ids)
+            # Saved now and again after the run, so a job that stops between
+            # (no shared parameter, a bngsim refusal) still replays its ids.
+            archive_save(record_to, spec, record)
 
     # --- Negotiate the shared, capped parameter list. ---
     try:
@@ -448,6 +594,14 @@ def _worker(spec: dict, q) -> None:
         q.put(res)
         return
 
+    # Both are known now, so a row that will never be compared skips bngsim's
+    # sensitivity run.
+    if replay and archived.get("shared_ids") is None:
+        q.put(_stale(res, "the recorded run stopped before AMICI's sensitivities"))
+        return
+    if replay and archived["shared_ids"] != shared_ids:
+        q.put(_stale(res, "the shared parameter list changed"))
+        return
     res["n_params"] = len(shared_ids)
     res["n_param_candidates"] = n_cand
     # Issue #339 — read ONCE and handed to both engines below, so no future edit
@@ -484,27 +638,47 @@ def _worker(spec: dict, q) -> None:
         cap = capture_exception("bngsim", exc)
         bn_exc, bn_cls = cap.text, cap.cls
 
-    # --- AMICI side (over the model built above) ---
+    # --- AMICI side (over the model built above, or from the archive) ---
     am = None
     am_timing = None
-    try:
-        t0 = time.perf_counter()
-        out = asens.amici_sens(
-            built,
-            p["t_start"],
-            p["t_end"],
-            p["n_points"],
-            p["rtol"],
-            p["atol"],
-            shared_ids,
-            method,
-            max_steps=max_steps,
-        )
-        am_wall += time.perf_counter() - t0
-        am, am_timing = out[:4], out[4]
-    except Exception as exc:
-        cap = capture_exception("amici", exc)
-        am_exc, am_cls, am_full = cap.text, cap.cls, cap.full
+    if replay:
+        am = archived_am
+        am_timing = archived.get("timing")
+        if am_timing is not None:
+            am_timing = {
+                **am_timing,
+                "replayed_from_archive": True,
+                "reference_version": archived.get("reference_version"),
+                "recorded_by_harness": archived.get("harness_git_rev"),
+            }
+        if am is None:
+            err = archived.get("run_error") or {}
+            am_exc, am_cls, am_full = err.get("text", ""), err.get("cls", ""), err.get("full", "")
+    else:
+        try:
+            t0 = time.perf_counter()
+            out = asens.amici_sens(
+                built,
+                p["t_start"],
+                p["t_end"],
+                p["n_points"],
+                p["rtol"],
+                p["atol"],
+                shared_ids,
+                method,
+                max_steps=max_steps,
+            )
+            am_wall += time.perf_counter() - t0
+            am, am_timing = out[:4], out[4]
+        except Exception as exc:
+            cap = capture_exception("amici", exc)
+            am_exc, am_cls, am_full = cap.text, cap.cls, cap.full
+        if record_to:
+            record["shared_ids"] = list(shared_ids)
+            record["timing"] = am_timing
+            if am is None:
+                record["run_error"] = {"text": am_exc, "cls": am_cls, "full": am_full}
+            archive_save(record_to, spec, record, am)
 
     res["wall_sec"] = round(bn_wall + am_wall, 3)
     if am is not None:
@@ -680,11 +854,26 @@ def main() -> int:
     )
     ap.add_argument("--rtol", type=float, default=DEFAULT_RTOL)
     ap.add_argument("--atol", type=float, default=DEFAULT_ATOL)
+    ap.add_argument(
+        "--write-reference-archive",
+        default="",
+        help="Also record each job's AMICI side here (free parameter ids, the shared list, "
+        "state and sensitivity tensors; one .npz per job; issue #805).",
+    )
+    ap.add_argument(
+        "--reference-archive",
+        default="",
+        help="Compare against the AMICI side recorded here instead of building and running "
+        "AMICI. An entry that no longer matches its job, or whose shared parameter list "
+        "differs from the one negotiated now, is never compared (archive_stale).",
+    )
     ap.add_argument("--limit", type=int, default=0, help="Max models after filtering (0=all).")
     ap.add_argument("--models", default="", help="Comma-separated model_id filter.")
     ap.add_argument("--include", default="")
     ap.add_argument("--exclude", default="")
     args = ap.parse_args()
+    if args.reference_archive and args.write_reference_archive:
+        ap.error("--reference-archive replays an archive; --write-reference-archive records one")
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     bad = [m for m in methods if m not in asens.SENS_METHODS]
@@ -724,6 +913,8 @@ def main() -> int:
         max_steps=args.max_steps,
     )
 
+    specs = _with_archive(specs, args)
+
     ver = versions.stamp("amici")
     ver["sundials"] = asens.sundials_version()
     print("=" * 72)
@@ -733,7 +924,8 @@ def main() -> int:
         f"  models: {len(jobs)}   methods: {','.join(methods)}   "
         f"jobs: {len(specs)}   workers: {args.workers}"
     )
-    print(f"  bngsim {ver['bngsim']}   amici {ver['amici']}   manifest {manifest.name}")
+    am_label = f"from archive {args.reference_archive}" if args.reference_archive else ver["amici"]
+    print(f"  bngsim {ver['bngsim']}   amici {am_label}   manifest {manifest.name}")
     print(
         f"  param budget: {args.param_budget or 'none'} coupled states"
         f"   extra cap: {args.param_cap or 'none'}   "
@@ -807,7 +999,12 @@ def main() -> int:
                 exception_class=r.get("exception_class"),
                 wall_sec=round(wall, 3) if wall else None,
                 timestamp=now,
-                versions=ver,
+                # A replayed row's reference is the archived engine, not a local
+                # one: on a replay every row reports the archived version, None
+                # where the entry recorded none or the row has no entry.
+                versions={**ver, "amici": r.get("reference_version")}
+                if args.reference_archive
+                else ver,
                 comment=comment,
                 reference_refusal=refusal,
                 timing=r.get("timing"),
@@ -853,10 +1050,19 @@ def main() -> int:
         suffix = "" if args.config == "auto" else f"__{args.config}"
         out_path = HERE / "runs" / f"report_sens{suffix}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.reference_archive:
+        # The report's header names the AMICI the archive entries recorded
+        # (issue #805), every distinct one where they differ.
+        recorded = sorted({v for r in raw if (v := r.get("reference_version"))})
+        ver["amici"] = " / ".join(recorded) or None
     meta = {
         "suite": "amici_parity",
         "reference_engine": "amici",
         "regime": "forward_sensitivity",
+        # Issue #805: where the reference side came from.
+        "reference_source": (
+            f"archive:{args.reference_archive}" if args.reference_archive else "amici (live)"
+        ),
         "git_rev": git_rev(str(HERE)),
         "versions": ver,
         "tally": counts,

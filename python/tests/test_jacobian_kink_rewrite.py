@@ -6,9 +6,10 @@ the parser creates) to ``re`` / ``im``; no emitter spells either, so
 ``differentiate_rate_law`` declined the rate law and the whole model ran on the
 finite-difference Jacobian — 28 corpus models, a Lorenz attractor among them.
 Now ``abs`` differentiates to ``sign(a)·a'`` through a twin of ``Abs`` with that
-``fdiff``, and the ``Heaviside`` factors of a ``max`` / ``min`` derivative are
-spelled ``if(u >= 0, 1, 0)`` afterwards — both forms the emitters print, and
-neither copies the argument the way a Piecewise rewrite of the value would.
+``fdiff``, and a ``max`` / ``min`` through binary twins whose ``Heaviside``
+factors are spelled as ``if()`` steps afterwards — both forms the emitters
+print, and neither copies the argument the way a Piecewise rewrite of the value
+would. Issue #1126: at a tie the arguments' weights sum to 1.
 """
 
 from __future__ import annotations
@@ -89,10 +90,24 @@ def test_prepare_leaves_piecewise_conditions_and_parameter_abs_alone():
     (v1, c1), (v2, _c2) = out.args
     assert c1.has(sp.Abs) and not c1.has(absval), "the condition's Abs must survive"
     assert v1.has(absval) and v1.has(sp.Abs(k)), "Abs(A) is twinned, Abs(k) is not"
-    assert isinstance(v2, sp.Max), "Max is left for sympy to differentiate"
+    assert isinstance(v2, J._kink_bindings(sp)["maxval"]), "Max over A is twinned"
     d = J._finish_kinks(sp.diff(out, A))
-    assert not d.has(absval) and not d.has(sp.Heaviside), d
+    twins = J._kink_bindings(sp).values()
+    assert not any(d.has(t) for t in twins) and not d.has(sp.Heaviside), d
     assert J.sympy_to_exprtk(d) is not None
+
+
+@pytest.mark.parametrize("law", ["k*max(A,B)", "k*min(A,B)", "k*max(A,B,C)", "k*min(C,A,B)"])
+def test_a_tie_weighs_one_in_all(law):
+    """Issue #1126: spelled ``if(u >= 0, 1, 0)``, each tied argument got the
+    weight 1, and a tie held along a run counted the state's sensitivity twice
+    (three times for three arguments)."""
+    names = sorted({"A", "B", "C"} & set(law))
+    dd = J.differentiate_rate_law(law, {}, set(names), {"k"})
+    assert sum(_at(dd[n], A=2, B=2, C=2, k=3) for n in names) == 3.0
+    if len(names) == 3:  # A off the tie, B and C on it
+        d = {n: _at(dd[n], A=1, B=2, C=2, k=3) for n in names}
+        assert (d["A"], d["B"] + d["C"]) == ((0.0, 3.0) if "max" in law else (3.0, 0.0))
 
 
 # ─── End to end ──────────────────────────────────────────────────────────────

@@ -161,15 +161,17 @@ newly loaded model gets the analytic code.
 Only conditions in rate laws count. One in an expression that is reported and
 that no reaction reads has no bearing on the code.
 
-A `run_batch` row is the exception. Every row runs on the code built for the
-model as the batch found it. A row whose own writes pin or re-attach a derived
-parameter is refused with `SensitivityUnsupportedError` where a requested
-column is of a parameter that one is derived from; its own column, and columns
-that do not reach the model through it, are the same code either way and run. A
-row at whose values a condition's switch time no longer resolves is refused
-likewise. Make the write on the model with `set_param` before the batch, so
-that every row agrees with it, or run that row with `set_params` and `run()`.
-A batch after such a write on the model is asked what a `run()` after it is.
+A `run_batch` row runs on the code built for the model as the batch found it,
+unless its own writes pin or re-attach a derived parameter that a requested
+column is derived through. Such a row runs on code built for that attachment
+before any row starts, shared by the rows that pin or attach the same
+parameters, each at its own values; its own column, and columns that do not
+reach the model through it, are the same code either way. A row at whose values
+a condition's switch time no longer resolves is refused with
+`SensitivityUnsupportedError`. Make the write on the model with `set_param`
+before the batch, so that every row agrees with it, or run that row with
+`set_params` and `run()`. A batch after such a write on the model is asked what
+a `run()` after it is.
 
 ## Parameters that set *when*, not *how fast*
 

@@ -305,6 +305,7 @@ def test_reactions_sharing_a_rate_law_spend_the_budget_once(tmp_path, monkeypatc
     distinct = _load("net", tmp_path, _net_many(12, shared=False))
     assert distinct.prepare_analytical_jacobian() is False
     assert "exceeded its 1.0s budget" in distinct.analytical_jacobian_status
+    assert distinct.analytical_jacobian_decline["kind"] == "budget"  # issue #538
 
 
 def test_a_shared_rate_law_that_declines_still_says_why(tmp_path, monkeypatch):

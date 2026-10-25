@@ -16,6 +16,7 @@ Architecture (AMICI/libRoadRunner pattern):
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
@@ -515,6 +516,34 @@ _SHARD_UNIT_BLOCKS = 8
 # would rather under-subscribe RAM than OOM a shared node. Override (MB) with
 # BNGSIM_CODEGEN_MEM_PER_JOB.
 _DEFAULT_SHARD_MEM_MB = 512
+
+# The <math.h> constants a generated source can name, with <math.h>'s own digits
+# so the value is the same double whichever header defines it. M_PI and M_E come
+# from a rate law over the engine's _pi / _e; the rest from sympy's C printer,
+# which writes d/dp 10^p as pow(10, p)*M_LN10 and likewise for the other entries
+# of sympy.printing.c.get_math_macros(). <math.h> is not a dependable supplier:
+# MSVC defines none of them without _USE_MATH_DEFINES, glibc hides them in strict
+# C mode, and the MIR JIT strips the include outright, so each source that
+# stands alone defines all of them, #ifndef-guarded (GH #470).
+_MATH_CONSTANT_DEFINES = tuple(
+    line
+    for name, value in (
+        ("M_E", "2.7182818284590452354"),
+        ("M_LOG2E", "1.4426950408889634074"),
+        ("M_LOG10E", "0.43429448190325182765"),
+        ("M_LN2", "0.69314718055994530942"),
+        ("M_LN10", "2.30258509299404568402"),
+        ("M_PI", "3.14159265358979323846"),
+        ("M_PI_2", "1.57079632679489661923"),
+        ("M_PI_4", "0.78539816339744830962"),
+        ("M_1_PI", "0.31830988618379067154"),
+        ("M_2_PI", "0.63661977236758134308"),
+        ("M_2_SQRTPI", "1.12837916709551257390"),
+        ("M_SQRT2", "1.41421356237309504880"),
+        ("M_SQRT1_2", "0.70710678118654752440"),
+    )
+    for line in (f"#ifndef {name}", f"#define {name} {value}", "#endif")
+)
 
 # Portable codegen prelude, emitted once per translation unit. Each macro is
 # #ifndef-guarded so the RHS + sensitivity + jacobian + output sources
@@ -1755,6 +1784,137 @@ def _normalize_exprtk_operators(expr: str) -> str:
     return _parenthesize_relational_chains(s)
 
 
+# What ends the operand of a `%`: an operator that binds looser than `*`,
+# `/` and `%` do, or a comma.
+_LOOSER_THAN_PRODUCT = frozenset("<>=!&|?:;,")
+_LOOSER_WORDS = frozenset(("and", "or", "xor", "nand", "nor", "xnor"))
+_NUMBER_BEFORE_EXPONENT = re.compile(r"(?<![A-Za-z0-9_.])(?:\d+\.?\d*|\.\d+)[eE]$")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ExprTk groups with all three kinds of bracket.
+_BRACKET_CLOSES = {"(": ")", "[": "]", "{": "}"}
+_CLOSING_BRACKETS = frozenset(_BRACKET_CLOSES.values())
+
+
+class _UnbalancedBrackets(Exception):
+    """A bracket in a text :func:`_spell_mod` reads has no partner of its kind."""
+
+
+def _spell_mod(text: str) -> str:
+    """*text* with each ``a % b`` written ``mod(a, b)``.
+
+    ExprTk's ``%`` on doubles is ``std::fmod``, which is its ``mod()`` too, so
+    the two read the same everywhere. C has no ``%`` on doubles. The stop and
+    root scanners of :mod:`bngsim._switch_sensitivity` read named calls only
+    (``_STEP_CALL``), and a pulse written with the operator got no stop on a
+    clock and no root on a counter, and was stepped over: Y = 0 for 3.93
+    (issue #1127). ``%`` binds like ``*`` and ``/``, from the left, and tighter
+    than ``+`` and ``-``: ``a*b % c - d`` is ``mod(a*b, c) - d``. Quoted text
+    (a ``tfun`` file name) is left alone, and so is a text whose brackets do
+    not pair up, which ExprTk would not compile either.
+
+    The test for ``%`` comes before the cache, so the bodies without one,
+    nearly all of them, are not hashed into it: a model with more functions
+    than the cache holds evicted every entry on every scan of its bodies.
+    """
+    if "%" not in text:
+        return text
+    return _spell_mod_cached(text)
+
+
+@functools.lru_cache(maxsize=16384)
+def _spell_mod_cached(text: str) -> str:
+    try:
+        out, _ = _spell_mod_from(text, 0, None)
+    except _UnbalancedBrackets:
+        return text
+    return out
+
+
+def _spell_mod_from(text: str, i: int, closer: str | None) -> tuple[str, int]:
+    """:func:`_spell_mod` of *text* from *i* to *closer*, the bracket that
+    closes it (``None``: the end of the text)."""
+    out: list[str] = []
+    chain: list[tuple[str, str]] = []  # (operator before it, factor) in one product
+    op, factor = "", ""
+
+    def close_chain() -> None:
+        nonlocal op, factor
+        chain.append((op, factor))
+        if any(o == "%" for o, _ in chain):
+            lead = chain[0][1][: len(chain[0][1]) - len(chain[0][1].lstrip())]
+            trail = factor[len(factor.rstrip()) :]
+            acc = chain[0][1].strip()
+            for o, f in chain[1:]:
+                acc = f"mod({acc}, {f.strip()})" if o == "%" else f"{acc}{o}{f.strip()}"
+            out.append(lead + acc + trail)
+        else:
+            out.append("".join(o + f for o, f in chain))
+        chain.clear()
+        op, factor = "", ""
+
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in _BRACKET_CLOSES:
+            inner, i = _spell_mod_from(text, i + 1, _BRACKET_CLOSES[c])
+            factor += c + inner + _BRACKET_CLOSES[c]
+            continue
+        if c in _CLOSING_BRACKETS:
+            if c != closer:
+                raise _UnbalancedBrackets
+            close_chain()
+            return "".join(out), i + 1
+        if c in "'\"":
+            end = text.find(c, i + 1)
+            end = n if end < 0 else end + 1
+            factor += text[i:end]
+            i = end
+            continue
+        if c == "*" and text.startswith("**", i):
+            factor += "**"
+            i += 2
+            continue
+        if c in "*/%":
+            chain.append((op, factor))
+            op, factor = c, ""
+            i += 1
+            continue
+        if c in "+-":
+            before = factor.rstrip()
+            if (
+                before
+                and not before.endswith(("^", "**"))
+                and not (_NUMBER_BEFORE_EXPONENT.search(before))
+            ):
+                close_chain()
+                out.append(c)
+                i += 1
+                continue
+            factor += c
+            i += 1
+            continue
+        if c in _LOOSER_THAN_PRODUCT:
+            close_chain()
+            out.append(c)
+            i += 1
+            continue
+        word = _WORD.match(text, i) if c.isalpha() or c == "_" else None
+        if word:
+            if word.group() in _LOOSER_WORDS and factor.strip():
+                close_chain()
+                out.append(word.group())
+            else:
+                factor += word.group()
+            i = word.end()
+            continue
+        factor += c
+        i += 1
+    if closer is not None:
+        raise _UnbalancedBrackets
+    close_chain()
+    return "".join(out), n
+
+
 def _parenthesize_relational_chains(s: str) -> str:
     """Left-associate every run of two or more relationals within one operand.
 
@@ -2948,7 +3108,8 @@ def _direct_derived_partials(
         # sp.ccode skipped: d(E^n)/dn printed as pow(E,n)*log(E) and d(E^n)/dE
         # as n*pow(E,n)/E, both NaN at E = 0, so every sensitivity run on such
         # a model was refused while the same law written inline in a Functional
-        # rate was right (issue #720). The printing itself stays sp.ccode.
+        # rate was right (issue #720). The printing itself is sp.ccode's, but
+        # for integers, which print as double literals (_term_order.ccode).
         deriv = _guard_zero_base(deriv)
         try:
             # sp.ccode, with a sum's terms in an order that does not follow the
@@ -3677,20 +3838,16 @@ def _emit_sens_rhs_body(
     _emit("#include <math.h>")
     _emit("#include <string.h>")
     _emit("")
-    # The same block the two RHS sources open with. A rate constant written over
+    # The same block the RHS source opens with. A rate constant written over
     # the engine's _pi or _e reaches this source as M_PI/M_E (see
-    # _BUILTIN_CONSTANT_VALUES), and <math.h> is not a reliable source for
-    # either: MSVC defines neither without _USE_MATH_DEFINES, and glibc hides
-    # both in strict C mode. On the MIR JIT backend every "#include <...>" line
-    # is stripped before c2mir sees the source, so these two defines are the
-    # only place the names come from at all — which is what the prelude comment
-    # in include/bngsim/mir_jit.hpp says is supposed to be happening here.
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    # _BUILTIN_CONSTANT_VALUES), and sympy writes the chain rule through 10^p as
+    # M_LN10 (see _MATH_CONSTANT_DEFINES). On the MIR JIT backend every
+    # "#include <...>" line is stripped before c2mir sees the source, so these
+    # defines are the only place the names come from at all — which is what the
+    # prelude comment in include/bngsim/mir_jit.hpp says is supposed to be
+    # happening here.
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     _emit(f"#define N_SPECIES {n_sp}")
     _emit(f"#define N_PARAMS  {n_params}")
@@ -5517,6 +5674,9 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     # ExprTk's reading of =, <>, -- and relational chains made explicit before
     # anything else, since each is copied through as text (issue #734).
     result = _normalize_exprtk_operators(expr)
+    # ``a % b`` on doubles does not compile in C; ``mod()`` becomes ``fmod``
+    # below, which is what ExprTk's operator is (issue #1127).
+    result = _spell_mod(result)
     # if() must be expanded first so nested ternary structure is correct
     # before identifier rewriting touches anything.
     result = _replace_if_calls(result)
@@ -6545,12 +6705,8 @@ def generate_rhs_from_model(model) -> str:
     _emit("#include <stdlib.h>")
     _emit("#include <string.h>")
     _emit("")
-    _emit("#ifndef M_PI")
-    _emit("#define M_PI 3.14159265358979323846")
-    _emit("#endif")
-    _emit("#ifndef M_E")
-    _emit("#define M_E 2.71828182845904523536")
-    _emit("#endif")
+    for _line in _MATH_CONSTANT_DEFINES:
+        _emit(_line)
     _emit("")
     # Layout MUST match CodegenUserDataForSO in cvode_simulator.cpp —
     # tfun_eval is invoked from this RHS for any tfun-backed function.
@@ -6918,7 +7074,9 @@ def _emit_function_lines(
     Shared by the RHS and analytical-Jacobian emitters (see
     ``_emit_observable_lines``). ``rateof_map`` (GH #106) resolves
     rate_of__<species> tokens to current_derivs[idx]; only the RHS emitter
-    passes it (the Jacobian emitter declines for rateOf models).
+    passes it. The Jacobian and sensitivity-RHS emitters have no such buffer and
+    pass functions whose rates are written out instead
+    (``_functions_with_rates_written_out``).
 
     Statements are emitted in dependency order (``_topological_function_order``)
     so a function that references another declared after it does not read an
@@ -7284,6 +7442,7 @@ def _functional_jacobian_groups(
         _TIME_SYM,
         build_per_species_c,
         differentiate_rate_law_c,
+        rateof_rate_laws,
     )
 
     params = data["parameters"]
@@ -7327,7 +7486,8 @@ def _functional_jacobian_groups(
     # ── Functional context (read like attach_functional_jacobian) ───────────
     ctx = core.functional_jacobian_context()
     frxns = ctx.get("functional_reactions") or []
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
     obs_groups = {name: [(int(si), float(f)) for si, f in grp] for name, grp in ctx["observables"]}
     species_meta = {i: (bool(av), float(vf)) for i, (av, vf) in enumerate(ctx["species_meta"])}
     # (#170 stage 2) Same map attach_functional_jacobian builds, for the same reason:
@@ -7881,10 +8041,17 @@ def generate_jacobian_from_model(model) -> str | None:
         if _jac_obs_lines
         else ([], [])
     )
+    # A function that reads rate_of__X has no live dx/dt here: its value is
+    # read off X's rate laws, the ones the terms above differentiated (issue
+    # #1124, item 7). Where they cannot be written out, decline rather than emit
+    # the token as an undeclared C name.
+    jac_functions = _functions_with_rates_written_out(data) if (need_func and functions) else []
+    if jac_functions is None:
+        return None
     jac_func_in, jac_func_fs = (
         _shard_value_lines(
             _emit_function_lines(
-                functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
+                jac_functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
             ),
             chunk=chunk,
             fn_prefix="jac_func_blk",
@@ -8216,8 +8383,11 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "(correct, but slower, where every rate law is continuous in the state along "
         "the run, though a column can still be wrong where a min(), max(), abs() or "
         "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
-        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
-        "for the jumps that are found in the rate "
+        "tolerance, at a triangle of width 0.01, issue #1126. Of these, min, max and "
+        "abs are left here only in a model whose rate laws hold a condition, or where "
+        "one sits in anything but a sum, a product, a whole power, an exp() or another "
+        "bend, or in a product with a division or a fractional power of the state or "
+        "the clock. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -8643,6 +8813,55 @@ class _FunctionalDfdpScope(NamedTuple):
     # Empty unless the model has an amount-valued species whose compartment size
     # is writable — see :func:`_observable_volume_weights`.
     obs_volume_weights: dict[str, dict[int, str]] = {}
+    # Issue #1126: whether abs / min / max are differentiated rather than
+    # declined. Only in a model whose rate laws hold no condition at all: the
+    # crossing gate is what a condition is read through on the analytic path,
+    # and a bend that kept such a model on the difference quotient kept it
+    # where the #938 refusal reads it. ``B == 0`` over a B that a max() makes
+    # from 0 is one the gate takes, and returned dY/dq = 0 for -2.
+    bends_analytic: bool = False
+
+
+def _bend_under_a_break(expr, moving: set[str]) -> str | None:
+    """The first ``abs``, ``min`` or ``max`` in *expr* that what it is written
+    in can break, as text, or ``None`` (issue #1126).
+
+    A bend is continuous, and so is a sum, a product, a whole positive power,
+    an ``exp`` or another bend of it. A division or a fractional power may not
+    be: ``e/abs(e)`` is a sign, ``max(e, 0)/e`` a step, ``sqrt(abs(e))`` a cusp
+    whose slope is infinite at the bend. So a bend under one, or in a product
+    with one of what reads a name in *moving* (the state and the clock), is
+    named, and the law is declined as before. ``max(…)/w`` over a parameter is
+    not. Nor is any other call trusted (``log(max(e, 0))`` is −∞ at the bend),
+    so a bend under one is named too.
+    """
+    import sympy as sp
+
+    def breaks(node) -> bool:
+        if not isinstance(node, sp.Pow):
+            return False
+        e = node.exp
+        whole = bool(e.is_Integer and e >= 1)
+        return not whole and bool({str(x) for x in node.base.free_symbols} & moving)
+
+    def walk(node, safe: bool) -> str | None:
+        if isinstance(node, (sp.Abs, sp.Min, sp.Max)):
+            if not safe:
+                return str(node)
+            return next((w for a in node.args if (w := walk(a, True))), None)
+        if isinstance(node, sp.Pow):
+            e = node.exp
+            whole = bool(e.is_Integer and e >= 1)
+            return walk(node.base, safe and whole) or walk(e, False)
+        if isinstance(node, sp.Mul):
+            inner = safe and not any(breaks(a) for a in node.args)
+        elif isinstance(node, (sp.Add, sp.exp)):
+            inner = safe
+        else:
+            inner = False
+        return next((w for a in node.args if (w := walk(a, inner))), None)
+
+    return walk(expr, True)
 
 
 def _functional_rate_law_partials(
@@ -8670,8 +8889,10 @@ def _functional_rate_law_partials(
         _IDENT_CALL_RE,
         _TIME_SYM,
         _exprtk_to_sympy,
+        _finish_kinks,
         _finish_zero_bases,
         _inline_functions,
+        _prepare_kinks,
         _prepare_zero_bases,
         sympy_to_c,
         unemitted_derivative_reason,
@@ -8695,7 +8916,13 @@ def _functional_rate_law_partials(
 
     # Reject on the *inlined* text so a construct hidden inside a referenced
     # function is caught, not just one written in the rate law itself.
-    reason = unsupported_expr_construct(inlined, allow_conditions=scope.switch_scope is not None)
+    # A bend (abs, min, max) is differentiated through the kink twins below
+    # (issue #1126): its derivative has no delta, so nothing is left to make up.
+    reason = unsupported_expr_construct(
+        inlined,
+        allow_conditions=scope.switch_scope is not None,
+        allow_bends=scope.bends_analytic,
+    )
     if reason is not None:
         return None, f"uses unsupported construct: {reason}"
 
@@ -8751,19 +8978,27 @@ def _functional_rate_law_partials(
     if unknown:
         return None, "references unrecognized symbol(s): " + ", ".join(sorted(unknown))
 
+    if scope.bends_analytic:
+        moving = {a for a, ref in scope.c_ref.items() if ref.startswith("obs[")} | {_TIME_SYM}
+        broken = _bend_under_a_break(sym_expr, moving)
+        if broken is not None:
+            return None, f"uses unsupported construct: {broken} under a call, division or power"
+
+    targets = free & (set(scope.param_of_alias) | set(scope.obs_volume_weights))
+    # Issue #1126: an abs over a differentiation variable differentiates to
+    # sign(a)·a', and min / max to the Heaviside _finish_kinks spells as if().
+    sym_expr = _prepare_kinks(sym_expr, targets)
     # Issue #541: a power with a zero base — an ``if(c, u, 0)`` raised to a
     # parameter-dependent exponent — differentiates to 0, not to sympy's nan.
     sym_expr = _prepare_zero_bases(
-        sym_expr,
-        free & (set(scope.param_of_alias) | set(scope.obs_volume_weights)),
-        set(scope.param_of_alias) | set(_MATH_CONSTANT_C),
+        sym_expr, targets, set(scope.param_of_alias) | set(_MATH_CONSTANT_C)
     )
 
     terms: list[tuple[int, str]] = []
     for a in sorted(free & set(scope.param_of_alias)):
         pname = scope.param_of_alias[a]
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -8817,7 +9052,7 @@ def _functional_rate_law_partials(
     # so this loop does not run and the emitted text is unchanged.
     for a in sorted(free & set(scope.obs_volume_weights)):
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -10229,11 +10464,16 @@ def _functional_dfdp_terms(
     functions = data["functions"]
     reactions = data["reactions"]
 
-    from bngsim._jacobian import _DerivationBudgetExceeded, has_condition_construct
+    from bngsim._jacobian import (
+        _DerivationBudgetExceeded,
+        has_condition_construct,
+        rateof_rate_laws,
+    )
 
     ctx = core.functional_jacobian_context()
     frxn_by_idx = {int(r["rxn_idx"]): r for r in (ctx.get("functional_reactions") or [])}
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
 
     param_idx_by_name = {p["name"]: i for i, p in enumerate(params)}
     primary_param_names = {p["name"] for p in params if p.get("is_const", True)}
@@ -10288,7 +10528,8 @@ def _functional_dfdp_terms(
     conditional_text = list(func_map.values()) + [
         str(r.get("rate_expr", "")) for r in frxn_by_idx.values()
     ]
-    if any(has_condition_construct(body) for body in conditional_text):
+    has_conditions = any(has_condition_construct(body) for body in conditional_text)
+    if has_conditions:
         from bngsim._switch_sensitivity import switch_condition_scope
 
         try:
@@ -10311,6 +10552,7 @@ def _functional_dfdp_terms(
         # (#170 stage 3) The compartment size an observable's amount conversion
         # hides. Empty ⇒ the derivative loop that reads it never runs.
         obs_volume_weights=_observable_volume_weights(data["species"], observables, _alias),
+        bends_analytic=not has_conditions,
     )
 
     # A rule-generated network reuses one rate-law expression across many
@@ -11028,6 +11270,71 @@ def generate_sens_from_model(
     return src
 
 
+_RATEOF_TOKEN_RE = re.compile(r"\b" + _RATEOF_PREFIX + r"\w+")
+_TFUN_CALL_RE = re.compile(r"\btfun_\w+\s*\(")
+
+
+def _functions_with_rates_written_out(data: dict) -> list[dict] | None:
+    """``data["functions"]``, each ``rate_of__X`` its texts read written out as
+    X's rate laws, inlined down to observables, parameters and time (issue
+    #1124, item 7); ``None`` where one cannot be.
+
+    ``rate_of__X`` is the live dx/dt the RHS's probe passes leave in
+    ``current_derivs``, and only the RHS has that buffer. The ``func[]``
+    recomputations of the analytical Jacobian and the sensitivity RHS read the
+    same value off the rate laws :func:`bngsim._jacobian.rateof_rate_laws`
+    states, which is what the derivations they are written against
+    differentiate. ``None`` where a function reads a rate it does not state,
+    where rates read each other in a ring, or where a written-out rate calls a
+    table, which neither caller can evaluate.
+
+    Both texts are rewritten. The value is printed from ``eval_expression``
+    where the loader set one (the zero-base log guard, GH #333), and the laws
+    are inlined through those same texts, so the value is the one the RHS sums.
+    """
+    functions = data["functions"]
+    if not any(_RATEOF_PREFIX in f["expression"] for f in functions):
+        return functions
+    from bngsim._jacobian import _inline_functions, rateof_rate_laws
+
+    laws = rateof_rate_laws(data)
+    bodies = {
+        **laws,
+        **{f["name"]: f.get("eval_expression") or f["expression"] for f in functions},
+    }
+    memo: dict[str, str] = {}
+    flat: dict[str, str | None] = {}
+
+    def written_out(token: str) -> str | None:
+        if token not in flat:
+            law = _inline_functions(laws[token], bodies, memo=memo) if token in laws else None
+            if law is not None and (_RATEOF_PREFIX in law or _TFUN_CALL_RE.search(law)):
+                law = None
+            flat[token] = law
+        return flat[token]
+
+    out = []
+    for f in functions:
+        texts = {
+            key: f[key]
+            for key in ("expression", "eval_expression")
+            if _RATEOF_PREFIX in f.get(key, "")
+        }
+        for text in texts.values():
+            if any(written_out(token) is None for token in _RATEOF_TOKEN_RE.findall(text)):
+                return None
+        if texts:
+            f = {
+                **f,
+                **{
+                    key: _RATEOF_TOKEN_RE.sub(lambda m: f"({flat[m.group(0)]})", text)
+                    for key, text in texts.items()
+                },
+            }
+        out.append(f)
+    return out
+
+
 def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """The ``obs[]``/``func[]`` recomputation ``bngsim_dfdp`` reads (GH #65).
 
@@ -11044,7 +11351,9 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     * an **embedded tfun wrapper**, which even the value codegen declines
       (``generate_outputs_from_model``) because the ``tfun_<table>(...)`` token
       would be emitted as an undeclared C call.
-    * **rateOf**, which needs the live dx/dt buffer no sensitivity-RHS call has.
+    * a **rateOf** that :func:`_functions_with_rates_written_out` cannot write
+      out as its species' rate laws: the live dx/dt it reads is in a buffer no
+      sensitivity-RHS call has.
 
     Called lazily and at most once per emit, and only when the ∂f/∂p switch
     actually references ``obs[``/``func[`` — an Elementary model never does, so
@@ -11052,11 +11361,10 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """
     species = data["species"]
     observables = data["observables"]
-    functions = data["functions"]
-    tfun_specs = data.get("table_functions", [])
-
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
+    functions = _functions_with_rates_written_out(data)
+    if functions is None:
         return None
+    tfun_specs = data.get("table_functions", [])
 
     tfun_names = [spec["name"] for spec in tfun_specs]
     for f in functions:

@@ -87,6 +87,12 @@ def parse_net_file(path: str | Path) -> dict[str, Any]:
             Michaelis-Menten (``MM kcat Km``); ``rate_law`` is
             ``"<kcat>,<Km>"``, the form ``ModelBuilder`` takes.
 
+        ``stat_factor`` is the ``<number>*`` prefix on the rate column, whatever
+        the type: BNG2.pl writes it ahead of a typed rate law too (``2*MM kcat
+        Km``, ``2*Sat k K``, ``2*Hill V K h``, for a substrate with equivalent
+        sites), and it comes back on the ``"mm"`` or rewritten ``"functional"``
+        reaction, multiplying the whole rate (issue #1230).
+
         ``legacy_constants`` holds an ``"mm"`` reaction's ``[kcat, Km]`` and is
         empty otherwise: a ``Sat`` or ``Hill`` rate law, whose operands it used to
         carry, now comes back rewritten (issue #803).

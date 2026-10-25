@@ -126,6 +126,42 @@ def fingerprint_max_rel(a: dict, b: dict, abs_floor: float = 1e-9) -> float:
     return worst
 
 
+def fingerprint_distance(a: dict, b: dict, rtol: float, atol: float) -> float:
+    """How far fingerprint ``a`` is from the reference ``b``, in units of a mixed
+    tolerance: the worst ``|x - y| / (rtol·|y| + atol)`` over ``t_last`` and every
+    per-variable stat. At most 1 is within it (issue #582).
+
+    The cross-platform comparison the golden gate runs. ``fingerprint_max_rel``
+    divides by ``max(|y|, 1e-9)`` alone, so a species resting near zero reads
+    any difference as large: e2f-rb's CKI_Inhibition, 3.0e-8 against 2.3e-8 and
+    below any ODE run's absolute tolerance, scored 22%. Mixed, as an
+    integrator's own error test is, it scores 0.0066 of rtol 1e-5, atol 1e-6.
+    ``t_last`` is compared too: a run that ends elsewhere on as many rows can
+    otherwise match every stat of a model already at rest.
+
+    inf for a structural difference (another variable set or row count), and for
+    a non-finite stat that is not the same blow-up on both sides, by the rules
+    ``fingerprint_max_rel`` gives (issue #572). A non-finite cell that reaches no
+    stat is invisible here: min/max/mean skip non-finite cells and ``last`` is one
+    row, so a NaN mid-trajectory leaves the fingerprint as it was. Compare a
+    committed trajectory's non-finite cells for that (the golden gate does).
+    """
+    av, bv = a.get("vars", {}), b.get("vars", {})
+    if set(av) != set(bv) or a.get("n_time") != b.get("n_time"):
+        return float("inf")
+    nan = float("nan")
+    pairs = [(a.get("t_last", nan), b.get("t_last", nan))]
+    pairs += [(av[n][s], bv[n][s]) for n in av for s in ("last", "min", "max", "mean")]
+    worst = 0.0
+    for x, y in pairs:
+        if not (math.isfinite(x) and math.isfinite(y)):
+            if (math.isnan(x) and math.isnan(y)) or x == y:
+                continue  # the same blow-up on both sides: they agree
+            return float("inf")
+        worst = max(worst, abs(x - y) / (rtol * abs(y) + atol))
+    return worst
+
+
 def golden_pair(time, values, names) -> tuple[str, dict]:
     """Convenience: (checksum, fingerprint) for one result."""
     return checksum(time, values, names), fingerprint(time, values, names)

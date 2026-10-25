@@ -83,8 +83,10 @@ def _expected(shape, a, param, times=T):
         "T0": lambda h, t: _x(shape, a, t, ON - h, WIDTH),
         # One that runs at 1 + h is on - T0 = 3 further along at 3/(1 + h).
         "r": lambda h, t: _x(shape, a, t, ON / (1 + h), WIDTH, rate=1 + h),
-        "k1": lambda h, t: _x(shape, a, t, ON, WIDTH)
-        + h * (_x(shape, a, t, ON, WIDTH) - K0 * (1 - np.exp(-KDEG * t)) / KDEG) / K1,
+        "k1": lambda h, t: (
+            _x(shape, a, t, ON, WIDTH)
+            + h * (_x(shape, a, t, ON, WIDTH) - K0 * (1 - np.exp(-KDEG * t)) / KDEG) / K1
+        ),
     }[param]
     return np.array([_slope(lambda h, t=t: moved(h, t)) for t in times])
 

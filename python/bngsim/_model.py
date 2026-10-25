@@ -103,7 +103,7 @@ class Model:
         "_interpret_sec",
         "_jac_derive_sec",
         "_jac_attempted",
-        "_jac_decline_reason",
+        "_jac_decline",
         "_net_path",
         "_ssa_issues",
         "_ar_report_map",
@@ -216,8 +216,9 @@ class Model:
         # False for all-Elementary models and for legitimate FD fallbacks, which
         # would make a non-differentiable model re-run SymPy on every solve.
         self._jac_attempted: bool = False
-        # Issue #506: why the attempt declined, for analytical_jacobian_status.
-        self._jac_decline_reason: str | None = None
+        # Issues #506/#538: why the attempt declined, {"kind", "reason", ...}, for
+        # analytical_jacobian_status and analytical_jacobian_decline.
+        self._jac_decline: dict | None = None
         # Set by Model.from_net: the .net file the model was loaded from.
         # Provenance only since #803: every backend reads the built model. It
         # used to select the .net codegen path (kept for "issue #15's
@@ -932,6 +933,7 @@ class Model:
             if derived is None:
                 try:
                     from bngsim._switch_sensitivity import (
+                        _condition_key,
                         _monotone_pieces,
                         _strip_redundant_parens,
                         time_discontinuity_conditions,
@@ -941,15 +943,10 @@ class Model:
                         # A condition reached through a function definition is
                         # spelled `(time())` where the same one written directly
                         # reads `time()`, and the loader registers one spelling
-                        # for both (issue #1082); compared on its key, so the
-                        # one registered covers the other, which the recovery
-                        # otherwise added again as a stop. Only an SBML model
-                        # registers, and only its loader needs libsbml.
-                        if self._time_disc_conditions:
-                            from bngsim._sbml_loader import _condition_key
-
-                            c = _condition_key(c)
-                        return _strip_redundant_parens(c).replace(" ", "")
+                        # for both (issue #1082); compared on the same key, so
+                        # the one registered covers the other, which the
+                        # recovery otherwise added again as a stop.
+                        return _strip_redundant_parens(_condition_key(c)).replace(" ", "")
 
                     registered = {spelled(c) for c in self._time_disc_conditions}
                     # The loader registers a turning comparison as its two
@@ -1179,18 +1176,21 @@ class Model:
             return bool(self._core.analytical_jacobian_complete)
         self._jac_attempted = True
         try:
-            from bngsim._jacobian import attach_functional_jacobian, last_decline_reason
+            from bngsim._jacobian import attach_functional_jacobian, last_decline
 
             t0 = time.perf_counter()
             attach_functional_jacobian(self._core)
             self._jac_derive_sec = time.perf_counter() - t0
-            self._jac_decline_reason = last_decline_reason()
+            self._jac_decline = last_decline()
         except Exception as e:
             # attach_functional_jacobian is contractually no-raise (it falls back
             # to FD and logs over-budget / unsupported cases itself, GH #95); this
             # guard only surfaces a genuinely unexpected error without re-deriving.
             logger.debug("Analytical Functional Jacobian skipped: %s", e)
-            self._jac_decline_reason = f"an unexpected error during derivation: {e}"
+            self._jac_decline = {
+                "kind": "unexpected_error",
+                "reason": f"an unexpected error during derivation: {e}",
+            }
         return bool(self._core.analytical_jacobian_complete)
 
     @property
@@ -1216,8 +1216,31 @@ class Model:
             return "complete"
         if not self._jac_attempted:
             return "pending"
-        reason = self._jac_decline_reason or "no reason was recorded"
-        return f"declined: {reason}"
+        return f"declined: {(self._jac_decline or _NO_DECLINE_RECORD)['reason']}"
+
+    @property
+    def analytical_jacobian_decline(self) -> dict | None:
+        """Why the model runs on the finite-difference Jacobian, as a stable
+        category a census can group by (issue #538).
+
+        ``None`` while :attr:`analytical_jacobian_status` is ``"complete"`` or
+        ``"pending"``. Otherwise a dict with ``kind``, one of
+        ``bngsim._jacobian.DECLINE_KINDS``, and ``reason``, the status's text
+        after ``"declined: "``. For the C++ attach gate's kinds (``fd_mismatch``,
+        ``nonfinite_entry``, ...) it also carries the fields that kind's verdict
+        sets — of ``rxn_idx``, ``per_observable``, ``target_idx``, ``row``,
+        ``col``, ``probe``, ``analytical``, ``finite_difference``,
+        ``n_nonfinite`` and ``detail`` — and the species ``row`` and ``col``
+        name as ``row_species`` / ``col_species``. A field the kind does not
+        set is absent, not a placeholder.
+
+        The kind is what to group by: the reason embeds the rate law, names and
+        values, and its wording changes. A clone carries it, as it carries the
+        status.
+        """
+        if bool(self._core.analytical_jacobian_complete) or not self._jac_attempted:
+            return None
+        return dict(self._jac_decline or _NO_DECLINE_RECORD)
 
     # ─── Load-phase timing accessors ──────────────────────────────────────
     # Public read-only views of the per-model setup timings the SBML loader
@@ -1298,7 +1321,7 @@ class Model:
         # an un-warmed parent inherits _jac_attempted=False and derives on first
         # solve — hence warm-before-clone for parallel fitting, GH #145 §3).
         m._jac_attempted = self._jac_attempted
-        m._jac_decline_reason = self._jac_decline_reason
+        m._jac_decline = dict(self._jac_decline) if self._jac_decline is not None else None
         # GH #97: same warm-clone reasoning for the #198 output-sens analysis — a
         # clone has the parent's structure, so re-running its sympy would be N×
         # waste in parallel fitting. Shared by reference (the analysis is
@@ -2938,6 +2961,10 @@ _STEP_DECIDES_WHY = (
     "second misses a term that reads it through a sum with something much larger "
     "(a total minus what is bound): which of the two is right is not known."
 )
+
+# A declined attempt that recorded no reason (issue #538), for
+# Model.analytical_jacobian_decline and the status read from it.
+_NO_DECLINE_RECORD = {"kind": "unrecorded", "reason": "no reason was recorded"}
 
 # How many recoveries a model and its clones keep in each of the issue #726
 # memos. Each is one parameter-dependent verdict and a model has few, so a full

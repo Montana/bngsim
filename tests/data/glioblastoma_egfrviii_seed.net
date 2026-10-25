@@ -1,0 +1,65 @@
+# Created by BioNetGen 2.9.3
+begin parameters
+    1 k_vIII_act_max  2.0  # Constant
+    2 Km_vIII         100  # Constant
+    3 k_pi3k_rec      1.5  # Constant
+    4 k_akt_act_max   10.0  # Constant
+    5 Km_akt          400  # Constant
+    6 n_hill          3.5  # Constant
+    7 k_esc_deg       0.05  # Constant
+    8 k_internal_WT   0.5  # Constant
+    9 k_lys_deg       0.02  # Constant
+   10 k_ptp1b_inh     0.8  # Constant
+   11 k_reset         0.05  # Constant
+   12 vIII_tot        500  # Constant
+   13 PI3K_tot        200  # Constant
+   14 AKT_tot         1000  # Constant
+   15 PTP1B_tot       100  # Constant
+   16 _rateLaw1       0.2  # Constant
+   17 _rateLaw2       5.0  # Constant
+   18 _rateLaw3       0.1  # Constant
+end parameters
+begin functions
+    1 v_vIII_act() k_vIII_act_max*(vIII_Substrate/(Km_vIII+vIII_Substrate))
+    2 v_cancer_drive() (k_akt_act_max*(Total_pAKT^n_hill))/((Km_akt^n_hill)+(Total_pAKT^n_hill))
+end functions
+begin species
+    1 EGFRvIII(b,loc~mem,s~U) vIII_tot
+    2 PI3K(b) PI3K_tot
+    3 AKT(s~U) AKT_tot
+    4 EGFRvIII(b,loc~mem,s~P) 0
+    5 Oncogenic_Output() 0
+    6 EGFRvIII(b,loc~cyt,s~U) 0
+    7 EGFRvIII(b,loc~mem,s~P!1).PI3K(b!1) 0
+    8 EGFRvIII(b,loc~cyt,s~P) 0
+    9 EGFRvIII(b,loc~cyt,s~P!1).PI3K(b!1) 0
+   10 AKT(s~P) 0
+end species
+begin reactions
+    1 1 4 v_vIII_act #_R1
+    2 0 5 v_cancer_drive #_R4
+    3 1 6 k_esc_deg #_R5
+    4 2,4 7 k_pi3k_rec #_R2
+    5 4 8 k_esc_deg #_R5
+    6 6 0 k_lys_deg #_R6
+    7 4 1 k_ptp1b_inh #_R7
+    8 5 0 _rateLaw3 #_R9
+    9 2,8 9 k_pi3k_rec #_R2
+   10 7 2,4 _rateLaw1 #_reverse__R2
+   11 3,7 7,10 _rateLaw2 #_R3
+   12 7 9 k_esc_deg #_R5
+   13 8 0 k_lys_deg #_R6
+   14 8 6 k_ptp1b_inh #_R7
+   15 9 2,8 _rateLaw1 #_reverse__R2
+   16 3,9 9,10 _rateLaw2 #_R3
+   17 9 2 k_lys_deg #_R6
+   18 10 3 k_reset #_R8
+end reactions
+begin groups
+    1 Survival_Burst       5
+    2 Total_pAKT           10
+    3 vIII_Platform        7,9
+    4 Mem_vIII             1,4,7
+    5 Active_vIII          4,8
+    6 vIII_Substrate       1
+end groups

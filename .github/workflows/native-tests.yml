@@ -66,7 +66,8 @@ name: native-tests
 # subsystem, and duplicating the vendored NFsim/RuleMonkey build on this Linux
 # gate would cost minutes for no new coverage. If NFsim ever needs Linux CI, add
 # a second ctest leg with NFsim ON rather than letting the pair fall through the
-# gap the way test_bngsim once did.
+# gap the way test_bngsim once did. sanitizers.yml's nightly C++ job (#583) is
+# NFsim ON for that reason: under LeakSanitizer the pair is new coverage.
 
 on:
   push:
@@ -111,12 +112,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Ninja (BLAS ${{ matrix.blas }})
+        # As python-tests.yml's LAPACK leg: a hung apt-get (79 minutes there on
+        # lanl/bngsim#1198) fails in 3 minutes a call and is tried once more,
+        # within 15 for the step; this job has no limit of its own.
+        timeout-minutes: 15
         run: |
           set -euxo pipefail
-          sudo apt-get update
+          apt_install() {
+            local opts=(-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3)
+            timeout --kill-after=30 180 sudo apt-get "${opts[@]}" update &&
+              timeout --kill-after=30 180 sudo apt-get "${opts[@]}" install -y "$@"
+          }
           # matrix.apt is empty on the stock leg — that leg installs no BLAS and
           # is the configuration the manylinux/Windows wheels ship.
-          sudo apt-get install -y ninja-build ${{ matrix.apt }}
+          apt_install ninja-build ${{ matrix.apt }} || {
+            echo "::warning::apt-get failed or hung; trying once more"
+            sleep 15
+            apt_install ninja-build ${{ matrix.apt }}
+          }
 
       - name: Configure (tests ON; KLU / NFsim / RuleMonkey OFF)
         run: |
