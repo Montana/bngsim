@@ -123,6 +123,74 @@ change in a nightly then means two pull requests that each passed the gate chang
 an outcome together, or something reached `main` without the gate (a manual
 `python-tests` run with `pytest_args` skips it).
 
+## The reference archive (issue #805)
+
+Five suites need a reference engine: `rr_ode` and `rr_ssa` (libRoadRunner),
+`bng_ode`, `bng_ssa` and `bng_nf` (BNG2.pl, run_network, NFsim), and `amici_sens`
+(AMICI). Running them every night meant provisioning BNG2.pl and building AMICI
+from source each time, spending half the compute on the oracle, and letting the
+oracle itself drift under the comparison (a BNG2.pl regression went unnoticed for
+five months, #661). So most nights replay a recorded reference instead:
+
+| when | mode | reference side |
+|---|---|---|
+| Monday to Saturday | `replay` | the published archive; no reference engine runs, and neither BNG2.pl nor AMICI is provisioned |
+| Sunday | `live` | every engine runs, as before, so an oracle-side change surfaces within a week |
+| on demand | `record` | live, and the run publishes a new archive |
+
+A manual run picks its mode (`gh workflow run nightly-parity.yml -f mode=live`); a
+pull request replays once a manifest is committed. `sbml`, `dsmts` and `fd_sens`
+need no engine and run the same in every mode.
+
+**What a replay compares against.** The archive is one release asset per suite,
+`reference-<suite>.tar.gz` on a `reference-data-vN` release (not a bngsim
+release: `release.yml` publishes `v*` tags only). `reference_archive.json` here
+pins each asset's URL and sha256. Each job's `reference_archive.py prepare` step
+downloads its asset, checks the sha256, and unpacks one `.npz` per job for the
+runner's `--reference-archive` flag; a missing or mismatched asset fails the job,
+and the night alerts. Inside, an entry holds what the engine returned (or the
+error it raised) and the job identity it is valid for: the model file's sha256,
+the grid, the tolerances and so on, per runner. An entry that no longer matches its
+job (a model, grid or tolerance changed) is refused, never compared: the row is
+REFERENCE_FAILED with `reference_refusal: archive_stale`, which alerts wherever the
+case was good. A replayed row reports the engine version the entry recorded.
+
+**Refreshing it.** Re-record after anything that changes the reference side: an
+engine pin (BioNetGen, AMICI, libRoadRunner), the corpus, a forced tolerance, or a
+harness change to how a runner calls its engine. A week of `archive_stale` alerts
+after such a change is the reminder.
+
+```bash
+gh workflow run nightly-parity.yml -f mode=record
+```
+
+That run is a live night that also records every suite. Each suite packs its
+record (`reference_archive.py pack`) before comparing, and refuses if any PASS row
+has no recorded reference, since that row would then alert every night. The
+publish job then creates the next `reference-data-vN` release with all six assets,
+or none if any suite failed to pack, and writes the manifest into the run summary
+and the `reference-manifest` artifact. Nothing replays from the new release until
+that file is committed:
+
+```bash
+gh run download <run-id> -n reference-manifest -D /tmp/ref
+cp /tmp/ref/reference_archive.json parity_checks/nightly/reference_archive.json
+```
+
+The pull request that commits it runs the nightly in replay mode against the new
+assets, which is the check that they reproduce the live verdicts.
+
+**Licensing.** An asset holds outputs computed from the models, so it goes only
+where the models' licenses allow a copy. `pack` looks every entry's model up in
+the corpus provenance manifests (`benchmarks/suites/biomodels/biomodels_provenance.json`,
+`bng_parity/manifest.json`) and packs it only under CC0-1.0, CC-BY-4.0 or MIT; any
+other license, `unknown` included, leaves the entry out, lists it, and leaves that
+row `archive_stale` until someone reviews it. Today every BioModels record is CC0
+and every BNG model MIT or CC-BY-4.0, so nothing is left out. An asset with any
+non-CC0 entry carries bngsim's `NOTICE` (the CC-BY attribution and the MIT text)
+and RuleMonkey's license, and its `entries.json` lists each entry's model, source
+and license.
+
 ## Running it locally
 
 ```bash

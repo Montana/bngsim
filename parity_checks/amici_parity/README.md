@@ -546,3 +546,5 @@ records the AMICI version that made it, and a replayed row's `versions.amici`
 is that version rather than whatever AMICI is installed where the replay ran.
 The two flags are mutually exclusive, and the report's `_meta.reference_source`
 says which side the AMICI numbers came from.
+
+In CI the nightly replays this archive Monday to Saturday and runs the engine live on Sundays; recording and publishing it, and what may go in it, are in [`nightly/README.md`](../nightly/README.md#the-reference-archive-issue-805).

@@ -553,6 +553,49 @@ def _piecewise_of_if(sp):
     return piecewise
 
 
+_truth_comparisons_cache: dict = {}
+
+
+def _truth_comparisons(sp) -> dict:
+    """``{"Eq": ..., "Ne": ...}`` for the parse: sympy's own, except between two
+    truth values, which are written with the connectives instead.
+
+    ``a != b`` over two conditions is their xor, and ``a == b`` their xnor.
+    sympy keeps such a pair as an ``Unequality`` / ``Equality`` whose sides are
+    themselves relations, and what reads a relation as the sign of ``lhs -
+    rhs`` takes it for one comparison: a size that jumps on one failed to load
+    (``StrictLessThan - StrictGreaterThan``). The SBML loader writes ``xor``,
+    and ``eq`` / ``neq`` of two conditions, with the connectives itself
+    (``_xor_text``); this is for such a pair from anywhere else, an ExprTk
+    ``(A > 1) != (B > 1)`` or an operand the loader could not tell was a
+    condition. An n-ary nest doubles the text of its first operands at each
+    level.
+
+    A sympy ``Symbol`` is a ``Boolean`` too, so a truth value is told by what
+    it is: a comparison, a connective, or ``true`` / ``false``. Built once, for
+    the reason :func:`engine_sympy_bindings` gives."""
+    bound = _truth_comparisons_cache.get("bound")
+    if bound is None:
+        from sympy.core.relational import Relational
+        from sympy.logic.boolalg import BooleanAtom, BooleanFunction
+
+        truth = (Relational, BooleanAtom, BooleanFunction)
+
+        def eq(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, b), sp.And(sp.Not(a), sp.Not(b)))
+            return sp.Eq(a, b, **options)
+
+        def ne(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, sp.Not(b)), sp.And(sp.Not(a), b))
+            return sp.Ne(a, b, **options)
+
+        bound = {"Eq": eq, "Ne": ne}
+        _truth_comparisons_cache["bound"] = bound
+    return bound
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -587,8 +630,7 @@ def _build_local_dict(preprocessed: str, sp):
         # ``Eq`` / ``Ne`` are the call form ``_rewrite_logicals`` produces for
         # ``==`` / ``!=`` (GH #335). Bound here — like the connectives — so the
         # round trip does not lean on ``parse_expr``'s implicit sympy global dict.
-        "Eq": sp.Eq,
-        "Ne": sp.Ne,
+        **_truth_comparisons(sp),
     }
     alias_of: dict[str, str] = {}
 
@@ -623,8 +665,13 @@ def _build_local_dict(preprocessed: str, sp):
     return local, alias_of
 
 
-def _exprtk_to_sympy(expr: str):
-    """Parse an ExprTk rate-law string into a sympy expression, or ``None``."""
+def _exprtk_to_sympy(expr: str, *, bends: bool = False):
+    """Parse an ExprTk rate-law string into a sympy expression, or ``None``.
+
+    ``bends`` binds ``clamp`` to the ``clampval`` twin of :func:`_kink_bindings`
+    (issue #1227), for a caller that differentiates bends and turns the twins
+    back with :func:`_finish_kinks`. Off, a ``clamp`` call is left unbound, as
+    it always was, for every other reader of this parse."""
     try:
         import sympy as sp
         from sympy.parsing.sympy_parser import parse_expr
@@ -638,6 +685,8 @@ def _exprtk_to_sympy(expr: str):
     s = re.sub(r"\blog2\s*\(", "(1.0/log(2))*log(", s)
 
     local, alias_of = _build_local_dict(s, sp)
+    if bends and re.search(r"\bclamp\s*\(", s):
+        local["clamp"] = _kink_bindings(sp)["clampval"]
 
     # Apply keyword aliases (longest first so e.g. ``lambda`` is replaced before
     # a hypothetical ``lambda2`` substring would be — word-boundary anchored).
@@ -1064,10 +1113,29 @@ def _kink_bindings(sp) -> dict:
 
             return type(name, (sp.Function,), {"nargs": 2, "fdiff": fdiff})
 
+        # Issue #1227: clamp(lo, x, hi) is ExprTk's e_clamp, `lo` where x < lo,
+        # else `hi` where x > hi, else `x`, tested in that order, so crossed
+        # bounds (lo > hi) give `lo` below it and `hi` from it on, which no
+        # Max/Min pair spells. Its derivative in each argument is the region
+        # where that argument is the value, each edge split as the binary twins
+        # split a tie: x between the bounds; lo below it; hi above both.
+        def clamp_fdiff(self, argindex=1):
+            lo, x, hi = self.args
+
+            def step(u):
+                return sp.Heaviside(u, sp.S.Half)
+
+            if argindex == 1:
+                return step(lo - x)
+            if argindex == 2:
+                return step(x - lo) * step(hi - x)
+            return step(x - lo) * step(x - hi)
+
         bindings = {
             "absval": absval,
             "maxval": binary("maxval", 1),
             "minval": binary("minval", -1),
+            "clampval": type("clampval", (sp.Function,), {"nargs": 3, "fdiff": clamp_fdiff}),
         }
         _kink_sympy_cache["bindings"] = bindings
     return bindings
@@ -1131,6 +1199,7 @@ def _finish_kinks(deriv):
         return deriv
     kinks = _kink_bindings(sp)
     absval = kinks["absval"]
+    clampval = kinks["clampval"]
     folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
@@ -1170,6 +1239,10 @@ def _finish_kinks(deriv):
             )
             if type(out) is absval:
                 out = sp.Abs(out.args[0])
+            elif type(out) is clampval:
+                # The engine's order of tests, which every emitter prints.
+                lo, x, hi = out.args
+                out = sp.Piecewise((lo, x < lo), (hi, x > hi), (x, True))
         memo[node] = out
         return out
 
@@ -1450,7 +1523,9 @@ def differentiate_rate_law(
         )
         return None
 
-    sym_expr = _exprtk_to_sympy(inlined)
+    # A clamp() is a bend like abs / min / max, which this path differentiates
+    # through the kink twins below wherever they appear (issue #1227).
+    sym_expr = _exprtk_to_sympy(inlined, bends=True)
     if sym_expr is None:
         _declined(f"rate law {_short(rate_expr)} could not be parsed into sympy", kind="unparsed")
         return None

@@ -557,6 +557,9 @@ template <class S> typename S::Obj codegen_data(const bngsim::NetworkModel &m, S
         // prefers it; every emitter that DIFFERENTIATES keeps reading
         // "expression", which is the smooth declared law.
         s.set(fd, "eval_expression", val(s, f.eval_expression));
+        // Issue #1186: read only by event assignments, so the emitted
+        // right-hand side leaves it out.
+        s.set(fd, "deferred", val(s, f.deferred));
         s.push(func_list, s.done(fd));
     }
     s.set(d, "functions", s.done(func_list));
@@ -2667,6 +2670,45 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "differentiates the trigger's threshold symbolically, so it needs "
             "the model's own spelling rather than the evaluator's preprocessed "
             "form.")
+        .def(
+            "events_as_written",
+            [](bngsim::NetworkModel &self) {
+                // The evaluator keeps each compiled expression's text; '' where
+                // it is not the ExprTk one, or the expression is not compiled.
+                const auto *exprtk =
+                    dynamic_cast<const bngsim::ExprTkEvaluator *>(&self.evaluator());
+                const auto text = [&](int idx) {
+                    return exprtk != nullptr && idx >= 0 ? exprtk->preprocessed_expr(idx)
+                                                         : std::string();
+                };
+                py::list out;
+                for (const auto &ev : self.events()) {
+                    py::list assignments;
+                    for (const auto &[sp, expr] : ev.assignments)
+                        assignments.append(py::make_tuple(sp, text(expr)));
+                    py::dict d;
+                    d["id"] = ev.id;
+                    d["trigger"] = ev.trigger_source;
+                    d["assignments"] = assignments;
+                    d["delay"] = ev.delay;
+                    d["delay_expr"] = text(ev.delay_expr_idx);
+                    d["priority"] = ev.priority;
+                    d["priority_expr"] = text(ev.priority_expr_idx);
+                    d["persistent"] = ev.persistent;
+                    d["initial_value"] = ev.initial_value;
+                    d["use_values_from_trigger_time"] = ev.use_values_from_trigger_time;
+                    d["size_jump_compartment"] = ev.size_jump_compartment;
+                    out.append(d);
+                }
+                return out;
+            },
+            "Each event as the run reads it, in events() order (issue #1244): {id, "
+            "trigger (as written), assignments [(0-based species index, value text)], "
+            "delay, delay_expr, priority, priority_expr, persistent, initial_value, "
+            "use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, "
+            "'' where none is "
+            "compiled. A schedule that reads a species only events write has its stops "
+            "placed from when those events set it.")
         .def_property_readonly("n_discontinuity_triggers",
                                &bngsim::NetworkModel::n_discontinuity_triggers)
         .def(
@@ -3310,7 +3352,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "a file — BNG's tfun([xs],[ys],index) form. xs must be monotonically "
              "increasing and the same length as ys.")
         .def("add_function", &bngsim::ModelBuilder::add_function, py::arg("name"),
-             py::arg("expression"), "Add a function (named expression). Returns 0-based index.")
+             py::arg("expression"), py::arg("deferred") = false,
+             "Add a function (named expression). Returns 0-based index. A deferred "
+             "function is read only by event assignments: the right-hand side and the "
+             "event roots do not evaluate it (issue #1186).")
         .def(
             "add_reaction",
             [](bngsim::ModelBuilder &self, const std::vector<int> &reactants,
@@ -3445,11 +3490,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "species, or -1. The engine stores base * size before / size after the event's "
              "other assignments rather than the assignment's expression.")
         .def("set_last_event_size_jump", &bngsim::ModelBuilder::set_last_event_size_jump,
-             py::arg("compartment"),
+             py::arg("compartment"), py::arg("before") = "",
              "Issue #1054: mark the most recently added event as the rescale where the "
              "piecewise assignment-rule size of the compartment jumps. The ODE engine "
              "executes it before the other events of its instant read their trigger, "
-             "values and delay.")
+             "values and delay. before, where given, is the compartment's size before "
+             "the jump (issue #1181).")
         .def("set_compute_conservation_laws", &bngsim::ModelBuilder::set_compute_conservation_laws,
              py::arg("enabled"),
              "Enable/disable conservation-law detection in build() (GH #102). The "
@@ -3676,6 +3722,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
         // Issue #524 — "newton" from the given state, no burst, stability reported.
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
+        // Issue #1191 — the burst-free solve without its stability certificate.
+        .def_readwrite("certify_root", &bngsim::SteadyStateOptions::certify_root)
+        // Issue #1191 — certify the given state as the root, with no Newton step.
+        .def_readwrite("certify_start", &bngsim::SteadyStateOptions::certify_start)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty

@@ -44,6 +44,17 @@ def _refused(text, params, issue, times=TIMES, rtol=1e-10, atol=1e-12, ic=None):
         sim.run(sample_times=times, rtol=rtol, atol=atol, timeout=60)
 
 
+def _unconfirmed(text, params, issue, times, rtol, atol=1e-9):
+    """Refused by the run at a hundredth of the tolerances that confirms an
+    order in the window (issue #1025), and not on one step's reach."""
+    model = bngsim.Model.from_antimony_string(text)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=params)
+    with pytest.raises(bngsim.SimulationError, match=f"#{issue}") as refused:
+        sim.run(sample_times=times, rtol=rtol, atol=atol, timeout=60)
+    assert "a hundredth of the tolerances" in str(refused.value)
+    assert "#1025" in str(refused.value)
+
+
 ON_ONE_INSTANT = {
     # dX/dthr = −1 for −0.5: the time switch's jump, twice.
     "a-fitted-time-switch-in-another-law": (
@@ -488,16 +499,48 @@ def test_a_counter_moved_by_its_own_rate_is_refused():
     _refused(text, ["one"], 946, rtol=1e-6, atol=1e-9)
 
 
+EVENT_BETWEEN = (
+    "species X, W, V, U; X = 0; W = 0; V = 0; U = 1; a = 2; q = 0.7; c = 1\n"
+    "J0: -> X; a\nJv: -> V; 2\nJu: -> U; c*U\nJ2: -> W; piecewise(q*X, V >= 6, 0)\n"
+    f"E1: at (U > {math.exp(3 + 5e-7)!r}): X = 0.5*X\nE2: at (V >= 5.9999998): W = W + 0\n"
+)
+
+
 def test_an_event_between_the_two_does_not_hide_the_first():
     """The event on U = e^(c·t) is 5e-7 after the switch on V, inside the
     reach at rtol 1e-6, and an event that does nothing fires on V between
     them. Only the last fire was remembered: dW/dc came back 9.45 for 3.15."""
-    text = (
-        "species X, W, V, U; X = 0; W = 0; V = 0; U = 1; a = 2; q = 0.7; c = 1\n"
-        "J0: -> X; a\nJv: -> V; 2\nJu: -> U; c*U\nJ2: -> W; piecewise(q*X, V >= 6, 0)\n"
-        f"E1: at (U > {math.exp(3 + 5e-7)!r}): X = 0.5*X\nE2: at (V >= 5.9999998): W = W + 0\n"
+    _refused(EVENT_BETWEEN, ["c"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize("rtol", [2e-7, 3e-7])
+def test_an_event_whose_trigger_s_error_has_added_up_is_refused(rtol):
+    """Issue #1025, from the event's side. V = 2t is exact and its switch is
+    known to one step's tolerance; the event's trigger on U = e^(c·t) carries
+    what every step added to U's error, and at these the event was found
+    before the switch it follows: dW/dc = 9.45 for 3.15, with no error. The
+    fire now has a reach of its own, which the two are judged apart by."""
+    _unconfirmed(EVENT_BETWEEN, ["c"], 945, EVENT_TIMES, rtol=rtol)
+
+
+def test_an_event_its_tolerance_does_place_after_the_switch_runs():
+    """Control: at rtol 1e-9 the event is placed after the switch, as it is.
+    The central difference of plain runs at rtol 1e-12 gives 3.15."""
+    model = bngsim.Model.from_antimony_string(EVENT_BETWEEN)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["c"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-9, atol=1e-9, timeout=60
     )
-    _refused(text, ["c"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(3.15, rel=1e-5)
+
+
+SWITCH_BETWEEN = (
+    "species X, W, V, Z, Q; X = 0; W = 0; V = 1; Z = 5.9999996; Q = 0; a = 2; q = 0.7;"
+    " tau = 3; kv = 2\n"
+    "J0: -> X; a\nJv: -> V; kv*V\nJz: Z -> ; 2\nJq: -> Q; piecewise(1, Z <= 0, 0)\n"
+    f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)\n"
+    "E1: at (time >= tau): X = 0.5*X\n"
+)
 
 
 def test_a_switch_between_the_two_does_not_hide_the_first():
@@ -505,14 +548,411 @@ def test_a_switch_between_the_two_does_not_hide_the_first():
     before it at rtol 1e-6, and a second switch that jumps, on Z through 0,
     crosses between them. Only the last crossing was remembered: dW/dtau came
     back −1.05 for −3.15."""
-    text = (
-        "species X, W, V, Z, Q; X = 0; W = 0; V = 1; Z = 5.9999996; Q = 0; a = 2; q = 0.7;"
-        " tau = 3; kv = 2\n"
-        "J0: -> X; a\nJv: -> V; kv*V\nJz: Z -> ; 2\nJq: -> Q; piecewise(1, Z <= 0, 0)\n"
-        f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)\n"
-        "E1: at (time >= tau): X = 0.5*X\n"
+    _refused(SWITCH_BETWEEN, ["tau"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize("rtol", [2e-6, 1.1e-6, 9e-7, 5e-7])
+def test_a_switch_whose_error_has_added_up_is_refused_around_that_tolerance(rtol):
+    """Issue #1025. V = e^(2t) carries what every step added to its error:
+    39 to 185 times one step's tolerance at t = 3, more than the 1.99e-5 its
+    switch follows the event by, and the run found the switch first. The
+    reach was one step's tolerance, so only rtol 1e-6 itself was refused, and
+    these returned dW/dtau = −1.05 for −3.15 with no error."""
+    _unconfirmed(SWITCH_BETWEEN, ["tau"], 945, EVENT_TIMES, rtol=rtol)
+
+
+@pytest.mark.parametrize("rtol", [1e-7, 1e-8, 1e-10])
+def test_a_switch_the_tolerance_does_place_after_the_event_runs(rtol):
+    """Control. At these the run places the switch after the event, as it is:
+    W gathers 0.7·dX/dtau = −0.7 over the 4.5 after it."""
+    model = bngsim.Model.from_antimony_string(SWITCH_BETWEEN)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=rtol, atol=1e-9, timeout=60
     )
-    _refused(text, ["tau"], 945, EVENT_TIMES, rtol=1e-6, atol=1e-9)
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
+
+
+# The same two models run from t = -3, with the event at t = 0.
+EARLY_TIMES = [t - 3.0 for t in EVENT_TIMES]
+SWITCH_BETWEEN_EARLY = SWITCH_BETWEEN.replace("tau = 3;", "tau = 0;")
+
+
+@pytest.mark.parametrize(
+    "text, param, rtol",
+    [
+        (SWITCH_BETWEEN_EARLY, "tau", 2e-6),
+        (SWITCH_BETWEEN_EARLY, "tau", 5e-7),
+        (EVENT_BETWEEN, "c", 3e-7),
+        (EVENT_BETWEEN, "c", 2e-7),
+    ],
+    ids=["switch, 2e-6", "switch, 5e-7", "event, 3e-7", "event, 2e-7"],
+)
+def test_a_run_that_starts_off_0_counts_its_error_from_its_start(text, param, rtol):
+    """The error that has added up is counted over the run's time so far. Read
+    as |t|, a run from t = -3 had next to none at the event at 0, and these
+    came back dW/dtau = -1.05 and dW/dc = 9.45 again, with no error."""
+    _unconfirmed(text, [param], 945, EARLY_TIMES, rtol=rtol)
+
+
+def test_a_run_that_starts_off_0_runs_where_its_tolerance_places_the_two():
+    """Control: from t = -3 at rtol 1e-8 the switch is placed after the event."""
+    model = bngsim.Model.from_antimony_string(SWITCH_BETWEEN_EARLY)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EARLY_TIMES, rtol=1e-8, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(-3.15, rel=1e-5)
+
+
+# Issue #1025's review. What a run's error is at a crossing is neither the sum
+# of what each step allows nor what |x| at the crossing allows: the first
+# refused runs that main returns right, and the second let through a crossing
+# whose error was made elsewhere. Past one step's tolerances, a pair inside a
+# generous window is confirmed against a plain run at a hundredth of the
+# tolerances instead.
+#
+# V = t − 0.5·cos(t) + 0.5 reaches 1000 at t ≈ 999.84, 0.66 before the event
+# at 1000.5, and an oscillator ω forces the steps. W gathers q·X from the
+# switch on, X halves at the event: dW/dtau = q·(tau − (1005 − tau)) = 697.2.
+LONG_RUN = (
+    "species X, W, V, O, P; X = 0; W = 0; V = 0; O = 1; P = 0; a = 2; q = 0.7;"
+    " tau = 1000.5\n"
+    "J0: -> X; a\nJv: -> V; 1 + 0.5*sin(time)\nJo: -> O; -{w}*P\nJp: -> P; {w}*O\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= tau): X = 0.5*X\n"
+)
+LONG_TIMES = [float(t) for t in np.linspace(0.0, 1005.0, 6)]
+
+
+@pytest.mark.parametrize(
+    "w, rtol",
+    [(0.0, 1e-5), (0.0, 1e-6), (5.0, 1e-4), (5.0, 1e-6)],
+    ids=["no-oscillator-1e-5", "no-oscillator-1e-6", "oscillator-1e-4", "oscillator-1e-6"],
+)
+def test_a_long_run_s_switch_well_before_the_event_runs(w, rtol):
+    """The step sum put the two within reach at every one of these, the
+    widest 6,070 against a gap of 0.66, and refused them; main returns
+    697.2. A run at a hundredth of the tolerances puts the state on the
+    switch's far side at the event by 4 to 10⁶ times what the residual
+    moved between the two."""
+    model = bngsim.Model.from_antimony_string(LONG_RUN.format(w=w))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=LONG_TIMES, rtol=rtol, atol=1e-9, timeout=60
+    )
+    w_idx = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w_idx, 0] == pytest.approx(697.2, rel=1e-6)
+
+
+# V = sin(t) crosses −δ just after π, where the event halves X. With the
+# event first, which is the truth, dW/dtau = −q·(π − 2·asin δ); with the
+# switch first it is 0.
+NEAR_0 = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; tau = {tau!r}\n"
+    "J0: -> X; a\nJv: -> V; cos(time)\nJ2: -> W; piecewise(q*X, V <= -{d}, 0)\n"
+    "E1: at (time >= tau): X = 0.5*X\n"
+)
+
+
+@pytest.mark.parametrize(
+    "d, rtol", [("5e-7", 3e-6), ("5e-7", 5e-7), ("5e-6", 3e-6), ("1e-10", 3e-6)]
+)
+def test_a_switch_near_0_whose_error_was_made_elsewhere_is_refused(d, rtol):
+    """V's error at π is what it took on where V was 1: 2.2e-5 at rtol 3e-6.
+    Read off |V| at the crossing, 1e-7 and below, and a bend weight of 0
+    there (V'' = 0), the reach was 10³ times short, and the run returned 0
+    for −2.199 with no error. The residual at the event moves by 6 to 160
+    times itself between this run and one at a hundredth of the
+    tolerances."""
+    _unconfirmed(NEAR_0.format(d=d, tau=math.pi), ["tau"], 945, EVENT_TIMES, rtol=rtol)
+
+
+def test_a_switch_near_0_the_tolerance_does_place_after_the_event_runs():
+    """Control: δ = 2e-5 at rtol 1e-6, where the run's error at π is a
+    seventh of the residual."""
+    model = bngsim.Model.from_antimony_string(NEAR_0.format(d="2e-5", tau=math.pi))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    truth = -0.7 * (math.pi - 2.0 * math.asin(2e-5))
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(truth, rel=1e-5)
+
+
+@pytest.mark.parametrize("rtol", [1e-6, 5e-7])
+def test_a_switch_near_0_is_refused_however_sparse_the_outputs(rtol):
+    """The largest V has been is read wherever the right-hand side is
+    asked, not at the outputs alone: with only t = 0 and 7.5 asked for,
+    no row lands near V's peak of 1, and this came back 2.4e-6 and 5.8e-8
+    for −2.199 with no error."""
+    _unconfirmed(NEAR_0.format(d="5e-6", tau=math.pi), ["tau"], 945, [0.0, 7.5], rtol=rtol)
+
+
+def _long_run_crossing():
+    """Where V = t − 0.5·cos(t) + 0.5 reaches 1000, by Newton."""
+    t = 1000.0
+    for _ in range(50):
+        t -= (t - 0.5 * math.cos(t) + 0.5 - 1000.0) / (1.0 + 0.5 * math.sin(t))
+    return t
+
+
+# The same switch moved by kv, V' = kv·(1 + 0.5·sin t), beside a fixed event
+# `gap` after it.
+MOVED_BY_KV = (
+    "species X, W, V, O, P; X = 0; W = 0; V = 0; O = 1; P = 0; a = 2; q = 0.7; kv = 1\n"
+    "J0: -> X; a\nJv: -> V; kv*(1 + 0.5*sin(time))\nJo: -> O; -{w}*P\nJp: -> P; {w}*O\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= {te!r}): X = 0.5*X\n"
+)
+
+
+def test_a_switch_a_column_moves_beside_a_fixed_event_is_refused_however_wide_the_window():
+    """A column moves a crossing where it moves its time by more than the
+    reach. Measured against the step sum, 6,000 at rtol 1e-4 under the
+    oscillator, kv moved it by 1,000 and was taken not to: the event does not
+    move either, nothing was refused, and dW/dkv came back 513,028, the
+    event-first side, for the 1,026,056 of a switch 1e-9 before it. Main
+    refuses; the reach a column is judged against is one step's again."""
+    text = MOVED_BY_KV.format(w=5.0, te=_long_run_crossing() + 1e-9)
+    _refused(text, ["kv"], 946, LONG_TIMES, rtol=1e-4, atol=1e-9)
+
+
+@pytest.mark.parametrize("gap", [-1e-9, 1e-3], ids=["event-first", "switch-first"])
+def test_a_switch_whose_error_is_far_past_its_gap_to_an_event_is_refused(gap):
+    """With no oscillator the run's crossing at rtol 1e-6 was 6.7e-3 early,
+    past the reach of an event 1e-9 or 1e-3 away. Main took the switch
+    first both times: dW/dkv came back 1,027,777, the switch-first side, for
+    an event that fires first, with no error. The switch's residual where
+    the event fired was 0.0105 against 0.00035 at a hundredth of the
+    tolerances."""
+    text = MOVED_BY_KV.format(w=0.0, te=_long_run_crossing() + gap)
+    _unconfirmed(text, ["kv"], 945, LONG_TIMES, rtol=1e-6)
+
+
+# V' = kv·(1 − 0.5·cos t) reaches 1000 at t* ≈ 1000.4975, which the run
+# reads late at every tolerance: V is 0.013 to 0.67 low there.
+LATE_SWITCH = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; kv = 1\n"
+    "J0: -> X; a\nJv: -> V; kv*(1 - 0.5*cos(time))\n"
+    "J2: -> W; piecewise(q*X, V >= 1000, 0)\nE1: at (time >= {te!r}): X = 0.5*X\n"
+)
+
+
+def _late_switch_crossing():
+    """Where V = t − 0.5·sin(t) reaches 1000, by Newton."""
+    t = 1000.0
+    for _ in range(50):
+        t -= (t - 0.5 * math.sin(t) - 1000.0) / (1.0 - 0.5 * math.cos(t))
+    return t
+
+
+def test_a_crossing_found_after_a_fire_it_came_before_is_refused():
+    """The switch is 0.002 before the event, which is fixed: kv moves the
+    crossing alone. At rtol 1e-5 the run fires the event first and finds
+    the crossing 0.03 after it, and main returned dW/dkv = 723,606, the
+    event-first side, for 1,474,092 with no error. Only the crossing can
+    ask, of the fire behind it: at a hundredth of the tolerances the
+    switch's residual there is on the other side of its surface (−0.032
+    against +0.0008)."""
+    text = LATE_SWITCH.format(te=_late_switch_crossing() + 0.002)
+    _unconfirmed(text, ["kv"], 945, LONG_TIMES, rtol=1e-5)
+
+
+def test_a_crossing_found_after_a_confirmed_fire_runs():
+    """Control: under the oscillator the same order is confirmed. With the
+    event first X is 2t − te at the crossing: dW/dkv = 0.7·(2t* − te)·1000/V'(t*)."""
+    ts = _long_run_crossing()
+    te = ts - 0.01
+    model = bngsim.Model.from_antimony_string(MOVED_BY_KV.format(w=5.0, te=te))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["kv"]).run(
+        sample_times=LONG_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    truth = 0.7 * (2.0 * ts - te) * 1000.0 / (1.0 + 0.5 * math.sin(ts))
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(truth, rel=1e-4)
+
+
+def test_a_switch_whose_gap_to_an_event_is_confirmed_runs():
+    """Control: under the oscillator the same gap is confirmed, and dW/dkv
+    is q·X(t*)·|dt*/dkv| = 0.7·2t*·1000/V'(t*)."""
+    ts = _long_run_crossing()
+    model = bngsim.Model.from_antimony_string(MOVED_BY_KV.format(w=5.0, te=ts + 1e-3))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["kv"]).run(
+        sample_times=LONG_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    truth = 0.7 * 2.0 * ts * 1000.0 / (1.0 + 0.5 * math.sin(ts))
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(truth, rel=1e-4)
+
+
+# SWITCH_BETWEEN's switch on V = e^(2t), 1.99e-5 after a fitted gate at tau in
+# the same rate law. With the gate first, which is the truth, the switch
+# turns on the whole law and dW/dtau = 0; with the switch first W gathers
+# half the law until tau, −0.5·q·X(tau) = −2.1.
+CLOCK_IN_THE_SAME_LAW = (
+    "species X, W, V; X = 0; W = 0; V = 1; a = 2; q = 0.7; tau = 3; kv = 2\n"
+    "J0: -> X; a\nJv: -> V; kv*V\n"
+    f"J2: -> W; piecewise(q*X, V >= {math.exp(6 + 2 * 1.99e-5)!r}, 0)"
+    "*piecewise(1, time >= tau, 0.5)\n"
+)
+
+
+@pytest.mark.parametrize("rtol", [2e-6, 1e-6, 1e-7])
+def test_a_switch_whose_error_has_added_up_beside_a_gate_in_its_law_is_refused(rtol):
+    """The #1025 edge from a clock's side: main returned −2.1 for 0 at each
+    of these with no error. The switch's residual at the gate is on the
+    other side of its surface in a run at a hundredth of the tolerances."""
+    _unconfirmed(CLOCK_IN_THE_SAME_LAW, ["tau"], 946, EVENT_TIMES, rtol=rtol)
+
+
+def test_a_switch_the_tolerance_does_place_after_a_gate_in_its_law_runs():
+    """Control: at rtol 1e-8 the gate comes first, as it does."""
+    model = bngsim.Model.from_antimony_string(CLOCK_IN_THE_SAME_LAW)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-8, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(0.0, abs=1e-8)
+
+
+# V = sin(t) comes down through δ just before π, where the event sets V to 2
+# and it never comes back. With the switch first, which is the truth, W
+# gathers q·X until the event: dW/dtau = q·2π = 4.398; with the event first
+# it is 0, and no crossing is found to ask about.
+TURNED_BACK = (
+    "species X, W, V; X = 0; W = 0; V = 0; a = 2; q = 0.7; tau = 3.141592653589793\n"
+    "J0: -> X; a\nJv: -> V; cos(time)\nJ2: -> W; piecewise(q*X, V <= {d}, 0)\n"
+    "E1: at (time >= tau): V = 2\n"
+)
+
+
+@pytest.mark.parametrize("d, rtol", [("2e-5", 1e-5), ("5e-6", 3e-6)])
+def test_a_switch_the_event_turns_back_before_it_crosses_is_refused(d, rtol):
+    """V read high at π, the switch had not crossed when the event fired,
+    and after it there was nothing to cross: main returned 0 for 4.398. At
+    the event the residual is on its way to its surface, past one step's
+    tolerances and within the window, and the event writes V."""
+    _unconfirmed(TURNED_BACK.format(d=d), ["tau"], 945, EVENT_TIMES, rtol=rtol)
+
+
+def test_a_switch_the_event_turns_back_after_it_crosses_runs():
+    """Control: at rtol 1e-6 the switch is found first, as it is."""
+    model = bngsim.Model.from_antimony_string(TURNED_BACK.format(d="2e-5"))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["tau"]).run(
+        sample_times=EVENT_TIMES, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(0.7 * 2 * math.pi, rel=1e-6)
+
+
+# A fire every 2π, a counter reset by its own event which also writes X, and a
+# switch on S = S0 + kv·sin(t) through S0 + 0.5, crossing 0.52 from the
+# nearest fire every time. The step sum's window spans many crossings and
+# fires by t = 1300.
+PERIODIC = (
+    "species X, W, S, C; X = 0; W = 0; S = 1000; C = 0; a = 2; q = 0.7; kv = 1\n"
+    "J0: -> X; a\nJs: -> S; kv*cos(time)\nJc: -> C; 1/(2*pi)\n"
+    "J2: -> W; piecewise(q*X, S >= 1000.5, 0)\nE1: at (C >= 1): C = 0, X = X + 1\n"
+)
+
+
+def test_a_long_run_of_many_crossings_and_fires_runs():
+    """Every pair inside the window was kept, past 4,096 by t = 1334, and the
+    run was refused for having more than are confirmed, where main returns
+    3.478e6. Of each switch, a fire asks the last crossing alone, and a
+    crossing the last fire of each event."""
+    model = bngsim.Model.from_antimony_string(PERIODIC)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["kv"]).run(
+        sample_times=[float(t) for t in np.linspace(0.0, 5000.0, 11)],
+        rtol=1e-6,
+        atol=1e-9,
+        timeout=60,
+    )
+    w = list(run.species_names).index("W")
+    assert np.asarray(run.sensitivities)[-1, w, 0] == pytest.approx(3.4779e6, rel=1e-3)
+
+
+# Issue #1025's review: what is dropped from the records the window asks.
+# S = sin(om·t) crosses 0.5 twice a period, about 4,100 times at om = 3200
+# before B = e^(−5t) falls through 1e-9 at t = 4.14, where the event halves X.
+# B's flow there is 5e-9, so the fire's window reaches back past every
+# crossing; at om = 3000 they are all kept.
+MANY_CROSSINGS = (
+    "species S, W, X, B, T, Y; S = 0; W = 0; X = 0; B = 1; T = 1; Y = 0; om = {om!r};"
+    " q = 0.7; lam = 5\n"
+    "Js: -> S; om*cos(om*time)\nJ2: -> W; piecewise(q*X, S >= 0.5, 0)\n"
+    "Jt: -> T; T\nJ3: -> Y; piecewise(q*X, T >= {once}, 0)\n"
+    "Jx: -> X; 1\nJb: B -> ; lam*B\nE1: at (B < 1e-9): X = 0.5*X\n"
+)
+EVICTION_TIMES = [float(t) for t in np.linspace(0.0, 5.0, 51)]
+
+
+def _evicted(text, param, times):
+    model = bngsim.Model.from_antimony_string(text)
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=[param])
+    with pytest.raises(bngsim.SimulationError, match="than are kept to ask it about"):
+        sim.run(sample_times=times, rtol=1e-6, atol=1e-9, timeout=60)
+
+
+def _column(text, param, times, name):
+    model = bngsim.Model.from_antimony_string(text)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=[param]).run(
+        sample_times=times, rtol=1e-6, atol=1e-9, timeout=60
+    )
+    return np.asarray(run.sensitivities)[-1, list(run.species_names).index(name), 0]
+
+
+def test_a_fire_past_thousands_of_one_switch_s_crossings_runs():
+    """The oldest crossings are dropped, but the fire asks only the last
+    crossing of each switch, which is kept. Refused on any one dropped, it
+    was refused where main returns 0.0828 (T never crosses here)."""
+    text = MANY_CROSSINGS.format(om=3200.0, once="1e300")
+    assert _column(text, "lam", EVICTION_TIMES, "W") == pytest.approx(0.0828239, rel=1e-3)
+
+
+def test_a_switch_whose_only_crossing_was_dropped_is_refused():
+    """T = e^t crosses once, at t = 0.1, in a law the event's write to X
+    changes. Past 4,096 crossings of S it is dropped, and it has no later
+    crossing kept to stand for it: the fire cannot be asked about it."""
+    _evicted(MANY_CROSSINGS.format(om=3200.0, once=math.exp(0.1)), "lam", EVICTION_TIMES)
+
+
+def test_a_switch_whose_only_crossing_is_kept_runs():
+    """Control: at om = 3000 it is kept, and the order is confirmed. Y
+    gathers q·X from t = 0.1 and X halves at t_F = ln(1e9)/lam:
+    dY/dlam = q·(t_F − 2.5)·dt_F/dlam."""
+    text = MANY_CROSSINGS.format(om=3000.0, once=math.exp(0.1))
+    t_fire = math.log(1e9) / 5.0
+    truth = 0.7 * (t_fire - 2.5) * (-t_fire / 5.0)
+    assert _column(text, "lam", EVICTION_TIMES, "Y") == pytest.approx(truth, rel=1e-4)
+
+
+# E1 fires every 1/rate until t = 4.5, about 4,500 times at rate 1000; E2
+# fires once, at 0.1, and writes X. B = e^(−2.5t) falls through 1e-9 at 8.29
+# with a flow of 2.5e-9: the crossing's window reaches back to E2.
+MANY_FIRES = (
+    "species C, B, X, Y; C = 0; B = 1; X = 0; Y = 0; rate = {rate!r}; q = 0.7; lam = 2.5\n"
+    "Jc: -> C; rate*piecewise(1, time < 4.5, 0)\nJb: B -> ; lam*B\nJx: -> X; 1\n"
+    "J3: -> Y; piecewise(q*X, B <= 1e-9, 0)\n"
+    "E1: at (C >= 1): C = 0\nE2: at (time >= 0.1): X = X + 1\n"
+)
+FIRES_TIMES = [float(t) for t in np.linspace(0.0, 10.0, 101)]
+
+
+def test_a_crossing_whose_event_s_only_fire_was_dropped_is_refused():
+    """Past 4,096 fires of E1, E2's one fire is dropped, and no later fire of
+    E2 is kept to stand for it."""
+    _evicted(MANY_FIRES.format(rate=1000.0), "lam", FIRES_TIMES)
+
+
+def test_a_crossing_whose_event_s_only_fire_is_kept_runs():
+    """Control: at rate 800 it is kept, and the order is confirmed. Y
+    gathers q·X from t_C = ln(1e9)/lam, where X = t_C + 1: dY/dlam =
+    q·(t_C + 1)·t_C/lam, 21.56. B is read to atol 1e-9 at a threshold of
+    1e-9, so the run's crossing is off by a few percent, and by 1.7e-4
+    more on Linux than on macOS."""
+    text = MANY_FIRES.format(rate=800.0)
+    t_cross = math.log(1e9) / 2.5
+    truth = 0.7 * (t_cross + 1.0) * t_cross / 2.5
+    assert _column(text, "lam", FIRES_TIMES, "Y") == pytest.approx(truth, rel=0.05)
 
 
 def test_a_trigger_that_reads_the_switch_s_species_and_another_is_refused():

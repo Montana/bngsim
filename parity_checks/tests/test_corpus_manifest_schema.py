@@ -3,8 +3,9 @@
 The schema (``parity_checks/manifest.schema.json``, JSON Schema draft 2020-12) is
 the contract for corpus reproducibility: one receipt per model with a pinned
 upstream origin, the sha256 of the tested bytes, and a license. This test locks
-that contract for all four committed manifests (bng_parity, rr_parity SED-ML,
-biomodels, DSMTS), so a bad vendor/fetch run — an unpinned ``@main`` origin, a
+that contract for every committed manifest (bng_parity, rr_parity SED-ML,
+biomodels, DSMTS, and the nightly's reference archive, one record per release
+asset), so a bad vendor/fetch run — an unpinned ``@main`` origin, a
 missing license, a patched-without-repairs record — fails loudly instead of
 silently shipping a non-reproducible manifest.
 
@@ -30,6 +31,7 @@ MANIFESTS = {
     "rr_parity_sedml": _PC / "rr_parity" / "temp_biomodels_manifest.json",
     "biomodels": _REPO / "benchmarks" / "suites" / "biomodels" / "biomodels_provenance.json",
     "dsmts": _REPO / "harness" / "sbml_test_suite" / "dsmts" / "dsmts_manifest.json",
+    "reference_archive": _PC / "nightly" / "reference_archive.json",
 }
 
 
