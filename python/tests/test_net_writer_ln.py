@@ -99,6 +99,16 @@ def test_the_natural_log_is_written_ln(tmp_path):
     assert "+catalog " in fields + " "
 
 
+def test_an_expression_written_as_it_is_is_spelled_ln_too(tmp_path):
+    """An expression the writer cannot give as one field (issue #1249) is
+    written as it is under strict=False, and its logarithm is still ``ln``."""
+    text = _NET.replace("k*log(Aobs+c)+", "if(Aobs > 1 xor k > 1, log(Aobs), 0)+")
+    with pytest.warns(bngsim.ConversionWarning, match="xor"):
+        net = write_net(_load(tmp_path, text), strict=False)
+    assert "if(Aobs > 1 xor k > 1, ln(Aobs), 0)+" in net
+    assert not re.search(r"(?<![\w.])log\s*\(", " ".join(_expressions(net))), net
+
+
 def test_the_written_file_is_the_model(tmp_path):
     """Read back, the same trajectory and sensitivities, the analytic Jacobian
     and sensitivity right-hand side kept."""

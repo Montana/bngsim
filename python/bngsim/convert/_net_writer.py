@@ -50,28 +50,6 @@ def _fmt(x: float) -> str:
     return repr(float(x))
 
 
-def _bng_spelling(lines: list[str]) -> list[str]:
-    """*lines* with each parameters and functions expression's natural logarithm
-    spelled ``ln`` (issue #1273). run_network has no ``log`` and refuses the file;
-    ``ln`` is the name BNGL and run_network give it, and bngsim's reader takes it
-    as the same function. ``_LOG_TOKEN`` is the cBNGL and SBML writers' own: not
-    ``log10`` or ``log2``, which run_network has, nor a name that holds ``log``."""
-    out, block = [], None
-    for line in lines:
-        s = line.strip()
-        if s.startswith("begin "):
-            block = s.split()[1]
-        elif s.startswith("end "):
-            block = None
-        elif block in ("parameters", "functions") and s and not s.startswith("#"):
-            fields = s.split(None, 2)
-            if len(fields) == 3 and _LOG_TOKEN.search(fields[2]):
-                indent = line[: len(line) - len(line.lstrip())]
-                line = f"{indent}{fields[0]} {fields[1]} {_LOG_TOKEN.sub('ln(', fields[2])}"
-        out.append(line)
-    return out
-
-
 # ─── Capability analysis ──────────────────────────────────────────────────
 
 
@@ -324,8 +302,16 @@ def _expressions_written(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _written(expr: str) -> str:
     """*expr* as the .net writes it: one token, or, where it cannot be, as it is.
-    capability_report names the second as lossy, so strict has refused it."""
-    return _one_token(expr)[0]
+    capability_report names the second as lossy, so strict has refused it.
+
+    Either way its natural logarithm is spelled ``ln`` (issue #1273): run_network
+    has no ``log`` and refuses the file, and ``ln`` is the name BNGL and
+    run_network give it. bngsim's reader computes the same value from it, to the
+    bit; its ``ln`` is bngsim's own adapter, which also reports a logarithm of a
+    value that is not positive, where ExprTk's ``log`` says nothing.
+    ``_LOG_TOKEN`` is the cBNGL and SBML writers' own: not ``log10`` or ``log2``,
+    which run_network has, nor a name that holds ``log``."""
+    return _LOG_TOKEN.sub("ln(", _one_token(expr)[0])
 
 
 # ─── Rate-token construction ──────────────────────────────────────────────
@@ -690,7 +676,7 @@ def write_net(
     lines.append("end reactions")
     lines.append("")
 
-    text = "\n".join(_bng_spelling(lines))
+    text = "\n".join(lines)
     if out_path is not None:
         Path(out_path).write_text(text)
     return text
