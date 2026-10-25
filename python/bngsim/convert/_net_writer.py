@@ -232,6 +232,19 @@ def capability_report(model: Model) -> dict[str, list[str]]:
             "would fail to compile (undefined symbol)"
         )
 
+    unjoined = [
+        f"{where}: {why}"
+        for where, expr in _expressions_written(data)
+        if (why := _one_token(expr)[1]) is not None
+    ]
+    if unjoined:
+        lossy.append(
+            f"{len(unjoined)} expression(s) cannot be written as one .net field (e.g. "
+            f"{'; '.join(unjoined[:3])}{'; …' if len(unjoined) > 3 else ''}) — joined, "
+            "two words would be one name, and spaced, run_network refuses the "
+            "parameters block or runs the function as its first word"
+        )
+
     return {"dropped": dropped, "lossy": lossy}
 
 
@@ -252,6 +265,67 @@ def _apply_capability_policy(
             warnings.warn(
                 f"{model_name}: lossy conversion — {note}", ConversionWarning, stacklevel=3
             )
+
+
+# ─── Expressions as one token ─────────────────────────────────────────────
+#
+# BioNetGen's run_network reads a .net line as whitespace-separated fields, so
+# an expression must be one of them (issue #1249). A spaced parameter
+# expression it refuses ("parameters list not read because of errors"); a
+# spaced function it reads up to the first space and runs that, with no
+# message. Whitespace between operators carries no meaning in either reader and
+# is removed. Between two words or numbers it does: joined, `a and b` is a name
+# (#498). ExprTk's `and` and `or` are written `&&` and `||`, which bngsim and
+# run_network both read with that meaning and C's precedence, as ExprTk gives
+# `and` and `or`; any other operator spelled as a word there (`xor`, `nand`,
+# `nor`) has no such spelling, and capability_report names the expression as
+# lossy, so strict refuses it as it does any other construct the .net cannot carry.
+
+# One token of an ExprTk expression: whitespace, a name, a number (with an
+# exponent), a two-character operator, or any one other character.
+_EXPR_TOKEN = re.compile(
+    r"\s+|[A-Za-z_][A-Za-z0-9_]*|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|&&|\|\||[<>!=]=|."
+)
+_WORD_OPERATORS = {"and": "&&", "or": "||"}
+
+
+def _is_word(token: str) -> bool:
+    return bool(token) and (token[0].isalnum() or token[0] in "_.")
+
+
+def _one_token(expr: str) -> tuple[str, str | None]:
+    """*expr* written as one whitespace-free token, and None; or *expr* as it
+    is and why it cannot be."""
+    out: list[str] = []
+    spaced = False
+    for token in _EXPR_TOKEN.findall(expr):
+        if token.isspace():
+            spaced = True
+            continue
+        token = _WORD_OPERATORS.get(token, token)
+        if spaced and out and _is_word(out[-1]) and _is_word(token):
+            return expr, f"`{out[-1]} {token}` is two words a space separates"
+        out.append(token)
+        spaced = False
+    return "".join(out), None
+
+
+def _expressions_written(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(where, expression)`` for each of the model's own expressions write_net
+    writes: a non-constant parameter's, and each function's. A parameter that
+    holds a function's value is not written (see write_net)."""
+    func_names = {f["name"] for f in data["functions"]}
+    return [
+        (f"parameter {p['name']}", p["expression"])
+        for p in data["parameters"]
+        if not p.get("is_const", True) and p.get("expression") and p["name"] not in func_names
+    ] + [(f"function {f['name']}()", f["expression"]) for f in data["functions"]]
+
+
+def _written(expr: str) -> str:
+    """*expr* as the .net writes it: one token, or, where it cannot be, as it is.
+    capability_report names the second as lossy, so strict has refused it."""
+    return _one_token(expr)[0]
 
 
 # ─── Rate-token construction ──────────────────────────────────────────────
@@ -493,6 +567,38 @@ def write_net(
         )
     lines.append("")
 
+    # Rewrite *every* within-compartment asf=False functional reaction as
+    # per-species signed-flux reactions, so they survive the round-trip. The
+    # reader multiplies a functional rate by the reactant amounts, so the only
+    # alternative — the reactant-division guard ``if(r>1e-300, P/r, 0)`` — cancels
+    # that re-multiplication only while every reactant stays strictly positive.
+    # It silently zeroes the flux the instant a reactant reaches zero *or goes
+    # negative* (rate/assignment-driven pseudo-species legitimately do — GH #18),
+    # and whether a reactant ever does so is a whole-trajectory property no
+    # writer-time probe can decide. The zero-reactant signed-flux form needs no
+    # such cancellation and is RHS-identical for any P and any reactant value, so
+    # we always use it. Cross-compartment (per-species-volume-scaled) reactions
+    # are refused at the capability gate (expand_psvs=False).
+    #
+    # The functions the writer emits, its own helpers and wrappers among them,
+    # are known before the parameters are written, which leave their values
+    # out (below). Building the reactions here appends nothing to the text.
+    labeled_reactions, flux_helpers = _expand_functional_reactions(
+        reactions,
+        species,
+        expand_psvs=False,
+        only_indices=None,
+    )
+    func_names_all = func_names | {h for h, _ in flux_helpers}
+    wrappers: list[tuple[str, str]] = []
+    rxn_lines: list[str] = []
+    for n, (label, r) in enumerate(labeled_reactions):
+        token = _rate_token(r, label, species_names, func_names_all, wrappers)
+        rs = ",".join(str(i + 1) for i in r["reactants"]) or "0"
+        ps = ",".join(str(i + 1) for i in r["products"]) or "0"
+        rxn_lines.append(f"    {n + 1} {rs} {ps} {token}")
+    called = frozenset(func_names_all | {w for w, _ in wrappers})
+
     # parameters — a literal is exact and avoids re-evaluation hazards, so it
     # stays the default. A non-constant parameter is not a constant expression
     # though: a synthesized _rateLaw_* refers to the model parameters it was
@@ -502,11 +608,22 @@ def write_net(
     # sensitivity with respect to it comes back identically zero. Keep the
     # expression for those. codegen_data lists parameters in dependency order,
     # so anything an expression refers to is already declared above it.
+    #
+    # Each expression is one field (issue #1249, see _one_token).
+    #
+    # A function's value is held in a parameter of its name, which bngsim's
+    # reader makes again from the function. Written, it shadowed the function
+    # in run_network, which read the parameter's number (0, or the value at
+    # load) wherever the function was meant (issue #1249).
     lines.append("begin parameters")
-    for i, p in enumerate(params, 1):
+    i = 0
+    for p in params:
+        if p["name"] in called:
+            continue
+        i += 1
         expression = p.get("expression")
         if not p.get("is_const", True) and expression:
-            lines.append(f"    {i} {p['name']} {expression}")
+            lines.append(f"    {i} {p['name']} {_written(expression)}")
         else:
             lines.append(f"    {i} {p['name']} {_fmt(p['value'])}")
     lines.append("end parameters")
@@ -530,7 +647,7 @@ def write_net(
     divisors = list(core.species_ic_param_ref_divisors)
     for k, (sp_i, p_i) in enumerate(core.species_ic_param_refs):
         divisor = divisors[k] if k < len(divisors) else 1.0
-        if divisor == 1.0 and 0 <= p_i < len(params):
+        if divisor == 1.0 and 0 <= p_i < len(params) and params[p_i]["name"] not in called:
             ic_param_name[sp_i] = params[p_i]["name"]
     lines.append("begin species")
     for i, s in enumerate(species, 1):
@@ -557,49 +674,14 @@ def write_net(
     lines.append("end groups")
     lines.append("")
 
-    # Rewrite *every* within-compartment asf=False functional reaction as
-    # per-species signed-flux reactions, so they survive the round-trip. The
-    # reader multiplies a functional rate by the reactant amounts, so the only
-    # alternative — the reactant-division guard ``if(r>1e-300, P/r, 0)`` — cancels
-    # that re-multiplication only while every reactant stays strictly positive.
-    # It silently zeroes the flux the instant a reactant reaches zero *or goes
-    # negative* (rate/assignment-driven pseudo-species legitimately do — GH #18),
-    # and whether a reactant ever does so is a whole-trajectory property no
-    # writer-time probe can decide. The zero-reactant signed-flux form needs no
-    # such cancellation and is RHS-identical for any P and any reactant value, so
-    # we always use it. Cross-compartment (per-species-volume-scaled) reactions
-    # are refused at the capability gate (expand_psvs=False).
-    labeled_reactions, flux_helpers = _expand_functional_reactions(
-        reactions,
-        species,
-        expand_psvs=False,
-        only_indices=None,
-    )
-    func_names_all = func_names | {h for h, _ in flux_helpers}
-
-    # reactions — build first so any synthesized wrapper functions are known
-    wrappers: list[tuple[str, str]] = []
-    rxn_lines: list[str] = []
-    for n, (label, r) in enumerate(labeled_reactions):
-        token = _rate_token(r, label, species_names, func_names_all, wrappers)
-        rs = ",".join(str(i + 1) for i in r["reactants"]) or "0"
-        ps = ",".join(str(i + 1) for i in r["products"]) or "0"
-        rxn_lines.append(f"    {n + 1} {rs} {ps} {token}")
-
-    # functions — originals (verbatim), then per-species flux helpers, then any
-    # synthesized reaction wrappers
+    # functions — originals, then per-species flux helpers, then any synthesized
+    # reaction wrappers, each expression one field
     if functions or flux_helpers or wrappers:
         lines.append("begin functions")
-        k = 0
-        for f in functions:
-            k += 1
-            lines.append(f"    {k} {f['name']}() {f['expression']}")
-        for hname, hexpr in flux_helpers:
-            k += 1
-            lines.append(f"    {k} {hname}() {hexpr}")
-        for wname, wexpr in wrappers:
-            k += 1
-            lines.append(f"    {k} {wname}() {wexpr}")
+        for k, (fname, fexpr) in enumerate(
+            [*((f["name"], f["expression"]) for f in functions), *flux_helpers, *wrappers], 1
+        ):
+            lines.append(f"    {k} {fname}() {_written(fexpr)}")
         lines.append("end functions")
         lines.append("")
 
