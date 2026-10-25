@@ -20,6 +20,11 @@ unknown. A size that holds is not: the rateOf of a species that never moves is
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import bngsim
 import numpy as np
 import pytest
@@ -182,12 +187,43 @@ def test_a_size_that_reads_the_rate_of_a_rate_rule_variable_is_refused_by_name()
     _refused(doc([("cv", a("plus", cn(2), rof("P")))], **P_DECAYS), "rateOf(P)")
 
 
-def test_the_reason_named_is_the_first_in_a_fixed_order_with_each_rule_on_the_way():
-    """Two unknown rates: the reason no longer moves with the hash seed. And a
-    rate read through two rules names both."""
+_REASON_CHILD = textwrap.dedent(
+    """
+    import sys
+    import bngsim
+    try:
+        bngsim.Model.from_sbml_string(sys.stdin.read())
+    except bngsim.ModelError as e:
+        line = next(x for x in str(e).splitlines() if "compartment cv" in x)
+        sys.stdout.write(line.split("rate: ", 1)[1])
+    """
+)
+
+
+def test_the_reason_named_does_not_move_with_the_hash_seed():
+    """Two unknown rates, read through q and r: the chain rule stopped at the
+    first in set order, so seeds 6 and 8 named r where 0 named q."""
     params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in "qr")
-    rules = [("r", ROF_S3), ("q", ROF_S3), ("cv", a("plus", cn(2), ci("r"), ci("q")))]
-    _refused(doc(rules, params=params), "rate: through q, it reads rateOf(S3)")
+    xml = doc([("r", ROF_S3), ("q", ROF_S3), ("cv", a("plus", cn(2), ci("r"), ci("q")))], params)
+    reasons = {}
+    for seed in (0, 6, 8):
+        proc = subprocess.run(
+            [sys.executable, "-c", _REASON_CHILD],
+            input=xml,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, PYTHONHASHSEED=str(seed)),
+            timeout=120,
+        )
+        assert proc.returncode == 0, f"child failed (seed={seed}):\n{proc.stderr}"
+        reasons[seed] = proc.stdout
+    assert set(reasons.values()) == {
+        "through q, it reads rateOf(S3), whose rate bngsim does not derive; its "
+        "concentrations would not be diluted"
+    }, reasons
+
+
+def test_a_rate_read_through_two_rules_names_both():
     params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in ("r1", "r2"))
     rules = [("r2", ROF_S3), ("r1", ci("r2")), ("cv", a("plus", cn(2), ci("r1")))]
     _refused(doc(rules, params=params), "rate: through r1 and r2, it reads rateOf(S3)")
