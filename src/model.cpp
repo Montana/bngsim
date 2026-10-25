@@ -4057,10 +4057,9 @@ void NetworkModel::evaluate_functions(double t, bool with_deferred) {
     }
 }
 
-void NetworkModel::evaluate_deferred_functions(double t) {
+void NetworkModel::evaluate_deferred_functions() {
     if (!impl_->has_functions)
         return;
-    impl_->current_time = t;
     auto &cache = impl_->function_value_cache;
     if (cache.size() != impl_->functions.size())
         cache.assign(impl_->functions.size(), 0.0);

@@ -165,3 +165,32 @@ def test_a_resize_read_through_deferred_functions(codegen):
     result, i = _run(bngsim.Model.from_sbml_string(_resize_doc(n)), times, codegen=codegen)
     sn = np.asarray(result.species)[:, i]
     np.testing.assert_allclose(sn, 5 * v[0] * np.exp(-0.3 * times) / v, rtol=1e-8)
+
+
+def test_a_batch_reads_the_time_the_functions_were_read_at():
+    """The deferred functions are read where a batch starts, against the others
+    as they stand, and set no time. Set to the batch's own, a delayed
+    execution due a few doubles before where the run stands read `time` as
+    when it was due in a model with any function, and as where the run stands
+    in one with none: `X = time` gave 2 + 4e-16 for 2 + 3.6e-15."""
+    from . import test_piecewise_size_jump as pw
+
+    def x_at_end(delay, with_function):
+        event = pw._event(
+            "E", pw._rel("geq", pw.T, pw._cn(1)), [("X", pw.T)], uvftt=False, delay=pw._cn(delay)
+        )
+        rules = [("Y", pw._times(pw._cn(2), pw._ci("S")))] if with_function else []
+        params = '<parameter id="Y" value="0" constant="false"/>' if with_function else ""
+        model = bngsim.Model.from_sbml_string(
+            pw._doc(rules, params=params, events=event, species=pw._sp("X"))
+        )
+        assert bool(model._core.codegen_data()["functions"]) == with_function
+        result = bngsim.Simulator(model, method="ode").run(
+            sample_times=[0.0, 2.0, 3.0], rtol=1e-10, atol=1e-12
+        )
+        return float(np.asarray(result.species)[-1, list(result.species_names).index("X")])
+
+    delay = 1.0
+    for _ in range(8):
+        delay = np.nextafter(delay, 2.0)
+        assert x_at_end(delay, True) == x_at_end(delay, False), delay

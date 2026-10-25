@@ -12940,8 +12940,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             return false;
         // The functions only event assignments read, which the right-hand side
         // and the roots leave where they were (issue #1186), read as the rest
-        // of the functions stand now. After each fire, all are read again.
-        model.evaluate_deferred_functions(t_now);
+        // of the functions stand now, at the time they were read at: a delayed
+        // execution due a few doubles before where the run stands is read with
+        // the functions there, as before. After each fire, all are read again.
+        model.evaluate_deferred_functions();
 
         // Capture an event's UVFTT snapshot + resolved delay AT THE CURRENT
         // state (its trigger time). Used both to seed the batch and to enqueue
