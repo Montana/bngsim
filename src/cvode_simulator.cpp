@@ -14754,6 +14754,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     "columns it moves would be silently stale (GH #205, issue #910). Please "
                     "report this model; dropping sensitivities for this run avoids it.");
             }
+            // Counted as the root's fires are (issue #1025): a run at a
+            // hundredth of the tolerances that fires this at a stop or a row,
+            // where the run it confirms fired it at a root, did not find it.
+            impl_->note_firing(risers, t_now, y_data, ns, n_events);
             return process_firing_batch(t_now, risers);
         }
         return false;
@@ -17506,6 +17510,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         trigger_was_true[ei] = now_true;
                     }
                     const std::vector<double> x_minus(y_data, y_data + ns);
+                    // Counted as a root's fires are, so that the run that
+                    // confirms an order near it can name this one (#1025).
+                    impl_->note_firing(firing, t_out[i], y_data, ns, n_events);
                     const std::vector<std::vector<double>> s_minus =
                         impl_->capture_event_sens(cvode_mem, ns, t_out[i], sens);
                     executed_fires.clear();

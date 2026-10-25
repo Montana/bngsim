@@ -213,3 +213,37 @@ def test_a_falling_trigger_at_the_row_agrees_with_a_plain_run():
     np.testing.assert_allclose(s, _column(text, times, "S"), rtol=1e-12)
     np.testing.assert_allclose(s, [3, 4, 2.75, 3.25], rtol=1e-6)
     np.testing.assert_allclose(np.asarray(r.sensitivities)[:, j, 0], [0, 0, 1.25, 1.25], atol=1e-6)
+
+
+# Issue #1182's model beside a switch on V = rate·t, which reads S, `gap`
+# before the row or after it: further apart than one step's tolerances and
+# within #1025's window, so the order is confirmed by a plain run at a
+# hundredth of the tolerances. That run, and the one it confirms, fire the
+# event at the row, and the fire there has to be counted as the root's are
+# for the two to name it alike. t* = 2.5/k, S halves at t*.
+_BESIDE_A_SWITCH = (
+    "species S, W, V; S = 3; W = 0; V = 0; q = 0; k = 1; c = 0.7\n"
+    "q' = k; S' = 1; V' = {rate}\n"
+    "J2: -> W; piecewise(c*S, V >= {threshold!r}, 0)\n"
+    "E1: at (q >= 2.5): S = S/2\n"
+)
+
+
+@pytest.mark.parametrize("rate", [0.25, 1.5, 4.0])
+@pytest.mark.parametrize("gap", [5e-5, -5e-5], ids=["switch-first", "event-first"])
+def test_a_fire_on_the_row_is_named_to_the_run_that_confirms_its_order(rate, gap):
+    """Uncounted, the tighter run's fire at the row was not found, and the
+    run was refused with 'does not fire it there' where its order is plain
+    (V is exact). Switch first, W gathers c·S from 2.5 − gap and
+    dW/dk = c·t*·dt*/dk = −4.375; event first, dW/dk = c·(3 − t_s)/2·2.5."""
+    text = _BESIDE_A_SWITCH.format(rate=rate, threshold=rate * (2.5 - gap))
+    model = bngsim.Model.from_antimony_string(text)
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["k"]).run(
+        sample_times=[0.0, 1.0, 2.0, 2.5, 3.0], rtol=1e-6, atol=1e-9, timeout=60
+    )
+    names = list(run.species_names)
+    assert np.asarray(run.species)[3, names.index("S")] == pytest.approx(2.75, rel=1e-12)
+    t_switch = 2.5 - gap
+    truth = -0.7 * 2.5 * 2.5 if gap > 0 else 0.7 * 0.5 * (3.0 - t_switch) * 2.5
+    got = np.asarray(run.sensitivities)[-1, names.index("W"), 0]
+    assert got == pytest.approx(truth, rel=1e-8)
