@@ -247,3 +247,38 @@ def test_a_fire_on_the_row_is_named_to_the_run_that_confirms_its_order(rate, gap
     truth = -0.7 * 2.5 * 2.5 if gap > 0 else 0.7 * 0.5 * (3.0 - t_switch) * 2.5
     got = np.asarray(run.sensitivities)[-1, names.index("W"), 0]
     assert got == pytest.approx(truth, rel=1e-8)
+
+
+# The same, with the switch beside a second event at t2 = 2.8/k, which the
+# run finds by root: its name to the tighter run is its count, and the count
+# of every fire before it, the one on the row included.
+_AFTER_A_ROW_FIRE = (
+    "species S, W, V; S = 3; W = 0; V = 0; q = 0; k = 1; c = 0.7\n"
+    "q' = k; S' = 1; V' = 1.5\n"
+    "J2: -> W; piecewise(c*S, V >= {threshold!r}, 0)\n"
+    "E1: at (q >= 2.5): S = S/2\nE2: at (q >= 2.8): S = S/2\n"
+)
+
+
+@pytest.mark.parametrize("gap", [5e-5, -5e-5], ids=["switch-first", "event-first"])
+def test_a_fire_after_one_on_the_row_is_named_with_it_counted(gap):
+    """With the row's fire left out of a count, the two runs disagreed on
+    how many fires came before E2, and the run was refused with 'fires other
+    events before it'. S halves at t1 = 2.5/k and t2 = 2.8/k. Switch first
+    (t_s = t2 − gap): dW/dk = c·[(t2 − t_s)/2 + (3 − t2)/4]·2.5
+    − c·[S(t2⁻)/2 − (3 − t2)/2]·t2, with S(t2⁻) = 2.75 + t2 − 2.5. Event
+    first: dW/dk = c·(3 − t_s)·(0.625 + t2/2)."""
+    t1, t2, t_s = 2.5, 2.8, 2.8 - gap
+    model = bngsim.Model.from_antimony_string(_AFTER_A_ROW_FIRE.format(threshold=1.5 * t_s))
+    run = bngsim.Simulator(model, method="ode", sensitivity_params=["k"]).run(
+        sample_times=[0.0, 1.0, 2.0, 2.5, 3.0], rtol=1e-6, atol=1e-9, timeout=60
+    )
+    names = list(run.species_names)
+    assert np.asarray(run.species)[3, names.index("S")] == pytest.approx(2.75, rel=1e-12)
+    if gap > 0:
+        before_t2 = 2.75 + t2 - t1
+        truth = 0.7 * (((t2 - t_s) / 2 + (3 - t2) / 4) * t1 - (before_t2 / 2 - (3 - t2) / 2) * t2)
+    else:
+        truth = 0.7 * (3 - t_s) * (0.625 + t2 / 2)
+    got = np.asarray(run.sensitivities)[-1, names.index("W"), 0]
+    assert got == pytest.approx(truth, rel=1e-8)
