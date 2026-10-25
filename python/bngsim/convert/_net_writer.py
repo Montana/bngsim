@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from bngsim._exceptions import ConversionError, ConversionWarning
+from bngsim.convert._sbml_writer import _LOG_TOKEN
 
 if TYPE_CHECKING:
     from bngsim._model import Model
@@ -301,8 +302,16 @@ def _expressions_written(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _written(expr: str) -> str:
     """*expr* as the .net writes it: one token, or, where it cannot be, as it is.
-    capability_report names the second as lossy, so strict has refused it."""
-    return _one_token(expr)[0]
+    capability_report names the second as lossy, so strict has refused it.
+
+    Either way its natural logarithm is spelled ``ln`` (issue #1273): run_network
+    has no ``log`` and refuses the file, and ``ln`` is the name BNGL and
+    run_network give it. bngsim's reader computes the same value from it, to the
+    bit; its ``ln`` is bngsim's own adapter, which also reports a logarithm of a
+    value that is not positive, where ExprTk's ``log`` says nothing.
+    ``_LOG_TOKEN`` is the cBNGL and SBML writers' own: not ``log10`` or ``log2``,
+    which run_network has, nor a name that holds ``log``."""
+    return _LOG_TOKEN.sub("ln(", _one_token(expr)[0])
 
 
 # ─── Rate-token construction ──────────────────────────────────────────────
