@@ -77,20 +77,30 @@ def test_a_clamp_pulse_agrees_with_the_same_pulse_in_max_and_abs(tmp_path):
     )
 
 
-@pytest.mark.parametrize(
-    "law",
-    [
-        "kx*clamp(1,(Tobs-c)/10,0)",  # crossed: a step at Tobs = c + 10
-        "kx*(1/w)*(clamp(lo,(Tobs-c+w/2)/(w/2),hi)-clamp(lo,(Tobs-c)/(w/2),hi))",
-    ],
-    ids=["crossed bounds", "parameter bounds"],
-)
-def test_a_clamp_not_known_to_bend_declines_as_before(tmp_path, law):
+def test_a_clamp_over_parameter_bounds_declines_as_before(tmp_path):
+    law = "kx*(1/w)*(clamp(lo,(Tobs-c+w/2)/(w/2),hi)-clamp(lo,(Tobs-c)/(w/2),hi))"
     sim = bngsim.Simulator(
         _model(tmp_path, law), method="ode", sensitivity_params=["kx", "k_clock"]
     )
     sim.run(t_span=(0, 30), n_points=3)
     assert "clamp" in (sim.sens_rhs_decline_reason or "")
+
+
+@pytest.mark.parametrize("bounds", ["1,{x},0", "hi,{x},lo"], ids=["numbers", "parameters"])
+def test_a_clamp_with_crossed_bounds_is_refused_as_the_step_it_is(tmp_path, bounds):
+    """With lo above hi the clamp is lo, then hi from x = lo on: a step at
+    Tobs = 50, t = 25. It declines, and the difference quotient it declined to
+    read across it: dY/dk_clock came back -1.41 for -0.97 at every tolerance,
+    with a warning that called the quotient correct. It is refused, as a step
+    call on the state is (issue #938)."""
+    law = "0.01*kx*clamp(" + bounds.format(x="(Tobs-c+10)/10") + ")"
+    sim = bngsim.Simulator(
+        _model(tmp_path, law), method="ode", sensitivity_params=["kx", "k_clock"]
+    )
+    assert "clamp" in (sim.sens_rhs_decline_reason or "")
+    with pytest.raises(bngsim.SensitivityUnsupportedError, match="#938") as caught:
+        sim.run(t_span=(0, 30), n_points=3)
+    assert "clamp(" in str(caught.value)
 
 
 def test_a_clamp_beside_a_condition_declines_as_before(tmp_path):

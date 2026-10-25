@@ -7551,6 +7551,8 @@ def _facts_of(
 # A call that is known to be continuous and to bend: asked about as a choice
 # is, by what the law divides by. Any other call this does not know could be
 # anything, a branch cut (``atan2``) or a pole, and is refused where it is live.
+# A clamp bends only with its bounds in order; crossed, it is a step, which
+# :func:`_quotient_across_a_choice` names (issue #1227).
 _BEND_CALLS = frozenset({"clamp"})
 
 
@@ -7806,8 +7808,11 @@ def _quotient_across_a_choice(
     has a value, an even power, a sum and a product keep: nothing is assumed
     of the state, which a concentration below 0 would break.
 
-    Three more are named:
+    Four more are named:
 
+    - a ``clamp`` whose bounds are numbers or parameters with ``lo`` above
+      ``hi``, over the state or over a requested parameter that moves its
+      argument across ``lo``: a step, not a bend (issue #1227);
     - a power under 1, a root, a logarithm or a ``hypot`` of what holds one
       of the three and is not known to be nonzero, and an inverse sine or
       cosine of what holds one: continuous, and leaving the bend with a
@@ -7833,6 +7838,29 @@ def _quotient_across_a_choice(
             name = _call_name(node)
             if _unknown_call(name) and name not in _BEND_CALLS and facts[id(node)].live:
                 return _clipped(node)
+    # A clamp bends only with its bounds in order. With lo above hi, ExprTk's
+    # clamp(lo, x, hi) is lo below x = lo and hi from there on, a step (issue
+    # #1227), and the quotient reads across it as across any jump:
+    # ``0.01*kx*clamp(1, (Tobs - 40)/10, 0)`` returned dY/dk_clock = -1.41 for
+    # -0.97 at every tolerance. One over the state is named, as a step call is;
+    # one over parameters alone where a requested one moves x across lo.
+    for node in order:
+        if _call_name(node) != "clamp" or not facts[id(node)].live:
+            continue
+        bounds = node.args  # type: ignore[attr-defined]
+        if len(bounds) != 3:
+            continue
+        lo, x, hi = bounds
+        bottom, top = facts[id(lo)].value, facts[id(hi)].value
+        if bottom is None or top is None or bottom <= top:
+            continue
+        over = facts[id(x)]
+        if over.state or (
+            over.asked
+            and not over.clock
+            and _flips_with_a_parameter(ast.BinOp(left=x, op=ast.Sub(), right=lo), values, asked)
+        ):
+            return _clipped(node)
 
     def small(node: ast.AST) -> bool:
         return facts[id(node)].live and facts[id(node)].size <= _FLIP_MAX_NODES
@@ -8232,7 +8260,9 @@ def fallback_crossing(
       ``min``: ``(thr − X)/abs(thr − X)``
       (:func:`_quotient_across_a_choice`). One that stands alone is a bend,
       and runs;
-    - a step call on the state, ``floor(Atot)``, or on a moved counter;
+    - a step call on the state, ``floor(Atot)``, or on a moved counter; and a
+      ``clamp`` over one whose bounds are crossed, ``clamp(1, Aobs, 0)``,
+      which is a step (issue #1227);
     - a step call on a clock, literal time or a counter nothing moves, whose
       argument reads a requested parameter, ``floor(time()/P)`` with ``P``
       requested: the steps move with ``P``, and nothing jumps a column at a

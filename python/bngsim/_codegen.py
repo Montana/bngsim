@@ -8387,7 +8387,8 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "abs are left here only in a model whose rate laws hold a condition, or where "
         "one sits in anything but a sum, a product, a whole power, an exp() or another "
         "bend, or in a product with a division or a fractional power of the state or "
-        "the clock. A time course is refused for the jumps that are found in the rate "
+        "the clock; clamp likewise, and also where its bounds are not numbers with lo "
+        "<= hi, issue #1227. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
