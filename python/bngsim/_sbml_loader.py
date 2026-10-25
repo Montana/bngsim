@@ -8365,6 +8365,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         _ar_rhs_ex: dict[str, str] = {}  # safe(var) -> ExprTk
         _rr_rhs_ex: dict[str, str] = {}  # safe(var) -> ExprTk
         _rr_ids: list[str] = []  # the rate-rule variables that are no species
+        _rule_id: dict[str, str] = {}  # safe(var) -> its SBML id, for a refusal
         for j in range(sbml_model.getNumRules()):
             _rule = sbml_model.getRule(j)
             _v = _rule.getVariable()
@@ -8373,8 +8374,10 @@ def _build_model_from_sbml_doc_in_context(doc):
                 continue
             if _rule.isAssignment() and _v in assignment_targets:
                 _ar_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+                _rule_id[_safe_name(_v)] = _v
             elif _rule.isRate() and _v not in _sbml_species_ids:
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+                _rule_id[_safe_name(_v)] = _v
                 _rr_ids.append(_v)
         # A reaction's id in math is its kinetic law's value, so a size is
         # followed through the law as through an assignment rule: for its rate
@@ -8390,6 +8393,7 @@ def _build_model_from_sbml_doc_in_context(doc):
             if _lm is not None:
                 _law_math[_rx.getId()] = _lm
                 _ar_rhs_ex[_safe_name(_rx.getId())] = _ast_to_exprtk_with_funcdefs(_lm, func_defs)
+                _rule_id[_safe_name(_rx.getId())] = _rx.getId()
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
         _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
@@ -8506,18 +8510,20 @@ def _build_model_from_sbml_doc_in_context(doc):
             return _rule_rate[safe_var]
 
         def _why_unknown(nm: str) -> str:
-            # Why the rate of the symbol nm, read by a rule, is unknown.
+            # Why the rate of the symbol nm, read by a rule, is unknown, in the
+            # model's own names: `in` is `_ant_in` to the engine.
             if nm in _rate_token_target:
                 return (
                     f"it reads rateOf({_rate_token_target[nm]}), whose rate bngsim does not derive"
                 )
             child = _ar_alias.get(nm)
             if child is None:
-                return f"the rate of {nm} is unknown"
+                return f"the rate of {_rule_id.get(_rr_alias.get(nm, nm), nm)} is unknown"
             why = _rate_unknown_why.get(child, "its rate is unknown")
+            name = _rule_id.get(child, child)
             if why.startswith("through "):  # each rule on the way, in order
-                return f"through {child} and {why.removeprefix('through ')}"
-            return f"through {child}, {why}"
+                return f"through {name} and {why.removeprefix('through ')}"
+            return f"through {name}, {why}"
 
         def _chain_rule(g, safe_var=None):
             # (Σ ∂g/∂s·ṡ over g's symbols, its nonzero terms), or (None, []).

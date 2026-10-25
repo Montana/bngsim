@@ -229,6 +229,13 @@ def test_a_rate_read_through_two_rules_names_both():
     _refused(doc(rules, params=params), "rate: through r1 and r2, it reads rateOf(S3)")
 
 
+def test_a_rule_is_named_by_its_id_not_the_engine_name():
+    """`in` is an ExprTk word, which the engine reads as `_ant_in`."""
+    rules = [("in", ROF_S3), ("cv", a("plus", cn(2), ci("in")))]
+    xml = doc(rules, params='<parameter id="in" value="0" constant="false"/>')
+    _refused(xml, "rate: through in, it reads rateOf(S3)")
+
+
 def _piecewise(cond):
     return f"<piecewise><piece>{cn(1)}{cond}</piece><otherwise>{cn(2)}</otherwise></piecewise>"
 
