@@ -278,7 +278,8 @@ NetworkModel NetworkModel::clone() const {
     // Deep-copy events and re-compile their expressions in the new evaluator.
     // Each event carries indices into the evaluator's expression table for
     // its trigger, optional delay, optional priority, per-assignment value
-    // expressions, and a resize rescale's compartment size (issue #936).
+    // expressions, a resize rescale's compartment size (issue #936), and a size
+    // jump's size before the jump (issue #1181).
     // These indices are evaluator-specific; without
     // re-compilation in the cloned evaluator, the cloned model's events
     // would be silent no-ops (DSMTS event cases 00028/29/32/33 hit this
@@ -318,6 +319,13 @@ NetworkModel NetworkModel::clone() const {
                 const auto &cached = impl_->evaluator->preprocessed_expr(idx);
                 idx = copy.impl_->evaluator->compile_preprocessed(cached);
             }
+        }
+        // ...and a size jump's size before the jump (issue #1181). Left as the
+        // source's index, a clone read some other expression as the size
+        // before an instant two jumps share: [Sn] 2.5 for 5/3.
+        if (ev.size_jump_before_expr >= 0) {
+            const auto &cached = impl_->evaluator->preprocessed_expr(ev.size_jump_before_expr);
+            ev.size_jump_before_expr = copy.impl_->evaluator->compile_preprocessed(cached);
         }
     }
     // Re-compile discontinuity triggers (GH #72) into the cloned evaluator,

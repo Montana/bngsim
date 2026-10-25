@@ -12691,6 +12691,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // For a size jump: the concentration each of its own rescales read
         // when its values were frozen.
         std::vector<double> jump_bases;
+        // A size jump that stands down for the first of its compartment's
+        // jumps at this instant, which rescales by the whole of it (issue
+        // #1181). It is drawn as it was, so the instant's tie-break makes the
+        // draws it made before and a seed's later draws stay where they were,
+        // and it writes nothing.
+        bool stood_down = false;
     };
 
     // The loader's rescale events where a piecewise compartment size jumps
@@ -12977,7 +12983,16 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     break; // a root behind the instant is crossed: further back only adds more
             }
             impl_->sync_model_at(t_now, x_now.data(), ns);
-            if (std::isnan(before_pre) || !std::isfinite(before_now) || before_now == 0.0) {
+            if (!std::isfinite(before_now) || before_now == 0.0) {
+                throw std::runtime_error(
+                    "the size of compartment '" + comp + "' jumps " + std::to_string(ks.size()) +
+                    " times at t=" + diag_number(t_now) +
+                    ", and its size before the first of those jumps reads " +
+                    diag_number(before_now) +
+                    " there, which bngsim cannot rescale its concentrations by once for the "
+                    "whole instant (issue #1181). Give the jumps times apart.");
+            }
+            if (std::isnan(before_pre)) {
                 throw std::runtime_error(
                     "the size of compartment '" + comp + "' jumps " + std::to_string(ks.size()) +
                     " times at t=" + diag_number(t_now) +
@@ -12994,16 +13009,16 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 throw std::runtime_error(
                     "Forward sensitivity: at t=" + diag_number(t_now) +
                     " the size of compartment '" + comp + "' jumps " + std::to_string(ks.size()) +
-                    " times at one instant, at roots no run constant relates, and its "
-                    "concentrations are rescaled once by the whole instant (issue #1181). The "
-                    "derivative of that rescale is not implemented. The trajectory itself is "
+                    " times at one instant, and its concentrations are rescaled once by the "
+                    "whole instant (issue #1181). The derivative of that rescale is not "
+                    "implemented. The trajectory itself is "
                     "unaffected; run without sensitivities, or give the jumps times apart.");
             }
             for (std::size_t a = 0; a < ev0.assignments.size(); ++a)
                 if (!is_resize_rescale(ev0, a))
                     first.snapshot_vals[a] *= scale;
             for (std::size_t m = 1; m < ks.size(); ++m)
-                queue[ks[m]].done = true;
+                queue[ks[m]].stood_down = true;
         }
     };
 
@@ -13262,6 +13277,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     "Event cascade exceeded CASCADE_LIMIT at t=" + std::to_string(t_now) +
                     " (same-instant events appear to arm each other in an algebraic loop).");
             }
+            // The first jump of its compartment wrote the whole instant.
+            if (queue[k].stood_down)
+                continue;
 
             const auto &ev = events_outer[queue[k].event_idx];
             double delay_now = queue[k].delay;

@@ -1124,5 +1124,74 @@ def test_the_sensitivity_of_jumps_a_few_ulp_apart_is_refused():
     one rescale is not implemented."""
     model = bngsim.Model.from_sbml_string(_two_steps(2.0, _ulps_past(2.0)))
     sim = bngsim.Simulator(model, method="ode", sensitivity_params=["k"])
-    with pytest.raises(Exception, match=r"compartment 'cv' jumps 2 times at one instant.*#1181"):
+    with pytest.raises(
+        bngsim.SimulationError, match=r"compartment 'cv' jumps 2 times at one instant.*#1181"
+    ):
         sim.run(sample_times=[0.0, 1.9, 2.5], rtol=1e-10, atol=1e-12)
+
+
+def test_the_sensitivity_of_an_equality_beside_a_step_names_what_it_refuses():
+    """t1 = t2 relates the two roots, and the equality is read as it stands, so
+    the instant's rescale is the engine's; the refusal no longer says the roots
+    are unrelated."""
+    eq = _pw((_cn(1), _rel("eq", T, _ci("t1"))), otherwise=_cn(0))
+    step = _pw((_cn(0), _rel("lt", T, _ci("t2"))), otherwise=_cn(1))
+    params = (
+        '<parameter id="t1" value="2.0" constant="true"/>'
+        '<parameter id="t2" value="2.0" constant="true"/>'
+    )
+    xml = _doc([("cv", _plus(_plus(_cn(1), eq), step))], params=params)
+    sim = bngsim.Simulator(
+        bngsim.Model.from_sbml_string(xml), method="ode", sensitivity_params=["k"]
+    )
+    with pytest.raises(bngsim.SimulationError, match=r"jumps 2 times at one instant") as err:
+        sim.run(sample_times=[0.0, 1.5, 2.5], rtol=1e-10, atol=1e-12)
+    assert "no run constant relates" not in str(err.value)
+
+
+@pytest.mark.parametrize("codegen", [False, True], ids=["interpreted", "codegen"])
+def test_a_clone_rescales_once_too(codegen):
+    """Every parallel worker integrates a clone. The size before the jump is an
+    expression of the clone's own evaluator; left at the source's index, the
+    clone read another expression there and gave [Sn] 2.5 for 5/3."""
+    size, params = _steps(("t1", 2.0), ("t2", _ulps_past(2.0)))
+    model = bngsim.Model.from_sbml_string(_doc([("cv", size)], params=params))
+    times = np.array([0.0, 1.9, 2.5])
+    np.testing.assert_allclose(
+        _sn_at(model.clone(), times, codegen=codegen), [5, 5, 5 / 3], rtol=1e-8
+    )
+
+
+def test_the_jumps_that_stand_down_are_drawn_as_before():
+    """Jumps of one instant tie on their priority, and the draw among them is
+    made as it was before #1181: a seed's later draws stay where they were.
+    Marked done before the draw, the one that stands down took no draw, and
+    with t1 = t2, where nothing else changed, every later tie-break moved.
+
+    Oracle: the same model with two plain events tied at t = 2 in place of the
+    jumps, which makes the same one draw there."""
+    at = lambda t: _rel("geq", T, _cn(t))  # noqa: E731
+    later = _event("E1", at(3), [("X", _cn(1))]) + _event("E2", at(3), [("X", _cn(2))])
+    tie = _event("F1", at(2), [("Y", _cn(1))]) + _event("F2", at(2), [("Y", _cn(2))])
+    params = (
+        '<parameter id="t1" value="2.0" constant="true"/>'
+        '<parameter id="t2" value="2.0" constant="true"/>'
+    )
+    jumps = _plus(_plus(_cn(1), _step_at("t1")), _step_at("t2"))
+    species = _sp("X") + _sp("Y")
+    with_jumps = _doc([("cv", jumps)], params=params, events=later, species=species)
+    with_events = _doc([("cv", _cn(1))], params=params, events=later + tie, species=species)
+
+    def x_after(xml, seed):
+        result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+            sample_times=[0.0, 2.5, 3.5], rtol=1e-10, atol=1e-12, seed=seed
+        )
+        names = list(result.species_names)
+        x = np.asarray(result.species)
+        return x[-1, names.index("X")], x[-1, names.index("Sn")]
+
+    got = [x_after(with_jumps, seed) for seed in range(16)]
+    want = [x_after(with_events, seed)[0] for seed in range(16)]
+    assert len(set(want)) == 2  # the draw decides it
+    assert [x for x, _ in got] == want
+    np.testing.assert_allclose([sn for _, sn in got], 5 / 3, rtol=1e-8)
