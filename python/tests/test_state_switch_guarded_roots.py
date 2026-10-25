@@ -65,12 +65,69 @@ class TestBranchGuard:
         text = "k/max(S,0.001) + if(a>1, 1, 0)"
         assert ss._branch_guard(text, text.index("max")) is None
 
+    @pytest.mark.parametrize(
+        ("text", "guard"),
+        [
+            # an if() that closed before the call holds nothing of it
+            ("if(c>1, 1, 0) + k/max(S,0.001)", None),
+            ("if(max(S,0.001)>1, 1, 0)", None),  # in the condition itself
+            ("if(c>1, k/max(S,0.001))", None),  # not three arguments
+            ("if(a>1, if(b<2, 1, 2) + max(S,0.001), 0)", "((a>1)!=0)"),
+            ("if(a>1, 0, if (b<2, max(S,0.001), 0))", "((a>1)==0)*((b<2)!=0)"),
+            ("if(a>1, (k, max(S,0.001), 0)", None),  # an if( never closed
+        ],
+    )
+    def test_the_edges_of_an_if(self, text, guard):
+        assert ss._branch_guard(text, text.rindex("max")) == guard
+
 
 def test_the_root_carries_its_branch():
     model = bngsim.Model.from_antimony_string(_OFF)
     covered = model.time_discontinuity_conditions()
     assert model._state_switch_roots_beside(covered) == ("(S)<(0.001)",)
     assert model._state_switch_guards_beside(covered) == ("(((time()>50))!=0)",)
+
+
+_MANY_CALLS_NET = """begin parameters
+    1 k 1
+end parameters
+begin functions
+    1 f() {law}
+end functions
+begin species
+    1 X() 5
+end species
+begin reactions
+    1 0 1 f
+end reactions
+begin groups
+    1 Xo 1
+end groups
+"""
+
+
+def test_a_branch_holding_many_calls_is_read_once(tmp_path):
+    """The guard of each call used to be read afresh from the text: every
+    if() before the call matched to its close paren and its arguments split,
+    which for the one if() holding all of them is the whole rate law each
+    time. 2,000 calls took 10.7 s, before any run and on every plain one;
+    the text is now read once."""
+    import time
+
+    n = 2000
+    path = tmp_path / "many_calls.net"
+    path.write_text(_MANY_CALLS_NET.format(law=f"if(Xo>3,{'+'.join(['k*max(Xo-1,0)'] * n)},2*k)"))
+    model = bngsim.Model.from_net(str(path))
+    covered = model.time_discontinuity_conditions()
+    began = time.perf_counter()
+    roots = model._state_switch_roots_beside(covered)
+    elapsed = time.perf_counter() - began
+    assert roots == ("Xo>3", "(Xo-1)<(0)")
+    assert model._state_switch_guards_beside(covered) == (
+        "",
+        f"max({', '.join(['((Xo>3)!=0)'] * n)})",
+    )
+    assert elapsed < 2.0
 
 
 def test_a_reading_outside_every_branch_leaves_the_root_unguarded():

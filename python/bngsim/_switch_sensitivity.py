@@ -6878,36 +6878,113 @@ def _iter_step_calls(
             yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
 
 
+_PAREN_OR_COMMA = re.compile(r"[(),]")
+
+
+class _BranchGuards:
+    """Every ``if()`` of a text, read once, so :func:`_branch_guard` can be
+    asked about any offset of it.
+
+    :func:`state_switch_root_conditions` asks for the guard of every step or
+    bend call in a rate law, and each question used to match every ``if()``
+    before the call to its close paren and split its arguments again, the
+    ones holding the call included: the product of the two counts, on every
+    plain run. One ``if()`` holding 2,000 ``max()`` calls, read whole for each
+    of them, spent 10.7 s there.
+
+    One pass over the parentheses and commas matches each ``if(`` to its close
+    paren and finds the commas between its arguments, where
+    ``_find_close_paren_strict`` and ``_split_top_level_commas`` find them, and
+    an ``if(`` left open is no ``if()`` at all, as there. Matched parens nest,
+    so a sweep over the ``if()``s in order keeps, for each stretch between two
+    edges of their argument lists, the innermost one holding it. The ``if()``s
+    enclosing an offset are then that one and the ones holding it, found by
+    bisection and read innermost first.
+    """
+
+    __slots__ = ("_expr", "_edges", "_inner", "_ifs")
+
+    def __init__(self, expr: str) -> None:
+        self._expr = expr
+        # Each matched if(): its open paren, its close paren, its top-level commas.
+        found: list[tuple[int, int, list[int]]] = []
+        if_opens = {m.end() - 1 for m in _IF_CALL.finditer(expr)}
+        if if_opens:
+            groups: list[tuple[int, list[int] | None]] = []  # the open parens
+            for m in _PAREN_OR_COMMA.finditer(expr):
+                c = m.group()
+                if c == "(":
+                    groups.append((m.start(), [] if m.start() in if_opens else None))
+                elif not groups:
+                    continue  # a comma or close paren outside every group
+                elif c == ",":
+                    commas = groups[-1][1]
+                    if commas is not None:
+                        commas.append(m.start())
+                else:
+                    open_paren, commas = groups.pop()
+                    if commas is not None:
+                        found.append((open_paren, m.start(), commas))
+            found.sort()
+        # Per if(): its open paren, where its then- and else-branches start
+        # (-1 for one without three arguments), and the if() holding it.
+        self._ifs: list[tuple[int, int, int, int]] = []
+        # The innermost if() holding each offset from an edge to the next.
+        self._edges: list[int] = []
+        self._inner: list[int] = []
+        holding: list[int] = []
+
+        def leave() -> None:
+            self._edges.append(found[holding.pop()][1])
+            self._inner.append(holding[-1] if holding else -1)
+
+        for i, (open_paren, _close_paren, commas) in enumerate(found):
+            while holding and found[holding[-1]][1] < open_paren:
+                leave()
+            then_start = else_start = -1
+            if len(commas) == 2:
+                then_start, else_start = commas[0] + 1, commas[1] + 1
+            self._ifs.append((open_paren, then_start, else_start, holding[-1] if holding else -1))
+            holding.append(i)
+            self._edges.append(open_paren + 1)
+            self._inner.append(i)
+        while holding:
+            leave()
+
+    def at(self, pos: int) -> str | None:
+        """:func:`_branch_guard` of offset *pos*."""
+        k = bisect.bisect_right(self._edges, pos) - 1
+        i = self._inner[k] if k >= 0 else -1
+        factors: list[str] = []
+        while i >= 0:
+            open_paren, then_start, else_start, i = self._ifs[i]
+            if then_start < 0:
+                return None  # not the form read here: no guard to give
+            cond = self._expr[open_paren + 1 : then_start - 1]
+            if then_start <= pos < else_start - 1:
+                factors.append(f"(({cond})!=0)")
+            elif pos >= else_start:
+                factors.append(f"(({cond})==0)")
+            else:
+                return None  # in the condition itself
+        return "*".join(reversed(factors)) if factors else None
+
+
 def _branch_guard(expr: str, pos: int) -> str | None:
     """Whether the ``if()`` branches enclosing offset *pos* of *expr* are on, as
     an expression that reads 1 where they all are and 0 where one is not:
     ``((c)!=0)`` for a then-branch and ``((c)==0)`` for an else-branch,
-    multiplied. ``None`` where no ``if()`` branch encloses it (issue #1147).
+    multiplied, outermost first. ``None`` where no ``if()`` branch encloses it
+    (issue #1147).
 
     A condition is ExprTk's to read, and ExprTk takes a branch wherever its
     condition is nonzero, not only where it is a comparison's 1: ``if(F, ...)``
     with ``F = 0.3`` runs its then-branch, and ``(c)`` read against ``> 0.5``
-    called that branch off and stepped over its kink."""
-    factors: list[str] = []
-    for m in _IF_CALL.finditer(expr):
-        open_paren = m.end() - 1
-        if open_paren >= pos:
-            break
-        close_paren = _find_close_paren_strict(expr, open_paren)
-        if close_paren < 0 or close_paren <= pos:
-            continue
-        args = _split_top_level_commas(expr[open_paren + 1 : close_paren])
-        if len(args) != 3:
-            return None  # not the form read here: no guard to give
-        then_start = open_paren + 1 + len(args[0]) + 1
-        else_start = then_start + len(args[1]) + 1
-        if then_start <= pos < else_start - 1:
-            factors.append(f"(({args[0]})!=0)")
-        elif pos >= else_start:
-            factors.append(f"(({args[0]})==0)")
-        else:
-            return None  # in the condition itself
-    return "*".join(factors) if factors else None
+    called that branch off and stepped over its kink.
+
+    A caller asking about many offsets of one text builds its
+    :class:`_BranchGuards` once."""
+    return _BranchGuards(expr).at(pos)
 
 
 def _fixed_clock_step(arg_flat: str, scope: SwitchConditionScope) -> bool:
@@ -9704,11 +9781,12 @@ def state_switch_root_conditions(
             for atom in compared
             for start in (m.start() for m in re.finditer(re.escape(atom), text))
         ]
+        guard_at = _BranchGuards(text).at
         for pattern in (_STEP_CALL, _BEND_CALL):
             for call, _arg, start in _iter_step_calls(
                 text, pattern=pattern, skip=spans, with_start=True
             ):
-                guard = _branch_guard(text, start)
+                guard = guard_at(start)
                 for atom in call_atoms(inline(call)):
                     admit(atom, guard=None if guard is None else inline(guard))
     if not with_guards:
