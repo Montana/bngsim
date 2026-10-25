@@ -3678,6 +3678,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
         // Issue #1191 — the burst-free solve without its stability certificate.
         .def_readwrite("certify_root", &bngsim::SteadyStateOptions::certify_root)
+        // Issue #1191 — certify the given state as the root, with no Newton step.
+        .def_readwrite("certify_start", &bngsim::SteadyStateOptions::certify_start)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty

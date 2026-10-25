@@ -1230,8 +1230,14 @@ struct SteadyStateOptions {
     // certificate, a dense eigendecomposition of the reduced Jacobian, and
     // report no verdict. steady_states() certifies each distinct root once
     // instead of every start that converged to it (91 times over on egfr_net,
-    // ~3.6 s of a 5.4 s call). Ignored by the two-tier solver.
+    // whose call took 7.2 s and takes 2.7 s). Ignored by the two-tier solver.
     bool certify_root = true;
+    // Issue #1191: true makes the burst-free solve take no Newton step and
+    // certify the state it is given, converged where that state passes `tol`.
+    // How steady_states() certifies each root, at the state it reports:
+    // solved again from there, 6 of fceri_ji's 15 roots did not converge a
+    // second time and came back with no verdict. Ignored by the two-tier solver.
+    bool certify_start = false;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —

@@ -2402,6 +2402,33 @@ static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyS
         const std::vector<double> &state;
         ~Restore() { model.set_state_from(state.data()); }
     } restore{model, start};
+    // The certificate's verdict and spectrum on a root. Issue #1191: a caller
+    // that certifies each distinct root once skips it, and the result carries
+    // no verdict.
+    const auto certify = [&](SteadyStateResult &root) {
+        if (!opts.certify_root)
+            return;
+        RootCertificate cert = certify_root_stability(model, rhs, opts, sub, root.concentrations);
+        root.root_stability = root_stability_name(cert.verdict);
+        root.eigenvalues = std::move(cert.eigenvalues);
+    };
+    // Issue #1191: the start taken as the root, with no Newton step, so the
+    // verdict is that of the state the caller reports. Solved again from
+    // there instead, 6 of fceri_ji's 15 roots did not converge a second time.
+    if (opts.certify_start) {
+        SteadyStateResult at;
+        at.method_used = "newton";
+        at.species_names = model.species_names();
+        at.concentrations = start;
+        at.n_residual_species = static_cast<int>(sub.included.size());
+        at.excluded_species = sub.excluded;
+        at.residual = compute_residual(rhs, start.data(), ns, sub);
+        at.converged = ss_accepts(model, rhs, opts, sub, start.data(), at.residual) &&
+                       ss_state_is_physical(start, ss_negative_slack(opts));
+        if (at.converged)
+            certify(at);
+        return at;
+    }
     // solve_by_newton already demotes a non-finite, unphysical or over-tol root.
     SteadyStateResult r = ss_newton_from(model, rhs, opts, sub, start);
     // Issue #1190: each law is pivoted on its largest member at the state the
@@ -2442,13 +2469,7 @@ static SteadyStateResult solve_by_newton_from_state(NetworkModel &model, SteadyS
             p.n_rhs_evals += r.n_rhs_evals;
             r = std::move(p);
         }
-        // Issue #1191: a caller that certifies each distinct root once skips
-        // it here, and the result carries no verdict.
-        if (opts.certify_root) {
-            RootCertificate cert = certify_root_stability(model, rhs, opts, sub, r.concentrations);
-            r.root_stability = root_stability_name(cert.verdict);
-            r.eigenvalues = std::move(cert.eigenvalues);
-        }
+        certify(r);
     }
     return r;
 }

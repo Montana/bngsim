@@ -1178,6 +1178,7 @@ class SsaSimulator:
         """
 class SteadyStateOptions:
     certify_root: bool
+    certify_start: bool
     codegen_c_source: str
     codegen_so_path: str
     criterion: str

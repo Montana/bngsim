@@ -844,3 +844,31 @@ def test_each_distinct_root_is_certified_once(monkeypatch):
     assert sorted(roots.stability) == ["stable", "stable", "unstable"]
     assert roots.stability[_row(roots, _SADDLE)] == "unstable"
     assert all(len(e) == 2 for e in roots.eigenvalues)
+
+
+def test_certify_start_certifies_the_state_it_is_given():
+    """``certify="start"`` takes no Newton step (issue #1191): the saddle comes
+    back as it was given, certified there, and a state that is no root comes
+    back unconverged with no verdict."""
+    sim, _ = _toggle()
+    kw = {"method": "newton", "newton_burst": False, "certify": "start"}
+    (at, off) = sim.steady_state_batch(states=np.array([_SADDLE, _SADDLE * 1.01]), **kw)
+    assert at.converged and at.n_steps == 0
+    np.testing.assert_array_equal(at.concentrations, _SADDLE)
+    assert at.root_stability == "unstable" and len(at.eigenvalues) == 2
+    assert not off.converged and off.root_stability == "" and len(off.eigenvalues) == 0
+    np.testing.assert_array_equal(off.concentrations, _SADDLE * 1.01)
+    with pytest.raises(ValueError, match="certify"):
+        sim.steady_state_batch(states=_SADDLE[None, :], **{**kw, "certify": "no"})
+
+
+def test_every_root_keeps_its_verdict_when_each_is_certified_once():
+    """fceri_ji_red's continuum of roots, each certified once (issue #1191).
+    Solved again from its representative, one of its 8 roots did not converge
+    a second time and came back "undetermined" with no spectrum, where
+    certifying every start called all 8 stable."""
+    model = bngsim.Model.from_net(_net("fceri_ji_red.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(seed=0)
+    assert len(roots) > 1
+    assert set(roots.stability) == {"stable"}, roots.stability
+    assert all(len(e) for e in roots.eigenvalues)
