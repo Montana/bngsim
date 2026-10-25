@@ -24,6 +24,7 @@ dY/dk_clock = -0.973501 and Y = 10(1 - e^(-1/4)).
 
 from __future__ import annotations
 
+import logging
 import math
 
 import bngsim
@@ -99,23 +100,50 @@ def test_a_jump_on_the_same_surface_is_refused_not_carried(tmp_path):
         _run(tmp_path, LAWS["if()"], 0.01, 1e-11, beside="kz*if(Tobs-c>=w/2,1,0)")
 
 
+def _beside_a_decay(law, w, trigger=None, **kw):
+    """The pulse model with Z -> 0 at kd = 0.1 from Z = 10 beside it, and an
+    event adding 5 to Z on *trigger* where one is given."""
+    b = ModelBuilder()
+    for name, value in (("kx", 1.0), ("k_clock", 2.0), ("c", 50.0), ("w", w), ("kd", 0.1)):
+        b.add_parameter(name, value)
+    t, x, y, z = (b.add_species(s, v) for s, v in (("T", 0), ("X", 10), ("Y", 0), ("Z", 10)))
+    b.add_observable("Tobs", [(t, 1.0)])
+    b.add_reaction([], [t], "elementary", "k_clock")
+    b.add_function("f", law)
+    b.add_reaction([x], [y], "functional", "f")
+    b.add_reaction([z], [], "elementary", "kd")
+    if trigger is not None:
+        b.add_event("dose", trigger, [(z, "Z + 5")])
+    return bngsim.Simulator(
+        bngsim.Model(b.build()), method="ode", sensitivity_params=["kx", "k_clock"], **kw
+    )
+
+
 @pytest.mark.parametrize("spelling", list(LAWS))
 def test_an_event_on_the_same_surface_is_refused_not_carried(spelling):
     """An event adds 5 to a decaying Z where the pulse returns to 0. Carried
     over with the bend, its trigger turned with no root: the event did not
     fire until the run's last output, and Z came back 5.4979 for 3.5313."""
-    b = ModelBuilder()
-    for name, value in (("kx", 1.0), ("k_clock", 2.0), ("c", 50.0), ("w", 0.01), ("kd", 0.1)):
-        b.add_parameter(name, value)
-    t, x, y, z = (b.add_species(s, v) for s, v in (("T", 0), ("X", 10), ("Y", 0), ("Z", 10)))
-    b.add_observable("Tobs", [(t, 1.0)])
-    b.add_reaction([], [t], "elementary", "k_clock")
-    b.add_function("f", LAWS[spelling])
-    b.add_reaction([x], [y], "functional", "f")
-    b.add_reaction([z], [], "elementary", "kd")
-    b.add_event("dose", "Tobs > c + w/2", [(z, "Z + 5")])
-    sim = bngsim.Simulator(
-        bngsim.Model(b.build()), method="ode", sensitivity_params=["kx", "k_clock"]
-    )
+    sim = _beside_a_decay(LAWS[spelling], 0.01, trigger="Tobs > c + w/2")
     with pytest.raises(bngsim.SimulationError, match="event 'dose'"):
         sim.run(t_span=(0, 30), n_points=3, rtol=1e-11, atol=1e-13)
+
+
+@pytest.mark.parametrize(
+    ("spelling", "w", "jacobian", "rel"),
+    [("max/abs", 0.01, "auto", 2e-5), ("if()", 0.003, "fd", 5e-4)],
+)
+def test_a_stall_the_time_cannot_move_out_of_is_carried(caplog, spelling, w, jacobian, rel):
+    """Beside the decaying Z, the step at the pulse's foot fell under half an
+    ulp of t = 25.0025 (h = 1.1e-15), so the time the hold check waits to see
+    pass never did, and the state was neither carried nor refused (issue
+    #1283). The batch ran out on the no-progress guard: with the analytic
+    Jacobian after 20,000 steps and a GH#176 retry on the difference quotient,
+    and with jacobian="fd", where there is nothing to retry with, as a failed
+    run. The foot is continuous, and is carried."""
+    sim = _beside_a_decay(LAWS[spelling], w, jacobian=jacobian)
+    with caplog.at_level(logging.WARNING):
+        run = sim.run(t_span=(0, 30), n_points=3, rtol=1e-10, atol=1e-12)
+    assert not [r for r in caplog.records if "no progress" in r.getMessage()]
+    assert float(np.asarray(run.species)[-1, 2]) == pytest.approx(Y_EXACT, rel=1e-8)
+    assert float(np.asarray(run.sensitivities)[-1, 2, 1]) == pytest.approx(EXACT, rel=rel)
