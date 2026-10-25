@@ -114,3 +114,51 @@ def test_the_sensitivity_to_the_divisor_itself():
     np.testing.assert_allclose(s, _central(READS, "C2"), rtol=1e-5, atol=1e-7)
     _, w = _run(WRITTEN, ["C2"])
     np.testing.assert_allclose(s, np.asarray(w.sensitivities)[:, :, 0], rtol=1e-6, atol=1e-12)
+
+
+_J = "J: A -> B; k*A*C1;"
+# Each: the reactions, the rule that reads rateOf, and the whole model with the
+# rate written out by hand.
+_CASES = {
+    # rateOf of the reactant: its divisor is its own compartment's, C1
+    "reactant": (_J, "S' = g*rateOf(A);", _J + " S' = g*(-k*A*C1/C1);"),
+    # a coefficient of 2, both sides read
+    "two-A": (
+        "J: 2A -> B; k*A^2*C1;",
+        "S' = g*rateOf(A) + rateOf(B);",
+        "J: 2A -> B; k*A^2*C1; S' = g*(-2*k*A^2*C1/C1) + (k*A^2*C1/C2);",
+    ),
+    # a reversible rate, negative where B's term leads
+    "reversible": (
+        "J: A -> B; k*A*C1 - g*B*C2;",
+        "S' = rateOf(B);",
+        "J: A -> B; k*A*C1 - g*B*C2; S' = (k*A*C1 - g*B*C2)/C2;",
+    ),
+    # rateOf in a reaction's rate, not a rule
+    "in-a-rate": (_J + " K: S -> ; g*S*rateOf(B)*C1;", "", _J + " K: S -> ; g*S*(k*A*C1/C2)*C1;"),
+    # C2 grows: B's rate is J's over the live C2, less its dilution
+    "live": (
+        _J + " C2' = 0.05;",
+        "S' = g*rateOf(B);",
+        _J + " C2' = 0.05; S' = g*(k*A*C1/C2 - B*0.05/C2);",
+    ),
+}
+_HEAD = """
+compartment C1 = 2; compartment C2 = 3; k = 0.3; g = 0.7;
+species A in C1 = 1; species B in C2 = 0.5; species S in C1 = 0;
+"""
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_each_shape_is_the_hand_written_model(case):
+    """A reactant's rate, a coefficient of 2, a reversible rate, rateOf in a
+    rate, and a growing divisor: each the model with the rate written by hand,
+    sizes included. Before, each declined to the difference quotient, which at
+    rtol 1e-11 took 7 to 53 million steps and was 5e-3 off in places."""
+    rxn, rule, hand = _CASES[case]
+    params = ["k", "g", "C1"] + ([] if case == "live" else ["C2"])
+    sim, reads = _run(_HEAD + rxn + "\n" + rule, params, rtol=1e-11, atol=1e-15)
+    assert sim.sens_rhs_decline_reason is None
+    _, written = _run(_HEAD + hand, params, rtol=1e-11, atol=1e-15)
+    np.testing.assert_allclose(reads.species, written.species, rtol=1e-9, atol=1e-15)
+    np.testing.assert_allclose(reads.sensitivities, written.sensitivities, rtol=1e-8, atol=1e-13)
