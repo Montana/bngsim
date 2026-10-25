@@ -432,8 +432,9 @@ class _SpanIndex:
     spans)``, and ``covers(start)`` is ``any(lo <= start < hi ...)``. Asked of
     every match of a pattern against every ``if()`` condition span, as four
     scans here did, that is a product of the two counts, and a rate law written
-    out through a diamond of rules holds thousands of both: 26.8 s of the 29 s
-    a sensitivity simulator for #1145's size jump took to build at 16 rules.
+    out through a diamond of rules holds thousands of both: a sensitivity
+    simulator for #1145's size jump took 298 s to build at 20 rules, and takes
+    35 s with the spans indexed.
 
     With the spans sorted by start and the furthest end of those so far kept
     beside each, some span holds ``[start, end]`` exactly when, of the spans
@@ -9617,10 +9618,13 @@ def state_switch_root_conditions(
         # Every step or bend call outside the comparisons, nested ones too: the
         # abs() inside `max(0, 1 - abs(u)/w)` bends the rate law as the max()
         # does (issue #1068). One inside a comparison jumps it only through
-        # that comparison, whose root is above.
+        # that comparison, whose root is above. Each atom's text is found
+        # once: written N times, it is in `compared` N times, and finding
+        # every copy for every copy listed N² spans, which the index the call
+        # scan puts them in then sorted (issue #1256).
         spans = [
             (start, start + len(atom))
-            for atom in compared
+            for atom in dict.fromkeys(compared)
             for start in (m.start() for m in re.finditer(re.escape(atom), text))
         ]
         for pattern in (_STEP_CALL, _BEND_CALL):
