@@ -143,6 +143,8 @@ def _integral(true, edges):
     "cond, true, edges",
     [
         (a("xor", LT15, GT1), lambda t: (t > T15) != (t < T10), (T15, T10)),
+        (a("neq", LT15, GT1), lambda t: (t > T15) != (t < T10), (T15, T10)),
+        (a("eq", LT15, GT1), lambda t: (t > T15) == (t < T10), (T15, T10)),
         (
             a("xor", call("lt15", "S3"), call("gt1", "S3")),
             lambda t: (t > T15) != (t < T10),
@@ -159,7 +161,7 @@ def _integral(true, edges):
             (2.0, 5.0),
         ),
     ],
-    ids=["state", "of-calls", "three-way", "clock"],
+    ids=["state", "neq", "eq", "of-calls", "three-way", "clock"],
 )
 def test_a_rate_law_that_branches_on_xor_gets_exact_sensitivities(cond, true, edges):
     """X' = -k·X·f, f = 1 or 0.2 as the xor reads, which k does not move: X =
