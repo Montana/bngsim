@@ -294,6 +294,16 @@ _UNAVAILABLE_NF_METHODS: dict[str, str] = _unavailable_nf_methods
 # sensitivity auto-codegen path here share one source of truth.
 
 
+def _ssa_flag_on(name: str) -> bool:
+    """Whether the SSA selector's environment flag *name* is on, read as the C++
+    selector's ``on()`` reads it: set, non-empty and not starting with ``0``.
+    Read as plain truthiness, ``BNGSIM_SSA_NO_CODEGEN=0`` kept Python from
+    building the propensity library while C++ took the flag as off, and the run
+    lost the compiled path neither side was asked to drop."""
+    value = os.environ.get(name, "")
+    return value != "" and value[0] != "0"
+
+
 def _codegen_refusal(cause: BaseException | None, decline: str | None) -> str:
     """Why ``codegen=True`` could not be honoured, as the prepare call recorded it:
     the build failed (``cause``, :func:`bngsim._codegen.last_codegen_error`) or
@@ -510,13 +520,20 @@ class Simulator:
         lets NFsim auto-compute a suggested limit from the XML.
 
     codegen : bool, optional
-        Only used for ``method="ode"``. When true, use a compiled C RHS,
-        generated from the model bngsim built -- whatever it was loaded from
-        (``.net``, BNGL, SBML, Antimony or the builder). ``None`` (default)
-        compiles automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species
-        (256), where native code beats the interpreter. ``False`` runs the
+        For ``method="ode"``: when true, use a compiled C RHS, generated from
+        the model bngsim built -- whatever it was loaded from (``.net``, BNGL,
+        SBML, Antimony or the builder). ``None`` (default) compiles
+        automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species (256),
+        where native code beats the interpreter. ``False`` runs the
         interpreter: it never compiles, and it ignores an artifact that an
         earlier Simulator or ``Model.clone()`` left on the model.
+
+        For ``method="ssa"``: unless ``False``, a small pure mass-action model
+        with no events gets a compiled propensity vector and the recompute-all
+        loop, reported as ``ssa_diagnostics["propensity_backend"]``.
+        ``False`` runs the interpreted propensities, on every engine the
+        Simulator builds, ``run_replicates`` and ``run_batch`` included (issue
+        #1213). Other methods ignore it.
 
     net_path : str, optional
         Deprecated and ignored (issue #803). Every backend reads the model it is
@@ -694,6 +711,9 @@ class Simulator:
 
     __slots__ = (
         "_reaction_stats",
+        # The cc propensity library __init__ built for an exact SSA, or "" (GH
+        # #190); _new_ssa_engine hands it to every engine.
+        "_ssa_propensity_lib",
         "_model",
         "_method",
         "_canonical_method",
@@ -812,6 +832,10 @@ class Simulator:
                 "(use method='ssa')"
             )
         self._reaction_stats = bool(reaction_stats)
+        # Set here, ahead of the rest of the codegen state below, because the SSA
+        # branch's _new_ssa_engine reads both.
+        self._codegen = codegen
+        self._ssa_propensity_lib = ""
 
         self._model = model
         # GH #198: stash whether expression output sensitivities will be needed,
@@ -956,40 +980,36 @@ class Simulator:
                 loc = f" [{w.location}]" if w.location else ""
                 logger.warning("SSA validation: %s%s — %s", w.code, loc, w.message)
 
-            # PSA shares SsaSimulator; dispatch happens at run time.
-            # Event-with-delay rejection happens C++-side at run() entry.
-            from bngsim._bngsim_core import SsaSimulator
-
-            self._sim = SsaSimulator(model._core)
-            if self._reaction_stats:
-                self._sim.set_record_reaction_stats(True)
-
-            # GH #190 — for exact SSA, hand the C++ simulator a cc-compiled
-            # value-specialized propensity .so so eligible small mass-action
-            # models take the RR-parity recompute-all + flat-scan loop by
-            # DEFAULT (no MIR). The C++ side makes the final eligibility/size
-            # decision and ignores it for PSA / events / functional / large-nr
-            # models; this just provides the artifact, cached on disk so an
-            # ensemble compiles once. Skipped for PSA (recompute-all needs exact
-            # SSA), when codegen=False, when BNGSIM_SSA_NO_CODEGEN is set, or when
-            # a BNGSIM_SSA_PROP_{CC,JIT} env override selects an in-process
-            # backend instead (then the C++ side compiles the source itself).
+            # GH #190 — for exact SSA, build a cc-compiled structure-specialized
+            # propensity .so so eligible small mass-action models take the
+            # RR-parity recompute-all + flat-scan loop by DEFAULT (no MIR). The
+            # C++ side makes the final eligibility/size decision and ignores it
+            # for PSA / events / functional / large-nr models; this just provides
+            # the artifact, cached on disk so an ensemble compiles once, and
+            # _new_ssa_engine hands it to every engine this Simulator builds.
+            # Skipped for PSA (recompute-all needs exact SSA), when
+            # codegen=False, when BNGSIM_SSA_NO_CODEGEN is set, or when a
+            # BNGSIM_SSA_PROP_{CC,JIT} env override selects an in-process backend
+            # instead (then the C++ side compiles the source itself).
             if (
                 dispatch == "ssa"
                 and codegen is not False
-                and not os.environ.get("BNGSIM_SSA_NO_CODEGEN")
-                and not os.environ.get("BNGSIM_SSA_PROP_CC")
-                and not os.environ.get("BNGSIM_SSA_PROP_JIT")
+                and not _ssa_flag_on("BNGSIM_SSA_NO_CODEGEN")
+                and not _ssa_flag_on("BNGSIM_SSA_PROP_CC")
+                and not _ssa_flag_on("BNGSIM_SSA_PROP_JIT")
             ):
                 try:
                     from bngsim._codegen import prepare_ssa_propensity_lib
 
-                    _ssa_lib = prepare_ssa_propensity_lib(model)
-                    if _ssa_lib:
-                        self._sim.set_propensity_library(_ssa_lib)
-                        logger.debug("SSA propensity .so ready: %s", _ssa_lib)
+                    self._ssa_propensity_lib = prepare_ssa_propensity_lib(model) or ""
+                    if self._ssa_propensity_lib:
+                        logger.debug("SSA propensity .so ready: %s", self._ssa_propensity_lib)
                 except Exception:  # pragma: no cover - defensive
                     logger.debug("SSA propensity codegen skipped", exc_info=True)
+
+            # PSA shares SsaSimulator; dispatch happens at run time.
+            # Event-with-delay rejection happens C++-side at run() entry.
+            self._sim = self._new_ssa_engine(model._core)
         elif dispatch == "nfsim":
             from bngsim._bngsim_core import HAS_NFSIM
 
@@ -1113,7 +1133,6 @@ class Simulator:
         self._snapshot_stack: list[dict] = []
 
         # Code-generated RHS support, including model-based codegen reuse.
-        self._codegen = codegen
         self._codegen_so_path = ""
         # In-process MIR micro-JIT source (GH #78). When the JIT backend is
         # selected (BNGSIM_CODEGEN_JIT=mir), the codegen C source is JIT-compiled
@@ -4416,22 +4435,45 @@ class Simulator:
 
         The persistent CvodeSimulator / SsaSimulator is constructed once from
         ``model._core``; after a parameter change some backend state must be
-        rebuilt to pick it up (the SSA value-specialized propensity library
-        bakes rate-constant values; the ODE path also drops any cached
-        integrator workspace). ``intervene``, ``restore``, and the scan
-        primitives all re-derive the backend through this single helper so the
-        recreation rule lives in one place.
+        rebuilt to pick it up (the ODE path drops any cached integrator
+        workspace). ``intervene``, ``restore``, and the scan primitives all
+        re-derive the backend through this single helper so the recreation rule
+        lives in one place. The SSA engine comes from :meth:`_new_ssa_engine`,
+        so it keeps the propensity library: the library is structure-specialized
+        and reads the live parameter values at the start of every run, so a
+        parameter change leaves it valid.
         """
         if self._method == "ode":
             from bngsim._bngsim_core import CvodeSimulator
 
             self._sim = CvodeSimulator(self._model._core)
         elif self._method in ("ssa", "psa"):
-            from bngsim._bngsim_core import SsaSimulator
+            self._sim = self._new_ssa_engine(self._model._core)
 
-            self._sim = SsaSimulator(self._model._core)
-            if self._reaction_stats:
-                self._sim.set_record_reaction_stats(True)
+    def _new_ssa_engine(self, core: Any) -> Any:
+        """A core ``SsaSimulator`` on *core*, set up as this Simulator's own.
+
+        Every SSA engine is built here: the one ``__init__`` makes, the one
+        :meth:`_recreate_interactive_sim` rebuilds after ``intervene`` or
+        ``restore``, ``run_replicates``' per-thread ones and ``run_batch``'s
+        per-row ones. Each keeps to the caller's ``codegen=False`` (issue #1213:
+        with no library to load, a MIR build's C++ default JITs the propensities
+        in-process, a path meant for an install with no compiler), carries the
+        propensity library ``__init__`` built (GH #190; it reads every rate
+        constant and volume at run time, so a clone and a changed parameter are
+        served alike) and records ``reaction_stats``. Built by hand at each site,
+        the later three had lost the library, and ``run_batch``'s the stats too.
+        """
+        from bngsim._bngsim_core import SsaSimulator
+
+        sim = SsaSimulator(core)
+        if self._codegen is False:
+            sim.set_codegen(False)
+        if self._ssa_propensity_lib:
+            sim.set_propensity_library(self._ssa_propensity_lib)
+        if self._reaction_stats:
+            sim.set_record_reaction_stats(True)
+        return sim
 
     # ─── Absolute tolerance, scalar or per-species (issue #196) ─────
 
@@ -5595,7 +5637,7 @@ class Simulator:
 
         base_seed = _resolve_seed(seed)
 
-        from bngsim._bngsim_core import SsaSimulator, TimeSpec
+        from bngsim._bngsim_core import TimeSpec
 
         def _make_times() -> Any:
             ts = TimeSpec()
@@ -5635,9 +5677,7 @@ class Simulator:
                 sim = getattr(local, "sim", None)
                 if sim is None:
                     local.model = self._model.clone()
-                    local.sim = SsaSimulator(local.model._core)
-                    if self._reaction_stats:
-                        local.sim.set_record_reaction_stats(True)
+                    local.sim = self._new_ssa_engine(local.model._core)
                     self._apply_ssa_breakpoints([local.sim], local.model, t_start, t_end)
                     local.times = _make_times()
                     sim = local.sim
@@ -6637,9 +6677,7 @@ class Simulator:
                 core_result = self._ode_attempts(times, opts, restore, sim=sim, core=row_core)
 
             elif self._method in ("ssa", "psa"):
-                from bngsim._bngsim_core import SsaSimulator
-
-                sim = SsaSimulator(clone._core)
+                sim = self._new_ssa_engine(clone._core)
                 # This row's parameters place its crossings, so resolve on the clone.
                 self._apply_ssa_breakpoints([sim], clone, t_span[0], t_span[1])
                 if self._method == "psa":
