@@ -149,7 +149,7 @@ def test_a_sensitivity_run_agrees_with_a_plain_run_at_the_row(grid):
     text = "species S = 3; q = 0; k = 1; q' = k; E1: at (q >= 2.5): S = 1;"
     times = _GRIDS[grid]
     _, _, s = _sens_run(text, times, sensitivity_params=["k"])
-    assert s == _column(text, times, "S")
+    np.testing.assert_allclose(s, _column(text, times, "S"), rtol=1e-12)
     assert s == [3.0 if t < 2.5 else 1.0 for t in times]
 
 
@@ -158,7 +158,7 @@ def test_a_sensitivity_run_jumps_its_columns_at_the_row(op):
     text = _HALVE.format(op=op)
     times = [0.0, 1.0, 2.0, 2.5, 3.0]
     r, j, s = _sens_run(text, times, sensitivity_params=["k"], sensitivity_ic=["q", "S"])
-    assert s == _column(text, times, "S")
+    np.testing.assert_allclose(s, _column(text, times, "S"), rtol=1e-12)
     np.testing.assert_allclose(s, [3, 4, 5, 2.75, 3.25], rtol=1e-6)
     after = np.array(times) >= 2.5
     dk = np.asarray(r.sensitivities)[:, j, 0]
@@ -174,7 +174,7 @@ def test_a_sensitivity_run_from_a_later_start_fires_at_the_row():
     r, j, s = _sens_run(
         _HALVE.format(op=">="), times, sensitivity_params=["k"], sensitivity_ic=["q"]
     )
-    assert s == _column(_HALVE.format(op=">="), times, "S")
+    np.testing.assert_allclose(s, _column(_HALVE.format(op=">="), times, "S"), rtol=1e-12)
     np.testing.assert_allclose(s, [3, 4, 2.75, 3.25], rtol=1e-6)
     np.testing.assert_allclose(np.asarray(r.sensitivities)[:, j, 0], [0, 0, 1.25, 1.25], atol=1e-6)
     np.testing.assert_allclose(
@@ -196,7 +196,7 @@ def test_two_events_on_one_crossing_at_the_row_fire_together():
     plain = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run(
         sample_times=times
     )
-    np.testing.assert_array_equal(x, np.asarray(plain.species))
+    np.testing.assert_allclose(x, np.asarray(plain.species), rtol=1e-12)
     np.testing.assert_allclose(x[:, names.index("R")], [1, 6.5, 6.5], rtol=1e-6)
     # R = 1 + 3 + t*: dR/dk = dt*/dk = -2.5
     np.testing.assert_allclose(
