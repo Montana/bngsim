@@ -81,7 +81,7 @@ def _decay(rid, sid, law):
 
 
 def _doc(x_comp, x_law, rules=""):
-    """S3 in c, decaying at 0.1·S3; X in x_comp, at x_law."""
+    """S3 in c, decaying at kd·S3 (kd = 0.1); X in x_comp, at x_law."""
     cv = '<compartment id="cv" size="1" constant="false"/>' if x_comp == "cv" else ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -90,18 +90,19 @@ def _doc(x_comp, x_law, rules=""):
         f'<listOfCompartments><compartment id="c" size="1" constant="true"/>{cv}'
         f"</listOfCompartments><listOfSpecies>{_species('S3', 'c')}{_species('X', x_comp)}"
         '</listOfSpecies><listOfParameters><parameter id="k" value="0.3" constant="true"/>'
+        '<parameter id="kd" value="0.1" constant="true"/>'
         f"</listOfParameters><listOfRules>{rules}</listOfRules><listOfReactions>"
-        f"{_decay('d3', 'S3', a('times', cn(0.1), ci('S3'), ci('c')))}{_decay('dX', 'X', x_law)}"
+        f"{_decay('d3', 'S3', a('times', ci('kd'), ci('S3'), ci('c')))}{_decay('dX', 'X', x_law)}"
         "</listOfReactions></model></sbml>"
     )
 
 
 def _x(model, sens=False):
-    sim = bngsim.Simulator(model, method="ode", **({"sensitivity_params": ["k"]} if sens else {}))
-    result = sim.run(sample_times=list(T))
+    params = {"sensitivity_params": ["k", "kd"]} if sens else {}
+    result = bngsim.Simulator(model, method="ode", **params).run(sample_times=list(T))
     i = list(result.species_names).index("X")
     x = np.asarray(result.species)[:, i]
-    return (x, np.asarray(result.sensitivities)[:, i, 0]) if sens else x
+    return (x, np.asarray(result.sensitivities)[:, i, :]) if sens else x
 
 
 # xor(S3 < 1.5, S3 > 1): true before 2.877 and after 6.931
@@ -131,12 +132,29 @@ def test_a_size_that_jumps_on_two_conditions_compared_loads_and_rescales(cond, t
     np.testing.assert_allclose(_x(model), 4 * cv[0] * np.exp(-T / 4) / cv, rtol=1e-5)
 
 
+def _f(true, t):
+    return 1.0 if true(t) else 0.2
+
+
 def _integral(true, edges):
     """F(t) = ∫f over [0, t], f = 1 where the condition holds and 0.2
     elsewhere, exact for a condition that flips only at ``edges``."""
     grid = np.unique(np.concatenate([T, edges]))
-    f = np.where([true(m) for m in 0.5 * (grid[:-1] + grid[1:])], 1.0, 0.2)
+    f = [_f(true, m) for m in 0.5 * (grid[:-1] + grid[1:])]
     return np.interp(T, grid, np.concatenate([[0.0], np.cumsum(f * np.diff(grid))]))
+
+
+def _integral_dkd(true, edges):
+    """dF/dkd. A flip of S3's comparison sits at c/kd, so kd moves it by
+    -edge/kd, and F gains f(edge⁻) - f(edge⁺) per unit it moves: the jump
+    term that a mis-signed or doubled root would get wrong."""
+    return sum(
+        (
+            np.where(e < T, (_f(true, e - 1e-9) - _f(true, e + 1e-9)) * (-e / 0.1), 0.0)
+            for e in edges
+        ),
+        np.zeros_like(T),
+    )
 
 
 @pytest.mark.parametrize(
@@ -158,20 +176,24 @@ def _integral(true, edges):
         (
             a("xor", a("lt", _TIME, cn(2)), a("gt", _TIME, cn(5))),
             lambda t: (t < 2) != (t > 5),
-            (2.0, 5.0),
+            (),  # the clock's flips, at 2 and 5, which kd does not move
         ),
     ],
     ids=["state", "neq", "eq", "of-calls", "three-way", "clock"],
 )
 def test_a_rate_law_that_branches_on_xor_gets_exact_sensitivities(cond, true, edges):
-    """X' = -k·X·f, f = 1 or 0.2 as the xor reads, which k does not move: X =
-    4·e^(-k·F(t)) with F = ∫f, and dX/dk = -F·X. Refused before, as no single
-    comparison bngsim can root on."""
+    """X' = -k·X·f, f = 1 or 0.2 as the xor reads: X = 4·e^(-k·F(t)) with F =
+    ∫f, so dX/dk = -F·X, and dX/dkd = -k·X·dF/dkd, where kd moves each flip
+    of S3's comparisons. Refused before, as no single comparison bngsim can
+    root on."""
     law = a("times", ci("k"), ci("X"), piecewise(cn(1), cond, cn(0.2)))
-    F = _integral(true, edges)
-    x, dx_dk = _x(bngsim.Model.from_sbml_string(_doc("c", law)), sens=True)
+    F = _integral(true, edges or (2.0, 5.0))
+    x, dx = _x(bngsim.Model.from_sbml_string(_doc("c", law)), sens=True)
     np.testing.assert_allclose(x, 4 * np.exp(-0.3 * F), rtol=1e-5)
-    np.testing.assert_allclose(dx_dk[1:], -F[1:] * x[1:], rtol=1e-5)
+    np.testing.assert_allclose(dx[1:, 0], -F[1:] * x[1:], rtol=1e-5)
+    np.testing.assert_allclose(
+        dx[1:, 1], -0.3 * x[1:] * _integral_dkd(true, edges)[1:], rtol=1e-4, atol=1e-7
+    )
 
 
 def test_xor_text_grows_quadratically_not_exponentially():
