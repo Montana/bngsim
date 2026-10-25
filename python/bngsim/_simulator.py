@@ -2213,6 +2213,7 @@ class Simulator:
             return conditions
         from bngsim._switch_sensitivity import (
             _PLAIN_INSTANT_FLOOR,
+            StopsMoveWithAnEvent,
             TriggerEqualityNeverHolds,
             crossings_with_periodic,
             merge_crossing_stops,
@@ -2265,7 +2266,7 @@ class Simulator:
             )
             if periodic_at:
                 crossings = sorted([*crossings, *periodic_at], key=lambda stop: stop.time)
-        except TriggerEqualityNeverHolds as e:
+        except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
             raise SimulationError(str(e)) from None
         except SensitivityUnsupportedError:
             raise
@@ -2560,6 +2561,7 @@ class Simulator:
             conditions = model.time_discontinuity_conditions()
             if conditions:
                 from bngsim._switch_sensitivity import (
+                    StopsMoveWithAnEvent,
                     TriggerEqualityNeverHolds,
                     crossings_with_periodic,
                     merge_crossing_stops,
@@ -2580,7 +2582,7 @@ class Simulator:
                     # whose window a step can otherwise lie across unseen.
                     if periodic:
                         times = sorted(set(times) | {float(stop.time) for stop in periodic})
-                except TriggerEqualityNeverHolds as e:
+                except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
                     raise SimulationError(str(e)) from None
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning(

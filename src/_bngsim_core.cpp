@@ -2667,6 +2667,45 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "differentiates the trigger's threshold symbolically, so it needs "
             "the model's own spelling rather than the evaluator's preprocessed "
             "form.")
+        .def(
+            "events_as_written",
+            [](bngsim::NetworkModel &self) {
+                // The evaluator keeps each compiled expression's text; '' where
+                // it is not the ExprTk one, or the expression is not compiled.
+                const auto *exprtk =
+                    dynamic_cast<const bngsim::ExprTkEvaluator *>(&self.evaluator());
+                const auto text = [&](int idx) {
+                    return exprtk != nullptr && idx >= 0 ? exprtk->preprocessed_expr(idx)
+                                                         : std::string();
+                };
+                py::list out;
+                for (const auto &ev : self.events()) {
+                    py::list assignments;
+                    for (const auto &[sp, expr] : ev.assignments)
+                        assignments.append(py::make_tuple(sp, text(expr)));
+                    py::dict d;
+                    d["id"] = ev.id;
+                    d["trigger"] = ev.trigger_source;
+                    d["assignments"] = assignments;
+                    d["delay"] = ev.delay;
+                    d["delay_expr"] = text(ev.delay_expr_idx);
+                    d["priority"] = ev.priority;
+                    d["priority_expr"] = text(ev.priority_expr_idx);
+                    d["persistent"] = ev.persistent;
+                    d["initial_value"] = ev.initial_value;
+                    d["use_values_from_trigger_time"] = ev.use_values_from_trigger_time;
+                    d["size_jump_compartment"] = ev.size_jump_compartment;
+                    out.append(d);
+                }
+                return out;
+            },
+            "Each event as the run reads it, in events() order (issue #1244): {id, "
+            "trigger (as written), assignments [(0-based species index, value text)], "
+            "delay, delay_expr, priority, priority_expr, persistent, initial_value, "
+            "use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, "
+            "'' where none is "
+            "compiled. A schedule that reads a species only events write has its stops "
+            "placed from when those events set it.")
         .def_property_readonly("n_discontinuity_triggers",
                                &bngsim::NetworkModel::n_discontinuity_triggers)
         .def(
