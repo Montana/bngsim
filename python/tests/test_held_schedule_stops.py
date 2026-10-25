@@ -200,3 +200,111 @@ def test_a_carried_execution_sets_the_value_it_froze(rtol):
     assert model.get_concentration("w") == 2.0
     exact = _exact([(245, 5.0), (250, 2.0)], 480, t_start=240, w0=1.0)
     assert gain == pytest.approx(exact, rel=10 * rtol)
+
+
+# ── Review of the first two commits ─────────────────────────────────────────
+
+
+def test_a_schedule_quiet_at_its_start_is_refused():
+    """w = 0 as the run starts, so `mod(time, 24) < w` never holds then, and a
+    state trigger sets w = 1 at t = 20. Read only at its start the condition
+    changed no times and was let through: Y(240) came to 0 for 9, the issue
+    again with nothing said. Read with w = 1 too, the number E1 sets, it
+    changes 20 times, and the run is refused."""
+    model = bngsim.Model.from_antimony_string(
+        f"""
+model m
+  compartment C = 1
+  species X in C, Y in C
+  X = 0; Y = 0
+  w = 0
+  J0: -> X; 0.1
+  J1: -> Y; {PULSE}
+  E1: at (X > 2): w = 1
+end"""
+    )
+    with pytest.raises(bngsim.SimulationError, match="issue #1244") as e:
+        bngsim.Simulator(model, method="ode").run(sample_times=[0, 240], rtol=1e-6, atol=1e-8)
+    assert "with w at 1.0, which an event sets it to" in str(e.value)
+
+
+def test_a_condition_only_an_output_reads_is_not_refused():
+    """The pulse is an output's alone: no rate law reads it, and a step across
+    one of its windows moves nothing. Main ran it; the first commits refused
+    it as a rate law's switch."""
+    model = bngsim.Model.from_antimony_string(
+        f"""
+model m
+  compartment C = 1
+  species X in C
+  X = 0
+  w = 1
+  y := {PULSE}
+  J0: -> X; 0.05
+  E1: at (X > 2): w = 2
+end"""
+    )
+    x = _x(model, [0, 240], rtol=1e-8, atol=1e-10)
+    assert x[-1] == pytest.approx(12, rel=1e-6)
+
+
+def test_a_value_read_through_a_derived_parameter_is_known():
+    """k2 = 2*w2 is a constant of the run, so `w = k2` sets a known value:
+    w = 4 from 50 on. It was refused as not known before the run."""
+    x = _x(_model("E1: at (time >= 50): w = k2", extra="k2 = 2*w2"), [0, 240], rtol=1e-8)
+    assert x[-1] == pytest.approx(_exact([(50, 4.0)], 240), rel=1e-6)
+
+
+def test_a_held_species_that_holds_over_the_run_reads_as_a_run_constant():
+    """w's one event is past the end, so w is 1 throughout, and the run must be
+    the one where w is a parameter, with an event elsewhere. A stretch's
+    condition, with w written as its number, was not found in the rate law,
+    so a ramp times the pulse was taken to hold between its changes and its
+    stops moved a double early: 1088.15 for that run's 1058.25 at rtol 1e-2."""
+    law = f"time*{PULSE}"
+    held = _x(_model("E1: at (time >= 1000): w = 2", law=law), [0, 240], rtol=1e-2, atol=1e-4)
+    constant = _x(
+        _model("E1: at (time >= 1000): Z = 2", law=law, extra="Z = 1"),
+        [0, 240],
+        rtol=1e-2,
+        atol=1e-4,
+    )
+    assert held[-1] == constant[-1]
+
+
+def _stretches_past(budget, monkeypatch, events, t_end):
+    from bngsim import _switch_sensitivity
+
+    monkeypatch.setattr(_switch_sensitivity, "_RUN_STOP_BUDGET", budget)
+    model = _model(events)
+    past: list = []
+    fixed, stops, _ = _switch_sensitivity.crossings_with_periodic(
+        model._core,
+        0.0,
+        t_end,
+        model.time_discontinuity_conditions(),
+        touches=model._event_disc_conditions,
+        over_budget=past,
+    )
+    return len(fixed) + len(stops), past
+
+
+def test_the_stretches_share_the_run_s_one_budget(monkeypatch):
+    """Three stretches of 13 or 14 changes each, against a budget of 30: each
+    stretch fit its own, so all 40 were placed, past the budget the run has.
+    (At the real budget, 1,200,002 stops were placed for 1,000,000.)"""
+    placed, past = _stretches_past(
+        30, monkeypatch, "E1: at (time >= 160): w = 2\n  E2: at (time >= 320): w = 1", 480.0
+    )
+    assert placed <= 30
+    assert [item.condition for item in past] == ["((time()-(24*floor((time()/24))))<w)"]
+
+
+def test_a_condition_past_the_budget_in_two_stretches_keeps_its_shortest_gap(monkeypatch):
+    """Past a budget of 10 before t = 240, where its windows are 1 wide, and
+    after, where they are 3: the step bound is made from the shortest gap, 1.
+    The last stretch's alone, 3, let a step span a window before 240."""
+    _, past = _stretches_past(10, monkeypatch, "E1: at (time >= 240): w = 3", 480.0)
+    assert len(past) == 1
+    assert past[0].changes == 40
+    assert past[0].min_gap == pytest.approx(1.0)
