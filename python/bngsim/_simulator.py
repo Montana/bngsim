@@ -30,7 +30,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
 
@@ -8953,6 +8953,7 @@ class Simulator:
         mask=None,
         newton_burst: bool = True,
         criterion: str = "scaled",
+        certify: bool | Literal["start"] = True,
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8979,6 +8980,15 @@ class Simulator:
             A ``$``-fixed species is then left out of the unknowns, whose
             Newton system it would make singular. Default ``True``, the
             two-tier solver of :meth:`steady_state`.
+        certify : bool or "start"
+            With ``newton_burst=False``, ``False`` skips the stability
+            certificate, a dense eigendecomposition of the reduced Jacobian,
+            and a converged result then has ``root_stability == ""`` and no
+            ``eigenvalues``. ``"start"`` takes no Newton step: each starting
+            state is the result, converged where it passes ``tol``, and
+            certified there. :meth:`steady_states` solves its starts with
+            ``False`` and certifies each distinct root once with ``"start"``
+            (issue #1191). Default ``True``. Ignored otherwise.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
@@ -9033,6 +9043,8 @@ class Simulator:
                 )
         if not params:
             raise ValueError("params must be non-empty")
+        if not (certify is True or certify is False or certify == "start"):
+            raise ValueError(f'certify must be True, False or "start", not {certify!r}')
         # Issue #710 — a row sets parameter values, not what the rates read.
         self._raise_if_no_steady_state_to_solve_for("steady_state_batch()")
 
@@ -9087,6 +9099,8 @@ class Simulator:
             opts.max_time = max_time
             opts.method = method
             opts.newton_burst = newton_burst
+            opts.certify_root = certify is not False
+            opts.certify_start = certify == "start"
             opts.rtol = eff_rtol
             if own_auto:
                 own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
@@ -9302,10 +9316,18 @@ class Simulator:
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
         solve_mask = ~held if held.any() else None
+        # The certificate is a dense eigendecomposition of the reduced Jacobian,
+        # and every start that converged paid it for the root it reached: on
+        # egfr_net 91 of 200 starts converged to one root, and the call took
+        # 7.2 s where certifying each distinct root once takes 2.7 s (issue
+        # #1191). Each root's representative is certified as it stands, with
+        # no Newton step: solved again from there, 6 of fceri_ji's 15 roots did
+        # not converge a second time and came back with no verdict.
         results = self.steady_state_batch(
             states=starts,
             method="newton",
             newton_burst=False,
+            certify=False,
             tol=tol,
             n_workers=n_workers,
             mask=solve_mask,
@@ -9350,6 +9372,7 @@ class Simulator:
                     states=[seed_state],
                     method="newton",
                     newton_burst=False,
+                    certify=False,
                     tol=tol,
                     mask=solve_mask,
                 )
@@ -9366,6 +9389,20 @@ class Simulator:
             roots.multiplicity[k] -= 1
             roots.basins = roots.basins[:-1]
             roots.n_failed = int(np.sum(roots.basins < 0))
+        if len(roots):
+            certified = self.steady_state_batch(
+                states=roots.states,
+                method="newton",
+                newton_burst=False,
+                certify="start",
+                tol=tol,
+                n_workers=n_workers,
+                mask=solve_mask,
+            )
+            for k, r in enumerate(certified):
+                if r.converged:
+                    roots.stability[k] = r.root_stability or "undetermined"
+                    roots.eigenvalues[k] = np.asarray(r.eigenvalues)
         return roots
 
     # ─── Stop conditions ────────────────────────────────────────────
@@ -10826,7 +10863,9 @@ class SteadyStateResult:
         ``"undetermined"`` (the certificate declined — more than 512 unknowns, or
         a Jacobian whose spectrum it could not compute), or ``"unstable"``.
         ``""`` when the result came from integration, which needs no certificate:
-        a trajectory cannot come to rest on an unstable equilibrium.
+        a trajectory cannot come to rest on an unstable equilibrium. ``""`` too
+        from a burst-free solve told to skip it
+        (``steady_state_batch(newton_burst=False, certify=False)``, issue #1191).
         ``"unstable"`` is returned only when the *initial condition itself* was
         that root; a polish that lands on one is discarded instead.
     n_unstable_roots_rejected : int

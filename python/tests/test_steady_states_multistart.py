@@ -466,15 +466,23 @@ def test_the_extra_start_adds_nothing_to_a_root_the_draws_found(monkeypatch):
 
     def spy(self, **kwargs):
         out = real(self, **kwargs)
-        calls.append(out)
+        calls.append((kwargs, out))
         return out
 
     monkeypatch.setattr(bngsim.Simulator, "steady_state_batch", spy)
     sim, _ = _toggle()
     roots = sim.steady_states(seed=0)
+    # Told apart by what each solves, not by their order: the draws, the seed
+    # (one state, uncertified, as the draws are), and each distinct root's
+    # certificate, solved once after the clustering (issue #1191).
+    (draws,) = [out for kw, out in calls if len(kw["states"]) == 200]
+    (seed,) = [out for kw, out in calls if len(kw["states"]) == 1 and kw.get("certify") is False][
+        0
+    ]
+    (certified,) = [out for kw, out in calls if kw.get("certify", True)]
+    assert len(certified) == len(roots)
     # The seed was solved, converged, and landed on a root the draws found.
-    (seed,) = calls[-1]
-    assert len(calls[-2]) == 200 and seed.converged
+    assert len(draws) == 200 and seed.converged
     assert any(np.allclose(seed.concentrations, y, rtol=1e-6) for y in roots.states)
     assert len(roots) == 3
     assert int(roots.multiplicity.sum()) + roots.n_failed == 200 == roots.basins.size
@@ -800,3 +808,67 @@ def test_a_law_whose_pivot_the_mask_leaves_out_is_still_solved(tmp_path):
     )
     assert r.converged, r
     np.testing.assert_allclose(r.concentrations, [2 / 3, 1 / 3], rtol=1e-12)
+
+
+def test_a_burst_free_solve_can_leave_the_certificate_out():
+    """``certify=False`` skips the eigendecomposition (issue #1191): the root is
+    the same, with no verdict and no spectrum on it."""
+    sim, _ = _toggle()
+    start = _SADDLE[None, :] * 1.001
+    kw = {"states": start, "method": "newton", "newton_burst": False}
+    (full,) = sim.steady_state_batch(**kw)
+    (bare,) = sim.steady_state_batch(certify=False, **kw)
+    assert full.converged and bare.converged
+    np.testing.assert_array_equal(bare.concentrations, full.concentrations)
+    assert full.root_stability == "unstable" and len(full.eigenvalues) == 2
+    assert bare.root_stability == "" and len(bare.eigenvalues) == 0
+
+
+def test_each_distinct_root_is_certified_once(monkeypatch):
+    """Issue #1191: the starts are solved without the certificate, and only one
+    representative of each distinct root gets it, not every start that reached
+    that root. The verdicts are the ones certifying every start gave."""
+    sim, _ = _toggle()
+    certified: list[int] = []
+    batch = bngsim.Simulator.steady_state_batch
+
+    def counting(self, *a, **k):
+        if k.get("certify", True):
+            certified.append(len(k["states"]))
+        return batch(self, *a, **k)
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state_batch", counting)
+    roots = sim.steady_states(seed=0)
+    assert certified == [len(roots)] == [3]
+    assert int(roots.multiplicity.sum()) > len(roots)  # starts shared roots
+    assert sorted(roots.stability) == ["stable", "stable", "unstable"]
+    assert roots.stability[_row(roots, _SADDLE)] == "unstable"
+    assert all(len(e) == 2 for e in roots.eigenvalues)
+
+
+def test_certify_start_certifies_the_state_it_is_given():
+    """``certify="start"`` takes no Newton step (issue #1191): the saddle comes
+    back as it was given, certified there, and a state that is no root comes
+    back unconverged with no verdict."""
+    sim, _ = _toggle()
+    kw = {"method": "newton", "newton_burst": False, "certify": "start"}
+    (at, off) = sim.steady_state_batch(states=np.array([_SADDLE, _SADDLE * 1.01]), **kw)
+    assert at.converged and at.n_steps == 0
+    np.testing.assert_array_equal(at.concentrations, _SADDLE)
+    assert at.root_stability == "unstable" and len(at.eigenvalues) == 2
+    assert not off.converged and off.root_stability == "" and len(off.eigenvalues) == 0
+    np.testing.assert_array_equal(off.concentrations, _SADDLE * 1.01)
+    with pytest.raises(ValueError, match="certify"):
+        sim.steady_state_batch(states=_SADDLE[None, :], **{**kw, "certify": "no"})
+
+
+def test_every_root_keeps_its_verdict_when_each_is_certified_once():
+    """fceri_ji_red's continuum of roots, each certified once (issue #1191).
+    Solved again from its representative, one of its 8 roots did not converge
+    a second time and came back "undetermined" with no spectrum, where
+    certifying every start called all 8 stable."""
+    model = bngsim.Model.from_net(_net("fceri_ji_red.net"))
+    roots = bngsim.Simulator(model, method="ode").steady_states(seed=0)
+    assert len(roots) > 1
+    assert set(roots.stability) == {"stable"}, roots.stability
+    assert all(len(e) for e in roots.eigenvalues)
