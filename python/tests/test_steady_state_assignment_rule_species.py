@@ -278,7 +278,11 @@ def test_a_rule_species_is_reported_at_the_state_the_solve_stepped_to():
     )
     assert text.count("5e-10") == 1 and text.count("5e-3") == 1
     model = bngsim.Model.from_sbml_string(text)
-    out = bngsim.Simulator(model, method="ode").steady_state(sensitivity_params=["kd"])
+    # The residual test, by name (issue #1001): the scaled one marches to the
+    # root itself, and leaves the sensitivity solve no steps to report.
+    out = bngsim.Simulator(model, method="ode").steady_state(
+        sensitivity_params=["kd"], criterion="residual"
+    )
     at = dict(zip(out.species_names, np.asarray(out.concentrations), strict=True))
     assert at["A"] == pytest.approx(1e-7, rel=1e-8)
     assert at["S"] == pytest.approx(2e-7, rel=1e-8)

@@ -60,10 +60,19 @@ def _regapped(tmp_path, data_dir, k_v_stim):
 
 
 def _solve(net, max_time=1e6, tol=None, jacobian="fd"):
+    # The residual test, by name (issue #1001): what is pinned here is the
+    # march, not the run the default criterion takes from the state it stops at.
     kwargs = {} if tol is None else {"tol": tol}
     return bngsim.Simulator(
         bngsim.Model.from_net(net), method="ode", jacobian=jacobian
-    ).steady_state(method="integration", rtol=TOL, atol=TOL, max_time=max_time, **kwargs)
+    ).steady_state(
+        method="integration",
+        rtol=TOL,
+        atol=TOL,
+        max_time=max_time,
+        criterion="residual",
+        **kwargs,
+    )
 
 
 def test_the_captured_march_now_converges(fixture_net, tmp_path, data_dir):

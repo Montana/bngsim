@@ -1174,25 +1174,28 @@ struct SensitivityOptions {
 // one RHS evaluation per unknown per setup.
 struct SteadyStateOptions {
     double tol = 1e-9; // convergence tolerance: ||f(y)||_2 / n_species < tol
-    // What `converged` asks of a state (issue #1001). "residual": today's
-    // BNG2.pl parity test, ||f(y)||_2 / n_species < tol, a number in the
-    // model's units of concentration per time. "scaled": the Newton step from
-    // the state to the root, -J^-1·f(y) on the system with the conserved
-    // totals taken out, is within rtol·|y_i| + atol_i of every species, with
-    // atol_i = rtol·max(|y_i|, floor) and the floor the smallest positive
-    // initial concentration of a species the test steps, $-fixed ones aside
-    // (where none starts above 0, the largest species of the state or of the
-    // root it steps to). The mask says which species are measured, not which
-    // move: every species moves by its own equation but a $-fixed one and a
-    // masked one that nothing reads or that reads nothing, which is held. No
-    // unit of
-    // concentration or of time is in it. Above 512 unknowns the step is not
-    // taken and the solve is the residual one, `tol` and all.
-    std::string criterion = "residual";
-    // Set by find_steady_state from the initial state, for "scaled": the
-    // floor (0 where nothing starts above 0), and whether the step is taken.
-    double criterion_floor = 1.0;
+    // What `converged` asks of a state (issue #1001). "scaled" (the default):
+    // the parity test below, and a run taken on from the state for max_time
+    // (at most 1e6) moves no species by more than rtol·|y_i| + atol_i (the
+    // march's own tolerances): what tells a state the system rests at from one
+    // under tol that a run leaves (a model in small units, or a slow one). An
+    // unstable root a run from it does not leave passes. The Newton step
+    // from the state to the root within the same tolerances (to 512 unknowns)
+    // decides where the solve stops, not `converged`; the state it stops at is
+    // polished. A burst-free Newton solve (newton_burst false), which reports
+    // unstable roots, takes no runs and is decided by the parity test.
+    // "residual": BNG2.pl's parity test alone, ||f(y)||_2 / n_species < tol,
+    // a number in the model's units of concentration per time, kept for
+    // comparisons with run_network.
+    std::string criterion = "scaled";
+    // Set by find_steady_state, for "scaled": whether the step is taken; the
+    // largest species the solve starts with, which caps the absolute part of
+    // the criterion's tolerances; and, for a burst-free Newton solve, that
+    // its root is accepted by the residual test, at whatever iterate KINSOL
+    // ends.
     bool criterion_by_distance = false;
+    double criterion_start_size = 0.0;
+    bool criterion_by_residual = false;
     double max_time = 1e6; // max integration time for the integration path
     double rtol = 1e-8;    // CVODE relative tolerance
     double atol = 1e-8;    // CVODE absolute tolerance
@@ -1223,6 +1226,18 @@ struct SteadyStateOptions {
     // starting states needs: a burst carries every start into an attractor's
     // basin, and a saddle is discarded on purpose. Ignored by "integration".
     bool newton_burst = true;
+    // Issue #1191: false makes the burst-free solve above skip the stability
+    // certificate, a dense eigendecomposition of the reduced Jacobian, and
+    // report no verdict. steady_states() certifies each distinct root once
+    // instead of every start that converged to it (91 times over on egfr_net,
+    // whose call took 7.2 s and takes 2.7 s). Ignored by the two-tier solver.
+    bool certify_root = true;
+    // Issue #1191: true makes the burst-free solve take no Newton step and
+    // certify the state it is given, converged where that state passes `tol`.
+    // How steady_states() certifies each root, at the state it reports:
+    // solved again from there, 6 of fceri_ji's 15 roots did not converge a
+    // second time and came back with no verdict. Ignored by the two-tier solver.
+    bool certify_start = false;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —
@@ -1318,14 +1333,19 @@ struct SteadyStateResult {
     std::vector<std::string> species_names;
     double residual = 0.0; // max|f(y)| at convergence
     // Issue #1001: the largest |δ_i| over rtol·|y_i| + atol_i at the returned
-    // state, δ the Newton step to the root (SteadyStateOptions::criterion).
-    // At most 1 is within tolerance of a steady state. Measured under
+    // state, δ the Newton step to the root, which under "scaled" decided
+    // where the solve stopped (SteadyStateOptions::criterion). Measured under
     // "scaled" only, for a system of up to 512 unknowns; NaN under "residual"
     // and above that, and +inf where the reduced Jacobian is singular at a
     // state that is not a root.
     double newton_distance = std::numeric_limits<double>::quiet_NaN();
+    // Issue #1001, the run test of "scaled": the largest move of a measured
+    // species over its tolerance, across the run taken on from the returned
+    // state; at most 1 passes. +inf where the run could not be taken to its
+    // time; NaN where none was taken (under "residual", where the parity test
+    // already refused, and for a burst-free Newton solve).
+    double continued_run_distance = std::numeric_limits<double>::quiet_NaN();
     std::string criterion;   // the criterion `converged` was decided by
-                             // ("residual" for "scaled" above 512 unknowns)
     std::string method_used; // "integration" or "newton"
     bool converged = false;
     int n_steps = 0; // CVODE steps or Newton iterations

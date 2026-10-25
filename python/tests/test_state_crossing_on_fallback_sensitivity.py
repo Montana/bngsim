@@ -205,18 +205,26 @@ def test_a_table_that_steps_on_the_state_is_refused(tmp_path, method):
         sim.run(t_span=(0.0, T_END), n_points=3, rtol=1e-6, atol=1e-8, timeout=60)
 
 
+# A leaves for X, in a compartment of another size: a reaction that divides by
+# each species' volume, so A's rate is not one the derivations write out from
+# its rate laws, and rateOf(A) keeps the model on the quotient. Lost at a*A in
+# one compartment, A's rate is written out, and the same models run on the
+# analytic RHS (test_a_rate_the_derivations_write_out_is_not_refused).
+_ACROSS = "compartment C0 = 1; compartment C2 = 3; species X in C2; X = 0\n"
+
 ISSUE_932 = {
     # The condition reads rateOf.
     "rateof-condition": (
-        "species A, Y; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
-        "J0: A -> ; a*A\n"
+        _ACROSS + "species A in C0, Y in C0; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
+        "J0: A -> X; a*A*C0\n"
         "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n",
         ["thr"],
     ),
     # rateOf is only in a rule an event's trigger reads.
     "rateof-in-a-rule": (
-        "species A, Y, Z, B; A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
-        "J0: A -> ; a*A\n"
+        _ACROSS + "species A in C0, Y in C0, Z in C0, B in C0\n"
+        "A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
+        "J0: A -> X; a*A*C0\n"
         "r := rateOf(A)\n"
         "J1: -> B; piecewise(1, A < q, 0)\n"
         "J2: -> Z; Y\n"
@@ -247,6 +255,50 @@ def test_a_run_that_stalled_short_of_a_jump_is_refused_by_name(model):
     assert not sim.has_analytic_sens_rhs
     with pytest.raises(bngsim.SensitivityUnsupportedError, match="#932"):
         sim.run(sample_times=np.linspace(0.0, 6.0, 7), rtol=1e-10, atol=1e-12, timeout=10)
+
+
+def test_a_rate_the_derivations_write_out_is_not_refused():
+    """Issue #1124, item 7: lost at a*A, A's rate is -a·A written out, so
+    neither model is on the quotient, and the columns read across the
+    crossings as any analytic column does. A = 10·e^(-at) and rateOf(A) =
+    -a·A cross -thr at t* = ln(10a/thr)/a; A crosses q at ln(10/q)/a.
+    dY/dthr = kb/(a·thr); dZ/dthr = 1/(a·thr), dZ/da = (ln(10a/thr) − 1)/a²;
+    dB/dq = 1/(a·q), dB/da = ln(10/q)/a²."""
+    t = np.linspace(0.0, 6.0, 7)
+    a, thr, q, kb = 0.5, 1.0, 3.0, 3.0
+    t_rate = math.log(10 * a / thr) / a
+    t_a = math.log(10 / q) / a
+    after = t > t_rate
+    cases = {
+        "species A, Y; A = A0; Y = 0; A0 = 10; a = 0.5; thr = 1; kb = 3\n"
+        "J0: A -> ; a*A\n"
+        "J1: -> Y; piecewise(kb, rateOf(A) > -thr, 0)\n": {
+            ("Y", "thr"): np.where(after, kb / (a * thr), 0.0),
+        },
+        "species A, Y, Z, B; A = 10; Y = 0; Z = 0; B = 0; a = 0.5; thr = 1; q = 3\n"
+        "J0: A -> ; a*A\n"
+        "r := rateOf(A)\n"
+        "J1: -> B; piecewise(1, A < q, 0)\n"
+        "J2: -> Z; Y\n"
+        "E: at (r > -thr): Y = 1\n": {
+            ("Z", "thr"): np.where(after, 1 / (a * thr), 0.0),
+            ("Z", "a"): np.where(after, (math.log(10 * a / thr) - 1) / a**2, 0.0),
+            ("B", "q"): np.where(t > t_a, 1 / (a * q), 0.0),
+            ("B", "a"): np.where(t > t_a, math.log(10 / q) / a**2, 0.0),
+        },
+    }
+    for text, expected in cases.items():
+        params = sorted({p for _sp, p in expected})
+        sim = bngsim.Simulator(
+            bngsim.Model.from_antimony_string(text), method="ode", sensitivity_params=params
+        )
+        assert sim.has_analytic_sens_rhs
+        result = sim.run(sample_times=t, rtol=1e-10, atol=1e-12, timeout=20)
+        names = list(result.species_names)
+        sens = np.asarray(result.sensitivities)
+        for (sp, p), want in expected.items():
+            got = sens[:, names.index(sp), params.index(p)]
+            np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7, err_msg=f"d{sp}/d{p}")
 
 
 def test_a_jump_no_requested_column_moves_is_refused_all_the_same(tmp_path):
@@ -604,7 +656,12 @@ def test_a_sign_of_the_time_that_a_requested_parameter_moves_is_refused(tmp_path
 
 
 CHOICES_THAT_BEND = {
-    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.01)",
+    # A reaches the floor at t = ln(100) ≈ 4.6, before T: dY/dk = −11.61. Under
+    # a floor it never reaches, Y = kb·T and dY/dk is 0, as it is for a max()
+    # that ignores the floor, and the column is only rounding: (kb·A)/A is 3
+    # to an ulp, and the quotient divides that by a move in A of about rtol·A.
+    # It came back 1.04e-8 at rtol 1e-10 on x86-64, past abs=1e-8.
+    "a-floor-under-a-divisor": "kb*Aobs/max(Aobs,0.1)",
     "a-magnitude-in-a-sum-it-divides-by": "kb/(1+abs(Aobs-thr))",
     "a-root-of-what-is-above-zero": "kb*Aobs/(1+0.5*(Aobs+sqrt(1+abs(Aobs*Aobs-thr))))",
     "a-clamp": "kb*max(0,min(Aobs,thr))",
