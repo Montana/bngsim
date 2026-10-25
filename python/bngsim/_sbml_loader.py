@@ -8451,8 +8451,9 @@ def _build_model_from_sbml_doc_in_context(doc):
         # safe(var) -> why its rate is unknown, for a refusal that names it
         # (issue #1193)
         _rate_unknown_why: dict[str, str] = {}
-        # The rules that cannot be written out through the rules they read (on
-        # or reading a cycle, or not read), as the size's jumps below need
+        # The rules that cannot be written out through the rules they read, as
+        # the size's jumps below need: on or reading a cycle, or a rule that
+        # could not be read
         _no_value: set[str] = set()
 
         def _leaf_deriv(nm: str):
@@ -8531,11 +8532,11 @@ def _build_model_from_sbml_doc_in_context(doc):
             # these symbols, and Heaviside, which do not print, and the size was
             # left out of the dilution (`cv := 2 + 0.1*abs(S3 - 1)`).
             kinked = any(isinstance(e, (_sp.Abs, _sp.Min, _sp.Max)) for e in _subexpressions(g))
-            gk = _prepare_kinks(g, {str(s) for s in g.free_symbols}) if kinked else g
 
             def partial(s):
-                p = _sp.diff(gk, s)
-                return _finish_kinks(p) if kinked else p
+                if not kinked:
+                    return _sp.diff(g, s)
+                return _finish_kinks(_sp.diff(_prepare_kinks(g, {str(s)}), s))
 
             total, terms, unknown = _sp.Integer(0), [], []
             for s in sorted(g.free_symbols, key=str):
