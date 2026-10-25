@@ -1226,6 +1226,18 @@ struct SteadyStateOptions {
     // starting states needs: a burst carries every start into an attractor's
     // basin, and a saddle is discarded on purpose. Ignored by "integration".
     bool newton_burst = true;
+    // Issue #1191: false makes the burst-free solve above skip the stability
+    // certificate, a dense eigendecomposition of the reduced Jacobian, and
+    // report no verdict. steady_states() certifies each distinct root once
+    // instead of every start that converged to it (91 times over on egfr_net,
+    // whose call took 7.2 s and takes 2.7 s). Ignored by the two-tier solver.
+    bool certify_root = true;
+    // Issue #1191: true makes the burst-free solve take no Newton step and
+    // certify the state it is given, converged where that state passes `tol`.
+    // How steady_states() certifies each root, at the state it reports:
+    // solved again from there, 6 of fceri_ji's 15 roots did not converge a
+    // second time and came back with no verdict. Ignored by the two-tier solver.
+    bool certify_start = false;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —
