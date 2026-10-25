@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from bngsim._exceptions import ConversionError, ConversionWarning
+from bngsim.convert._sbml_writer import _LOG_TOKEN
 
 if TYPE_CHECKING:
     from bngsim._model import Model
@@ -47,6 +48,28 @@ def _fmt(x: float) -> str:
     """Render a float so ``float()`` round-trips it exactly (net_reader parses
     every value field with ``float()``)."""
     return repr(float(x))
+
+
+def _bng_spelling(lines: list[str]) -> list[str]:
+    """*lines* with each parameters and functions expression's natural logarithm
+    spelled ``ln`` (issue #1273). run_network has no ``log`` and refuses the file;
+    ``ln`` is the name BNGL and run_network give it, and bngsim's reader takes it
+    as the same function. ``_LOG_TOKEN`` is the cBNGL and SBML writers' own: not
+    ``log10`` or ``log2``, which run_network has, nor a name that holds ``log``."""
+    out, block = [], None
+    for line in lines:
+        s = line.strip()
+        if s.startswith("begin "):
+            block = s.split()[1]
+        elif s.startswith("end "):
+            block = None
+        elif block in ("parameters", "functions") and s and not s.startswith("#"):
+            fields = s.split(None, 2)
+            if len(fields) == 3 and _LOG_TOKEN.search(fields[2]):
+                indent = line[: len(line) - len(line.lstrip())]
+                line = f"{indent}{fields[0]} {fields[1]} {_LOG_TOKEN.sub('ln(', fields[2])}"
+        out.append(line)
+    return out
 
 
 # ─── Capability analysis ──────────────────────────────────────────────────
@@ -585,7 +608,7 @@ def write_net(
     lines.append("end reactions")
     lines.append("")
 
-    text = "\n".join(lines)
+    text = "\n".join(_bng_spelling(lines))
     if out_path is not None:
         Path(out_path).write_text(text)
     return text
