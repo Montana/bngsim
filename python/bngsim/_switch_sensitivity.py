@@ -9320,11 +9320,16 @@ def equalities_held_at_start(core, ctx=None, t0: float = 0.0) -> list[str]:
     from, observables and functions refreshed from it, and still exactly 0 a
     step along the flow from there: the state stays on the surface rather than
     starting on it and leaving (``Aobs == 10`` with A decaying from 10 holds for
-    the instant t = 0, and is not one). A state whose residual turns at second
-    order, still at the start, is taken as staying, which refuses a run that
-    would have been right; it never passes one that would not. An equality over a step
-    or bend call (``floor(T/24) == 3``) is a window like any other and is not
-    one.
+    the instant t = 0, and is not one). An equality over a step or bend call
+    (``floor(T/24) == 3``) is a window like any other and is not one.
+
+    The test is first order and reads the flow alone, so it never passes a run
+    that would be wrong but refuses some that would be right (issue #1279): a
+    residual that turns at second order at the start, a stretch that outlasts
+    the run, one that only an event ends (the event's own jump is right), one
+    that a rooted condition inside the equality ends (``if(fB()==0, kb, 0)``
+    with ``fB`` gated by ``if(q-Aobs>0, …)``), and one whose conjunction never
+    holds for another reason.
 
     The start is read at *t0*, the run's start time, and the step lands at *t0*
     plus the step: a rate or a residual that reads the clock is read where the

@@ -516,13 +516,15 @@ so no crossing is located and there is no crossing time for the sensitivities
 to move with. A run without sensitivities is carried across.
 So is a run that starts on an equality's surface and stays on it (issue #1228):
 `if(Bobs == 0, kb, 0)` with B held at 0 until A falls to q holds the branch
-for a stretch. An equality is rooted only where the state crosses it, and
-either side of its surface reads false, so leaving it is a switch nothing
-locates. Write the switch as the crossing that ends the stretch,
+for a stretch. An equality is not rooted, since one the state crosses holds
+for an instant, and either side of its surface reads false, so leaving it is
+a switch nothing locates. Write the switch as the crossing that ends the stretch,
 `if(Aobs > q, kb, 0)` there. `Bobs <= 0` names the same surface and is refused
 at its tangency. The start is read at the run's start time. A state that an
-event puts on the surface mid-run is not yet seen, and a stretch that outlasts
-the run is refused all the same (issue #1279).
+event puts on the surface mid-run is not yet seen. A stretch is refused all
+the same where nothing in the run ends it, where only an event ends it (the
+event's own jump would have been right), or where the rest of a conjunction
+never holds (issue #1279).
 A conjunction or a negation is split into its comparisons first. What the
 analytic path declines is a crossing nothing can locate: a comparison outside any
 `if()`, such as `k*(X > 1)`, and one whose sides
