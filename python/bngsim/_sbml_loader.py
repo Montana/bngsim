@@ -8336,7 +8336,13 @@ def _build_model_from_sbml_doc_in_context(doc):
         from sympy.functions.elementary.piecewise import ExprCondPair as _ExprCondPair
 
         from bngsim._codegen import _PY_KEYWORD_PARAM_NAMES, _alias_keyword_param
-        from bngsim._jacobian import _TIME_SYM, _exprtk_to_sympy, sympy_to_exprtk
+        from bngsim._jacobian import (
+            _TIME_SYM,
+            _exprtk_to_sympy,
+            _finish_kinks,
+            _prepare_kinks,
+            sympy_to_exprtk,
+        )
 
         # Python keywords only. This round trip prints back to *ExprTk* through
         # `sympy_to_exprtk`, not to C through `sp.ccode`, so a C reserved word is
@@ -8358,6 +8364,8 @@ def _build_model_from_sbml_doc_in_context(doc):
         }
         _ar_rhs_ex: dict[str, str] = {}  # safe(var) -> ExprTk
         _rr_rhs_ex: dict[str, str] = {}  # safe(var) -> ExprTk
+        _rr_ids: list[str] = []  # the rate-rule variables that are no species
+        _rule_id: dict[str, str] = {}  # safe(var) -> its SBML id, for a refusal
         for j in range(sbml_model.getNumRules()):
             _rule = sbml_model.getRule(j)
             _v = _rule.getVariable()
@@ -8366,8 +8374,11 @@ def _build_model_from_sbml_doc_in_context(doc):
                 continue
             if _rule.isAssignment() and _v in assignment_targets:
                 _ar_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+                _rule_id[_safe_name(_v)] = _v
             elif _rule.isRate() and _v not in _sbml_species_ids:
                 _rr_rhs_ex[_safe_name(_v)] = _ast_to_exprtk_with_funcdefs(_m, func_defs)
+                _rule_id[_safe_name(_v)] = _v
+                _rr_ids.append(_v)
         # A reaction's id in math is its kinetic law's value, so a size is
         # followed through the law as through an assignment rule: for its rate
         # here, and for its jumps below. Read as a constant, `C := 1 + 0.5*J0`
@@ -8382,10 +8393,16 @@ def _build_model_from_sbml_doc_in_context(doc):
             if _lm is not None:
                 _law_math[_rx.getId()] = _lm
                 _ar_rhs_ex[_safe_name(_rx.getId())] = _ast_to_exprtk_with_funcdefs(_lm, func_defs)
+                _rule_id[_safe_name(_rx.getId())] = _rx.getId()
 
         # Classification in aliased-safe-name space (matches str(free_symbol)).
         _species_alias = {_alias(_safe_name(s)): s for s in _sbml_species_ids}  # alias -> id
         _rate_token_species = {_rateof_token(s): s for s in _sbml_species_ids}
+        # Every rateOf token a rule can read: a rate-rule parameter or
+        # compartment is promoted to a species, and its rate is read the same
+        # way. Left out, `cv := 2 + rateOf(P)` with P' = -0.1*P read rateOf(P) as
+        # a constant, and cv was never diluted (#1193).
+        _rate_token_target = _rate_token_species | {_rateof_token(v): v for v in _rr_ids}
         # A species whose value never moves continuously, so its rate is 0 and
         # reading it needs no rate accessor: nothing changes its amount (constant,
         # boundary, or in no reaction, with no rate rule), and the value is that
@@ -8435,6 +8452,13 @@ def _build_model_from_sbml_doc_in_context(doc):
         _rule_rate: dict[str, object] = {}
         # safe(var) -> the nonzero terms of its rate: (∂g/∂s, s, ṡ)
         _rule_terms: dict[str, list] = {}
+        # safe(var) -> why its rate is unknown, for a refusal that names it
+        # (issue #1193)
+        _rate_unknown_why: dict[str, str] = {}
+        # The rules that cannot be written out through the rules they read, as
+        # the size's jumps below need: on or reading a cycle, or a rule that
+        # could not be read
+        _no_value: set[str] = set()
 
         def _leaf_deriv(nm: str):
             # d(symbol)/dt: None ⇒ unknown (bail the whole V̇); 0 ⇒ constant.
@@ -8449,6 +8473,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                 return _sp.Symbol(_rateof_token(sid))
             if nm in _rr_alias:
                 return _rr_deriv(_rr_alias[nm])
+            if nm in _rate_token_target:
+                # rateOf(S) is S's live rate, and its own rate is not derived
+                # here (issue #1193): read as 0, as the fall-through below did,
+                # `cv := 2 + rateOf(S3)` with S3 decaying was never diluted. Of
+                # a species that never moves continuously it is 0 for good.
+                return _sp.Integer(0) if _rate_token_target[nm] in _still_species else None
             # An event-promoted parameter jumps at its events, which rescale the
             # concentrations there (#74), and holds between them (#1052: this
             # used to make V̇ unknown and drop the whole term).
@@ -8460,26 +8490,83 @@ def _build_model_from_sbml_doc_in_context(doc):
             # unwinds with None through every rule on the cycle.
             if safe_var in _rule_rate:
                 got = _rule_rate[safe_var]
-                return None if got is _on_path else got
+                if got is _on_path:
+                    _no_value.add(safe_var)
+                    _rate_unknown_why.setdefault(
+                        safe_var, "it reads itself through a cycle of rules"
+                    )
+                    return None
+                return got
             if safe_var not in _ar_rhs_ex:
+                _no_value.add(safe_var)
+                _rate_unknown_why.setdefault(safe_var, "its rule could not be read")
                 return None
             _rule_rate[safe_var] = _on_path
-            _rule_rate[safe_var], _rule_terms[safe_var] = _chain_rule(_ar_sym(safe_var))
+            g = _ar_sym(safe_var)
+            if g is None:
+                _no_value.add(safe_var)
+                _rate_unknown_why.setdefault(safe_var, "its rule could not be parsed")
+            _rule_rate[safe_var], _rule_terms[safe_var] = _chain_rule(g, safe_var)
             return _rule_rate[safe_var]
 
-        def _chain_rule(g):
+        def _why_unknown(nm: str) -> str:
+            # Why the rate of the symbol nm, read by a rule, is unknown, in the
+            # model's own names: `in` is `_ant_in` to the engine.
+            if nm in _rate_token_target:
+                return (
+                    f"it reads rateOf({_rate_token_target[nm]}), whose rate bngsim does not derive"
+                )
+            child = _ar_alias.get(nm)
+            if child is None:
+                return f"the rate of {_rule_id.get(_rr_alias.get(nm, nm), nm)} is unknown"
+            why = _rate_unknown_why.get(child, "its rate is unknown")
+            name = _rule_id.get(child, child)
+            if why.startswith("through "):  # each rule on the way, in order
+                return f"through {name} and {why.removeprefix('through ')}"
+            return f"through {name}, {why}"
+
+        def _chain_rule(g, safe_var=None):
             # (Σ ∂g/∂s·ṡ over g's symbols, its nonzero terms), or (None, []).
+            # The symbols are taken in a fixed order, so the reason a refusal
+            # names does not move with the hash seed, and each is followed past
+            # one whose rate is unknown, so a rule that reads one that cannot be
+            # written out is marked wherever it reads it.
             if g is None:
                 return None, []
-            total, terms = _sp.Integer(0), []
-            for s in g.free_symbols:
+            # abs, min and max get the derivative the emitters print, as the
+            # Jacobian's (#507, #1126): sympy's own reads re() and im() over
+            # these symbols, and Heaviside, which do not print, and the size was
+            # left out of the dilution (`cv := 2 + 0.1*abs(S3 - 1)`).
+            kinked = any(isinstance(e, (_sp.Abs, _sp.Min, _sp.Max)) for e in _subexpressions(g))
+
+            def partial(s):
+                if not kinked:
+                    return _sp.diff(g, s)
+                return _finish_kinks(_sp.diff(_prepare_kinks(g, {str(s)}), s))
+
+            total, terms, unknown = _sp.Integer(0), [], []
+            for s in sorted(g.free_symbols, key=str):
                 d = _leaf_deriv(str(s))
-                if d is None:
-                    return None, []
-                if d != 0:
-                    p = _sp.diff(g, s)
+                if _ar_alias.get(str(s)) in _no_value:
+                    if safe_var is not None:
+                        _no_value.add(safe_var)
+                    unknown.append(str(s))
+                elif d is None:
+                    # One read only where it picks a piece moves g only at a
+                    # jump, which the size's jump events carry (#1054), and adds
+                    # nothing between them: as unknown, `cv := piecewise(1,
+                    # rateOf(S3) < -0.15, 2)` was refused, where its jump at the
+                    # flip alone is right.
+                    if partial(s) != 0:
+                        unknown.append(str(s))
+                elif d != 0 and not unknown:
+                    p = partial(s)
                     terms.append((p, s, d))
                     total = total + p * d
+            if unknown:
+                if safe_var is not None and safe_var not in _rate_unknown_why:
+                    _rate_unknown_why[safe_var] = _why_unknown(unknown[0])
+                return None, []
             return total, terms
 
         # Reverse the keyword aliasing _exprtk_to_sympy applies, so the emitted
@@ -8560,6 +8647,14 @@ def _build_model_from_sbml_doc_in_context(doc):
                 vdot = _vdot_sym(_safe_name(comp))
                 _comp_vdot[comp] = vdot
                 _comp_rated[comp] = _rate_tokens(vdot) if vdot is not None else set()
+        # A size that moves with the run and whose rate is unknown was left out
+        # of the dilution, and its concentrations came back as if it held, with
+        # no word (issue #1193). Refused by name instead, below. A size that
+        # reads constants alone holds (#745), a cycle of them included, and has
+        # nothing to dilute.
+        _unknown_vdot = sorted(
+            comp for comp, v in _comp_vdot.items() if v is None and comp in ar_comp_moving
+        )
 
         # Written out in full, a rate that more than one rule reads is written
         # once per path to it, and the term is as exponential as the walk was
@@ -8642,6 +8737,41 @@ def _build_model_from_sbml_doc_in_context(doc):
             return cid
 
         _refusals: list[str] = []
+        for comp in _unknown_vdot:
+            _refusals.append(
+                f"compartment {comp} ({_size_text(comp)}) moves with the run, but bngsim "
+                f"cannot follow its size to its rate: "
+                f"{_rate_unknown_why.get(_safe_name(comp), 'its rate is unknown')}; its "
+                f"concentrations would not be diluted"
+            )
+
+        # compartment -> (V̇ as ExprTk, [(`_ddt_` function, its ExprTk)], whether
+        # they read a rate), or None where one of them does not print. Written
+        # here, before the refusals are raised: a rate that does not print was
+        # left out of the dilution after them, with no word (issue #1193), as
+        # `cv := 2 + 0.1*floor(S3)`'s, whose derivative sympy leaves unevaluated.
+        _comp_vdot_ex: dict[str, tuple[str, list[tuple[str, str]], bool] | None] = {}
+        for comp, vdot in _comp_vdot.items():
+            if vdot is None or vdot == 0:
+                continue
+            expr, rules = _comp_by_name.get(comp, (vdot, []))
+            parts = [expr, *map(_rate_by_name, rules)]
+            texts = [sympy_to_exprtk(e) for e in parts]
+            if any(t is None for t in texts):
+                _comp_vdot_ex[comp] = None
+                if comp in ar_comp_moving:
+                    _refusals.append(
+                        f"compartment {comp} ({_size_text(comp)}) moves with the run, but "
+                        "bngsim cannot write the rate of its size for the engine; its "
+                        "concentrations would not be diluted"
+                    )
+                continue
+            _comp_vdot_ex[comp] = (
+                _unalias(texts[0]),
+                [(_rate_fn[r], _unalias(t)) for r, t in zip(rules, texts[1:], strict=True)],
+                # By name, a rate the full V̇ cancels can still be read.
+                bool(_comp_rated[comp]) or (bool(rules) and any(_rate_tokens(e) for e in parts)),
+            )
 
         # A piecewise size jumps where one of its conditions flips (#1054). The
         # chain rule above differentiates each piece, which is right between
@@ -8729,7 +8859,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 if s not in _still_species and s not in _flow_free
             }
             | set(_rr_alias)
-            | set(_rate_token_species)
+            | set(_rate_token_target)
         )
 
         # safe(var) -> the size written through the rules it reads, once a rule
@@ -9307,35 +9437,11 @@ def _build_model_from_sbml_doc_in_context(doc):
                 "that reads its own concentration too (a recursive assignment rule)."
             )
 
-        # compartment -> (V̇ as ExprTk, [(`_ddt_` function, its ExprTk)], whether
-        # they read a rate), or None where one of them does not print
-        _comp_vdot_ex: dict[str, tuple[str, list[tuple[str, str]], bool] | None] = {}
         _rate_fns_added: set[str] = set()
         for sid, comp in species_comp.items():
             if _diluted(sid):
-                vdot = _comp_vdot[comp]
-                if vdot is None or vdot == 0:
-                    continue
-                if comp not in _comp_vdot_ex:
-                    expr, rules = _comp_by_name.get(comp, (vdot, []))
-                    parts = [expr, *map(_rate_by_name, rules)]
-                    texts = [sympy_to_exprtk(e) for e in parts]
-                    _comp_vdot_ex[comp] = (
-                        None
-                        if any(t is None for t in texts)
-                        else (
-                            _unalias(texts[0]),
-                            [
-                                (_rate_fn[r], _unalias(t))
-                                for r, t in zip(rules, texts[1:], strict=True)
-                            ],
-                            # By name, a rate the full V̇ cancels can still be read.
-                            bool(_comp_rated[comp])
-                            or (bool(rules) and any(_rate_tokens(e) for e in parts)),
-                        )
-                    )
-                if _comp_vdot_ex[comp] is None:
-                    continue
+                if _comp_vdot_ex.get(comp) is None:
+                    continue  # V̇ is 0, unknown or unwritten: refused above if it moves
                 vdot_ex, rate_fns, reads_rate = _comp_vdot_ex[comp]
                 for fn, fn_ex in rate_fns:  # each after the ones it reads
                     if fn not in _rate_fns_added:
