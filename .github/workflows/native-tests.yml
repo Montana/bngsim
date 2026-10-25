@@ -66,7 +66,8 @@ name: native-tests
 # subsystem, and duplicating the vendored NFsim/RuleMonkey build on this Linux
 # gate would cost minutes for no new coverage. If NFsim ever needs Linux CI, add
 # a second ctest leg with NFsim ON rather than letting the pair fall through the
-# gap the way test_bngsim once did.
+# gap the way test_bngsim once did. sanitizers.yml's nightly C++ job (#583) is
+# NFsim ON for that reason: under LeakSanitizer the pair is new coverage.
 
 on:
   push:
