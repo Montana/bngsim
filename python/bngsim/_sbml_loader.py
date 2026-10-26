@@ -3665,7 +3665,10 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
     # `cf := 1 + rateOf(S3)` beside one was refused as moving, where
     # libRoadRunner runs it with cf = 1 (#1138's review). A stoichiometry that
     # is not a plain finite number (set by math, by a rule, or not constant) is
-    # taken as moving the species, as before.
+    # taken as moving the species, as before, and so is one an initialAssignment
+    # sets, which the engine reads in place of the attribute: `S0 -> S0` with
+    # the product's 1 set to 2 grows S0, and a cycle of rules reading it was
+    # taken to hold, its feedback left out of the size's rate (#1281's review).
     changed_by_reaction: set[str] = set()
     for j in range(sbml_model.getNumReactions() if candidates - sources else 0):
         rxn = sbml_model.getReaction(j)
@@ -3679,6 +3682,7 @@ def _moving_assignment_rule_vars(sbml_model) -> tuple[dict, set[str]]:
                     sr.isSetStoichiometryMath()
                     or not sr.getConstant()
                     or not _math.isfinite(stoich)
+                    or (sr.isSetId() and sbml_model.getInitialAssignmentBySymbol(sr.getId()))
                 ):
                     changed_by_reaction.add(sid)
                     continue

@@ -325,3 +325,46 @@ def test_a_stoichiometry_an_initial_assignment_sets():
     np.testing.assert_allclose(
         _x(sbml), _diluted(lambda t: 2 - 0.2 * np.exp(-t / 10)), rtol=1e-7, atol=1e-10
     )
+
+
+def _a_catalyst_made_a_product(model):
+    """R: S0 -> S0 with the product's stoichiometry 1 on the attribute and 2 by
+    an initialAssignment: S0 grows, at 1.0·S0 an amount, [S0] = exp(t/2)."""
+    import libsbml
+
+    sr = model.getReaction("R").getProduct(0)
+    sr.setId("nu")
+    sr.setConstant(True)
+    sr.setStoichiometry(1.0)
+    ia = model.createInitialAssignment()
+    ia.setSymbol("nu")
+    ia.setMath(libsbml.parseL3Formula("2"))
+
+
+_GROWS = "species S0 in c = 1; R: S0 -> S0; 1.0*S0;"
+
+
+def test_the_rate_of_a_species_an_initial_assignment_makes_grow():
+    """rateOf(S0) = exp(t/2)/2, so cv = 2 + exp(t/2)/2. On main S0 was taken
+    for a catalyst, cv for a size that holds, and [X] was left undiluted."""
+    sbml = _edited(_GROWS + " cv := 2 + rateOf(S0);", _a_catalyst_made_a_product)
+    np.testing.assert_allclose(
+        _x(sbml), _diluted(lambda t: 2 + 0.5 * np.exp(t / 2)), rtol=1e-7, atol=1e-10
+    )
+
+
+def test_a_cycle_over_a_species_an_initial_assignment_makes_grow_is_refused():
+    """p1 = 1 + 0.5·p2 + S0 and p2 = 1 + 0.5·p1 move with S0, so the cycle
+    has no rate bngsim derives. Taken to hold, as S0 was taken for a catalyst,
+    its rate read 0 where the cycle came back to itself, and [X] was 30% off
+    at t = 4 with no word."""
+    import libsbml
+
+    doc = libsbml.readSBMLFromString(
+        _with_rules(
+            _GROWS + " cv := 1 + 0.1*time + p1;", [("p1", "1 + 0.5*p2 + S0"), ("p2", "1 + 0.5*p1")]
+        )
+    )
+    _a_catalyst_made_a_product(doc.getModel())
+    with pytest.raises(bngsim.ModelError, match="(?s)cannot follow to its rate of change.*cycle"):
+        bngsim.Model.from_sbml_string(libsbml.writeSBMLToString(doc))
