@@ -532,6 +532,102 @@ def test_a_declined_function_of_a_species_at_0_is_refused(tmp_path):
     assert format(0.5 * SQRT_EPS / K1, ".6g") + " with those species" in msg
 
 
+NAN_WINDOW = """begin parameters
+    1 s   0.0
+    2 k1  0.21
+    3 sg  1e8
+    4 dg  1.0
+    5 kd  0.5
+end parameters
+begin species
+    1 X() 0
+    2 E() 0
+    3 G() 1e8
+end species
+begin groups
+    1 Xo 1
+end groups
+begin functions
+    1 r() if(Xo > 0.6, if(Xo < 0.9, log(Xo - 1), 0), 0)
+end functions
+begin reactions
+    1 0 1 s
+    2 1 0 k1
+    3 0 2 r
+    4 2 0 kd
+    5 0 3 sg
+    6 3 0 dg
+end reactions
+"""
+
+
+def test_a_half_step_answer_that_is_no_number_is_refused(tmp_path):
+    """E is made at a rate that is no number for X between 0.6 and 0.9, and
+    X sits at 0 beside G = 1e8: the floored step, 1.49, is past that window
+    and half of it is inside. The floored answer, dX*/ds = 1/k1, is right
+    here, and main returns it; but a solve that is no number confirms
+    nothing, and the columns are refused, as they are where the own step's
+    solve is no number."""
+    path = tmp_path / "nan_window.net"
+    path.write_text(NAN_WINDOW)
+    with pytest.raises(bngsim.SimulationError, match=r"dY_ss/dp") as err:
+        _steady(bngsim.Model.from_net(path), jacobian="fd")
+    assert "dX()/ds is " + format(1 / K1, ".6g") in str(err.value)
+    assert "nan with X(), E() stepped by half the first step" in str(err.value)
+
+
+# The model above with Z, made at kz = 1e-30 and removed at 1, which makes X
+# at q·Z: dX*/dq = Z*/k1 and dG*/dq = 2·k·X*·dX*/dq, a column of 1e-29.
+UNDER_LAST_BIT = (
+    SECOND_ORDER.replace("    5 dg  1.0\n", "    5 dg  1.0\n    6 kz  1e-30\n    7 q   1.0\n")
+    .replace("    2 G() {big!r}\n", "    2 G() {big!r}\n    3 Z() 0\n")
+    .replace("    5 2 0 dg\n", "    5 2 0 dg\n    6 0 3 kz\n    7 3 0 dg\n    8 3 3,1 q\n")
+)
+
+
+def _under_last_bit(tmp_path, functions):
+    text = UNDER_LAST_BIT.format(s=S, k1=K1, big=1e8)
+    if not functions:
+        text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
+    path = tmp_path / "under_last_bit.net"
+    path.write_text(text)
+    return bngsim.Model.from_net(path)
+
+
+def test_a_column_under_the_last_bit_of_its_species_is_returned(tmp_path):
+    """Control. dG*/dq is 5.9e-29 beside G at 1e8, and the half step moves
+    it by 3.5e-30: apart by 5% of the column, and by 21 decades less than
+    the last bit of G, for a change in q of its own size. That is no
+    second answer, and the floored one is returned as main returns it.
+    (BIOMD0000000347's dY/dEpoRCISRemove, at 1e-36 and less beside species
+    at 0.01 to 370, was refused for it.)"""
+    sim = bngsim.Simulator(_under_last_bit(tmp_path, False), method="ode", jacobian="fd")
+    out = sim.steady_state(sensitivity_params=["q"])
+    assert out.sens_fd_disagree_species is None
+    assert "X()" in out.sens_fd_half_step_species
+    z = float(np.asarray(out.concentrations)[2])
+    assert z == pytest.approx(1e-30, rel=1e-6)
+    sens = np.asarray(out.sensitivity)
+    assert sens[0, 0] == pytest.approx(z / K1, rel=1e-6)
+    # The floored secant, k·(2X + h)·dX*/dq, 12% from the slope 2·k·X*·dX*/dq.
+    assert sens[1, 0] == pytest.approx(_secant_dg_ds(1e8) * z, rel=1e-6)
+
+
+def test_a_function_column_under_its_last_bit_is_returned(tmp_path):
+    """Control. ``gx = abs(X)·X + G`` is at 1e8, and its total for q,
+    1.2e-28, moves by 3.5e-30 at half the step: under the function's last
+    bit, and returned as main returns it."""
+    sim = bngsim.Simulator(_under_last_bit(tmp_path, True), method="ode")
+    out = sim.steady_state(sensitivity_params=["q"])
+    assert out.sens_fd_disagree_function is None
+    z = float(np.asarray(out.concentrations)[2])
+    got = float(np.asarray(out.output_sensitivities(["gx"])).ravel()[0])
+    # dG*/dq from the closed-form Jacobian, and the floored secant of the
+    # function's partial: (2X + h) + 2·k·X, times dX*/dq.
+    h = (SO_X + SQRT_EPS * (1e8 + SO_X * SO_X)) - SO_X
+    assert got == pytest.approx((4 * SO_X + h) * z / K1, rel=1e-6)
+
+
 @pytest.mark.parametrize("big", [1e6, 1e8])
 def test_the_third_matrix_has_the_columns_at_half_the_step(tmp_path, big):
     """The columns of X and D, both far below G, are each the quotient at

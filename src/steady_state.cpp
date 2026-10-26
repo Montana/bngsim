@@ -4817,11 +4817,21 @@ static constexpr double kFdAnswersAgree = 1e-4;
 // kFdAnswersAgree of a column's largest, the entry that is furthest is put on
 // the result, which steady_state() refuses. Where they agree, the columns are
 // the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
-// solve that gave result.sensitivity, at the state result.concentrations.
+// solve that gave result.sensitivity, at the state result.concentrations;
+// `param_scale` is each column's parameter, or 1 where it is 0.
+//
+// The half step's answer is not counted apart where it is apart by less
+// than the last bit of the species' own concentration, for a change in the
+// parameter of its own size: a column whose entries are all that small,
+// dY/dEpoRCISRemove of BIOMD0000000347 at 1e-36 and less beside species at
+// 0.01 to 370, carried by a species at -3e-39, read as 73% apart at half the
+// step. A species at 0 has no last bit to be under. The own step's answer is
+// held to kFdAnswersAgree alone, as it was.
 template <class Solve>
-static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResult &result,
-                                           const double *J, int ns, int np,
-                                           const ResidualSubspace &sub, Solve &&solve_columns) {
+static void
+ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResult &result, const double *J,
+                               int ns, int np, const ResidualSubspace &sub,
+                               const std::vector<double> &param_scale, Solve &&solve_columns) {
     if (result.sens_jacobian_source != "finite-difference") {
         return;
     }
@@ -4865,7 +4875,11 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
             // (An answer that is no number is as far apart as can be, which
             // std::max would not keep.)
             const double own_apart = std::abs(own[k] - result.sensitivity[k]);
-            const double half_apart = std::abs(half[k] - result.sensitivity[k]);
+            double half_apart = std::abs(half[k] - result.sensitivity[k]);
+            if (half_apart * param_scale[static_cast<size_t>(p)] <=
+                std::numeric_limits<double>::epsilon() * std::abs(y_ss[i])) {
+                half_apart = 0.0; // under the species' last bit
+            }
             const double apart = std::isnan(own_apart) || std::isnan(half_apart)
                                      ? std::numeric_limits<double>::quiet_NaN()
                                      : std::max(own_apart, half_apart);
@@ -4917,6 +4931,13 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
             throw std::runtime_error("Steady-state sensitivity: parameter '" + param_names[p] +
                                      "' not found");
         }
+    }
+    // Each column's parameter, or 1 where it is 0, as param_fd_step takes it:
+    // what issue #1002's check reads a disagreement against.
+    std::vector<double> param_scale(static_cast<size_t>(np));
+    for (int p = 0; p < np; ++p) {
+        const double v = params[static_cast<size_t>(pidx[p])].value;
+        param_scale[static_cast<size_t>(p)] = v != 0.0 ? std::abs(v) : 1.0;
     }
 
     // ── Step 1: dense Jacobian J at y_ss, column-major (J[j*ns+i] = ∂f_i/∂x_j) ──
@@ -5271,7 +5292,8 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
             }
         };
         solve_columns(J.data(), result.sensitivity, &result.sens_jacobian_rcond);
-        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, solve_columns);
+        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, param_scale,
+                                       solve_columns);
 
         // Issue #995: whether this was an isolated root, and the state on it,
         // asked of the same system. The totals and the fixed species force the
@@ -5347,7 +5369,8 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
             }
         };
         solve_columns(J.data(), result.sensitivity, &result.sens_jacobian_rcond);
-        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, solve_columns);
+        ss_confirm_differenced_columns(rhs, result, J.data(), ns, np, sub, param_scale,
+                                       solve_columns);
 
         // Issue #995: whether this was an isolated root, and the state on it.
         std::vector<int> every_species(static_cast<size_t>(ns));
@@ -5732,7 +5755,11 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             // Where either total is further from the floored one than
             // kFdAnswersAgree of the largest function sensitivity in the
             // column, the furthest is put on the result, which steady_state()
-            // refuses. The values returned are the floored ones either way.
+            // refuses; the half step's total is not counted apart where it is
+            // under the last bit of the function's value or of its terms over
+            // the state, for a change in the parameter of its own size (as
+            // ss_confirm_differenced_columns has it of a species). The values
+            // returned are the floored ones either way.
             const auto eval_functions = [&](const double *yy, double *g) {
                 model.update_observables(yy);
                 model.evaluate_functions(0.0);
@@ -5784,9 +5811,18 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                     }
                     const double change = change_by(retaken, D_own, m, p);
                     const double change_half = change_by(halved, D_half, m, p);
-                    const double apart = std::isnan(change) || std::isnan(change_half)
+                    const int pi = pidx[p];
+                    const double pval = pi >= 0 ? params[static_cast<size_t>(pi)].value : 0.0;
+                    const double last_bit =
+                        std::numeric_limits<double>::epsilon() *
+                        std::max(std::abs(f0[m]), func_term_scale[static_cast<size_t>(m)]);
+                    const double half_apart =
+                        std::abs(change_half) * (pval != 0.0 ? std::abs(pval) : 1.0) <= last_bit
+                            ? 0.0
+                            : std::abs(change_half);
+                    const double apart = std::isnan(change) || std::isnan(half_apart)
                                              ? std::numeric_limits<double>::quiet_NaN()
-                                             : std::max(std::abs(change), std::abs(change_half));
+                                             : std::max(std::abs(change), half_apart);
                     if (apart <= kFdAnswersAgree * largest) {
                         continue;
                     }
