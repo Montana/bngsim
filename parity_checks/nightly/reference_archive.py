@@ -23,7 +23,10 @@ entry that no longer describes its job is refused, never compared
     fixed order, times, owners and modes) and a ``.json`` sidecar describing it.
     Every PASS row of the run's report must have a recorded entry, or nothing is
     packed: an archive missing one would turn that good case into an
-    ``archive_stale`` alert every night. An entry goes in only if its model's
+    ``archive_stale`` alert every night. A TIMEOUT row with no entry is listed
+    (``timed_out_unrecorded``) for the same reason: a replay that needs the entry
+    refuses it, which alerts the night after a live night that passes it. An
+    entry goes in only if its model's
     license, as a corpus provenance manifest records it, allows a copy; the rest
     are listed and left out, and their nightly row is ``archive_stale`` until the
     license is reviewed.
@@ -207,17 +210,18 @@ def _tar_member(name: str, size: int) -> tarfile.TarInfo:
     return info
 
 
-def _unrecorded_passes(reports: list[Path], recorded: set[tuple[str, str | None]]) -> list[str]:
-    """The PASS rows of ``reports`` with no recorded entry. An entry that names no
-    method (bng_stoch's, ssa_screen's) covers every row of its model."""
+def _unrecorded(
+    reports: list[Path], recorded: set[tuple[str, str | None]]
+) -> list[tuple[str, str]]:
+    """``(case, outcome)`` for each row of ``reports`` with no recorded entry. An
+    entry that names no method (bng_stoch's, ssa_screen's) covers every row of its
+    model."""
     missing = []
     for path in reports:
         for row in json.loads(path.read_text())["results"]:
-            if row["outcome"] != "PASS":
-                continue
             mid, method = row["model_id"], row.get("method")
             if (mid, method) not in recorded and (mid, None) not in recorded:
-                missing.append(f"{mid}|{method}")
+                missing.append((f"{mid}|{method}", row["outcome"]))
     return sorted(missing)
 
 
@@ -277,7 +281,8 @@ def pack(
         )
     if not entries:
         raise SystemExit(f"{suite}: no entry to pack in {src}")
-    missing = _unrecorded_passes(reports or [], recorded)
+    unrecorded = _unrecorded(reports or [], recorded)
+    missing = [case for case, outcome in unrecorded if outcome == "PASS"]
     if missing:
         raise SystemExit(
             f"{suite}: {len(missing)} PASS row(s) have no recorded reference, so a replay "
@@ -319,6 +324,13 @@ def pack(
         "good_in_baseline_only": (
             _good_in_baseline_only(reports or [], baseline) if baseline is not None else []
         ),
+        # Jobs killed before their reference was saved (issue #1290). A replay that
+        # needs the entry refuses them as archive_stale, an alert on the night after
+        # a live night that passes them. Listed, not refused: a model too slow for
+        # the recording must not block the rest. TIMEOUT rows only: a row of another
+        # outcome may need no entry (ssa_screen decides its time-event rows before
+        # it reads the archive).
+        "timed_out_unrecorded": [case for case, outcome in unrecorded if outcome == "TIMEOUT"],
     }
     (out_dir / f"{top}.json").write_text(json.dumps(sidecar, indent=1) + "\n")
     print(
@@ -332,6 +344,12 @@ def pack(
         print(
             f"  {len(cases)} case(s) good in the baseline were not PASS in this recording; a "
             f"replay that takes the baseline's path may refuse them: {', '.join(cases[:20])}"
+        )
+    if sidecar["timed_out_unrecorded"]:
+        cases = sidecar["timed_out_unrecorded"]
+        print(
+            f"  {len(cases)} case(s) timed out before their reference was recorded; a "
+            f"replay that needs it refuses them as archive_stale: {', '.join(cases[:20])}"
         )
     return sidecar
 
@@ -391,7 +409,8 @@ def manifest(
 
 def caveats(sidecars: Path) -> list[str]:
     """Markdown bullets for the publish summary: per suite, the cases good in the
-    baseline that were not PASS in the recording (see ``_good_in_baseline_only``)."""
+    baseline that were not PASS in the recording (see ``_good_in_baseline_only``),
+    and the cases that timed out before their reference was recorded."""
     lines = []
     for suite in SUITES:
         side = json.loads((sidecars / f"reference-{suite}.json").read_text())
@@ -400,6 +419,13 @@ def caveats(sidecars: Path) -> list[str]:
             lines.append(
                 f"- **{suite}**: {len(cases)} case(s) good in the baseline were not PASS in "
                 f"this recording: {', '.join(cases[:30])}"
+            )
+        cases = side.get("timed_out_unrecorded") or []
+        if cases:
+            lines.append(
+                f"- **{suite}**: {len(cases)} case(s) timed out before their reference was "
+                f"recorded; a replay that needs it refuses them as archive_stale: "
+                f"{', '.join(cases[:30])}"
             )
     return lines
 
