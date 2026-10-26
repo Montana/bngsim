@@ -6334,8 +6334,10 @@ def _psvs_row_divisor(species: list[dict], si: int) -> tuple[int, float, int]:
 
     One lookup for every emitter that scatters such a row: the RHS
     (:func:`generate_rhs_from_model`, which *defines* the divide), the Jacobian /
-    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`) and the
-    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`). Deriving it twice is
+    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`), the
+    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`), and the dX/dt that
+    :func:`bngsim._jacobian.rateof_rate_laws` writes out for a ``rateOf`` to be
+    differentiated through (issue #1266). Deriving it twice is
     how a row the RHS divides ends up with a derivative that does not — the defect
     family GH #119 is about, one scale factor wide and invisible at V = 1. Mirrors
     ``compute_derivs_core``'s ``species_divisor`` and
@@ -6689,6 +6691,7 @@ def generate_rhs_from_model(model) -> str:
             _obs_map,
             _func_map,
             _rateof_map,
+            with_deferred=False,
         )
         if functions
         else [],
@@ -7075,18 +7078,25 @@ def _emit_function_lines(
     obs_map: dict,
     func_map: dict,
     rateof_map: dict | None = None,
+    with_deferred: bool = True,
 ) -> list[str]:
     """C lines computing ``double func[N]; func[i] = …`` in dependency order.
 
     Shared by the RHS and analytical-Jacobian emitters (see
     ``_emit_observable_lines``). ``rateof_map`` (GH #106) resolves
     rate_of__<species> tokens to current_derivs[idx]; only the RHS emitter
-    passes it (the Jacobian emitter declines for rateOf models).
+    passes it. The Jacobian and sensitivity-RHS emitters have no such buffer and
+    pass functions whose rates are written out instead
+    (``_functions_with_rates_written_out``).
 
     Statements are emitted in dependency order (``_topological_function_order``)
     so a function that references another declared after it does not read an
     uninitialised ``func[]`` slot; the ``func[i]`` slot index stays the
     declaration index, so ``func_map`` references are unaffected.
+
+    ``with_deferred=False`` leaves out the functions only event assignments
+    read (issue #1186), which no rate law and no other function reads: the RHS
+    emitter passes it.
     """
     # Built once and shared across every function body — rebuilding it per body
     # is the model-based GH #161 quadratic (see _build_ident_lookup_model).
@@ -7095,6 +7105,8 @@ def _emit_function_lines(
     lines = [f"    double func[{len(functions)}];"]
     for i in _topological_function_order(functions, tfun_call_by_name):
         f = functions[i]
+        if f.get("deferred") and not with_deferred:
+            continue
         tfun_call = tfun_call_by_name.get(f["name"])
         if tfun_call is not None:
             tf_id, idx_c = tfun_call
@@ -7447,6 +7459,7 @@ def _functional_jacobian_groups(
         _TIME_SYM,
         build_per_species_c,
         differentiate_rate_law_c,
+        rateof_rate_laws,
     )
 
     params = data["parameters"]
@@ -7490,7 +7503,8 @@ def _functional_jacobian_groups(
     # ── Functional context (read like attach_functional_jacobian) ───────────
     ctx = core.functional_jacobian_context()
     frxns = ctx.get("functional_reactions") or []
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
     obs_groups = {name: [(int(si), float(f)) for si, f in grp] for name, grp in ctx["observables"]}
     species_meta = {i: (bool(av), float(vf)) for i, (av, vf) in enumerate(ctx["species_meta"])}
     # (#170 stage 2) Same map attach_functional_jacobian builds, for the same reason:
@@ -8044,10 +8058,17 @@ def generate_jacobian_from_model(model) -> str | None:
         if _jac_obs_lines
         else ([], [])
     )
+    # A function that reads rate_of__X has no live dx/dt here: its value is
+    # read off X's rate laws, the ones the terms above differentiated (issue
+    # #1124, item 7). Where they cannot be written out, decline rather than emit
+    # the token as an undeclared C name.
+    jac_functions = _functions_with_rates_written_out(data) if (need_func and functions) else []
+    if jac_functions is None:
+        return None
     jac_func_in, jac_func_fs = (
         _shard_value_lines(
             _emit_function_lines(
-                functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
+                jac_functions, tfun_call_by_name, _param_map, _species_map, _obs_map, _func_map
             ),
             chunk=chunk,
             fn_prefix="jac_func_blk",
@@ -8379,8 +8400,12 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "(correct, but slower, where every rate law is continuous in the state along "
         "the run, though a column can still be wrong where a min(), max(), abs() or "
         "clamp() over the state bends a narrow pulse: by a fifth to six-fold, with the "
-        "tolerance, at a triangle of width 0.01, issue #1126. A time course is refused "
-        "for the jumps that are found in the rate "
+        "tolerance, at a triangle of width 0.01, issue #1126. Of these, min, max and "
+        "abs are left here only in a model whose rate laws hold a condition, or where "
+        "one sits in anything but a sum, a product, a whole power, an exp() or another "
+        "bend, or in a product with a division or a fractional power of the state or "
+        "the clock; clamp likewise, and also where its bounds are not numbers with lo "
+        "<= hi, issue #1227. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -8806,6 +8831,81 @@ class _FunctionalDfdpScope(NamedTuple):
     # Empty unless the model has an amount-valued species whose compartment size
     # is writable — see :func:`_observable_volume_weights`.
     obs_volume_weights: dict[str, dict[int, str]] = {}
+    # Issue #1126: whether abs / min / max are differentiated rather than
+    # declined. Only in a model whose rate laws hold no condition at all: the
+    # crossing gate is what a condition is read through on the analytic path,
+    # and a bend that kept such a model on the difference quotient kept it
+    # where the #938 refusal reads it. ``B == 0`` over a B that a max() makes
+    # from 0 is one the gate takes, and returned dY/dq = 0 for -2.
+    bends_analytic: bool = False
+
+
+def _bend_under_a_break(expr, moving: set[str]) -> str | None:
+    """The first ``abs``, ``min``, ``max`` or ``clamp`` in *expr* that what it is
+    written in can break, as text, or ``None`` (issues #1126, #1227).
+
+    A bend is continuous, and so is a sum, a product, a whole positive power,
+    an ``exp`` or another bend of it. A division or a fractional power may not
+    be: ``e/abs(e)`` is a sign, ``max(e, 0)/e`` a step, ``sqrt(abs(e))`` a cusp
+    whose slope is infinite at the bend. So a bend under one, or in a product
+    with one of what reads a name in *moving* (the state and the clock), is
+    named, and the law is declined as before. ``max(…)/w`` over a parameter is
+    not. Nor is any other call trusted (``log(max(e, 0))`` is −∞ at the bend),
+    so a bend under one is named too.
+    """
+    import sympy as sp
+
+    from bngsim._jacobian import _kink_bindings
+
+    def breaks(node) -> bool:
+        if not isinstance(node, sp.Pow):
+            return False
+        e = node.exp
+        whole = bool(e.is_Integer and e >= 1)
+        return not whole and bool({str(x) for x in node.base.free_symbols} & moving)
+
+    clampval = _kink_bindings(sp)["clampval"]
+
+    def walk(node, safe: bool) -> str | None:
+        if isinstance(node, (sp.Abs, sp.Min, sp.Max, clampval)):
+            if not safe:
+                return str(node)
+            return next((w for a in node.args if (w := walk(a, True))), None)
+        if isinstance(node, sp.Pow):
+            e = node.exp
+            whole = bool(e.is_Integer and e >= 1)
+            return walk(node.base, safe and whole) or walk(e, False)
+        if isinstance(node, sp.Mul):
+            inner = safe and not any(breaks(a) for a in node.args)
+        elif isinstance(node, (sp.Add, sp.exp)):
+            inner = safe
+        else:
+            inner = False
+        return next((w for a in node.args if (w := walk(a, inner))), None)
+
+    return walk(expr, True)
+
+
+def _clamp_not_known_ordered(expr) -> str | None:
+    """The first ``clamp`` in *expr* whose bounds are not numbers with ``lo <=
+    hi``, as text, or ``None`` (issue #1227).
+
+    ExprTk's ``clamp(lo, x, hi)`` reads ``x < lo`` first, so where ``lo > hi``
+    it is ``lo`` below ``x = lo`` and ``hi`` from there on: a step, not a bend.
+    A bend's root carries no jump, so only a clamp whose bounds are known to be
+    ordered is differentiated as one; any other declines, as before.
+    """
+    import sympy as sp
+
+    from bngsim._jacobian import _kink_bindings
+
+    clampval = _kink_bindings(sp)["clampval"]
+    for node in sp.preorder_traversal(expr):
+        if isinstance(node, clampval):
+            lo, _x, hi = node.args
+            if not (lo.is_number and hi.is_number and bool(lo <= hi)):
+                return f"clamp({lo}, {_x}, {hi})"
+    return None
 
 
 def _functional_rate_law_partials(
@@ -8833,8 +8933,10 @@ def _functional_rate_law_partials(
         _IDENT_CALL_RE,
         _TIME_SYM,
         _exprtk_to_sympy,
+        _finish_kinks,
         _finish_zero_bases,
         _inline_functions,
+        _prepare_kinks,
         _prepare_zero_bases,
         sympy_to_c,
         unemitted_derivative_reason,
@@ -8858,7 +8960,13 @@ def _functional_rate_law_partials(
 
     # Reject on the *inlined* text so a construct hidden inside a referenced
     # function is caught, not just one written in the rate law itself.
-    reason = unsupported_expr_construct(inlined, allow_conditions=scope.switch_scope is not None)
+    # A bend (abs, min, max) is differentiated through the kink twins below
+    # (issue #1126): its derivative has no delta, so nothing is left to make up.
+    reason = unsupported_expr_construct(
+        inlined,
+        allow_conditions=scope.switch_scope is not None,
+        allow_bends=scope.bends_analytic,
+    )
     if reason is not None:
         return None, f"uses unsupported construct: {reason}"
 
@@ -8894,11 +9002,14 @@ def _functional_rate_law_partials(
         # Admitted only alongside the gate above, so a model whose conditions
         # were NOT cleared still reports them as unsupported.
         known = known | _condition_call_heads()
+    if scope.bends_analytic:
+        # Issue #1227: clamp is a bend, differentiated through its kink twin.
+        known = known | {"clamp"}
     stray = sorted({m.group(1) for m in _IDENT_CALL_RE.finditer(probe)} - known)
     if stray:
         return None, "calls unsupported function(s): " + ", ".join(stray)
 
-    sym_expr = _exprtk_to_sympy(inlined)
+    sym_expr = _exprtk_to_sympy(inlined, bends=scope.bends_analytic)
     if sym_expr is None:
         return None, "could not be parsed for differentiation"
 
@@ -8914,19 +9025,34 @@ def _functional_rate_law_partials(
     if unknown:
         return None, "references unrecognized symbol(s): " + ", ".join(sorted(unknown))
 
+    if scope.bends_analytic:
+        moving = {a for a, ref in scope.c_ref.items() if ref.startswith("obs[")} | {_TIME_SYM}
+        broken = _bend_under_a_break(sym_expr, moving)
+        if broken is not None:
+            return None, f"uses unsupported construct: {broken} under a call, division or power"
+        crossed = _clamp_not_known_ordered(sym_expr)
+        if crossed is not None:
+            return None, (
+                f"uses unsupported construct: {crossed}, whose bounds are not numbers known "
+                "to satisfy lo <= hi; crossed bounds make clamp a step, whose jump a bend "
+                "does not carry"
+            )
+
+    targets = free & (set(scope.param_of_alias) | set(scope.obs_volume_weights))
+    # Issue #1126: an abs over a differentiation variable differentiates to
+    # sign(a)·a', and min / max to the Heaviside _finish_kinks spells as if().
+    sym_expr = _prepare_kinks(sym_expr, targets)
     # Issue #541: a power with a zero base — an ``if(c, u, 0)`` raised to a
     # parameter-dependent exponent — differentiates to 0, not to sympy's nan.
     sym_expr = _prepare_zero_bases(
-        sym_expr,
-        free & (set(scope.param_of_alias) | set(scope.obs_volume_weights)),
-        set(scope.param_of_alias) | set(_MATH_CONSTANT_C),
+        sym_expr, targets, set(scope.param_of_alias) | set(_MATH_CONSTANT_C)
     )
 
     terms: list[tuple[int, str]] = []
     for a in sorted(free & set(scope.param_of_alias)):
         pname = scope.param_of_alias[a]
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -8980,7 +9106,7 @@ def _functional_rate_law_partials(
     # so this loop does not run and the emitted text is unchanged.
     for a in sorted(free & set(scope.obs_volume_weights)):
         _check_derivation_deadline(scope.deadline)
-        deriv = _finish_zero_bases(sp.diff(sym_expr, sp.Symbol(a)))
+        deriv = _finish_zero_bases(_finish_kinks(sp.diff(sym_expr, sp.Symbol(a))))
         if deriv == 0:
             continue
         c_expr = sympy_to_c(deriv, resolve_symbol)
@@ -10392,11 +10518,16 @@ def _functional_dfdp_terms(
     functions = data["functions"]
     reactions = data["reactions"]
 
-    from bngsim._jacobian import _DerivationBudgetExceeded, has_condition_construct
+    from bngsim._jacobian import (
+        _DerivationBudgetExceeded,
+        has_condition_construct,
+        rateof_rate_laws,
+    )
 
     ctx = core.functional_jacobian_context()
     frxn_by_idx = {int(r["rxn_idx"]): r for r in (ctx.get("functional_reactions") or [])}
-    func_map = dict(ctx["function_map"])
+    # A rate_of__X a law reads is X's own rate law (issue #1124, item 7).
+    func_map = {**rateof_rate_laws(data), **dict(ctx["function_map"])}
 
     param_idx_by_name = {p["name"]: i for i, p in enumerate(params)}
     primary_param_names = {p["name"] for p in params if p.get("is_const", True)}
@@ -10451,7 +10582,8 @@ def _functional_dfdp_terms(
     conditional_text = list(func_map.values()) + [
         str(r.get("rate_expr", "")) for r in frxn_by_idx.values()
     ]
-    if any(has_condition_construct(body) for body in conditional_text):
+    has_conditions = any(has_condition_construct(body) for body in conditional_text)
+    if has_conditions:
         from bngsim._switch_sensitivity import switch_condition_scope
 
         try:
@@ -10474,6 +10606,7 @@ def _functional_dfdp_terms(
         # (#170 stage 3) The compartment size an observable's amount conversion
         # hides. Empty ⇒ the derivative loop that reads it never runs.
         obs_volume_weights=_observable_volume_weights(data["species"], observables, _alias),
+        bends_analytic=not has_conditions,
     )
 
     # A rule-generated network reuses one rate-law expression across many
@@ -11191,6 +11324,71 @@ def generate_sens_from_model(
     return src
 
 
+_RATEOF_TOKEN_RE = re.compile(r"\b" + _RATEOF_PREFIX + r"\w+")
+_TFUN_CALL_RE = re.compile(r"\btfun_\w+\s*\(")
+
+
+def _functions_with_rates_written_out(data: dict) -> list[dict] | None:
+    """``data["functions"]``, each ``rate_of__X`` its texts read written out as
+    X's rate laws, inlined down to observables, parameters and time (issue
+    #1124, item 7); ``None`` where one cannot be.
+
+    ``rate_of__X`` is the live dx/dt the RHS's probe passes leave in
+    ``current_derivs``, and only the RHS has that buffer. The ``func[]``
+    recomputations of the analytical Jacobian and the sensitivity RHS read the
+    same value off the rate laws :func:`bngsim._jacobian.rateof_rate_laws`
+    states, which is what the derivations they are written against
+    differentiate. ``None`` where a function reads a rate it does not state,
+    where rates read each other in a ring, or where a written-out rate calls a
+    table, which neither caller can evaluate.
+
+    Both texts are rewritten. The value is printed from ``eval_expression``
+    where the loader set one (the zero-base log guard, GH #333), and the laws
+    are inlined through those same texts, so the value is the one the RHS sums.
+    """
+    functions = data["functions"]
+    if not any(_RATEOF_PREFIX in f["expression"] for f in functions):
+        return functions
+    from bngsim._jacobian import _inline_functions, rateof_rate_laws
+
+    laws = rateof_rate_laws(data)
+    bodies = {
+        **laws,
+        **{f["name"]: f.get("eval_expression") or f["expression"] for f in functions},
+    }
+    memo: dict[str, str] = {}
+    flat: dict[str, str | None] = {}
+
+    def written_out(token: str) -> str | None:
+        if token not in flat:
+            law = _inline_functions(laws[token], bodies, memo=memo) if token in laws else None
+            if law is not None and (_RATEOF_PREFIX in law or _TFUN_CALL_RE.search(law)):
+                law = None
+            flat[token] = law
+        return flat[token]
+
+    out = []
+    for f in functions:
+        texts = {
+            key: f[key]
+            for key in ("expression", "eval_expression")
+            if _RATEOF_PREFIX in f.get(key, "")
+        }
+        for text in texts.values():
+            if any(written_out(token) is None for token in _RATEOF_TOKEN_RE.findall(text)):
+                return None
+        if texts:
+            f = {
+                **f,
+                **{
+                    key: _RATEOF_TOKEN_RE.sub(lambda m: f"({flat[m.group(0)]})", text)
+                    for key, text in texts.items()
+                },
+            }
+        out.append(f)
+    return out
+
+
 def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """The ``obs[]``/``func[]`` recomputation ``bngsim_dfdp`` reads (GH #65).
 
@@ -11207,7 +11405,9 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     * an **embedded tfun wrapper**, which even the value codegen declines
       (``generate_outputs_from_model``) because the ``tfun_<table>(...)`` token
       would be emitted as an undeclared C call.
-    * **rateOf**, which needs the live dx/dt buffer no sensitivity-RHS call has.
+    * a **rateOf** that :func:`_functions_with_rates_written_out` cannot write
+      out as its species' rate laws: the live dx/dt it reads is in a buffer no
+      sensitivity-RHS call has.
 
     Called lazily and at most once per emit, and only when the ∂f/∂p switch
     actually references ``obs[``/``func[`` — an Elementary model never does, so
@@ -11215,11 +11415,10 @@ def _sens_value_lines(data: dict) -> tuple[list[str], list[str]] | None:
     """
     species = data["species"]
     observables = data["observables"]
-    functions = data["functions"]
-    tfun_specs = data.get("table_functions", [])
-
-    if any(_RATEOF_PREFIX in f["expression"] for f in functions):
+    functions = _functions_with_rates_written_out(data)
+    if functions is None:
         return None
+    tfun_specs = data.get("table_functions", [])
 
     tfun_names = [spec["name"] for spec in tfun_specs]
     for f in functions:

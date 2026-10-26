@@ -82,8 +82,16 @@ and whether the two ODEs agree, then label:
     or an unexplained residual. THIS is the only status that means "look at
     bngsim".
 
+NaN attribution (issue #1211). bngsim refuses a propensity that is NaN or
+infinite (issue #809). Where RoadRunner's gillespie, on the same seeds, reaches
+a non-finite rate of the same reaction, or declines the model for a feature it
+does not simulate (a rate rule), the rate law is undefined at a state the SSA
+reaches and neither engine has a trajectory: ``nonfinite_rate``, a BAD_TEST.
+Any other such refusal stays an ``error``.
+
 Only ``fail`` / ``diff_ode_level`` / ``error`` fail the exit code; the
-explained-not-bngsim statuses (``diff_not_bngsim`` / ``rr_known``) are green.
+explained-not-bngsim statuses (``diff_not_bngsim`` / ``rr_known``) and
+``nonfinite_rate`` are green.
 ``--self-z-tol`` tunes the per-engine SSA-vs-own-ODE z tolerance (default 7.30,
 the #30 discriminator). The attribution runs each engine's ODE only for the
 handful of fails, so its cost is negligible.
@@ -1150,7 +1158,9 @@ def _revalidate_time_events(cases: list, specs: list, args) -> None:
 # A live run can record, per model, every RoadRunner result the screen used: the
 # gillespie ensemble (or the error it raised) at each horizon it ran — the full
 # horizon, and the rungs of the partial- or extended-horizon ladders it walked —
-# and, when a fail was attributed, RoadRunner's ODE on the screen's grid. A later
+# and, when a fail was attributed, RoadRunner's ODE on the screen's grid, and,
+# when bngsim refused a NaN or infinite propensity, whether RoadRunner's gillespie
+# reaches a non-finite rate on the same seeds (issue #1211). A later
 # run replays from that record with no RoadRunner. An entry whose inputs no longer
 # match the model (the SBML's sha256, horizon, output steps, replicate count, seed
 # base) is stale (``archive_stale``). A replay that needs a RoadRunner result the
@@ -1191,7 +1201,8 @@ def _json_bytes(obj) -> np.ndarray:
 class Reference:
     """RoadRunner's side of one model: live, live and recorded, or replayed.
 
-    ``ssa`` and ``ode`` have the signatures of :func:`_rr_common.rr_ssa` and
+    ``ssa``, ``nonfinite_rate`` and ``ode`` have the signatures of
+    :func:`_rr_common.rr_ssa`, :func:`_rr_common.rr_ssa_nonfinite_rate` and
     :func:`_rr_ode`. Recording rewrites the model's entry after every RoadRunner
     call, so a worker killed mid-ladder still leaves what it ran. Replaying
     raises :class:`ArchiveMiss` for a call the entry does not hold."""
@@ -1202,6 +1213,7 @@ class Reference:
         self.runs: dict[str, dict] = {}  # repr(horizon) -> {timing, elapsed_sec | error}
         self.ensembles: dict[str, tuple] = {}  # repr(horizon) -> (times, arr, names)
         self.rr_ode = None
+        self.nonfinite = None  # {"result": ...} | {"error", "error_type"}
         self.stale = ""
         # Which RoadRunner made the record: kept beside the identity, not in it.
         self.reference_version = None
@@ -1254,6 +1266,28 @@ class Reference:
     def elapsed_sec(self, t_end) -> float | None:
         return self.runs.get(repr(float(t_end)), {}).get("elapsed_sec")
 
+    def nonfinite_rate(self, xml, t_start, t_end, n_points, n, seed_base) -> dict:
+        if self.replay:
+            if self.nonfinite is None:
+                raise ArchiveMiss(
+                    "the replay needs RoadRunner's rates where bngsim refused a NaN or "
+                    "infinite propensity, and the archive holds none for this model"
+                )
+            if "error" in self.nonfinite:
+                raise type(self.nonfinite["error_type"], (RuntimeError,), {})(
+                    self.nonfinite["error"]
+                )
+            return self.nonfinite["result"]
+        try:
+            result = rc.rr_ssa_nonfinite_rate(xml, t_start, t_end, n_points, n, seed_base)
+        except Exception as exc:
+            self.nonfinite = {"error": str(exc), "error_type": type(exc).__name__}
+            self._save()
+            raise
+        self.nonfinite = {"result": result}
+        self._save()
+        return result
+
     def ode(self, xml, t_end, n_steps):
         if self.replay:
             if self.rr_ode is None:
@@ -1278,6 +1312,8 @@ class Reference:
             "reference_version": self.reference_version,
             "runs": {},
         }
+        if self.nonfinite is not None:
+            meta["nonfinite_rate"] = self.nonfinite
         arrays = {}
         for i, (key, run) in enumerate(self.runs.items()):
             meta["runs"][key] = {**run, "index": i}
@@ -1307,6 +1343,7 @@ class Reference:
                     self.stale = f"the model's {', '.join(changed)} changed"
                     return
                 self.reference_version = meta.get("reference_version")
+                self.nonfinite = meta.get("nonfinite_rate")
                 for key, run in meta["runs"].items():
                     i = run.pop("index")
                     self.runs[key] = run
@@ -1325,7 +1362,7 @@ class Reference:
             # An entry that cannot be read is no reference either. Refused like a
             # stale one, rather than killing the worker, whose row would then read
             # as a bngsim crash.
-            self.runs, self.ensembles, self.rr_ode = {}, {}, None
+            self.runs, self.ensembles, self.rr_ode, self.nonfinite = {}, {}, None, None
             self.stale = f"the entry could not be read ({type(exc).__name__}: {exc})"[:300]
 
 
@@ -1337,6 +1374,73 @@ def _not_from_archive(entry: dict, ref: Reference, miss: ArchiveMiss) -> dict:
     entry["status"] = status
     entry["error"] = f"roadrunner (archive): {status}: {miss}"
     return entry
+
+
+# bngsim's refusal of a NaN or infinite propensity (issue #809), from
+# throw_nonfinite_propensity in src/ssa_simulator.cpp.
+NONFINITE_PROPENSITY = "A rate law that evaluates to NaN or infinity has no stochastic meaning"
+# The reaction that refusal names, as reaction_label writes it there: "R<n> (A + B
+# -> C)", species ids joined by " + " (a stoichiometry of 2 as the id twice), and
+# "0" for no species. The total propensity's refusal names no reaction.
+_REFUSED_REACTION = re.compile(r"the propensity of reaction R\d+ \((.*?) -> (.*?)\) is ")
+# RoadRunner's gillespie declining a model for a feature it does not simulate.
+GILLESPIE_REFUSAL = "The gillespie integrator is unable to simulate a model with"
+
+
+def _refused_net(message: str) -> dict[str, float] | None:
+    """The net change of each species in the reaction bngsim's refusal names, or
+    None when it names none (the total propensity) or names a species it could not."""
+    m = _REFUSED_REACTION.search(message)
+    if m is None:
+        return None
+    net: dict[str, float] = {}
+    for side, sign in ((m.group(1), -1.0), (m.group(2), 1.0)):
+        if side == "0":
+            continue
+        for sid in side.split(" + "):
+            if sid == "?":
+                return None
+            net[sid] = net.get(sid, 0.0) + sign
+    return {sid: v for sid, v in net.items() if v != 0.0}
+
+
+def _judge_nonfinite(
+    entry: dict, ref: Reference, xml: str, t_end: float, n_steps: int, message: str
+) -> None:
+    """Whose NaN or infinite propensity bngsim refused (issue #1211).
+
+    RoadRunner's gillespie runs on the same seeds. Where its own rate of the same
+    reaction (the same net change of each floating species) turns non-finite too,
+    the rate law is undefined at a state the SSA reaches, which is the model's, not
+    bngsim's: the row is ``nonfinite_rate`` (BAD_TEST), since RoadRunner, which
+    raises nothing there and holds the state to ``t_end``, has no trajectory
+    either. Where RoadRunner's gillespie declines the model for a feature it does
+    not simulate (a rate rule), neither engine runs it, which is ``nonfinite_rate``
+    too. Everything else stays a red ``error``: every rate finite, a non-finite rate
+    of another reaction, any other RoadRunner error, a refusal that names no
+    reaction, and a replay whose record holds no such run, so a bngsim defect is
+    never hidden. Mutates ``entry``.
+    """
+    want = _refused_net(message)
+    if want is None:
+        return
+    try:
+        found = ref.nonfinite_rate(xml, 0.0, t_end, n_steps + 1, ref.n, ref.seed_base)
+    except ArchiveMiss:
+        return
+    except Exception as exc:
+        entry["nonfinite_rate"] = {"roadrunner_error": f"{type(exc).__name__}: {exc}"[:300]}
+        if GILLESPIE_REFUSAL in str(exc):
+            entry["status"] = "nonfinite_rate"
+        return
+    entry["nonfinite_rate"] = found
+    boundary = set(found["boundary"])
+    want = {sid: v for sid, v in want.items() if sid not in boundary}
+    for hit in found["nonfinite"]:
+        if hit["net"] == want:
+            entry["nonfinite_rate"] = {**found, "match": hit}
+            entry["status"] = "nonfinite_rate"
+            return
 
 
 def _worker(
@@ -1435,7 +1539,7 @@ def _worker(
             incompatible = True  # fall through to the normal UNSUPPORTED path
         except Exception as exc:
             entry["status"] = "error"
-            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+            entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
             q.put(entry)
             return
         if not incompatible:
@@ -1472,7 +1576,13 @@ def _worker(
         full = False
     except Exception as exc:
         entry["status"] = "error"
-        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:300]
+        entry["error"] = f"bngsim: {type(exc).__name__}: {exc}"[:500]
+        if NONFINITE_PROPENSITY in str(exc):
+            # The red row first: RoadRunner's run can outlast the per-model cap, and
+            # the parent recovers a killed worker's last row rather than marking it
+            # too_slow, which this suite counts as expected.
+            q.put(dict(entry))
+            _judge_nonfinite(entry, ref, xml, t_end, n_steps, str(exc))
         q.put(entry)
         return
 
@@ -1887,6 +1997,7 @@ def _print_progress(finished: int, total: int, res: dict) -> None:
         "diff_ode_level": "DIFFo",
         "partial": "PART ",
         "attribution_incomplete": "ATTR?",
+        "nonfinite_rate": "NaN ",
     }.get(st, st)
     extra = ""
     if st == "partial":
@@ -1908,7 +2019,14 @@ def _print_progress(finished: int, total: int, res: dict) -> None:
             )
             if w:
                 extra += f" worst={w.get('species')}"
-    elif st in ("error", "too_slow", "skip", "archive_stale", "archive_unreplayable"):
+    elif st in (
+        "error",
+        "too_slow",
+        "skip",
+        "archive_stale",
+        "archive_unreplayable",
+        "nonfinite_rate",
+    ):
         extra = f" {res.get('error', '')[:70]}"
     print(f"  [{finished}/{total}] {tag} {res['name']} ({res['source']}){extra}", flush=True)
 
@@ -2029,7 +2147,15 @@ def main() -> int:
     too_slow_models = sorted(c["name"] for c in cases if c["status"] == "too_slow")
     error_models = sorted(c["name"] for c in cases if c["status"] == "error")
     skip_models = sorted(c["name"] for c in cases if c["status"] == "skip")
-    not_compared = ("too_slow", "error", "skip", "archive_stale", "archive_unreplayable")
+    nonfinite_models = sorted(c["name"] for c in cases if c["status"] == "nonfinite_rate")
+    not_compared = (
+        "too_slow",
+        "error",
+        "skip",
+        "archive_stale",
+        "archive_unreplayable",
+        "nonfinite_rate",
+    )
     n_compared_models = sum(1 for c in cases if c["status"] not in not_compared)
     total_lowcount_skips = sum(int(c.get("n_skipped_lowcount", 0)) for c in cases)
     # DIFF attribution (GH #107 follow-up): each surviving cross-engine fail is
@@ -2082,6 +2208,12 @@ def main() -> int:
         print(f"    {', '.join(error_models)}")
     if skip_models:
         print(f"  skip (DROPPED, sbml missing): {len(skip_models)}")
+    if nonfinite_models:
+        print(
+            "  nonfinite_rate (DROPPED, a rate law is NaN or infinite where the SSA goes; "
+            f"neither engine has a trajectory): {len(nonfinite_models)}"
+        )
+        print(f"    {', '.join(nonfinite_models)}")
     if vacuous_lowcount:
         print(
             f"  pass-but-uncompared (every cell below the low-count floor): "
@@ -2132,6 +2264,7 @@ def main() -> int:
             "too_slow": too_slow_models,
             "error": error_models,
             "skip": skip_models,
+            "nonfinite_rate": nonfinite_models,
             "pass_but_uncompared_lowcount": vacuous_lowcount,
             "diff_not_bngsim": sorted(
                 c["name"] for c in cases if c["status"] == "diff_not_bngsim"

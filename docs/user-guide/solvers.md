@@ -453,16 +453,54 @@ What this does not cover:
   `*`, and `/` by one of those), however coarse: `ceil(t0 + time())` with
   `t0 = 1e12` moves once in 500 instants of a run 240 long, but a sum or a
   product with a constant never steps back, so it crosses each whole number
-  once and is read as any other. One thing of this kind is refused: a `mod`
-  or `frac` used as a number (not under a comparison) that takes off a whole
-  number beyond 2^48 (2.8e14), as `100*mod(1e12 + time(), 0.0015)` does. The
-  doubles of its argument are then a sixteenth of the modulus apart or more,
-  and what it returns is the argument's rounding, a few steps up to each
-  wrap, and not a sawtooth. Take the offset out of what the call divides. And
-  a `mod` or `frac` used as a number whose argument is coarser than the clock
-  (an offset more than about 64 times the time, as in `frac(1e6 + time())`)
-  gets no stop on its wraps from this reading: it is integrated as before,
-  with the error test finding each wrap (issue #1018).
+  once and is read as any other.
+
+  Far from zero, such a line holds each of its doubles for a stretch of time,
+  a tread (1.2e-4 at `1e12 + time()`), and a rate law that reads the clock
+  once, inside such a line, is a staircase, however the rest of it is written
+  (`floor((1e10 + time())/(0.01))`, as SBML's `quotient` loads, is read through
+  `1e10 + time()`). Where the reading above refuses such a law, or leaves it
+  without stops, the law is read once on each tread instead, and stopped on
+  the last double before each change (issue #1018): between two stops the
+  rate is constant, and integrated exactly. So it is with
+  `floor(mod(1e12 + time(), 0.3)/0.3 + 0.0005)`, a pulse 1.5e-4 wide before
+  each wrap, too many to read every quarter instant; with a `mod` or `frac`
+  used as a number (not under a comparison) whose argument is coarser than the
+  clock and whose period is at most 1,024 doubles of its argument, as in
+  `100*mod(1.1e12 + time(), 0.0048828125)` (20); and with one that takes off a
+  whole number beyond 2^48 (2.8e14), as `100*mod(1e12 + time(), 0.0015)` does.
+  That last returns its argument's rounding, a few steps up to each wrap, and
+  not a sawtooth: where its stops are placed, the run is made as the model
+  reads it, and warned. Take the offset out of what the call divides for a
+  sawtooth.
+
+  A sawtooth with more doubles to its period than that is a staircase of steps
+  under a thousandth of the period, the line it nearly is, and is integrated
+  as before: `100*mod(1.7e9 + time(), 86400)/86400`, a time of day, over 0.2 is
+  14 steps, where a stop on each of its 838,861 treads would be 1.7 million.
+  Up to 4.2 million treads of each law are read in a run, and 1,000,000 stops
+  placed. A law the reading above refuses that needs more stops than that is
+  refused by name, whatever `max_step` is passed, with a leg that fits (past
+  the 4.2 million treads, it is refused as it was): a step bound
+  in place of its stops left `100*mod(1e12 + time(), 12u)` 0.4% off at the
+  default tolerances, and 4.5% from X(0) = 1e4, where in legs each change has
+  its stop and the answer is exact to rounding. A sawtooth it leaves without
+  stops has its stops placed after every other switch of the run has its own,
+  and where they do not fit, or are more than can be read, it is integrated as
+  before, with the error test finding each change, and a warning (once a
+  session) to run it in legs that fit. Nor is anything read so whose changes
+  are closer together than 3.5e-13 of the time (16 times the 2.2e-14 of it
+  within which CVODE takes a stop as reached and integrates nothing more):
+  late in a run its stops would each be reached at the one before, and the
+  stretch between never integrated. Such a law is refused where it was, and
+  integrated as before where it was not. So is a rate law that reads such a
+  line outside its conditions too, as SBML's `rem` does, written out as
+  `x - P*floor(x/P)`: a stop on each change of the `floor` is not a stop on
+  each step of `x`. So is a run with two laws read so, whose stops can fall a
+  double apart and be taken as one, or with one beside a condition past the
+  budget, whose step bound its stops would cut. Runs with sensitivity
+  columns, an event's trigger, a counter clock, a function no rate law reads
+  and the stochastic methods are read as before.
 - **More than 1,000,000 switches in one run.** A repeating schedule or a
   sinusoid that is the only thing in the model that switches is then integrated
   under a step bound of half its shorter stretch. Anything else is refused with
@@ -483,6 +521,52 @@ that adds up: a quantity of order `n_stops × atol` is integrated to no better
 than that. `mod(time(), 0.0003)` over 10 time units (33,000 stops) accumulates
 1.5e-3, which the default `atol` of 1e-8 does not resolve and `atol=1e-14`
 does to 2e-8. Tighten `atol` where a run has many stops and small quantities.
+
+A stop sits on the first double at which the model's own arithmetic reads
+the rate law's new value, found by asking the evaluator: an edge worked out
+from a period and an offset can be a double away from it, and with an offset
+in the argument (`mod(1e12 + time(), 0.3)`) billions of doubles of the clock
+(issue #891). The compiled right-hand side is built without fused
+multiply-add (issue #963), so it changes on the same double as the
+interpreter. (A law read tread by tread is stopped on the last double before
+each change: above.) A condition an event's trigger reads keeps its stop where it
+was put, as does every condition in a run with sensitivity columns. At an
+`rtol` looser than 1e-4, each stop the resolvers or the scan put on a change
+sits on the last double before the change instead (issue #1226); one on a
+counter clock stays where it was put, since the integrated counter lands a
+few doubles past it. A step ends on a stop, and the implicit step reads the
+rate at its end: on the change, the step that reaches it is taken at the next
+stretch's rate, and at a tolerance loose enough for that step to span the
+stretch, `if(mod(time(), 24) < 1, 1, 0)` over 1,000 days came to 14,627 for
+1,000 at `rtol` 1e-2 (each day's 23 hours off at the rate on, its hour on at
+the rate off). A double earlier it is exact to rounding, where the rate law
+holds between its changes. One that reads the clock outside every condition
+that holds between its changes (a sawtooth, written with `mod`, `frac` or
+`floor`, a ramp, a pulse times the clock) keeps its stops where they were put:
+spanned by one step, its stretch is read at one end, and the end a double
+before the change is no better than the other (`mod(time(), 0.7)` from
+X(0) = 1e4 at `rtol` 1e-3 was 19.3 over a double before each change, and 0.45
+as the stops were put). A condition that comes in parentheses, as every one an
+SBML or Antimony model loads does (`((time() - 24*floor(time()/24)) < 1)`), is
+not read as one that holds, and keeps its stops where they were put: an SBML
+pulse schedule is main's at every tolerance. Tighter, the step on the change fails on the jump and
+the run walks the stretch before it, which finds a pulse inside the stretch
+that a step from the double before would not. In a run where a moved stop
+would sit a double or two from another stop (two spellings of one schedule,
+or another switch on one of its edges), every stop the resolvers placed is
+where they put it: the run takes the second of two such as reached where it
+restarts on the first, and neither alone is right for both conditions.
+
+CVODE takes a stop as reached once a step ends within 100 doubles' worth of
+its time, about 2.2e-14*t, and does not integrate what is left. Where a rate
+jumps on a stop by so much that that time's worth of the jump would be a tenth
+of the tolerance or more, a run with no sensitivity columns stops CVODE on the
+double before the stop, integrates that double on the branch that ends, and
+takes the stop from there: stopped on the stop itself, a dose schedule
+started at t = 1e6 lost 2e-8 at each stop where it switched off, 180 times
+rtol at 1e-9 (issue #891). Elsewhere the step that reaches a stop reads the
+new branch and, at a tight tolerance, fails on the jump, so the integrator
+walks the stretch before it, which is how a pulse inside it is found.
 
 Where the rate law is flat at a restart, the integrator's first step has
 nothing to measure its error by, and the steps after it grow as far as the

@@ -68,7 +68,13 @@ def test_ungated_roadrunner_would_diverge_on_homodimer() -> None:
     """Why the gate exists: with A(0)=1 the exact-SSA answer for C is identically 0
     (can't pick 2 of 1), and bngsim's SSA gives 0 — but RoadRunner's Gillespie, fed the
     ``0.5*k1*A*A`` law, fires the reaction and grows C. This is the DIFF the gate
-    suppresses; asserting it keeps the granularity mismatch pinned."""
+    suppresses; asserting it keeps the granularity mismatch pinned.
+
+    Each run is capped at 50 output rows (49 events). Since libRoadRunner 2.9.3 a
+    Gillespie run no longer stops when a species goes negative (RoadRunner #1322),
+    so A falls 1, -1, -3, ... and the law's propensity grows as A**2: a run has
+    infinitely many events before a finite time (about 4.5 on average at k1 = 1),
+    and 64 uncapped replicates to t = 10 never return."""
     import warnings
 
     import numpy as np
@@ -99,13 +105,18 @@ def test_ungated_roadrunner_would_diverge_on_homodimer() -> None:
 
     rr = roadrunner.RoadRunner(text)
     rr.integrator = "gillespie"
-    rr.integrator.variable_step_size = False
+    rr.integrator.variable_step_size = True  # where max_output_rows applies: a row per event
+    rr.integrator.max_output_rows = 50
     id_map = nrr._observable_id_map(text)
     rr.timeCourseSelections = ["time", id_map["C_tot"]]
     rr_final = []
     for rep in range(n_rep):
         rr.reset()
         rr.integrator.seed = rep
-        res = np.asarray(rr.simulate(0.0, 10.0, 11))
+        with warnings.catch_warnings():
+            # The cap stopping a run short of t = 10 is the point.
+            warnings.filterwarnings("ignore", "Simulation requested end time point", UserWarning)
+            res = np.asarray(rr.simulate(0.0, 10.0))
         rr_final.append(res[-1, 1])
-    assert float(np.mean(rr_final)) > 1.0  # ungated RoadRunner diverges from the exact 0
+    # Ungated RoadRunner diverges from the exact 0: it fires 2A -> C at A = 1.
+    assert sum(c > 0 for c in rr_final) > n_rep // 2

@@ -1,7 +1,7 @@
 """A derived parameter's column on the difference-quotient path (issue #707).
 
 ``kd = 2*k0`` and a rate law the analytic sensitivity right-hand side declines,
-``kd*max(1, 0*Atot)*Atot``, so CVODES takes each column by its internal difference
+``kd*clamp(1, 0*Atot, big)*Atot``, so CVODES takes each column by its internal difference
 quotient: it moves one parameter, reads the right-hand side, and puts it back.
 
 bngsim mirrors the moved value into the model and re-derives the derived
@@ -29,6 +29,7 @@ NET = """begin parameters
     3 ke 3*kd
     4 A0 10
     5 ks 4
+    6 big 1e300
 end parameters
 begin functions
     1 rf() {law}
@@ -47,7 +48,10 @@ T = np.linspace(0.0, 2.0, 5)
 # A rate constant of kd, written so that the analytic path declines it. Not
 # as ``kd*abs(Atot)/Atot``, a sign written as a quotient, which a run on the
 # quotient is refused for (issue #938).
-DECLINED = "kd*max(1,0*Atot)"
+# clamp(1, x, big) with big = 1e300 is max(1, x); max has an analytic sensitivity
+# RHS since issue #1126, and so does a clamp with numbers for bounds since issue
+# #1227. With the upper bound a parameter, this one is still declined.
+DECLINED = "kd*clamp(1,0*Atot,big)"
 ANALYTIC = "kd"
 
 
@@ -115,9 +119,15 @@ def test_the_models_parameters_are_as_they_were_after_the_run(tmp_path):
     assert [model.get_param(n) for n in ("k0", "kd", "ke")] == [0.5, 1.0, 3.0]
 
 
-def test_an_sbml_parameter_set_by_an_initial_assignment():
+# SBML has no clamp(), and abs() has an analytic RHS since issue #1126, so
+# the antimony models below are put on the quotient by the hatch.
+QUOTIENT = "BNGSIM_NO_FUNCTIONAL_SENS_RHS"
+
+
+def test_an_sbml_parameter_set_by_an_initial_assignment(monkeypatch):
     """``kd = 2*k0`` as an initial assignment, with ``kd*abs(A)`` as the
     kinetic law: the same 0."""
+    monkeypatch.setenv(QUOTIENT, "1")
     text = "species A; A = 10; k0 = 0.5; kd = 2*k0\nJ1: A -> ; kd*abs(A)\n"
     model = bngsim.Model.from_antimony_string(text)
     sim = bngsim.Simulator(model, method="ode", sensitivity_params=["kd", "k0"])
@@ -206,10 +216,11 @@ def _event_column(event, times):
     return np.asarray(run.sensitivities)[:, 0, 0]
 
 
-def test_an_event_assignment_that_reads_the_derived_parameter():
+def test_an_event_assignment_that_reads_the_derived_parameter(monkeypatch):
     """``A = A + kd`` at t = 1: A = (10·e^(−kd) + kd)·e^(−kd·(t − 1)) from
     there. The column came back 0 before the event and 0.607 for −3.044 at
     t = 1.5: the assignment's own ∂/∂kd, and nothing of the rate."""
+    monkeypatch.setenv(QUOTIENT, "1")
     got = _event_column("E1: at (time > 1): A = A + kd\n", [0.0, 0.5, 1.5, 2.5])
     a1 = 10.0 * np.exp(-1.0)
     want = [0.0, _dA_dk(1.0)[1]] + [
@@ -219,12 +230,13 @@ def test_an_event_assignment_that_reads_the_derived_parameter():
     np.testing.assert_allclose(got, want, rtol=2e-5, atol=1e-7)
 
 
-def test_an_event_trigger_that_reads_the_derived_parameter():
+def test_an_event_trigger_that_reads_the_derived_parameter(monkeypatch):
     """``at (A < 2*kd): A = A + 1``. A reaches 2·kd at t* = ln(5/kd)/kd and
     is 2·kd + 1 after it, so with dt*/dkd = −(1 + ln(5/kd))/kd²,
     dA/dkd = e^(−kd·(t − t*))·(2 + (2·kd + 1)·(kd·dt*/dkd − (t − t*))). The
     run ends before the trigger fires a second time. The column came back 0
     up to the event and −0.677 for −4.74 after it."""
+    monkeypatch.setenv(QUOTIENT, "1")
     t_star = float(np.log(5.0))
     dt_star = -(1.0 + np.log(5.0))
     t_end = 2.0

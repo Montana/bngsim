@@ -117,10 +117,13 @@ class TestGH78SaddleRejected:
     def test_the_polish_still_happens_after_a_rejection(self):
         """Rejecting the saddle must not cost the tighter root the polish buys:
         a later rung lands on the attractor and that one is accepted."""
+        # The residual test, by name (issue #1001): the one the polish is tighter by.
         sim, _model = _toggle()
-        r = sim.steady_state(method="newton")
+        r = sim.steady_state(method="newton", criterion="residual")
         assert r.method_used == "newton"
-        integ_residual = _toggle()[0].steady_state(method="integration").residual
+        integ_residual = (
+            _toggle()[0].steady_state(method="integration", criterion="residual").residual
+        )
         assert r.residual < integ_residual
 
     def test_finite_difference_jacobian_rejects_it_too(self):
@@ -151,14 +154,16 @@ class TestGH78SaddleRejected:
 
 
 class TestGH78Reporting:
-    def test_an_initial_condition_at_the_saddle_is_reported_not_hidden(self):
+    @pytest.mark.parametrize("criterion", ["scaled", "residual"])
+    def test_an_initial_condition_at_the_saddle_is_reported_not_hidden(self, criterion):
         """Handed the saddle as the IC, there is nowhere else to fall back to —
         integration would return the same state. Report the verdict instead of
-        acting on it."""
+        acting on it. Under either criterion a run from the saddle does not
+        leave it (issue #1001). Control: main returns it converged under both."""
         sim, model = _toggle()
         model.set_concentration("R1()", float(_SADDLE[0]))
         model.set_concentration("R2()", float(_SADDLE[1]))
-        r = sim.steady_state(method="newton")
+        r = sim.steady_state(method="newton", criterion=criterion)
         assert r.converged
         assert r.method_used == "newton"
         np.testing.assert_allclose(np.asarray(r.concentrations, dtype=float), _SADDLE, rtol=1e-6)

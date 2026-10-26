@@ -452,6 +452,89 @@ When you add one:
 - Names are permanent: `capabilities()` promises that existing keys are never
   renamed or removed.
 
+## Fixing bugs
+
+These rules apply to every bug-fix PR, whether a person or an agent writes it
+(issue #960). They exist because, for a stretch, most new issues came from
+reviews of our own fixes, and each fix opened more issues than it closed.
+
+### Fix review findings in the PR; do not file them
+
+A finding from a review of your PR is fixed in that PR, even outside the issue's
+original scope, when it is in code the PR touches or behaviour it changes, or is
+the same kind of bug in a neighbouring path. Filing it instead turns one unit of
+work into several, each with its own branch, review, CI run and merge, and loses
+the context the reviewer had.
+
+- Rerun the review until it comes back clean.
+- Turn each reviewer probe into a test.
+- List what was found and fixed under a "Review" heading in the PR body.
+- Reviewers report findings to the author, not as new issues.
+
+File a new issue only for a finding that is a design question needing the
+maintainer's decision, large enough to be its own project (days, not hours), or
+unrelated to the PR (a different subsystem, found by accident). Add it to an
+existing tracking issue when one fits. A pre-existing bug that is merely nearby
+is not a reason to file. Fix it if it is small. Otherwise list it under a "Left
+alone" heading in the PR body, with its repro; the family's owner picks it up
+from there.
+
+### Forward sensitivities: compute inside the envelope, refuse outside it
+
+Switches, events, windows, kinks, clocks and their interplay form an unbounded
+space of corner cases, and an adversarial reviewer will always find one more. So
+forward sensitivity through a discontinuity is computed only inside an envelope
+where it is known to be right, and refused loudly outside it. This is the rule
+of [When a value cannot be computed](#when-a-value-cannot-be-computed) applied
+to derivatives: a refusal is an acceptable outcome, a silently wrong derivative
+is not.
+
+The exact envelope is for the sensitivity family's owner to write, and it is
+drawn deliberately narrowly. As a starting point, inside means:
+
+- **Isolated transversal crossings.** A switch or event crossing that is
+  isolated in time, from other crossings and from events, and transversal: the
+  trajectory crosses at nonzero speed. Anything within solver tolerance of
+  another crossing or event is not isolated.
+- **Single fires.** One event fire per instant, or a same-instant batch whose
+  fires read nothing an earlier fire wrote.
+- **Plain thresholds.** A threshold linear in the parameters, a clock that is
+  time itself, and a window whose edges are each such a crossing.
+
+Outside means:
+
+- coincident or near-coincident crossings;
+- sliding modes and chattering;
+- a crossing whose threshold moves at a power or another nonlinear rate, where
+  that changes the sensitivity;
+- same-instant compositions that read earlier writes;
+- delays.
+
+Each refusal names its reason and the issue that tracks it, and is raised at
+analysis time where the shape is static and at run time otherwise.
+
+This changes how sensitivity issues and reviews are judged:
+
+- An issue whose case falls outside the envelope is closed by the PR that
+  refuses it, not by a bespoke fix. One whose case falls inside is fixed.
+- Do not chase edge cases outside the envelope. A new one found in review gets
+  the refusal, not a fix.
+- In review, a wrong derivative inside the envelope is a bug in that PR. So is a
+  wrong derivative outside it that is not refused: the refusal is missing. A
+  correct refusal is not a finding.
+- A refusal of a case inside the envelope is not wrong and is not a finding
+  against the PR, but it is a refusal to lift once the silently wrong results
+  are cleared. #961 tracks every refusal where a derivative exists, these among
+  them, each with what is refused, why the code cannot tell it from the unsafe
+  case, and, where known, what lifting it would take. Add a new one there.
+
+### Triage before fixing
+
+Before starting on a family of issues, close the duplicates, each pointing at
+the issue it duplicates, and the ones already fixed, each pointing at what fixed
+it. Keep silently wrong results apart from performance, test-infrastructure and
+enhancement items, which do not block the correctness backlog.
+
 ## Credit
 
 Everyone whose code is merged is listed in [`CONTRIBUTORS.md`](CONTRIBUTORS.md),
