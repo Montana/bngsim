@@ -377,3 +377,48 @@ def test_a_model_with_no_jump_has_nothing_mended(
         t_span=(0.0, 100.0), n_points=101, rtol=RTOL, atol=ATOL
     )
     assert "across a jump" not in capfd.readouterr().err
+
+
+def test_a_parked_sum_keeps_the_slope_that_holds_it(data_dir: Path, tmp_path: Path) -> None:
+    """Control. The #176 fixture with its voltage carried as V + V2, two species
+    that trade at kx·time() and kx while their sum parks 1e-11 under the step at
+    50 (#903's `split`). Each of them moves, at about 0.3, so only their
+    direction, toward the step, tells them from species leaving it. The
+    straddled slope is what carries this run on the difference quotient;
+    mended, it fails as the closed form does. Main carries it too."""
+    step = "if(((-70+Voltage_Level)<-20),0.5,0.05)"
+    text = (data_dir / "ltype_calcium_discontinuous_jacobian.net").read_text()
+    swaps = [
+        (
+            "   19 _rateLaw2       0.01  # Constant\n",
+            "   19 _rateLaw2       0.01  # Constant\n   20 kx 0.01\n",
+        ),
+        (f"    4 v_rec() {step}\n", f"    4 v_rec() {step}\n    5 xf() kx*time()\n"),
+        (
+            "   10 LTCC(b,g~C,loc~mem,p~P,s~I) 0\n",
+            "   10 LTCC(b,g~C,loc~mem,p~P,s~I) 0\n   11 Voltage2() 0\n",
+        ),
+        (
+            "   25 10 8 _rateLaw2 #_R8\n",
+            "   25 10 8 _rateLaw2 #_R8\n   26 3 11 xf\n   27 11 3 kx\n   28 11 0 k_v_leak\n",
+        ),
+        ("    8 Voltage_Level        3\n", "    8 Voltage_Level        3,11\n"),
+    ]
+    for old, new in swaps:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    exact_text = text.replace(step, "0.5").replace(
+        "if((Phospho_LTCC>0),k_pka_shift,0)", "k_pka_shift"
+    )
+    (tmp_path / "split.net").write_text(text)
+    (tmp_path / "split_exact.net").write_text(exact_text)
+    window = dict(t_span=(0.0, 150.0), n_points=301, rtol=1e-8, atol=1e-8)
+    got = bngsim.Simulator(
+        bngsim.Model.from_net(str(tmp_path / "split.net")), method="ode", jacobian="fd"
+    ).run(**window)
+    want = bngsim.Simulator(
+        bngsim.Model.from_net(str(tmp_path / "split_exact.net")), method="ode"
+    ).run(**{**window, "rtol": 1e-12, "atol": 1e-12})
+    g, w = np.asarray(got.observables), np.asarray(want.observables)
+    scale = np.maximum(np.abs(w).max(axis=0), 1e-12)
+    assert float((np.abs(g - w) / scale).max()) < 1e-6
