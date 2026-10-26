@@ -8517,52 +8517,67 @@ def _build_model_from_sbml_doc_in_context(doc):
             got = _rateof_rates[nm]
             return None if got is _on_path else got
 
-        # What an event assigns, and the concentrations it rescales by
-        # assigning their compartment; and each rule's math, to follow a name
-        # through the rules (and laws) it reads.
-        _assigned_at_events = {
+        # What an event assigns (the size's jumps below start from it too)
+        _event_vars = {
             sbml_model.getEvent(k).getEventAssignment(j).getVariable()
             for k in range(sbml_model.getNumEvents())
             for j in range(sbml_model.getEvent(k).getNumEventAssignments())
         }
-        _assigned_at_events |= {s for s, c in species_comp.items() if c in _assigned_at_events}
-        _math_of = {
-            sbml_model.getRule(j).getVariable(): sbml_model.getRule(j).getMath()
-            for j in range(sbml_model.getNumRules())
-            if not sbml_model.getRule(j).isAlgebraic()
-            and sbml_model.getRule(j).getMath() is not None
+        _event_names = {_alias(_safe_name(n)) for n in _event_vars}
+        # a concentration -> its compartment's size, which it moves with
+        _size_of = {
+            a: _alias(_safe_name(species_comp[s]))
+            for a, s in _species_alias.items()
+            if s in species_comp and not species_hosu.get(s, False)
         }
+        # What picks a piece or steps: sympy differentiates each to 0 or to
+        # nothing printable, and its jump is a delta no rate carries.
+        _step_nodes = (
+            _sp.Piecewise,
+            _sp.core.relational.Relational,
+            _sp.logic.boolalg.BooleanFunction,
+        )
+        _step_calls = {"floor", "ceiling", "sign", "frac", "round", "trunc", "sgn", "Heaviside"}
 
-        def _jumps_at_an_event(maths) -> bool:
-            # Whether an event assigns a name these read, through the rules
-            # and laws they read. Then rateOf jumps at that event, and the size
-            # with it; the size's jumps found below do not look through a
-            # rate, so its concentrations would not be rescaled there (issue
-            # #1281: S3 reset by an event lost a fifth of X's amount).
-            seen: set[str] = set()
-            stack = [n for m in maths for n in _ast_name_set(m)]
+        def _jumps(g) -> bool:
+            # Whether g can jump at an instant: it reads, through the rules
+            # and laws it reads and the sizes of the concentrations it reads,
+            # a piece, a step, or a name an event assigns. Then rateOf jumps
+            # there, and the size with it; the size's jumps found below do not
+            # look through a rate, so its concentrations would not be rescaled
+            # there (issue #1281: S3 reset by an event lost a fifth of X's
+            # amount, and P' = piecewise(-0.1, t < 2, 0.3) a fifth of [X]). A
+            # rate-rule variable is not followed: it does not jump.
+            names: set[str] = set()
+            stack = [g]
             while stack:
-                n = stack.pop()
-                if n not in seen:
-                    seen.add(n)
-                    m = _math_of.get(n, _law_math.get(n))
-                    if m is not None:
-                        stack.extend(_ast_name_set(m))
-            return bool(seen & _assigned_at_events)
+                for x in _subexpressions(stack.pop()):
+                    if isinstance(x, _step_nodes) or type(x).__name__ in _step_calls:
+                        return True
+                    todo = [str(x)] if x.is_Symbol else []
+                    while todo:
+                        n = todo.pop()
+                        if n in names:
+                            continue
+                        names.add(n)
+                        if n in _ar_alias and _ar_sym(_ar_alias[n]) is not None:
+                            stack.append(_ar_sym(_ar_alias[n]))
+                        if n in _size_of:
+                            todo.append(_size_of[n])
+            return bool(names & _event_names)
 
         def _rate_written_out(target: str):
             # rateOf(target) as a sympy expression whose rate the chain rule
             # takes, or None where it cannot be written (issue #1281). Of a
             # rate-rule variable, its right-hand side. Of a species, its
-            # reactions' laws, each times its net stoichiometry, over its
-            # compartment's size for a concentration: but only where that size
-            # holds, no conversion factor scales the change, and every
-            # stoichiometry is a plain number, as the engine's own rate is then.
-            # Not where an event moves what it reads (_jumps_at_an_event).
+            # reactions' laws, each times its net stoichiometry as the engine
+            # reads it, over its compartment's size for a concentration: but
+            # only where that size holds, no conversion factor scales the
+            # change, and no stoichiometry moves, as the engine's own rate is
+            # then. Not where it can jump (_jumps).
             if target in _rr_ids:
-                if _jumps_at_an_event([_math_of[target]]):
-                    return None
-                return _rr_deriv(_safe_name(target))
+                g = _rr_deriv(_safe_name(target))
+                return None if g is None or _jumps(g) else g
             comp = species_comp.get(target)
             if (
                 target in rate_rule_targets
@@ -8574,9 +8589,7 @@ def _build_model_from_sbml_doc_in_context(doc):
                 or sbml_model.getSpecies(target).isSetConversionFactor()
             ):
                 return None
-            import math as _math
-
-            terms, laws = [], []
+            terms = []
             for j in range(sbml_model.getNumReactions()):
                 rx = sbml_model.getReaction(j)
                 net = 0.0
@@ -8585,12 +8598,15 @@ def _build_model_from_sbml_doc_in_context(doc):
                         sr = lst.get(k)
                         if sr.getSpecies() != target:
                             continue
-                        stoich = sr.getStoichiometry()
-                        if (
-                            sr.isSetStoichiometryMath()
-                            or (sr.isSetConstant() and not sr.getConstant())
-                            or not _math.isfinite(stoich)
+                        # The engine's stoichiometry (§6c): one set by an
+                        # initialAssignment was read off the attribute, and
+                        # rateOf(S3) written at half its rate (`nu = 2`).
+                        if _variable_stoich_expr(sr) is not None or (
+                            sr.isSetConstant() and not sr.getConstant()
                         ):
+                            return None
+                        stoich = _resolve_stoich(sr)
+                        if stoich is None:
                             return None
                         net += sign * stoich
                 if net == 0.0:
@@ -8598,14 +8614,12 @@ def _build_model_from_sbml_doc_in_context(doc):
                 lm = _law_math_in_model_scope(rx)
                 if lm is None:
                     return None
-                laws.append(lm)
                 terms.append(f"({net!r})*({_ast_to_exprtk_with_funcdefs(lm, func_defs)})")
-            if comp in _assigned_at_events or _jumps_at_an_event(laws):
-                return None
             text = "+".join(terms) or "0"
             if not species_hosu.get(target, False):
                 text = f"({text})/{_safe_name(comp)}"
-            return _exprtk_to_sympy(text)
+            g = _exprtk_to_sympy(text)
+            return None if g is None or _jumps(g) else g
 
         def _holds(safe_var: str) -> bool:
             # An assignment rule over values that hold (#621's cycle of
@@ -8935,11 +8949,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         # only at an event, though it is not constant: `cv := piecewise(1, Kw >
         # 7, 2)` beside `at (t > 1): Kw = 2` was refused, where the event's
         # resize alone is right.
-        _event_moved = {
-            sbml_model.getEvent(k).getEventAssignment(j).getVariable()
-            for k in range(sbml_model.getNumEvents())
-            for j in range(sbml_model.getEvent(k).getNumEventAssignments())
-        }
+        _event_moved = set(_event_vars)
         _rescaled_in: dict[str, set[str]] = {}
         for _sid, _scomp in species_comp.items():
             if not species_hosu.get(_sid, False) and _sid not in assignment_targets:

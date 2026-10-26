@@ -17,7 +17,9 @@ size moves, and ``[X]`` is that over ``cv(t)``, written below in closed form for
 each model. Undiluted, ``[X]`` decays as ``exp(-t/4)`` whatever ``cv`` does.
 
 What still cannot be derived is still refused: a cycle of rules that move, a
-cycle of rates, and ``rateOf`` of a species whose own compartment moves.
+cycle of rates, ``rateOf`` of a species whose own compartment moves, and a rate
+that an event or a piece jumps, as the size's jumps are not looked for through
+a rate.
 """
 
 from __future__ import annotations
@@ -46,6 +48,11 @@ CASES = {
     ),
     # rateOf(S3) stays in [-0.1, 0], so the max is 1
     "species-max": ("cv := 2 + max(rateOf(S3), 1); D: S3 -> ; 0.1*S3;", lambda t: 3 + 0 * t),
+    # an amount: rateOf(S4) = -0.1·S4 = -0.2 exp(-t/10), not over c's size 2
+    "amount-decaying": (
+        "substanceOnly species S4 in c = 2; cv := 2 + rateOf(S4); D4: S4 -> ; 0.1*S4;",
+        lambda t: 2 - 0.2 * np.exp(-t / 10),
+    ),
     "rate-rule-constant": ("cv := 2 + rateOf(P); P = 1; P' = 0.1;", lambda t: 2.1 + 0 * t),
     # P = exp(-t/10), so rateOf(P) = -0.1 exp(-t/10)
     "rate-rule-moving": (
@@ -200,9 +207,14 @@ def _conversion_factor(model):
 
 
 def _variable_stoichiometry(model):
+    import libsbml
+
     sr = model.getReaction("D").getReactant(0)
     sr.setId("nu")
     sr.setConstant(False)
+    rule = model.createRateRule()  # nu' = 0.1, so nu moves with the run
+    rule.setVariable("nu")
+    rule.setMath(libsbml.parseL3Formula("0.1"))
 
 
 @pytest.mark.parametrize(
@@ -211,9 +223,9 @@ def _variable_stoichiometry(model):
     ids=["conversion-factor", "stoichiometry"],
 )
 def test_a_species_rate_the_writing_does_not_cover_is_still_refused(edit):
-    """A conversion factor scales S3's change, and a stoichiometry that is not
-    constant moves with the run: the sum of the laws is then not rateOf(S3),
-    so its rate is left unknown, and the size is refused as before."""
+    """A conversion factor scales S3's change, and a stoichiometry that a rule
+    moves moves with the run: the sum of the laws is then not rateOf(S3), so
+    its rate is left unknown, and the size is refused as before."""
     sbml = _edited("cv := 2 + rateOf(S3); D: S3 -> ; 0.1*S3;", edit)
     with pytest.raises(bngsim.ModelError, match=r"(?s)cannot follow to its rate.*rateOf\(S3\)"):
         bngsim.Model.from_sbml_string(sbml)
@@ -231,6 +243,10 @@ _EVENT_MOVES_THE_RATE = {
     "its-compartment": "cv := 2 + rateOf(S3); D: S3 -> ; 0.1*S3; at time >= 2: c = 4;",
     # a law that reads neither S3 nor c: rateOf(S3) = 0.1/c jumps with c alone
     "its-compartment-alone": "cv := 2 + rateOf(S3); P0: -> S3; 0.1; at time >= 2: c = 4;",
+    # a law that reads [S5], whose size c5 := q the event doubles: the event's
+    # resize halves [S5], and rateOf(S3) with it
+    "a-concentrations-size": "compartment c5; c5 := q; q = 1; species S5 in c5 = 1;"
+    " cv := 2 + rateOf(S3); P0: -> S3; 0.2*S5; at time >= 2: q = 2;",
 }
 
 
@@ -240,10 +256,72 @@ def test_a_rate_an_event_moves_is_still_refused(case):
         bngsim.Model.from_sbml_string(_sbml(_EVENT_MOVES_THE_RATE[case]))
 
 
-def test_an_event_that_moves_nothing_the_rate_reads():
-    """An event elsewhere, on a q no law reads, leaves the rate alone: the
-    model loads, and X's amount is A(0) exp(-t/4) across the event."""
-    sbml = _sbml("cv := 2 + rateOf(S3); D: S3 -> ; 0.1*S3; q = 1; at time >= 2: q = 3;")
+# A rate that picks a piece, or reads a concentration whose size does, jumps
+# at the flip with no event at all, and sympy differentiates the piece to 0.
+# Loaded, P' = piecewise(-0.1, t < 2, 0.3) carried [X] across t = 2 as if cv
+# held: 2.366 where its amount gives 1.955, with no word.
+_A_PIECE_JUMPS_THE_RATE = {
+    "rate-rule": "cv := 2 + rateOf(P); P = 1; P' = piecewise(-0.1, time < 2, 0.3);",
+    "law": "cv := 2 + rateOf(S3); P0: -> S3; piecewise(0.1, time < 2, 0.5);",
+    "through-a-rule": "cv := 2 + rateOf(S3); P0: -> S3; k; k := piecewise(0.1, time < 2, 0.5);",
+    "a-concentrations-size": "compartment c5; c5 := piecewise(1, time < 2, 2);"
+    " species S5 in c5 = 1; cv := 2 + rateOf(S3); P0: -> S3; 0.2*S5;",
+}
+
+
+@pytest.mark.parametrize("case", list(_A_PIECE_JUMPS_THE_RATE))
+def test_a_rate_a_piece_jumps_is_still_refused(case):
+    with pytest.raises(bngsim.ModelError, match=r"(?s)cannot follow to its rate.*rateOf"):
+        bngsim.Model.from_sbml_string(_sbml(_A_PIECE_JUMPS_THE_RATE[case]))
+
+
+# name -> (a model with an event the rate does not jump at, cv(t))
+_EVENT_LEAVES_THE_RATE = {
+    # on a q no law reads
+    "elsewhere": (
+        "cv := 2 + rateOf(S3); D: S3 -> ; 0.1*S3; q = 1; at time >= 2: q = 3;",
+        lambda t: 2 - 0.1 * np.exp(-t / 20),
+    ),
+    # on what Q's rate reads: Q is continuous there, and rateOf(P) = -0.1·Q too
+    "a-rate-rules-rate": (
+        "cv := 2 + rateOf(P); P = 1; Q = 1; P' = -0.1*Q; Q' = -0.1*e; e = 1; at time >= 2: e = 2;",
+        lambda t: 2 - 0.1 * np.where(t < 2, 1 - 0.1 * t, 0.8 - 0.2 * (t - 2)),
+    ),
+    # on the size of an amount the law reads, which a resize keeps:
+    # rateOf(S3) = 0.2·S5/2 = 0.1 exp(-t/10) across it
+    "an-amounts-size": (
+        "compartment c5 = 1; substanceOnly species S5 in c5 = 1; D5: S5 -> ; 0.1*S5;"
+        " cv := 2 + rateOf(S3); P0: -> S3; 0.2*S5; at time >= 2: c5 = 2;",
+        lambda t: 2 + 0.1 * np.exp(-t / 10),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_EVENT_LEAVES_THE_RATE))
+def test_an_event_that_moves_nothing_the_rate_reads(case):
+    """The event leaves the rate alone: the model loads, and X's amount is A(0)
+    exp(-t/4) across the event."""
+    rest, cv = _EVENT_LEAVES_THE_RATE[case]
+    np.testing.assert_allclose(_x(_sbml(rest)), _diluted(cv), rtol=1e-7, atol=1e-10)
+
+
+def test_a_stoichiometry_an_initial_assignment_sets():
+    """D's stoichiometry is 1 on the attribute and 2 by an initialAssignment,
+    which the engine reads: [S3] = 2 exp(-t/10), so rateOf(S3) = -0.2
+    exp(-t/10). Read off the attribute, its rate was written at half that, and
+    X lost amount with no word."""
+    import libsbml
+
+    def two_by_an_initial_assignment(model):
+        sr = model.getReaction("D").getReactant(0)
+        sr.setId("nu")
+        sr.setConstant(True)
+        sr.setStoichiometry(1.0)
+        ia = model.createInitialAssignment()
+        ia.setSymbol("nu")
+        ia.setMath(libsbml.parseL3Formula("2"))
+
+    sbml = _edited("cv := 2 + rateOf(S3); D: S3 -> ; 0.1*S3;", two_by_an_initial_assignment)
     np.testing.assert_allclose(
-        _x(sbml), _diluted(lambda t: 2 - 0.1 * np.exp(-t / 20)), rtol=1e-7, atol=1e-10
+        _x(sbml), _diluted(lambda t: 2 - 0.2 * np.exp(-t / 10)), rtol=1e-7, atol=1e-10
     )
