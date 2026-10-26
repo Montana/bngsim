@@ -128,6 +128,7 @@ Source→license map:
 | `sbml-test-suite`| sbmlteam SBML Test Suite        | `LGPL-2.1-or-later` | yes             |
 | `d2d`            | Data2Dynamics fit workspaces    | see upstream    | attribution by URL |
 | `petab`          | PEtab benchmark collection      | `BSD-3-Clause`  | yes             |
+| `reference-archive` | bngsim's nightly reference archive (issue #805): reference engines' outputs on the corpora above | those of its models, per entry | as its models' (`NOTICE`) |
 
 ### `repairs[]` — the patch ledger
 

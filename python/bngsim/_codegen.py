@@ -2893,7 +2893,11 @@ def _prepare_derived_expr(
     import sympy as sp
     from sympy.parsing.sympy_parser import parse_expr
 
-    from bngsim._jacobian import builtin_shadow_bindings, engine_sympy_bindings
+    from bngsim._jacobian import (
+        builtin_shadow_bindings,
+        engine_sympy_bindings,
+        exprtk_closed_form_bindings,
+    )
 
     # Pass 1: ExprTk → sympy surface syntax (if→Piecewise, ^→**, logicals →
     # And/Or call form). Applied to the raw string so whole-word matching of
@@ -2939,6 +2943,9 @@ def _prepare_derived_expr(
     local_dict: dict = builtin_constant_bindings(sp)
     # Before sym_map, so a parameter named `round` stays a parameter (#684).
     local_dict.update(builtin_shadow_bindings(sp))
+    # ExprTk's calls sympy has under another name or not at all, written out
+    # so sympy can differentiate them (issue #1214). Before sym_map too.
+    local_dict.update(exprtk_closed_form_bindings(sp))
     local_dict.update(sym_map)
     local_dict.update(Piecewise=sp.Piecewise, And=sp.And, Or=sp.Or, Not=sp.Not, Eq=sp.Eq, Ne=sp.Ne)
     # The engine's own functions, which sympy has no counterpart for (issue
@@ -6327,8 +6334,10 @@ def _psvs_row_divisor(species: list[dict], si: int) -> tuple[int, float, int]:
 
     One lookup for every emitter that scatters such a row: the RHS
     (:func:`generate_rhs_from_model`, which *defines* the divide), the Jacobian /
-    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`) and the
-    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`). Deriving it twice is
+    ``J·v`` reconstruction (:func:`_functional_jacobian_groups`), the
+    sensitivity ``∂f/∂p`` (:func:`generate_sens_from_model`), and the dX/dt that
+    :func:`bngsim._jacobian.rateof_rate_laws` writes out for a ``rateOf`` to be
+    differentiated through (issue #1266). Deriving it twice is
     how a row the RHS divides ends up with a derivative that does not — the defect
     family GH #119 is about, one scale factor wide and invisible at V = 1. Mirrors
     ``compute_derivs_core``'s ``species_divisor`` and
@@ -6682,6 +6691,7 @@ def generate_rhs_from_model(model) -> str:
             _obs_map,
             _func_map,
             _rateof_map,
+            with_deferred=False,
         )
         if functions
         else [],
@@ -7068,6 +7078,7 @@ def _emit_function_lines(
     obs_map: dict,
     func_map: dict,
     rateof_map: dict | None = None,
+    with_deferred: bool = True,
 ) -> list[str]:
     """C lines computing ``double func[N]; func[i] = …`` in dependency order.
 
@@ -7082,6 +7093,10 @@ def _emit_function_lines(
     so a function that references another declared after it does not read an
     uninitialised ``func[]`` slot; the ``func[i]`` slot index stays the
     declaration index, so ``func_map`` references are unaffected.
+
+    ``with_deferred=False`` leaves out the functions only event assignments
+    read (issue #1186), which no rate law and no other function reads: the RHS
+    emitter passes it.
     """
     # Built once and shared across every function body — rebuilding it per body
     # is the model-based GH #161 quadratic (see _build_ident_lookup_model).
@@ -7090,6 +7105,8 @@ def _emit_function_lines(
     lines = [f"    double func[{len(functions)}];"]
     for i in _topological_function_order(functions, tfun_call_by_name):
         f = functions[i]
+        if f.get("deferred") and not with_deferred:
+            continue
         tfun_call = tfun_call_by_name.get(f["name"])
         if tfun_call is not None:
             tf_id, idx_c = tfun_call
@@ -8387,7 +8404,8 @@ def _warn_functional_sens_rhs_refused(reason: str) -> None:
         "abs are left here only in a model whose rate laws hold a condition, or where "
         "one sits in anything but a sum, a product, a whole power, an exp() or another "
         "bend, or in a product with a division or a fractional power of the state or "
-        "the clock. A time course is refused for the jumps that are found in the rate "
+        "the clock; clamp likewise, and also where its bounds are not numbers with lo "
+        "<= hi, issue #1227. A time course is refused for the jumps that are found in the rate "
         "laws' text, issue #938; one written some other way is read across and is not "
         "seen).",
         reason,
@@ -8823,8 +8841,8 @@ class _FunctionalDfdpScope(NamedTuple):
 
 
 def _bend_under_a_break(expr, moving: set[str]) -> str | None:
-    """The first ``abs``, ``min`` or ``max`` in *expr* that what it is written
-    in can break, as text, or ``None`` (issue #1126).
+    """The first ``abs``, ``min``, ``max`` or ``clamp`` in *expr* that what it is
+    written in can break, as text, or ``None`` (issues #1126, #1227).
 
     A bend is continuous, and so is a sum, a product, a whole positive power,
     an ``exp`` or another bend of it. A division or a fractional power may not
@@ -8837,6 +8855,8 @@ def _bend_under_a_break(expr, moving: set[str]) -> str | None:
     """
     import sympy as sp
 
+    from bngsim._jacobian import _kink_bindings
+
     def breaks(node) -> bool:
         if not isinstance(node, sp.Pow):
             return False
@@ -8844,8 +8864,10 @@ def _bend_under_a_break(expr, moving: set[str]) -> str | None:
         whole = bool(e.is_Integer and e >= 1)
         return not whole and bool({str(x) for x in node.base.free_symbols} & moving)
 
+    clampval = _kink_bindings(sp)["clampval"]
+
     def walk(node, safe: bool) -> str | None:
-        if isinstance(node, (sp.Abs, sp.Min, sp.Max)):
+        if isinstance(node, (sp.Abs, sp.Min, sp.Max, clampval)):
             if not safe:
                 return str(node)
             return next((w for a in node.args if (w := walk(a, True))), None)
@@ -8862,6 +8884,28 @@ def _bend_under_a_break(expr, moving: set[str]) -> str | None:
         return next((w for a in node.args if (w := walk(a, inner))), None)
 
     return walk(expr, True)
+
+
+def _clamp_not_known_ordered(expr) -> str | None:
+    """The first ``clamp`` in *expr* whose bounds are not numbers with ``lo <=
+    hi``, as text, or ``None`` (issue #1227).
+
+    ExprTk's ``clamp(lo, x, hi)`` reads ``x < lo`` first, so where ``lo > hi``
+    it is ``lo`` below ``x = lo`` and ``hi`` from there on: a step, not a bend.
+    A bend's root carries no jump, so only a clamp whose bounds are known to be
+    ordered is differentiated as one; any other declines, as before.
+    """
+    import sympy as sp
+
+    from bngsim._jacobian import _kink_bindings
+
+    clampval = _kink_bindings(sp)["clampval"]
+    for node in sp.preorder_traversal(expr):
+        if isinstance(node, clampval):
+            lo, _x, hi = node.args
+            if not (lo.is_number and hi.is_number and bool(lo <= hi)):
+                return f"clamp({lo}, {_x}, {hi})"
+    return None
 
 
 def _functional_rate_law_partials(
@@ -8958,11 +9002,14 @@ def _functional_rate_law_partials(
         # Admitted only alongside the gate above, so a model whose conditions
         # were NOT cleared still reports them as unsupported.
         known = known | _condition_call_heads()
+    if scope.bends_analytic:
+        # Issue #1227: clamp is a bend, differentiated through its kink twin.
+        known = known | {"clamp"}
     stray = sorted({m.group(1) for m in _IDENT_CALL_RE.finditer(probe)} - known)
     if stray:
         return None, "calls unsupported function(s): " + ", ".join(stray)
 
-    sym_expr = _exprtk_to_sympy(inlined)
+    sym_expr = _exprtk_to_sympy(inlined, bends=scope.bends_analytic)
     if sym_expr is None:
         return None, "could not be parsed for differentiation"
 
@@ -8983,6 +9030,13 @@ def _functional_rate_law_partials(
         broken = _bend_under_a_break(sym_expr, moving)
         if broken is not None:
             return None, f"uses unsupported construct: {broken} under a call, division or power"
+        crossed = _clamp_not_known_ordered(sym_expr)
+        if crossed is not None:
+            return None, (
+                f"uses unsupported construct: {crossed}, whose bounds are not numbers known "
+                "to satisfy lo <= hi; crossed bounds make clamp a step, whose jump a bend "
+                "does not carry"
+            )
 
     targets = free & (set(scope.param_of_alias) | set(scope.obs_volume_weights))
     # Issue #1126: an abs over a differentiation variable differentiates to

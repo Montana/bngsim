@@ -55,6 +55,7 @@ from bngsim._codegen import (
     _alias_keyword_param,
     _coerce_booleans_used_as_numbers,
     _normalize_exprtk_operators,
+    _psvs_row_divisor,
     _rewrite_logicals,
     _translate_bngl_if_to_piecewise,
     builtin_constant_bindings,
@@ -262,6 +263,131 @@ def builtin_shadow_bindings(sp) -> dict:
         }
         bindings = {"round": type("round", (sp.Function,), attrs)}
         _builtin_shadow_cache["bindings"] = bindings
+    return bindings
+
+
+# ─── ExprTk's other calls, as sympy (issue #1214) ───────────────────────────
+_closed_form_cache: dict = {}
+
+
+def _exact_log1p(sp):
+    """sympy's ``codegen.cfunctions.log1p``, valued as C's ``log1p`` is at every
+    argument (see :func:`exprtk_closed_form_bindings`). Named ``log1p`` so the C
+    and numpy printers find it by name as they do sympy's."""
+    import mpmath
+    from mpmath.libmp import prec_to_dps
+    from sympy.codegen.cfunctions import log1p as _log1p
+
+    def _value(arg, prec):
+        with mpmath.workprec(prec):
+            got = mpmath.log1p(arg._to_mpmath(prec))
+        if isinstance(got, mpmath.mpc):  # x < -1, off the real line as log's is
+            return sp.Float._new(got.real._mpf_, prec) + sp.I * sp.Float._new(got.imag._mpf_, prec)
+        return sp.Float._new(got._mpf_, prec)
+
+    def _eval(cls, arg):
+        # sympy's folds a number to log(1 + x), which a Float or a tiny
+        # Rational then loses to rounding: a Float is valued here, a
+        # Rational left as the call for _eval_evalf.
+        if arg.is_zero:
+            return sp.S.Zero
+        if arg.is_Float:
+            return _value(arg, arg._prec)
+        if arg.is_Rational:
+            return None
+        return _log1p.eval(arg)
+
+    def _eval_evalf(self, prec):
+        # prec is in bits and evalf takes digits.
+        arg = self.args[0].evalf(prec_to_dps(prec))
+        if not arg.is_Number:
+            return None
+        return _value(arg, prec)
+
+    return type("log1p", (_log1p,), {"eval": classmethod(_eval), "_eval_evalf": _eval_evalf})
+
+
+def _unfolded_erfc(sp):
+    """sympy's ``erfc``, without its rewrite of ``erfc(-x)`` as ``2 - erfc(x)``.
+
+    The rewrite goes by the sign written in front of ``x``, not by its value, and
+    where ``x`` is negative it cancels: ``erfc(-x)`` is small there, and C's
+    ``erfc``, which ExprTk calls, has it to full precision. ExprTk's ``ncdf(x)`` is
+    ``0.5*erfc(-x/√2)``, so ``-log(ncdf(p))/40`` printed its partial over
+    ``1 - erfc(p/√2)/2``, which read ncdf(-8) 7% high and ncdf(-9) as 0: a
+    sensitivity 6.6% off at p = -8 on the analytic right-hand side, with no
+    decline, and a non-finite one at p = -8.5. A model's own ``erfc(-p)`` lost
+    the same way past p = -5. A number is still folded, since its sign is its
+    value's and nothing cancels. Named ``erfc`` so the C printer and evalf find
+    C's and mpmath's by name."""
+
+    def _eval(cls, arg):
+        if not arg.is_Number and arg.could_extract_minus_sign():
+            return None
+        return super(cls, cls).eval(arg)
+
+    return type("erfc", (sp.erfc,), {"eval": classmethod(_eval)})
+
+
+def exprtk_closed_form_bindings(sp) -> dict:
+    """``{name: callable}`` for the ExprTk calls sympy has under another name or
+    not at all, each written out as ExprTk defines it (third_party/exprtk), for a
+    ``parse_expr`` ``local_dict``. Bind it before the model's symbols, so a
+    parameter of the same name wins.
+
+    Left to ``parse_expr``, each became an undefined sympy function, whose
+    derivative sympy leaves unevaluated: ``k = log10(p)`` declined the analytic
+    sensitivity right-hand side for the whole model as if it stepped like
+    ``floor()``, for a derivative of 1/(p·ln 10) (issue #1214), and ``logn``,
+    ``ncdf``, ``deg2rad`` and ``rad2deg`` were refused outright, as calls the
+    jump detector cannot read. The calls that step (``floor``, ``ceil``,
+    ``round``, ``trunc``, ``frac``, ``sgn``, ``sign``) are not here: they have
+    no derivative to give, and decline as before.
+
+    The five that C has, sympy's ``codegen.cfunctions`` classes carry with their
+    derivatives, and they print and evaluate as C's own: ``log(1 + x)`` for
+    ``log1p`` read 0 at x = 1e-300, where a crossing time reads the value. Each
+    is in the MIR JIT's prelude, which a derivative that keeps the call (d/dp
+    of ``log10(p)^2``) prints into the source. sympy's own ``log1p`` evaluates
+    as ``log(1 + x)`` at the working precision, 0 below x = 1e-16, so its
+    value is read through mpmath's.
+
+    ``erfc`` is here although sympy has it, because sympy rewrites
+    ``erfc(-x)`` as ``2 - erfc(x)``, which cancels in the tail ``ncdf`` and a
+    model's own ``erfc(-p)`` read (see :func:`_unfolded_erfc`).
+
+    Built once, for the reason :func:`engine_sympy_bindings` gives.
+    """
+    bindings = _closed_form_cache.get("bindings")
+    if bindings is None:
+        from sympy.codegen.cfunctions import expm1, hypot, log2, log10
+
+        erfc = _unfolded_erfc(sp)
+
+        def _avg(*args):
+            return sp.Add(*args) / len(args)
+
+        bindings = {
+            "log10": log10,
+            "log2": log2,
+            "logn": lambda x, n: sp.log(x) / sp.log(n),
+            "log1p": _exact_log1p(sp),
+            "expm1": expm1,
+            "hypot": hypot,
+            "erfc": erfc,
+            "ncdf": lambda x: erfc(-x / sp.sqrt(2)) / 2,
+            "deg2rad": lambda x: x * sp.pi / 180,
+            "rad2deg": lambda x: x * 180 / sp.pi,
+            "deg2grad": lambda x: x * sp.Rational(10, 9),
+            "grad2deg": lambda x: x * sp.Rational(9, 10),
+            "avg": _avg,
+            "sum": sp.Add,
+            "mul": sp.Mul,
+            # (x < lo) ? lo : ((x > hi) ? hi : x), which is not Min(Max(x, lo), hi)
+            # where lo > hi
+            "clamp": lambda lo, x, hi: sp.Piecewise((lo, x < lo), (hi, x > hi), (x, True)),
+        }
+        _closed_form_cache["bindings"] = bindings
     return bindings
 
 
@@ -553,6 +679,49 @@ def _piecewise_of_if(sp):
     return piecewise
 
 
+_truth_comparisons_cache: dict = {}
+
+
+def _truth_comparisons(sp) -> dict:
+    """``{"Eq": ..., "Ne": ...}`` for the parse: sympy's own, except between two
+    truth values, which are written with the connectives instead.
+
+    ``a != b`` over two conditions is their xor, and ``a == b`` their xnor.
+    sympy keeps such a pair as an ``Unequality`` / ``Equality`` whose sides are
+    themselves relations, and what reads a relation as the sign of ``lhs -
+    rhs`` takes it for one comparison: a size that jumps on one failed to load
+    (``StrictLessThan - StrictGreaterThan``). The SBML loader writes ``xor``,
+    and ``eq`` / ``neq`` of two conditions, with the connectives itself
+    (``_xor_text``); this is for such a pair from anywhere else, an ExprTk
+    ``(A > 1) != (B > 1)`` or an operand the loader could not tell was a
+    condition. An n-ary nest doubles the text of its first operands at each
+    level.
+
+    A sympy ``Symbol`` is a ``Boolean`` too, so a truth value is told by what
+    it is: a comparison, a connective, or ``true`` / ``false``. Built once, for
+    the reason :func:`engine_sympy_bindings` gives."""
+    bound = _truth_comparisons_cache.get("bound")
+    if bound is None:
+        from sympy.core.relational import Relational
+        from sympy.logic.boolalg import BooleanAtom, BooleanFunction
+
+        truth = (Relational, BooleanAtom, BooleanFunction)
+
+        def eq(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, b), sp.And(sp.Not(a), sp.Not(b)))
+            return sp.Eq(a, b, **options)
+
+        def ne(a, b, **options):
+            if isinstance(a, truth) and isinstance(b, truth):
+                return sp.Or(sp.And(a, sp.Not(b)), sp.And(sp.Not(a), b))
+            return sp.Ne(a, b, **options)
+
+        bound = {"Eq": eq, "Ne": ne}
+        _truth_comparisons_cache["bound"] = bound
+    return bound
+
+
 def _build_local_dict(preprocessed: str, sp):
     """Bind every identifier in ``preprocessed`` to a plain sympy Symbol (so
     names like ``E``, ``S``, ``I``, ``N`` are not mistaken for sympy constants
@@ -587,8 +756,7 @@ def _build_local_dict(preprocessed: str, sp):
         # ``Eq`` / ``Ne`` are the call form ``_rewrite_logicals`` produces for
         # ``==`` / ``!=`` (GH #335). Bound here — like the connectives — so the
         # round trip does not lean on ``parse_expr``'s implicit sympy global dict.
-        "Eq": sp.Eq,
-        "Ne": sp.Ne,
+        **_truth_comparisons(sp),
     }
     alias_of: dict[str, str] = {}
 
@@ -623,8 +791,13 @@ def _build_local_dict(preprocessed: str, sp):
     return local, alias_of
 
 
-def _exprtk_to_sympy(expr: str):
-    """Parse an ExprTk rate-law string into a sympy expression, or ``None``."""
+def _exprtk_to_sympy(expr: str, *, bends: bool = False):
+    """Parse an ExprTk rate-law string into a sympy expression, or ``None``.
+
+    ``bends`` binds ``clamp`` to the ``clampval`` twin of :func:`_kink_bindings`
+    (issue #1227), for a caller that differentiates bends and turns the twins
+    back with :func:`_finish_kinks`. Off, a ``clamp`` call is left unbound, as
+    it always was, for every other reader of this parse."""
     try:
         import sympy as sp
         from sympy.parsing.sympy_parser import parse_expr
@@ -638,6 +811,8 @@ def _exprtk_to_sympy(expr: str):
     s = re.sub(r"\blog2\s*\(", "(1.0/log(2))*log(", s)
 
     local, alias_of = _build_local_dict(s, sp)
+    if bends and re.search(r"\bclamp\s*\(", s):
+        local["clamp"] = _kink_bindings(sp)["clampval"]
 
     # Apply keyword aliases (longest first so e.g. ``lambda`` is replaced before
     # a hypothetical ``lambda2`` substring would be — word-boundary anchored).
@@ -790,10 +965,22 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
     (``report_rateof_amount``) reads the sum times its compartment's size, as
     ``refresh_rateof_derivs_once_`` scales it: the size parameter by name where
     the size is writable, so a write moves it (issue #170), else the number.
+    A cross-compartment reaction (``per_species_volume_scaling``) states its
+    rate in amount per time, and the engine divides it by each species' own
+    divisor: the live volume where the species' compartment is promoted (its
+    ``ode_live_volume_idx0``), its size otherwise (issue #1266). dX/dt divides
+    the same way: by the observable that holds the promoted compartment alone,
+    by the size parameter by name where it is the species' size (a write to it
+    moves the engine's divisor, and so must move this), else by the number.
+    (Where the live volume is not positive the engine divides by the size
+    instead; no run reaches a compartment of no size with an amount in it, and
+    a condition here would be a state switch the sensitivity path refuses.)
+
     Left out, so that a law reading the token declines as before: a species a
-    reaction changes that divides by each species' volume, is
-    Michaelis–Menten, or takes a species factor of a reactant no observable
-    holds alone. ``data`` is the model's ``codegen_data()``; one with no
+    reaction changes that is Michaelis–Menten, takes a species factor of a
+    reactant no observable holds alone, divides by a live volume no observable
+    holds alone, or divides by a size parameter whose value is not the size the
+    engine divides by. ``data`` is the model's ``codegen_data()``; one with no
     reaction list says nothing of any rate and gives none, and so does one
     whose functions read none.
     """
@@ -818,14 +1005,17 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
         for i in rxn.get("products", ()):
             net[int(i)] = net.get(int(i), 0) + 1
         rate = _reaction_rate_text(rxn, params, alone)
+        per_species = bool(rxn.get("per_species_volume_scaling", False))
         for i, n in net.items():
             if n == 0:
                 continue
-            if rate is None:
+            divisor = _species_divisor_text(species, i, params, alone) if per_species else ""
+            if rate is None or divisor is None:
                 unreadable.add(i)
                 continue
             coeff = n * float(rxn.get("stat_factor", 1.0))
-            terms.setdefault(i, []).append(f"({coeff!r})*{rate}")
+            term = f"({coeff!r})*{rate}"
+            terms.setdefault(i, []).append(f"{term}/({divisor})" if per_species else term)
     out: dict[str, str] = {}
     for i, sp in enumerate(species):
         if sp.get("fixed", False):
@@ -845,9 +1035,9 @@ def rateof_rate_laws(data: dict) -> dict[str, str]:
 def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str | None:
     """A reaction's rate before its stat factor, as ``compute_rxn_rate`` forms
     it on the ODE path, or ``None`` where :func:`rateof_rate_laws` cannot state
-    it. ``alone`` maps a species to the observable that holds it alone."""
-    if rxn.get("per_species_volume_scaling", False):
-        return None
+    it. ``alone`` maps a species to the observable that holds it alone. A
+    cross-compartment reaction's rate is in amount per time; each species'
+    divisor is :func:`_species_divisor_text`'s."""
     kind = rxn.get("type")
     if kind == "functional":
         base = rxn.get("function_name") or ""
@@ -866,6 +1056,27 @@ def _reaction_rate_text(rxn: dict, params: list, alone: dict[int, str]) -> str |
                 return None
             factors.append(name)
     return "*".join(factors)
+
+
+def _species_divisor_text(
+    species: list, i: int, params: list, alone: dict[int, str]
+) -> str | None:
+    """What ``compute_derivs_core`` divides a cross-compartment reaction's rate by
+    for species *i*, from the lookup every emitter that scatters such a row
+    reads (:func:`bngsim._codegen._psvs_row_divisor`): its live volume, read
+    through the observable that holds the promoted compartment alone; else its
+    size, by the size parameter's name where that is the species' size, so that
+    a write to it, which moves the engine's divisor, moves this one; else the
+    number. ``None`` where a live volume has no such observable, or a named size
+    is not the number the engine divides by."""
+    live, size, k = _psvs_row_divisor(species, i)
+    if live >= 0:
+        return alone.get(live)
+    if 0 <= k < len(params):
+        if float(params[k]["value"]) != float(species[i].get("volume_factor", 1.0)):
+            return None
+        return params[k]["name"]
+    return repr(size)
 
 
 def _inline_functions(
@@ -1030,10 +1241,29 @@ def _kink_bindings(sp) -> dict:
 
             return type(name, (sp.Function,), {"nargs": 2, "fdiff": fdiff})
 
+        # Issue #1227: clamp(lo, x, hi) is ExprTk's e_clamp, `lo` where x < lo,
+        # else `hi` where x > hi, else `x`, tested in that order, so crossed
+        # bounds (lo > hi) give `lo` below it and `hi` from it on, which no
+        # Max/Min pair spells. Its derivative in each argument is the region
+        # where that argument is the value, each edge split as the binary twins
+        # split a tie: x between the bounds; lo below it; hi above both.
+        def clamp_fdiff(self, argindex=1):
+            lo, x, hi = self.args
+
+            def step(u):
+                return sp.Heaviside(u, sp.S.Half)
+
+            if argindex == 1:
+                return step(lo - x)
+            if argindex == 2:
+                return step(x - lo) * step(hi - x)
+            return step(x - lo) * step(x - hi)
+
         bindings = {
             "absval": absval,
             "maxval": binary("maxval", 1),
             "minval": binary("minval", -1),
+            "clampval": type("clampval", (sp.Function,), {"nargs": 3, "fdiff": clamp_fdiff}),
         }
         _kink_sympy_cache["bindings"] = bindings
     return bindings
@@ -1097,6 +1327,7 @@ def _finish_kinks(deriv):
         return deriv
     kinks = _kink_bindings(sp)
     absval = kinks["absval"]
+    clampval = kinks["clampval"]
     folds = {kinks["maxval"]: sp.Max, kinks["minval"]: sp.Min}
     deriv = deriv.replace(
         lambda n: isinstance(n, sp.Heaviside),
@@ -1136,6 +1367,10 @@ def _finish_kinks(deriv):
             )
             if type(out) is absval:
                 out = sp.Abs(out.args[0])
+            elif type(out) is clampval:
+                # The engine's order of tests, which every emitter prints.
+                lo, x, hi = out.args
+                out = sp.Piecewise((lo, x < lo), (hi, x > hi), (x, True))
         memo[node] = out
         return out
 
@@ -1416,7 +1651,9 @@ def differentiate_rate_law(
         )
         return None
 
-    sym_expr = _exprtk_to_sympy(inlined)
+    # A clamp() is a bend like abs / min / max, which this path differentiates
+    # through the kink twins below wherever they appear (issue #1227).
+    sym_expr = _exprtk_to_sympy(inlined, bends=True)
     if sym_expr is None:
         _declined(f"rate law {_short(rate_expr)} could not be parsed into sympy", kind="unparsed")
         return None

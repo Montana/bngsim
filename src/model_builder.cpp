@@ -389,6 +389,7 @@ struct ModelBuilder::BuilderImpl {
         bool initial_value = true;
         bool use_values_from_trigger_time = true;
         std::string size_jump_compartment; // issue #1054; "" for a model's own event
+        std::string size_jump_before;      // issue #1181; "" where none
     };
     std::vector<EventSpec> event_specs;
 
@@ -477,13 +478,15 @@ int ModelBuilder::add_observable(const std::string &name,
     return idx;
 }
 
-int ModelBuilder::add_function(const std::string &name, const std::string &expression) {
+int ModelBuilder::add_function(const std::string &name, const std::string &expression,
+                               bool deferred) {
     int idx = static_cast<int>(bimpl_->functions.size());
     Function func;
     func.index = idx + 1;
     func.name = name;
     func.expression = expression;
     func.evaluator_id = -1;
+    func.deferred = deferred;
 
     bimpl_->function_name_to_idx[name] = idx;
     bimpl_->functions.push_back(std::move(func));
@@ -706,12 +709,14 @@ void ModelBuilder::set_last_event_assignment_rescale(int assign_idx0, const std:
     spec.assignment_rescale_base[static_cast<std::size_t>(assign_idx0)] = base_assign_idx0;
 }
 
-void ModelBuilder::set_last_event_size_jump(const std::string &compartment) {
+void ModelBuilder::set_last_event_size_jump(const std::string &compartment,
+                                            const std::string &before) {
     if (bimpl_->event_specs.empty())
         throw std::runtime_error("ModelBuilder: set_last_event_size_jump with no event");
     if (compartment.empty())
         throw std::runtime_error("ModelBuilder: set_last_event_size_jump with no compartment");
     bimpl_->event_specs.back().size_jump_compartment = compartment;
+    bimpl_->event_specs.back().size_jump_before = before;
 }
 
 void ModelBuilder::add_discontinuity_trigger(const std::string &condition_expr) {
@@ -2839,6 +2844,16 @@ NetworkModel ModelBuilder::build() {
                     throw std::runtime_error("ModelBuilder: failed to compile event delay '" +
                                              espec.id + "': " + espec.delay_expr + " — " +
                                              e.what());
+                }
+            }
+
+            if (!espec.size_jump_before.empty()) {
+                try {
+                    ev.size_jump_before_expr = eval.compile(espec.size_jump_before);
+                } catch (const std::exception &e) {
+                    throw std::runtime_error(
+                        "ModelBuilder: failed to compile the size before the jump of event '" +
+                        espec.id + "': " + espec.size_jump_before + " — " + e.what());
                 }
             }
 

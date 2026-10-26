@@ -703,8 +703,18 @@ class NetworkModel {
     // conc is 0-based n_species array.
     void update_observables(const double *conc);
 
-    // Evaluate all functions (updates variable parameters).
-    void evaluate_functions(double t);
+    // Evaluate all functions (updates variable parameters). The right-hand
+    // side, the event roots and the analytic Jacobian's refresh pass
+    // with_deferred = false: a deferred function is read only by event
+    // assignments, and is evaluated with the rest everywhere else (issue #1186).
+    void evaluate_functions(double t, bool with_deferred = true);
+
+    // The deferred functions alone, against the functions, the state and the
+    // time as they stand: what an event's assignments read after a right-hand
+    // side or root evaluation left them behind. A no-op for a model with none:
+    // it sets no time, so a batch run at a time other than the one the
+    // functions were read at reads `time` as before (issue #1186).
+    void evaluate_deferred_functions();
 
     // ─── RHS observable/function-eval gate instrumentation (T1) ──────────────
     // compute_derivs_core() refreshes observable totals + function-bound

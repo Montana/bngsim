@@ -72,6 +72,13 @@ name: mir-jit
 # function it never declares (frac, equal) is an error under cc, but c2mir
 # declares it implicitly, so MIR either exit()ed the process or bound an
 # unrelated symbol of that name. test_codegen_jit_prelude.py pins the refusal.
+#
+# Issue #1213 is the first in the SSA engine. With no cc library to load, its
+# propensity selector falls back to MirJit, the path for an install with no
+# compiler, and took that path for a caller's codegen=False too. Only a MIR
+# build has the fallback, so test_ssa_codegen_false_is_interpreted.py passes
+# everywhere else whether or not the fix is in; it runs here, and a change to
+# src/ssa_simulator.cpp starts this job.
 
 on:
   workflow_dispatch:
@@ -89,6 +96,8 @@ on:
       # the JIT too, so it is a second place a #85-class prelude bug can surface.
       - "src/steady_state.cpp"
       - "src/_bngsim_core.cpp"
+      # Issue #1213 — the SSA propensity selector and its MirJit fallback.
+      - "src/ssa_simulator.cpp"
       # Issue #619 — the other half of a duplicated invariant. _codegen.py's
       # function ordering says of itself "This mirrors ModelBuilder's Kahn sort
       # (src/model_builder.cpp) so the emitted func[] block is ordered the same
@@ -114,6 +123,7 @@ on:
       - "python/tests/test_codegen*.py"
       - "python/tests/test_steady_state_output_sensitivities.py"
       - "python/tests/test_mir_vendoring.py"
+      - "python/tests/test_ssa_codegen_false_is_interpreted.py"
       - "CMakeLists.txt"
       - ".github/workflows/mir.yml"
   pull_request:
@@ -267,6 +277,7 @@ jobs:
             python/tests/test_codegen_steady_state_mask.py \
             python/tests/test_codegen_steady_state_fd_step.py \
             python/tests/test_steady_state_output_sensitivities.py \
+            python/tests/test_ssa_codegen_false_is_interpreted.py \
             -rA --tb=short ${{ github.event.inputs.pytest_args }} \
             2>&1 | tee mir-${{ matrix.os }}.log
 

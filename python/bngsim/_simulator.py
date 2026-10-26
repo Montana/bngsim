@@ -30,7 +30,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
 
@@ -294,6 +294,16 @@ _UNAVAILABLE_NF_METHODS: dict[str, str] = _unavailable_nf_methods
 # sensitivity auto-codegen path here share one source of truth.
 
 
+def _ssa_flag_on(name: str) -> bool:
+    """Whether the SSA selector's environment flag *name* is on, read as the C++
+    selector's ``on()`` reads it: set, non-empty and not starting with ``0``.
+    Read as plain truthiness, ``BNGSIM_SSA_NO_CODEGEN=0`` kept Python from
+    building the propensity library while C++ took the flag as off, and the run
+    lost the compiled path neither side was asked to drop."""
+    value = os.environ.get(name, "")
+    return value != "" and value[0] != "0"
+
+
 def _codegen_refusal(cause: BaseException | None, decline: str | None) -> str:
     """Why ``codegen=True`` could not be honoured, as the prepare call recorded it:
     the build failed (``cause``, :func:`bngsim._codegen.last_codegen_error`) or
@@ -510,13 +520,20 @@ class Simulator:
         lets NFsim auto-compute a suggested limit from the XML.
 
     codegen : bool, optional
-        Only used for ``method="ode"``. When true, use a compiled C RHS,
-        generated from the model bngsim built -- whatever it was loaded from
-        (``.net``, BNGL, SBML, Antimony or the builder). ``None`` (default)
-        compiles automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species
-        (256), where native code beats the interpreter. ``False`` runs the
+        For ``method="ode"``: when true, use a compiled C RHS, generated from
+        the model bngsim built -- whatever it was loaded from (``.net``, BNGL,
+        SBML, Antimony or the builder). ``None`` (default) compiles
+        automatically at or above ``BNGSIM_CODEGEN_THRESHOLD`` species (256),
+        where native code beats the interpreter. ``False`` runs the
         interpreter: it never compiles, and it ignores an artifact that an
         earlier Simulator or ``Model.clone()`` left on the model.
+
+        For ``method="ssa"``: unless ``False``, a small pure mass-action model
+        with no events gets a compiled propensity vector and the recompute-all
+        loop, reported as ``ssa_diagnostics["propensity_backend"]``.
+        ``False`` runs the interpreted propensities, on every engine the
+        Simulator builds, ``run_replicates`` and ``run_batch`` included (issue
+        #1213). Other methods ignore it.
 
     net_path : str, optional
         Deprecated and ignored (issue #803). Every backend reads the model it is
@@ -694,6 +711,9 @@ class Simulator:
 
     __slots__ = (
         "_reaction_stats",
+        # The cc propensity library __init__ built for an exact SSA, or "" (GH
+        # #190); _new_ssa_engine hands it to every engine.
+        "_ssa_propensity_lib",
         "_model",
         "_method",
         "_canonical_method",
@@ -812,6 +832,10 @@ class Simulator:
                 "(use method='ssa')"
             )
         self._reaction_stats = bool(reaction_stats)
+        # Set here, ahead of the rest of the codegen state below, because the SSA
+        # branch's _new_ssa_engine reads both.
+        self._codegen = codegen
+        self._ssa_propensity_lib = ""
 
         self._model = model
         # GH #198: stash whether expression output sensitivities will be needed,
@@ -956,40 +980,36 @@ class Simulator:
                 loc = f" [{w.location}]" if w.location else ""
                 logger.warning("SSA validation: %s%s — %s", w.code, loc, w.message)
 
-            # PSA shares SsaSimulator; dispatch happens at run time.
-            # Event-with-delay rejection happens C++-side at run() entry.
-            from bngsim._bngsim_core import SsaSimulator
-
-            self._sim = SsaSimulator(model._core)
-            if self._reaction_stats:
-                self._sim.set_record_reaction_stats(True)
-
-            # GH #190 — for exact SSA, hand the C++ simulator a cc-compiled
-            # value-specialized propensity .so so eligible small mass-action
-            # models take the RR-parity recompute-all + flat-scan loop by
-            # DEFAULT (no MIR). The C++ side makes the final eligibility/size
-            # decision and ignores it for PSA / events / functional / large-nr
-            # models; this just provides the artifact, cached on disk so an
-            # ensemble compiles once. Skipped for PSA (recompute-all needs exact
-            # SSA), when codegen=False, when BNGSIM_SSA_NO_CODEGEN is set, or when
-            # a BNGSIM_SSA_PROP_{CC,JIT} env override selects an in-process
-            # backend instead (then the C++ side compiles the source itself).
+            # GH #190 — for exact SSA, build a cc-compiled structure-specialized
+            # propensity .so so eligible small mass-action models take the
+            # RR-parity recompute-all + flat-scan loop by DEFAULT (no MIR). The
+            # C++ side makes the final eligibility/size decision and ignores it
+            # for PSA / events / functional / large-nr models; this just provides
+            # the artifact, cached on disk so an ensemble compiles once, and
+            # _new_ssa_engine hands it to every engine this Simulator builds.
+            # Skipped for PSA (recompute-all needs exact SSA), when
+            # codegen=False, when BNGSIM_SSA_NO_CODEGEN is set, or when a
+            # BNGSIM_SSA_PROP_{CC,JIT} env override selects an in-process backend
+            # instead (then the C++ side compiles the source itself).
             if (
                 dispatch == "ssa"
                 and codegen is not False
-                and not os.environ.get("BNGSIM_SSA_NO_CODEGEN")
-                and not os.environ.get("BNGSIM_SSA_PROP_CC")
-                and not os.environ.get("BNGSIM_SSA_PROP_JIT")
+                and not _ssa_flag_on("BNGSIM_SSA_NO_CODEGEN")
+                and not _ssa_flag_on("BNGSIM_SSA_PROP_CC")
+                and not _ssa_flag_on("BNGSIM_SSA_PROP_JIT")
             ):
                 try:
                     from bngsim._codegen import prepare_ssa_propensity_lib
 
-                    _ssa_lib = prepare_ssa_propensity_lib(model)
-                    if _ssa_lib:
-                        self._sim.set_propensity_library(_ssa_lib)
-                        logger.debug("SSA propensity .so ready: %s", _ssa_lib)
+                    self._ssa_propensity_lib = prepare_ssa_propensity_lib(model) or ""
+                    if self._ssa_propensity_lib:
+                        logger.debug("SSA propensity .so ready: %s", self._ssa_propensity_lib)
                 except Exception:  # pragma: no cover - defensive
                     logger.debug("SSA propensity codegen skipped", exc_info=True)
+
+            # PSA shares SsaSimulator; dispatch happens at run time.
+            # Event-with-delay rejection happens C++-side at run() entry.
+            self._sim = self._new_ssa_engine(model._core)
         elif dispatch == "nfsim":
             from bngsim._bngsim_core import HAS_NFSIM
 
@@ -1113,7 +1133,6 @@ class Simulator:
         self._snapshot_stack: list[dict] = []
 
         # Code-generated RHS support, including model-based codegen reuse.
-        self._codegen = codegen
         self._codegen_so_path = ""
         # In-process MIR micro-JIT source (GH #78). When the JIT backend is
         # selected (BNGSIM_CODEGEN_JIT=mir), the codegen C source is JIT-compiled
@@ -2213,6 +2232,7 @@ class Simulator:
             return conditions
         from bngsim._switch_sensitivity import (
             _PLAIN_INSTANT_FLOOR,
+            StopsMoveWithAnEvent,
             TriggerEqualityNeverHolds,
             crossings_with_periodic,
             merge_crossing_stops,
@@ -2265,7 +2285,7 @@ class Simulator:
             )
             if periodic_at:
                 crossings = sorted([*crossings, *periodic_at], key=lambda stop: stop.time)
-        except TriggerEqualityNeverHolds as e:
+        except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
             raise SimulationError(str(e)) from None
         except SensitivityUnsupportedError:
             raise
@@ -2560,6 +2580,7 @@ class Simulator:
             conditions = model.time_discontinuity_conditions()
             if conditions:
                 from bngsim._switch_sensitivity import (
+                    StopsMoveWithAnEvent,
                     TriggerEqualityNeverHolds,
                     crossings_with_periodic,
                     merge_crossing_stops,
@@ -2580,7 +2601,7 @@ class Simulator:
                     # whose window a step can otherwise lie across unseen.
                     if periodic:
                         times = sorted(set(times) | {float(stop.time) for stop in periodic})
-                except TriggerEqualityNeverHolds as e:
+                except (TriggerEqualityNeverHolds, StopsMoveWithAnEvent) as e:
                     raise SimulationError(str(e)) from None
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning(
@@ -2792,7 +2813,9 @@ class Simulator:
         """
         self._codegen_sens_rhs_available = None
 
-    def _apply_state_switch_sens(self, opts, core, model=None, covered=None) -> None:
+    def _apply_state_switch_sens(
+        self, opts, core, model=None, covered=None, t_start: float = 0.0
+    ) -> None:
         """Register the state-dependent rate-law switches to jump at (issue #150).
 
         The rate-law twin of :meth:`_apply_event_time_sens`. A condition that
@@ -2819,19 +2842,52 @@ class Simulator:
         RHS, so the columns are CVODES' difference quotient, which can still
         read a narrow one wrong (issue #1126).
 
+        A rate-law equality over state that the run starts on, at *t_start*, and
+        stays on is refused first (issue #1228): leaving it is a switch nothing
+        locates.
+
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
         untouched.
         """
         from bngsim._switch_sensitivity import (
             _surface_key,
+            equalities_held_at_start,
             state_switch_conditions,
             state_switch_reactions,
             state_switch_residual,
         )
 
+        # A rate-law equality the run starts on holds for a stretch, and leaving
+        # it is a switch nothing locates (issue #1228): refused by name, as the
+        # same switch written `<=` is refused at its tangency. The context is
+        # built once for this and the conditions below.
+        ctx = None
         try:
-            conditions = state_switch_conditions(core)
+            if core.n_functions:
+                ctx = core.functional_jacobian_context()
+            held = equalities_held_at_start(core, ctx, t0=t_start)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Equality-at-start detection failed (%s) (issue #1228).", e)
+            held = []
+        if held:
+            raise SensitivityUnsupportedError(
+                "Forward sensitivity is not supported for this model: a rate law branches "
+                f"on {held[0]!r}, and the state starts on that equality's surface and stays "
+                "on it, so the condition holds one value for a stretch rather than an "
+                "instant. Leaving the surface is a switch bngsim does not locate: an "
+                "equality is not rooted, since one the state crosses holds for an instant, "
+                "and either side of its surface reads false, so the columns of whatever "
+                "ends the stretch would come back 0 with no jump (issue #1228). Write the "
+                "switch as the crossing that ends the stretch, which is located and "
+                "jumped (`if(Aobs>q, kb, 0)` for `if(Bobs==0, kb, 0)` in that issue's "
+                "model, where B is made only once A falls to q). The same switch as an "
+                "inequality, `Bobs<=0`, is refused at its tangency. Or drop sensitivities "
+                "for this run."
+            )
+
+        try:
+            conditions = state_switch_conditions(core, ctx)
         except Exception as e:  # pragma: no cover - defensive
             # Detection is best-effort: failing it leaves the pre-#150 behavior
             # (columns short by the crossing jump), which the codegen gate still
@@ -4379,22 +4435,45 @@ class Simulator:
 
         The persistent CvodeSimulator / SsaSimulator is constructed once from
         ``model._core``; after a parameter change some backend state must be
-        rebuilt to pick it up (the SSA value-specialized propensity library
-        bakes rate-constant values; the ODE path also drops any cached
-        integrator workspace). ``intervene``, ``restore``, and the scan
-        primitives all re-derive the backend through this single helper so the
-        recreation rule lives in one place.
+        rebuilt to pick it up (the ODE path drops any cached integrator
+        workspace). ``intervene``, ``restore``, and the scan primitives all
+        re-derive the backend through this single helper so the recreation rule
+        lives in one place. The SSA engine comes from :meth:`_new_ssa_engine`,
+        so it keeps the propensity library: the library is structure-specialized
+        and reads the live parameter values at the start of every run, so a
+        parameter change leaves it valid.
         """
         if self._method == "ode":
             from bngsim._bngsim_core import CvodeSimulator
 
             self._sim = CvodeSimulator(self._model._core)
         elif self._method in ("ssa", "psa"):
-            from bngsim._bngsim_core import SsaSimulator
+            self._sim = self._new_ssa_engine(self._model._core)
 
-            self._sim = SsaSimulator(self._model._core)
-            if self._reaction_stats:
-                self._sim.set_record_reaction_stats(True)
+    def _new_ssa_engine(self, core: Any) -> Any:
+        """A core ``SsaSimulator`` on *core*, set up as this Simulator's own.
+
+        Every SSA engine is built here: the one ``__init__`` makes, the one
+        :meth:`_recreate_interactive_sim` rebuilds after ``intervene`` or
+        ``restore``, ``run_replicates``' per-thread ones and ``run_batch``'s
+        per-row ones. Each keeps to the caller's ``codegen=False`` (issue #1213:
+        with no library to load, a MIR build's C++ default JITs the propensities
+        in-process, a path meant for an install with no compiler), carries the
+        propensity library ``__init__`` built (GH #190; it reads every rate
+        constant and volume at run time, so a clone and a changed parameter are
+        served alike) and records ``reaction_stats``. Built by hand at each site,
+        the later three had lost the library, and ``run_batch``'s the stats too.
+        """
+        from bngsim._bngsim_core import SsaSimulator
+
+        sim = SsaSimulator(core)
+        if self._codegen is False:
+            sim.set_codegen(False)
+        if self._ssa_propensity_lib:
+            sim.set_propensity_library(self._ssa_propensity_lib)
+        if self._reaction_stats:
+            sim.set_record_reaction_stats(True)
+        return sim
 
     # ─── Absolute tolerance, scalar or per-species (issue #196) ─────
 
@@ -5108,7 +5187,9 @@ class Simulator:
                     # Outside the parameter guard on purpose: a *state* crossing
                     # moves every column, initial conditions included (issue
                     # #150 / #144), so an IC-only request needs the jump too.
-                    self._apply_state_switch_sens(opts, self._model._core, self._model, covered)
+                    self._apply_state_switch_sens(
+                        opts, self._model._core, self._model, covered, t_start
+                    )
                 else:
                     self._apply_state_switch_roots(opts, self._model, covered)
 
@@ -5556,7 +5637,7 @@ class Simulator:
 
         base_seed = _resolve_seed(seed)
 
-        from bngsim._bngsim_core import SsaSimulator, TimeSpec
+        from bngsim._bngsim_core import TimeSpec
 
         def _make_times() -> Any:
             ts = TimeSpec()
@@ -5596,9 +5677,7 @@ class Simulator:
                 sim = getattr(local, "sim", None)
                 if sim is None:
                     local.model = self._model.clone()
-                    local.sim = SsaSimulator(local.model._core)
-                    if self._reaction_stats:
-                        local.sim.set_record_reaction_stats(True)
+                    local.sim = self._new_ssa_engine(local.model._core)
                     self._apply_ssa_breakpoints([local.sim], local.model, t_start, t_end)
                     local.times = _make_times()
                     sim = local.sim
@@ -6580,7 +6659,7 @@ class Simulator:
                     self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1])
                     # See the note at the single-shot site: keyed on "any
                     # sensitivity at all", not on a parameter request.
-                    self._apply_state_switch_sens(opts, clone._core, clone, covered)
+                    self._apply_state_switch_sens(opts, clone._core, clone, covered, t_span[0])
                 else:
                     self._apply_state_switch_roots(opts, clone, covered)
                 # The GH #176 retry, as run() places it. Without it a row raised
@@ -6598,9 +6677,7 @@ class Simulator:
                 core_result = self._ode_attempts(times, opts, restore, sim=sim, core=row_core)
 
             elif self._method in ("ssa", "psa"):
-                from bngsim._bngsim_core import SsaSimulator
-
-                sim = SsaSimulator(clone._core)
+                sim = self._new_ssa_engine(clone._core)
                 # This row's parameters place its crossings, so resolve on the clone.
                 self._apply_ssa_breakpoints([sim], clone, t_span[0], t_span[1])
                 if self._method == "psa":
@@ -7082,6 +7159,11 @@ class Simulator:
                     "(issue #708). A Simulator built at these values is refused too: it has "
                     "no analytic right-hand side for the condition (issues #414, #961)."
                 ) from None
+            if isinstance(exc, SensitivityUnsupportedError):
+                # A refusal of the model, raised as a chunk sets up (issue
+                # #1228's held equality): no column runs alone either, and
+                # retrying them reported it as a tolerance failure, untyped.
+                raise exc
             return self._recover_failed_chunk(
                 chunk_idx,
                 chunks,
@@ -7308,7 +7390,7 @@ class Simulator:
         # must be built against that subset rather than the full request.
         self._apply_switch_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
         self._apply_event_time_sens(opts, clone._core, t_span[0], t_span[1], sens_params)
-        self._apply_state_switch_sens(opts, clone._core, clone, covered)
+        self._apply_state_switch_sens(opts, clone._core, clone, covered, t_span[0])
         opts.set_sensitivity_method(self._sensitivity_method)
 
         try:
@@ -8953,6 +9035,7 @@ class Simulator:
         mask=None,
         newton_burst: bool = True,
         criterion: str = "scaled",
+        certify: bool | Literal["start"] = True,
     ):
         """Compute steady states for multiple parameter sets, starting states,
         or both.
@@ -8979,6 +9062,15 @@ class Simulator:
             A ``$``-fixed species is then left out of the unknowns, whose
             Newton system it would make singular. Default ``True``, the
             two-tier solver of :meth:`steady_state`.
+        certify : bool or "start"
+            With ``newton_burst=False``, ``False`` skips the stability
+            certificate, a dense eigendecomposition of the reduced Jacobian,
+            and a converged result then has ``root_stability == ""`` and no
+            ``eigenvalues``. ``"start"`` takes no Newton step: each starting
+            state is the result, converged where it passes ``tol``, and
+            certified there. :meth:`steady_states` solves its starts with
+            ``False`` and certifies each distinct root once with ``"start"``
+            (issue #1191). Default ``True``. Ignored otherwise.
         method : str
             ``"integration"`` (default), ``"newton"``, or ``"kinsol"``
             (alias for ``"newton"``). See :meth:`steady_state`.
@@ -9033,6 +9125,8 @@ class Simulator:
                 )
         if not params:
             raise ValueError("params must be non-empty")
+        if not (certify is True or certify is False or certify == "start"):
+            raise ValueError(f'certify must be True, False or "start", not {certify!r}')
         # Issue #710 — a row sets parameter values, not what the rates read.
         self._raise_if_no_steady_state_to_solve_for("steady_state_batch()")
 
@@ -9087,6 +9181,8 @@ class Simulator:
             opts.max_time = max_time
             opts.method = method
             opts.newton_burst = newton_burst
+            opts.certify_root = certify is not False
+            opts.certify_start = certify == "start"
             opts.rtol = eff_rtol
             if own_auto:
                 own = self._steady_state_atol(None, criterion, clone.get_state(), eff_rtol)
@@ -9173,9 +9269,8 @@ class Simulator:
         ``multiplicity`` or ``basins``, and a root only it found has
         multiplicity 0. The seed is then put on the conservation laws at the
         model's totals, as every draw is. Two cases return less. Where Newton
-        cannot hold the root, as at the large law totals below (issue #1190), it
-        is missed: on a three-species law at a total of ``1e8``, the call returns
-        none. And where the solve had moved a held species, it solved another
+        cannot hold the root at ``tol``, as at the large rates below, it is
+        missed. And where the solve had moved a held species, it solved another
         problem: a masked sink at the end of a chain, as the pure-sink mask below
         makes it, moves its law's total, and a held species the rates read moves
         the rates. Newton from the seed then reaches a root of the problem the
@@ -9208,11 +9303,16 @@ class Simulator:
         solve, though a law's dependent species is rebuilt from the law.
 
         ``tol`` is absolute, as in :meth:`steady_state`. A model at so small a
-        scale that most starts are already under it is refused; at law totals
-        above about ``1e7`` the law's round-off alone can exceed it, and a
-        root is then reported as a failed start. Below concentrations of about
-        ``1e-9``, KINSOL's step limits are absolute too, and most starts fail
-        even with a ``tol`` scaled to match.
+        scale that most starts are already under it is refused. Each solve
+        rebuilds, from each conservation law, the member that carries the most
+        of the law's total where the solve is, so a large total's round-off
+        lands in a species at its own scale rather than in a small one (issue
+        #1190). Where a root's rates are themselves large, their own rounding
+        can still exceed ``tol``, and the root is then reported as a failed
+        start: ``A <-> B`` at rates 1 and 2 and a total of ``1e8`` ends at a
+        residual of ``5e-9`` when Newton starts at the root itself. Below
+        concentrations of about ``1e-9``, KINSOL's step limits are absolute
+        too, and most starts fail even with a ``tol`` scaled to match.
 
         Parameters
         ----------
@@ -9298,10 +9398,18 @@ class Simulator:
         # as an unknown: every start on catalysis, localfunc, gene_expr_3stage
         # and Motivating_example failed on the singular matrix.
         solve_mask = ~held if held.any() else None
+        # The certificate is a dense eigendecomposition of the reduced Jacobian,
+        # and every start that converged paid it for the root it reached: on
+        # egfr_net 91 of 200 starts converged to one root, and the call took
+        # 7.2 s where certifying each distinct root once takes 2.7 s (issue
+        # #1191). Each root's representative is certified as it stands, with
+        # no Newton step: solved again from there, 6 of fceri_ji's 15 roots did
+        # not converge a second time and came back with no verdict.
         results = self.steady_state_batch(
             states=starts,
             method="newton",
             newton_burst=False,
+            certify=False,
             tol=tol,
             n_workers=n_workers,
             mask=solve_mask,
@@ -9326,7 +9434,7 @@ class Simulator:
             # recomputes the totals from its start, reported a "root" of
             # m1_ground at a total of 0, not 100. Where nothing held moved, this
             # moves the seed by the integration's drift, a few 1e-9.
-            A, totals = _moving_laws(L, in_law, y0)
+            A, totals, law_scale = _moving_laws(L, in_law, y0)
             if A.shape[0]:
                 cols = np.flatnonzero(in_law)
                 w = np.maximum(seed_state[cols], np.finfo(float).tiny)
@@ -9335,7 +9443,7 @@ class Simulator:
                 # its way to None, which drops the seed. That is the answer, so
                 # nothing is raised or warned, and nothing non-finite is kept.
                 with np.errstate(all="ignore"):
-                    y = _project_onto_laws(w, A, totals)
+                    y = _project_onto_laws(w, A, totals, law_scale)
                 if y is None or not np.all(np.isfinite(y)):
                     seed_state = None
                 else:
@@ -9346,6 +9454,7 @@ class Simulator:
                     states=[seed_state],
                     method="newton",
                     newton_burst=False,
+                    certify=False,
                     tol=tol,
                     mask=solve_mask,
                 )
@@ -9362,6 +9471,20 @@ class Simulator:
             roots.multiplicity[k] -= 1
             roots.basins = roots.basins[:-1]
             roots.n_failed = int(np.sum(roots.basins < 0))
+        if len(roots):
+            certified = self.steady_state_batch(
+                states=roots.states,
+                method="newton",
+                newton_burst=False,
+                certify="start",
+                tol=tol,
+                n_workers=n_workers,
+                mask=solve_mask,
+            )
+            for k, r in enumerate(certified):
+                if r.converged:
+                    roots.stability[k] = r.root_stability or "undetermined"
+                    roots.eigenvalues[k] = np.asarray(r.eigenvalues)
         return roots
 
     # ─── Stop conditions ────────────────────────────────────────────
@@ -10539,7 +10662,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     y0, L, held, in_law = _manifold_partition(model, mask)
     ns = y0.size
     moved = ~held
-    A, totals = _moving_laws(L, in_law, y0)
+    A, totals, own_scale = _moving_laws(L, in_law, y0)
     if upper is None:
         upper = _default_sampling_bound(y0, L)
     upper_v = np.broadcast_to(np.asarray(upper, dtype=float), (ns,))
@@ -10550,7 +10673,7 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
     if A.shape[0]:
         cols = np.flatnonzero(in_law)
         for row in out:
-            y = _project_onto_laws(row[cols], A, totals)
+            y = _project_onto_laws(row[cols], A, totals, own_scale)
             if y is None:
                 raise SimulationError(
                     "steady_states(): the conservation laws admit no state with every "
@@ -10562,14 +10685,16 @@ def _sample_on_conservation_manifold(model, n, rng, upper, mask, decades=4.0) ->
 
 def _moving_laws(L, in_law, y0):
     """The laws over the species a start moves, ``A·y[in_law] = totals``, at the
-    totals the model's state ``y0`` holds (issue #524). A law over held species
-    alone constrains nothing a start moves, and is left out."""
+    totals the model's state ``y0`` holds (issue #524), and each law's own scale,
+    ``|A|·|y0|``: what its total is 0 to the round-off of (issue #1265). A law over
+    held species alone constrains nothing a start moves, and is left out."""
     A = L[:, in_law]
     A = A[(A != 0).any(axis=1)]
-    return A, A @ y0[in_law]
+    y = y0[in_law]
+    return A, A @ y, np.abs(A) @ np.abs(y)
 
 
-def _project_onto_laws(w, A, b, max_iter=200):
+def _project_onto_laws(w, A, b, scale=None, max_iter=200):
     """The point of ``{y > 0 : A·y = b}`` nearest ``w`` in relative entropy (issue #524).
 
     It is ``y = w·exp(Aᵀλ)`` at the minimum of the convex dual
@@ -10581,13 +10706,23 @@ def _project_onto_laws(w, A, b, max_iter=200):
     laws does, the iterates approach it by a factor ``e`` a step and the
     floor below takes them there. ``None`` when no step decreases ``F``: the
     laws admit no positive point.
+
+    Each law is judged on its own scale (issue #1265). A law of non-negative
+    coefficients has a positive point exactly when its total is positive, so it
+    is pinned only where the total is 0 to the round-off of its own members,
+    ``scale`` (``|A|·|y0|``, from :func:`_moving_laws`; ``|b|`` where not given,
+    which pins a total of 0 or less). And a law is met to ``1e-12`` of its own
+    total, or ``1e-15`` of its own ``scale``, not of the largest law's: beside a
+    pool of 1e8, a pool of 1e-5 was pinned to 0, and one of 1e-3 was met only
+    to 1e-7.
     """
-    ref = max(float(np.abs(b).max()), float((np.abs(A) @ w).max()))
+    b = np.asarray(b, dtype=float)
+    scale = np.abs(b) if scale is None else np.asarray(scale, dtype=float)
     out = np.array(w, dtype=float)
     live = np.ones(out.size, dtype=bool)
     rows = np.ones(A.shape[0], dtype=bool)
     while True:
-        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * ref)
+        pin = rows & np.all(A[:, live] >= 0.0, axis=1) & (b <= 1e-12 * scale)
         if not pin.any():
             break
         live &= ~(A[pin] != 0.0).any(axis=0)
@@ -10599,7 +10734,9 @@ def _project_onto_laws(w, A, b, max_iter=200):
     logw = np.log(w)
     lam = np.zeros(A.shape[0])
     y = w
-    floor = 1e-15 * ref
+    # Each law's own: its members' scale in the model's state, at least its
+    # total, not the start's, whose weights are drawn on the largest law's scale.
+    floor = 1e-15 * scale[rows]
     for _ in range(max_iter):
         g = A @ y - b
         if np.all(np.abs(g) <= 1e-12 * np.maximum(np.abs(b), np.abs(A) @ y) + floor):
@@ -10822,7 +10959,9 @@ class SteadyStateResult:
         ``"undetermined"`` (the certificate declined — more than 512 unknowns, or
         a Jacobian whose spectrum it could not compute), or ``"unstable"``.
         ``""`` when the result came from integration, which needs no certificate:
-        a trajectory cannot come to rest on an unstable equilibrium.
+        a trajectory cannot come to rest on an unstable equilibrium. ``""`` too
+        from a burst-free solve told to skip it
+        (``steady_state_batch(newton_burst=False, certify=False)``, issue #1191).
         ``"unstable"`` is returned only when the *initial condition itself* was
         that root; a polish that lands on one is discarded instead.
     n_unstable_roots_rejected : int

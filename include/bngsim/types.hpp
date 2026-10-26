@@ -458,6 +458,15 @@ struct Function {
     // while only the value consumers -- the ExprTk evaluator and the codegen C
     // emitter -- read the branch.
     std::string eval_expression;
+
+    // Issue #1186: read only by event assignments, so the right-hand side
+    // (interpreted and compiled), the event roots and the analytic Jacobian's
+    // refresh leave it alone, and it is evaluated where an event executes, as
+    // everywhere else that evaluates the functions. A size jump's sides through
+    // a diamond of rules are written as functions of their own (#1145), and
+    // evaluated at every step they cost more than the model. Nothing that is
+    // not deferred may read one.
+    bool deferred = false;
 };
 
 // ─── Stoichiometry entry (sparse) ────────────────────────────────────────────
@@ -955,6 +964,12 @@ struct Event {
     // an event before anything else at its instant, and the other events
     // triggered there read their trigger, values and delay after it.
     std::string size_jump_compartment;
+    // Issue #1181 — for such an event, the compartment's size before its jump
+    // (the size with its own condition on the side it leaves, the others as
+    // they stand), compiled; -1 where the loader gave none. Where more than one
+    // jump of a compartment executes at one instant, the engine reads it just
+    // before the instant, with every condition there on the side it leaves.
+    int size_jump_before_expr = -1;
 };
 
 // ─── Sensitivity options ─────────────────────────────────────────────────────
@@ -1226,6 +1241,18 @@ struct SteadyStateOptions {
     // starting states needs: a burst carries every start into an attractor's
     // basin, and a saddle is discarded on purpose. Ignored by "integration".
     bool newton_burst = true;
+    // Issue #1191: false makes the burst-free solve above skip the stability
+    // certificate, a dense eigendecomposition of the reduced Jacobian, and
+    // report no verdict. steady_states() certifies each distinct root once
+    // instead of every start that converged to it (91 times over on egfr_net,
+    // whose call took 7.2 s and takes 2.7 s). Ignored by the two-tier solver.
+    bool certify_root = true;
+    // Issue #1191: true makes the burst-free solve take no Newton step and
+    // certify the state it is given, converged where that state passes `tol`.
+    // How steady_states() certifies each root, at the state it reports:
+    // solved again from there, 6 of fceri_ji's 15 roots did not converge a
+    // second time and came back with no verdict. Ignored by the two-tier solver.
+    bool certify_start = false;
     // Jacobian strategy (same values as SolverOptions). Read by everything that
     // needs the matrix: dY_ss/dp and the issue #78 stability certificate, which
     // need it as a MATRIX (via ss_fill_state_jacobian), and — since issue #127 —
