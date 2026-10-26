@@ -181,7 +181,14 @@ def _cases():
         for check in CHECKS:
             marks = ()
             if (shape, check) in OPEN:
-                marks = pytest.mark.xfail(strict=True, reason=OPEN[shape, check])
+                # Only where the path runs: a build without KLU skips the KLU
+                # check, which is right, and is no pass of #1254's (the MIR leg
+                # builds without it).
+                marks = pytest.mark.xfail(
+                    condition=check != "klu_vs_dense" or bool(bngsim._bngsim_core.HAS_KLU),
+                    strict=True,
+                    reason=OPEN[shape, check],
+                )
             yield pytest.param(shape, check, id=f"{shape}-{check}", marks=marks)
 
 

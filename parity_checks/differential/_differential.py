@@ -330,6 +330,8 @@ def _compiled(job: Job):
     except RuntimeError as e:
         if "codegen declined this model" in str(e):
             raise _Declined(str(e).splitlines()[0][:300]) from e
+        if "No C compiler found" in str(e):  # a machine without cc: no cc path here
+            raise _NoCompiler("codegen=True found no C compiler") from e
         raise
     if sim.codegen_backend == "exprtk":
         raise _NoCompiler("codegen=True ran the interpreter: no codegen backend")

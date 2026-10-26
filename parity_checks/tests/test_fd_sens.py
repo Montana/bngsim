@@ -528,3 +528,36 @@ def test_a_sweep_that_finds_nothing_leaves_the_verdict():
     res = {"status": "pass", "value": 1e-6}
     F._apply_sweep(res, F.tolerance_sweep(_sweep_runs(), ["a", "b"]))
     assert res["status"] == "pass" and res["sweep_settled"] is True
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "pulse_triangle_maxabs_narrow",
+        "pulse_triangle_clamp_narrow",
+        "pulse_triangle_if_narrow",
+        "pulse_ramp_clamp_narrow",
+    ],
+)
+def test_a_narrow_pulse_converges_with_the_tolerance(model_id):
+    """The sweep on every pull request, not only the nightly: a narrow pulse's
+    columns settle between rtol 1e-10 and 1e-12 with the trajectory. Before
+    #1242, triangle_clamp_narrow's k_clock column moved 107% there (and
+    ramp_clamp_narrow's 1.2e-3), while a difference of plain runs passed both."""
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == model_id
+    )
+    params = ["kx", "k_clock"]
+    for method in F.SENS_METHODS:
+        spec = {
+            "t_start": 0.0,
+            "t_end": float(job["t_end"]),
+            "n_points": int(job["n_points"]),
+            "sens_method": method,
+        }
+        sweep = F.tolerance_sweep(F._sweep_runs(F.REPO / job["path"], params, spec), params)
+        assert sweep["settled"], (method, sweep)
+        assert set(sweep["column_gaps"]) == set(params), (method, sweep)
+        assert sweep["moving"] == [], (method, sweep)
