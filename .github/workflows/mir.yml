@@ -91,6 +91,9 @@ on:
     branches: [main]
     paths: &mir_paths
       - "include/bngsim/mir_jit.hpp"
+      # Issue #1235 — c2mir reads literals with strtod, so mir_jit.hpp compiles
+      # under the per-thread "C" scope this header defines.
+      - "include/bngsim/c_locale_numbers.hpp"
       - "src/cvode_simulator.cpp"
       # Issue #75 — steady_state.cpp now resolves bngsim_codegen_output_sens off
       # the JIT too, so it is a second place a #85-class prelude bug can surface.
@@ -123,6 +126,7 @@ on:
       - "python/tests/test_codegen*.py"
       - "python/tests/test_steady_state_output_sensitivities.py"
       - "python/tests/test_mir_vendoring.py"
+      - "python/tests/test_comma_decimal_locale.py"
       - "python/tests/test_ssa_codegen_false_is_interpreted.py"
       # Issue #1257 — cc against MIR on each shape, and codegen=False still the
       # interpreter on a MIR build (#1213's check); the only leg where both run.
@@ -282,6 +286,7 @@ jobs:
             python/tests/test_codegen_steady_state_fd_step.py \
             python/tests/test_steady_state_output_sensitivities.py \
             python/tests/test_ssa_codegen_false_is_interpreted.py \
+            python/tests/test_comma_decimal_locale.py \
             python/tests/test_differential_shapes.py \
             -rA --tb=short ${{ github.event.inputs.pytest_args }} \
             2>&1 | tee mir-${{ matrix.os }}.log

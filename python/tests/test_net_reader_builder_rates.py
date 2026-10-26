@@ -453,3 +453,95 @@ class TestTokensAfterTheRateLaw:
             parse_net_file(net)
         with pytest.raises(ModelError, match=message):
             bngsim.Model.from_net(str(net))
+
+
+class TestANumberReadOnlyInPart:
+    """A group factor and an inline table value are numbers and nothing else.
+    stod stops at the first character it cannot use, and these two sites never
+    asked how much it had read, so `1/2` read 1 with no error (issue #1235's
+    mechanism, which a decimal-comma locale reached with `0.5`)."""
+
+    @pytest.mark.parametrize("factor", ["1/2", "0.5x", "nan"])
+    def test_a_group_factor_that_is_not_a_number_is_refused(
+        self, tmp_path: Path, factor: str
+    ) -> None:
+        net = _write_net(
+            tmp_path,
+            f"""
+            begin parameters
+              1 k 1
+            end parameters
+            begin species
+              1 A() 100
+            end species
+            begin reactions
+              1 1 0 k
+            end reactions
+            begin groups
+              1 Half {factor}*1
+            end groups
+            """,
+        )
+        message = re.escape(f"whose factor '{factor}' is not a number")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
+    @pytest.mark.parametrize(
+        ("xs", "ys", "bad"),
+        [("0,1,2", "0,1/2,1", "1/2"), ("0,0.5x,2", "0,1,2", "0.5x")],
+        ids=["value", "breakpoint"],
+    )
+    def test_a_table_value_that_is_not_a_number_is_refused(
+        self, tmp_path: Path, xs: str, ys: str, bad: str
+    ) -> None:
+        net = _write_net(
+            tmp_path,
+            f"""
+            begin parameters
+              1 k 1
+            end parameters
+            begin species
+              1 A() 0
+            end species
+            begin functions
+              1 f() tfun([{xs}],[{ys}],time())
+            end functions
+            begin reactions
+              1 0 1 f #_FUNC
+            end reactions
+            begin groups
+              1 Atot 1
+            end groups
+            """,
+        )
+        message = re.escape(f"has value '{bad}', which is not a number")
+        with pytest.raises(ValueError, match=message):
+            parse_net_file(net)
+        with pytest.raises(ModelError, match=message):
+            bngsim.Model.from_net(str(net))
+
+    def test_the_numbers_bng2pl_writes_still_load(self, tmp_path: Path) -> None:
+        net = _write_net(
+            tmp_path,
+            """
+            begin parameters
+              1 k 1
+            end parameters
+            begin species
+              1 A() 0
+            end species
+            begin functions
+              1 f() tfun([0,1e-3,2.5],[0,0.25,1.5e+1],time())
+            end functions
+            begin reactions
+              1 0 1 f #_FUNC
+            end reactions
+            begin groups
+              1 Half 0.5*1,2.5e-1*1
+            end groups
+            """,
+        )
+        model = bngsim.Model.from_net(str(net))
+        assert model.n_species == 1
