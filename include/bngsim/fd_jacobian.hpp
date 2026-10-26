@@ -403,8 +403,7 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 // both collapse the step there, and the straddled quotient integrates it to
 // 2.5e-7 of the exact branch. Short of parking, the run crosses the jump soon
 // and its matrix is formed again beyond it. Moving away, or standing on the
-// jump, nothing forms the matrix again and the run follows its predictor. A
-// root-finder's matrix has no motion to read, and is mended wherever it crosses.
+// jump, nothing forms the matrix again and the run follows its predictor.
 constexpr double kFdJumpRatio = 16.0;
 constexpr double kFdJumpNoise = 1024.0;
 

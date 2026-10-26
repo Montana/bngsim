@@ -276,3 +276,18 @@ def test_a_run_that_starts_on_a_threshold_between_basins(tmp_path: Path) -> None
     )
     t, s = _run(model, 200.0, 41)
     assert _worst(s[:, 0], 1.0 + 4.0 * np.exp(-0.1 * t)) < OK
+
+
+def test_a_model_with_no_jump_has_nothing_mended(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """BIOMD0000000091 is mass action alone. Its rows cancel, so a short step
+    moves them by a last bit of their terms; against a floor of a row's value
+    alone, two entries at t = 21.2 were taken for jumps and the run left main's
+    bits. Against its terms, nothing is mended and the run is CVODE's own."""
+    monkeypatch.setenv("BNGSIM_JAC_DEBUG", "1")
+    model = bngsim.Model.from_sbml(str(data_dir / "BIOMD0000000091.xml"))
+    bngsim.Simulator(model, method="ode", jacobian="fd").run(
+        t_span=(0.0, 100.0), n_points=101, rtol=RTOL, atol=ATOL
+    )
+    assert "across a jump" not in capfd.readouterr().err
