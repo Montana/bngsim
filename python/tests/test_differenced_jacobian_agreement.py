@@ -576,8 +576,8 @@ def test_a_half_step_answer_that_is_no_number_is_refused(tmp_path):
     assert "nan with X(), E() stepped by half the first step" in str(err.value)
 
 
-# The model above with Z, made at kz = 1e-30 and removed at 1, which makes X
-# at q·Z: dX*/dq = Z*/k1 and dG*/dq = 2·k·X*·dX*/dq, a column of 1e-29.
+# SECOND_ORDER with Z, made at kz = 1e-30 and removed at 1, which makes X at
+# q·Z: dX*/dq = Z*/k1 and dG*/dq = 2·k·X*·dX*/dq, a column of 1e-29.
 UNDER_LAST_BIT = (
     SECOND_ORDER.replace("    5 dg  1.0\n", "    5 dg  1.0\n    6 kz  1e-30\n    7 q   1.0\n")
     .replace("    2 G() {big!r}\n", "    2 G() {big!r}\n    3 Z() 0\n")
@@ -626,6 +626,29 @@ def test_a_function_column_under_its_last_bit_is_returned(tmp_path):
     # function's partial: (2X + h) + 2·k·X, times dX*/dq.
     h = (SO_X + SQRT_EPS * (1e8 + SO_X * SO_X)) - SO_X
     assert got == pytest.approx((4 * SO_X + h) * z / K1, rel=1e-6)
+
+
+def test_an_own_step_disagreement_under_the_last_bit_is_still_refused(tmp_path):
+    """Control. The issue's model with Z at 1e-30 making X at q·Z: dX*/dq =
+    Z*/(k1 + 4·k2·X*), 3.6e-31, and the floored step reads 2.0e-31 beside
+    G = 1e8, where X's own step reads the slope. That is under X's last
+    bit, but the own step's answer is held to 1e-4 of the column alone, as
+    on main, which refuses it too: the last bit lets through only what the
+    half step adds."""
+    text = (
+        NET.format(s=S, k1=K1, k2=K2, kd=KD, big=1e8)
+        .replace("    6 dg  1.0\n", "    6 dg  1.0\n    7 kz  1e-30\n    8 q   1.0\n")
+        .replace("    3 G() 100000000.0\n", "    3 G() 100000000.0\n    4 Z() 0\n")
+        .replace("    6 3 0 dg\n", "    6 3 0 dg\n    7 0 4 kz\n    8 4 0 dg\n    9 4 4,1 q\n")
+        .replace("    1 xsq() abs(Xo)*Xo\n    2 weak() 1e-3*Xo\n", "")
+    )
+    path = tmp_path / "own_under_last_bit.net"
+    path.write_text(text)
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian="fd")
+        sim.steady_state(sensitivity_params=["q"])
+    assert "dX()/dq is " in str(err.value)
+    assert "stepped by 1.5e-8 of itself" in str(err.value)
 
 
 @pytest.mark.parametrize("big", [1e6, 1e8])
