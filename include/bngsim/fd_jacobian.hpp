@@ -40,7 +40,8 @@ constexpr double kFdEps = 1.4901161193847656e-8;
 // to stay out of the cancellation noise.
 //
 // What the floor costs a species far below the state's scale, a step of many
-// times itself, is checked by `fd_own_step_columns` below (issue #1002).
+// times itself, is checked by `fd_own_step_columns` and `fd_half_step_columns`
+// below (issue #1002).
 inline double state_fd_step(double y, double y_scale) {
     return kFdEps * std::max(std::abs(y), y_scale);
 }
@@ -282,6 +283,63 @@ inline std::vector<int> fd_own_step_columns(Eval &&eval, const double *y, int ns
         changed.push_back(small[s]);
     }
     return changed;
+}
+
+// ─── Curvature in a row the own step does not read (issue #1002) ─────────────
+//
+// fd_own_step_columns takes an entry again only where the own step reads its
+// row, and a row that a much larger species is in is not read there: its
+// rounding over the own step is more than the entry. A term of second order in
+// the small species in such a row, `k·X²` in the rate of a species at 1e8, is
+// a secant across the floored step that nothing compares with anything:
+// dG*/ds came back 66.05 for 58.96 with jacobian="fd", and no error.
+//
+// So the column of each species far below the state's scale is also taken
+// again at half the floored step, over which a row's rounding comes to twice
+// the quotient it comes to over the floored step, and no more. A secant moves
+// with its step (k·(2X + h) for k·X²), and a slope does not: an answer that
+// both steps give is not the curvature's. A column is taken whole, every entry
+// at the one step, so that rows that add up to nothing in the right-hand side
+// add up to nothing in it. A species at 0 is taken again too: the floored step
+// is all the step it has, and k·X² there reads k·h for 0.
+//
+// `D_half` is `D` with those columns at half the floored step. Returns the
+// species whose columns were taken (0-based, ascending). One more `eval` per
+// such species. A species `excluded` names is taken too: the solve reads the
+// column of one that is a conservation law's dependent, or a fixed species a
+// parameter sets.
+template <class Eval>
+inline std::vector<int> fd_half_step_columns(Eval &&eval, const double *y, int ns, int n_out,
+                                             const std::vector<int> &excluded, const double *g0,
+                                             const double *D, double *D_half) {
+    const auto un = static_cast<std::size_t>(ns);
+    const auto um = static_cast<std::size_t>(n_out);
+    std::memcpy(D_half, D, un * um * sizeof(double));
+    std::vector<int> taken;
+    const double y_scale = state_probe_scale(y, ns, excluded);
+    std::vector<double> g1(um), y_pert(y, y + un);
+    for (int j = 0; j < ns; ++j) {
+        const auto uj = static_cast<std::size_t>(j);
+        const double h_req = state_fd_step(y[j], y_scale);
+        double unused = 0.0;
+        const double h = fd_probe(y[j], h_req, &unused);
+        if (y[j] != 0.0 && !(h > kFdRefineRatio * kFdEps * std::abs(y[j]))) {
+            continue; // stepped by about its own step: no curvature to speak of
+        }
+        const double h_half = fd_probe(y[j], 0.5 * h_req, &y_pert[uj]);
+        if (!(h_half > 0.0) || !(h_half < h)) {
+            y_pert[uj] = y[j];
+            continue; // no smaller step that a double holds
+        }
+        eval(y_pert.data(), g1.data());
+        y_pert[uj] = y[j];
+        double *col = D_half + uj * um;
+        for (std::size_t i = 0; i < um; ++i) {
+            col[i] = (g1[i] - g0[i]) / h_half;
+        }
+        taken.push_back(j);
+    }
+    return taken;
 }
 
 // Dense COLUMN-MAJOR J (ns×ns, J[j*ns + i] = ∂f_i/∂y_j) at (t, y) by one-sided

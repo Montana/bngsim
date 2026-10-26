@@ -1568,15 +1568,26 @@ struct SteadyStateResult {
     // state-chain term of a function sensitivity that was differenced (an
     // index into function_names), with the two totals in
     // sens_fd_function_floored and sens_fd_function_own_step.
+    //
+    // They are solved a third time with the matrix that has the columns of
+    // those species, and of species at 0, at half the floored step, whole
+    // (fd_half_step_columns): sens_fd_half_step_species are the species whose
+    // columns were taken. The entry put on the result is the one furthest from
+    // the floored answer by either, and sens_fd_half_step (and
+    // sens_fd_function_half_step) its value at half the step. Where a matrix
+    // has no column taken, its value is the floored one.
     std::vector<int> sens_fd_own_step_species;
+    std::vector<int> sens_fd_half_step_species;
     int sens_fd_disagree_species = -1;
     int sens_fd_disagree_param = -1;
     double sens_fd_floored = 0.0;
     double sens_fd_own_step = 0.0;
+    double sens_fd_half_step = 0.0;
     int sens_fd_disagree_function = -1;
     int sens_fd_function_param = -1;
     double sens_fd_function_floored = 0.0;
     double sens_fd_function_own_step = 0.0;
+    double sens_fd_function_half_step = 0.0;
 
     // ─── Observable / function output sensitivities at steady state (GH #12) ───
     // The chain-rule projection of the species dY_ss/dp above onto the model's
