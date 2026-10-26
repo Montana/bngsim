@@ -406,14 +406,14 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 //   parking, the run crosses the jump soon and its matrix is formed again
 //   beyond it. Moving away, or standing on the jump, nothing forms the matrix
 //   again and the run follows its predictor.
-// - The two points back stay on the species' side of 0, or the species is at
-//   0. A step wider than the species (CVODE's floor: 2.5e-2 beside a species
-//   at 1.6e-8, 7.8e13 beside one at 1.7e-4 late in a march) reads the model at
-//   negative amounts on the way back, where a saturating law is nothing like
-//   itself; five corpus models had a saturation taken for a jump that way. A
-//   species at exactly 0 stays there unless something makes it, and then it
-//   moves toward its step; its column reaches Newton only through rounding,
-//   which a jump-sized entry turns into a flip of the law.
+// - The species is more than two steps from 0, or exactly at 0. A step wider
+//   than the species (CVODE's floor: 2.5e-2 beside a species at 1.6e-8, 7.8e13
+//   beside one at 1.7e-4 late in a march, 3.2 beside one at -3.7e-7) reads the
+//   model on the other side of 0, where a saturating law is nothing like
+//   itself; six corpus models had a saturation or a pole taken for a jump that
+//   way. A species at exactly 0 stays there unless something makes it, and
+//   then it moves toward its step; its column reaches Newton only through
+//   rounding, which a jump-sized entry turns into a flip of the law.
 //
 // A row that cancels inside one rate law has terms its matrix does not show,
 // and can still have a last bit taken for a jump: BIOMD0000000520 had an entry
@@ -430,7 +430,7 @@ inline bool fd_jump_testable(double y, double f_self, double inc) {
     if (f_self * inc > 0.0) {
         return false;
     }
-    return y == 0.0 || (y > 0.0) == (y - 2.0 * inc > 0.0);
+    return y == 0.0 || std::abs(y) > 2.0 * std::abs(inc);
 }
 
 // The least change a row reads as a jump, from the sum of its terms' sizes.
