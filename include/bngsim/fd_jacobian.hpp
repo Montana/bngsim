@@ -305,7 +305,8 @@ inline std::vector<int> fd_own_step_columns(Eval &&eval, const double *y, int ns
 //
 // `D_half` is `D` with those columns at half the floored step. Returns the
 // species whose columns were taken (0-based, ascending). One more `eval` per
-// such species.
+// such species. A species in `excluded` (ascending) is not taken: the solve
+// holds it, and does not read its column.
 template <class Eval>
 inline std::vector<int> fd_half_step_columns(Eval &&eval, const double *y, int ns, int n_out,
                                              const std::vector<int> &excluded, const double *g0,
@@ -316,8 +317,13 @@ inline std::vector<int> fd_half_step_columns(Eval &&eval, const double *y, int n
     std::vector<int> taken;
     const double y_scale = state_probe_scale(y, ns, excluded);
     std::vector<double> g1(um), y_pert(y, y + un);
+    std::size_t e = 0;
     for (int j = 0; j < ns; ++j) {
         const auto uj = static_cast<std::size_t>(j);
+        if (e < excluded.size() && excluded[e] == j) {
+            ++e;
+            continue;
+        }
         const double h_req = state_fd_step(y[j], y_scale);
         double unused = 0.0;
         const double h = fd_probe(y[j], h_req, &unused);

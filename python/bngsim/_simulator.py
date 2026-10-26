@@ -8131,15 +8131,18 @@ class Simulator:
             text = ", ".join(names[:5])
             return text + (f" and {len(names) - 5} more" if len(names) > 5 else "")
 
-        def others(first: float, own: float, half: float, own_whose: str, half_whose: str) -> str:
+        def others(
+            first: float, own: float, half: float, own_whose: str, half_whose: str, of: str
+        ) -> str:
             # The second answers that are not the first (an answer that is no
-            # number is not).
+            # number is not), and how far the furthest is.
             said = []
             if own != first:
                 said.append(f"{own:.6g} with {own_whose} stepped by 1.5e-8 of itself")
             if half != first:
                 said.append(f"{half:.6g} with {half_whose} stepped by half the first step")
-            return ", and ".join(said)
+            apart = "the further of them more" if len(said) > 1 else "more"
+            return ", and ".join(said) + f", {apart} than 1e-4 of {of} from the first."
 
         opening = (
             "steady_state(sensitivity_params=...) does not return {what} for this model at "
@@ -8158,8 +8161,9 @@ class Simulator:
                     result.sens_fd_half_step,
                     listed(result.sens_fd_own_step_species),
                     listed(result.sens_fd_half_step_species),
+                    "the column's largest entry",
                 )
-                + f", more than 1e-4 of the column's largest entry from the first. {why}"
+                + f" {why}"
             )
         if result.sens_fd_disagree_function is not None:
             raise SimulationError(
@@ -8174,9 +8178,9 @@ class Simulator:
                     result.sens_fd_function_half_step,
                     "the species far below that scale",
                     "those species and the species at 0",
+                    "the largest function sensitivity in that column",
                 )
-                + ", more than 1e-4 of the largest function sensitivity in that column from "
-                f"the first. {why}"
+                + f" {why}"
             )
 
     def _raise_if_not_an_isolated_root(

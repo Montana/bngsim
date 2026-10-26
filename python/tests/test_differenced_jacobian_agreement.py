@@ -144,9 +144,9 @@ def test_a_closed_form_jacobian_is_not_asked(tmp_path, big):
     its columns are right whatever G is: nothing is solved twice."""
     out = _steady(_model(tmp_path, big, functions=()))
     assert out.sens_jacobian_source != "finite-difference"
+    assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-9)
     assert out.sens_fd_own_step_species == []
     assert out.sens_fd_half_step_species == []
-    assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-9)
 
 
 GRAIN = """begin parameters
@@ -420,8 +420,8 @@ SO_X = S / K1
 SO_DG_DS = 2 * SO_X / K1
 
 
-def _second_order(tmp_path, big, functions=False):
-    text = SECOND_ORDER.format(s=S, k1=K1, big=float(big))
+def _second_order(tmp_path, big, functions=False, s=S):
+    text = SECOND_ORDER.format(s=s, k1=K1, big=float(big))
     if not functions:
         text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
     path = tmp_path / "second_order.net"
@@ -459,11 +459,11 @@ def test_curvature_both_steps_agree_on_is_returned(tmp_path):
     so its column is taken again at half the step, and the two answers are
     6e-6 of each other: returned, the floored one."""
     out = _steady(_second_order(tmp_path, 1e4), jacobian="fd")
-    assert out.sens_fd_half_step_species == ["X()"]
-    assert out.sens_fd_disagree_species is None
     sens = np.asarray(out.sensitivity)
     assert sens[1, 0] == pytest.approx(_secant_dg_ds(1e4), rel=1e-9)
     assert sens[1, 0] == pytest.approx(SO_DG_DS, rel=2e-5)
+    assert out.sens_fd_disagree_species is None
+    assert out.sens_fd_half_step_species == ["X()"]
 
 
 def test_curvature_in_a_declined_function_over_a_larger_species_is_refused(tmp_path):
@@ -511,13 +511,13 @@ def test_a_species_at_0_is_returned_where_the_step_does_not_decide(tmp_path, big
     model = _model(tmp_path, big, functions=(), s=0.0)
     sim = bngsim.Simulator(model, method="ode", jacobian="fd")
     out = sim.steady_state(sensitivity_params=["sg", "s"] if big == 1.0 else ["sg"])
-    assert out.sens_fd_disagree_species is None
-    assert out.sens_fd_half_step_species == ["X()", "D()"]
     sens = np.asarray(out.sensitivity)
     assert sens[0, 0] == 0.0
     assert sens[2, 0] == pytest.approx(1.0, rel=1e-12)
     if big == 1.0:
         assert sens[0, 1] == pytest.approx(1.0 / K1, rel=1e-6)
+    assert out.sens_fd_disagree_species is None
+    assert out.sens_fd_half_step_species == ["X()", "D()"]
 
 
 def test_a_declined_function_of_a_species_at_0_is_refused(tmp_path):
@@ -565,9 +565,9 @@ def test_a_half_step_answer_that_is_no_number_is_refused(tmp_path):
     """E is made at a rate that is no number for X between 0.6 and 0.9, and
     X sits at 0 beside G = 1e8: the floored step, 1.49, is past that window
     and half of it is inside. The floored answer, dX*/ds = 1/k1, is right
-    here, and main returns it; but a solve that is no number confirms
-    nothing, and the columns are refused, as they are where the own step's
-    solve is no number."""
+    here, and main returns it; but a column that is no number at half the
+    step confirms nothing, and a column of the answer that reads it is
+    refused, as one is where the own step's solve is no number."""
     path = tmp_path / "nan_window.net"
     path.write_text(NAN_WINDOW)
     with pytest.raises(bngsim.SimulationError, match=r"dY_ss/dp") as err:
@@ -576,79 +576,86 @@ def test_a_half_step_answer_that_is_no_number_is_refused(tmp_path):
     assert "nan with X(), E() stepped by half the first step" in str(err.value)
 
 
+@pytest.mark.parametrize("kw", [{}, {"jacobian": "fd"}])
+def test_a_half_step_column_that_is_no_number_is_not_read_where_its_entry_is_0(tmp_path, kw):
+    """Control. Asked for sg, which moves neither X nor E, the answer does
+    not read X's column, nor r's partial over X: dG*/dsg = 1 and the rest 0
+    are returned, as on main, with the differenced Jacobian and with the
+    default one (where only r's partial is differenced)."""
+    path = tmp_path / "nan_window.net"
+    path.write_text(NAN_WINDOW)
+    sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", **kw)
+    out = sim.steady_state(sensitivity_params=["sg"])
+    sens = np.asarray(out.sensitivity)
+    assert sens[0, 0] == 0.0
+    assert sens[1, 0] == 0.0
+    assert sens[2, 0] == pytest.approx(1.0, rel=1e-12)
+    got = float(np.asarray(out.output_sensitivities(["r"])).ravel()[0])
+    assert got == 0.0
+
+
 # SECOND_ORDER with Z, made at kz = 1e-30 and removed at 1, which makes X at
 # q·Z: dX*/dq = Z*/k1 and dG*/dq = 2·k·X*·dX*/dq, a column of 1e-29.
-UNDER_LAST_BIT = (
+TINY_COLUMN = (
     SECOND_ORDER.replace("    5 dg  1.0\n", "    5 dg  1.0\n    6 kz  1e-30\n    7 q   1.0\n")
     .replace("    2 G() {big!r}\n", "    2 G() {big!r}\n    3 Z() 0\n")
     .replace("    5 2 0 dg\n", "    5 2 0 dg\n    6 0 3 kz\n    7 3 0 dg\n    8 3 3,1 q\n")
 )
 
 
-def _under_last_bit(tmp_path, functions):
-    text = UNDER_LAST_BIT.format(s=S, k1=K1, big=1e8)
+def _tiny_column(tmp_path, functions):
+    text = TINY_COLUMN.format(s=S, k1=K1, big=1e8)
     if not functions:
         text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
-    path = tmp_path / "under_last_bit.net"
+    path = tmp_path / "tiny_column.net"
     path.write_text(text)
     return bngsim.Model.from_net(path)
 
 
-def test_a_column_under_the_last_bit_of_its_species_is_returned(tmp_path):
-    """Control. dG*/dq is 5.9e-29 beside G at 1e8, and the half step moves
-    it by 3.5e-30: apart by 5% of the column, and by 21 decades less than
-    the last bit of G, for a change in q of its own size. That is no
-    second answer, and the floored one is returned as main returns it.
-    (BIOMD0000000347's dY/dEpoRCISRemove, at 1e-36 and less beside species
-    at 0.01 to 370, was refused for it.)"""
-    sim = bngsim.Simulator(_under_last_bit(tmp_path, False), method="ode", jacobian="fd")
-    out = sim.steady_state(sensitivity_params=["q"])
-    assert out.sens_fd_disagree_species is None
-    assert "X()" in out.sens_fd_half_step_species
-    z = float(np.asarray(out.concentrations)[2])
-    assert z == pytest.approx(1e-30, rel=1e-6)
-    sens = np.asarray(out.sensitivity)
-    assert sens[0, 0] == pytest.approx(z / K1, rel=1e-6)
-    # The floored secant, k·(2X + h)·dX*/dq, 12% from the slope 2·k·X*·dX*/dq.
-    assert sens[1, 0] == pytest.approx(_secant_dg_ds(1e8) * z, rel=1e-6)
-
-
-def test_a_function_column_under_its_last_bit_is_returned(tmp_path):
-    """Control. ``gx = abs(X)·X + G`` is at 1e8, and its total for q,
-    1.2e-28, moves by 3.5e-30 at half the step: under the function's last
-    bit, and returned as main returns it."""
-    sim = bngsim.Simulator(_under_last_bit(tmp_path, True), method="ode")
-    out = sim.steady_state(sensitivity_params=["q"])
-    assert out.sens_fd_disagree_function is None
-    z = float(np.asarray(out.concentrations)[2])
-    got = float(np.asarray(out.output_sensitivities(["gx"])).ravel()[0])
-    # dG*/dq from the closed-form Jacobian, and the floored secant of the
-    # function's partial: (2X + h) + 2·k·X, times dX*/dq.
-    h = (SO_X + SQRT_EPS * (1e8 + SO_X * SO_X)) - SO_X
-    assert got == pytest.approx((4 * SO_X + h) * z / K1, rel=1e-6)
-
-
-def test_an_own_step_disagreement_under_the_last_bit_is_still_refused(tmp_path):
-    """Control. The issue's model with Z at 1e-30 making X at q·Z: dX*/dq =
-    Z*/(k1 + 4·k2·X*), 3.6e-31, and the floored step reads 2.0e-31 beside
-    G = 1e8, where X's own step reads the slope. That is under X's last
-    bit, but the own step's answer is held to 1e-4 of the column alone, as
-    on main, which refuses it too: the last bit lets through only what the
-    half step adds."""
-    text = (
-        NET.format(s=S, k1=K1, k2=K2, kd=KD, big=1e8)
-        .replace("    6 dg  1.0\n", "    6 dg  1.0\n    7 kz  1e-30\n    8 q   1.0\n")
-        .replace("    3 G() 100000000.0\n", "    3 G() 100000000.0\n    4 Z() 0\n")
-        .replace("    6 3 0 dg\n", "    6 3 0 dg\n    7 0 4 kz\n    8 4 0 dg\n    9 4 4,1 q\n")
-        .replace("    1 xsq() abs(Xo)*Xo\n    2 weak() 1e-3*Xo\n", "")
-    )
-    path = tmp_path / "own_under_last_bit.net"
-    path.write_text(text)
-    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
-        sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian="fd")
+def test_a_column_of_1e_29_is_held_to_the_same_check(tmp_path):
+    """dG*/dq is 5.9e-29 beside G at 1e8, and the floored step reads it 12%
+    high, as it reads dG*/ds: main returned it with ``jacobian="fd"`` and no
+    error. A column is refused for what the step does to it, whatever its
+    size; the half step moves this one by 5% of itself."""
+    sim = bngsim.Simulator(_tiny_column(tmp_path, False), method="ode", jacobian="fd")
+    with pytest.raises(bngsim.SimulationError, match=r"dG\(\)/dq is ") as err:
         sim.steady_state(sensitivity_params=["q"])
-    assert "dX()/dq is " in str(err.value)
-    assert "stepped by 1.5e-8 of itself" in str(err.value)
+    assert "stepped by half the first step" in str(err.value)
+
+
+def test_a_function_column_of_1e_28_is_held_to_the_same_check(tmp_path):
+    """``gx = abs(X)·X + G`` beside G at 1e8: d(gx)/dq is 1.2e-28, and the
+    floored partial over X reads it 6% high at the default settings, where
+    main returned it with no error."""
+    sim = bngsim.Simulator(_tiny_column(tmp_path, True), method="ode")
+    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
+        sim.steady_state(sensitivity_params=["q"])
+    assert "dgx/dq is " in str(err.value)
+
+
+@pytest.mark.parametrize("s", [1e-12, 1e-9])
+def test_a_parameter_at_a_small_value_is_held_to_the_same_check(tmp_path, s):
+    """dG*/ds = 2·k·s/k1², 4.5e-11 at s = 1e-12, where X* = s/k1 is 4.8e-12
+    beside G at 1e8. The floored step, 1.49, reads k·(2X + h): main returned
+    dG*/ds = 7.0958 with ``jacobian="fd"`` and no error, 1.6e11 times the
+    slope. (A floor on the half step's disagreement that was scaled by the
+    parameter's size let it through.)"""
+    x = s / K1
+    h = (x + SQRT_EPS * (1e8 + x * x)) - x
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        _steady(_second_order(tmp_path, 1e8, s=s), jacobian="fd")
+    assert "dG()/ds is " + format((2 * x + h) / K1, ".6g") in str(err.value)
+    assert "stepped by half the first step" in str(err.value)
+
+
+def test_a_species_the_mask_leaves_out_is_not_stepped_again(tmp_path):
+    """Control. With ``mask=`` keeping X and G, D is held where the solve
+    left it and its column is not read: it is not taken at half the step,
+    though it is far below G. X is, and dX*/ds is returned."""
+    sim = bngsim.Simulator(_model(tmp_path, 1e4, functions=()), method="ode", jacobian="fd")
+    out = sim.steady_state(sensitivity_params=["s"], mask=["X()", "G()"])
+    assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-4)
+    assert out.sens_fd_half_step_species == ["X()"]
 
 
 @pytest.mark.parametrize("big", [1e6, 1e8])
