@@ -5,6 +5,7 @@
 // workflows (e.g., equilibrate → setConcentration → simulate).
 
 #include "bngsim/nfsim_simulator.hpp"
+#include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/expression.hpp"
 #include "bngsim/platform_compat.hpp" // POSIX getpid() shim for Windows (GH #150)
 #include "bngsim/result.hpp"
@@ -849,17 +850,24 @@ struct NfsimSimulator::Impl {
         // Pass through the same-complex-binding-block flag (NFsim ``-bscb``).
         // When ``false``, NFsim still auto-enables complex tracking if the
         // model declares any Species-typed observable.
-        auto *system = NFinput::initializeFromXML(
-            xml_to_load.string(),
-            /*blockSameComplexBinding=*/block_same_complex_binding, molecule_limit,
-            /*verbose=*/false, suggestedTraversalLimit,
-            /*evaluateComplexScopedLocalFunctions=*/true,
-            /*connectivityFlag=*/connectivity_flag,
-            // Keep zero-base-rate rules so a post-init set_param can activate a
-            // rule that loaded with rate 0 (e.g. equilibrate then switch a rate
-            // on). Without this NFsim drops such rules at parse and the write is
-            // silently a no-op (GH #44).
-            /*keepZeroRateReactions=*/true);
+        //
+        // In "C" (#1235): NFsim reads an inline TFUN's values with strtod, so
+        // under a decimal-comma LC_NUMERIC a table with a 0.5 in it was refused.
+        ::NFcore::System *system = nullptr;
+        {
+            const ScopedCNumericLocale c_numbers;
+            system = NFinput::initializeFromXML(
+                xml_to_load.string(),
+                /*blockSameComplexBinding=*/block_same_complex_binding, molecule_limit,
+                /*verbose=*/false, suggestedTraversalLimit,
+                /*evaluateComplexScopedLocalFunctions=*/true,
+                /*connectivityFlag=*/connectivity_flag,
+                // Keep zero-base-rate rules so a post-init set_param can activate a
+                // rule that loaded with rate 0 (e.g. equilibrate then switch a rate
+                // on). Without this NFsim drops such rules at parse and the write is
+                // silently a no-op (GH #44).
+                /*keepZeroRateReactions=*/true);
+        }
 
         if (changed_cwd) {
             try {

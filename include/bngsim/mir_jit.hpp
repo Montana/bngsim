@@ -20,6 +20,8 @@
 #include <string>
 
 #if defined(BNGSIM_HAS_MIR)
+#include "bngsim/c_locale_numbers.hpp" // c2mir reads literals with strtod (#1235)
+
 #include <cmath> // libm addresses for the prelude's import table (GH #3)
 #include <cstddef>
 #include <cstdio>  // open_memstream/tmpfile, FILE, fflush, fclose, stderr
@@ -480,8 +482,15 @@ class MirJit {
         opts.message_file = diag.file();
 
         detail::MirSourceReader reader{jit_source.c_str()};
-        int ok = c2mir_compile(ctx_, &opts, detail::mir_source_getc, &reader, "bngsim_rhs_module",
+        int ok = 0;
+        {
+            // c2mir converts a float literal with strtod and refuses whatever
+            // strtod leaves, so under a decimal-comma LC_NUMERIC every `0.5` in
+            // the source was a "wrong number" and the compile failed (#1235).
+            const ScopedCNumericLocale c_numbers;
+            ok = c2mir_compile(ctx_, &opts, detail::mir_source_getc, &reader, "bngsim_rhs_module",
                                nullptr);
+        }
         std::string diagnostics = diag.str();
 
         if (!ok) {

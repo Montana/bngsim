@@ -1,6 +1,7 @@
 // bngsim/src/rulemonkey_simulator.cpp — RuleMonkey simulator wrapper
 
 #include "bngsim/rulemonkey_simulator.hpp"
+#include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/wallclock.hpp"
 #include "seed_count_rounding.hpp" // round_half_up_count — the GH #51 policy
 
@@ -188,8 +189,14 @@ bool on_session_clock(double t, double session_t) {
 
 struct RuleMonkeySimulator::Impl {
     explicit Impl(std::string path) : xml_path(std::move(path)) {
-        sim = std::make_unique<rulemonkey::RuleMonkeySimulator>(xml_path,
-                                                                rulemonkey::Method::NfExact);
+        {
+            // RuleMonkey's loader reads TFUN values and symmetry factors with
+            // std::stod: under a decimal-comma LC_NUMERIC a table's 0.5 read 0,
+            // and the run went on with no error (#1235).
+            const ScopedCNumericLocale c_numbers;
+            sim = std::make_unique<rulemonkey::RuleMonkeySimulator>(xml_path,
+                                                                    rulemonkey::Method::NfExact);
+        }
         reject_unsupported_errors(*sim);
         apply_seed_rounding();
     }
