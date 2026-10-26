@@ -216,7 +216,7 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // entry that does is given fd_entry_past_jump. A column of a color leaves the
 // rows of the other columns of that color alone, so one evaluation serves them
 // all, as the quotient's own does. The session is an integrator, so a column is
-// mended only where fd_jump_mendable takes it. Null leaves the quotient as it
+// tested only where fd_jump_testable takes it. Null leaves the quotient as it
 // was. `*n_mended` (if given) counts the entries mended.
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
@@ -286,20 +286,23 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
     };
     for (int c = 0; c < sp.n_colors; ++c) {
         const auto &group = sp.color_groups[c];
-        auto mendable = [&](int j) { return fd_jump_mendable(fy[j], h_vals[j]); };
+        auto mendable = [&](int j) { return fd_jump_testable(y[j], fy[j], h_vals[j]); };
         if (std::none_of(group.begin(), group.end(), mendable) || !side(group, 2.0, f2)) {
             continue;
         }
         // f(y + h) is fy + h·J to the rounding of the column formula.
+        auto may_at = [&](int j, int64_t k) {
+            const int i = static_cast<int>(sp.row_indices[k]);
+            const double d01 = jac_data[k] * h_vals[j];
+            return fd_step_may_cross_jump(d01, f2[i] - fy[i] - d01, fd_jump_floor(terms[i]));
+        };
         bool may = false;
         for (int j : group) {
             if (!mendable(j)) {
                 continue;
             }
             for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1] && !may; ++k) {
-                const int i = static_cast<int>(sp.row_indices[k]);
-                const double d01 = jac_data[k] * h_vals[j];
-                may = fd_step_may_cross_jump(d01, f2[i] - fy[i] - d01, fd_jump_floor(terms[i]));
+                may = may_at(j, k);
             }
         }
         if (!may || !side(group, -1.0, fm1) || !side(group, -2.0, fm2)) {
@@ -315,7 +318,7 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
                 const double d12 = f2[i] - fy[i] - d01;
                 const double dmm = fm1[i] - fm2[i];
                 const double floor = fd_jump_floor(terms[i]);
-                if (fd_step_crosses_jump(dmm, d01, d12, floor)) {
+                if (may_at(j, k) && fd_step_crosses_jump(dmm, d01, d12, floor)) {
                     jac_data[k] = fd_entry_past_jump(dmm, fy[i] - fm1[i], d12, floor, h_vals[j]);
                     if (n_mended != nullptr) {
                         ++*n_mended;

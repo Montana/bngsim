@@ -396,20 +396,42 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 // `fd_step_may_cross_jump` is the half of the test the forward step gives; only
 // where it holds are the two backward points worth evaluating.
 //
-// An integrator's matrix is mended only where the species is not moving toward
-// the jump its step crosses (`fd_jump_mendable`). Moving toward it, the large
-// slope is what lets CVODE hold a species that parks just short of a jump: the
-// #176 fixture parks V 1e-11 under a step, the closed form and a mended matrix
-// both collapse the step there, and the straddled quotient integrates it to
-// 2.5e-7 of the exact branch. Short of parking, the run crosses the jump soon
-// and its matrix is formed again beyond it. Moving away, or standing on the
-// jump, nothing forms the matrix again and the run follows its predictor.
+// A column is tested only where `fd_jump_testable` holds:
+//
+// - The species is not moving toward the jump its step would cross. Moving
+//   toward it, the large slope is what lets CVODE hold a species that parks
+//   just short of a jump: the #176 fixture parks V 1e-11 under a step, the
+//   closed form and a mended matrix both collapse the step there, and the
+//   straddled quotient integrates it to 2.5e-7 of the exact branch. Short of
+//   parking, the run crosses the jump soon and its matrix is formed again
+//   beyond it. Moving away, or standing on the jump, nothing forms the matrix
+//   again and the run follows its predictor.
+// - The two points back stay on the species' side of 0, or the species is at
+//   0. A step wider than the species (CVODE's floor: 2.5e-2 beside a species
+//   at 1.6e-8, 7.8e13 beside one at 1.7e-4 late in a march) reads the model at
+//   negative amounts on the way back, where a saturating law is nothing like
+//   itself; five corpus models had a saturation taken for a jump that way. A
+//   species at exactly 0 stays there unless something makes it, and then it
+//   moves toward its step; its column reaches Newton only through rounding,
+//   which a jump-sized entry turns into a flip of the law.
+//
+// A row that cancels inside one rate law has terms its matrix does not show,
+// and can still have a last bit taken for a jump: BIOMD0000000520 had an entry
+// of 1e-9 mended, against an iteration that cannot feel it (the run was bit
+// for bit). Weighing an entry by the solver's step does not tell those apart:
+// a run's first step is 1.9e-10 beside `if(X > 5, ...)` at X = 5, and the
+// matrix formed there is used at steps 1e10 times longer.
 constexpr double kFdJumpRatio = 16.0;
 constexpr double kFdJumpNoise = 1024.0;
 
-// Does a time integrator's quotient of species j, stepped by `inc` from a state
-// where its own rate is `f_self`, get mended where it crosses a jump?
-inline bool fd_jump_mendable(double f_self, double inc) { return !(f_self * inc > 0.0); }
+// Is a time integrator's column of species j, at `y` with its own rate
+// `f_self`, stepped by `inc`, tested for a jump?
+inline bool fd_jump_testable(double y, double f_self, double inc) {
+    if (f_self * inc > 0.0) {
+        return false;
+    }
+    return y == 0.0 || (y > 0.0) == (y - 2.0 * inc > 0.0);
+}
 
 // The least change a row reads as a jump, from the sum of its terms' sizes.
 inline double fd_jump_floor(double row_terms) {
