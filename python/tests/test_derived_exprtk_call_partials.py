@@ -24,6 +24,15 @@ import pytest
 import sympy as sp
 from bngsim._jacobian import exprtk_closed_form_bindings
 
+
+def _ncdf(p):
+    return 0.5 * math.erfc(-p / math.sqrt(2))
+
+
+def _phi(p):
+    return math.exp(-p * p / 2) / math.sqrt(2 * math.pi)
+
+
 # text of k over p, p, k(p), k'(p)
 CLOSED_FORMS = {
     "log10": ("log10(p)", 100.0, math.log10, lambda p: 1 / (p * math.log(10))),
@@ -43,11 +52,35 @@ CLOSED_FORMS = {
     "log1p": ("log1p(p)", 0.5, math.log1p, lambda p: 1 / (1 + p)),
     "expm1": ("expm1(p)", 0.5, math.expm1, math.exp),
     "hypot": ("hypot(p, 2)", 0.5, lambda p: math.hypot(p, 2), lambda p: p / math.hypot(p, 2)),
-    "ncdf": (
-        "ncdf(p)",
-        0.5,
-        lambda p: 0.5 * math.erfc(-p / math.sqrt(2)),
-        lambda p: math.exp(-p * p / 2) / math.sqrt(2 * math.pi),
+    "ncdf": ("ncdf(p)", 0.5, _ncdf, _phi),
+    # The partial keeps ncdf's value, 6.2e-16 at p = -8. sympy wrote erfc(-x/√2)
+    # as 2 - erfc(x/√2), and the C's 1 - erfc(p/√2)/2 read it 7% high; at
+    # p = -8.5 it read 0 and the run failed on a non-finite partial.
+    "ncdf in its lower tail": (
+        "-log(ncdf(p))/40",
+        -8.0,
+        lambda p: -math.log(_ncdf(p)) / 40,
+        lambda p: -_phi(p) / (40 * _ncdf(p)),
+    ),
+    "ncdf further out": (
+        "-log(ncdf(p))/40",
+        -8.5,
+        lambda p: -math.log(_ncdf(p)) / 40,
+        lambda p: -_phi(p) / (40 * _ncdf(p)),
+    ),
+    # A model's own erfc(-p), folded the same way: 0.4% off at p = -5.5,
+    # non-finite at p = -6.
+    "erfc in its lower tail": (
+        "-log(erfc(-p))/40",
+        -5.5,
+        lambda p: -math.log(math.erfc(-p)) / 40,
+        lambda p: -2 * math.exp(-p * p) / (40 * math.sqrt(math.pi) * math.erfc(-p)),
+    ),
+    "erfc further out": (
+        "-log(erfc(-p))/40",
+        -6.0,
+        lambda p: -math.log(math.erfc(-p)) / 40,
+        lambda p: -2 * math.exp(-p * p) / (40 * math.sqrt(math.pi) * math.erfc(-p)),
     ),
     "deg2rad": ("deg2rad(p)", 30.0, lambda p: p * math.pi / 180, lambda p: math.pi / 180),
     "rad2deg": ("rad2deg(p)", 0.01, lambda p: p * 180 / math.pi, lambda p: 180 / math.pi),
