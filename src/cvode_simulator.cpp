@@ -14,6 +14,7 @@
 // Uses Jacobian sparsity computed at model load time for sparse linear solves.
 
 #include "bngsim/atol_vector.hpp"
+#include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/codegen_abi.hpp"
 #include "bngsim/functional_jac_scatter.hpp"
 #include "bngsim/lapack_dense_linsol.hpp"
@@ -5144,7 +5145,7 @@ void CvodeSimulator::Impl::setup_sens_error_floor(const SolverOptions &opts, int
     }
     double frac = kSensFloorTauFraction;
     if (const char *fenv = std::getenv("BNGSIM_SENS_ERROR_FLOOR_TAU")) {
-        const double v = std::atof(fenv);
+        const double v = c_atof(fenv);
         if (v > 0.0) {
             frac = v;
         }
@@ -5191,7 +5192,7 @@ void CvodeSimulator::Impl::setup_sens_error_floor(const SolverOptions &opts, int
         sens.floor_do_unresolvable = std::string(ur) != "0";
     }
     if (const char *uc = std::getenv("BNGSIM_SENS_FLOOR_UNRESOLVABLE_CAP")) {
-        const double v = std::atof(uc);
+        const double v = c_atof(uc);
         if (v > 0.0) {
             sens.floor_unresolvable_cap = v;
         }
@@ -15554,7 +15555,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     const bool ladder_off = ladder_mode == "off";
     double ladder_first = 1e-6;
     if (const char *lf = std::getenv("BNGSIM_SENS_FLOOR_LADDER_FIRST")) {
-        const double v = std::atof(lf);
+        const double v = c_atof(lf);
         if (v > 0.0 && v < 1.0) {
             ladder_first = v;
         }
@@ -15570,7 +15571,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // never calls CVodeSensSVtolerances.
     double ladder_ratio = 2.0;
     if (const char *lr = std::getenv("BNGSIM_SENS_FLOOR_LADDER_RATIO")) {
-        const double v = std::atof(lr);
+        const double v = c_atof(lr);
         if (v > 1.0) {
             ladder_ratio = v;
         }
