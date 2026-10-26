@@ -398,14 +398,23 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 //
 // A column is tested only where `fd_jump_testable` holds:
 //
-// - The species is not moving toward the jump its step would cross. Moving
-//   toward it, the large slope is what lets CVODE hold a species that parks
-//   just short of a jump: the #176 fixture parks V 1e-11 under a step, the
-//   closed form and a mended matrix both collapse the step there, and the
-//   straddled quotient integrates it to 2.5e-7 of the exact branch. Short of
+// - The species is not moving toward the jump its step would cross
+//   (`fd_jump_testable`), and of the mends its column takes, those are kept
+//   where it moves away at more than kFdJumpParked of the terms of its own row
+//   in the mended matrix, or where nothing moves it (that row is zero:
+//   `fd_jump_unparked`). Then nothing forms the matrix again and the run
+//   follows its predictor, or the LU's rounding is all that moves the species.
+//   The mended matrix, because its own straddled entry swells a row's terms:
+//   X at 0.1 beside `if(X > 5, ...)·X` had terms of 6.7e6.
+//   Moving toward the jump, the large slope is what lets CVODE hold a species
+//   that parks just short of it: the #176 fixture parks V 1e-11 under a step,
+//   the closed form and a mended matrix both collapse the step there, and the
+//   straddled quotient integrates it to 2.5e-7 of the exact branch; short of
 //   parking, the run crosses the jump soon and its matrix is formed again
-//   beyond it. Moving away, or standing on the jump, nothing forms the matrix
-//   again and the run follows its predictor.
+//   beyond it. Parked, its rate is its solver's noise and points either way:
+//   with V's asymptote 9e-11 under the step and tolerances of 1e-8, the march
+//   read V moving away at t = 27.7 and, mended, never converged (residual 18
+//   where main reaches 5e-10).
 // - The species is more than two steps from 0, or exactly at 0. A step wider
 //   than the species (CVODE's floor: 2.5e-2 beside a species at 1.6e-8, 7.8e13
 //   beside one at 1.7e-4 late in a march, 3.2 beside one at -3.7e-7) reads the
@@ -423,6 +432,7 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 // matrix formed there is used at steps 1e10 times longer.
 constexpr double kFdJumpRatio = 16.0;
 constexpr double kFdJumpNoise = 1024.0;
+constexpr double kFdJumpParked = 1e-6;
 
 // Is a time integrator's column of species j, at `y` with its own rate
 // `f_self`, stepped by `inc`, tested for a jump?
@@ -432,6 +442,19 @@ inline bool fd_jump_testable(double y, double f_self, double inc) {
     }
     return y == 0.0 || std::abs(y) > 2.0 * std::abs(inc);
 }
+
+// Are the mends of a tested column kept, its species' own rate `f_self` out of
+// its row's terms `self_terms` in the mended matrix?
+inline bool fd_jump_unparked(double f_self, double self_terms) {
+    return self_terms == 0.0 || std::abs(f_self) > kFdJumpParked * self_terms;
+}
+
+// A mend made, and undone where its column's species turns out parked.
+struct FdJumpMend {
+    std::size_t at; // the entry, in the solver's matrix data
+    long col;       // its column
+    double was;     // what the quotient had read
+};
 
 // The least change a row reads as a jump, from the sum of its terms' sizes.
 inline double fd_jump_floor(double row_terms) {

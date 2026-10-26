@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace bngsim {
 
@@ -284,6 +285,7 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
         }
         return true;
     };
+    std::vector<FdJumpMend> mends;
     for (int c = 0; c < sp.n_colors; ++c) {
         const auto &group = sp.color_groups[c];
         auto mendable = [&](int j) { return fd_jump_testable(y[j], fy[j], h_vals[j]); };
@@ -319,12 +321,28 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
                 const double dmm = fm1[i] - fm2[i];
                 const double floor = fd_jump_floor(terms[i]);
                 if (may_at(j, k) && fd_step_crosses_jump(dmm, d01, d12, floor)) {
+                    mends.push_back({static_cast<std::size_t>(k), j, jac_data[k]});
                     jac_data[k] = fd_entry_past_jump(dmm, fy[i] - fm1[i], d12, floor, h_vals[j]);
-                    if (n_mended != nullptr) {
-                        ++*n_mended;
-                    }
                 }
             }
+        }
+    }
+    if (mends.empty()) {
+        return;
+    }
+    for (int i = 0; i < ns; ++i) {
+        terms[i] = std::abs(fy[i]);
+    }
+    for (int j = 0; j < ns; ++j) {
+        for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+            terms[sp.row_indices[k]] += std::abs(jac_data[k] * y[j]);
+        }
+    }
+    for (const FdJumpMend &m : mends) {
+        if (!fd_jump_unparked(fy[m.col], terms[m.col])) {
+            jac_data[m.at] = m.was;
+        } else if (n_mended != nullptr) {
+            ++*n_mended;
         }
     }
 }

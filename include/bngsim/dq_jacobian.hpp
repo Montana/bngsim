@@ -107,6 +107,7 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
     if (side == nullptr) {
         return -1;
     }
+    std::vector<FdJumpMend> mends;
     auto side_at = [&](sunindextype j, double yj, double m, double *out) {
         yd[j] = yj + m * inc_of(j, yj);
         N_VSetArrayPointer(out, side);
@@ -139,13 +140,34 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
             const double dmm = fm1[i] - fm2[i];
             const double floor = fd_jump_floor(terms[i]);
             if (may_at(i) && fd_step_crosses_jump(dmm, d01, d12, floor)) {
+                mends.push_back({static_cast<std::size_t>(j) * un + static_cast<std::size_t>(i),
+                                 static_cast<long>(j), col[i]});
                 col[i] = fd_entry_past_jump(dmm, f0[i] - fm1[i], d12, floor, inc);
-                ++*n_mended;
             }
         }
     }
     N_VSetArrayPointer(nullptr, side);
     N_VDestroy(side);
+    if (mends.empty()) {
+        return 0;
+    }
+    double *jac = SUNDenseMatrix_Data(J);
+    for (sunindextype i = 0; i < n; ++i) {
+        terms[i] = std::abs(f0[i]);
+    }
+    for (sunindextype j = 0; j < n; ++j) {
+        const double *col = SUNDenseMatrix_Column(J, j);
+        for (sunindextype i = 0; i < n; ++i) {
+            terms[i] += std::abs(col[i] * yd[j]);
+        }
+    }
+    for (const FdJumpMend &m : mends) {
+        if (fd_jump_unparked(f0[m.col], terms[m.col])) {
+            ++*n_mended;
+        } else {
+            jac[m.at] = m.was;
+        }
+    }
     return 0;
 }
 
