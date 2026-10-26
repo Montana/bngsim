@@ -44,17 +44,8 @@ def _rows(results):
 
 
 def test_each_check_is_a_row_with_its_outcome():
-    statuses = [
-        "pass",
-        "diff",
-        "unsupported",
-        "skip",
-        "exception",
-        "no_base",
-        "pass",
-        "pass",
-        "pass",
-    ]
+    statuses = ["pass", "diff", "unsupported", "skip", "exception", "no_base"]
+    statuses += ["pass"] * (len(CHECKS) - len(statuses))
     r = {
         "rows": {
             c: {"status": s, "value": 0.5, "note": f"{s} note", "extra": {"x": 1}}

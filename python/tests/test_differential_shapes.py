@@ -12,11 +12,13 @@ shapes the corpus rarely holds, on every pull request:
   ``if()``, and a ``clamp`` ramp, each wide (w = 0.5) and narrow (w = 0.01):
   only the narrow ones, at several tolerances, found #1227;
 * an equality the state sits on, ``if(Bobs==0, kb, 0)`` (#1228, #1254);
-* a derived rate constant over ``log10`` (#1214);
+* a derived rate constant over ``log10`` (#1214, fixed by #1224);
 * a state trigger that crosses exactly at a sample time (#1182);
 * a compartment an assignment rule moves, so its species are diluted;
 * ``rateOf`` across compartments (#1266);
-* a daily pulse whose width an event sets (#1244).
+* a daily pulse whose width an event sets, between pulses and inside one
+  (#1244: the grid check, 8x the output points read at the base's own, found
+  it 7.5x the trajectory's peak off before #1263).
 
 Each check is asked to pass or to say why it does not apply. A known bug that is
 still open is a strict xfail naming its issue, so its fix turns it into a
@@ -143,6 +145,13 @@ def _shapes() -> dict[str, D.Job]:
             " E1: at (time >= 50): w = 2;",
             230.0,
         ),
+        # the same, the width set inside a pulse (t = 72.5, in the one from 72)
+        "pulse-width-event-midpulse": (
+            "compartment C = 1; species X in C; X = 0; w = 1; a = 1;"
+            " J0: -> X; a*piecewise(1, (time - 24*floor(time/24)) < w, 0);"
+            " E1: at (time >= 72.5): w = 2;",
+            230.0,
+        ),
     }
     for name, (text, t_end) in sbml.items():
         jobs[name] = D.Job(name, _sbml(name, text), 0.0, t_end, 21)
@@ -186,26 +195,10 @@ def test_each_path_gives_the_same_answer(shape, check):
         assert v.status in ("pass", "skip"), f"{v.status}: {v.note}"
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        pytest.param(
-            s,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="#1214: a derived rate constant over log10 declines the analytic "
-                "sensitivity RHS",
-            ),
-        )
-        if s == "derived-log10"
-        else s
-        for s in SHAPES
-        if (s, "sens_runs") not in REFUSED
-    ],
-)
+@pytest.mark.parametrize("shape", [s for s in SHAPES if (s, "sens_runs") not in REFUSED])
 def test_the_sensitivity_rhs_is_analytic(shape):
     """A slow fallback with right answers is the #1214 class: the answers agree,
-    so only the path it took shows it."""
+    so only the path it took shows it. derived-log10 declined until #1224."""
     v = _verdicts(shape)["sens_runs"]
     assert v.extra.get("sens_rhs") == "analytic", v.extra
 

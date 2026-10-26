@@ -613,10 +613,15 @@ jobs:
         run: uv sync --extra dev --python 3.12
       - name: Build identity
         run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; print('bngsim', bngsim.__version__); bp.print_identity()"
+      # --timeout 900, not 300: three of a model's paths compile C, and the cache
+      # starts empty each night. On the PR's first run nine models passed the 300 s
+      # cap that finish in 22-90 s cold on an M3 Max (BIOMD0000000505: 48 s there),
+      # and the slowest that finished took 248 s; a timeout that flips with runner
+      # speed would alert as a regression.
       - name: Run differential_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 300 --out "$RUNNER_TEMP/differential.json" || true
+        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 900 --out "$RUNNER_TEMP/differential.json" || true
       - name: Compare
         env:
           GH_TOKEN: ${{ github.token }}

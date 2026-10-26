@@ -17,6 +17,8 @@ check                  path                                      reference
 ``cc_vs_interp``       ``codegen=True``                          ``codegen=False``
 ``cc_vs_mir``          ``BNGSIM_CODEGEN_JIT=mir``                ``codegen=True`` (cc)
 ``locale``             the run under a comma-decimal locale      the base, under ``C``
+``grid``               the run at 8x the output points, read     the base
+                       at the base's own sample times
 =====================  ========================================  =====================
 
 and three rules for bugs whose answers are right, which no comparison of
@@ -83,6 +85,8 @@ DRIFT_FACTOR = 10.0
 UNJUDGEABLE_DRIFT = 1e-3
 #: The parameters a sensitivity run takes, at most.
 MAX_SENS_PARAMS = 3
+#: The grid check's output points, as a multiple of the base's intervals.
+GRID_FACTOR = 8
 #: Comma-decimal locales, in the order tried.
 COMMA_LOCALES = ("de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR")
 
@@ -94,6 +98,7 @@ CHECKS = (
     "cc_vs_interp",
     "cc_vs_mir",
     "locale",
+    "grid",
     "sparsity_covers_jacobian",
     "backend_as_asked",
 )
@@ -355,9 +360,13 @@ def check_cc_vs_interp(base: Base) -> Verdict:
 
 
 @contextlib.contextmanager
-def _env(name: str, value: str):
+def _env(name: str, value: str | None):
+    """``name`` set to ``value`` (unset for None) for the block."""
     old = os.environ.get(name)
-    os.environ[name] = value
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
     try:
         yield
     finally:
@@ -374,8 +383,11 @@ def check_cc_vs_mir(base: Base) -> Verdict:
         return Verdict("skip", note="a build without MIR")
 
     def go():
+        # cc with the selector cleared: a run under BNGSIM_CODEGEN_JIT=mir (the
+        # MIR leg sets it for its whole suite) would compare MIR with itself.
         try:
-            cc, _ = _compiled(base.job)
+            with _env("BNGSIM_CODEGEN_JIT", None):
+                cc, _ = _compiled(base.job)
         except _NoCompiler as e:
             return Verdict("skip", note=str(e))
         with _env("BNGSIM_CODEGEN_JIT", "mir"):
@@ -385,6 +397,23 @@ def check_cc_vs_mir(base: Base) -> Verdict:
         ref = Base.__new__(Base)
         ref.__dict__.update(base.__dict__, x=np.asarray(cc.species, dtype=float))
         return ref.compare(mir.species, "mir against cc: ")
+
+    return _guard(go)
+
+
+def check_grid(base: Base) -> Verdict:
+    """The answer must not depend on where it is read: a run asked for 8x the
+    output points, read at the base's own sample times, is the base. #1244 was a
+    pulse train stepped over at one grid and caught at another: each output
+    point is a stop the integrator lands on, and a schedule's stops moved with
+    them."""
+
+    def go():
+        fine = Job(**{**base.job.__dict__, "n_points": (base.job.n_points - 1) * GRID_FACTOR + 1})
+        x, _ = run(fine)
+        return base.compare(
+            np.asarray(x.species, dtype=float)[::GRID_FACTOR], f"{GRID_FACTOR}x the points: "
+        )
 
     return _guard(go)
 
@@ -560,6 +589,7 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
         "klu_vs_dense": check_klu,
         "cc_vs_interp": check_cc_vs_interp,
         "cc_vs_mir": check_cc_vs_mir,
+        "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
     }
