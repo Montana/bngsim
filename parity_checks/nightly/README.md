@@ -166,7 +166,13 @@ gh workflow run nightly-parity.yml -f mode=record
 
 That run is a live night that also records every suite. Each suite packs its
 record (`reference_archive.py pack`) before comparing, and refuses if any PASS row
-has no recorded reference, since that row would then alert every night. The
+has no recorded reference, since that row would then alert every night. A TIMEOUT
+row with no entry is listed in the publish summary: a replay that needs the entry
+refuses it as `archive_stale`, which alerts the night after any live night that
+passes it (#1290). To keep that list short, `rr_run.py` records RoadRunner's side
+first, before bngsim starts, and kills a job only at twice the cap, up to 600 s
+(the giant pass's cap, which it does not extend); the row is still TIMEOUT past
+the cap itself, as on a live night. The
 publish job then creates the next `reference-data-vN` release with all six assets,
 or none if any suite failed to pack, and writes the manifest into the run summary
 and the `reference-manifest` artifact. Nothing replays from the new release until
