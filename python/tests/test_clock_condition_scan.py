@@ -2585,12 +2585,27 @@ def test_a_sawtooth_beyond_what_its_argument_resolves_is_refused(tmp_path, call,
         ("100*mod(1000000000000.0 + time(), 0.000146484375)", (0.0, 0.3)),
     ],
 )
-def test_a_run_on_a_sawtooth_beyond_what_its_argument_resolves_says_so(tmp_path, dose, run):
-    sim = bngsim.Simulator(_model(tmp_path, dose), method="ode")
-    with pytest.raises(bngsim.SimulationError, match=r"beyond 2\^48") as refused:
-        sim.run(t_span=run, n_points=3)
-    assert "mod(1000000000000.0 + time()" in str(refused.value)
-    assert "creep" not in str(refused.value)
+def test_a_run_on_a_sawtooth_beyond_what_its_argument_resolves_says_so(
+    tmp_path, dose, run, caplog
+):
+    """Refused, until the law was read tread by tread (issue #1018): the run is
+    now made as the evaluator reads it, a staircase with a stop on each step,
+    and warned that the call resolves only a few steps of its period."""
+    from bngsim import _switch_sensitivity
+
+    period = float(dose.rsplit(", ", 1)[1].rstrip(")"))
+    u = float(np.spacing(1e12))
+    k = np.arange(-1, math.ceil(run[1] / u) + 2)
+    widths = np.clip((k + 0.5) * u, *run) - np.clip((k - 0.5) * u, *run)
+    exact = float(np.sum(100 * np.fmod(1e12 + k * u, period) * widths))
+    _switch_sensitivity._SCHEDULE_CACHE.clear()
+    _switch_sensitivity._SAID.clear()  # said once a session
+    with caplog.at_level("WARNING", logger="bngsim"):
+        sim = bngsim.Simulator(_model(tmp_path, dose), method="ode")
+        gain = float(np.asarray(sim.run(t_span=run, n_points=3).species)[-1, 0])
+    assert gain == pytest.approx(exact, rel=1e-9)
+    said = [r.getMessage() for r in caplog.records if "beyond 2^48" in r.getMessage()]
+    assert len(said) == 1 and "mod(1000000000000.0 + time()" in said[0]
 
 
 # ── What goes wrong in the scan is not a condition that cannot be read ───────
@@ -2829,11 +2844,16 @@ def test_a_pulse_inside_the_step_resolvers_rounding_is_not_its_to_place(tmp_path
     each wrap. The step resolver reads `(1e12 + time())/0.3` to 5e-4 of a
     whole number, took the middle of a pulse for past the wrap, and placed 158
     of the 1,600 changes in a run of 240: X was 0.0109 for 0.12, on main too,
-    with no word. It declines now where the middle of a piece between two of
-    its edges is within a few last places of a level, and the scan, which
-    cannot read every double of that many pulses, says so."""
-    with pytest.raises(bngsim.SimulationError, match="cannot be placed"):
-        _x_end(tmp_path, "floor(mod(1e12 + time(), 0.3)/0.3 + 0.0005)", 241.3992)
+    with no word. It declines where the middle of a piece between two of its
+    edges is within a few last places of a level, and the scan, which could
+    not read every double of that many pulses, refused the run; read once on
+    each of its treads, it has every pulse (issue #1018)."""
+    u = float(np.spacing(1e12))
+    k = np.arange(-1, math.ceil(241.3992 / u) + 2)
+    widths = np.clip((k + 0.5) * u, 0.0, 241.3992) - np.clip((k - 0.5) * u, 0.0, 241.3992)
+    exact = float(np.sum(np.floor(np.fmod(1e12 + k * u, 0.3) / 0.3 + 0.0005) * widths))
+    gain = _x_end(tmp_path, "floor(mod(1e12 + time(), 0.3)/0.3 + 0.0005)", 241.3992)
+    assert gain == pytest.approx(exact, rel=1e-9)
 
 
 @pytest.mark.parametrize("law", ["floor(time() - 1000000000.0)", "floor(time() - 300000000.0)"])
@@ -2873,14 +2893,23 @@ def test_the_step_resolver_still_places_edges_it_can_tell_apart(tmp_path, dose, 
     assert times is not None and len(times) == stops
 
 
-# ── A sawtooth of a coarse line is left as main leaves it ────────────────────
+# ── A sawtooth of a coarse line is read tread by tread ───────────────────────
 # The scan finds every wrap of `mod(1.1e12 + time(), P)`. A run that restarts
 # on each of them restarts where the rate is flat for a double of the
 # argument, and where a period is a whole number of those doubles the rate is
 # the same on every wrap: the integrator takes a period in one step and adds
 # nothing for it (issue #998). Main's step resolver answers "no change" for
-# these and the run, with no stop, has them right.
+# these, and the run, with no stop, had them right or not as the error test
+# found each wrap. Each step of the staircase now has its stop (issue #1018).
 _COARSE = "100*mod(1100000000000.0 + time(), 0.0048828125)"  # 20 doubles of the sum
+
+
+def _coarse_exact(period: float, t_end: float, scale: float = 100.0) -> float:
+    """``scale*mod(1.1e12 + time(), period)`` summed tread by tread of the sum."""
+    u = float(np.spacing(1.1e12))
+    k = np.arange(-1, math.ceil(t_end / u) + 2)
+    widths = np.clip((k + 0.5) * u, 0.0, t_end) - np.clip((k - 0.5) * u, 0.0, t_end)
+    return float(np.sum(scale * np.fmod(1.1e12 + k * u, period) * widths))
 
 
 @pytest.mark.parametrize(
@@ -2893,41 +2922,47 @@ _COARSE = "100*mod(1100000000000.0 + time(), 0.0048828125)"  # 20 doubles of the
 def test_a_run_on_a_sawtooth_of_a_coarse_line_adds_every_period(tmp_path, dose, t_end, exact):
     """With a stop on each wrap, X was 0.0826 and 0.0592: about 72 periods of
     4,100. A resolver's answer for a sawtooth is not held against how few
-    cells of a grid its value differs across."""
+    cells of a grid its value differs across. With a stop on each step of the
+    staircase, a double before it, the rate is constant between two."""
     model = _model(tmp_path, dose)
     opts = _Options()
     bngsim.Simulator(model, method="ode")._apply_crossing_stops(opts, 0.0, t_end)
-    assert opts.stops == []
-    assert _x_end(tmp_path, dose, t_end=t_end) == pytest.approx(exact, rel=2e-3)
+    assert len(opts.stops) == math.ceil(t_end / float(np.spacing(1.1e12)) - 0.5)
+    period = float(dose.rsplit(", ", 1)[1].rstrip(")"))
+    assert _coarse_exact(period, t_end) == pytest.approx(exact, rel=1e-5)
+    assert _x_end(tmp_path, dose, t_end=t_end) == pytest.approx(
+        _coarse_exact(period, t_end), rel=1e-7
+    )
 
 
 @pytest.mark.parametrize("x0", [0.0, 1e4])
 def test_a_run_in_legs_on_a_sawtooth_of_a_coarse_line_adds_every_period(tmp_path, x0):
     """Ten legs of 0.2 fell to 0.22 of the integral; with a second stop to
     each wrap they held from X(0) = 0, and from X(0) = 1e4 one run did not
-    (0.014 of it). (As main has them, which is with three outputs to the
-    leg: with two, main is 20% over by the sixth, and so is this.)"""
+    (0.014 of it). With no stop, and two outputs to the leg, main was 20%
+    over by the sixth; with three, and from X(0) = 1e4, 4% over."""
     path = tmp_path / "coarse.net"
     path.write_text(_NET.format(dose=_COARSE).replace("X() 0", f"X() {x0!r}"), encoding="utf-8")
     sim = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode")
     for leg in range(6):
-        result = sim.run(t_span=(0.2 * leg, 0.2 * (leg + 1)), n_points=3)
+        result = sim.run(t_span=(0.2 * leg, 0.2 * (leg + 1)), n_points=2)
     gain = float(np.asarray(result.species)[-1, 0]) - x0
-    # (Main's own figure from X(0) = 1e4 is 4% over: the gain is 3e-5 of X.)
-    assert gain == pytest.approx(0.2782, rel=6e-2)
+    # (From X(0) = 1e4 the error test allows rtol*X = 1e-4 a step.)
+    assert gain == pytest.approx(_coarse_exact(0.0048828125, 1.2), rel=1e-4, abs=1e-8 * x0 * 6)
 
 
 def test_the_scan_is_not_asked_to_place_a_sawtooth_of_a_coarse_line(tmp_path):
     """`frac`, which no resolver reads: the scan has every wrap of it (below),
-    and the run takes none for a stop while the line holds each of its
-    doubles for longer than an instant."""
+    and the run takes none of those for its stops while the line holds each
+    of its doubles for longer than an instant. It has a stop on each tread of
+    the sum inside instead (issue #1018)."""
     coarse = "frac((1100000000000.0 + time())/0.0048828125)"
     assert _scan_value(tmp_path, coarse, 0.0, 0.1).size == 20
     opts = _Options()
     bngsim.Simulator(_model(tmp_path, f"100*{coarse}"), method="ode")._apply_crossing_stops(
         opts, 0.0, 0.1
     )
-    assert opts.stops == []
+    assert len(opts.stops) == math.ceil(0.1 / float(np.spacing(1.1e12)) - 0.5)
     # A fine one has its stops, as before.
     opts = _Options()
     bngsim.Simulator(_model(tmp_path, "100*frac(time()/7)"), method="ode")._apply_crossing_stops(

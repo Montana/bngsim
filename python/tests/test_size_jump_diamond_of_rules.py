@@ -297,3 +297,29 @@ def test_two_roots_a_run_constant_puts_on_one_instant_over_a_diamond(scale):
         np.testing.assert_allclose(
             sn[away], (5 * v[0] / v)[away], rtol=1e-8, err_msg=f"seed {seed}"
         )
+
+
+def test_a_function_is_not_named_as_one_of_the_model_s_parameters():
+    """A parameter of a ``_szj_`` function's name is bound to the function
+    (#266), which wrote its value over the parameter's at every step. Here
+    the parameter is S's decay rate."""
+    n = 22
+    taken = next(
+        f
+        for f in bngsim.Model.from_sbml_string(_doc(n, "bottom")).function_names
+        if f.startswith("_szj_")
+    )
+    xml = (
+        _doc(n, "bottom")
+        .replace(
+            '<parameter id="k" value="0.5" constant="true"/>',
+            f'<parameter id="k" value="0.5" constant="true"/>'
+            f'<parameter id="{taken}" value="0.5" constant="true"/>',
+        )
+        .replace("<ci>k</ci><ci>S</ci><ci>c</ci>", f"<ci>{taken}</ci><ci>S</ci><ci>c</ci>")
+    )
+    model = bngsim.Model.from_sbml_string(xml)
+    assert taken not in model.function_names
+    times = np.linspace(0.0, 4.0, 41)
+    v = _size(times, n, "bottom")
+    np.testing.assert_allclose(_sn(model, times), 5 * v[0] / v, rtol=1e-8)

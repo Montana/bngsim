@@ -508,10 +508,17 @@ target_include_directories(bngsim_expression
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/exprtk)
 target_compile_features(bngsim_expression PUBLIC cxx_std_17)
 set_target_properties(bngsim_expression PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# -Wall -Wextra (issue #583) are informational, not -Werror: they put what the
+# compiler sees in src/ into every build log. Not -Wmissing-field-initializers:
+# src/ initializes option and state structs as `T x{a, b}` on purpose, leaving
+# the trailing members to their default member initializers, which is all eight
+# of its findings when this was added. bngsim and _bngsim_core take them too.
+set(BNGSIM_WARNING_OPTIONS -Wall -Wextra -Wno-missing-field-initializers)
 # ExprTk-heavy translation units can exceed MSVC's default section limit.
 target_compile_options(bngsim_expression PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
     ${BNGSIM_EXPRTK_COMPILE_OPTIONS}
+    "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${BNGSIM_WARNING_OPTIONS}>"
 )
 
 # ─── NFsim (vendored static library) ───────────────────────────────────────────
@@ -820,8 +827,10 @@ endif()
 add_library(bngsim ${BNGSIM_SOURCES})
 
 # ExprTk-heavy translation units can exceed MSVC's default section limit.
+# BNGSIM_WARNING_OPTIONS: see bngsim_expression above.
 target_compile_options(bngsim PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+    "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${BNGSIM_WARNING_OPTIONS}>"
 )
 
 target_include_directories(bngsim
@@ -833,9 +842,11 @@ target_include_directories(bngsim
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# NFsim simulator needs NFsim headers
+# NFsim simulator needs NFsim headers. SYSTEM, so the -Wall -Wextra above report
+# src/nfsim_simulator.cpp and not the vendored headers it includes; without it,
+# NFsim's own unused parameters were all 19 warnings of a default build.
 if(BNGSIM_BUILD_NFSIM)
-    target_include_directories(bngsim PRIVATE
+    target_include_directories(bngsim SYSTEM PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nfsim/src
     )
     target_compile_definitions(bngsim PUBLIC BNGSIM_HAS_NFSIM=1)
@@ -966,7 +977,8 @@ if(BNGSIM_BUILD_PYTHON)
     # The single pybind binding TU registers the whole API and can exceed
     # MSVC's default COFF section limit; /bigobj raises it. GH #150.
     target_compile_options(_bngsim_core PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+        $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${BNGSIM_WARNING_OPTIONS}>")
 
     # When building for Python, link bngsim statically into the extension
     # so the .so/.dylib is self-contained (no separate libbngsim needed).

@@ -35,9 +35,9 @@ class ModelBuilder:
         """
         Add a discrete event. assignments = [(sp_idx_0based, value_expr_str), ...]. delay_expr/priority_expr (when non-empty) override the constant delay/priority: the delay is evaluated when the event is triggered, the priority when it executes (issue #752). assignment_ode_only (GH #81) is a parallel bool list; true entries apply under ODE only and are skipped under SSA (the compartment-resize concentration rescale that must not perturb counts).
         """
-    def add_function(self, name: str, expression: str) -> int:
+    def add_function(self, name: str, expression: str, deferred: bool = False) -> int:
         """
-        Add a function (named expression). Returns 0-based index.
+        Add a function (named expression). Returns 0-based index. A deferred function is read only by event assignments: the right-hand side and the event roots do not evaluate it (issue #1186).
         """
     def add_inline_table_function_spec(self, func_name: str, xs: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], ys: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], index_name: str = 'time', method: str = 'linear') -> None:
         """
@@ -87,9 +87,9 @@ class ModelBuilder:
         """
         Issue #936: mark an assignment of the most recently added event as the concentration rescale a compartment resize injects. size_expr is the compartment's size; base_assign_idx0 the event's own assignment to the same species, or -1. The engine stores base * size before / size after the event's other assignments rather than the assignment's expression.
         """
-    def set_last_event_size_jump(self, compartment: str) -> None:
+    def set_last_event_size_jump(self, compartment: str, before: str = '') -> None:
         """
-        Issue #1054: mark the most recently added event as the rescale where the piecewise assignment-rule size of the compartment jumps. The ODE engine executes it before the other events of its instant read their trigger, values and delay.
+        Issue #1054: mark the most recently added event as the rescale where the piecewise assignment-rule size of the compartment jumps. The ODE engine executes it before the other events of its instant read their trigger, values and delay. before, where given, is the compartment's size before the jump (issue #1181).
         """
     def set_net_file_dir(self, dir: str) -> None:
         """
@@ -214,6 +214,10 @@ class NetworkModel:
     def event_trigger_sources(self) -> list[str]:
         """
         Each event's trigger expression as the loader wrote it, in events() order (issue #49). The event-time sensitivity detector differentiates the trigger's threshold symbolically, so it needs the model's own spelling rather than the evaluator's preprocessed form.
+        """
+    def events_as_written(self) -> list:
+        """
+        Each event as the run reads it, in events() order (issue #1244): {id, trigger (as written), assignments [(0-based species index, value text)], delay, delay_expr, priority, priority_expr, persistent, initial_value, use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, '' where none is compiled. A schedule that reads a species only events write has its stops placed from when those events set it.
         """
     def events_with_runtime_event_time_sens(self) -> list[int]:
         """
@@ -1164,6 +1168,10 @@ class SsaSimulator:
         """
         Issue #719: times at which a time-dependent rate may jump. The continuous (time-dependent) loop never steps across one. Applies to every later run; [] clears it.
         """
+    def set_codegen(self, enabled: bool) -> None:
+        """
+        Issue #1213: whether compiled propensities are allowed. False is the caller's codegen=False and acts as BNGSIM_SSA_NO_CODEGEN: the run takes the interpreted path, a MIR build's in-process JIT included.
+        """
     def set_piecewise_constant_functions(self, names: collections.abc.Sequence[str]) -> None:
         """
         Functions, by name, constant in time between the breakpoints: a rate that reads the clock only through them is held constant and re-read at each breakpoint. Applies to every later run; [] clears it.
@@ -1177,6 +1185,8 @@ class SsaSimulator:
         GH #616: record each reaction's cumulative firing count and integrated propensity at every output time (Result.reaction_firing_counts / reaction_propensity_integrals). Exact SSA only; run_psa ignores it. Off by default, and enabling it changes no trajectory.
         """
 class SteadyStateOptions:
+    certify_root: bool
+    certify_start: bool
     codegen_c_source: str
     codegen_so_path: str
     criterion: str
@@ -1258,6 +1268,9 @@ class SteadyStateResultCore:
         ...
     @property
     def concentrations(self) -> list[float]:
+        ...
+    @property
+    def continued_run_distance(self) -> float:
         ...
     @property
     def converged(self) -> bool:

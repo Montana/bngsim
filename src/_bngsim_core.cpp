@@ -80,28 +80,13 @@ static py::array_t<double> vec_to_ndarray_1d(const std::vector<double> &data) {
 // recovered from the buffer size (data.size() / (n_times * depth)) since the
 // Result class does not track it separately. An empty/unpopulated buffer yields
 // an empty (0,0,0) array, matching the species-sensitivity accessors.
-static py::array_t<double> sens_block_to_ndarray_3d(const std::vector<double> &data, int n_times,
-                                                    int depth) {
-    if (data.empty() || n_times == 0 || depth == 0) {
-        return py::array_t<double>({0, 0, 0});
-    }
-    int n_rows = static_cast<int>(data.size() / (static_cast<size_t>(n_times) * depth));
-    auto *vec = new std::vector<double>(data);
-    auto capsule = py::capsule(vec, [](void *p) { delete static_cast<std::vector<double> *>(p); });
-    return py::array_t<double>(
-        {n_times, n_rows, depth},
-        {static_cast<py::ssize_t>(static_cast<size_t>(n_rows) * depth * sizeof(double)),
-         static_cast<py::ssize_t>(static_cast<size_t>(depth) * sizeof(double)),
-         static_cast<py::ssize_t>(sizeof(double))},
-        vec->data(), capsule);
-}
-
-// Like sens_block_to_ndarray_3d but projects the middle (row) axis to ``keep``.
-// The expression output-sensitivity blocks (GH #198) are recorded with one row
-// per *raw* function (including the auto-generated _rateLawN intermediates); this
-// drops those rows so the returned block aligns with the filtered
-// ``expression_names`` a selector indexes into — exactly mirroring how
-// ``expression_data`` filters the value columns.
+//
+// The middle (row) axis is projected to ``keep``. The expression
+// output-sensitivity blocks (GH #198) are recorded with one row per *raw*
+// function (including the auto-generated _rateLawN intermediates); this drops
+// those rows so the returned block aligns with the filtered ``expression_names``
+// a selector indexes into — exactly mirroring how ``expression_data`` filters
+// the value columns.
 static py::array_t<double> sens_block_to_ndarray_3d_rows(const std::vector<double> &data,
                                                          int n_times, int depth,
                                                          const std::vector<size_t> &keep) {
@@ -574,6 +559,9 @@ template <class S> typename S::Obj codegen_data(const bngsim::NetworkModel &m, S
         // prefers it; every emitter that DIFFERENTIATES keeps reading
         // "expression", which is the smooth declared law.
         s.set(fd, "eval_expression", val(s, f.eval_expression));
+        // Issue #1186: read only by event assignments, so the emitted
+        // right-hand side leaves it out.
+        s.set(fd, "deferred", val(s, f.deferred));
         s.push(func_list, s.done(fd));
     }
     s.set(d, "functions", s.done(func_list));
@@ -2694,6 +2682,45 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "differentiates the trigger's threshold symbolically, so it needs "
             "the model's own spelling rather than the evaluator's preprocessed "
             "form.")
+        .def(
+            "events_as_written",
+            [](bngsim::NetworkModel &self) {
+                // The evaluator keeps each compiled expression's text; '' where
+                // it is not the ExprTk one, or the expression is not compiled.
+                const auto *exprtk =
+                    dynamic_cast<const bngsim::ExprTkEvaluator *>(&self.evaluator());
+                const auto text = [&](int idx) {
+                    return exprtk != nullptr && idx >= 0 ? exprtk->preprocessed_expr(idx)
+                                                         : std::string();
+                };
+                py::list out;
+                for (const auto &ev : self.events()) {
+                    py::list assignments;
+                    for (const auto &[sp, expr] : ev.assignments)
+                        assignments.append(py::make_tuple(sp, text(expr)));
+                    py::dict d;
+                    d["id"] = ev.id;
+                    d["trigger"] = ev.trigger_source;
+                    d["assignments"] = assignments;
+                    d["delay"] = ev.delay;
+                    d["delay_expr"] = text(ev.delay_expr_idx);
+                    d["priority"] = ev.priority;
+                    d["priority_expr"] = text(ev.priority_expr_idx);
+                    d["persistent"] = ev.persistent;
+                    d["initial_value"] = ev.initial_value;
+                    d["use_values_from_trigger_time"] = ev.use_values_from_trigger_time;
+                    d["size_jump_compartment"] = ev.size_jump_compartment;
+                    out.append(d);
+                }
+                return out;
+            },
+            "Each event as the run reads it, in events() order (issue #1244): {id, "
+            "trigger (as written), assignments [(0-based species index, value text)], "
+            "delay, delay_expr, priority, priority_expr, persistent, initial_value, "
+            "use_values_from_trigger_time, size_jump_compartment}. The texts are the evaluator's, "
+            "'' where none is "
+            "compiled. A schedule that reads a species only events write has its stops "
+            "placed from when those events set it.")
         .def_property_readonly("n_discontinuity_triggers",
                                &bngsim::NetworkModel::n_discontinuity_triggers)
         .def(
@@ -2971,6 +2998,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "recompute-all eligible (pure mass-action exact SSA, no events, small "
              "nr), the run takes the RR-style recompute-all + flat-scan loop by "
              "default. No-op for ineligible models; '' clears it.")
+        .def("set_codegen", &bngsim::SsaSimulator::set_codegen, py::arg("enabled"),
+             "Issue #1213: whether compiled propensities are allowed. False is the "
+             "caller's codegen=False and acts as BNGSIM_SSA_NO_CODEGEN: the run takes "
+             "the interpreted path, a MIR build's in-process JIT included.")
         .def("set_breakpoints", &bngsim::SsaSimulator::set_breakpoints, py::arg("times"),
              "Issue #719: times at which a time-dependent rate may jump. The "
              "continuous (time-dependent) loop never steps across one. Applies to "
@@ -3337,7 +3368,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "a file — BNG's tfun([xs],[ys],index) form. xs must be monotonically "
              "increasing and the same length as ys.")
         .def("add_function", &bngsim::ModelBuilder::add_function, py::arg("name"),
-             py::arg("expression"), "Add a function (named expression). Returns 0-based index.")
+             py::arg("expression"), py::arg("deferred") = false,
+             "Add a function (named expression). Returns 0-based index. A deferred "
+             "function is read only by event assignments: the right-hand side and the "
+             "event roots do not evaluate it (issue #1186).")
         .def(
             "add_reaction",
             [](bngsim::ModelBuilder &self, const std::vector<int> &reactants,
@@ -3472,11 +3506,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
              "species, or -1. The engine stores base * size before / size after the event's "
              "other assignments rather than the assignment's expression.")
         .def("set_last_event_size_jump", &bngsim::ModelBuilder::set_last_event_size_jump,
-             py::arg("compartment"),
+             py::arg("compartment"), py::arg("before") = "",
              "Issue #1054: mark the most recently added event as the rescale where the "
              "piecewise assignment-rule size of the compartment jumps. The ODE engine "
              "executes it before the other events of its instant read their trigger, "
-             "values and delay.")
+             "values and delay. before, where given, is the compartment's size before "
+             "the jump (issue #1181).")
         .def("set_compute_conservation_laws", &bngsim::ModelBuilder::set_compute_conservation_laws,
              py::arg("enabled"),
              "Enable/disable conservation-law detection in build() (GH #102). The "
@@ -3710,6 +3745,10 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("max_time", &bngsim::SteadyStateOptions::max_time)
         // Issue #524 — "newton" from the given state, no burst, stability reported.
         .def_readwrite("newton_burst", &bngsim::SteadyStateOptions::newton_burst)
+        // Issue #1191 — the burst-free solve without its stability certificate.
+        .def_readwrite("certify_root", &bngsim::SteadyStateOptions::certify_root)
+        // Issue #1191 — certify the given state as the root, with no Newton step.
+        .def_readwrite("certify_start", &bngsim::SteadyStateOptions::certify_start)
         .def_readwrite("rtol", &bngsim::SteadyStateOptions::rtol)
         .def_readwrite("atol", &bngsim::SteadyStateOptions::atol)
         // Issue #196 — per-species absolute tolerance for the march. Empty
@@ -3757,6 +3796,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("species_names", &bngsim::SteadyStateResult::species_names)
         .def_readonly("residual", &bngsim::SteadyStateResult::residual)
         .def_readonly("newton_distance", &bngsim::SteadyStateResult::newton_distance)
+        .def_readonly("continued_run_distance", &bngsim::SteadyStateResult::continued_run_distance)
         .def_readonly("criterion", &bngsim::SteadyStateResult::criterion)
         .def_readonly("method_used", &bngsim::SteadyStateResult::method_used)
         .def_readonly("converged", &bngsim::SteadyStateResult::converged)

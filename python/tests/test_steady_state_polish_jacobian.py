@@ -70,7 +70,9 @@ def _seeded_polish(jacobian: str):
 
     model._core.set_state(settled)
     model._core.reset_rhs_counters()
-    ss = sim.steady_state(method="newton")
+    # The residual test, by name (issue #1001): the scaled one's verdict takes
+    # a Jacobian and a run of its own, which are not the polish's columns.
+    ss = sim.steady_state(method="newton", criterion="residual")
 
     assert ss.converged
     assert ss.method_used == "newton"

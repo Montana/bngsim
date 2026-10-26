@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import ast
 import bisect
+import contextlib
 import functools
+import itertools
 import logging
 import math
 import re
 import sys
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import NamedTuple
@@ -422,6 +425,45 @@ def _condition_spans(expr: str) -> list[tuple[int, int]]:
         cursor = open_paren + 1
 
 
+class _SpanIndex:
+    """Which character spans hold a match, answered by bisection (issue #1256).
+
+    ``contains(start, end)`` is ``any(lo <= start and end <= hi for lo, hi in
+    spans)``, and ``covers(start)`` is ``any(lo <= start < hi ...)``. Asked of
+    every match of a pattern against every ``if()`` condition span, as four
+    scans here did, that is a product of the two counts, and a rate law written
+    out through a diamond of rules holds thousands of both: a sensitivity
+    simulator for #1145's size jump took 298 s to build at 20 rules, and takes
+    35 s with the spans indexed.
+
+    With the spans sorted by start and the furthest end of those so far kept
+    beside each, some span holds ``[start, end]`` exactly when, of the spans
+    that start at or before ``start``, the furthest end is at or after ``end``:
+    the same answer, in ``O(log n)``. (A match across two adjacent spans is in
+    their union, but in neither, and is not held: the furthest end belongs to
+    one span.)
+    """
+
+    __slots__ = ("_starts", "_furthest")
+
+    def __init__(self, spans) -> None:
+        ordered = sorted(spans)
+        self._starts = [lo for lo, _hi in ordered]
+        self._furthest = list(itertools.accumulate((hi for _lo, hi in ordered), max))
+
+    def _reach(self, start: int):
+        k = bisect.bisect_right(self._starts, start)
+        return self._furthest[k - 1] if k else None
+
+    def contains(self, start: int, end: int) -> bool:
+        far = self._reach(start)
+        return far is not None and far >= end
+
+    def covers(self, start: int) -> bool:
+        far = self._reach(start)
+        return far is not None and far > start
+
+
 def _condition_only_params(
     core,
     candidates: set[str],
@@ -515,10 +557,10 @@ def _condition_only_params(
             flat = _inline_derived_param_refs(body, exprs)
             if not flat:
                 continue
-            spans = _condition_spans(flat)
+            spans = _SpanIndex(_condition_spans(flat))
             for name in sorted(asking):
                 for m in pats[name].finditer(flat):
-                    if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans):
+                    if not spans.contains(m.start(), m.end()):
                         pure.discard(name)
                         break
         for text in constants:
@@ -3300,6 +3342,8 @@ def crossings_with_periodic(
     over_budget=None,
     sensitivity_params=None,
     on_the_flip=False,
+    before_the_flip=False,
+    by_tread=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
     """:func:`all_fixed_crossings`, and for the conditions it leaves out, their
     stops and their crossings, from one pass over the conditions.
@@ -3343,6 +3387,25 @@ def crossings_with_periodic(
     it in a run with no sensitivity columns. Not the SSA's: there a step rate on
     `1e12 + t` switched a double of the clock, 1.2e-4 of time, later than the
     same run from the origin, and the run far from it was no longer that run.
+
+    *before_the_flip* moves each such stop, and each the scan places on the
+    evaluator's change, onto the last double before that change, on literal
+    time: the ODE path asks for it at the tolerances that are not on the flip
+    (issue #1226). A step ends on a stop, and the implicit step reads the rate
+    at its end: on the first double of the next stretch it is taken at the
+    next stretch's rate, and where the tolerance lets it span the stretch,
+    `if(mod(time(), 24) < 1, 1, 0)` over 1,000 days at rtol 1e-2 came to
+    14,627 for 1,000. A double earlier it is exact to rounding. Only for a
+    condition whose rate laws hold between its changes: one that reads the
+    clock outside every condition that holds (a sawtooth, a ramp, a pulse
+    times the clock) keeps its stops where they were put
+    (`changes_between_its_stops` in :func:`_resolve_crossings`).
+
+    *by_tread* reads a condition on a line far from zero tread by tread where
+    the scan refuses it or leaves it without stops (issue #1018,
+    :func:`_tread_stop_times`); the ODE path asks for it in a run with no
+    sensitivity columns. Not the SSA's: its stops are a double before each
+    change, and a step rate read there is the old one.
     """
     return _resolve_crossings(
         core,
@@ -3354,6 +3417,8 @@ def crossings_with_periodic(
         over_budget=over_budget,
         sensitivity_params=sensitivity_params,
         on_the_flip=on_the_flip,
+        before_the_flip=before_the_flip,
+        by_tread=by_tread,
     )
 
 
@@ -3385,6 +3450,10 @@ class StopsOverBudget(NamedTuple):
     # last entry true) for more of the run than the call can be read over
     # (:class:`bngsim._clock_scan.Flickers`). Such a condition is `unresolved`.
     flicker: tuple[str, float, float, bool] | None = None
+    # A leg of the run that would fit, where the condition was read tread by
+    # tread (issue #1018) and is refused by name past the budget: without a
+    # stop on each change a step bound need not keep it within the tolerance.
+    legs: float | None = None
 
 
 class _OverStopBudget(Exception):
@@ -3396,12 +3465,256 @@ class _OverStopBudget(Exception):
         min_gap: float | None = None,
         unresolved: bool = False,
         flicker: tuple[str, float, float, bool] | None = None,
+        legs: float | None = None,
     ):
         super().__init__(count)
         self.count = int(min(count, 2**62))
         self.min_gap = min_gap
         self.unresolved = unresolved
         self.flicker = flicker
+        self.legs = legs
+
+
+class StopsMoveWithAnEvent(Exception):
+    """A rate law's condition reads a species only events write, at times or
+    to values not known before the run, and it changes more than once in it
+    (issue #1244): no stop can be placed for it, and a step can lie across a
+    whole window of it."""
+
+
+# Times or values an event's schedule is read from: ``time() >= c`` and its
+# spellings, with c the run's constant.
+_TIME_TRIGGER = re.compile(r"^time\(\)\s*(>=|>)\s*(.+)$|^(.+?)\s*(<=|<)\s*time\(\)$")
+# Stretches a schedule is placed over, at most; past it the run is refused as
+# one whose schedule is not known.
+_HELD_STRETCHES_MOST = 512
+
+
+def _event_held_species(core, conditions=None) -> dict[str, int]:
+    """The species events assign and nothing else moves: no reaction, rate rule
+    or rescale reads them as a reactant or a product. Between two of those
+    events each holds its value. Name to 0-based index; of those *conditions*
+    read, where they are given."""
+    assigned = set(core.event_assigned_species)
+    if not assigned:
+        return {}
+    names = list(core.species_names)
+    if conditions is not None:
+        read = {m.group(0) for cond in conditions for m in _IDENTIFIER.finditer(cond)}
+        assigned = {i for i in assigned if names[i] in read}
+        if not assigned:
+            return {}  # the model as a dict is not built for a run that asks nothing of it
+    data = core.codegen_data()
+    for rxn in data["reactions"]:
+        assigned -= set(rxn["reactants"]) | set(rxn["products"])
+    return {names[i]: i for i in sorted(assigned)}
+
+
+def _reads_run_constants_alone(text: str, scope: SwitchConditionScope) -> bool:
+    """True when *text* reads no clock, no state and no model function: only
+    numbers, builtins and run constants, read directly or through a derived
+    parameter, which is a constant of the run too (`w = k2`, k2 = 2*w2)."""
+    text = _inline_derived_param_refs(text, scope.derived_exprs) or text
+    if not _clock_free(text, scope.clock_symbols):
+        return False
+    for m in _IDENTIFIER.finditer(text):
+        name = m.group(0)
+        if name in scope.function_names:
+            return False
+        if text[m.end() :].lstrip().startswith("("):
+            continue  # an engine builtin; its arguments are read by this loop
+        if name in scope.run_constants or name in _BUILTIN_CONSTANT_VALUES:
+            continue
+        return False
+    return True
+
+
+def _with_values(text: str, values: Mapping[str, float]) -> str:
+    """*text* with each name in *values* written as its number."""
+    return _IDENTIFIER.sub(
+        lambda m: f"({values[m.group(0)]!r})" if m.group(0) in values else m.group(0), text
+    )
+
+
+def _held_schedule(
+    core,
+    scope: SwitchConditionScope,
+    held: Mapping[str, int],
+    t_start: float,
+    t_end: float,
+    sensitivity_params,
+) -> tuple[list[tuple[float, dict[str, float]]], dict[str, str], dict[str, set[float]]]:
+    """When each held species changes in ``(t_start, t_end)``, and to what, as
+    ``[(t_start, values), (t1, values from t1), ...]``; for each held species
+    whose changes are not known before the run, why; and for each, the numbers
+    an event is known to set it to, whenever that event fires.
+
+    Known: every event that writes it fires on ``time() >= c`` (or ``>``, or
+    the same written the other way), with c a run constant, after a constant
+    delay, and sets a value that reads only run constants and held species
+    known then. Such a trigger rises once, so the event fires once. A run that
+    starts where the last one ended continues its events (``event_carry``, issue
+    #693): a trigger rises in it only where it was false there, and the
+    executions the last run delayed into it are taken with the values they
+    froze. A fresh run's trigger was false before it unless its initialValue
+    says true. Not known: two writers executing at one instant, which are not ordered here;
+    a delayed fire whose value, read at its trigger, reads a held species that
+    another fire sets in between; and, in a run with sensitivity columns, a
+    time or a value that reads a requested parameter, or one derived from
+    them, whose stops would move with it."""
+    names_of = {i: name for name, i in held.items()}
+    unknown: dict[str, str] = {}
+    requested = set(sensitivity_params or ())
+
+    def moved(text: str) -> list[str]:
+        """The requested parameters *text* reads, directly or through a
+        derived parameter, as :func:`_resolve_flat` reads a condition."""
+        flat = _inline_derived_param_refs(text, scope.derived_exprs) or text
+        return sorted(set(_IDENTIFIER.findall(flat)) & requested)
+
+    param_names = list(core.param_names)
+    if sensitivity_params:
+        for sp, p in core.species_ic_param_refs:
+            if sp in names_of and moved(param_names[p]):
+                unknown[names_of[sp]] = (
+                    f"its initial value is {param_names[p]}, which a requested "
+                    "sensitivity parameter moves"
+                )
+
+    def value_of(text: str, at: float) -> tuple[float | None, str]:
+        """The number *text* reads, or None and why not."""
+        if not _reads_run_constants_alone(text, scope):
+            return None, "which is not known before the run"
+        hit = moved(text)
+        if hit:
+            return None, f"which a requested sensitivity parameter moves ({', '.join(hit)})"
+        v = float(core.evaluate_over_times(text, [float(at)], 0.0)[0])
+        return (v, "") if math.isfinite(v) else (None, f"which reads {v}")
+
+    start = {name: float(core.get_concentration(name)) for name in held}
+    # What each event is known to set a held species to, read with the others
+    # as the run starts, whenever it fires: a condition whose stops cannot be
+    # placed is read with each of these as well as with its start.
+    sets: dict[str, set[float]] = {}
+
+    def may_set(writes) -> None:
+        for name, text in writes:
+            text = _with_values(text, start)
+            if _reads_run_constants_alone(text, scope):
+                v = float(core.evaluate_over_times(text, [float(t_start)], 0.0)[0])
+                if math.isfinite(v):
+                    sets.setdefault(name, set()).add(v)
+
+    # The last run's events, where this one continues it: what each trigger read
+    # where it ended, and its executions not yet applied.
+    carry = core.event_carry()
+    continued = carry is not None and float(carry[0]) == float(t_start)
+    was_true: list = list(carry[1]) if continued else []
+    events = core.events_as_written()
+
+    # (execution time, trigger time, label, [(species, value text)], from trigger)
+    fires: list[tuple[float, float, str, list[tuple[str, str]], bool]] = []
+    if continued:
+        for i, at, frozen in carry[2]:
+            ev = events[i]
+            writes = [
+                (names_of[sp], (repr(float(frozen[k])) if frozen else text))
+                for k, (sp, text) in enumerate(ev["assignments"])
+                if sp in names_of
+            ]
+            if not writes:
+                continue
+            may_set(writes)
+            label = f"event {ev['id'] or '?'}, delayed from the last run"
+            if frozen and len(frozen) != len(ev["assignments"]):
+                for name, _ in writes:
+                    unknown.setdefault(name, f"{label} carries values it cannot be read by")
+                continue
+            if float(at) < t_end:
+                fires.append((float(at), t_start, label, writes, False))
+    for i, ev in enumerate(events):
+        writes = [(names_of[sp], text) for sp, text in ev["assignments"] if sp in names_of]
+        if not writes:
+            continue
+        may_set(writes)
+        trigger = _strip_redundant_parens(ev["trigger"])
+        label = f"event {ev['id'] or '?'} on {trigger}"
+        m = _TIME_TRIGGER.match(trigger.replace(" ", ""))
+        threshold, why = None, "a trigger that is no fixed time"
+        if m is not None and ev["delay_expr"]:
+            why = f"after a delay of {ev['delay_expr']}, not a constant"
+        elif m is not None:
+            op, c = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+            threshold, why = value_of(c, t_start)
+            why = f"at time {c}, {why}"
+        if threshold is None:
+            for name, _ in writes:
+                unknown.setdefault(name, f"{label} sets it, {why}")
+            continue
+        true_at_start = t_start >= threshold if op in (">=", "<=") else t_start > threshold
+        true_before = bool(was_true[i]) if continued else bool(ev["initial_value"])
+        if true_at_start and true_before:
+            continue  # it never rises in this run
+        rises = t_start if true_at_start else threshold
+        at = rises + float(ev["delay"])
+        if at < t_end:
+            from_trigger = float(ev["delay"]) > 0 and ev["use_values_from_trigger_time"]
+            fires.append((at, rises, label, writes, from_trigger))
+    fires.sort(key=lambda f: f[0])
+    for a, b in zip(fires, fires[1:], strict=False):
+        if abs(b[0] - a[0]) <= 1e-12 * max(1.0, abs(a[0])):
+            for name, _ in a[3] + b[3]:
+                unknown.setdefault(name, f"{a[2]} and {b[2]} set it at one instant")
+    if len(fires) > _HELD_STRETCHES_MOST:
+        for f in fires:
+            for name, _ in f[3]:
+                unknown.setdefault(name, f"events set it {len(fires)} times in the run")
+
+    values = dict(start)
+    schedule = [(t_start, dict(values))]
+    for at, rises, label, writes, from_trigger in fires:
+        if from_trigger and any(rises < other[0] < at for other in fires):
+            # Its value is read at its trigger, before a fire it would read.
+            for name, _ in writes:
+                unknown.setdefault(
+                    name, f"{label} reads its value at its trigger, before another event sets it"
+                )
+            continue
+        new = {}
+        for name, text in writes:
+            v, why = value_of(_with_values(text, values), at)
+            if v is None:
+                unknown.setdefault(name, f"{label} sets it to {text}, {why}")
+            else:
+                new[name] = v
+        if new:
+            values = {**values, **new}
+            if at > t_start:
+                schedule.append((at, dict(values)))
+            else:
+                schedule[0] = (t_start, dict(values))
+            for name, v in new.items():
+                sets.setdefault(name, set()).add(v)
+    return schedule, unknown, sets
+
+
+def _past_budget_in_both(a: StopsOverBudget, b: StopsOverBudget) -> StopsOverBudget:
+    """One condition past the budget in two stretches of a run (issue #1244),
+    as one: the changes of both, the shorter of each stretch between two, and
+    what either could not count or read. A step bound made from the last
+    stretch alone can span the windows of an earlier, narrower one."""
+
+    def least(x, y):
+        return y if x is None else x if y is None else min(x, y)
+
+    return a._replace(
+        changes=a.changes + b.changes,
+        min_gap=least(a.min_gap, b.min_gap),
+        union_gap=least(a.union_gap, b.union_gap),
+        unresolved=a.unresolved or b.unresolved,
+        flicker=a.flicker or b.flicker,
+        legs=least(a.legs, b.legs),
+    )
 
 
 def _resolve_crossings(
@@ -3414,27 +3727,257 @@ def _resolve_crossings(
     over_budget=None,
     sensitivity_params=None,
     on_the_flip=False,
+    before_the_flip=False,
+    by_tread=False,
 ) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
+    """:func:`_resolve_flat`, with a condition that reads a species only events
+    write resolved stretch by stretch between their executions (issue #1244).
+
+    Such a species is no run constant, so a condition that reads it was given
+    no stop at all, and a schedule of pulses whose width an event writes was
+    stepped over before the event as well as after: X(240) came to 1 for 17.
+    Between two of the events it holds, and where when they execute and what
+    they set is known before the run (:func:`_held_schedule`), each stretch is
+    resolved with the species written as its number there. Where it is not
+    known, a condition a rate law reads that changes more than once over the
+    run, as its start reads it or with the species at any number an event is
+    known to set it to, is refused by name (:class:`StopsMoveWithAnEvent`): a
+    step can lie across a whole window of it. One that changes once is a
+    root's sign change, and an event's trigger is located as a root, so both
+    are read as before; so is one that only an output reads.
+
+    The run has one budget of stops (:data:`_RUN_STOP_BUDGET`), whatever its
+    stretches, and each call reads the rate laws for every condition of the
+    run as the model spells it."""
+    kw = dict(
+        periodic=periodic,
+        over_budget=over_budget,
+        sensitivity_params=sensitivity_params,
+        on_the_flip=on_the_flip,
+        before_the_flip=before_the_flip,
+        by_tread=by_tread,
+    )
+    held = _event_held_species(core, [c for c in conditions if c not in touches])
+    reads = {
+        cond: sorted(set(_IDENTIFIER.findall(cond)) & held.keys())
+        for cond in conditions
+        if cond not in touches
+    }
+    reads = {cond: names for cond, names in reads.items() if names}
+    if not reads:
+        return _resolve_flat(core, t_start, t_end, conditions, touches=touches, **kw)
+    ctx = core.functional_jacobian_context()
+    scope = switch_condition_scope(core, ctx)
+    schedule, unknown, sets = _held_schedule(core, scope, held, t_start, t_end, sensitivity_params)
+    known = {cond: names for cond, names in reads.items() if not set(names) & unknown.keys()}
+    # What is not known is read as before: given no stop, or refused below.
+    rest = [cond for cond in conditions if cond not in known]
+    unplaced = [cond for cond in reads if cond not in known]
+    # Only where a rate law reads it: a step across a window of a condition
+    # that only an output reads moves nothing (as past the budget,
+    # :func:`conditions_a_rate_law_reads`).
+    switching = conditions_a_rate_law_reads(core, unplaced) if unplaced else frozenset()
+    for cond in unplaced:
+        if cond not in switching:
+            continue
+        names = reads[cond]
+        # As its start reads it, and with each held species it reads at each
+        # number an event is known to set it to: more than one change over the
+        # run, in any of these, and a step can lie across one of its windows,
+        # as across a pulse. (Quiet at its start, a width w = 0 pulses once a
+        # state trigger sets w = 1.)
+        at_start = schedule[0][1]
+        readings = [(None, at_start)] + [
+            (name, {**at_start, name: v})
+            for name in names
+            for v in sorted(sets.get(name, ()))
+            if v != at_start[name]
+        ]
+        for set_by, values in readings:
+            quiet: list = []
+            stops = [
+                stop
+                for part in _resolve_flat(
+                    core,
+                    t_start,
+                    t_end,
+                    [_with_values(cond, values)],
+                    periodic=True,
+                    over_budget=quiet,
+                )[:2]
+                for stop in part
+            ]
+            if len(stops) <= 1 and not quiet:
+                continue
+            name = next(n for n in names if n in unknown)
+            how_often = f"{len(stops)} times" if not quiet else "more often than stops are placed"
+            where = (
+                "as the run starts"
+                if set_by is None
+                else f"with {set_by} at {values[set_by]!r}, which an event sets it to,"
+            )
+            raise StopsMoveWithAnEvent(
+                f"A rate law switches at {_strip_redundant_parens(cond.strip())!r}, which "
+                f"reads {name}, and only events set {name}: {unknown[name]}. So its stops "
+                f"cannot be placed before the run, and {where} the condition "
+                f"changes {how_often}: a step can lie across a whole window of it with "
+                "nothing said (issue #1244). bngsim refuses rather than step over it. An "
+                f"event that sets {name} at a fixed time (`time >= c`) to a constant, "
+                "with no requested sensitivity parameter in either, has the condition's "
+                "stops placed stretch by stretch."
+            )
+    # Each call is asked about some of the run's conditions, and reads the rate
+    # laws for all of them, as the model spells them.
+    written = {cond: cond for cond in conditions}
+    found = list(_resolve_flat(core, t_start, t_end, rest, touches=touches, written=written, **kw))
+    if known:
+        # Past the budget in a stretch is reported as the condition the model
+        # holds, which is what the run's switches are matched against, once.
+        past: dict[str, StopsOverBudget] = {}
+        # One budget for the run: each stretch's stops count against it with
+        # every stop placed before them.
+        placed = [stop.time for stop in (*found[0], *found[1])]
+        ends = [at for at, _ in schedule[1:]] + [t_end]
+        for (lo, values), hi in zip(schedule, ends, strict=True):
+            if hi <= lo:
+                continue
+            asked = {_with_values(cond, values): cond for cond in known}
+            here: list[StopsOverBudget] = []
+            part = _resolve_flat(
+                core,
+                lo,
+                hi,
+                list(asked),
+                touches=touches,
+                written={**written, **asked},
+                placed_before=placed,
+                **{**kw, "over_budget": here},
+            )
+            for k in range(3):
+                found[k] = [*found[k], *part[k]]
+            placed.extend(stop.time for stop in (*part[0], *part[1]))
+            for item in here:
+                cond = asked.get(item.condition, item.condition)
+                item = item._replace(condition=cond)
+                past[cond] = item if cond not in past else _past_budget_in_both(past[cond], item)
+        for item in past.values():
+            if over_budget is None:
+                _warn_over_budget(item.condition, item.changes, t_start, t_end)
+            else:
+                over_budget.append(item)
+    fixed, stops, crossings = (sorted(f, key=lambda stop: stop.time) for f in found)
+    return fixed, stops, crossings
+
+
+def _resolve_flat(
+    core,
+    t_start: float,
+    t_end: float,
+    conditions,
+    periodic: bool,
+    touches=frozenset(),
+    over_budget=None,
+    sensitivity_params=None,
+    on_the_flip=False,
+    before_the_flip=False,
+    by_tread=False,
+    written=None,
+    placed_before=(),
+) -> tuple[list[CrossingStop], list[CrossingStop], list[CrossingStop]]:
+    """The resolvers over *conditions*, for :func:`_resolve_crossings`.
+
+    *written*, where it asks about some of the run's conditions, maps each
+    condition asked here, and every other the run asks about, to the model's
+    spelling of it: a stretch's is written with a held species as its number
+    (issue #1244), and the rate laws are read for what the model spells.
+    *placed_before* are the times of the stops the run has placed already,
+    which count against its one budget."""
     if not conditions:
         return [], [], []
     ctx = core.functional_jacobian_context()
     scope = switch_condition_scope(core, ctx)
     bodies = _function_slot_bodies(ctx)
+    spelled = dict(written) if written is not None else {}
+    every = list(dict.fromkeys(spelled.values())) if written is not None else list(conditions)
     found: list[CrossingStop] = []
     stops: list[CrossingStop] = []
     crossings: list[CrossingStop] = []
     # The changes of each condition that did not fit, where they were listed.
     unplaced: dict[int, list[float]] = {}
+    # Stops read tread by tread (issue #1018), placed after every other's.
+    treaded: list[tuple[str, int, _TreadStops]] = []
+    # The conditions whose value holds between two changes (a comparison, a
+    # step call): the rest of a rate law's reads of the clock are where it
+    # changes between its stops (issue #1226).
+    held_conditions = (
+        sorted((c for c in every if _held_between_changes(c)), key=len, reverse=True)
+        if before_the_flip
+        else []
+    )
+
+    reads_here: list[list[tuple[str, bool]] | None] = []
+
+    def changes_between_its_stops(cond: str) -> bool:
+        """Whether a rate law that reads *cond* reads the clock outside every
+        condition that holds between its changes: a sawtooth (a `mod`, `frac`
+        or `floor` remainder), a ramp, a pulse times the clock. Spanned by one
+        step, such a stretch is read at one end, and a double before the change
+        that end is not the right one more than the other: from X(0) = 1e4 at
+        rtol 1e-3, `mod(time(), 0.7)` over 70 was 19.3 over a double before
+        every change and 0.45 as the resolvers put them. So it keeps them. A
+        law that holds between its changes is exact a double before. (Each
+        rate law flattened, with what it calls written into it; past
+        :data:`_HELD_READ_MOST`, not read, and taken to change.)"""
+        cond = spelled.get(cond, cond)
+        if not reads_here:
+            try:
+                reads_here.append(_rate_laws_read_held(core, tuple(held_conditions)))
+            except Exception as exc:  # noqa: BLE001 - then it is taken to
+                logger.debug("the rate laws: not read (%s)", exc)
+                reads_here.append(None)
+        reads = reads_here[0]
+        if reads is None:
+            return True
+        return any(clock for flat, clock in reads if cond in flat)
+
+    flats: list[list[str]] = []
+
+    def read_by_a_rate_law(cond: str) -> bool:
+        """Whether a rate law reads *cond*, and none that does reads the clock
+        in a far line outside every condition (:func:`_a_far_line_outside`).
+        Asked only of a condition about to be read tread by tread. A function
+        that only reports is no reason for a stop: a stop on each tread of an
+        output of `100*mod(1e12 + time(), P)` took 1.6 million steps where the
+        run took 10."""
+        cond = spelled.get(cond, cond)
+        if not flats:
+            try:
+                flats.append(_rate_law_flats(core))
+            except Exception as exc:  # noqa: BLE001 - then the reading is not made
+                logger.debug("the rate laws: not read (%s)", exc)
+                flats.append([])
+        mine = [flat for flat in flats[0] if cond in flat]
+        return bool(mine) and not any(
+            _a_far_line_outside(core, flat, every, scope, t_start, t_end) for flat in mine
+        )
+
     whole_triggers: set[str] | None = None
 
-    def over(cond, count, min_gap, listed=None, unresolved=False, flicker=None) -> None:
+    def over(cond, count, min_gap, listed=None, unresolved=False, flicker=None, legs=None) -> None:
         if over_budget is None:
             _warn_over_budget(cond, count, t_start, t_end)
         else:
             if listed is not None:
                 unplaced[len(over_budget)] = listed
             over_budget.append(
-                StopsOverBudget(cond, int(count), min_gap, unresolved=unresolved, flicker=flicker)
+                StopsOverBudget(
+                    cond,
+                    int(count),
+                    min_gap,
+                    unresolved=unresolved,
+                    flicker=flicker,
+                    legs=legs,
+                )
             )
 
     def requested_in(asked: _EngineCondition) -> list[str]:
@@ -3540,6 +4083,11 @@ def _resolve_crossings(
                 continue
         times: list[float] | None = None
         pairs: list[tuple[float, float]] = []
+        # Tread by tread (issue #1018): a plain ODE run, on literal time, and not
+        # for an event's trigger. (On a counter the integrated clock lands a few
+        # doubles past a stop's value, and a stop a double before a change is
+        # not a stop before it.)
+        treads = by_tread and sensitivity_params is None and clock_idx < 0 and cond not in touches
         # (time, the counter's value there, on a touch) for a scanned condition.
         scanned: list[tuple[float, float, bool]] | None = None
         try:
@@ -3577,7 +4125,33 @@ def _resolve_crossings(
                         logger.debug("stops for %r disagree with the evaluator; scanning", cond)
                         times = None
                         scanned = _engine_scan_stop_times(
-                            core, cond, engine(), offset, scope, t_start, t_end, cond in touches
+                            core,
+                            cond,
+                            engine(),
+                            offset,
+                            scope,
+                            t_start,
+                            t_end,
+                            cond in touches,
+                            by_tread=treads,
+                            reads=read_by_a_rate_law,
+                        )
+                    elif not times and treads and _a_whole_sawtooth_call(text):
+                        # A sawtooth of a line far from zero, which the step
+                        # resolver reads as within its rounding of zero on both
+                        # sides of every wrap: `100*mod(1.1e12 + time(),
+                        # 0.0048828125)` had no stop and was 21% over by the
+                        # sixth of six legs of 0.2. Read tread by tread, where
+                        # it can be (issue #1018).
+                        scanned = _left_alone_tread_stops(
+                            core,
+                            cond,
+                            engine(),
+                            scope,
+                            t_start,
+                            t_end,
+                            offset,
+                            reads=read_by_a_rate_law,
                         )
                 elif periodic:
                     shaped: list[bool] = []
@@ -3593,7 +4167,16 @@ def _resolve_crossings(
                         )
                     if not shaped and asks_evaluator(engine, clock_idx, cond in touches):
                         scanned = _engine_scan_stop_times(
-                            core, cond, engine(), offset, scope, t_start, t_end, cond in touches
+                            core,
+                            cond,
+                            engine(),
+                            offset,
+                            scope,
+                            t_start,
+                            t_end,
+                            cond in touches,
+                            by_tread=treads,
+                            reads=read_by_a_rate_law,
                         )
                 if times is None and not pairs and scanned is None and not equality:
                     times = _inner_step_stop_times(text, scope, t_start, t_end)
@@ -3613,15 +4196,41 @@ def _resolve_crossings(
                     raise
                 times, pairs, scanned = None, [], few
         except _OverStopBudget as exc:
-            over(cond, exc.count, exc.min_gap, unresolved=exc.unresolved, flicker=exc.flicker)
+            over(
+                cond,
+                exc.count,
+                exc.min_gap,
+                unresolved=exc.unresolved,
+                flicker=exc.flicker,
+                legs=exc.legs,
+            )
             continue
+        if isinstance(scanned, _TreadStops):
+            if scanned.past is not None:
+                _say_left_alone(cond, *scanned.past)
+                scanned = None
+            else:
+                # Taken once every other condition has its stops: before, a law
+                # main leaves without any took the budget a schedule beside it
+                # fits in, and the run was refused.
+                treaded.append((cond, clock_idx, scanned))
+                continue
         inside = [t for t in times or () if t_start < t <= t_end]
         # One budget for the run, not one per condition: each stop costs a
         # restart, and a few conditions near it took a gigabyte.
         mine = len(inside) + len(pairs) + len(scanned or ())
-        if len(found) + len(stops) + mine > _RUN_STOP_BUDGET:
-            every = sorted([*inside, *(ts for _, ts in pairs), *(t for t, _, _ in scanned or ())])
-            over(cond, mine, _shortest_stretch(every), every)
+        if len(placed_before) + len(found) + len(stops) + mine > _RUN_STOP_BUDGET:
+            changes = sorted(
+                [*inside, *(ts for _, ts in pairs), *(t for t, _, _ in scanned or ())]
+            )
+            legs = (
+                _leg_that_fits(
+                    [*placed_before, *(s.time for s in found), *(s.time for s in stops), *changes]
+                )
+                if isinstance(scanned, _TreadStops)
+                else None
+            )
+            over(cond, mine, _shortest_stretch(changes), changes, legs=legs)
             continue
         for t_cross, t_stop in pairs:
             crossings.append(
@@ -3635,7 +4244,19 @@ def _resolve_crossings(
                     touch=t_stop == t_cross,
                 )
             )
+        # (The scan's stops are on the evaluator's change. A double before it,
+        # where the run asks for that and no event's trigger reads it: issue
+        # #1226, above.)
+        before = (
+            before_the_flip
+            and clock_idx < 0
+            and cond not in touches
+            and bool(scanned or inside)
+            and not changes_between_its_stops(cond)
+        )
         for t_cross, value, touch in scanned or ():
+            if before and not touch and t_start < math.nextafter(t_cross, -math.inf):
+                t_cross = math.nextafter(t_cross, -math.inf)
             crossings.append(CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0))
             stops.append(
                 CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0, touch=touch)
@@ -3652,7 +4273,7 @@ def _resolve_crossings(
             _stops_on_the_flip(core, engine, text, offset, scope, bodies, t_start, t_end, inside)
             if inside
             and periodic
-            and on_the_flip
+            and (on_the_flip or before)
             and sensitivity_params is None
             and cond not in touches
             else None
@@ -3668,6 +4289,10 @@ def _resolve_crossings(
                     # stays on the end: a last step that is not stopped is
                     # taken past the end and read back, across the change.
                     t_cross, value = t_placed, t_placed + offset
+                elif before:
+                    # The last double before the change (issue #1226).
+                    t_cross = math.nextafter(t_cross, -math.inf)
+                    value = t_cross + offset
                 if t_start < t_cross <= t_end:
                     found.append(
                         CrossingStop(
@@ -3687,6 +4312,48 @@ def _resolve_crossings(
             found.append(
                 CrossingStop(t_cross, clock_idx, t_cross + offset if clock_idx >= 0 else 0.0)
             )
+    if len(treaded) > 1 or (treaded and over_budget):
+        # Main's answer for each, where another law of the run is read so too
+        # or is past the budget. Two lines whose treads end on the same
+        # instants (`1e12 + time()`, `1e12 + 3*time()`) put two stops a double
+        # or two apart, which a run merges onto the later, on the earlier's
+        # change, and a third of the changes had no stop before them (+977
+        # local tolerances where main refuses). Beside a condition past the
+        # budget, these stops cut the stretch its step bound is made from, and
+        # a run main makes was refused for a bound of 3e8 steps.
+        for cond, _clock_idx, scanned in treaded:
+            if scanned.main is not None:
+                over(
+                    cond,
+                    scanned.main.count,
+                    scanned.main.min_gap,
+                    unresolved=scanned.main.unresolved,
+                    flicker=scanned.main.flicker,
+                )
+        treaded = []
+    for cond, clock_idx, scanned in treaded:
+        others = len(placed_before) + len(found) + len(stops)
+        if others + len(scanned) > _RUN_STOP_BUDGET:
+            fits = _leg_that_fits(
+                [
+                    *placed_before,
+                    *(s.time for s in found),
+                    *(s.time for s in stops),
+                    *(t for t, _, _ in scanned),
+                ]
+            )
+            if scanned.main is not None:
+                over(cond, len(scanned), _shortest_stretch([t for t, _, _ in scanned]), legs=fits)
+            else:
+                _say_left_alone(cond, len(scanned), t_start, t_end, fits=fits, others=others)
+            continue
+        for t_cross, value, touch in scanned:
+            crossings.append(CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0))
+            stops.append(
+                CrossingStop(t_cross, clock_idx, value if clock_idx >= 0 else 0.0, touch=touch)
+            )
+        if scanned.coarse is not None:
+            _say_beyond_2_48(cond, scanned.coarse)
     # The sort is stable, so among equal times the conditions keep their order.
     found.sort(key=lambda stop: stop.time)
     stops.sort(key=lambda stop: stop.time)
@@ -3695,9 +4362,10 @@ def _resolve_crossings(
         # A window of the rate law can open on one condition and close on
         # another, so what a step must not span is a stretch between two
         # changes of any of them.
-        placed = [stop.time for stop in found] + [stop.time for stop in stops]
-        every = sorted([*placed, *(t for times in unplaced.values() for t in times)])
-        shortest = _shortest_stretch(every)
+        placed = [*placed_before, *(stop.time for stop in found), *(stop.time for stop in stops)]
+        shortest = _shortest_stretch(
+            sorted([*placed, *(t for times in unplaced.values() for t in times)])
+        )
         for i in unplaced:
             over_budget[i] = over_budget[i]._replace(union_gap=shortest)
     return found, stops, crossings
@@ -3756,10 +4424,94 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
     with more changes than a run has stops for (``mod(time(), 0.0001)``,
     plotted) was refused as if the rate law switched on it.
     """
-    from bngsim._jacobian import _IDENT_RE, _inline_functions
-
     if not conditions:
         return frozenset()
+    flats = _rate_law_flats(core)
+    return frozenset(cond for cond in conditions if any(cond in flat for flat in flats))
+
+
+# What :func:`_rate_law_flat_parts` made, for each model it was made for (a
+# model's rate laws and functions are its core's for its life), and by the
+# texts it was made from, for a clone (a row of `run_batch` has a core of its
+# own): a loop of legs on one model asks on every leg, and the inlining was
+# half of such a leg's time.
+_FLATS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_FLATS_BY_TEXT: dict[tuple, tuple[list[str], int, float]] = {}
+_FLATS_BY_TEXT_MOST = 32
+# The longest a rate law may flatten to and be read for whether it holds
+# between its changes (issue #1226). Past it the inliner writes each text
+# through sympy: a chain of 600 functions took 27 s to read where the run took
+# 0.2, and main reads no rate law there. (The inliner's own limit.)
+_HELD_READ_MOST = 20_000
+# What :func:`_rate_laws_read_held` made, for each model, by the conditions
+# written out.
+_HELD_READS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _flattened_length(rate_laws, func_map) -> float:
+    """The most any of *rate_laws* would be with every function it calls
+    written out, from the lengths of the bodies, without writing one out."""
+    from bngsim._jacobian import _IDENT_RE
+
+    sizes: dict[str, float] = {}
+
+    def size(name: str) -> float:
+        if name not in sizes:
+            sizes[name] = math.inf  # a cycle reads as too long
+            sizes[name] = len(func_map[name]) + sum(
+                size(ref) + 2 - len(ref)
+                for ref in _IDENT_RE.findall(func_map[name])
+                if ref in func_map
+            )
+        return sizes[name]
+
+    try:
+        return max(
+            (
+                len(text)
+                + sum(
+                    size(ref) + 2 - len(ref) for ref in _IDENT_RE.findall(text) if ref in func_map
+                )
+                for text in rate_laws
+            ),
+            default=0.0,
+        )
+    except RecursionError:
+        return math.inf
+
+
+def _rate_law_flat_parts(core) -> tuple[list[str], int, float]:
+    """``(flats, n, longest)``: each rate law and then each function a rate law
+    reaches, with the functions it calls written out (the first *n* are the
+    rate laws'), and the most a rate law flattens to. The flats are made only
+    where that is within :data:`_HELD_READ_MOST` or a caller asks for them
+    whatever it is (:func:`_rate_law_flats`)."""
+    with contextlib.suppress(TypeError):
+        made = _FLATS.get(core)
+        if made is not None:
+            return made
+    ctx = core.functional_jacobian_context()
+    func_map = _scan_function_map(ctx)
+    rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
+    key = (tuple(rate_laws), tuple(sorted(func_map.items())))
+    made = _FLATS_BY_TEXT.get(key)
+    if made is None:
+        made = ([], len(rate_laws), _flattened_length(rate_laws, func_map))
+        if len(_FLATS_BY_TEXT) >= _FLATS_BY_TEXT_MOST:
+            _FLATS_BY_TEXT.clear()
+        _FLATS_BY_TEXT[key] = made
+    with contextlib.suppress(TypeError):
+        _FLATS[core] = made
+    return made
+
+
+def _write_flats(core, made: tuple[list[str], int, float]) -> list[str]:
+    """Fill *made*'s flats in place, once."""
+    from bngsim._jacobian import _IDENT_RE, _inline_functions
+
+    flats = made[0]
+    if flats:
+        return flats
     ctx = core.functional_jacobian_context()
     func_map = _scan_function_map(ctx)
     rate_laws = dict.fromkeys(_scan_rate_law(r) for r in ctx["functional_reactions"])
@@ -3771,11 +4523,85 @@ def conditions_a_rate_law_reads(core, conditions: Sequence[str]) -> frozenset[st
             reached[name] = None
             pending.extend(n for n in _IDENT_RE.findall(func_map[name]) if n in func_map)
     memo: dict[str, str] = {}
-    flats = [
+    flats.extend(
         _inline_functions(text, func_map, memo=memo) or text
         for text in (*rate_laws, *(func_map[name] for name in reached))
-    ]
-    return frozenset(cond for cond in conditions if any(cond in flat for flat in flats))
+    )
+    return flats
+
+
+def _rate_law_flats(core) -> list[str]:
+    """Each rate law, and each function a rate law reaches, with the functions
+    it calls written out."""
+    return _write_flats(core, _rate_law_flat_parts(core))
+
+
+def _rate_laws_read_held(core, held: tuple[str, ...]) -> list[tuple[str, bool]] | None:
+    """For each rate law flattened, ``(flat, reads the clock)`` with every one
+    of *held* written out of it; ``None`` where a rate law flattens past
+    :data:`_HELD_READ_MOST`, and is not read (issue #1226). Made once a model
+    and conditions: written out once a condition, a regimen of 600 windows in
+    one rate law took 21.8 s for main's 1.5."""
+    from bngsim import _clock_scan
+
+    made = _rate_law_flat_parts(core)
+    if made[2] > _HELD_READ_MOST:
+        return None
+    try:
+        reads = _HELD_READS.setdefault(core, {})
+    except TypeError:
+        reads = {}
+    if held not in reads:
+        flats = _write_flats(core, made)[: made[1]]
+        out = []
+        for flat in flats:
+            rest = flat
+            for text in held:
+                rest = rest.replace(text, "0")
+            out.append((flat, bool(_clock_scan._READS_CLOCK.search(rest))))
+        if len(reads) >= 4:
+            reads.clear()
+        reads[held] = out
+    return reads[held]
+
+
+def _a_far_line_outside(core, flat: str, conditions, scope, t_start, t_end) -> bool:
+    """Whether *flat* reads the clock, outside every one of *conditions*,
+    inside a line in time far enough from zero to hold each of its doubles
+    for longer than an instant of the clock from *t_start* to *t_end*.
+
+    Such a rate law is a staircase there too, and a stop on each change of
+    the condition is not a stop on each of its steps: SBML's `rem(1.1e12 +
+    time, P)` loads as `x - P*floor(x/P)`, and with a stop on each change of
+    the `floor` it was 9e-5 off at rtol 1e-8, where main refused it. (A
+    condition has its own stops, and a read of the clock near zero, as in
+    `exp(-time())`, is the integrator's to follow.)"""
+    import numpy as np
+
+    from bngsim import _clock_scan
+
+    rest = flat
+    for cond in sorted(conditions, key=len, reverse=True):
+        rest = rest.replace(cond, "0")
+    ends = np.array([float(t_start), float(t_end)])
+    instant = _clock_scan.TOUCH_ULPS * float(np.spacing(np.max(np.abs(ends))))
+    for clock in _clock_scan._READS_CLOCK.finditer(rest):
+        parts = _clock_scan.lines_holding_the_clock(rest, scope.run_constants, at=clock.start())
+        if not parts:
+            continue
+        try:
+            x = np.asarray(core.evaluate_over_times(f"({parts[-1]})", ends), dtype=float)
+        except Exception:  # noqa: BLE001 - not read: then it may be one
+            return True
+        if not np.all(np.isfinite(x)):
+            return True
+        moved = abs(float(x[1] - x[0]))
+        if (
+            moved > 0.0
+            and float(np.spacing(np.max(np.abs(x)))) * (ends[1] - ends[0]) / moved > instant
+        ):
+            return True
+    return False
 
 
 def _shortest_stretch(times: Sequence[float]) -> float | None:
@@ -3980,6 +4806,8 @@ def _engine_scan_stop_times(
     t_start,
     t_end,
     touches: bool,
+    by_tread: bool = False,
+    reads: Callable[[str], bool] | None = None,
 ) -> list[tuple[float, float, bool]] | None:
     """``(time, counter value, touch)`` for each change of *cond* in
     ``(t_start, t_end]``, found by evaluating it (:mod:`bngsim._clock_scan`),
@@ -3989,6 +4817,13 @@ def _engine_scan_stop_times(
     time is the first double at which the model's evaluator reads the new
     value. *touch* marks a stop on a window a few doubles wide, kept for an
     event trigger alone.
+
+    With *by_tread*, a condition on a line far from zero that the scan refuses
+    or leaves without stops is read tread by tread instead, where it can be
+    (:func:`_tread_stop_times`) and where *reads* says a rate law reads it,
+    and not for an event's trigger: those stops are a double before each
+    change. The scan's own answer is remembered as on main, and the reading
+    apart from it, by the condition and the window alone.
     """
     import numpy as np
 
@@ -3998,10 +4833,42 @@ def _engine_scan_stop_times(
         return None
     shift = asked.shift
     lo, hi = float(t_start) + shift, float(t_end) + shift
+    treads = by_tread and not touches and reads is not None
+    key = (
+        "scan",
+        asked.kind,
+        touches,
+        asked.offset,
+        asked.tables,
+        *_stop_memo_key(asked.inlined, scope, lo, hi),
+    )
+
+    def as_stops(edges):
+        at = np.asarray(edges, dtype=float)
+        touch = np.zeros(at.size, dtype=bool)
+        if touches and at.size > 1:
+            narrow = np.diff(at) <= _clock_scan.TOUCH_ULPS * np.spacing(np.abs(at[:-1]))
+            touch[:-1] |= narrow
+        out = [
+            (float(c - shift), float(c), bool(k))
+            if shift
+            else (float(c), float(c) + offset, bool(k))
+            for c, k in zip(at, touch, strict=True)
+        ]
+        return _TreadStops(out, edges.coarse) if isinstance(edges, _TreadStops) else out
+
     sawtooth = _sawtooth_of_a_line(asked, scope)
     if sawtooth is not None and _coarse_sawtooth(core, asked, sawtooth, lo, hi):
-        logger.debug("%r: a sawtooth of a line coarser than the clock gets no stops (#1018)", cond)
-        return None
+        read = (
+            _left_alone_tread_stops(core, cond, asked, scope, t_start, t_end, offset, reads)
+            if treads
+            else None
+        )
+        if read is None:
+            logger.debug(
+                "%r: a sawtooth of a line coarser than the clock gets no stops (#1018)", cond
+            )
+        return read
 
     class Unreadable(Exception):
         pass
@@ -4063,26 +4930,365 @@ def _engine_scan_stop_times(
             return None
         return edges
 
+    main: _OverStopBudget | None = None
+    try:
+        edges = _memoized_stops(key, resolve)
+    except _OverStopBudget as refused:
+        # Refused where it cannot be read every quarter instant: read once on
+        # each tread, where it can be, and refused as before where it cannot.
+        if refused.flicker is None or not treads or reads is None or not reads(cond):
+            raise
+        coarse = refused.flicker[0] if refused.flicker[3] == "coarse" else None
+        edges = _memoized_stops(
+            ("treads", *key),
+            lambda: _tread_stop_times(core, cond, asked, scope, lo, hi, coarse=coarse),
+        )
+        if edges is None:
+            raise refused from None
+        main = refused
+    if edges is None:
+        return None
+    out = as_stops(edges)
+    if isinstance(out, _TreadStops):
+        out.main = main
+    return out
+
+
+def _tread_stop_times(
+    core,
+    cond: str,
+    asked: _EngineCondition,
+    scope: SwitchConditionScope,
+    lo: float,
+    hi: float,
+    left_alone: bool = False,
+    coarse: str | None = None,
+) -> list[float] | None:
+    """The stops of *asked* from ``lo`` to ``hi`` on the evaluator's clock,
+    read once for each double of the line its one read of the clock is in
+    (:func:`bngsim._clock_scan.tread_changes`, issue #1018), for a condition
+    the scan refuses or, with *left_alone*, leaves without stops. ``None``
+    where it cannot be read that way, and the condition is left as the scan
+    left it.
+
+    Between two stops the rate law is then exactly constant: the rows of the
+    issue the scan refused (`floor(mod(1e12 + time(), 0.3)/0.3 + 0.0005)`
+    over 240, a dozen doubles of `1e12 + time()` to a `mod`) are exact to
+    rounding, and `100*mod(1.1e12 + time(), 0.0048828125)`, which the scan
+    left alone, was 21% over by the sixth of six legs of 0.2.
+
+    *coarse* is the sawtooth call the scan refused as beyond 2^48: the run is
+    made as the evaluator reads the law, a staircase, and is warned that the
+    call resolves only a few steps of its period.
+
+    Past the run's budget of stops, a condition the scan refused is over it,
+    and the rule for that stands: a step bound of half its shortest stretch
+    where it is all that switches, refused by name otherwise. One the scan
+    left alone is left so, and the run is warned. Bounded at a tread,
+    `100*frac(1e6 + time())` over (3, 10) is 6e10 steps, past what a bound
+    may cost, where the run without stops is right; over (1e6, 1e6 + 1),
+    `100*frac((3e9 + time())/0.0009765625)` came out 4.9e-4 off, for 2.2e-5
+    without.
+    """
+    from bngsim import _clock_scan
+
+    text = asked.text
+    if len(_clock_scan._READS_CLOCK.findall(text)) != 1:
+        return None
+    parts = _clock_scan.lines_holding_the_clock(text, scope.run_constants)
+    if not parts:
+        return None
+    read: _clock_scan.Treads | None = None
+    unread: tuple[str, _clock_scan.Treads] | None = None
+    # The innermost part of the line that holds the clock first: the doubles
+    # of `(1.1e12 + time())/0.0048828125` skip, as a quotient by 5/1024 of
+    # doubles 2.4e-4 apart is, and that sawtooth was left without stops, where
+    # the sum inside takes each of its doubles in turn. A part too fine to read
+    # is passed over for the next one out: `time() - 1` inside
+    # `1e12 + (time() - 1)` holds a double of the clock to a tread.
+    line = parts[-1]
+    for part in parts:
+        try:
+            got = _clock_scan.tread_changes(
+                lambda what, at: asked.evaluate(core, what, at),
+                text,
+                part,
+                lo,
+                hi,
+                _RUN_STOP_BUDGET,
+            )
+        except Exception as exc:  # noqa: BLE001 - declined, and left as the scan left it
+            logger.debug("tread-by-tread reading declined %r: %s", cond, exc)
+            return None
+        if got is None:
+            continue
+        if not got.read:
+            if part == parts[-1]:
+                unread = (part, got)
+            continue
+        read, line = got, part
+        break
+    if read is None:
+        if unread is None:
+            return None
+        line, read = unread
+    if read.stops is not None:
+        return _TreadStops([float(t) for t in read.stops], coarse)
+    if not left_alone:
+        if read.read:
+            # Refused by name, with a leg that fits (#890's step bound in place
+            # of the stops left `100*mod(1e12 + time(), 12u)` over 130 0.4% off
+            # at the default tolerances, and 4.5% from X(0) = 1e4; over 100,
+            # each change stopped at, it is exact to rounding).
+            raise _OverStopBudget(read.changes, min_gap=read.shortest, legs=read.fits)
+        return None
+    shift = asked.shift
+    return _TreadStops(
+        [],
+        past=(read.changes, lo - shift, hi - shift, None if read.read else line, read.fits),
+    )
+
+
+class _TreadStops(list):
+    """Stops read tread by tread (issue #1018), and what the run is told of
+    them: *coarse*, the sawtooth call beyond 2^48 they are the steps of;
+    *past*, ``(changes, t0, t1, line, leg that fits)`` where there were more
+    than a run places or reads, and none are placed.
+    What a reading finds is the condition's and the window's alone, and is
+    remembered so: a law in a function no rate law reads, read and remembered
+    as no stops, was no stops for the next model that did read it."""
+
+    def __init__(
+        self,
+        items=(),
+        coarse: str | None = None,
+        past: tuple | None = None,
+        main: _OverStopBudget | None = None,
+    ):
+        super().__init__(items)
+        self.coarse = coarse
+        self.past = past
+        # Main's answer where it refused the law: what the run is given again
+        # where these stops are not placed.
+        self.main = main
+
+
+def _say_beyond_2_48(cond: str, call: str) -> None:
+    _say_once(
+        cond,
+        "2^48",
+        "The rate law switches on %r, and the whole number of periods `%s` takes off its "
+        "argument is beyond 2^48 in this run: the call resolves only a few steps of each "
+        "period, each a large part of it. The run is made as the evaluator reads the rate "
+        "law, a staircase with a stop on each step (issue #1018). For a sawtooth, take the "
+        "offset out of what the call divides: `mod(time(), P)`, not `mod(1e12 + time(), P)`.",
+        cond,
+        call.partition("(")[0].strip(),
+    )
+
+
+# The conditions and kinds of warning :func:`_say_once` has said.
+_SAID: set[tuple[str, str]] = set()
+
+
+# What the readings of the run being placed have to say, said once its stops
+# are taken (:func:`say_what_was_read`).
+_PENDING: list[tuple[str, str, str, tuple]] = []
+
+
+def _say_once(cond: str, kind: str, message: str, *args) -> None:
+    """Warn *message* the first time a run of this session meets *cond* for
+    *kind*: a loop of a thousand legs is one warning, not a thousand. Said
+    when the run's stops are taken: said as another condition refused the
+    run, the warning was spent, and the legs run next had none."""
+    if (cond, kind) not in _SAID:
+        _PENDING.append((cond, kind, message, args))
+
+
+def say_what_was_read(taken: bool) -> None:
+    """Say what the readings of the run just placed found, where its stops
+    were *taken*; drop it where they were not."""
+    pending = list(_PENDING)
+    _PENDING.clear()
+    if not taken:
+        return
+    for cond, kind, message, args in pending:
+        if (cond, kind) not in _SAID:
+            _SAID.add((cond, kind))
+            logger.warning(message, *args)
+
+
+def _three_places_down(x: float) -> str:
+    """*x* to three significant figures, rounded down: a leg of 0.477 where
+    0.476837 fits held 1,000,341 changes, and was over the budget again."""
+    if not (x > 0.0 and math.isfinite(x)):
+        return f"{x:g}"
+    scale = 10.0 ** (math.floor(math.log10(x)) - 2)
+    return f"{math.floor(x / scale) * scale:.3g}"
+
+
+def _say_left_alone(
+    cond: str,
+    changes: int,
+    t0: float,
+    t1: float,
+    line: str | None = None,
+    fits: float | None = None,
+    others: int = 0,
+) -> None:
+    """The warning for a law read tread by tread that is integrated as before
+    issue #1018 after all, for want of the stops or the reads. *fits* is the
+    longest leg that would have them."""
+    from bngsim import _clock_scan
+
+    span = abs(t1 - t0)
+    if line is not None:
+        what = (
+            f"is read through {line!r}, which takes {changes} doubles between t={t0!r} and "
+            f"t={t1!r}, more than bngsim reads for one law in one run "
+            f"({_clock_scan.TREAD_READS:,})"
+        )
+        leg = span * _clock_scan.TREAD_READS / max(changes, 1)
+    elif others:
+        what = (
+            f"changes {changes} times between t={t0!r} and t={t1!r}, which with the "
+            f"{others:,} stops of the run's other switches is more than the "
+            f"{_RUN_STOP_BUDGET:,} bngsim places in one run"
+        )
+        leg = span * _RUN_STOP_BUDGET / max(changes + others, 1)
+    else:
+        what = (
+            f"changes {changes} times between t={t0!r} and t={t1!r}, more than the "
+            f"{_RUN_STOP_BUDGET:,} stops bngsim places in one run"
+        )
+        leg = span * _RUN_STOP_BUDGET / max(changes, 1)
+    _say_once(
+        cond,
+        "left alone",
+        "The rate law switches on %r, which %s. It is integrated without a stop on each "
+        "change, as before issue #1018, and is as near as the error test finding each "
+        "change makes it. Run it in legs of %s or shorter (run_until) to have them.",
+        cond,
+        what,
+        _three_places_down(min(leg, fits) if fits is not None else leg),
+    )
+
+
+def _leg_that_fits(times) -> float:
+    """The shortest stretch holding one stop more than a run's budget: a leg
+    shorter than it holds no more than the budget."""
+    import numpy as np
+
+    at = np.sort(np.asarray(list(times), dtype=float))
+    if at.size <= _RUN_STOP_BUDGET:
+        return math.inf
+    return float(np.min(at[_RUN_STOP_BUDGET:] - at[:-_RUN_STOP_BUDGET]))
+
+
+class _LeftAloneStops(_TreadStops):
+    """The stops :func:`_left_alone_tread_stops` read for a law main leaves
+    without any, which a run takes once every other condition has its own."""
+
+
+# A period of a sawtooth of a line, in doubles of its argument, up to which
+# the sawtooth is read tread by tread where main leaves it without stops.
+# Finer, it is a staircase of steps under a thousandth of the period, and main
+# integrates it as the line it nearly is: `100*mod(1.7e9 + time(), 86400)/86400`
+# over 0.2 took 14 steps and was right to 4e-10, and a stop on each of its
+# 838,861 treads took 1.7 million steps and 5.6 s. With 20 doubles to a period,
+# `100*mod(1.1e12 + time(), 0.0048828125)` was 21% over on main.
+_TREADS_TO_A_PERIOD = 1024.0
+
+
+def _sawtooth_treads(core, asked: _EngineCondition, phase, lo: float, hi: float):
+    """``(doubles of the argument to a period, beyond 2^48)`` for the sawtooth
+    *phase* of *asked* from *lo* to *hi*, the fewer doubles of the two ends;
+    ``None`` where it cannot be read."""
+    import numpy as np
+
+    from bngsim import _clock_scan
+
+    argument = _clock_scan._split_commas(phase.call.partition("(")[2][:-1])[0].strip()
+    ends = np.array([lo, hi], dtype=float)
+    try:
+        x = np.abs(np.asarray(asked.evaluate(core, f"({argument})", ends), dtype=float))
+        size = np.abs(np.asarray(asked.evaluate(core, phase.phase, ends), dtype=float))
+    except Exception:  # noqa: BLE001 - the reading is declined
+        return None
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(size))) or np.any(size == 0.0):
+        return None
+    if np.any(x == 0.0):
+        return None
+    doubles = float(np.min((x / size) / np.spacing(x)))
+    return doubles, bool(np.any(size >= _clock_scan._SAWTOOTH_AT_MOST))
+
+
+def _left_alone_tread_stops(
+    core,
+    cond: str,
+    asked: _EngineCondition | None,
+    scope: SwitchConditionScope,
+    t_start,
+    t_end,
+    offset: float,
+    reads: Callable[[str], bool] | None = None,
+) -> _LeftAloneStops | None:
+    """``(time, counter value, touch)`` for each change of a sawtooth of a line
+    far from zero standing as a number, which main leaves without stops (the
+    scan declines it as coarser than the clock, or a resolver lists no change
+    of it), read tread by tread (issue #1018). ``None`` where it is left so:
+    where a period is more than :data:`_TREADS_TO_A_PERIOD` doubles of its
+    argument, or where it cannot be read.
+
+    One beyond 2^48 is read so too, and warned of where its stops are placed;
+    where it cannot be read, or past the budget, it is left as main leaves it.
+    (Refused there, it refused runs main has right: `100*mod(1e8 + time(),
+    20u)` at t = 1e6, whose stops CVODE cannot take apart, is within a tenth
+    of a local tolerance on main.)
+    """
+    if asked is None:
+        return None
+    phase = _sawtooth_of_a_line(asked, scope)
+    if phase is None:
+        return None
+    shift = asked.shift
+    lo, hi = float(t_start) + shift, float(t_end) + shift
+    treads = _sawtooth_treads(core, asked, phase, lo, hi)
+    if treads is None or treads[0] > _TREADS_TO_A_PERIOD:
+        return None
+    # (Last: it reads every rate law, which a leg of a model with an ordinary
+    # schedule paid for at three times main's cost a leg.)
+    if reads is None or not reads(cond):
+        return None
+    beyond = treads[1]
     key = (
-        "scan",
+        "treads",
         asked.kind,
-        touches,
         asked.offset,
         asked.tables,
         *_stop_memo_key(asked.inlined, scope, lo, hi),
     )
+
+    def resolve():
+        return _tread_stop_times(
+            core,
+            cond,
+            asked,
+            scope,
+            lo,
+            hi,
+            left_alone=True,
+            coarse=phase.call if beyond else None,
+        )
+
     edges = _memoized_stops(key, resolve)
-    if edges is None:
+    if edges is None or not (edges or edges.past):
         return None
-    at = np.asarray(edges, dtype=float)
-    touch = np.zeros(at.size, dtype=bool)
-    if touches and at.size > 1:
-        narrow = np.diff(at) <= _clock_scan.TOUCH_ULPS * np.spacing(np.abs(at[:-1]))
-        touch[:-1] |= narrow
-    return [
-        (float(c - shift), float(c), bool(k)) if shift else (float(c), float(c) + offset, bool(k))
-        for c, k in zip(at, touch, strict=True)
+    stops = [
+        (float(c - shift), float(c), False) if shift else (float(c), float(c) + offset, False)
+        for c in edges
     ]
+    return _LeftAloneStops(stops, edges.coarse, edges.past)
 
 
 def _few_changes(
@@ -5250,7 +6456,9 @@ def merge_crossing_stops(found: Sequence[CrossingStop], floor: float = 1.0) -> l
     # restarted a double before its own change (`time() - P*floor(time()/P)`
     # beside `mod(time(), P)`: 305 times rtol, main 33); onto a moved one, an
     # event trigger's stop was read a double late. Where any is, every stop
-    # goes back to where the resolvers put it, and the run is main's.
+    # the resolvers placed goes back to where they put it. (A scanned stop has
+    # no placing of theirs, and stays a double before its change where it was
+    # put there, issue #1226.)
     if any(stop.on_flip for stop in found) and any(
         (a.on_flip or b.on_flip) and a.time != b.time and _same_instant(a.time, b.time, floor)
         for a, b in zip(found, found[1:], strict=False)
@@ -5504,6 +6712,56 @@ def _fixed_threshold_expr(threshold_expr: str, scope: SwitchConditionScope) -> b
 # moving argument is on CVODES' difference quotient with that jump in it.
 # ``abs``/``min``/``max`` are not here: they bend ``f`` without breaking it, and
 # the difference quotient integrates through a kink correctly.
+# A condition that is a sawtooth call, whole (`mod(1.1e12 + time(), P)`): the
+# shape :func:`_left_alone_tread_stops` reads, asked of a resolver's "no change"
+# before the condition is made for the evaluator.
+_SAWTOOTH_CALL = re.compile(r"\s*(?:mod|frac)\s*\(")
+
+
+# The calls whose value holds between two of its changes.
+_HELD_CALLS = frozenset(
+    {"floor", "ceil", "round", "roundn", "rint", "nint", "trunc", "sign", "sgn"}
+)
+
+
+def _held_between_changes(cond: str) -> bool:
+    """Whether *cond* holds its value between two of its changes: a comparison
+    (or a combination of them), or a whole step call. Not a sawtooth (`mod`,
+    `frac`), which climbs between its wraps, nor a bend. Read at the top
+    level only: a comparison in parentheses, as every one an SBML model loads
+    is, is not taken to, and keeps its stops where they were put."""
+    text = cond.strip()
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0 and ch in "<>" or (depth == 0 and text[i : i + 2] in ("==", "!=")):
+            return True
+    name, paren, _ = text.partition("(")
+    if not paren or name.strip() not in _HELD_CALLS:
+        return False
+    depth = 0
+    for i in range(len(name), len(text)):
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        if depth == 0:
+            return i == len(text) - 1
+    return False
+
+
+def _a_whole_sawtooth_call(text: str) -> bool:
+    """Whether *text* is one `mod` or `frac` call, and not a comparison of
+    one (`mod(time(), 24) < 12`)."""
+    head = _SAWTOOTH_CALL.match(text)
+    if head is None:
+        return False
+    depth = 0
+    body = text.rstrip()
+    for i in range(head.end() - 1, len(body)):
+        depth += {"(": 1, ")": -1}.get(body[i], 0)
+        if depth == 0:
+            return i == len(body) - 1
+    return False
+
+
 _STEP_CALL = re.compile(
     r"(?<![A-Za-z0-9_.])"
     r"(?:floor|ceil|round|roundn|rint|nint|trunc|frac|sign|sgn|mod|fmod|rem|iclamp|inrange)"
@@ -5641,12 +6899,12 @@ def _iter_step_calls(
     *skip* are further spans of *expr* whose calls are not reported: the
     comparisons outside every ``if()`` that are conditions in their own right.
     """
-    spans = [*_condition_spans(expr), *skip]
+    spans = _SpanIndex([*_condition_spans(expr), *skip])
     covered = -1  # the close paren of the last call reported, under *outermost*
     for m in (pattern or _STEP_CALL).finditer(expr):
         if m.start() < covered:
             continue
-        if any(lo <= m.start() < hi for lo, hi in spans):
+        if spans.covers(m.start()):
             continue
         open_paren = m.end() - 1
         close_paren = _find_close_paren_strict(expr, open_paren)
@@ -5660,36 +6918,113 @@ def _iter_step_calls(
             yield expr[m.start() : close_paren + 1], expr[open_paren + 1 : close_paren]
 
 
+_PAREN_OR_COMMA = re.compile(r"[(),]")
+
+
+class _BranchGuards:
+    """Every ``if()`` of a text, read once, so :func:`_branch_guard` can be
+    asked about any offset of it.
+
+    :func:`state_switch_root_conditions` asks for the guard of every step or
+    bend call in a rate law, and each question used to match every ``if()``
+    before the call to its close paren and split its arguments again, the
+    ones holding the call included: the product of the two counts, on every
+    plain run. One ``if()`` holding 2,000 ``max()`` calls, read whole for each
+    of them, spent 10.7 s there.
+
+    One pass over the parentheses and commas matches each ``if(`` to its close
+    paren and finds the commas between its arguments, where
+    ``_find_close_paren_strict`` and ``_split_top_level_commas`` find them, and
+    an ``if(`` left open is no ``if()`` at all, as there. Matched parens nest,
+    so a sweep over the ``if()``s in order keeps, for each stretch between two
+    edges of their argument lists, the innermost one holding it. The ``if()``s
+    enclosing an offset are then that one and the ones holding it, found by
+    bisection and read innermost first.
+    """
+
+    __slots__ = ("_expr", "_edges", "_inner", "_ifs")
+
+    def __init__(self, expr: str) -> None:
+        self._expr = expr
+        # Each matched if(): its open paren, its close paren, its top-level commas.
+        found: list[tuple[int, int, list[int]]] = []
+        if_opens = {m.end() - 1 for m in _IF_CALL.finditer(expr)}
+        if if_opens:
+            groups: list[tuple[int, list[int] | None]] = []  # the open parens
+            for m in _PAREN_OR_COMMA.finditer(expr):
+                c = m.group()
+                if c == "(":
+                    groups.append((m.start(), [] if m.start() in if_opens else None))
+                elif not groups:
+                    continue  # a comma or close paren outside every group
+                elif c == ",":
+                    commas = groups[-1][1]
+                    if commas is not None:
+                        commas.append(m.start())
+                else:
+                    open_paren, commas = groups.pop()
+                    if commas is not None:
+                        found.append((open_paren, m.start(), commas))
+            found.sort()
+        # Per if(): its open paren, where its then- and else-branches start
+        # (-1 for one without three arguments), and the if() holding it.
+        self._ifs: list[tuple[int, int, int, int]] = []
+        # The innermost if() holding each offset from an edge to the next.
+        self._edges: list[int] = []
+        self._inner: list[int] = []
+        holding: list[int] = []
+
+        def leave() -> None:
+            self._edges.append(found[holding.pop()][1])
+            self._inner.append(holding[-1] if holding else -1)
+
+        for i, (open_paren, _close_paren, commas) in enumerate(found):
+            while holding and found[holding[-1]][1] < open_paren:
+                leave()
+            then_start = else_start = -1
+            if len(commas) == 2:
+                then_start, else_start = commas[0] + 1, commas[1] + 1
+            self._ifs.append((open_paren, then_start, else_start, holding[-1] if holding else -1))
+            holding.append(i)
+            self._edges.append(open_paren + 1)
+            self._inner.append(i)
+        while holding:
+            leave()
+
+    def at(self, pos: int) -> str | None:
+        """:func:`_branch_guard` of offset *pos*."""
+        k = bisect.bisect_right(self._edges, pos) - 1
+        i = self._inner[k] if k >= 0 else -1
+        factors: list[str] = []
+        while i >= 0:
+            open_paren, then_start, else_start, i = self._ifs[i]
+            if then_start < 0:
+                return None  # not the form read here: no guard to give
+            cond = self._expr[open_paren + 1 : then_start - 1]
+            if then_start <= pos < else_start - 1:
+                factors.append(f"(({cond})!=0)")
+            elif pos >= else_start:
+                factors.append(f"(({cond})==0)")
+            else:
+                return None  # in the condition itself
+        return "*".join(reversed(factors)) if factors else None
+
+
 def _branch_guard(expr: str, pos: int) -> str | None:
     """Whether the ``if()`` branches enclosing offset *pos* of *expr* are on, as
     an expression that reads 1 where they all are and 0 where one is not:
     ``((c)!=0)`` for a then-branch and ``((c)==0)`` for an else-branch,
-    multiplied. ``None`` where no ``if()`` branch encloses it (issue #1147).
+    multiplied, outermost first. ``None`` where no ``if()`` branch encloses it
+    (issue #1147).
 
     A condition is ExprTk's to read, and ExprTk takes a branch wherever its
     condition is nonzero, not only where it is a comparison's 1: ``if(F, ...)``
     with ``F = 0.3`` runs its then-branch, and ``(c)`` read against ``> 0.5``
-    called that branch off and stepped over its kink."""
-    factors: list[str] = []
-    for m in _IF_CALL.finditer(expr):
-        open_paren = m.end() - 1
-        if open_paren >= pos:
-            break
-        close_paren = _find_close_paren_strict(expr, open_paren)
-        if close_paren < 0 or close_paren <= pos:
-            continue
-        args = _split_top_level_commas(expr[open_paren + 1 : close_paren])
-        if len(args) != 3:
-            return None  # not the form read here: no guard to give
-        then_start = open_paren + 1 + len(args[0]) + 1
-        else_start = then_start + len(args[1]) + 1
-        if then_start <= pos < else_start - 1:
-            factors.append(f"(({args[0]})!=0)")
-        elif pos >= else_start:
-            factors.append(f"(({args[0]})==0)")
-        else:
-            return None  # in the condition itself
-    return "*".join(factors) if factors else None
+    called that branch off and stepped over its kink.
+
+    A caller asking about many offsets of one text builds its
+    :class:`_BranchGuards` once."""
+    return _BranchGuards(expr).at(pos)
 
 
 def _fixed_clock_step(arg_flat: str, scope: SwitchConditionScope) -> bool:
@@ -6216,6 +7551,8 @@ def _facts_of(
 # A call that is known to be continuous and to bend: asked about as a choice
 # is, by what the law divides by. Any other call this does not know could be
 # anything, a branch cut (``atan2``) or a pole, and is refused where it is live.
+# A clamp bends only with its bounds in order; crossed, it is a step, which
+# :func:`_quotient_across_a_choice` names (issue #1227).
 _BEND_CALLS = frozenset({"clamp"})
 
 
@@ -6471,8 +7808,11 @@ def _quotient_across_a_choice(
     has a value, an even power, a sum and a product keep: nothing is assumed
     of the state, which a concentration below 0 would break.
 
-    Three more are named:
+    Four more are named:
 
+    - a ``clamp`` whose bounds are numbers or parameters with ``lo`` above
+      ``hi``, over the state or over a requested parameter that moves its
+      argument across ``lo``: a step, not a bend (issue #1227);
     - a power under 1, a root, a logarithm or a ``hypot`` of what holds one
       of the three and is not known to be nonzero, and an inverse sine or
       cosine of what holds one: continuous, and leaving the bend with a
@@ -6498,6 +7838,29 @@ def _quotient_across_a_choice(
             name = _call_name(node)
             if _unknown_call(name) and name not in _BEND_CALLS and facts[id(node)].live:
                 return _clipped(node)
+    # A clamp bends only with its bounds in order. With lo above hi, ExprTk's
+    # clamp(lo, x, hi) is lo below x = lo and hi from there on, a step (issue
+    # #1227), and the quotient reads across it as across any jump:
+    # ``0.01*kx*clamp(1, (Tobs - 40)/10, 0)`` returned dY/dk_clock = -1.41 for
+    # -0.97 at every tolerance. One over the state is named, as a step call is;
+    # one over parameters alone where a requested one moves x across lo.
+    for node in order:
+        if _call_name(node) != "clamp" or not facts[id(node)].live:
+            continue
+        bounds = node.args  # type: ignore[attr-defined]
+        if len(bounds) != 3:
+            continue
+        lo, x, hi = bounds
+        bottom, top = facts[id(lo)].value, facts[id(hi)].value
+        if bottom is None or top is None or bottom <= top:
+            continue
+        over = facts[id(x)]
+        if over.state or (
+            over.asked
+            and not over.clock
+            and _flips_with_a_parameter(ast.BinOp(left=x, op=ast.Sub(), right=lo), values, asked)
+        ):
+            return _clipped(node)
 
     def small(node: ast.AST) -> bool:
         return facts[id(node)].live and facts[id(node)].size <= _FLIP_MAX_NODES
@@ -6897,7 +8260,9 @@ def fallback_crossing(
       ``min``: ``(thr − X)/abs(thr − X)``
       (:func:`_quotient_across_a_choice`). One that stands alone is a bend,
       and runs;
-    - a step call on the state, ``floor(Atot)``, or on a moved counter;
+    - a step call on the state, ``floor(Atot)``, or on a moved counter; and a
+      ``clamp`` over one whose bounds are crossed, ``clamp(1, Aobs, 0)``,
+      which is a step (issue #1227);
     - a step call on a clock, literal time or a counter nothing moves, whose
       argument reads a requested parameter, ``floor(time()/P)`` with ``P``
       requested: the steps move with ``P``, and nothing jumps a column at a
@@ -7364,9 +8729,9 @@ def _compares_outside_an_if(text: str) -> bool:
     conditions reads those of an ``if()`` and does not find it."""
     if _SINGLE_EQUALS.search(text) or _TERNARY.search(text):
         return True
-    spans = _condition_spans(text)
+    spans = _SpanIndex(_condition_spans(text))
     return any(
-        not any(lo <= m.start() and m.end() <= hi for lo, hi in spans)
+        not spans.contains(m.start(), m.end())
         for pat in (_RELATIONAL, _LOGICAL, _NOT_OP, _NOT_CALL)
         for m in pat.finditer(text)
     )
@@ -8080,6 +9445,126 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
     return conditions
 
 
+def equalities_held_at_start(core, ctx=None, t0: float = 0.0) -> list[str]:
+    """The rate-law equalities over model state that the run starts on (issue #1228).
+
+    :func:`state_switch_conditions` roots no equality: a trajectory that crosses
+    ``X == c`` holds it for an instant, so its branch adds nothing, and a root
+    there would make the branch, as the restart at the crossing reads it as
+    holding over the next step. The core admits the equality's surface (issue
+    #381) and measures its branch gap either side of it, where both sides read
+    false.
+
+    A state that sits ON the surface holds the equality for a stretch:
+    ``if(Bobs==0, kb, 0)`` with B made only once A falls to q kept its branch on
+    until then. Leaving it is a switch, and neither root nor probe sees it, so a
+    sensitivity run returned dY/da and dY/dq as 0 for -6.44 and -1 with no word,
+    where ``Bobs<=0``, the same switch, is located and refused as a tangency.
+
+    Each atom here is a plain equality (or ``!=``) of things that move smoothly,
+    over live state, in a functional rate law or a function one reaches (one an
+    output alone reads moves nothing), whose residual is exactly 0 at the state the run starts
+    from, observables and functions refreshed from it, and still exactly 0 a
+    step along the flow from there: the state stays on the surface rather than
+    starting on it and leaving (``Aobs == 10`` with A decaying from 10 holds for
+    the instant t = 0, and is not one). An equality over a step or bend call
+    (``floor(T/24) == 3``) is a window like any other and is not one.
+
+    The test is first order and reads the flow alone, so it never passes a run
+    that would be wrong but refuses some that would be right (issue #1279): a
+    residual that turns at second order at the start, a stretch that outlasts
+    the run, one that only an event ends (the event's own jump is right), one
+    that a rooted condition inside the equality ends (``if(fB()==0, kb, 0)``
+    with ``fB`` gated by ``if(q-Aobs>0, …)``), and one whose conjunction never
+    holds for another reason.
+
+    The start is read at *t0*, the run's start time, and the step lands at *t0*
+    plus the step: a rate or a residual that reads the clock is read where the
+    run is. Read at t = 0, ``if(time()<1, 1, 0)`` in B's rate made B leave 0 at
+    once in a run over (5, 20) that held it there until t*, and the columns came
+    back 0 again. The species, and a pending carry-over dx/dθ seed, are put back
+    as found, since ``set_state`` drops the seed (GH #210) that a
+    ``carry_sensitivities=True`` run starts from. The observables and functions
+    are left refreshed from the start state.
+
+    Only the start is read. A state that an event puts on the surface mid-run
+    is not seen here (issue #1279).
+    """
+    import numpy as np
+
+    from bngsim._jacobian import _inline_functions
+
+    if core.n_functions == 0:
+        return []
+    if ctx is None:
+        ctx = core.functional_jacobian_context()
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
+        return []
+    func_map = _scan_function_map(ctx)
+    memo: dict[str, str] = {}
+    # The rate laws, with the functions they reach written in: an equality in a
+    # function that only an output reads moves no trajectory and no column. Each
+    # law and each atom is read once, however many reactions share it.
+    atoms: dict[str, None] = {}
+    for law in dict.fromkeys(_scan_rate_law(rxn) for rxn in ctx["functional_reactions"]):
+        flat = _inline_functions(law, func_map, memo=memo) or law
+        if _IF_CALL.search(flat):
+            atoms.update(dict.fromkeys(_iter_condition_atoms(flat)))
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for whole in atoms:
+        if not is_equality_atom(whole) or _STEP_CALL.search(whole) or _BEND_CALL.search(whole):
+            continue
+        residual = state_switch_residual(core, whole)
+        if residual and residual not in seen:
+            seen.add(residual)
+            candidates.append((whole, residual))
+    if not candidates:
+        return []
+
+    step = 1e-6
+    x0 = core.get_state()
+    seed = (
+        (
+            np.array(core.pending_sensitivity_seed(), dtype=np.float64),
+            list(core.pending_sensitivity_seed_param_names),
+        )
+        if core.has_pending_sensitivity_seed
+        else None
+    )
+
+    def value_at(residual, t, state):
+        # With the species at *state*, and the observables and functions
+        # refreshed from them at *t*; the start is put back below.
+        core.set_state(state)
+        core.compute_derivs(t, state)
+        return _evaluate_over(core, residual, [t])
+
+    held: list[str] = []
+    stepped = None
+    try:
+        for whole, residual in candidates:
+            try:
+                if not np.all(value_at(residual, t0, x0) == 0.0):
+                    continue
+                if stepped is None:
+                    # One step along the flow: a residual every rate it reads
+                    # leaves at exactly 0 stays at exactly 0.
+                    stepped = x0 + step * core.compute_derivs(t0, x0)
+                if np.all(value_at(residual, t0 + step, stepped) == 0.0):
+                    held.append(whole)
+            except Exception:  # noqa: BLE001 - a residual the evaluator cannot read is not asked
+                continue
+    finally:
+        core.set_state(x0)
+        if seed is not None:
+            core.set_pending_sensitivity_seed(*seed)
+        # The run refreshes them anyway, and says why where it cannot.
+        with contextlib.suppress(Exception):
+            core.compute_derivs(t0, x0)
+    return held
+
+
 def state_switch_reactions(core, conditions: Sequence[str], ctx=None) -> list[list[int]]:
     """For each condition, the 0-based functional reactions whose rate law reads it.
 
@@ -8360,17 +9845,21 @@ def state_switch_root_conditions(
         # Every step or bend call outside the comparisons, nested ones too: the
         # abs() inside `max(0, 1 - abs(u)/w)` bends the rate law as the max()
         # does (issue #1068). One inside a comparison jumps it only through
-        # that comparison, whose root is above.
+        # that comparison, whose root is above. Each atom's text is found
+        # once: written N times, it is in `compared` N times, and finding
+        # every copy for every copy listed N² spans, which the index the call
+        # scan puts them in then sorted (issue #1256).
         spans = [
             (start, start + len(atom))
-            for atom in compared
+            for atom in dict.fromkeys(compared)
             for start in (m.start() for m in re.finditer(re.escape(atom), text))
         ]
+        guard_at = _BranchGuards(text).at
         for pattern in (_STEP_CALL, _BEND_CALL):
             for call, _arg, start in _iter_step_calls(
                 text, pattern=pattern, skip=spans, with_start=True
             ):
-                guard = _branch_guard(text, start)
+                guard = guard_at(start)
                 for atom in call_atoms(inline(call)):
                     admit(atom, guard=None if guard is None else inline(guard))
     if not with_guards:
@@ -8564,10 +10053,10 @@ def uncompensated_condition_reason(
     # carries no operator either pattern matches, so it was admitted, sympy
     # differentiated `~X` to a clean 1, and nothing warned. Both spellings now
     # land in the same class.
-    spans = _condition_spans(expr)
+    spans = _SpanIndex(_condition_spans(expr))
     for pat in (_RELATIONAL, _LOGICAL, _NOT_OP, _NOT_CALL):
         for m in pat.finditer(expr):
-            if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans):
+            if not spans.contains(m.start(), m.end()):
                 # `not(` is matched with its paren; report the operator alone.
                 op = m.group(0).rstrip("( \t")
                 return UncompensatedCrossingReason(

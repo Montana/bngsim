@@ -473,10 +473,12 @@ CHAINS = {
         {"k1", "d"},
         "size of compartment 'c'",
     ),
+    # A lives outside c: a rate that reads a species of c is refused as a loop
+    # (c through J0 through [A] = amount/c) by Antimony >= 3.2 and libRoadRunner.
     "a-size-from-a-rate": (
         lambda: bngsim.Model.from_antimony_string(
-            "compartment c; species A in c, S in c; A = 4; S = 1; k1 = 0.5; k = 1; c = J0;\n"
-            "J0: A -> ; k1*A\nJ: S -> ; k*S\n"
+            "compartment c, d; d = 1; species A in d, S in c; A = 4; S = 1; k1 = 0.5; k = 1;\n"
+            "c = J0;\nJ0: A -> ; k1*A\nJ: S -> ; k*S\n"
         ),
         {"k1"},
         "size of compartment 'c'",
