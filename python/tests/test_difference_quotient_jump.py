@@ -205,12 +205,27 @@ def _held_inhibitor(tmp_path: Path, **kw) -> bngsim.Model:
     )
 
 
-def test_a_species_held_at_zero_stays_there(tmp_path: Path) -> None:
-    """Main put 1e-36 into I through the LU and Y went to 100: 4.0 at t = 200."""
-    t, s = _run(_held_inhibitor(tmp_path), 200.0, 41, jacobian="fd")
+@pytest.mark.parametrize(
+    ("declined", "kw"),
+    [(False, {"jacobian": "fd"}), (True, {})],
+)
+def test_a_species_held_at_zero_stays_there(tmp_path: Path, declined: bool, kw: dict) -> None:
+    """I = 0 for good; Y is lost at 0.05 while I = 0 (0.01 were I > 0), so Y =
+    10·exp(-0.05 t). Main put 1e-35 into I through the LU, and Y fell at 0.01:
+    4.9 off at t = 60 with "fd", 10 with a declined law. The leak's sign is the
+    LU's rounding (on other output grids main leaked below 0 and Y came out
+    right), so I is also held to exactly 0."""
+    model = _net(
+        tmp_path,
+        ["I() 0", "Y() 10"],
+        ["Iobs 1"],
+        ["f() kx*if(Iobs > 0, 0.01, 0.05)"],
+        ["2 0 f"],
+        declined=declined,
+    )
+    t, s = _run(model, 60.0, 121, **kw)
+    assert _worst(s[:, 1], 10.0 * np.exp(-0.05 * t)) < OK
     assert np.all(s[:, 0] == 0.0)
-    exact = 20.0 - 10.0 * np.exp(-0.05 * t)
-    assert _worst(s[:, 1], exact) < OK
 
 
 @pytest.mark.parametrize("method", ["integration", "newton"])
