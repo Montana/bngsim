@@ -246,6 +246,34 @@ def test_a_gate_held_at_zero(tmp_path: Path, declined: bool, kw: dict) -> None:
     assert _worst(s[:, 1], 0.5 + 0.5 * np.exp(-t)) < OK
 
 
+def test_a_gate_held_at_zero_under_equality(tmp_path: Path) -> None:
+    """`X == 0` at X = 0: the steps both ways cross, so neither one-sided quotient
+    is the row's slope and the entry is 0. Main: Y went to 1 for 0.5."""
+    model = _net(
+        tmp_path,
+        ["X() 0", "Y() 1", "S() 1"],
+        ["Xobs 1", "Sobs 3"],
+        ["g() if(Xobs == 0, 0.5, 1)/Sobs"],
+        ["3 2,3 g", "2 0 kx"],
+    )
+    t, s = _run(model, 60.0, 61, jacobian="fd")
+    assert np.all(s[:, 0] == 0.0)
+    assert _worst(s[:, 1], 0.5 + 0.5 * np.exp(-t)) < OK
+
+
+def test_a_stiff_run_that_starts_on_a_threshold(tmp_path: Path) -> None:
+    """X0 = 5 on `X > 5` with rates 2000 above and 1000 at or below: X =
+    5·exp(-1000 t). Main: 1.73 off at t = 1e-3 (35% of X0)."""
+    model = _net(
+        tmp_path, ["X() 5", "Y() 0"], ["Xobs 1"], ["f() kx*if(Xobs > 5, 2000, 1000)"], ["1 2 f"]
+    )
+    result = bngsim.Simulator(model, method="ode", jacobian="fd").run(
+        t_span=(0.0, 0.01), n_points=11, rtol=RTOL, atol=1e-12
+    )
+    t, x = np.asarray(result.time), np.asarray(result.species)[:, 0]
+    assert float(np.max(np.abs(x - 5.0 * np.exp(-1000.0 * t)))) < 5.0 * OK
+
+
 @pytest.mark.parametrize(("declined", "kw"), [(False, {"jacobian": "fd"}), (True, {})])
 @pytest.mark.parametrize("method", ["integration", "newton"])
 def test_the_steady_state_of_a_gate_held_at_zero(
@@ -281,12 +309,15 @@ def test_a_run_that_starts_on_a_threshold_between_basins(tmp_path: Path) -> None
 def test_a_model_with_no_jump_has_nothing_mended(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """BIOMD0000000091 is mass action alone. Its rows cancel, so a short step
-    moves them by a last bit of their terms; against a floor of a row's value
-    alone, two entries at t = 21.2 were taken for jumps and the run left main's
-    bits. Against its terms, nothing is mended and the run is CVODE's own."""
+    """Control: MODEL1812040006 has no jump in it, and nothing of it is mended.
+    Two smooth shapes read as jumps to a looser test. A species at 1.6e-8 is
+    stepped by CVODE's floor, 2.5e-2, and its points back are negative amounts,
+    where the saturating law it feeds is nothing like itself: 52 mends with
+    those points taken. And a row whose terms cancel moves by a last bit of
+    them: 2 mends against a floor of the row's value instead of its terms.
+    Either moved the run off main's bits."""
     monkeypatch.setenv("BNGSIM_JAC_DEBUG", "1")
-    model = bngsim.Model.from_sbml(str(data_dir / "BIOMD0000000091.xml"))
+    model = bngsim.Model.from_sbml(str(data_dir / "MODEL1812040006.xml"))
     bngsim.Simulator(model, method="ode", jacobian="fd").run(
         t_span=(0.0, 100.0), n_points=101, rtol=RTOL, atol=ATOL
     )
