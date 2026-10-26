@@ -698,7 +698,16 @@ static std::vector<ParsedObservable> parse_groups(std::ifstream &file) {
                 int sp_idx_1based = 0;
                 auto star = es.find('*');
                 if (star != std::string::npos) {
-                    factor = c_stod(es.substr(0, star));
+                    // All of it a number: stod stops at what it cannot read, so
+                    // `1/2*1` read a factor of 1 with nothing said (#1235's
+                    // mechanism, with the locale out of it).
+                    const std::string text = es.substr(0, star);
+                    size_t used = 0;
+                    factor = c_stod(text, &used);
+                    if (used != text.size() || !std::isfinite(factor)) {
+                        throw std::runtime_error("group '" + obs.name + "' has entry '" + es +
+                                                 "', whose factor '" + text + "' is not a number");
+                    }
                     sp_idx_1based = std::stoi(es.substr(star + 1));
                 } else {
                     sp_idx_1based = std::stoi(es);
@@ -750,11 +759,20 @@ static std::vector<double> parse_bracket_array(const std::string &expr, size_t &
             ++pos;
         std::string num_str = expr.substr(num_start, pos - num_start);
         if (!num_str.empty()) {
+            double v = 0.0;
+            size_t used = 0;
             try {
-                vals.push_back(c_stod(num_str));
+                v = c_stod(num_str, &used);
             } catch (...) {
                 break;
             }
+            // A value stod read only the front of (`1/2` read 1) is refused, not
+            // truncated with nothing said (#1235's mechanism).
+            if (used != num_str.size()) {
+                throw std::runtime_error("table function '" + expr + "' has value '" + num_str +
+                                         "', which is not a number");
+            }
+            vals.push_back(v);
         }
         // Skip comma
         if (pos < expr.size() && expr[pos] == ',')

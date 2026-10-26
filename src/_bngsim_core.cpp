@@ -13,6 +13,7 @@
 #include <pybind11/stl.h>
 
 #include <bngsim/bngsim.hpp>
+#include <bngsim/c_locale_numbers.hpp>
 #include <bngsim/cc_jit.hpp>
 #include <bngsim/function_columns.hpp>
 #include <bngsim/mir_jit.hpp>
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -862,6 +864,16 @@ typename S::Obj functional_jacobian_context(const bngsim::NetworkModel &self, S 
 }
 
 } // namespace codegen_visit
+
+namespace {
+// Issue #1235 — what `with _CNumericLocale():` holds: "C" for LC_NUMERIC on the
+// calling thread from __enter__ to __exit__, for libantimony, whose parse reads
+// numbers in the C locale. Per thread, where locale.setlocale would switch the
+// whole process under every other thread.
+struct CNumericLocaleBlock {
+    std::optional<bngsim::ScopedCNumericLocale> scope;
+};
+} // namespace
 
 PYBIND11_MODULE(_bngsim_core, m) {
     m.doc() = "bngsim C++ engine bindings (low-level)";
@@ -3681,6 +3693,13 @@ PYBIND11_MODULE(_bngsim_core, m) {
             return d;
         },
         "Return dict of reserved constant and function names");
+
+    py::class_<CNumericLocaleBlock>(m, "_CNumericLocale",
+                                    "Context manager: numbers read and written in the \"C\" "
+                                    "locale on this thread for the length of the block (#1235)")
+        .def(py::init<>())
+        .def("__enter__", [](CNumericLocaleBlock &b) { b.scope.emplace(); })
+        .def("__exit__", [](CNumericLocaleBlock &b, const py::args &) { b.scope.reset(); });
 
     // --- SteadyStateOptions ---
     py::class_<bngsim::SteadyStateOptions>(m, "SteadyStateOptions")

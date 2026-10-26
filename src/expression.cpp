@@ -17,9 +17,9 @@
 // ExprTk defaults to case-insensitive, which silently merges k3/K3
 // into the same variable and produces incorrect trajectories.
 #define exprtk_disable_caseinsensitivity
-#include "bngsim/c_locale_numbers.hpp"
 #include "exprtk.hpp"
 
+#include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/expr_compat.hpp"
 #include "bngsim/expression.hpp"
 

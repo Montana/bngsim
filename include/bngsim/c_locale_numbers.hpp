@@ -16,8 +16,15 @@
 // it replaces, read or written in "C". Where a "C" locale cannot be made (it
 // always can on the platforms bngsim builds for), they fall back to the
 // process's own.
+//
+// Code that is not bngsim's to change reads numbers the same way, in-process:
+// RuleMonkey's loader (std::stod: a TFUN's 0.5 read 0, with no error), NFsim's
+// TFUN parser (strtod: refused), MIR's C front end (strtod: every decimal
+// literal refused) and libantimony. ScopedCNumericLocale puts "C" in force
+// around each call into them, for the calling thread only.
 
 #include <cerrno>
+#include <clocale>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
@@ -27,6 +34,12 @@
 #include <string>
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <xlocale.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BNGSIM_PRINTF_FORMAT(fmt, args) __attribute__((format(printf, fmt, args)))
+#else
+#define BNGSIM_PRINTF_FORMAT(fmt, args)
 #endif
 
 namespace bngsim {
@@ -81,17 +94,25 @@ inline double c_stod(const std::string &s, std::size_t *pos = nullptr) {
 }
 
 // snprintf, written in "C". The locale is switched for this thread only, for
-// the length of the call.
+// the length of the call. It returns what vsnprintf does, the length the whole
+// output needs, on Windows too: _vsnprintf_s_l alone gives -1 when it truncates.
+BNGSIM_PRINTF_FORMAT(3, 4)
 inline int c_snprintf(char *buf, std::size_t n, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     const auto loc = detail::c_numeric_locale();
     int r;
 #if defined(_WIN32)
-    if (loc)
-        r = _vsnprintf_s_l(buf, n, _TRUNCATE, fmt, loc, ap);
-    else
+    if (loc) {
+        va_list len_ap;
+        va_copy(len_ap, ap);
+        r = _vscprintf_l(fmt, loc, len_ap);
+        va_end(len_ap);
+        if (n > 0)
+            _vsnprintf_s_l(buf, n, _TRUNCATE, fmt, loc, ap);
+    } else {
         r = std::vsnprintf(buf, n, fmt, ap);
+    }
 #else
     if (loc) {
         const locale_t old = uselocale(loc);
@@ -105,4 +126,48 @@ inline int c_snprintf(char *buf, std::size_t n, const char *fmt, ...) {
     return r;
 }
 
+// "C" in force for LC_NUMERIC on the calling thread while the object lives, and
+// the thread's previous setting put back after: uselocale on POSIX, and on
+// Windows setlocale under _configthreadlocale(_ENABLE_PER_THREAD_LOCALE). The
+// process's own setting is never touched, so no other thread reads in "C", and
+// none has its own switch undone when this one ends, as with a process-wide
+// setlocale. Nests.
+class ScopedCNumericLocale {
+  public:
+    ScopedCNumericLocale() {
+#if defined(_WIN32)
+        prev_mode_ = _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+        if (const char *cur = std::setlocale(LC_NUMERIC, nullptr))
+            prev_numeric_ = cur;
+        std::setlocale(LC_NUMERIC, "C");
+#else
+        if (const auto loc = detail::c_numeric_locale())
+            prev_ = uselocale(loc);
+#endif
+    }
+    ~ScopedCNumericLocale() {
+#if defined(_WIN32)
+        if (!prev_numeric_.empty())
+            std::setlocale(LC_NUMERIC, prev_numeric_.c_str());
+        if (prev_mode_ != -1)
+            _configthreadlocale(prev_mode_);
+#else
+        if (prev_)
+            uselocale(prev_);
+#endif
+    }
+    ScopedCNumericLocale(const ScopedCNumericLocale &) = delete;
+    ScopedCNumericLocale &operator=(const ScopedCNumericLocale &) = delete;
+
+  private:
+#if defined(_WIN32)
+    int prev_mode_ = -1;
+    std::string prev_numeric_;
+#else
+    locale_t prev_ = static_cast<locale_t>(0);
+#endif
+};
+
 } // namespace bngsim
+
+#undef BNGSIM_PRINTF_FORMAT
