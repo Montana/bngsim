@@ -2528,27 +2528,33 @@ class Model:
         #1002). The first steps every species by 1.5e-8 of the state's largest
         concentration, which reads a term of second order in a small species
         as a secant across it; the second misses a term that reads it through a
-        sum with something much larger. ``steady_state`` refuses the columns
-        it would solve with such a matrix; here the matrix is returned, as it
-        was, and the warning names the entry."""
-        own, changed = self._core.fill_dense_fd_jacobian_own_step(t, y, np.asfortranarray(dense))
+        sum with something much larger. The same is asked of the matrix with
+        those columns, and those of species at 0, taken whole at half the first
+        step, which a secant moves with and a slope does not, also in a row the
+        own step cannot read. ``steady_state`` refuses the columns it would
+        solve with such a matrix; here the matrix is returned, as it was, and
+        the warning names the entry."""
+        floored = np.asfortranarray(dense)
+        own, changed = self._core.fill_dense_fd_jacobian_own_step(t, y, floored)
+        half, taken = self._core.fill_dense_fd_jacobian_half_step(t, y, floored)
         worst = None
-        for j in changed:
-            largest = float(np.max(np.abs(dense[:, j])))
-            apart = np.abs(own[:, j] - dense[:, j])
-            i = int(np.argmax(apart))
-            share = apart[i] / largest if largest > 0.0 else np.inf
-            if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):
-                worst = (share, i, j)
+        for other, at, columns in ((own, "1.5e-8 of itself", changed), (half, "half that", taken)):
+            for j in columns:
+                largest = float(np.max(np.abs(dense[:, j])))
+                apart = np.abs(other[:, j] - dense[:, j])
+                i = int(np.argmax(apart))
+                share = apart[i] / largest if largest > 0.0 else np.inf
+                if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):
+                    worst = (share, i, j, other[i, j], at)
         if worst is None:
             return
-        _, i, j = worst
+        _, i, j, second, at = worst
         names = self.species_names
         warnings.warn(
             f"Model.jacobian(): the entry d(rate of {names[i]})/d{names[j]} of this "
             f"difference quotient is {dense[i, j]:.6g} with {names[j]} stepped by 1.5e-8 of "
-            f"the state's largest concentration, and {own[i, j]:.6g} stepped by 1.5e-8 of "
-            "itself, more than 1e-4 of its column's largest entry apart (issue #1002). "
+            f"the state's largest concentration, and {second:.6g} stepped by {at}, more "
+            "than 1e-4 of its column's largest entry apart (issue #1002). "
             f"{_STEP_DECIDES_WHY} The first is returned. "
             "steady_state(sensitivity_params=...) refuses columns solved with such a matrix.",
             UserWarning,
@@ -2957,9 +2963,10 @@ class Model:
 # once for the Model.jacobian() warning and the steady-state refusal alike.
 _STEP_DECIDES_WHY = (
     "A species far below the state's scale is stepped by many times itself at the "
-    "first, which reads a term of second order in it as a secant across it, and the "
-    "second misses a term that reads it through a sum with something much larger "
-    "(a total minus what is bound): which of the two is right is not known."
+    "first, which reads a term of second order in it as a secant across it, and a "
+    "secant moves with its step where a slope does not; stepped by 1.5e-8 of itself, "
+    "it misses a term that reads it through a sum with something much larger (a "
+    "total minus what is bound): which is right is not known."
 )
 
 # A declined attempt that recorded no reason (issue #538), for

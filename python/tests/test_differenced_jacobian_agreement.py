@@ -19,6 +19,14 @@ apart than 1e-4 of a column's largest, they are refused. The same holds of the
 state-chain term of a function's sensitivity, which is differenced at the
 default settings too.
 
+The own step reads a row only where its rounding over the step is under the
+term, and a row that a much larger species is in it does not read: there a
+term of second order in the small species was compared with nothing, and
+``k·X²`` in the rate of a species at 1e8 came back 12% off. A species at 0
+was not stepped twice at all. So the columns are solved a third time, with
+those columns, and those of species at 0, taken whole at half the floored
+step, which a secant moves with and a slope does not.
+
 Every expected value is a closed form.
 """
 
@@ -69,8 +77,8 @@ end groups
 """
 
 
-def _model(tmp_path, big, functions=("xsq", "weak")):
-    text = NET.format(s=S, k1=K1, k2=K2, kd=KD, big=float(big))
+def _model(tmp_path, big, functions=("xsq", "weak"), s=S):
+    text = NET.format(s=s, k1=K1, k2=K2, kd=KD, big=float(big))
     for name, line in (("xsq", "    1 xsq() abs(Xo)*Xo\n"), ("weak", "    2 weak() 1e-3*Xo\n")):
         if name not in functions:
             text = text.replace(line, "")
@@ -137,6 +145,7 @@ def test_a_closed_form_jacobian_is_not_asked(tmp_path, big):
     out = _steady(_model(tmp_path, big, functions=()))
     assert out.sens_jacobian_source != "finite-difference"
     assert out.sens_fd_own_step_species == []
+    assert out.sens_fd_half_step_species == []
     assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-9)
 
 
@@ -372,3 +381,212 @@ def test_model_jacobian_is_quiet_where_the_steps_agree(tmp_path, monkeypatch):
         warnings.simplefilter("error")
         jac = model.jacobian(_state(1.0))
     assert jac.source == "finite-difference"
+
+
+# ─── Curvature in a row the own step does not read ───────────────────────────
+
+# 0 -> X at s and X -> 0 at k1: X is linear in its own row, X* = s/k1.
+# X + X -> X + X + G at k makes G at k·X², and G, made at sg and removed at
+# dg = 1, sits at sg + k·X*². dG*/ds = 2·k·X*·dX*/ds = 2·k·s/k1², whatever sg
+# is. G's row is G's: the rounding of a rate of 1e8 over X's own step, 9e-8,
+# is more than the slope of k·X² there, so the own step reads nothing of it.
+SECOND_ORDER = """begin parameters
+    1 s   {s!r}
+    2 k1  {k1!r}
+    3 k   1.0
+    4 sg  {big!r}
+    5 dg  1.0
+end parameters
+begin species
+    1 X() 0
+    2 G() {big!r}
+end species
+begin groups
+    1 Xo 1
+    2 Go 2
+end groups
+begin functions
+    1 gx() abs(Xo)*Xo + Go
+end functions
+begin reactions
+    1 0 1 s
+    2 1 0 k1
+    3 1,1 1,1,2 k
+    4 0 2 sg
+    5 2 0 dg
+end reactions
+"""
+SO_X = S / K1
+SO_DG_DS = 2 * SO_X / K1
+
+
+def _second_order(tmp_path, big, functions=False):
+    text = SECOND_ORDER.format(s=S, k1=K1, big=float(big))
+    if not functions:
+        text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
+    path = tmp_path / "second_order.net"
+    path.write_text(text)
+    return bngsim.Model.from_net(path)
+
+
+def _secant_dg_ds(big, part=1.0):
+    """dG*/ds from the secant of k·X² across X's floored step (or a part of
+    it): k·(2·X* + h)·dX*/ds, the X row being linear. The step is floored at
+    the largest concentration, G* = sg + k·X*²."""
+    h = (SO_X + part * SQRT_EPS * (float(big) + SO_X * SO_X)) - SO_X
+    return (2 * SO_X + h) / K1
+
+
+@pytest.mark.parametrize("big", [1e6, 1e8, 1e10])
+def test_curvature_in_a_row_a_larger_species_is_in_is_refused(tmp_path, big):
+    """dG*/ds = 2·k·s/k1² = 58.957. With ``jacobian="fd"`` it came back
+    59.028 at G = 1e6, 66.053 at 1e8 and 768.5 at 1e10, with no error: X's
+    column was not taken again at its own step, since the X row is linear and
+    the own step reads nothing of G's, and nothing was compared. At half the
+    floored step the secant is k·(2X + h/2), and the two answers are refused,
+    with both named."""
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        _steady(_second_order(tmp_path, big), jacobian="fd")
+    msg = str(err.value)
+    assert "dG()/ds is " + format(_secant_dg_ds(big), ".6g") in msg
+    assert (
+        format(_secant_dg_ds(big, 0.5), ".6g") + " with X() stepped by half the first step" in msg
+    )
+
+
+def test_curvature_both_steps_agree_on_is_returned(tmp_path):
+    """Control. At G = 1e4 X is stepped by 1.5e-4, 1,600 times its own step,
+    so its column is taken again at half the step, and the two answers are
+    6e-6 of each other: returned, the floored one."""
+    out = _steady(_second_order(tmp_path, 1e4), jacobian="fd")
+    assert out.sens_fd_half_step_species == ["X()"]
+    assert out.sens_fd_disagree_species is None
+    sens = np.asarray(out.sensitivity)
+    assert sens[1, 0] == pytest.approx(_secant_dg_ds(1e4), rel=1e-9)
+    assert sens[1, 0] == pytest.approx(SO_DG_DS, rel=2e-5)
+
+
+def test_curvature_in_a_declined_function_over_a_larger_species_is_refused(tmp_path):
+    """``gx = abs(X)·X + G`` has no compiled derivative, so its state-chain
+    term is differenced at the default settings. d(gx)/ds = 2·X*·dX*/ds +
+    dG*/ds = 117.91; beside G = 1e8 it came back 125.01 (6% off) with no
+    error, the own step reading nothing of a function at 1e8."""
+    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
+        _steady(_second_order(tmp_path, 1e8, functions=True))
+    msg = str(err.value)
+    assert "dgx/ds is 125.01" in msg
+    assert "stepped by half the first step" in msg
+
+
+def test_curvature_in_a_declined_function_both_steps_agree_on_is_returned(tmp_path):
+    """Control. At G = 1e4 the two totals are 3e-6 of each other."""
+    out = _steady(_second_order(tmp_path, 1e4, functions=True))
+    assert out.sens_fd_disagree_function is None
+    got = float(np.asarray(out.output_sensitivities(["gx"])).ravel()[0])
+    assert got == pytest.approx(2 * SO_DG_DS, rel=1e-5)
+
+
+@pytest.mark.parametrize("big", [1e4, 1e8])
+def test_a_species_at_0_the_parameter_moves_is_refused(tmp_path, big):
+    """With s = 0 nothing makes X, and X* = 0; dX*/ds = 1/k1 = 4.7619. A
+    species at 0 has no own step, so its column was never taken again, and
+    ``-2·k2·X²`` was read as ``-2·k2·h`` for 0: dX*/ds came back 4.7570 at
+    G = 1e4 and 0.4192 (91% off) at 1e8, with no error. At half the step it
+    is 4.7594 and 0.7705."""
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        _steady(_model(tmp_path, big, functions=(), s=0.0), jacobian="fd")
+    msg = str(err.value)
+    h = SQRT_EPS * float(big)
+    floored = 1.0 / (K1 + 2 * K2 * h)
+    assert "dX()/ds is " + format(floored, ".6g") in msg
+    assert "stepped by half the first step" in msg
+
+
+@pytest.mark.parametrize("big", [1.0, 1e8])
+def test_a_species_at_0_is_returned_where_the_step_does_not_decide(tmp_path, big):
+    """Control. With s = 0 and the columns asked for sg, nothing moves X,
+    and its column, wrong as it is at 1e8, is multiplied by 0: dG*/dsg = 1
+    and dX*/dsg = 0 are returned. At G = 1 the floored step is 1.5e-8 and
+    the column is right to 1e-7."""
+    model = _model(tmp_path, big, functions=(), s=0.0)
+    sim = bngsim.Simulator(model, method="ode", jacobian="fd")
+    out = sim.steady_state(sensitivity_params=["sg", "s"] if big == 1.0 else ["sg"])
+    assert out.sens_fd_disagree_species is None
+    assert out.sens_fd_half_step_species == ["X()", "D()"]
+    sens = np.asarray(out.sensitivity)
+    assert sens[0, 0] == 0.0
+    assert sens[2, 0] == pytest.approx(1.0, rel=1e-12)
+    if big == 1.0:
+        assert sens[0, 1] == pytest.approx(1.0 / K1, rel=1e-6)
+
+
+def test_a_declined_function_of_a_species_at_0_is_refused(tmp_path):
+    """``xsq = abs(X)·X`` is differenced; with s = 0, X* = 0 and
+    d(xsq)/ds = 2·|X*|·dX*/ds = 0. Its partial across the floored step is
+    h for 0, so d(xsq)/ds came back 7.1e-8, the step's alone, at the default
+    settings beside G = 1, with no error. At half the step it is half that."""
+    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
+        _steady(_model(tmp_path, 1.0, functions=("xsq",), s=0.0))
+    msg = str(err.value)
+    assert "dxsq/ds is " + format(SQRT_EPS / K1, ".6g") in msg
+    assert format(0.5 * SQRT_EPS / K1, ".6g") + " with those species" in msg
+
+
+@pytest.mark.parametrize("big", [1e6, 1e8])
+def test_the_third_matrix_has_the_columns_at_half_the_step(tmp_path, big):
+    """The columns of X and D, both far below G, are each the quotient at
+    half the floored step, whole; G's is the first matrix's to the bit."""
+    model = _model(tmp_path, big, functions=())
+    y = _state(big)
+    floored = _fd(model, y)
+    half, taken = model._core.fill_dense_fd_jacobian_half_step(0.0, y, np.asfortranarray(floored))
+    half = np.asarray(half)
+    assert list(taken) == [0, 1]
+    for j in (0, 1):
+        stepped = y.copy()
+        stepped[j] = y[j] + 0.5 * SQRT_EPS * float(big)
+        quotient = (np.asarray(model.rhs(stepped, 0.0)) - np.asarray(model.rhs(y, 0.0))) / (
+            stepped[j] - y[j]
+        )
+        np.testing.assert_array_equal(half[:, j], quotient)
+    # The secant of -2·k2·X² across h/2, and of k2·X².
+    h = (y[0] + 0.5 * SQRT_EPS * float(big)) - y[0]
+    assert half[0, 0] == pytest.approx(-(K1 + 2 * K2 * (2 * X_SS + h)), rel=1e-6)
+    assert half[1, 0] == pytest.approx(K2 * (2 * X_SS + h), rel=1e-6)
+    np.testing.assert_array_equal(half[:, 2], floored[:, 2])
+
+
+def test_the_third_matrix_takes_a_species_at_0(tmp_path):
+    """X and D at 0 beside G = 1e8: both columns are taken, X's reading
+    -k1 - 2·k2·(h/2) for the floored -k1 - 2·k2·h."""
+    model = _model(tmp_path, 1e8, functions=())
+    y = np.array([0.0, 0.0, 1e8])
+    floored = _fd(model, y)
+    half, taken = model._core.fill_dense_fd_jacobian_half_step(0.0, y, np.asfortranarray(floored))
+    assert list(taken) == [0, 1]
+    h = SQRT_EPS * 1e8
+    assert floored[0, 0] == pytest.approx(-(K1 + 2 * K2 * h), rel=1e-12)
+    assert np.asarray(half)[0, 0] == pytest.approx(-(K1 + K2 * h), rel=1e-12)
+
+
+def test_the_third_matrix_of_a_state_of_one_scale_is_the_first(tmp_path):
+    """Control."""
+    model = _model(tmp_path, 1.0, functions=())
+    y = _state(1.0)
+    floored = _fd(model, y)
+    half, taken = model._core.fill_dense_fd_jacobian_half_step(0.0, y, np.asfortranarray(floored))
+    assert list(taken) == []
+    np.testing.assert_array_equal(np.asarray(half), floored)
+
+
+def test_model_jacobian_warns_where_the_half_step_decides(tmp_path, monkeypatch):
+    """``Model.jacobian()`` returns the floored matrix and warns with the
+    entry where the half step moves it, in a row the own step cannot read:
+    d(rate of G)/dX is k·(2X + h), 13.871, and 13.126 at half the step."""
+    model = _second_order(tmp_path, 1e8)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    y = np.array([SO_X, 1e8 + SO_X * SO_X])
+    with pytest.warns(UserWarning, match=r"d\(rate of G\(\)\)/dX\(\) .* stepped by half that"):
+        jac = model.jacobian(y)
+    assert jac.source == "finite-difference"
+    np.testing.assert_array_equal(np.asarray(jac)[:, 0], _first_quotient(model, y, 0))
