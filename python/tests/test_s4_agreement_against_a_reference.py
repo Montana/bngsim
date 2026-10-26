@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,8 @@ _SCRIPT = (
 
 def _check(tmp_path, monkeypatch, rtol=1e-6, atol=1e-9):
     """The check's module, set up to run on the decay alone."""
+    # The script puts parity_checks on sys.path; leave it as we found it.
+    monkeypatch.setattr(sys, "path", list(sys.path))
     spec = importlib.util.spec_from_file_location("s4_agreement_check", _SCRIPT)
     check = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(check)
@@ -66,7 +69,7 @@ def _check(tmp_path, monkeypatch, rtol=1e-6, atol=1e-9):
         raise ModuleNotFoundError("No module named 'COPASI'")
 
     monkeypatch.setattr(check, "_copasi_final", no_copasi)
-    monkeypatch.setitem(__import__("sys").modules, "COPASI", None)
+    monkeypatch.setitem(sys.modules, "COPASI", None)
     return check
 
 
@@ -260,7 +263,84 @@ def test_species_that_cannot_be_matched_are_not_agreement(tmp_path, monkeypatch,
         return [*names[:-1], "Q"], x
 
     row = _chain_check(tmp_path, monkeypatch, species)
-    assert row["agree"] is not True
+    assert row["agree"] is None
+
+
+def test_a_species_the_reference_lacks_is_not_agreement(tmp_path, monkeypatch):
+    """The reference does not report D, and bngsim's D is 10x off: D is
+    compared with nothing, so it was passed over what was left."""
+    check = _check(tmp_path, monkeypatch)
+    (tmp_path / "models" / "DECAY" / "decay.xml").write_text(CHAIN_SBML)
+    rr_real, bn_real = check._roadrunner_final, check._bngsim_final
+
+    def rr(xml, span, rtol, atol):
+        names, x = rr_real(xml, span, rtol, atol)
+        keep = [i for i, n in enumerate(names) if n != "D"]
+        return [names[i] for i in keep], np.asarray(x)[:, keep]
+
+    def bn(xml, span, rtol, atol):
+        names, x = bn_real(xml, span, rtol, atol)
+        x = np.array(x, dtype=float)
+        x[:, _col(names, "D")] *= 10
+        return names, x
+
+    monkeypatch.setattr(check, "_roadrunner_final", rr)
+    monkeypatch.setattr(check, "_bngsim_final", bn)
+    row = _row(check, tmp_path)
+    assert row["bngsim_vs_reference_converged"]["extra_species"] == 1
+    assert row["agree"] is None
+
+
+def _copasi_as_roadrunner(check):
+    """A COPASI stand-in that agrees: libRoadRunner's final state."""
+
+    def copasi(xml, span, rtol, atol):
+        names, x = check._roadrunner_final(xml, span, rtol, atol)
+        return names, np.asarray(x)[-1:]
+
+    return copasi
+
+
+def test_an_engine_timed_but_not_converged_is_not_agreement(tmp_path, monkeypatch):
+    """bngsim completes at the timing tolerances, 50% off, and fails at the
+    reference's. COPASI agrees, but bngsim's timing row is of a computation
+    nothing checked."""
+    check = _check(tmp_path, monkeypatch)
+    (tmp_path / "models" / "DECAY" / "decay.xml").write_text(CHAIN_SBML)
+    monkeypatch.setattr(check, "_copasi_final", _copasi_as_roadrunner(check))
+    real = check._bngsim_final
+
+    def bngsim(xml, span, rtol, atol):
+        if rtol < 1e-9:
+            raise RuntimeError("CVODE Error: CV_TOO_MUCH_ACC")
+        names, x = real(xml, span, rtol, atol)
+        return names, np.asarray(x) * 1.5
+
+    monkeypatch.setattr(check, "_bngsim_final", bngsim)
+    row = _row(check, tmp_path)
+    assert row["converged_status"] == {"copasi": "agree", "bngsim": "not established"}
+    assert "CV_TOO_MUCH_ACC" in row["bngsim_vs_reference_converged"]["why"]
+    assert row["agree"] is None
+
+
+def test_a_nan_at_the_timing_tolerances_disagrees(tmp_path, monkeypatch):
+    """Converged, bngsim agrees; its timed run, the one in the timing table,
+    holds a NaN at a middle row."""
+    check = _check(tmp_path, monkeypatch)
+    (tmp_path / "models" / "DECAY" / "decay.xml").write_text(CHAIN_SBML)
+    real = check._bngsim_final
+
+    def bngsim(xml, span, rtol, atol):
+        names, x = real(xml, span, rtol, atol)
+        x = np.array(x, dtype=float)
+        if rtol > 1e-9:
+            x[len(x) // 2, _col(names, "B")] = np.nan
+        return names, x
+
+    monkeypatch.setattr(check, "_bngsim_final", bngsim)
+    row = _row(check, tmp_path)
+    assert row["converged_status"] == {"bngsim": "agree"}
+    assert row["agree"] is False
 
 
 def test_nothing_compared_is_not_agreement(tmp_path, monkeypatch):

@@ -1,7 +1,7 @@
 {
  "_meta": {
   "suite": "ode_engines_s4_sbml",
-  "description": "Cross-engine trajectory agreement for the Table S4 models, against a converged reference (issue #1250): each engine at the reference tolerances is compared with it species by species, matched by SBML id, over its trajectory (COPASI: final state), and agree is True only when every engine that completes is within agree_tol; False when one is not or holds a non-finite value; None when agreement could not be established (see why). Each engine's final-state error at the figure's tolerances is reported, not judged. bngsim_vs_*_sorted_mre are the earlier reports' order-independent numbers, kept for comparison.",
+  "description": "Cross-engine trajectory agreement for the Table S4 models, against a converged reference (issue #1250): each engine at the reference tolerances is compared with it species by species, matched by SBML id, over its trajectory (COPASI: final state), and agree is True only when every engine that completes is within agree_tol; False when one is not or holds a non-finite value, at either tolerance; None when agreement could not be established (see why), including for an engine timed but not run at the reference tolerances. Each engine's final-state error at the figure's tolerances is reported, not judged. bngsim_vs_*_sorted_mre are the earlier reports' order-independent numbers, kept for comparison.",
   "reference": {
    "engines": [
     "libRoadRunner",
@@ -24,10 +24,10 @@
    "copasi": "4.46.300 (Source)"
   },
   "hardware": {
-   "cpu": "Apple M3 Max",
-   "physical_cores": 14,
-   "logical_cores": 14,
-   "platform": "macOS-27.0.1-arm64-arm-64bit"
+   "cpu": "Apple M1 Max",
+   "physical_cores": 10,
+   "logical_cores": 10,
+   "platform": "macOS-26.7.1-arm64-arm-64bit"
   }
  },
  "results": [
@@ -46,7 +46,7 @@
    "n_species": 75,
    "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 1.4872752910228832e-05,
-   "bngsim_vs_copasi_sorted_mre": 3.552900895143459e-05,
+   "bngsim_vs_copasi_sorted_mre": 3.552469410330923e-05,
    "reference": {
     "engine": "roadrunner",
     "rtol": 1e-12,
@@ -61,7 +61,7 @@
     "extra_species": 0
    },
    "copasi_vs_reference_converged": {
-    "mre": 3.3429621851499194e-09,
+    "mre": 3.337485107997436e-09,
     "compared": 75,
     "species": 75,
     "non_finite": 0,
@@ -86,9 +86,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 7.297655729870596e-05,
+   "copasi_error_at_timing_tolerances": 7.298244205334587e-05,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 7.297655729870596e-05,
+    "mre": 7.298244205334587e-05,
     "compared": 75,
     "species": 75,
     "non_finite": 0,
@@ -100,7 +100,7 @@
     "copasi": "agree"
    },
    "agree": true,
-   "worst_converged_mre": 3.3429621851499194e-09
+   "worst_converged_mre": 3.337485107997436e-09
   },
   {
    "model_id": "BIOMD0000000468",
@@ -117,7 +117,7 @@
    "n_species": 79,
    "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 0.04820424031406689,
-   "bngsim_vs_copasi_sorted_mre": 0.045130690070321236,
+   "bngsim_vs_copasi_sorted_mre": 0.04127581076925982,
    "reference": {
     "engine": "roadrunner",
     "rtol": 1e-12,
@@ -132,7 +132,7 @@
     "extra_species": 0
    },
    "copasi_vs_reference_converged": {
-    "mre": 2.0727520504765146e-08,
+    "mre": 3.4291753749912524e-08,
     "compared": 77,
     "species": 79,
     "non_finite": 0,
@@ -157,9 +157,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 0.0018419992211300557,
+   "copasi_error_at_timing_tolerances": 0.005855435681389482,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 0.0018419992211300557,
+    "mre": 0.005855435681389482,
     "compared": 77,
     "species": 79,
     "non_finite": 0,
@@ -188,7 +188,7 @@
    "n_species": 90,
    "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 9.432524359849477e-07,
-   "bngsim_vs_copasi_sorted_mre": 5.4693505059081845e-06,
+   "bngsim_vs_copasi_sorted_mre": 4.79689073727178e-06,
    "reference": {
     "engine": "roadrunner",
     "rtol": 1e-12,
@@ -203,7 +203,7 @@
     "extra_species": 0
    },
    "copasi_vs_reference_converged": {
-    "mre": 6.735581947233643e-12,
+    "mre": 1.4200576299241259e-11,
     "compared": 90,
     "species": 90,
     "non_finite": 0,
@@ -228,9 +228,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 3.1034419218084575e-06,
+   "copasi_error_at_timing_tolerances": 2.0589291930043883e-06,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 3.1034419218084575e-06,
+    "mre": 2.0589291930043883e-06,
     "compared": 90,
     "species": 90,
     "non_finite": 0,
@@ -259,7 +259,7 @@
    "n_species": 103,
    "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 5.906152613493397e-06,
-   "bngsim_vs_copasi_sorted_mre": 3.1768941872143944e-06,
+   "bngsim_vs_copasi_sorted_mre": 3.5754284382802914e-06,
    "reference": {
     "engine": "roadrunner",
     "rtol": 1e-12,
@@ -274,7 +274,7 @@
     "extra_species": 0
    },
    "copasi_vs_reference_converged": {
-    "mre": 2.9166128619855484e-11,
+    "mre": 2.919836539876428e-11,
     "compared": 103,
     "species": 103,
     "non_finite": 0,
@@ -299,9 +299,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 6.965983954162173e-08,
+   "copasi_error_at_timing_tolerances": 4.6799856587572523e-07,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 6.965983954162173e-08,
+    "mre": 4.6799856587572523e-07,
     "compared": 103,
     "species": 103,
     "non_finite": 0,
@@ -330,7 +330,7 @@
    "roadrunner_error": "RuntimeError: CVODE Error: CV_CONV_FAILURE: Convergence test failures occurred too many times (= MXNCF = 10) during one internal timestep or occurred with |h| = hmin.; In virtual double rr::CVODEIntegrator::integrate(double, double)",
    "n_species": 133,
    "agree_tol": 0.0001,
-   "bngsim_vs_copasi_sorted_mre": 0.00026491445638796414,
+   "bngsim_vs_copasi_sorted_mre": 0.00026491409425634003,
    "roadrunner_reference_tolerance_error": "RuntimeError: CVODE Error: CV_CONV_FAILURE: Convergence test failures occurred too many times (= MXNCF = 10) during one internal timestep or occurred with |h| = hmin.; In virtual double rr::CVODEIntegrator::integrate(double, double)",
    "reference": {
     "engine": "bngsim",
@@ -338,7 +338,7 @@
     "atol": 1e-15
    },
    "copasi_vs_reference_converged": {
-    "mre": 4.723322678956852e-09,
+    "mre": 6.439238647049366e-09,
     "compared": 93,
     "species": 133,
     "non_finite": 0,
@@ -354,9 +354,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 0.0002630843934607442,
+   "copasi_error_at_timing_tolerances": 0.0002630840313284572,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 0.0002630843934607442,
+    "mre": 0.0002630840313284572,
     "compared": 93,
     "species": 133,
     "non_finite": 0,
@@ -367,7 +367,7 @@
     "copasi": "agree"
    },
    "agree": true,
-   "worst_converged_mre": 4.723322678956852e-09
+   "worst_converged_mre": 6.439238647049366e-09
   },
   {
    "model_id": "BIOMD0000001065",
@@ -384,7 +384,7 @@
    "n_species": 148,
    "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 3.914702927075104e-09,
-   "bngsim_vs_copasi_sorted_mre": 3.917521924947369e-09,
+   "bngsim_vs_copasi_sorted_mre": 3.917377581961705e-09,
    "reference": {
     "engine": "roadrunner",
     "rtol": 1e-12,
@@ -399,7 +399,7 @@
     "extra_species": 0
    },
    "copasi_vs_reference_converged": {
-    "mre": 2.7656955825693804e-10,
+    "mre": 2.777824595718388e-10,
     "compared": 139,
     "species": 148,
     "non_finite": 0,
@@ -424,9 +424,9 @@
     "why": null,
     "extra_species": 0
    },
-   "copasi_error_at_timing_tolerances": 7.158928045918036e-08,
+   "copasi_error_at_timing_tolerances": 1.6261335290476688e-08,
    "copasi_error_at_timing_tolerances_detail": {
-    "mre": 7.158928045918036e-08,
+    "mre": 1.6261335290476688e-08,
     "compared": 113,
     "species": 148,
     "non_finite": 0,

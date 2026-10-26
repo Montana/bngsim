@@ -15,8 +15,10 @@ figure's own output grid (issue #1250). The two questions need it:
   compared with the reference species by species, matched by SBML id: over every
   output row where the engine returns its trajectory (bngsim, libRoadRunner), and
   at the final time for COPASI, which this reads its final state from. ``agree`` is
-  True when every engine that completes is within ``AGREE_TOL`` of the reference.
-  This verdict used to compare bngsim with the others at the timing tolerance,
+  True when every engine that completes is within ``AGREE_TOL`` of the reference;
+  an engine that completes its timed run but not the run at the reference
+  tolerances leaves agreement not established, since its timing row is then of a
+  computation nothing here checked. This verdict used to compare bngsim with the others at the timing tolerance,
   which measures that tolerance's slack, not the engines: on Koo2013 at rtol 1e-6
   the final state swings by up to 7% with the number of output rows, in every
   engine, while at rtol 1e-12 the three agree to 2e-8. A 5% bar there was passed or
@@ -24,14 +26,17 @@ figure's own output grid (issue #1250). The two questions need it:
 - **Accuracy at the timed settings.** Each engine's final-state error from the
   reference at the figure's tolerances, ``*_error_at_timing_tolerances``. It is
   reported, not judged: it is a fact about the settings, which a reader of the
-  timing table needs, and on Koo2013 it is several percent in every engine.
+  timing table needs, and on Koo2013 it is several percent in every engine. A
+  value there that is not finite is judged, as a disagreement: that is no
+  tolerance's slack, and the timing row would be of a broken run.
 
 A comparison is a relative error, ``|a - r| / max(|a|, |r|)``, over the values above
 a floor tied to what the run resolves: ``RESOLVED`` times the reference's absolute
 tolerance for the verdict, and the timed run's own absolute tolerance for its
 accuracy (below it a solver controls only the absolute error). It never passes for
 want of a comparison: a value that is not finite is a disagreement, and species
-that cannot be matched one to one, or no value above the floor, leave agreement not
+that cannot be matched one to one (one the reference has and the engine does not,
+or the other way round), or no value above the floor, leave agreement not
 established (``agree`` None), with the reason and how many species were compared.
 
 The earlier report's order-independent comparison, of the sorted final values, is
@@ -96,9 +101,10 @@ REF_RTOL, REF_ATOL = 1e-12, 1e-15
 # rr_parity oracle's tolerance (ode_jobs.json, `oracle.tol`). Converged, the S4
 # engines agree to 4e-6 or better over their trajectories.
 AGREE_TOL = 1e-4
-# A value is compared where the run resolves it: above this many times the
-# absolute tolerance it was integrated at (1e-12 at REF_ATOL). Below, its
-# relative error measures the tolerance, not the engine.
+# For the verdict, a value is compared where the reference resolves it: above
+# this many times REF_ATOL (1e-12). Below, its relative error measures the
+# tolerance, not the engine. The accuracy at the timing tolerances is read over
+# the values above the timed run's own atol, not this many times it.
 RESOLVED = 1e3
 
 
@@ -152,8 +158,9 @@ def _compare(names, values, ref_names, ref_values, floor):
     ``non_finite`` and ``why`` (None, or what kept it from a comparison).
 
     Rows are output rows; an engine with one row (its final state) is compared at
-    the reference's last. The reference's species must all be reported, once each;
-    an engine's species the reference does not have are counted, not compared."""
+    the reference's last. The engine and the reference must report the same
+    species, once each: one either of them lacks is not compared over what is
+    left, since that would pass a species nothing checked."""
     keys, ref_keys = _canonical(names), _canonical(ref_names)
     out = {"mre": None, "compared": 0, "species": len(ref_keys), "non_finite": 0, "why": None}
     a = np.atleast_2d(np.asarray(values, float))
@@ -168,7 +175,11 @@ def _compare(names, values, ref_names, ref_values, floor):
     if missing:
         out["why"] = f"{len(missing)} of the reference's species are not reported: {missing[:3]}"
         return out
-    out["extra_species"] = len(set(keys) - set(ref_keys))
+    extra = [k for k in keys if k not in ref_keys]
+    out["extra_species"] = len(extra)
+    if extra:
+        out["why"] = f"{len(extra)} species are not in the reference: {extra[:3]}"
+        return out
     a = a[:, [keys.index(k) for k in ref_keys]]
     if a.shape[0] == 1:
         r = r[-1:]
@@ -358,13 +369,32 @@ def _check_model(rec, xml, span, rtol, atol):
         cmp = _compare(names, values, ref_names, ref, RESOLVED * REF_ATOL)
         rec[f"{engine}_vs_reference_converged"] = cmp
         statuses[engine] = _status(cmp)
-    # Accuracy at the timed settings, at the final time: reported, not judged.
+    # An engine timed at the figure's tolerances that did not complete at the
+    # reference's: its timing row is of a computation nothing here checked.
+    for engine in timed:
+        if engine not in tight:
+            rec[f"{engine}_vs_reference_converged"] = {
+                "mre": None,
+                "compared": 0,
+                "species": len(ref_names),
+                "non_finite": 0,
+                "why": "no run at the reference tolerances: "
+                + rec[f"{engine}_reference_tolerance_error"],
+            }
+            statuses[engine] = "not established"
+    # Accuracy at the timed settings, at the final time: reported, not judged,
+    # except a value that is not finite anywhere in the timed run, which is no
+    # tolerance's slack.
+    broken = [e for e, (_, v) in timed.items() if not np.isfinite(np.asarray(v, float)).all()]
     for engine, (names, values) in timed.items():
         cmp = _compare(names, np.asarray(values)[-1:], ref_names, ref[-1:], atol)
         rec[f"{engine}_error_at_timing_tolerances"] = cmp["mre"]
         rec[f"{engine}_error_at_timing_tolerances_detail"] = cmp
     rec["converged_status"] = statuses
-    if not statuses:
+    if broken:
+        rec["agree"] = False
+        rec["why"] = f"a value that is not finite at the timing tolerances: {', '.join(broken)}"
+    elif not statuses:
         rec["agree"] = None
         rec["why"] = "only the reference engine completed at the reference tolerances"
     elif "disagree" in statuses.values():
@@ -389,6 +419,8 @@ def _summary(rec) -> str:
     if rec.get("reference") is None:
         return f"{head} {rec.get('why')}"
     tag = {True: "AGREE", False: "DISAGREE", None: "NOT ESTABLISHED"}[rec["agree"]]
+    if rec.get("why"):
+        tag += f" ({rec['why']})"
     conv = "  ".join(
         f"{e}={_show(rec[f'{e}_vs_reference_converged'], 'mre')}"
         f"({rec[f'{e}_vs_reference_converged']['compared']}/"
@@ -475,9 +507,11 @@ def main(argv=None) -> int:
                 "tolerances is compared with it species by species, matched by SBML "
                 "id, over its trajectory (COPASI: final state), and agree is True "
                 "only when every engine that completes is within agree_tol; False "
-                "when one is not or holds a non-finite value; None when agreement "
-                "could not be established (see why). Each engine's final-state error "
-                "at the figure's tolerances is reported, not judged. "
+                "when one is not or holds a non-finite value, at either tolerance; "
+                "None when agreement could not be established (see why), including "
+                "for an engine timed but not run at the reference tolerances. Each "
+                "engine's final-state error at the figure's tolerances is reported, "
+                "not judged. "
                 "bngsim_vs_*_sorted_mre are the earlier reports' order-independent "
                 "numbers, kept for comparison."
             ),
