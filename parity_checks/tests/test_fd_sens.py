@@ -466,3 +466,65 @@ def test_the_manifest_names_tracked_models_and_why_some_are_left_out():
             ).stdout.split()
         )
         assert tracked == {j["path"] for j in payload["jobs"]}, "a manifest model is not tracked"
+
+
+# The tolerance sweep (issue #1257): runs at SWEEP_RTOLS, (species, sensitivities)
+
+
+def _sweep_runs(state_move=0.0, column_moves=(0.0, 0.0), sizes=(1.0, 1.0)):
+    x = np.full((5, 2), 10.0)
+    s = np.stack([np.full((5, 2), z) for z in sizes], axis=-1)
+    x1 = x * (1 + state_move)
+    s1 = s.copy()
+    for j, m in enumerate(column_moves):
+        s1[..., j] *= 1 + m
+    return [(x1, s1), (x, s)]
+
+
+def test_the_sweep_names_a_column_that_moves_where_the_trajectory_settles():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 0.5)), ["a", "b"])
+    assert sweep["settled"] and sweep["moving"] == ["b"]
+    assert sweep["column_gaps"]["b"] == pytest.approx(0.5)
+
+
+def test_the_sweep_judges_nothing_where_the_trajectory_does_not_settle():
+    """A model that amplifies every difference moves its columns with the
+    tolerance too (LV): no oracle can judge those."""
+    sweep = F.tolerance_sweep(_sweep_runs(state_move=1e-3, column_moves=(0.5, 0.5)), ["a", "b"])
+    assert not sweep["settled"] and sweep["moving"] == []
+
+
+def test_the_sweep_leaves_out_a_column_at_the_states_rounding():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 5.0), sizes=(1.0, 1e-16)), ["a", "b"])
+    assert "b" not in sweep["column_gaps"] and sweep["moving"] == []
+
+
+def test_the_sweep_asks_only_of_the_judged_columns():
+    """A column under the solver's resolution reads its noise, which moves
+    with the tolerance: a narrow pulse's position, whose true column is 0."""
+    runs = _sweep_runs(column_moves=(0.0, 5.0))
+    assert F.tolerance_sweep(runs, ["a", "b"], judged=["a"])["moving"] == []
+    assert F.tolerance_sweep(runs, ["a", "b"], judged=["a", "b"])["moving"] == ["b"]
+
+
+def test_a_column_that_converged_is_not_named():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(1e-6, 1e-6)), ["a", "b"])
+    assert sweep["settled"] and sweep["moving"] == []
+
+
+def test_the_sweep_turns_a_pass_or_an_unjudged_row_into_a_diff():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 0.5)), ["a", "b"])
+    for status in ("pass", "bad_test"):
+        res = {"status": status, "value": 0.0}
+        F._apply_sweep(res, sweep)
+        assert res["status"] == "diff" and res["columns_diff"] == ["b"]
+        assert "do not converge with the tolerance" in res["why"]
+    refused = {"status": "unsupported"}
+    F._apply_sweep(refused, sweep)
+    assert refused["status"] == "unsupported"
+
+
+def test_a_sweep_that_finds_nothing_leaves_the_verdict():
+    res = {"status": "pass", "value": 1e-6}
+    F._apply_sweep(res, F.tolerance_sweep(_sweep_runs(), ["a", "b"]))
+    assert res["status"] == "pass" and res["sweep_settled"] is True
