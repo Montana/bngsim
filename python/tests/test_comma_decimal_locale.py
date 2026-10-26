@@ -228,8 +228,10 @@ _PROBE = textwrap.dedent(
             m = bngsim.Model.from_antimony_string("species A; A = 50; k = 0.1; R: A -> ; k*A")
             return [m.get_param("k"), last(m, t_span=(0, 1), n_points=2)[0]]
 
-        # ... and "C" on this thread only: another thread, and the process's own
-        # setting, keep the caller's locale (a process-wide switch did not).
+        # ... and "C" on this thread only: another thread, which reads the
+        # process's own setting, keeps the caller's locale (a process-wide
+        # switch gave it "C" too). Asked of localeconv(), not of setlocale(),
+        # which on Windows reports the thread's own setting once it has one.
         @case("antimony thread")
         def _():
             from bngsim._sbml_loader import _antimony_numbers_in_c_locale
@@ -242,7 +244,6 @@ _PROBE = textwrap.dedent(
                 )
                 other.start()
                 other.join()
-                seen["process"] = locale.setlocale(locale.LC_NUMERIC)
             seen["after"] = locale.localeconv()["decimal_point"]
             return seen
 
@@ -343,4 +344,4 @@ def test_the_values_under_c_are_the_right_ones(under_c):
 @_needs_antimony
 def test_the_antimony_switch_is_this_threads_alone(under_comma):
     seen = under_comma["antimony thread"]
-    assert seen == {"this thread": ".", "other": ",", "process": COMMA, "after": ","}
+    assert seen == {"this thread": ".", "other": ",", "after": ","}
