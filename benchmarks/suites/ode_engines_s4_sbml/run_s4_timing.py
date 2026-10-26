@@ -132,11 +132,12 @@ ENGINE_ORDER = ["run_network", "bngsim", "roadrunner", "amici_klu", "amici_dense
 # must be tight) and is the informational "matches bngsim to solver tolerance" flag.
 PARITY_TOL = 1e-3
 # The run_network *engine*-parity cell is EXCLUDED only when it grossly disagrees with
-# bngsim beyond this looser bar — the same cross-engine "same trajectory" tolerance the
-# companion agreement check uses (check_sbml_engine_agreement.DISAGREE_TOL = 5e-2). On a
-# numerically ill-conditioned model (Koo2013: ~1% cross-engine spread across bngsim, RR,
-# COPASI) run_network then keeps its timing, consistent with how the SBML-native engines
-# are treated on that same model; a truly wrong (unfaithful/misread) .net still exceeds it.
+# bngsim beyond this looser bar, at the timing tolerances. On Koo2013 those tolerances
+# leave every engine several percent from the converged trajectory, by an amount that
+# swings with the output grid (issue #1250), so run_network keeps its timing there; a
+# truly wrong (unfaithful/misread) .net still exceeds it. The companion agreement check
+# no longer judges at these tolerances: it asks whether each engine converges to one
+# reference (check_sbml_engine_agreement.AGREE_TOL), which this bar could ask too.
 RN_ENGINE_TOL = 5e-2
 
 
