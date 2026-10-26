@@ -13,6 +13,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -209,6 +211,161 @@ def test_an_archive_refusal_is_judged_by_no_override(tmp_path, monkeypatch):
     assert rows["BIOMD0000000001"]["versions"]["roadrunner"] == "2.7.0"
     assert rows[adjudicated]["versions"]["roadrunner"] is None
     assert report["_meta"]["versions"]["roadrunner"] == "2.7.0"
+
+
+def _engines(monkeypatch, *, rr_sec=0.0, bn=None) -> list[str]:
+    """Answer both engines in-process: RoadRunner with ``_rr()`` after ``rr_sec``,
+    bngsim with ``bn`` (default: the same trajectory after 0.05 s). Returns the
+    list each call appends its engine to."""
+    calls: list[str] = []
+
+    def rr_ode(*a, **k):
+        calls.append("roadrunner")
+        time.sleep(rr_sec)
+        return (*_rr(), {"integrate_sec": 0.01})
+
+    def bn_ode(*a, **k):
+        calls.append("bngsim")
+        time.sleep(0.05)
+        return (*_rr(), {"integrate_sec": 0.02})
+
+    monkeypatch.setattr(R.rc, "measure_warmup", lambda include_roadrunner=True: {})
+    monkeypatch.setattr(R.rc, "set_rr_quiet", lambda: None)
+    monkeypatch.setattr(R.rc, "rr_ode", rr_ode)
+    monkeypatch.setattr(R.rc, "bn_ode", bn or bn_ode)
+    return calls
+
+
+def _work(spec: dict, **extra) -> dict:
+    q = _Queue()
+    R._worker({**spec, "metric": "max_rel_err", "tol": 1e-4, "cap": 300.0, **extra}, q)
+    (res,) = q
+    return res
+
+
+def test_a_recording_saves_the_reference_before_bngsim_starts(tmp_path, monkeypatch):
+    """Issue #1290: saved after bngsim, a job the two engines together carried past
+    the cap left no entry, and every replay refused a job it could have compared.
+    RoadRunner now runs first and its entry is on disk before bngsim starts, so a
+    kill anywhere in bngsim's side keeps it."""
+    arch = tmp_path / "arch"
+    spec = _spec(tmp_path)
+
+    def bn_ode(*a, **k):
+        assert R._archive_file(arch, spec["key"]).is_file(), "bngsim ran before the save"
+        raise KeyboardInterrupt  # the parent's kill, as far as this worker is concerned
+
+    _engines(monkeypatch, bn=bn_ode)
+    with pytest.raises(KeyboardInterrupt):
+        _work(spec, write_reference_archive=arch)
+    rr, exc, timing, _meta = R.archive_load(arch, spec)
+    assert exc == "" and timing == {"integrate_sec": 0.01}
+    np.testing.assert_array_equal(rr[1], _rr()[1])
+
+
+def test_a_recording_scores_the_job_as_a_live_run_does(tmp_path, monkeypatch):
+    """Only the order changes: the row is the one a live run gives, with both
+    engines' timing, and a wall that counts both. Each engine runs once."""
+    calls = _engines(monkeypatch, rr_sec=0.05)
+    live = _work(_spec(tmp_path))
+    assert calls == ["bngsim", "roadrunner"]
+    calls.clear()
+    recorded = _work(_spec(tmp_path), write_reference_archive=tmp_path / "arch")
+    assert calls == ["roadrunner", "bngsim"]
+    for row in (live, recorded):
+        assert row.pop("wall_sec") >= 0.1  # 0.05 s each
+    assert recorded == live and live["status"] == "pass"
+    assert live["timing"]["roadrunner"] == {"integrate_sec": 0.01}
+    assert live["timing"]["bngsim"] == {"integrate_sec": 0.02}
+
+
+def test_a_recording_past_the_cap_is_a_timeout_with_its_reference_saved(tmp_path, monkeypatch):
+    """A recording is killed only at twice the cap, so it can save the entry; the
+    row is still TIMEOUT past the cap itself, as a live night would make it, not a
+    PASS no other night would give. On a clock the engines advance, 0.65 s against
+    a 0.5 s cap: past the cap, short of twice it, and RoadRunner alone is past it,
+    so judging by twice the cap or by bngsim's time alone would pass the row."""
+    now = [0.0]
+
+    def run(sec):
+        def engine(*a, **k):
+            now[0] += sec
+            return (*_rr(), {})
+
+        return engine
+
+    _engines(monkeypatch, bn=run(0.05))
+    monkeypatch.setattr(R.rc, "rr_ode", run(0.6))
+    monkeypatch.setattr(R, "time", types.SimpleNamespace(perf_counter=lambda: now[0]))
+    spec = _spec(tmp_path)
+    res = _work(spec, write_reference_archive=tmp_path / "arch", cap=0.5)
+    assert (res["status"], res["cap"]) == ("timeout", 0.5)
+    assert "value" not in res and "timing" not in res
+    assert res["comment"] == (
+        "ran past the 0.5s wall cap (a recording runs to 1.0s to save its reference)"
+    )
+    assert R.archive_load(tmp_path / "arch", spec)[1] == ""
+    # A live run is killed by the parent at the cap; the worker leaves it be.
+    assert _work(spec, cap=0.5)["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    ("flag", "timeout", "kill_at"),
+    [
+        (None, 300.0, 300.0),
+        ("--reference-archive", 300.0, 300.0),
+        ("--write-reference-archive", 300.0, 600.0),  # the light pass
+        ("--write-reference-archive", 100.0, 200.0),
+        ("--write-reference-archive", 600.0, 600.0),  # the giant pass: no later kill
+        ("--write-reference-archive", 450.0, 600.0),
+        ("--write-reference-archive", 1800.0, 1800.0),  # never before the cap
+    ],
+)
+def test_a_recording_is_killed_at_twice_the_cap_up_to_a_ceiling(
+    tmp_path, monkeypatch, flag, timeout, kill_at
+):
+    """Issue #1290: three jobs that sit at the 300 s cap timed out in the
+    2026-10-24 recording, where RoadRunner compiled about 1.7x slower, and left no
+    entry. The giants that time out at 600 s need 20 minutes and
+    14 GB of RoadRunner alone, so their kill is not put off. The cap the worker
+    judges by stays the cap."""
+    seen = {}
+
+    def schedule(specs, worker, *, timeout_of, **kw):
+        seen.update({s["model_id"]: (s["cap"], timeout_of(s)) for s in specs})
+        return [{**s, "status": "timeout", "cap": timeout_of(s)} for s in specs]
+
+    monkeypatch.setattr(R.rc, "schedule", schedule)
+    out = tmp_path / "report.json"
+    argv = ["rr_run.py", "--jobs", str(SMOKE_JOBS), "--timeout", str(timeout)]
+    argv += [flag, str(tmp_path / "arch")] if flag else []
+    monkeypatch.setattr(sys, "argv", [*argv, "--out", str(out)])
+    R.main()
+    assert seen and set(seen.values()) == {(timeout, kill_at)}
+    comments = {r["comment"] for r in json.loads(out.read_text())["results"]}
+    assert comments == {f"killed at {kill_at}s wall cap"}
+
+
+def test_a_timeout_the_worker_judged_keeps_its_own_note(tmp_path, monkeypatch):
+    """A recording's row past the cap was not killed there; the report says what
+    happened rather than "killed at"."""
+    note = "ran past the 300.0s wall cap (a recording runs to 600.0s to save its reference)"
+
+    def schedule(specs, worker, **kw):
+        keep = ("key", "model_id", "method", "metric", "tol")
+        return [
+            {**{k: s[k] for k in keep}, "status": "timeout", "cap": 300.0, "comment": note}
+            for s in specs
+        ]
+
+    monkeypatch.setattr(R.rc, "schedule", schedule)
+    out = tmp_path / "report.json"
+    argv = ["rr_run.py", "--jobs", str(SMOKE_JOBS), "--timeout", "300"]
+    argv += ["--write-reference-archive", str(tmp_path / "arch"), "--out", str(out)]
+    monkeypatch.setattr(sys, "argv", argv)
+    R.main()
+    rows = json.loads(out.read_text())["results"]
+    assert rows and {(r["outcome"], r["comment"]) for r in rows} == {("TIMEOUT", note)}
 
 
 def test_the_two_flags_are_exclusive(tmp_path):

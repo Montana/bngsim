@@ -368,7 +368,11 @@ def humanize_comment(result: dict) -> str:
             out.append(f"Adjudicated {m.group(1)}{m.group(2)}: {m.group(3)}")
             continue
         # Refusal / timeout / crash — already in the per-engine footnote; drop here.
-        if re.match(r"reference refusal=\w+|killed at [\d.]+s wall cap|worker died", part):
+        if re.match(
+            r"reference refusal=\w+|killed at [\d.]+s wall cap|ran past the [\d.]+s wall cap|"
+            r"worker died",
+            part,
+        ):
             continue
         out.append(part)
     return " ".join(out)
