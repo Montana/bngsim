@@ -207,10 +207,19 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // scratch buffers are ns long — the caller owns them so a per-step Jacobian
 // allocates nothing. `eval_rhs(t, y_pert, fy_pert)` evaluates the SAME right-
 // hand side the session is integrating.
+//
+// The step. With the session's error weights `ewt` (and `min_inc` from them), a
+// column's step is CVODE's own dense difference quotient's (cvLsDenseDQJac):
+// max(sqrt(eps)*|y_j|, min_inc/ewt_j), on the scale the error test judges y_j by.
+// Without them, sqrt(eps)*max(|y_j|, 1): a floor of 1 in absolute terms, which
+// moved a species of 1e-9 by fifteen times itself, so the matrix KLU factored
+// was the Jacobian somewhere else, and Newton failed to converge or reached a
+// state with no finite rate where dense differences, on the weights, ran (#1254).
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
                                 const double *fy, double *jac_data, double *y_pert, double *fy_pert,
-                                double *h_vals, EvalRhs &&eval_rhs) {
+                                double *h_vals, EvalRhs &&eval_rhs, const double *ewt = nullptr,
+                                double min_inc = 1.0) {
     // Finite difference perturbation scale
     const double sqrt_uround = 1.4901161193847656e-8; // sqrt(machine epsilon)
 
@@ -222,7 +231,8 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
         std::memcpy(y_pert, y, static_cast<std::size_t>(ns) * sizeof(double));
 
         for (int j : group) {
-            double h = sqrt_uround * std::max(std::abs(y[j]), 1.0);
+            double h = ewt != nullptr ? std::max(sqrt_uround * std::abs(y[j]), min_inc / ewt[j])
+                                      : sqrt_uround * std::max(std::abs(y[j]), 1.0);
             h_vals[j] = h;
             y_pert[j] += h;
         }
