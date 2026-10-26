@@ -1,24 +1,33 @@
 {
  "_meta": {
   "suite": "ode_engines_s4_sbml",
-  "description": "Cross-engine trajectory agreement for the Table S4 models: bngsim from_sbml (reference) vs RoadRunner and COPASI, final state, order-independent (sorted species multiset). A model whose completing engines disagree would be timing different computations; all six agree to solver tolerance.",
-  "reference": "bngsim Model.from_sbml",
-  "cross_checks": [
+  "description": "Cross-engine trajectory agreement for the Table S4 models, against a converged reference (issue #1250): each engine at the reference tolerances is compared with it species by species, matched by SBML id, over its trajectory (COPASI: final state), and agree is True only when every engine that completes is within agree_tol; False when one is not or holds a non-finite value, at either tolerance; None when agreement could not be established (see why), including for an engine timed but not run at the reference tolerances. Each engine's final-state error at the figure's tolerances is reported, not judged. bngsim_vs_*_sorted_mre are the earlier reports' order-independent numbers, kept for comparison.",
+  "reference": {
+   "engines": [
+    "libRoadRunner",
+    "bngsim where libRoadRunner fails"
+   ],
+   "rtol": 1e-12,
+   "atol": 1e-15
+  },
+  "engines": [
+   "bngsim Model.from_sbml",
    "libRoadRunner",
    "COPASI"
   ],
-  "metric": "sorted final-state species multiset, max relative error",
-  "disagree_tol": 0.05,
+  "metric": "max |a - r| / max(|a|, |r|) over values above a floor: RESOLVED x REF_ATOL for the verdict, the timed run's atol for its accuracy",
+  "resolved_factor": 1000.0,
+  "agree_tol": 0.0001,
   "versions": {
    "bngsim": "0.16.0",
    "roadrunner": "2.9.2",
    "copasi": "4.46.300 (Source)"
   },
   "hardware": {
-   "cpu": "Apple M4 Max",
-   "physical_cores": 16,
-   "logical_cores": 16,
-   "platform": "macOS-26.5.1-arm64-arm-64bit"
+   "cpu": "Apple M1 Max",
+   "physical_cores": 10,
+   "logical_cores": 10,
+   "platform": "macOS-26.7.1-arm64-arm-64bit"
   }
  },
  "results": [
@@ -35,13 +44,63 @@
     "atol": 1e-09
    },
    "n_species": 75,
-   "disagree_tol": 0.05,
+   "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 1.4872752910228832e-05,
-   "bngsim_vs_roadrunner_name_mre": 1.4872752910228832e-05,
-   "n_common_species": 75,
-   "bngsim_vs_copasi_sorted_mre": 3.552940636197351e-05,
+   "bngsim_vs_copasi_sorted_mre": 3.552469410330923e-05,
+   "reference": {
+    "engine": "roadrunner",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "bngsim_vs_reference_converged": {
+    "mre": 3.667365315875898e-10,
+    "compared": 75,
+    "species": 75,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 3.337485107997436e-09,
+    "compared": 75,
+    "species": 75,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "roadrunner_error_at_timing_tolerances": 0.0001010611336625058,
+   "roadrunner_error_at_timing_tolerances_detail": {
+    "mre": 0.0001010611336625058,
+    "compared": 75,
+    "species": 75,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 9.43630340201926e-05,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 9.43630340201926e-05,
+    "compared": 75,
+    "species": 75,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 7.298244205334587e-05,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 7.298244205334587e-05,
+    "compared": 75,
+    "species": 75,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "bngsim": "agree",
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 3.552940636197351e-05
+   "worst_converged_mre": 3.337485107997436e-09
   },
   {
    "model_id": "BIOMD0000000468",
@@ -56,13 +115,63 @@
     "atol": 1e-09
    },
    "n_species": 79,
-   "disagree_tol": 0.05,
+   "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 0.04820424031406689,
-   "bngsim_vs_roadrunner_name_mre": 0.04820424031406689,
-   "n_common_species": 79,
-   "bngsim_vs_copasi_sorted_mre": 0.04741475778501889,
+   "bngsim_vs_copasi_sorted_mre": 0.04127581076925982,
+   "reference": {
+    "engine": "roadrunner",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "bngsim_vs_reference_converged": {
+    "mre": 3.947720879997771e-06,
+    "compared": 77,
+    "species": 79,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 3.4291753749912524e-08,
+    "compared": 77,
+    "species": 79,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "roadrunner_error_at_timing_tolerances": 0.0014641289951896183,
+   "roadrunner_error_at_timing_tolerances_detail": {
+    "mre": 0.0014641289951896183,
+    "compared": 77,
+    "species": 79,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 0.046889558595492695,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 0.046889558595492695,
+    "compared": 77,
+    "species": 79,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 0.005855435681389482,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 0.005855435681389482,
+    "compared": 77,
+    "species": 79,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "bngsim": "agree",
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 0.04820424031406689
+   "worst_converged_mre": 3.947720879997771e-06
   },
   {
    "model_id": "BIOMD0000000559",
@@ -77,13 +186,63 @@
     "atol": 1e-09
    },
    "n_species": 90,
-   "disagree_tol": 0.05,
+   "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 9.432524359849477e-07,
-   "bngsim_vs_roadrunner_name_mre": 9.432524359849477e-07,
-   "n_common_species": 90,
-   "bngsim_vs_copasi_sorted_mre": 5.668842515781722e-06,
+   "bngsim_vs_copasi_sorted_mre": 4.79689073727178e-06,
+   "reference": {
+    "engine": "roadrunner",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "bngsim_vs_reference_converged": {
+    "mre": 1.8736989355397446e-09,
+    "compared": 90,
+    "species": 90,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 1.4200576299241259e-11,
+    "compared": 90,
+    "species": 90,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "roadrunner_error_at_timing_tolerances": 6.401329628417169e-06,
+   "roadrunner_error_at_timing_tolerances_detail": {
+    "mre": 6.401329628417169e-06,
+    "compared": 90,
+    "species": 90,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 6.5894616977041415e-06,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 6.5894616977041415e-06,
+    "compared": 90,
+    "species": 90,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 2.0589291930043883e-06,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 2.0589291930043883e-06,
+    "compared": 90,
+    "species": 90,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "bngsim": "agree",
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 5.668842515781722e-06
+   "worst_converged_mre": 1.8736989355397446e-09
   },
   {
    "model_id": "BIOMD0000000667",
@@ -98,13 +257,63 @@
     "atol": 1e-09
    },
    "n_species": 103,
-   "disagree_tol": 0.05,
+   "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 5.906152613493397e-06,
-   "bngsim_vs_roadrunner_name_mre": 5.906152613493397e-06,
-   "n_common_species": 103,
-   "bngsim_vs_copasi_sorted_mre": 3.0706957918875353e-06,
+   "bngsim_vs_copasi_sorted_mre": 3.5754284382802914e-06,
+   "reference": {
+    "engine": "roadrunner",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "bngsim_vs_reference_converged": {
+    "mre": 2.309739002615275e-10,
+    "compared": 103,
+    "species": 103,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 2.919836539876428e-11,
+    "compared": 103,
+    "species": 103,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "roadrunner_error_at_timing_tolerances": 3.2776583888097243e-06,
+   "roadrunner_error_at_timing_tolerances_detail": {
+    "mre": 3.2776583888097243e-06,
+    "compared": 103,
+    "species": 103,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 5.802348241783308e-06,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 5.802348241783308e-06,
+    "compared": 103,
+    "species": 103,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 4.6799856587572523e-07,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 4.6799856587572523e-07,
+    "compared": 103,
+    "species": 103,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "bngsim": "agree",
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 5.906152613493397e-06
+   "worst_converged_mre": 2.309739002615275e-10
   },
   {
    "model_id": "BIOMD0000000474",
@@ -118,12 +327,47 @@
     "rtol": 1e-06,
     "atol": 1e-09
    },
-   "n_species": 133,
-   "disagree_tol": 0.05,
    "roadrunner_error": "RuntimeError: CVODE Error: CV_CONV_FAILURE: Convergence test failures occurred too many times (= MXNCF = 10) during one internal timestep or occurred with |h| = hmin.; In virtual double rr::CVODEIntegrator::integrate(double, double)",
-   "bngsim_vs_copasi_sorted_mre": 0.00026491425109077197,
+   "n_species": 133,
+   "agree_tol": 0.0001,
+   "bngsim_vs_copasi_sorted_mre": 0.00026491409425634003,
+   "roadrunner_reference_tolerance_error": "RuntimeError: CVODE Error: CV_CONV_FAILURE: Convergence test failures occurred too many times (= MXNCF = 10) during one internal timestep or occurred with |h| = hmin.; In virtual double rr::CVODEIntegrator::integrate(double, double)",
+   "reference": {
+    "engine": "bngsim",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 6.439238647049366e-09,
+    "compared": 93,
+    "species": 133,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 3.881386781196903e-06,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 3.881386781196903e-06,
+    "compared": 93,
+    "species": 133,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 0.0002630840313284572,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 0.0002630840313284572,
+    "compared": 93,
+    "species": 133,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 0.00026491425109077197
+   "worst_converged_mre": 6.439238647049366e-09
   },
   {
    "model_id": "BIOMD0000001065",
@@ -138,13 +382,63 @@
     "atol": 1e-09
    },
    "n_species": 148,
-   "disagree_tol": 0.05,
+   "agree_tol": 0.0001,
    "bngsim_vs_roadrunner_sorted_mre": 3.914702927075104e-09,
-   "bngsim_vs_roadrunner_name_mre": 3.914702927075104e-09,
-   "n_common_species": 140,
-   "bngsim_vs_copasi_sorted_mre": 3.917371269232306e-09,
+   "bngsim_vs_copasi_sorted_mre": 3.917377581961705e-09,
+   "reference": {
+    "engine": "roadrunner",
+    "rtol": 1e-12,
+    "atol": 1e-15
+   },
+   "bngsim_vs_reference_converged": {
+    "mre": 1.3128776731933746e-06,
+    "compared": 148,
+    "species": 148,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_vs_reference_converged": {
+    "mre": 2.777824595718388e-10,
+    "compared": 139,
+    "species": 148,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "roadrunner_error_at_timing_tolerances": 1.0335606918868045e-06,
+   "roadrunner_error_at_timing_tolerances_detail": {
+    "mre": 1.0335606918868045e-06,
+    "compared": 113,
+    "species": 148,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "bngsim_error_at_timing_tolerances": 1.0,
+   "bngsim_error_at_timing_tolerances_detail": {
+    "mre": 1.0,
+    "compared": 116,
+    "species": 148,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "copasi_error_at_timing_tolerances": 1.6261335290476688e-08,
+   "copasi_error_at_timing_tolerances_detail": {
+    "mre": 1.6261335290476688e-08,
+    "compared": 113,
+    "species": 148,
+    "non_finite": 0,
+    "why": null,
+    "extra_species": 0
+   },
+   "converged_status": {
+    "bngsim": "agree",
+    "copasi": "agree"
+   },
    "agree": true,
-   "worst_mre": 3.917371269232306e-09
+   "worst_converged_mre": 1.3128776731933746e-06
   }
  ]
 }

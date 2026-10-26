@@ -13,6 +13,7 @@
 #include <pybind11/stl.h>
 
 #include <bngsim/bngsim.hpp>
+#include <bngsim/c_locale_numbers.hpp>
 #include <bngsim/cc_jit.hpp>
 #include <bngsim/function_columns.hpp>
 #include <bngsim/mir_jit.hpp>
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -850,6 +852,16 @@ typename S::Obj functional_jacobian_context(const bngsim::NetworkModel &self, S 
 }
 
 } // namespace codegen_visit
+
+namespace {
+// Issue #1235 — what `with _CNumericLocale():` holds: "C" for LC_NUMERIC on the
+// calling thread from __enter__ to __exit__, for libantimony, whose parse reads
+// numbers in the C locale. Per thread, where locale.setlocale would switch the
+// whole process under every other thread.
+struct CNumericLocaleBlock {
+    std::optional<bngsim::ScopedCNumericLocale> scope;
+};
+} // namespace
 
 PYBIND11_MODULE(_bngsim_core, m) {
     m.doc() = "bngsim C++ engine bindings (low-level)";
@@ -2437,6 +2449,31 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "at their own step where the rules of fd_own_step_columns allow, and the "
             "species (0-based) whose columns that changed. Issue #1002.")
         .def(
+            "fill_dense_fd_jacobian_half_step",
+            [](bngsim::NetworkModel &self, double t,
+               py::array_t<double, py::array::c_style | py::array::forcecast> conc,
+               py::array_t<double, py::array::f_style | py::array::forcecast> floored) {
+                const double *y = state_arg(self, conc, "fill_dense_fd_jacobian_half_step");
+                const int ns = self.n_species();
+                if (floored.ndim() != 2 || floored.shape(0) != ns || floored.shape(1) != ns) {
+                    throw py::value_error("fill_dense_fd_jacobian_half_step: floored must be "
+                                          "(n_species, n_species)");
+                }
+                std::vector<double> jac(static_cast<size_t>(ns) * ns, 0.0);
+                std::vector<int> taken;
+                if (ns > 0) {
+                    py::gil_scoped_release release;
+                    taken = self.fill_dense_fd_jacobian_half_step(t, y, floored.data(), jac.data());
+                }
+                return py::make_tuple(colmajor_to_ndarray_2d(jac, ns), taken);
+            },
+            py::arg("t"), py::arg("conc"), py::arg("floored"),
+            "The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the "
+            "same point) with the columns of species far below the state's scale, and "
+            "of species at 0, taken whole at half the floored step "
+            "(fd_half_step_columns), and the species (0-based) whose columns were "
+            "taken. Issue #1002.")
+        .def(
             "fill_sparse_analytical_jacobian",
             [](bngsim::NetworkModel &self, double t,
                py::array_t<double, py::array::c_style | py::array::forcecast> conc) {
@@ -2893,11 +2930,11 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "(issue #820).")
 
         .def("__repr__", [](const bngsim::NetworkModel &m) {
-            std::ostringstream os;
-            os << "NetworkModel(species=" << m.n_species() << ", reactions=" << m.n_reactions()
-               << ", observables=" << m.n_observables() << ", parameters=" << m.n_parameters()
-               << ")";
-            return os.str();
+                std::ostringstream os;
+                os << "NetworkModel(species=" << m.n_species() << ", reactions=" << m.n_reactions()
+                   << ", observables=" << m.n_observables() << ", parameters=" << m.n_parameters()
+                   << ")";
+                return os.str();
         });
 
     // ─── CvodeSimulator ──────────────────────────────────────────────────────
@@ -3717,6 +3754,13 @@ PYBIND11_MODULE(_bngsim_core, m) {
         },
         "Return dict of reserved constant and function names");
 
+    py::class_<CNumericLocaleBlock>(m, "_CNumericLocale",
+                                    "Context manager: numbers read and written in the \"C\" "
+                                    "locale on this thread for the length of the block (#1235)")
+        .def(py::init<>())
+        .def("__enter__", [](CNumericLocaleBlock &b) { b.scope.emplace(); })
+        .def("__exit__", [](CNumericLocaleBlock &b, const py::args &) { b.scope.reset(); });
+
     // --- SteadyStateOptions ---
     py::class_<bngsim::SteadyStateOptions>(m, "SteadyStateOptions")
         .def(py::init<>())
@@ -3868,11 +3912,14 @@ PYBIND11_MODULE(_bngsim_core, m) {
                       &bngsim::SteadyStateResult::state_switch_roots_dropped)
         .def_readonly("sens_fd_own_step_species",
                       &bngsim::SteadyStateResult::sens_fd_own_step_species)
+        .def_readonly("sens_fd_half_step_species",
+                      &bngsim::SteadyStateResult::sens_fd_half_step_species)
         .def_readonly("sens_fd_disagree_species",
                       &bngsim::SteadyStateResult::sens_fd_disagree_species)
         .def_readonly("sens_fd_disagree_param", &bngsim::SteadyStateResult::sens_fd_disagree_param)
         .def_readonly("sens_fd_floored", &bngsim::SteadyStateResult::sens_fd_floored)
         .def_readonly("sens_fd_own_step", &bngsim::SteadyStateResult::sens_fd_own_step)
+        .def_readonly("sens_fd_half_step", &bngsim::SteadyStateResult::sens_fd_half_step)
         .def_readonly("sens_fd_disagree_function",
                       &bngsim::SteadyStateResult::sens_fd_disagree_function)
         .def_readonly("sens_fd_function_param", &bngsim::SteadyStateResult::sens_fd_function_param)
@@ -3880,6 +3927,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
                       &bngsim::SteadyStateResult::sens_fd_function_floored)
         .def_readonly("sens_fd_function_own_step",
                       &bngsim::SteadyStateResult::sens_fd_function_own_step)
+        .def_readonly("sens_fd_function_half_step",
+                      &bngsim::SteadyStateResult::sens_fd_function_half_step)
         .def_property_readonly(
             "sensitivity_data",
             [](const bngsim::SteadyStateResult &r) {

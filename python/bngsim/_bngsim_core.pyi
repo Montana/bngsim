@@ -231,6 +231,10 @@ class NetworkModel:
         """
         The one-sided finite-difference Jacobian of compute_derivs at (t, conc) as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, stepped by the steady-state solver's own rule. Issue #523.
         """
+    def fill_dense_fd_jacobian_half_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
+        """
+        The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale, and of species at 0, taken whole at half the floored step (fd_half_step_columns), and the species (0-based) whose columns were taken. Issue #1002.
+        """
     def fill_dense_fd_jacobian_own_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
         """
         The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale taken at their own step where the rules of fd_own_step_columns allow, and the species (0-based) whose columns that changed. Issue #1002.
@@ -1371,10 +1375,19 @@ class SteadyStateResultCore:
     def sens_fd_function_floored(self) -> float:
         ...
     @property
+    def sens_fd_function_half_step(self) -> float:
+        ...
+    @property
     def sens_fd_function_own_step(self) -> float:
         ...
     @property
     def sens_fd_function_param(self) -> int:
+        ...
+    @property
+    def sens_fd_half_step(self) -> float:
+        ...
+    @property
+    def sens_fd_half_step_species(self) -> list[int]:
         ...
     @property
     def sens_fd_own_step(self) -> float:
@@ -1510,6 +1523,16 @@ class TimeSpec:
         ...
     @t_start.setter
     def t_start(self, arg0: typing.SupportsFloat | typing.SupportsIndex) -> None:
+        ...
+class _CNumericLocale:
+    """
+    Context manager: numbers read and written in the "C" locale on this thread for the length of the block (#1235)
+    """
+    def __enter__(self) -> None:
+        ...
+    def __exit__(self, *args) -> None:
+        ...
+    def __init__(self) -> None:
         ...
 def _refuse_nonfinite_sensitivities(data: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], times: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], col_names: collections.abc.Sequence[str], axis: str = 'parameter column') -> None:
     """

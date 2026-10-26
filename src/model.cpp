@@ -3,6 +3,7 @@
 // Core RHS evaluation: update_observables → evaluate_functions → compute rates.
 // Ported from BNG's derivs_network() (network.cpp) to instance-based design.
 
+#include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/fd_jacobian.hpp"
 #include "bngsim/functional_jac_scatter.hpp"
 #include "bngsim/mm_jacobian.hpp"
@@ -3630,6 +3631,17 @@ std::vector<int> NetworkModel::fill_dense_fd_jacobian_own_step(double t, const d
                                conc, ns, ns, kNoExcluded, f0.data(), floored, jac);
 }
 
+std::vector<int> NetworkModel::fill_dense_fd_jacobian_half_step(double t, const double *conc,
+                                                                const double *floored,
+                                                                double *jac) {
+    static const std::vector<int> kNoExcluded;
+    const int ns = n_species();
+    std::vector<double> f0(static_cast<size_t>(ns));
+    compute_derivs(t, conc, f0.data());
+    return fd_half_step_columns([this, t](const double *y, double *f) { compute_derivs(t, y, f); },
+                                conc, ns, ns, kNoExcluded, f0.data(), floored, jac);
+}
+
 void NetworkModel::fill_sparse_analytical_jacobian(double t, const double *conc, double *vals) {
     // Sparse mirror of fill_dense_analytical_jacobian: identical math, written by
     // CSC data index instead of (col·n + row). This is the canonical sparse
@@ -4805,9 +4817,11 @@ std::pair<std::string, int> NetworkModel::emit_ssa_propensity_source_structure()
     const int nr = static_cast<int>(reactions.size());
     const int ns = static_cast<int>(species.size());
 
+    // Written in "C" (issue #1235): under a decimal-comma locale "%.17g" wrote
+    // 0,5 into the C source, which cc and MIR read as two arguments.
     auto lit = [](double v) {
         char buf[40];
-        std::snprintf(buf, sizeof(buf), "%.17g", v);
+        c_snprintf(buf, sizeof(buf), "%.17g", v);
         return std::string(buf);
     };
 
