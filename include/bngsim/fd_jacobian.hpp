@@ -409,12 +409,16 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 //   Moving toward the jump, the large slope is what lets CVODE hold a species
 //   that parks just short of it: the #176 fixture parks V 1e-11 under a step,
 //   the closed form and a mended matrix both collapse the step there, and the
-//   straddled quotient integrates it to 2.5e-7 of the exact branch; short of
-//   parking, the run crosses the jump soon and its matrix is formed again
-//   beyond it. Parked, its rate is its solver's noise and points either way:
-//   with V's asymptote 9e-11 under the step and tolerances of 1e-8, the march
-//   read V moving away at t = 27.7 and, mended, never converged (residual 18
-//   where main reaches 5e-10).
+//   straddled quotient integrates it to 2.5e-7 of the exact branch. Where the
+//   step is in a sum of species that trade among themselves while the sum
+//   parks (#903's `split`), each of them moves, so the direction is all there
+//   is to go on. Toward a jump that stays put, the run crosses it soon and its
+//   matrix is formed again beyond it. Toward one that recedes, or one the run
+//   slides along, it does not, and the run is wrong as on main (in the PR's
+//   "Left alone"). Parked, a species' rate is its solver's noise and points
+//   either way: with V's asymptote 9e-11 under the step and tolerances of
+//   1e-8, the march read V moving away at t = 27.7 and, mended, never
+//   converged (residual 18 where main reaches 5e-10).
 // - The species is more than two steps from 0, or exactly at 0. A step wider
 //   than the species (CVODE's floor: 2.5e-2 beside a species at 1.6e-8, 7.8e13
 //   beside one at 1.7e-4 late in a march, 3.2 beside one at -3.7e-7) reads the

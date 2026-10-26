@@ -16,9 +16,11 @@ two things, with no error or warning:
   turned the condition true: 490% off, and a steady state 5x off with
   ``converged=True``.
 
-bngsim now forms the quotients CVODE and KINSOL formed (bngsim/dq_jacobian.hpp),
-the same matrix bit for bit, and mends a row whose step crosses a jump
-(bngsim/fd_jacobian.hpp). Every closed form here is piecewise exponential.
+bngsim now forms the dense quotient CVODE formed (bngsim/dq_jacobian.hpp), the
+same matrix bit for bit, for runs and the steady-state march, and mends a row
+whose step crosses a jump (bngsim/fd_jacobian.hpp); a run's colored sparse
+quotient does the same. KINSOL's quotient is left as it was. Every closed form
+here is piecewise exponential.
 """
 
 from __future__ import annotations
@@ -149,6 +151,44 @@ def test_a_run_that_leaves_the_threshold_it_starts_on(
     below 5 at once and the matrix formed a hair under it does. Main: 1.7 with
     "fd", 7.8e-2 with a declined law."""
     t, s = _run(_threshold(tmp_path, 5.0, cond="Xobs >= 5", declined=declined), 60.0, 61, **kw)
+    assert _worst(s[:, 0], 5.0 * np.exp(-0.02 * t)) < OK
+
+
+_FD_PATHS = pytest.mark.parametrize(
+    "kw",
+    [{"jacobian": "fd"}, {"jacobian": "fd", "force_sparse_linear_solver": True}],
+    ids=["fd", "fd-sparse"],
+)
+
+
+@_FD_PATHS
+def test_sensitivities_of_a_run_that_starts_on_a_threshold(tmp_path: Path, kw: dict) -> None:
+    """X = 5·exp(-0.02·kx·t), so dX/dkx = -0.02·t·X, at most 1.84 in size. Main:
+    the state 1.66 off and dX/dkx off by 4.19."""
+    result = bngsim.Simulator(
+        _threshold(tmp_path, 5.0), method="ode", sensitivity_params=["kx"], **kw
+    ).run(t_span=(0.0, 60.0), n_points=61, rtol=RTOL, atol=ATOL)
+    t = np.asarray(result.time)
+    exact = 5.0 * np.exp(-0.02 * t)
+    assert _worst(np.asarray(result.species)[:, 0], exact) < OK
+    dxdk = np.asarray(result.sensitivities)[:, 0, 0]
+    assert float(np.max(np.abs(dxdk + 0.02 * t * exact))) < 1e-3
+
+
+@_FD_PATHS
+def test_a_law_steep_enough_to_step_like_a_jump(tmp_path: Path, kw: dict) -> None:
+    """kx·(0.03 + 0.01·tanh(1e10·(X − 5)))·X is smooth, but across the quotient's
+    step of 7.5e-8 it is a jump from 0.02 to 0.04, and X0 = 5 sits on it: X =
+    5·exp(-0.02 t) after a transient of 1e-10. Main: 1.66 off. A test of a rate
+    law's operators would not have looked at this one."""
+    model = _net(
+        tmp_path,
+        ["X() 5", "Y() 0"],
+        ["Xobs 1"],
+        ["f() kx*(0.03 + 0.01*tanh(1e10*(Xobs - 5)))"],
+        ["1 2 f"],
+    )
+    t, s = _run(model, 60.0, 61, **kw)
     assert _worst(s[:, 0], 5.0 * np.exp(-0.02 * t)) < OK
 
 
