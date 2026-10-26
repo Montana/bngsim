@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "bngsim/fd_jacobian.hpp"
 #include "bngsim/lapack_dense_linsol.hpp"
 #include "bngsim/types.hpp"
 
@@ -207,10 +208,21 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // scratch buffers are ns long — the caller owns them so a per-step Jacobian
 // allocates nothing. `eval_rhs(t, y_pert, fy_pert)` evaluates the SAME right-
 // hand side the session is integrating.
+//
+// `jump_rows`, 4·ns long, turns on the jump test of fd_jacobian.hpp (issue
+// #1002), over the matrix the loop above left (which gives each row's terms):
+// one more evaluation per color at twice the step and, for a color one of whose
+// entries may step across a jump, two at minus one and minus two steps; an
+// entry that does is given fd_entry_past_jump. A column of a color leaves the
+// rows of the other columns of that color alone, so one evaluation serves them
+// all, as the quotient's own does. The session is an integrator, so a column is
+// mended only where fd_jump_mendable takes it. Null leaves the quotient as it
+// was. `*n_mended` (if given) counts the entries mended.
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
                                 const double *fy, double *jac_data, double *y_pert, double *fy_pert,
-                                double *h_vals, EvalRhs &&eval_rhs) {
+                                double *h_vals, EvalRhs &&eval_rhs, double *jump_rows = nullptr,
+                                int *n_mended = nullptr) {
     // Finite difference perturbation scale
     const double sqrt_uround = 1.4901161193847656e-8; // sqrt(machine epsilon)
 
@@ -239,6 +251,76 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
             for (int64_t k = col_start; k < col_end; ++k) {
                 int i = static_cast<int>(sp.row_indices[k]);
                 jac_data[k] = (fy_pert[i] - fy[i]) * inv_h;
+            }
+        }
+    }
+    if (jump_rows == nullptr) {
+        return;
+    }
+
+    double *f2 = jump_rows;
+    double *fm1 = jump_rows + ns;
+    double *fm2 = jump_rows + 2 * static_cast<std::ptrdiff_t>(ns);
+    double *terms = jump_rows + 3 * static_cast<std::ptrdiff_t>(ns);
+    for (int i = 0; i < ns; ++i) {
+        terms[i] = std::abs(fy[i]);
+    }
+    for (int j = 0; j < ns; ++j) {
+        for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+            terms[sp.row_indices[k]] += std::abs(jac_data[k] * y[j]);
+        }
+    }
+    // f at y + m·Σh_j·e_j over the color; false where it fails, so a probe the
+    // session itself never asked for cannot end the run.
+    auto side = [&](const std::vector<int> &group, double m, double *out) {
+        std::memcpy(y_pert, y, static_cast<std::size_t>(ns) * sizeof(double));
+        for (int j : group) {
+            y_pert[j] = y[j] + m * h_vals[j];
+        }
+        try {
+            eval_rhs(t, y_pert, out);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+    for (int c = 0; c < sp.n_colors; ++c) {
+        const auto &group = sp.color_groups[c];
+        auto mendable = [&](int j) { return fd_jump_mendable(fy[j], h_vals[j]); };
+        if (std::none_of(group.begin(), group.end(), mendable) || !side(group, 2.0, f2)) {
+            continue;
+        }
+        // f(y + h) is fy + h·J to the rounding of the column formula.
+        bool may = false;
+        for (int j : group) {
+            if (!mendable(j)) {
+                continue;
+            }
+            for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1] && !may; ++k) {
+                const int i = static_cast<int>(sp.row_indices[k]);
+                const double d01 = jac_data[k] * h_vals[j];
+                may = fd_step_may_cross_jump(d01, f2[i] - fy[i] - d01, fd_jump_floor(terms[i]));
+            }
+        }
+        if (!may || !side(group, -1.0, fm1) || !side(group, -2.0, fm2)) {
+            continue;
+        }
+        for (int j : group) {
+            if (!mendable(j)) {
+                continue;
+            }
+            for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+                const int i = static_cast<int>(sp.row_indices[k]);
+                const double d01 = jac_data[k] * h_vals[j];
+                const double d12 = f2[i] - fy[i] - d01;
+                const double dmm = fm1[i] - fm2[i];
+                const double floor = fd_jump_floor(terms[i]);
+                if (fd_step_crosses_jump(dmm, d01, d12, floor)) {
+                    jac_data[k] = fd_entry_past_jump(dmm, fy[i] - fm1[i], d12, floor, h_vals[j]);
+                    if (n_mended != nullptr) {
+                        ++*n_mended;
+                    }
+                }
             }
         }
     }

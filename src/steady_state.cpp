@@ -30,6 +30,7 @@
 #include "bngsim/atol_vector.hpp"
 #include "bngsim/codegen_abi.hpp"
 #include "bngsim/dense_eigenvalues.hpp"
+#include "bngsim/dq_jacobian.hpp"
 #include "bngsim/dynamic_library.hpp"
 #include "bngsim/fd_jacobian.hpp"
 #include "bngsim/function_columns.hpp"
@@ -366,6 +367,15 @@ struct SteadyStateUserData {
     // sized once when that callback is selected so a per-step Jacobian
     // allocates nothing. Empty on every other path.
     std::vector<double> fd_y_pert, fd_fy_pert, fd_h_vals;
+    // The rows the colored quotient's jump test evaluates (issue #1002), 4·ns.
+    std::vector<double> fd_jump_rows;
+    // The dense difference quotients bngsim forms in place of CVODE's and
+    // KINSOL's (issue #1002): the march's CVODE session, the KINSOL solve's
+    // scaling, and the rows its jump test evaluates.
+    void *dq_cvode_mem = nullptr;
+    const double *dq_uscale = nullptr;
+    std::vector<double> dq_scratch;
+    bool dq_debug = false;
     // Tracking absolute tolerance for the march (issue #213). Inactive for
     // every solve that does not ask for it.
     AtolTracking atol_tracking;
@@ -855,6 +865,57 @@ static int cvode_ss_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix 
         ud, [&] { return cvode_ss_dense_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
 }
 
+// f at a state the solver never asked about (issue #1002), through the solver's
+// own callback `call(out)`, leaving no exception parked that the solve would
+// rethrow. False where it fails or is not finite there.
+template <class Data, class Call>
+static bool ss_dq_side_point(Data *data, N_Vector f, Call &&call) {
+    const bool had_error = static_cast<bool>(data->callback_error);
+    const int rc = call(f);
+    if (!had_error) {
+        data->callback_error = nullptr;
+    }
+    if (rc != 0) {
+        return false;
+    }
+    const double *fd = N_VGetArrayPointer(f);
+    const sunindextype n = N_VGetLength(f);
+    for (sunindextype i = 0; i < n; ++i) {
+        if (!std::isfinite(fd[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The march with no closed form to install (issue #1002): the quotient CVODE
+// would difference, formed by bngsim with the jump test (bngsim/dq_jacobian.hpp).
+static int cvode_ss_dense_dq_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                      N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    auto *data = static_cast<SteadyStateUserData *>(ud);
+    int mended = 0;
+    const int rc = cvode_dense_dq_past_jumps(
+        data->dq_cvode_mem, y, fy, J, tmp1, tmp2, tmp3, data->dq_scratch,
+        [&](N_Vector out) { return cvode_ss_rhs(t, y, out, ud); },
+        [&](N_Vector out) {
+            return ss_dq_side_point(data, out,
+                                    [&](N_Vector o) { return cvode_ss_rhs(t, y, o, ud); });
+        },
+        &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr,
+                     "[jac] steady-state march dense DQ t=%.17g: %d entries step across a jump\n",
+                     static_cast<double>(t), mended);
+    }
+    return rc;
+}
+
+static int cvode_ss_dense_dq_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                 N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_dense_dq_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
+}
+
 #ifdef BNGSIM_HAS_KLU
 // The same Jacobian, written into the CSC values KLU factors (issue #128), for a
 // march the routing rule sent to the sparse linear solver. The structure has to
@@ -907,11 +968,18 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
     // Sized once, when the callback was selected, so this hot path allocates
     // nothing per Jacobian evaluation.
     SteadyStateRhs *rhs = data->rhs;
+    int mended = 0;
     colored_fd_jacobian(
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
+        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); },
+        data->fd_jump_rows.data(), &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr,
+                     "[jac] steady-state march colored DQ t=%.17g: %d entries step across a jump\n",
+                     static_cast<double>(t), mended);
+    }
     return 0;
 }
 
@@ -1454,6 +1522,8 @@ class SteadyStateMarcher {
                 ud_.fd_y_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_fy_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_h_vals.assign(static_cast<size_t>(ns_), 0.0);
+                ud_.fd_jump_rows.assign(4 * static_cast<size_t>(ns_), 0.0);
+                ud_.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
             }
             if (CVodeSetJacFn(cvode_mem_, analytical ? cvode_ss_sparse_jac
                                                      : cvode_ss_colored_jac) != CV_SUCCESS) {
@@ -1471,6 +1541,15 @@ class SteadyStateMarcher {
         if (ss_install_solver_jacobian(rhs, opts)) {
             if (CVodeSetJacFn(cvode_mem_, cvode_ss_dense_jac) != CV_SUCCESS) {
                 throw std::runtime_error("CVodeSetJacFn failed (steady_state)");
+            }
+        } else {
+            // No closed form: the quotient CVODE would form, with the jump
+            // test (issue #1002).
+            ud_.dq_cvode_mem = cvode_mem_;
+            ud_.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
+            if (CVodeSetJacFn(cvode_mem_, cvode_ss_dense_dq_jac) != CV_SUCCESS) {
+                throw std::runtime_error(
+                    "CVodeSetJacFn failed (steady_state, difference quotient)");
             }
         }
     }
@@ -1540,6 +1619,11 @@ struct ReducedKinsolData {
     // at, the full ns×ns fill, and its projection onto the unknowns. Held here so
     // a Jacobian setup allocates nothing.
     std::vector<double> jac_y_full, jac_full, jac_red;
+    // KINSOL's difference quotient as bngsim forms it (issue #1002): the
+    // solve's scaling and the rows its jump test evaluates.
+    const double *dq_uscale = nullptr;
+    std::vector<double> dq_scratch;
+    bool dq_debug = false;
     // What a callback threw, if one did (issue #589). SUNDIALS is C, so an
     // exception must not unwind through its frames; guard_ss_callback parks the
     // first one here and returns the unrecoverable-failure code, and the solve
@@ -1701,6 +1785,59 @@ static int kinsol_jac(N_Vector y, N_Vector fval, SUNMatrix J, void *ud, N_Vector
                       N_Vector tmp2) {
     return guard_ss_callback<SteadyStateUserData>(
         ud, [&] { return kinsol_jac_body(y, fval, J, ud, tmp1, tmp2); });
+}
+
+// The polish with no closed form to install (issue #1002): the quotient KINSOL
+// would difference, of the full or the reduced residual, formed by bngsim with
+// the jump test (bngsim/dq_jacobian.hpp).
+static int kinsol_dq_jac_body(N_Vector u, N_Vector fu, SUNMatrix J, void *ud, N_Vector tmp1,
+                              N_Vector tmp2) {
+    auto *data = static_cast<SteadyStateUserData *>(ud);
+    int mended = 0;
+    const int rc = kinsol_dense_dq_past_jumps(
+        u, fu, J, tmp1, tmp2, data->dq_uscale, data->dq_scratch,
+        [&](N_Vector out) { return kinsol_rhs(u, out, ud); },
+        [&](N_Vector out) {
+            return ss_dq_side_point(data, out, [&](N_Vector o) { return kinsol_rhs(u, o, ud); });
+        },
+        &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr, "[jac] steady-state KINSOL DQ: %d entries step across a jump\n",
+                     mended);
+    }
+    return rc;
+}
+
+static int kinsol_dq_jac(N_Vector u, N_Vector fu, SUNMatrix J, void *ud, N_Vector tmp1,
+                         N_Vector tmp2) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return kinsol_dq_jac_body(u, fu, J, ud, tmp1, tmp2); });
+}
+
+static int kinsol_reduced_dq_jac_body(N_Vector u, N_Vector fu, SUNMatrix J, void *ud, N_Vector tmp1,
+                                      N_Vector tmp2) {
+    auto *data = static_cast<ReducedKinsolData *>(ud);
+    int mended = 0;
+    const int rc = kinsol_dense_dq_past_jumps(
+        u, fu, J, tmp1, tmp2, data->dq_uscale, data->dq_scratch,
+        [&](N_Vector out) { return kinsol_reduced_rhs(u, out, ud); },
+        [&](N_Vector out) {
+            return ss_dq_side_point(data, out,
+                                    [&](N_Vector o) { return kinsol_reduced_rhs(u, o, ud); });
+        },
+        &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr,
+                     "[jac] steady-state reduced KINSOL DQ: %d entries step across a jump\n",
+                     mended);
+    }
+    return rc;
+}
+
+static int kinsol_reduced_dq_jac(N_Vector u, N_Vector fu, SUNMatrix J, void *ud, N_Vector tmp1,
+                                 N_Vector tmp2) {
+    return guard_ss_callback<ReducedKinsolData>(
+        ud, [&] { return kinsol_reduced_dq_jac_body(u, fu, J, ud, tmp1, tmp2); });
 }
 
 // Which species a restricted steady-state system treats as UNKNOWNS.
@@ -2222,6 +2359,18 @@ static SteadyStateResult solve_by_newton(NetworkModel &model, SteadyStateRhs &rh
         flag = KINSetJacFn(kin_mem, use_reduced ? kinsol_reduced_jac : kinsol_jac);
         if (flag != KIN_SUCCESS) {
             throw std::runtime_error("KINSetJacFn failed");
+        }
+    } else {
+        // No closed form: the quotient KINSOL would form, with the jump test
+        // (issue #1002). `scale` is the uscale KINSol is handed below.
+        const bool dbg = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
+        rd.dq_uscale = N_VGetArrayPointer(scale);
+        rd.dq_debug = dbg;
+        ud.dq_uscale = N_VGetArrayPointer(scale);
+        ud.dq_debug = dbg;
+        flag = KINSetJacFn(kin_mem, use_reduced ? kinsol_reduced_dq_jac : kinsol_dq_jac);
+        if (flag != KIN_SUCCESS) {
+            throw std::runtime_error("KINSetJacFn failed (difference quotient)");
         }
     }
 

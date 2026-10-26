@@ -364,4 +364,80 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
     }
 }
 
+// ─── A quotient that steps across a jump (issue #1002) ───────────────────────
+//
+// A rate law with a jump in it (`if(X > 5, a, b)`, a comparison, `ceil`,
+// `rint`) differenced from a state within one step of the threshold reads the
+// jump over the step, Δf/h, where the row has a slope. Beside X = 5,
+// `if(X > 5, 0.04, 0.02)·X` came back with −1.3e6 for −0.02. CVODE's Newton
+// iteration under that matrix takes corrections a millionth of their size,
+// calls them converged at once, and the run follows its predictor (X = 5 − 0.1t,
+// 166% off at t = 60, with no error). A species held at 0 under `if(I > 0, …)`
+// is stepped by the solver's floor, far under 1e-12; the entry is larger still,
+// and the LU's rounding through it leaks 1e-36 into I, which turns the
+// condition true (490% off).
+//
+// What tells a jump from a slope is the row over the steps beside the
+// quotient's own. A slope, a kink, an extremum or an inflection moves the row
+// over one step by no more than a small factor of what it moves over the steps
+// either side; a jump moves it by the jump, however short the step. So the
+// quotient's difference d = f(y + h) − f(y) reads a jump where |d| is more than
+// kFdJumpRatio times both f(y + 2h) − f(y + h) and f(y − h) − f(y − 2h). The
+// outer steps, not f(y) − f(y − h): on `X == 0` at X = 0 both inner steps cross.
+//
+// And more than kFdJumpNoise last bits of the row's terms (`fd_jump_floor`):
+// a row whose terms cancel answers a short step in counts of their last bit,
+// which is a jump at that grain and none in the model. A branch of a rate law
+// changes a term by a part of itself. The terms are the row's value and each
+// entry times its species, from the matrix the solver formed: BIOMD0000000091,
+// mass action alone, had two entries taken for jumps against a floor of the
+// row's value.
+//
+// `fd_step_may_cross_jump` is the half of the test the forward step gives; only
+// where it holds are the two backward points worth evaluating.
+//
+// An integrator's matrix is mended only where the species is not moving toward
+// the jump its step crosses (`fd_jump_mendable`). Moving toward it, the large
+// slope is what lets CVODE hold a species that parks just short of a jump: the
+// #176 fixture parks V 1e-11 under a step, the closed form and a mended matrix
+// both collapse the step there, and the straddled quotient integrates it to
+// 2.5e-7 of the exact branch. Short of parking, the run crosses the jump soon
+// and its matrix is formed again beyond it. Moving away, or standing on the
+// jump, nothing forms the matrix again and the run follows its predictor. A
+// root-finder's matrix has no motion to read, and is mended wherever it crosses.
+constexpr double kFdJumpRatio = 16.0;
+constexpr double kFdJumpNoise = 1024.0;
+
+// Does a time integrator's quotient of species j, stepped by `inc` from a state
+// where its own rate is `f_self`, get mended where it crosses a jump?
+inline bool fd_jump_mendable(double f_self, double inc) { return !(f_self * inc > 0.0); }
+
+// The least change a row reads as a jump, from the sum of its terms' sizes.
+inline double fd_jump_floor(double row_terms) {
+    return kFdJumpNoise * std::numeric_limits<double>::epsilon() * row_terms;
+}
+
+// The tests over one row, in the row's differences: d01 the quotient's own,
+// d12 one step further on, dmm two steps back, dm the step back.
+inline bool fd_step_may_cross_jump(double d01, double d12, double floor) {
+    return std::isfinite(d01) && std::isfinite(d12) &&
+           std::abs(d01) > kFdJumpRatio * std::abs(d12) + floor;
+}
+
+inline bool fd_step_crosses_jump(double dmm, double d01, double d12, double floor) {
+    return fd_step_may_cross_jump(d01, d12, floor) && std::isfinite(dmm) &&
+           std::abs(d01) > kFdJumpRatio * std::max(std::abs(dmm), std::abs(d12)) + floor;
+}
+
+// The entry a row whose quotient crosses a jump takes instead: the backward
+// quotient dm/h, the slope of the branch the state is on, where that step
+// crosses nothing by the same test against the same outer steps; 0 where it
+// does, as on `X == 0` at X = 0, whose rows have no slope to give.
+inline double fd_entry_past_jump(double dmm, double dm, double d12, double floor, double h) {
+    const bool clean =
+        std::isfinite(dm) &&
+        std::abs(dm) <= kFdJumpRatio * std::max(std::abs(dmm), std::abs(d12)) + floor;
+    return clean ? dm / h : 0.0;
+}
+
 } // namespace bngsim
