@@ -2541,7 +2541,10 @@ class Model:
         for other, at, columns in ((own, "1.5e-8 of itself", changed), (half, "half that", taken)):
             for j in columns:
                 largest = float(np.max(np.abs(dense[:, j])))
+                # An entry that is no number at the second step is as far
+                # apart as can be.
                 apart = np.abs(other[:, j] - dense[:, j])
+                apart[np.isnan(apart)] = np.inf
                 i = int(np.argmax(apart))
                 share = apart[i] / largest if largest > 0.0 else np.inf
                 if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):

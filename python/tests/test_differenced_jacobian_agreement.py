@@ -529,7 +529,11 @@ def test_a_declined_function_of_a_species_at_0_is_refused(tmp_path):
         _steady(_model(tmp_path, 1.0, functions=("xsq",), s=0.0))
     msg = str(err.value)
     assert "dxsq/ds is " + format(SQRT_EPS / K1, ".6g") in msg
-    assert format(0.5 * SQRT_EPS / K1, ".6g") + " with those species" in msg
+    assert (
+        format(0.5 * SQRT_EPS / K1, ".6g")
+        + " with the species far below that scale and those at 0"
+        in msg
+    )
 
 
 NAN_WINDOW = """begin parameters
@@ -648,14 +652,103 @@ def test_a_parameter_at_a_small_value_is_held_to_the_same_check(tmp_path, s):
     assert "stepped by half the first step" in str(err.value)
 
 
-def test_a_species_the_mask_leaves_out_is_not_stepped_again(tmp_path):
-    """Control. With ``mask=`` keeping X and G, D is held where the solve
-    left it and its column is not read: it is not taken at half the step,
-    though it is far below G. X is, and dX*/ds is returned."""
-    sim = bngsim.Simulator(_model(tmp_path, 1e4, functions=()), method="ode", jacobian="fd")
-    out = sim.steady_state(sensitivity_params=["s"], mask=["X()", "G()"])
-    assert np.asarray(out.sensitivity)[0, 0] == pytest.approx(DX_DS, rel=1e-4)
-    assert out.sens_fd_half_step_species == ["X()"]
+# B <-> A at kf = kr = 1 with A + B = 1, B the law's dependent; G is made at
+# k·B² beside sg = 1e8. B* = 1/2, dB*/dkf = 1/4 and dG*/dkf = 2·k·B*·dB*/dkf.
+MASKED_DEPENDENT = """begin parameters
+    1 kf  1.0
+    2 kr  1.0
+    3 k   1.0
+    4 sg  1e8
+    5 dg  1.0
+    6 T   1.0
+end parameters
+begin species
+    1 B() 0
+    2 A() T
+    3 G() 1e8
+end species
+begin reactions
+    1 2 1 kf
+    2 1 2 kr
+    3 1,1 1,1,3 k
+    4 0 3 sg
+    5 3 0 dg
+end reactions
+"""
+
+# $F at F0 = 0.5 makes G at k·F² beside sg = 1e8: dG*/dF0 = 2·k·F0 = 1.
+MASKED_FIXED = """begin parameters
+    1 F0  0.5
+    2 k   1.0
+    3 sg  1e8
+    4 dg  1.0
+    5 s   1.3
+    6 k1  0.21
+end parameters
+begin species
+    1 $F() F0
+    2 X() 0
+    3 G() 1e8
+end species
+begin reactions
+    1 1,1 1,1,3 k
+    2 0 3 sg
+    3 3 0 dg
+    4 0 2 s
+    5 2 0 k1
+end reactions
+"""
+
+
+@pytest.mark.parametrize(
+    "text, param, mask, floored",
+    [
+        (MASKED_DEPENDENT, "kf", ["A()", "G()"], "dG()/dkf is 0.622529"),
+        (MASKED_FIXED, "F0", ["X()", "G()"], "dG()/dF0 is 2.49012"),
+    ],
+    ids=["a law's dependent", "a fixed species a parameter sets"],
+)
+def test_a_species_the_mask_leaves_out_is_stepped_again_where_its_column_is_read(
+    tmp_path, text, param, mask, floored
+):
+    """A species ``mask=`` leaves out is held, and its column is still read
+    by the solve where it is a conservation law's dependent, rebuilt from the
+    total, or a fixed species a parameter sets. Its secant across the floored
+    step, k·(2B + h), came back as dG*/dkf 0.6225 for 0.25 and dG*/dF0 2.490
+    for 1 with ``jacobian="fd"`` and no error. (Not stepping it again, which
+    an earlier cut of this check did, let both through.)"""
+    path = tmp_path / "masked.net"
+    path.write_text(text)
+    sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian="fd")
+    with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
+        sim.steady_state(sensitivity_params=[param], mask=mask)
+    assert floored in str(err.value)
+    assert "stepped by half the first step" in str(err.value)
+
+
+def test_a_function_whose_half_step_partial_is_no_number_is_refused(tmp_path):
+    """At the default settings r's partial over X is differenced, and it is
+    no number at half the step, where dX*/ds is not 0: refused, as the
+    species' columns are with ``jacobian="fd"``. (d(r)/ds is 0 here, and
+    main returns it; a partial that is no number confirms nothing.)"""
+    path = tmp_path / "nan_window.net"
+    path.write_text(NAN_WINDOW)
+    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
+        _steady(bngsim.Model.from_net(path))
+    assert "dr/ds is 0 " in str(err.value)
+    assert "nan with the species far below that scale and those at 0" in str(err.value)
+
+
+def test_model_jacobian_warns_where_the_half_step_is_no_number(tmp_path, monkeypatch):
+    """``Model.jacobian()`` at X = 0 beside G = 1e8 in the model whose rate
+    is no number for X between 0.6 and 0.9: the column of X at half the
+    step is no number, and the warning says so."""
+    path = tmp_path / "nan_window.net"
+    path.write_text(NAN_WINDOW)
+    model = bngsim.Model.from_net(path)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    with pytest.warns(UserWarning, match=r"and nan stepped by half that"):
+        model.jacobian(np.array([0.0, 0.0, 1e8]))
 
 
 @pytest.mark.parametrize("big", [1e6, 1e8])

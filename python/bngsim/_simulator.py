@@ -8177,7 +8177,7 @@ class Simulator:
                     result.sens_fd_function_own_step,
                     result.sens_fd_function_half_step,
                     "the species far below that scale",
-                    "those species and the species at 0",
+                    "the species far below that scale and those at 0",
                     "the largest function sensitivity in that column",
                 )
                 + f" {why}"
