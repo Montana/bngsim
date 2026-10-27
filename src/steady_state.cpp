@@ -4810,11 +4810,20 @@ static constexpr double kFdAnswersAgree = 1e-4;
 // own step reads it, and misses a term that answers in the grain of a sum with
 // something larger. So the columns are solved again with the second matrix,
 // the first's with those species' columns at their own step
-// (fd_own_step_columns), and where the two answers are further apart than
+// (fd_own_step_columns), and a third time with them, and the columns of
+// species at 0, at half the floored step (fd_half_step_columns), which a
+// secant moves with and a slope does not, in a row the own step cannot read
+// too. Where either answer is further from the floored one than
 // kFdAnswersAgree of a column's largest, the entry that is furthest is put on
 // the result, which steady_state() refuses. Where they agree, the columns are
 // the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
 // solve that gave result.sensitivity, at the state result.concentrations.
+//
+// A column that is no number at half the step (a rate that is not one between
+// the state and the floored step) confirms nothing. It is put back as the
+// floored step has it, so that it does not spoil the solve of the others, and
+// a column of the answer that reads it, where its species' entry is not 0, is
+// refused with no number for its half-step value.
 template <class Solve>
 static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResult &result,
                                            const double *J, int ns, int np,
@@ -4825,17 +4834,44 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
     const double *y_ss = result.concentrations.data();
     std::vector<double> f0(static_cast<size_t>(ns));
     rhs.eval(0.0, y_ss, f0.data());
+    const auto eval = [&](const double *yy, double *f) { rhs.eval(0.0, yy, f); };
     std::vector<double> J_own(static_cast<size_t>(ns) * ns);
     result.sens_fd_own_step_species =
-        fd_own_step_columns([&](const double *yy, double *f) { rhs.eval(0.0, yy, f); }, y_ss, ns,
-                            ns, sub.excluded, f0.data(), J, J_own.data());
+        fd_own_step_columns(eval, y_ss, ns, ns, sub.excluded, f0.data(), J, J_own.data());
+    std::vector<double> J_half(static_cast<size_t>(ns) * ns);
+    result.sens_fd_half_step_species =
+        fd_half_step_columns(eval, y_ss, ns, ns, sub.excluded, f0.data(), J, J_half.data());
+    std::vector<int> no_number;
+    for (const int j : result.sens_fd_half_step_species) {
+        const size_t at = static_cast<size_t>(j) * ns;
+        if (!std::all_of(J_half.begin() + at, J_half.begin() + at + ns,
+                         [](double v) { return std::isfinite(v); })) {
+            std::copy(J + at, J + at + ns, J_half.begin() + at);
+            no_number.push_back(j);
+        }
+    }
     // The caches as an evaluation at the state leaves them.
     rhs.eval(0.0, y_ss, f0.data());
-    if (result.sens_fd_own_step_species.empty()) {
+    if (result.sens_fd_own_step_species.empty() && result.sens_fd_half_step_species.empty()) {
         return;
     }
-    std::vector<double> own(result.sensitivity.size(), 0.0);
-    solve_columns(J_own.data(), own, nullptr);
+    std::vector<double> own = result.sensitivity;
+    if (!result.sens_fd_own_step_species.empty()) {
+        solve_columns(J_own.data(), own, nullptr);
+    }
+    std::vector<double> half = result.sensitivity;
+    if (!result.sens_fd_half_step_species.empty()) {
+        solve_columns(J_half.data(), half, nullptr);
+    }
+    for (int p = 0; p < np; ++p) {
+        if (std::any_of(no_number.begin(), no_number.end(), [&](int j) {
+                return result.sensitivity[static_cast<size_t>(j) * np + p] != 0.0;
+            })) {
+            for (int i = 0; i < ns; ++i) {
+                half[static_cast<size_t>(i) * np + p] = std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+    }
     double worst = 0.0;
     for (int p = 0; p < np; ++p) {
         double largest = 0.0;
@@ -4850,7 +4886,13 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
             if (!std::isfinite(result.sensitivity[k])) {
                 continue; // no answer to confirm
             }
-            const double apart = std::abs(own[k] - result.sensitivity[k]);
+            // (An answer that is no number is as far apart as can be, which
+            // std::max would not keep.)
+            const double own_apart = std::abs(own[k] - result.sensitivity[k]);
+            const double half_apart = std::abs(half[k] - result.sensitivity[k]);
+            const double apart = std::isnan(own_apart) || std::isnan(half_apart)
+                                     ? std::numeric_limits<double>::quiet_NaN()
+                                     : std::max(own_apart, half_apart);
             if (apart <= kFdAnswersAgree * largest) {
                 continue;
             }
@@ -4863,6 +4905,7 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
                 result.sens_fd_disagree_param = p;
                 result.sens_fd_floored = result.sensitivity[k];
                 result.sens_fd_own_step = own[k];
+                result.sens_fd_half_step = half[k];
             }
         }
     }
@@ -5708,19 +5751,26 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
 
             // Issue #1002: the state-chain term again, with the partials of
             // species far below the state's scale at their own step
-            // (fd_own_step_columns). Where the two totals are further apart
-            // than kFdAnswersAgree of the largest function sensitivity in the
+            // (fd_own_step_columns), and again with them, and those of
+            // species at 0, at half the floored step (fd_half_step_columns).
+            // Where either total is further from the floored one than
+            // kFdAnswersAgree of the largest function sensitivity in the
             // column, the furthest is put on the result, which steady_state()
             // refuses. The values returned are the floored ones either way.
+            const auto eval_functions = [&](const double *yy, double *g) {
+                model.update_observables(yy);
+                model.evaluate_functions(0.0);
+                const std::vector<double> &cache = model.function_value_cache();
+                std::copy(cache.begin(), cache.begin() + n_func, g);
+            };
             std::vector<double> D_own(D_func.size());
-            const std::vector<int> retaken = fd_own_step_columns(
-                [&](const double *yy, double *g) {
-                    model.update_observables(yy);
-                    model.evaluate_functions(0.0);
-                    const std::vector<double> &cache = model.function_value_cache();
-                    std::copy(cache.begin(), cache.begin() + n_func, g);
-                },
-                y_ss, ns, n_func, result.excluded_species, f0.data(), D_func.data(), D_own.data());
+            const std::vector<int> retaken =
+                fd_own_step_columns(eval_functions, y_ss, ns, n_func, result.excluded_species,
+                                    f0.data(), D_func.data(), D_own.data());
+            std::vector<double> D_half(D_func.size());
+            const std::vector<int> halved =
+                fd_half_step_columns(eval_functions, y_ss, ns, n_func, result.excluded_species,
+                                     f0.data(), D_func.data(), D_half.data());
             // A rate law BNG2.pl wrote as a function (`_rateLawN`) is not among
             // the function sensitivities a result returns.
             std::vector<uint8_t> asked(static_cast<size_t>(n_func), 0);
@@ -5728,8 +5778,24 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                 asked[static_cast<size_t>(m)] =
                     need_fd[m] && !is_auto_rate_law(result.function_names[static_cast<size_t>(m)]);
             }
+            // The change a set of retaken partials makes to func_m's total in
+            // column p.
+            const auto change_by = [&](const std::vector<int> &species,
+                                       const std::vector<double> &D_other, int m, int p) {
+                double change = 0.0;
+                for (const int i : species) {
+                    const size_t k = static_cast<size_t>(i) * n_func + m;
+                    const double dxi = result.sensitivity[static_cast<size_t>(i) * np + p];
+                    // (A partial that is no number at half the step, times
+                    // an entry of 0, adds nothing.)
+                    if (std::isfinite(dxi) && dxi != 0.0) {
+                        change += (D_other[k] - D_func[k]) * dxi;
+                    }
+                }
+                return change;
+            };
             double worst = 0.0;
-            for (int p = 0; p < np && !retaken.empty(); ++p) {
+            for (int p = 0; p < np && !(retaken.empty() && halved.empty()); ++p) {
                 double largest = 0.0;
                 for (int m = 0; m < n_func; ++m) {
                     const double v = result.function_sensitivity[static_cast<size_t>(m) * np + p];
@@ -5742,15 +5808,11 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                     if (!asked[static_cast<size_t>(m)] || !std::isfinite(v)) {
                         continue;
                     }
-                    double change = 0.0;
-                    for (const int i : retaken) {
-                        const size_t k = static_cast<size_t>(i) * n_func + m;
-                        const double dxi = result.sensitivity[static_cast<size_t>(i) * np + p];
-                        if (std::isfinite(dxi)) {
-                            change += (D_own[k] - D_func[k]) * dxi;
-                        }
-                    }
-                    const double apart = std::abs(change);
+                    const double change = change_by(retaken, D_own, m, p);
+                    const double change_half = change_by(halved, D_half, m, p);
+                    const double apart = std::isnan(change) || std::isnan(change_half)
+                                             ? std::numeric_limits<double>::quiet_NaN()
+                                             : std::max(std::abs(change), std::abs(change_half));
                     if (apart <= kFdAnswersAgree * largest) {
                         continue;
                     }
@@ -5763,6 +5825,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                         result.sens_fd_function_param = p;
                         result.sens_fd_function_floored = v;
                         result.sens_fd_function_own_step = v + change;
+                        result.sens_fd_function_half_step = v + change_half;
                     }
                 }
             }

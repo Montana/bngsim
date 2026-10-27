@@ -8106,6 +8106,15 @@ class Simulator:
         them; where they are further apart than 1e-4 of a column's largest
         entry they are refused. Curvature moves the first answer and rounding
         grain the second, so one both give is neither.
+
+        The own step reads a term only where the row's rounding over it is
+        smaller, and in a row that a much larger species is in, it is not:
+        ``k*X**2`` in the rate of a species at 1e8 was compared with nothing,
+        and dG*/ds came back 66.05 for 58.96. So the columns are solved a third
+        time with those species, and species at 0, stepped by half the first
+        step, whole columns, and refused where that answer is further than
+        that from the first: a secant across the step moves with it, and a
+        slope does not.
         """
         time_course = (
             "a time course with forward sensitivities run to the steady state, "
@@ -8117,9 +8126,24 @@ class Simulator:
             'jacobian="auto" uses it where the model has one, which jacobian="fd" does '
             f"not. Otherwise take the columns from {time_course}."
         )
-        stepped = ", ".join(result.sens_fd_own_step_species[:5])
-        if len(result.sens_fd_own_step_species) > 5:
-            stepped += f" and {len(result.sens_fd_own_step_species) - 5} more"
+
+        def listed(names: list[str]) -> str:
+            text = ", ".join(names[:5])
+            return text + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+
+        def others(
+            first: float, own: float, half: float, own_whose: str, half_whose: str, of: str
+        ) -> str:
+            # The second answers that are not the first (an answer that is no
+            # number is not), and how far the furthest is.
+            said = []
+            if own != first:
+                said.append(f"{own:.6g} with {own_whose} stepped by 1.5e-8 of itself")
+            if half != first:
+                said.append(f"{half:.6g} with {half_whose} stepped by half the first step")
+            apart = "the further of them more" if len(said) > 1 else "more"
+            return ", and ".join(said) + f", {apart} than 1e-4 of {of} from the first."
+
         opening = (
             "steady_state(sensitivity_params=...) does not return {what} for this model at "
             "this steady state (issue #1002): the Jacobian is a difference quotient, and "
@@ -8130,9 +8154,16 @@ class Simulator:
                 opening.format(what="dY_ss/dp")
                 + f"d{result.sens_fd_disagree_species}/d{result.sens_fd_disagree_param} is "
                 f"{result.sens_fd_floored:.6g} with every species stepped by 1.5e-8 of the "
-                f"state's largest concentration, and {result.sens_fd_own_step:.6g} with "
-                f"{stepped} stepped by 1.5e-8 of itself, more than 1e-4 of the column's "
-                f"largest entry apart. {why}"
+                "state's largest concentration, and "
+                + others(
+                    result.sens_fd_floored,
+                    result.sens_fd_own_step,
+                    result.sens_fd_half_step,
+                    listed(result.sens_fd_own_step_species),
+                    listed(result.sens_fd_half_step_species),
+                    "the column's largest entry",
+                )
+                + f" {why}"
             )
         if result.sens_fd_disagree_function is not None:
             raise SimulationError(
@@ -8140,9 +8171,16 @@ class Simulator:
                 + f"d{result.sens_fd_disagree_function}/d{result.sens_fd_function_param} "
                 f"is {result.sens_fd_function_floored:.6g} with every species stepped by "
                 "1.5e-8 of the state's largest concentration in the function's partials "
-                f"over the state, and {result.sens_fd_function_own_step:.6g} with the "
-                "species far below that scale stepped by 1.5e-8 of themselves, more than "
-                f"1e-4 of the largest function sensitivity in that column apart. {why}"
+                "over the state, and "
+                + others(
+                    result.sens_fd_function_floored,
+                    result.sens_fd_function_own_step,
+                    result.sens_fd_function_half_step,
+                    "the species far below that scale",
+                    "the species far below that scale and those at 0",
+                    "the largest function sensitivity in that column",
+                )
+                + f" {why}"
             )
 
     def _raise_if_not_an_isolated_root(
@@ -11159,16 +11197,23 @@ class SteadyStateResult:
         again at their own step, for the columns to be solved a second time
         with (issue #1002). Empty where there is none, or the Jacobian is in
         closed form.
+    sens_fd_half_step_species : list of str
+        The same for the columns taken again whole at half the floored step,
+        for a third solve: those of the species far below the state's scale,
+        and of species at 0. A secant across the step moves with it and a
+        slope does not, also in a row that a much larger species is in, which
+        the own step cannot read.
     sens_fd_disagree_species, sens_fd_disagree_param : str or None
-    sens_fd_floored, sens_fd_own_step : float
-        The entry of ``dY_ss/dp`` where the two solves are furthest apart, by
-        more than 1e-4 of the column's largest entry, and its two values: the
-        one with every species stepped against the state's scale, which is
-        what ``sensitivity`` holds, and the one with those species at their own
-        step. ``steady_state`` raises where there is one. None where the two
-        agree.
+    sens_fd_floored, sens_fd_own_step, sens_fd_half_step : float
+        The entry of ``dY_ss/dp`` furthest from the floored answer, by more
+        than 1e-4 of the column's largest entry, and its three values: the one
+        with every species stepped against the state's scale, which is what
+        ``sensitivity`` holds, the one with those species at their own step,
+        and the one with them at half the floored step (each the floored one
+        where that matrix has no column taken). ``steady_state`` raises where
+        there is one. None where they agree.
     sens_fd_disagree_function, sens_fd_function_param : str or None
-    sens_fd_function_floored, sens_fd_function_own_step : float
+    sens_fd_function_floored, sens_fd_function_own_step, sens_fd_function_half_step : float
         The same for a function sensitivity whose state-chain term was
         differenced (``sens_output_source`` not ``"codegen"``).
 
@@ -11250,14 +11295,17 @@ class SteadyStateResult:
         "sens_mask_held_species",
         "sens_mask_reader_species",
         "sens_fd_own_step_species",
+        "sens_fd_half_step_species",
         "sens_fd_disagree_species",
         "sens_fd_disagree_param",
         "sens_fd_floored",
         "sens_fd_own_step",
+        "sens_fd_half_step",
         "sens_fd_disagree_function",
         "sens_fd_function_param",
         "sens_fd_function_floored",
         "sens_fd_function_own_step",
+        "sens_fd_function_half_step",
         "_sensitivity",
         "_sens_param_names",
         "_observable_names",
@@ -11370,12 +11418,16 @@ class SteadyStateResult:
         self.sens_fd_own_step_species = [
             species[i] for i in getattr(core, "sens_fd_own_step_species", ())
         ]
+        self.sens_fd_half_step_species = [
+            species[i] for i in getattr(core, "sens_fd_half_step_species", ())
+        ]
         self.sens_fd_disagree_species = _named(
             species, getattr(core, "sens_fd_disagree_species", -1)
         )
         self.sens_fd_disagree_param = _named(columns, getattr(core, "sens_fd_disagree_param", -1))
         self.sens_fd_floored = getattr(core, "sens_fd_floored", 0.0)
         self.sens_fd_own_step = getattr(core, "sens_fd_own_step", 0.0)
+        self.sens_fd_half_step = getattr(core, "sens_fd_half_step", 0.0)
         self.sens_fd_disagree_function = _named(
             list(getattr(core, "raw_expression_names", ())),
             getattr(core, "sens_fd_disagree_function", -1),
@@ -11383,6 +11435,7 @@ class SteadyStateResult:
         self.sens_fd_function_param = _named(columns, getattr(core, "sens_fd_function_param", -1))
         self.sens_fd_function_floored = getattr(core, "sens_fd_function_floored", 0.0)
         self.sens_fd_function_own_step = getattr(core, "sens_fd_function_own_step", 0.0)
+        self.sens_fd_function_half_step = getattr(core, "sens_fd_function_half_step", 0.0)
 
         self._sensitivity: np.ndarray | None
         if core.n_sens_params > 0:
