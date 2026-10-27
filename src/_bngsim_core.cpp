@@ -3869,8 +3869,8 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("linear_solver", &bngsim::SteadyStateResult::linear_solver)
         .def_readonly("sens_jacobian_source", &bngsim::SteadyStateResult::sens_jacobian_source)
         .def_readonly("sens_dfdp_source", &bngsim::SteadyStateResult::sens_dfdp_source)
-        // Issue #75 — "codegen" / "mixed" / "finite-difference" for the d(func)/dp
-        // block, so a caller can tell the compiled chain rule from the fallback.
+        // Issues #75, #1002 — "codegen" / "partial" / "none": how much of the
+        // d(func)/dp block the compiled chain rule answered (the rest is NaN).
         .def_readonly("sens_output_source", &bngsim::SteadyStateResult::sens_output_source)
         .def_readonly("sens_jacobian_rcond", &bngsim::SteadyStateResult::sens_jacobian_rcond)
         // Issue #995 — whether the steady state is an isolated root of the
@@ -3920,15 +3920,6 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readonly("sens_fd_floored", &bngsim::SteadyStateResult::sens_fd_floored)
         .def_readonly("sens_fd_own_step", &bngsim::SteadyStateResult::sens_fd_own_step)
         .def_readonly("sens_fd_half_step", &bngsim::SteadyStateResult::sens_fd_half_step)
-        .def_readonly("sens_fd_disagree_function",
-                      &bngsim::SteadyStateResult::sens_fd_disagree_function)
-        .def_readonly("sens_fd_function_param", &bngsim::SteadyStateResult::sens_fd_function_param)
-        .def_readonly("sens_fd_function_floored",
-                      &bngsim::SteadyStateResult::sens_fd_function_floored)
-        .def_readonly("sens_fd_function_own_step",
-                      &bngsim::SteadyStateResult::sens_fd_function_own_step)
-        .def_readonly("sens_fd_function_half_step",
-                      &bngsim::SteadyStateResult::sens_fd_function_half_step)
         .def_property_readonly(
             "sensitivity_data",
             [](const bngsim::SteadyStateResult &r) {

@@ -15,9 +15,11 @@ sum with something much larger, ``C·((K + X) − K)``, answers in steps of that
 sum's last bit, which the own step does not see. Nothing in a row tells the two
 apart in every case, so the columns are solved with both matrices. Where they
 agree the floored one's are returned, as they were; where they are further
-apart than 1e-4 of a column's largest, they are refused. The same holds of the
-state-chain term of a function's sensitivity, which is differenced at the
-default settings too.
+apart than 1e-4 of a column's largest, they are refused. The state-chain term
+of a function's sensitivity was differenced at the default settings too, and
+held to the same check; it is not differenced at all now (Step 2 of the plan
+on #1002): a function the compiled chain rule has no derivative for is
+refused by name, as after a run.
 
 The own step reads a row only where its rounding over the step is under the
 term, and a row that a much larger species is in it does not read: there a
@@ -107,6 +109,15 @@ def _first_quotient(model, y, j):
 def _steady(model, **kw):
     sim = bngsim.Simulator(model, method="ode", **kw)
     return sim.steady_state(sensitivity_params=["s"])
+
+
+def _refused_by_name(out, name, construct):
+    """``output_sensitivities`` refuses the function by its name and the
+    construct the compiled chain rule has no derivative for (issue #1002)."""
+    with pytest.raises(ValueError, match=rf"'expression:{name}' has no steady-state") as err:
+        out.output_sensitivities([name])
+    assert f"uses unsupported construct: {construct}" in str(err.value)
+    assert "issue #1002" in str(err.value)
 
 
 # ─── The steady state's columns ──────────────────────────────────────────────
@@ -282,24 +293,28 @@ def test_a_grain_row_beside_a_column_both_steps_agree_on_is_returned(tmp_path):
 # ─── A function's sensitivity ────────────────────────────────────────────────
 
 
-def test_a_function_the_step_decides_is_refused_at_the_default_settings(tmp_path):
+@pytest.mark.parametrize("big", [1e4, 1e8])
+def test_a_declined_function_is_refused_by_name(tmp_path, big):
     """``xsq = abs(X)·X`` has no compiled derivative, so its sensitivity at a
-    steady state is assembled from a differenced ``∂xsq/∂X``, with the
+    steady state was assembled from a differenced ``∂xsq/∂X``, with the
     closed-form Jacobian too. d(xsq)/ds = 2·X*·dX*/ds; beside G = 1e8 it
-    came back 85% off at the default settings."""
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        _steady(_model(tmp_path, 1e8, functions=("xsq",)))
-    assert "dxsq/ds" in str(err.value)
+    came back 85% off at the default settings, and #1100 refused the solve.
+    Beside G = 1e4 the quotient was right to 8.5e-5, and was returned; a
+    quotient does not tell the two apart. Neither is differenced now: the
+    solve returns dY_ss/dp, and xsq is refused by name."""
+    out = _steady(_model(tmp_path, big, functions=("xsq",)))
+    assert float(np.asarray(out.sensitivity)[0, 0]) == pytest.approx(DX_DS, rel=1e-7)
+    assert out.sens_output_source == "none"
+    _refused_by_name(out, "xsq", "abs()")
 
 
 @pytest.mark.parametrize("functions", [("xsq", "big"), ("big", "xsq")])
-def test_a_compiled_function_does_not_hide_a_declined_one_the_step_decides(tmp_path, functions):
+def test_a_compiled_function_beside_a_declined_one_keeps_its_row(tmp_path, functions):
     """``big = 1e8 + X`` has a compiled derivative and ``xsq = abs(X)·X`` has
-    not. The own step moves ``1e8 + X`` by its last bit or not at all, so
-    that row is not taken; taken whole or not at all, X's column was not,
-    and d(xsq)/ds came back 1.17 for 0.633 (85% off) with no error beside
-    G = 1e8, where alone it is refused. Each function's state-chain term is
-    its own sum, and a row another function vetoes is no reason to skip it."""
+    not. d(xsq)/ds came back 1.17 for 0.633 (85% off) with no error beside
+    G = 1e8 and ``big`` (#1100's review), and both were refused with the
+    solve after it. ``big`` is returned now, d(big)/ds = dX*/ds, and ``xsq``
+    is refused by name, in either order."""
     text = NET.format(s=S, k1=K1, k2=K2, kd=KD, big=1e8)
     lines = {"xsq": "    1 xsq() abs(Xo)*Xo\n", "big": "    2 big() 1e8+Xo\n"}
     block = "".join(lines[name] for name in functions)
@@ -307,24 +322,18 @@ def test_a_compiled_function_does_not_hide_a_declined_one_the_step_decides(tmp_p
     path = tmp_path / "mixed.net"
     path.write_text(text)
     model = bngsim.Model.from_net(path)
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        _steady(model)
-    assert "dxsq/ds" in str(err.value)
-
-
-def test_a_function_both_steps_agree_on_is_returned(tmp_path):
-    """Control. At G = 1e4 the two partials are 8.5e-5 of each other."""
-    out = _steady(_model(tmp_path, 1e4, functions=("xsq",)))
-    assert out.sens_fd_disagree_function is None
-    got = float(np.asarray(out.output_sensitivities(["xsq"])).ravel()[0])
-    assert got == pytest.approx(2 * X_SS * DX_DS, rel=1e-4)
+    out = _steady(model)
+    assert out.sens_output_source == "partial"
+    got = float(np.asarray(out.output_sensitivities(["big"])).ravel()[0])
+    assert got == pytest.approx(DX_DS, rel=1e-7)
+    _refused_by_name(out, "xsq", "abs()")
 
 
 def test_a_function_linear_in_a_small_species_is_returned(tmp_path):
-    """Control. ``weak = 1e-3·X``: d(weak)/ds = 1e-3·dX*/ds, whatever the
-    step."""
+    """Control. ``weak = 1e-3·X`` has a compiled derivative: d(weak)/ds =
+    1e-3·dX*/ds."""
     out = _steady(_model(tmp_path, 1e8, functions=("weak",)))
-    assert out.sens_fd_disagree_function is None
+    assert out.sens_output_source == "codegen"
     got = float(np.asarray(out.output_sensitivities(["weak"])).ravel()[0])
     assert got == pytest.approx(1e-3 * DX_DS, rel=1e-7)
 
@@ -466,24 +475,17 @@ def test_curvature_both_steps_agree_on_is_returned(tmp_path):
     assert out.sens_fd_half_step_species == ["X()"]
 
 
-def test_curvature_in_a_declined_function_over_a_larger_species_is_refused(tmp_path):
+@pytest.mark.parametrize("big", [1e4, 1e8])
+def test_curvature_in_a_declined_function_over_a_larger_species_is_refused(tmp_path, big):
     """``gx = abs(X)·X + G`` has no compiled derivative, so its state-chain
-    term is differenced at the default settings. d(gx)/ds = 2·X*·dX*/ds +
+    term was differenced at the default settings. d(gx)/ds = 2·X*·dX*/ds +
     dG*/ds = 117.91; beside G = 1e8 it came back 125.01 (6% off) with no
-    error, the own step reading nothing of a function at 1e8."""
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        _steady(_second_order(tmp_path, 1e8, functions=True))
-    msg = str(err.value)
-    assert "dgx/ds is 125.01" in msg
-    assert "stepped by half the first step" in msg
-
-
-def test_curvature_in_a_declined_function_both_steps_agree_on_is_returned(tmp_path):
-    """Control. At G = 1e4 the two totals are 3e-6 of each other."""
-    out = _steady(_second_order(tmp_path, 1e4, functions=True))
-    assert out.sens_fd_disagree_function is None
-    got = float(np.asarray(out.output_sensitivities(["gx"])).ravel()[0])
-    assert got == pytest.approx(2 * SO_DG_DS, rel=1e-5)
+    error, the own step reading nothing of a function at 1e8, and #1294
+    refused the solve. At G = 1e4 it was right to 3e-6 and returned. It is
+    refused by name at both now, and dG*/ds comes from the closed form."""
+    out = _steady(_second_order(tmp_path, big, functions=True))
+    assert float(np.asarray(out.sensitivity)[1, 0]) == pytest.approx(SO_DG_DS, rel=1e-7)
+    _refused_by_name(out, "gx", "abs()")
 
 
 @pytest.mark.parametrize("big", [1e4, 1e8])
@@ -521,19 +523,14 @@ def test_a_species_at_0_is_returned_where_the_step_does_not_decide(tmp_path, big
 
 
 def test_a_declined_function_of_a_species_at_0_is_refused(tmp_path):
-    """``xsq = abs(X)·X`` is differenced; with s = 0, X* = 0 and
+    """``xsq = abs(X)·X`` was differenced; with s = 0, X* = 0 and
     d(xsq)/ds = 2·|X*|·dX*/ds = 0. Its partial across the floored step is
     h for 0, so d(xsq)/ds came back 7.1e-8, the step's alone, at the default
-    settings beside G = 1, with no error. At half the step it is half that."""
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        _steady(_model(tmp_path, 1.0, functions=("xsq",), s=0.0))
-    msg = str(err.value)
-    assert "dxsq/ds is " + format(SQRT_EPS / K1, ".6g") in msg
-    assert (
-        format(0.5 * SQRT_EPS / K1, ".6g")
-        + " with the species far below that scale and those at 0"
-        in msg
-    )
+    settings beside G = 1, with no error, and #1294 refused the solve. The
+    solve returns dX*/ds = 1/k1 now, and xsq is refused by name."""
+    out = _steady(_model(tmp_path, 1.0, functions=("xsq",), s=0.0))
+    assert float(np.asarray(out.sensitivity)[0, 0]) == pytest.approx(1.0 / K1, rel=1e-7)
+    _refused_by_name(out, "xsq", "abs()")
 
 
 NAN_WINDOW = """begin parameters
@@ -583,9 +580,10 @@ def test_a_half_step_answer_that_is_no_number_is_refused(tmp_path):
 @pytest.mark.parametrize("kw", [{}, {"jacobian": "fd"}])
 def test_a_half_step_column_that_is_no_number_is_not_read_where_its_entry_is_0(tmp_path, kw):
     """Control. Asked for sg, which moves neither X nor E, the answer does
-    not read X's column, nor r's partial over X: dG*/dsg = 1 and the rest 0
-    are returned, as on main, with the differenced Jacobian and with the
-    default one (where only r's partial is differenced)."""
+    not read X's column: dG*/dsg = 1 and the rest 0 are returned, as on main,
+    with the differenced Jacobian and with the default one. ``r`` reads an
+    ``if()``, which has no compiled derivative, and is refused by name (it
+    was differenced, and 0 here)."""
     path = tmp_path / "nan_window.net"
     path.write_text(NAN_WINDOW)
     sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", **kw)
@@ -594,8 +592,7 @@ def test_a_half_step_column_that_is_no_number_is_not_read_where_its_entry_is_0(t
     assert sens[0, 0] == 0.0
     assert sens[1, 0] == 0.0
     assert sens[2, 0] == pytest.approx(1.0, rel=1e-12)
-    got = float(np.asarray(out.output_sensitivities(["r"])).ravel()[0])
-    assert got == 0.0
+    _refused_by_name(out, "r", "if() conditional")
 
 
 # SECOND_ORDER with Z, made at kz = 1e-30 and removed at 1, which makes X at
@@ -627,14 +624,14 @@ def test_a_column_of_1e_29_is_held_to_the_same_check(tmp_path):
     assert "stepped by half the first step" in str(err.value)
 
 
-def test_a_function_column_of_1e_28_is_held_to_the_same_check(tmp_path):
+def test_a_function_column_of_1e_28_is_refused_by_name(tmp_path):
     """``gx = abs(X)·X + G`` beside G at 1e8: d(gx)/dq is 1.2e-28, and the
-    floored partial over X reads it 6% high at the default settings, where
-    main returned it with no error."""
+    floored partial over X read it 6% high at the default settings, where
+    main returned it with no error (and #1294 refused the solve). It is not
+    differenced now, whatever its size."""
     sim = bngsim.Simulator(_tiny_column(tmp_path, True), method="ode")
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        sim.steady_state(sensitivity_params=["q"])
-    assert "dgx/dq is " in str(err.value)
+    out = sim.steady_state(sensitivity_params=["q"])
+    _refused_by_name(out, "gx", "abs()")
 
 
 @pytest.mark.parametrize("s", [1e-12, 1e-9])
@@ -727,16 +724,15 @@ def test_a_species_the_mask_leaves_out_is_stepped_again_where_its_column_is_read
 
 
 def test_a_function_whose_half_step_partial_is_no_number_is_refused(tmp_path):
-    """At the default settings r's partial over X is differenced, and it is
-    no number at half the step, where dX*/ds is not 0: refused, as the
-    species' columns are with ``jacobian="fd"``. (d(r)/ds is 0 here, and
-    main returns it; a partial that is no number confirms nothing.)"""
+    """At the default settings r's partial over X was differenced, and it is
+    no number at half the step, where dX*/ds is not 0: #1294 refused the
+    solve. It is not differenced now: the solve returns dX*/ds = 1/k1, and
+    ``r`` is refused by name."""
     path = tmp_path / "nan_window.net"
     path.write_text(NAN_WINDOW)
-    with pytest.raises(bngsim.SimulationError, match=r"function sensitivities") as err:
-        _steady(bngsim.Model.from_net(path))
-    assert "dr/ds is 0 " in str(err.value)
-    assert "nan with the species far below that scale and those at 0" in str(err.value)
+    out = _steady(bngsim.Model.from_net(path))
+    assert float(np.asarray(out.sensitivity)[0, 0]) == pytest.approx(1.0 / K1, rel=1e-7)
+    _refused_by_name(out, "r", "if() conditional")
 
 
 def test_model_jacobian_warns_where_the_half_step_is_no_number(tmp_path, monkeypatch):

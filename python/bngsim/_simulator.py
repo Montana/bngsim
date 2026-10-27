@@ -7756,16 +7756,19 @@ class Simulator:
         differences that factor, with a warning, is Michaelis-Menten and the
         Functional laws carrying a condition or a non-smooth builtin.
 
-        The expression block ``d(func)/dp`` prefers compiled code the same way
-        (issue #75): it is evaluated by ``bngsim_codegen_output_sens``, the GH #198
-        chain rule a CVODES forward-sensitivity ``run()`` already uses, fed the
-        solved ``dY_ss/dp`` columns — so a steady-state gradient and a long-run
-        one now come from the same evaluator. Finite differences remain the
-        per-function fallback for what that evaluator declines (a table function,
-        a non-smooth construct, a function that reads ``rateOf``);
-        ``ss.sens_output_source`` reports ``"codegen"``, ``"mixed"``, or
-        ``"finite-difference"``. The *observable* block is an exact linear
-        projection through the group factors and never differences anything.
+        The expression block ``d(func)/dp`` is compiled code too (issue #75): it
+        is evaluated by ``bngsim_codegen_output_sens``, the GH #198 chain rule a
+        CVODES forward-sensitivity ``run()`` already uses, fed the solved
+        ``dY_ss/dp`` columns — so a steady-state gradient and a long-run one come
+        from the same evaluator. A function that evaluator declines (a table
+        function, a non-smooth construct such as ``if()``, ``abs()`` or
+        ``max()``, a function that reads ``rateOf``) has no derivative here, as
+        after a run: its row is ``NaN``, and ``ss.output_sensitivities`` refuses
+        it by name, with the reason. It is not differenced: a difference quotient
+        of a function over the state can be wrong with nothing to show it (issue
+        #1002). ``ss.sens_output_source`` reports ``"codegen"``, ``"partial"``,
+        or ``"none"``. The *observable* block is an exact linear projection
+        through the group factors and never differences anything.
         """
         if self._method != "ode":
             raise ValueError(
@@ -7888,6 +7891,7 @@ class Simulator:
             raise SimulationError(f"Steady-state computation failed: {e}") from e
 
         result = SteadyStateResult(core_result)
+        self._note_ss_unsupported(result)
         self._apply_ss_ar_report_map(result)
         self._apply_ss_ar_sensitivity_map(result)
         self._apply_ss_varvol_report_maps(result)
@@ -8089,8 +8093,8 @@ class Simulator:
 
     @staticmethod
     def _raise_if_the_step_decides(result: SteadyStateResult) -> None:
-        """Refuse ``dY_ss/dp``, and a function's ``d/dp``, where a difference
-        quotient of the state gives two answers at two steps (issue #1002).
+        """Refuse ``dY_ss/dp`` where a difference quotient of the state gives
+        two answers at two steps (issue #1002).
 
         A species of the Jacobian's difference quotient is stepped by 1.5e-8 of
         the state's largest concentration, which keeps a small species out of
@@ -8115,6 +8119,10 @@ class Simulator:
         step, whole columns, and refused where that answer is further than
         that from the first: a secant across the step moves with it, and a
         slope does not.
+
+        A function's ``d/dp`` is not differenced at all (issue #1002): its row
+        is NaN where the compiled chain rule has no derivative for it, and
+        :meth:`SteadyStateResult.output_sensitivities` refuses it by name.
         """
         time_course = (
             "a time course with forward sensitivities run to the steady state, "
@@ -8162,23 +8170,6 @@ class Simulator:
                     listed(result.sens_fd_own_step_species),
                     listed(result.sens_fd_half_step_species),
                     "the column's largest entry",
-                )
-                + f" {why}"
-            )
-        if result.sens_fd_disagree_function is not None:
-            raise SimulationError(
-                opening.format(what="the function sensitivities")
-                + f"d{result.sens_fd_disagree_function}/d{result.sens_fd_function_param} "
-                f"is {result.sens_fd_function_floored:.6g} with every species stepped by "
-                "1.5e-8 of the state's largest concentration in the function's partials "
-                "over the state, and "
-                + others(
-                    result.sens_fd_function_floored,
-                    result.sens_fd_function_own_step,
-                    result.sens_fd_function_half_step,
-                    "the species far below that scale",
-                    "the species far below that scale and those at 0",
-                    "the largest function sensitivity in that column",
                 )
                 + f" {why}"
             )
@@ -8685,6 +8676,24 @@ class Simulator:
             return mask_selector
         return keep
 
+    def _note_ss_unsupported(self, result: SteadyStateResult) -> None:
+        """Record on *result* why the compiled chain rule has no derivative for
+        each function whose row it left ``NaN`` (issue #1002).
+
+        The reasons are the compiled code's own (:meth:`_expression_sens_support`),
+        the ones ``Result.output_sensitivities`` refuses a time course's
+        function by. Read only where a row was left: a block the chain rule
+        answered whole needs none.
+        """
+        if result.sens_output_source not in ("partial", "none"):
+            return
+        names = set(result.expression_names)
+        result._expression_sens_unsupported = {
+            name: reason
+            for name, reason in self._expression_sens_support().items()
+            if reason is not None and name in names
+        }
+
     def _apply_ss_ar_report_map(
         self, result: SteadyStateResult, model: Model | None = None
     ) -> None:
@@ -8787,6 +8796,7 @@ class Simulator:
                 block, k = result._observable_sensitivity, obs_idx[src]
             elif kind == "expression" and src in expr_idx:
                 block, k = result._expression_sensitivity, expr_idx[src]
+                result._rule_target_expressions[name] = src
             else:
                 continue
             if block is None or block.size == 0:
@@ -8856,6 +8866,7 @@ class Simulator:
             )
 
             needed_masked: set[str] = set()
+            unsupported_sizes: set[str] = set()
 
             def _no_row(name: str) -> str:
                 # Why the solve returned no row for this species.
@@ -8874,19 +8885,35 @@ class Simulator:
                 k = expr_idx.get(c, len(size_kept))
                 if s in sp_idx and kept[sp_idx[s]] and k < len(size_kept) and not size_kept[k]:
                     read = missing[k] if k < len(missing) else None
-                    short[s] = (
-                        f"its size {c} reads {_no_row(read)}"
-                        if read is not None
-                        else f"the derivative of its size {c} is not a number at this state"
-                    )
+                    unsupported = result._expression_sens_unsupported.get(c)
+                    if unsupported is not None:
+                        unsupported_sizes.add(c)
+                        short[s] = (
+                            f"its size {c} has no steady-state derivative: {unsupported} "
+                            "(issue #1002)"
+                        )
+                    elif read is not None:
+                        short[s] = f"its size {c} reads {_no_row(read)}"
+                    else:
+                        short[s] = f"the derivative of its size {c} is not a number at this state"
             if short:
                 causes = "; ".join(f"for {s}, {short[s]}" for s in sorted(short))
-                remedy = (
-                    f"Keep {sorted(needed_masked)} in the mask, or leave these species out as well"
-                    if needed_masked
-                    else "Take these rows from a time course with forward sensitivities run "
-                    "to the steady state"
-                )
+                if needed_masked:
+                    remedy = (
+                        f"Keep {sorted(needed_masked)} in the mask, or leave these species out "
+                        "as well"
+                    )
+                elif unsupported_sizes:
+                    remedy = (
+                        "A steady state does not difference a function's partials; a rule for "
+                        f"{', '.join(sorted(unsupported_sizes))} written without that construct "
+                        "has a derivative"
+                    )
+                else:
+                    remedy = (
+                        "Take these rows from a time course with forward sensitivities run "
+                        "to the steady state"
+                    )
                 raise SimulationError(
                     f"Steady-state dY_ss/dp of {sorted(short)}: each is an amount reported "
                     "as a concentration in a compartment whose size changes, so its row "
@@ -11068,15 +11095,18 @@ class SteadyStateResult:
         were unconditionally finite-differenced before it, and the result gave
         no way to tell.
     sens_output_source : str
-        How the expression block ``d(func)/dp`` was built (issue #75):
-        ``"codegen"`` (the compiled ``bngsim_codegen_output_sens`` chain rule —
-        the same evaluator a CVODES forward-sensitivity ``run()`` uses — answered
-        every function), ``"finite-difference"`` (it answered none: no compiled
-        artifact, or the codegen declined the whole model), or ``"mixed"`` (it
-        answered some and the rest were differenced, e.g. a table function).
-        ``""`` when no sensitivity was requested or the model has no global
-        functions. The *observable* block is an exact linear projection either
-        way and is not covered by this field.
+        How much of the expression block ``d(func)/dp`` the compiled
+        ``bngsim_codegen_output_sens`` chain rule answered (issues #75, #1002) —
+        the same evaluator a CVODES forward-sensitivity ``run()`` uses:
+        ``"codegen"`` (every function), ``"partial"`` (some), or ``"none"`` (not
+        one: each declined, no compiled evaluator, or the codegen declined the
+        whole model). A row it
+        does not answer is ``NaN``, and :meth:`output_sensitivities` refuses it
+        by name, with the reason, as it does after a run: a function's partials
+        are not differenced at a steady state (issue #1002). ``""`` when no
+        sensitivity was requested or the model has no global functions. The
+        *observable* block is an exact linear projection either way and is not
+        covered by this field.
     sens_jacobian_rcond : float
         ``min|U_jj| / max|U_jj|`` from the LU of the (reduced) Jacobian that was
         inverted — how close to singular the sensitivity system was.
@@ -11212,10 +11242,6 @@ class SteadyStateResult:
         and the one with them at half the floored step (each the floored one
         where that matrix has no column taken). ``steady_state`` raises where
         there is one. None where they agree.
-    sens_fd_disagree_function, sens_fd_function_param : str or None
-    sens_fd_function_floored, sens_fd_function_own_step, sens_fd_function_half_step : float
-        The same for a function sensitivity whose state-chain term was
-        differenced (``sens_output_source`` not ``"codegen"``).
 
     Notes
     -----
@@ -11301,11 +11327,6 @@ class SteadyStateResult:
         "sens_fd_floored",
         "sens_fd_own_step",
         "sens_fd_half_step",
-        "sens_fd_disagree_function",
-        "sens_fd_function_param",
-        "sens_fd_function_floored",
-        "sens_fd_function_own_step",
-        "sens_fd_function_half_step",
         "_sensitivity",
         "_sens_param_names",
         "_observable_names",
@@ -11313,9 +11334,11 @@ class SteadyStateResult:
         "_observable_sensitivity",
         "_expression_sensitivity",
         "_expression_sens_missing",
+        "_expression_sens_unsupported",
         "_observable_values",
         "_expression_values",
         "_rule_target_species",
+        "_rule_target_expressions",
     )
 
     def __init__(self, core) -> None:
@@ -11341,8 +11364,14 @@ class SteadyStateResult:
         self.n_residual_species = getattr(core, "n_residual_species", len(self._species_names))
         self.excluded_species = list(getattr(core, "excluded_species", []))
         # The assignment-rule targets among them, which the solve leaves out by
-        # itself (GH #247); Simulator._apply_ss_ar_sensitivity_map fills it in.
+        # itself (GH #247); Simulator._apply_ss_ar_sensitivity_map fills it in,
+        # and the expression each one's rule is, where it is one.
         self._rule_target_species: list[int] = []
+        self._rule_target_expressions: dict[str, str] = {}
+        # Issue #1002 — why the compiled chain rule has no derivative for a
+        # function, by name, where it has none; Simulator._note_ss_unsupported
+        # fills it in.
+        self._expression_sens_unsupported: dict[str, str] = {}
         self.unconverged_pure_sinks = list(getattr(core, "unconverged_pure_sinks", []))
         # Issue #78 — the linear-stability verdict on a Newton root, and how many
         # candidate roots were thrown out for failing it.
@@ -11428,14 +11457,6 @@ class SteadyStateResult:
         self.sens_fd_floored = getattr(core, "sens_fd_floored", 0.0)
         self.sens_fd_own_step = getattr(core, "sens_fd_own_step", 0.0)
         self.sens_fd_half_step = getattr(core, "sens_fd_half_step", 0.0)
-        self.sens_fd_disagree_function = _named(
-            list(getattr(core, "raw_expression_names", ())),
-            getattr(core, "sens_fd_disagree_function", -1),
-        )
-        self.sens_fd_function_param = _named(columns, getattr(core, "sens_fd_function_param", -1))
-        self.sens_fd_function_floored = getattr(core, "sens_fd_function_floored", 0.0)
-        self.sens_fd_function_own_step = getattr(core, "sens_fd_function_own_step", 0.0)
-        self.sens_fd_function_half_step = getattr(core, "sens_fd_function_half_step", 0.0)
 
         self._sensitivity: np.ndarray | None
         if core.n_sens_params > 0:
@@ -11671,6 +11692,27 @@ class SteadyStateResult:
                     f"derivative: its value at the steady state is {value}, which is "
                     "not finite."
                 )
+        # Issue #1002: a function the compiled chain rule has no derivative for
+        # is not differenced here, and is refused as Result.output_sensitivities
+        # refuses it after a run, by the same reason. So is a rule target whose
+        # rule is one.
+        rule = meta["name"] if kind == "expression" else None
+        if kind == "species":
+            rule = self._rule_target_expressions.get(meta["name"])
+        unsupported = self._expression_sens_unsupported.get(rule) if rule else None
+        if unsupported is None and rule and self.sens_output_source == "none":
+            # The compiled code the solve had carries no chain rule at all (a
+            # rebuild for it failed, and the artifact before it was kept).
+            unsupported = "has no chain rule in the compiled code it was solved with"
+        if unsupported is not None:
+            whose = f"its rule {rule!r}" if kind == "species" else "it"
+            return (
+                f"output_sensitivities: {meta['selector']!r} has no steady-state "
+                f"derivative: {whose} {unsupported}. The compiled output-sensitivity "
+                "code has no derivative for it, and a steady state does not difference "
+                "one: a difference quotient of a function over the state can be wrong "
+                "with nothing to show it (issue #1002)."
+            )
         masked = self._caller_masked_species()
         if kind == "species":
             named = [meta["name"]] if meta["name"] in masked else []
