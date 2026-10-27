@@ -274,6 +274,13 @@ def main(argv=None) -> int:
         specs, _worker, workers=args.workers, timeout_of=lambda s: s["timeout"], on_done=on_done
     )
     stamp = versions.stamp(REFERENCE_ENGINE)
+    # #1309: a model whose answer is contested, by its stable row or by a
+    # DIFF whose third arms split, listed by name.
+    contested = sorted(
+        spec["job"]["model_id"]
+        for spec, r in zip(specs, raw, strict=False)
+        if D.contested(r.get("rows") or {})
+    )
     results = [x for spec, r in zip(specs, raw, strict=False) for x in to_results(spec, r, stamp)]
     meta = {
         "suite": "differential",
@@ -282,6 +289,7 @@ def main(argv=None) -> int:
         "git_rev": git_rev(str(HERE)),
         "versions": stamp,
         "tally": tally(r.outcome for r in results),
+        "contested": contested,
         "n_jobs": len(results),
         "n_models": len(specs),
         "elapsed_sec": round(time.perf_counter() - t0, 2),
@@ -299,6 +307,8 @@ def main(argv=None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     write_report(out, results, meta=meta)
     print(f"report: {out}  {meta['tally']}")
+    if contested:
+        print(f"contested ({len(contested)}): {', '.join(contested)}")
     return 0
 
 

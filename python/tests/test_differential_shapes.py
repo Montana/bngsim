@@ -465,3 +465,114 @@ def test_a_state_the_rule_cannot_reach_is_left_out_not_an_exception(monkeypatch)
     monkeypatch.setattr(bngsim.Simulator, "run", fails_on_one_interval)
     v = D.check_sparsity(base)
     assert v.status == "pass" and "at 1 states" in v.note, v
+
+
+# ── Attribution and branch stability (#1309) ──
+
+
+def _verdict(ref, path):
+    return D.Verdict("diff", 1.0, "", ref_x=np.asarray(ref, float), path_x=np.asarray(path, float))
+
+
+def test_each_arm_names_the_side_it_takes():
+    """An arm on the reference's side, one on the path's, one between: a
+    split, which marks the model contested."""
+    base = _base("derived-log10")
+    ref = base.x
+    path = ref * 1.5
+    v = _verdict(ref, path)
+    a = D.attribute(
+        base, v, {"tighter": path.copy(), "dense": ref.copy(), "roadrunner": ref * 1.25}
+    )
+    assert a["verdict"] == "split"
+    assert a["arms"]["tighter"]["side"] == "path"
+    assert a["arms"]["dense"]["side"] == "reference"
+    assert a["arms"]["roadrunner"]["side"] == "neither"
+    assert D.contested({"klu_vs_dense": {"status": "diff", "extra": {"attribution": a}}})
+
+
+def test_arms_that_agree_attribute_the_diff_to_one_side():
+    base = _base("derived-log10")
+    v = _verdict(base.x, base.x * 1.5)
+    a = D.attribute(base, v, {"tighter": base.x.copy(), "dense": base.x.copy()})
+    assert a["verdict"] == "reference"
+    assert not D.contested({"klu_vs_dense": {"status": "diff", "extra": {"attribution": a}}})
+
+
+def test_a_diff_is_attributed_by_real_arms(monkeypatch):
+    """check_all attributes every DIFF: here a planted cc_vs_interp that moves
+    the path by 50%, which the real arms (the base at a hundredfold tighter
+    tolerance, the other solver) all put on the reference's side."""
+    base = _base("derived-log10")
+
+    def planted(b):
+        return b.compare(b.x * 1.5, "planted: ")
+
+    monkeypatch.setattr(D, "check_cc_vs_interp", planted)
+    v = D.check_all(SHAPES["derived-log10"], None, ("cc_vs_interp",))["cc_vs_interp"]
+    assert v.status == "diff"
+    a = v.extra["attribution"]
+    assert a["verdict"] == "reference", a
+    assert {"tighter"} <= set(a["arms"]), a
+    assert base.x.shape == v.path_x.shape
+
+
+def test_an_answer_that_jumps_with_the_tolerance_is_contested(monkeypatch):
+    """A branch that flips at rtol x2: check_stable reads DIFF, and the model
+    is contested."""
+    base = _base("equality-dwell")
+    real = D.run
+
+    def flips(job, **kw):
+        result, sim = real(job, **kw)
+        if job.rtol > base.job.rtol * 1.5:
+            result = type(
+                "R",
+                (),
+                {
+                    "species": np.asarray(result.species) * 1.5,
+                    "species_names": result.species_names,
+                },
+            )()
+        return result, sim
+
+    monkeypatch.setattr(D, "run", flips)
+    v = D.check_stable(base)
+    assert v.status == "diff" and "rtol x2" in v.note, v
+    assert D.contested({"stable": {"status": "diff", "extra": v.extra}})
+
+
+def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
+    base = _base("equality-dwell")
+    real = D.run
+
+    def flips(job, **kw):
+        result, sim = real(job, **kw)
+        if job.n_points == base.job.n_points + 1:
+            x = np.asarray(result.species).copy()
+            x[-1] *= 1.5
+            result = type("R", (), {"species": x, "species_names": result.species_names})()
+        return result, sim
+
+    monkeypatch.setattr(D, "run", flips)
+    v = D.check_stable(base)
+    assert v.status == "diff" and "n_points+1" in v.note, v
+
+
+_B338 = Path("parity_checks/rr_parity/models/BIOMD0000000338/BIOMD0000000338_url.xml")
+
+
+@pytest.mark.skipif(
+    not _B338.exists(), reason="rr_parity corpus model BIOMD0000000338 not present"
+)
+@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
+def test_1304s_model_reads_contested_with_each_arms_side_named():
+    """#1304: KLU reads Fg 311 at t = 2 and dense 0.73. The base runs on KLU,
+    so the KLU route at a hundredfold tighter tolerance sides with KLU, and
+    the dense solver with dense: split, contested."""
+    job = D.Job("BIOMD0000000338", _B338, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
+    v = D.check_all(job, None, ("klu_vs_dense",))["klu_vs_dense"]
+    assert v.status == "diff", v
+    a = v.extra["attribution"]
+    assert a["verdict"] == "split", a
+    assert a["arms"]["tighter"]["side"] == "path" and a["arms"]["dense"]["side"] == "reference", a
