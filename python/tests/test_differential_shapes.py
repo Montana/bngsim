@@ -634,9 +634,9 @@ _NF_XML = _ROOT / "tests" / "data" / "nfsim" / "simple_system.xml"
 
 def _nf_job(n_rep=10):
     if not _NF_XML.is_file():
-        pytest.skip(f"{_NF_XML} is not in this tree")
+        pytest.skip(f"test data not found: {_NF_XML}")
     if not bngsim._bngsim_core.HAS_RULEMONKEY:
-        pytest.skip("this build has no RuleMonkey")
+        pytest.skip("RuleMonkey not compiled in")
     sim = {"block_same_complex_binding": True}
     return D.Job("simple_system", _NF_XML, 0.0, 10.0, 11, sim=sim, method="nf", n_rep=n_rep)
 
