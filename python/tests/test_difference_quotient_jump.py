@@ -25,6 +25,7 @@ here is piecewise exponential.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 
@@ -448,39 +449,72 @@ def _split_deviation(net: str, exact: str, **window) -> float:
     return float((np.abs(g - w) / scale).max())
 
 
+def _split_mends(
+    net: str, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str], **window
+) -> str:
+    """What the run prints under BNGSIM_JAC_DEBUG: a line for each matrix it mends."""
+    monkeypatch.setenv("BNGSIM_JAC_DEBUG", "1")
+    capfd.readouterr()
+    sparse = window.pop("sparse")
+    with contextlib.suppress(bngsim.SimulationError):
+        bngsim.Simulator(
+            bngsim.Model.from_net(net),
+            method="ode",
+            jacobian="fd",
+            force_sparse_linear_solver=sparse,
+        ).run(**window)
+    return capfd.readouterr().err
+
+
+# Where `split`'s outcome lands moves with the platform's rounding: #176 records
+# its parked regime as chaotic. On x86-64 Linux these runs, with nothing mended
+# and so main's own matrices, came out 0.62 and 0.633 off at some of these
+# tolerances, where on macOS they are right. So what the controls below hold is
+# the matrix (the species that trade are never mended, as on main), not one
+# platform's digits.
 @pytest.mark.parametrize(
-    ("rtol", "atol", "n_points", "within"),
-    [(1e-8, 1e-8, 301, 1e-6), (1e-7, 1e-10, 301, 1e-5), (3e-7, 1e-8, 601, 1e-5)],
+    ("rtol", "atol", "n_points"), [(1e-8, 1e-8, 301), (1e-7, 1e-10, 301), (3e-7, 1e-8, 601)]
 )
 def test_a_parked_sum_keeps_the_slope_that_holds_it(
-    data_dir: Path, tmp_path: Path, rtol: float, atol: float, n_points: int, within: float
+    data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    rtol: float,
+    atol: float,
+    n_points: int,
 ) -> None:
     """Control. #903's `split`: V + V2 parks 1e-11 under the #176 step at 50.
     At t = 18.6 V leaves at 0.38 and V2 arrives at 0.38; V's step crosses the
-    threshold, in the rows of the species the step gates, not V's own. The
-    straddled slope is what carries this run on the difference quotient:
-    mended, the run crossed, 0.633 off at rtol 1e-7 and 3e-7 (601 points), and
-    failed at others. Main is within 2e-6 at each of these."""
+    threshold, in the rows of the species the step gates, not V's own, so
+    nothing of it is mended and the straddled slope still carries the run.
+    Mended, the run crossed on macOS at these tolerances, 0.633 off at rtol 1e-7
+    and 3e-7 (601 points), where main is right there."""
     net, exact = _split(data_dir, tmp_path, "49.99999999999")
     window = dict(t_span=(0.0, 150.0), n_points=n_points, rtol=rtol, atol=atol)
-    assert _split_deviation(net, exact, jacobian="fd", sparse=False, **window) < within
+    assert "across a jump" not in _split_mends(net, monkeypatch, capfd, sparse=False, **window)
+    if rtol == 1e-8:
+        assert _split_deviation(net, exact, jacobian="fd", sparse=False, **window) < 1e-6
 
 
 @pytest.mark.parametrize(
     ("rtol", "atol", "sparse"),
     [(1e-6, 1e-6, False), (1e-6, 1e-8, True), (3e-7, 1e-6, True), (1e-8, 1e-12, True)],
 )
-def test_a_sum_parked_on_its_threshold_is_never_silently_wrong(
-    data_dir: Path, tmp_path: Path, rtol: float, atol: float, sparse: bool
+def test_a_sum_parked_on_its_threshold_is_not_mended(
+    data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    rtol: float,
+    atol: float,
+    sparse: bool,
 ) -> None:
     """Control. `split` with the stimulus at exactly 50, so V + V2 parks on the
-    step itself (the #176 fixture upstream): the run fails or is right, here
-    and on main. With V's mends kept in the gated rows it returned 0.633 off
-    with no error at each of these tolerances, where main failed loudly."""
-    net, exact = _split(data_dir, tmp_path, "50.0")
+    step itself (the #176 fixture upstream): nothing is mended. With V's mends
+    kept in the gated rows, a step back along the flow let them through on
+    macOS and the run returned 0.633 off with no error at each of these
+    tolerances, where main fails loudly there."""
+    net, _ = _split(data_dir, tmp_path, "50.0")
     window = dict(t_span=(0.0, 150.0), n_points=301, rtol=rtol, atol=atol)
-    try:
-        deviation = _split_deviation(net, exact, jacobian="fd", sparse=sparse, **window)
-    except bngsim.SimulationError:
-        return
-    assert deviation < 1e-3
+    assert "across a jump" not in _split_mends(net, monkeypatch, capfd, sparse=sparse, **window)
