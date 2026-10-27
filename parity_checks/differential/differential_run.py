@@ -7,6 +7,10 @@ run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
 and three rules for bugs whose answers are right (a sensitivity run refused, a
 sparsity pattern that misses entries, a backend other than the one asked for).
+Four more transform the model file itself, where the answer is known to follow,
+which the loader reads a second way (#1305, ``_transforms.py``): its species and
+reactions reordered, its names renamed, each reaction split in two at half the
+rate, and, where it does not read the clock, every rate and the window rescaled.
 One row per (model, check), its ``method`` the check:
 
     the path agrees with its reference .............. PASS

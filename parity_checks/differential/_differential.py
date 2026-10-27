@@ -62,14 +62,17 @@ one oracle with one set of rules (``parity_checks/fd_sens``).
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from _transforms import TRANSFORMS, Inapplicable, transform
 
 #: How many times the run's rtol two correct paths may differ by, before the
 #: reference's own drift is counted: their errors are each about rtol, scaled by
@@ -101,6 +104,11 @@ CHECKS = (
     "grid",
     "sparsity_covers_jacobian",
     "backend_as_asked",
+    # Metamorphic (#1305): the model file transformed, the answer known.
+    "reorder",
+    "rename",
+    "split",
+    "rescale_time",
 )
 
 
@@ -209,6 +217,9 @@ class Base:
         result, sim = run(job)
         self.job = job
         self.x = np.asarray(result.species, dtype=float)
+        # The columns of x, by name: a Result's species, which leave out a
+        # parameter an event promotes into the state (Model.species_names has it).
+        self.species_names = list(result.species_names)
         self.backend = sim.codegen_backend
         self.drift = own_drift(job, self.x)
         self.limit = max(PATH_RTOL_FACTOR * job.rtol, DRIFT_FACTOR * self.drift)
@@ -521,6 +532,48 @@ def check_sparsity(base: Base) -> Verdict:
     return _guard(go)
 
 
+def check_transform(base: Base, kind: str) -> Verdict:
+    """The model file transformed (``_transforms.py``, #1305) and run again: the
+    answer must transform with it. Every other check here starts from the one
+    loaded model, so a bug in the loader, the model build or the parser makes
+    them agree on the wrong answer; this one reads the file a second way. Its
+    trajectories are taken by name and judged as every path is, with
+    ``Base.compare``: a transform changes the order of floating-point sums, so
+    equality is not what is asked."""
+
+    def go():
+        with tempfile.TemporaryDirectory(prefix=f"differential_{kind}_") as d:
+            try:
+                tr = transform(kind, base.job.path, Path(d))
+            except Inapplicable as e:
+                return Verdict("skip", note=f"{kind} does not apply: {e}")
+            c = tr.time_scale
+            job = Job(
+                **{
+                    **base.job.__dict__,
+                    "path": tr.path,
+                    "t_start": base.job.t_start / c,
+                    "t_end": base.job.t_end / c,
+                }
+            )
+            result, _ = run(job)
+        want = base.species_names
+        # An SBML id bngsim cannot spell as it is (null, In, time, NaN: a word
+        # its expressions reserve) is reported as _ant_<id>, and the map back
+        # from a fresh name gives the id itself.
+        spelled = {w[len("_ant_") :]: w for w in want if w.startswith("_ant_")}
+        got = [tr.names.get(n, n) for n in result.species_names]
+        got = [g if g in want else spelled.get(g, g) for g in got]
+        if sorted(got) != sorted(want):
+            odd = sorted(set(got) ^ set(want))[:5]
+            return Verdict("diff", None, f"{kind}: the species are not the base's: {odd}")
+        at = {n: i for i, n in enumerate(got)}
+        x = np.asarray(result.species, dtype=float)[:, [at[n] for n in want]]
+        return base.compare(x, f"{kind} ({tr.note}): ")
+
+    return _guard(go)
+
+
 def comma_locale() -> str | None:
     """A comma-decimal LC_NUMERIC this machine has, or None. Asked of a child
     process, so this one's locale is never set."""
@@ -594,6 +647,7 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
         "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
+        **{kind: functools.partial(check_transform, kind=kind) for kind in TRANSFORMS},
     }
     for name, fn in one.items():
         if name in checks:
