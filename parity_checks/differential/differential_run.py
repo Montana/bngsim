@@ -27,6 +27,8 @@ at its own tolerances:
 * ``fd_sens/fd_sens_jobs.json``: the 53 committed ``.net`` models;
 * ``rr_parity/ode_jobs.json``: the BioModels the nightly's corpus job fetched,
   those present and under ``--max-bytes``, at most ``--max-points`` samples;
+* ``rr_parity/ssa_jobs.json`` (``--ssa-jobs``): rr_ssa's models, as SSA jobs at
+  their own window and seed, at most ``--max-reps`` replicates (#1310);
 * ``--net-dir``: every ``.net`` under a directory, and ``--model-list``: a file
   of model paths, each over ``--default-span``.
 
