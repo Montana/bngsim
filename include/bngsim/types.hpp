@@ -1443,12 +1443,17 @@ struct SteadyStateResult {
     // bngsim_codegen_output_sens chain rule answered (issues #75, #1002), over
     // the functions a result returns (not the auto-generated _rateLawN):
     // "codegen" (every one), "partial" (some; the rest are NaN rows), or
-    // "none" (not one: each declined, no symbol, or a whole-model decline). A row
+    // "none" (not one: each declined or NaN for its own reason, no symbol, or a
+    // whole-model decline). A row
     // the chain rule does not answer is not differenced. "" when no
     // sensitivity was requested or the model has no function a result
     // returns. The observable block is an exact linear projection either way
     // and is not covered by this field.
     std::string sens_output_source;
+    // Whether that chain rule was called at all: false where the artifact has
+    // none (no symbol, a whole-model decline), so that a refusal of a NaN row
+    // can tell "no chain rule" from a row it gave NaN for (issue #1002).
+    bool sens_output_evaluated = false;
     // How close to singular the factored (reduced) Jacobian was:
     // min|U_jj| / max|U_jj| from its LU. dY_ss/dp only exists when that Jacobian
     // has full rank; a steady state that is a continuum rather than an isolated

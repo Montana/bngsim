@@ -3872,6 +3872,7 @@ PYBIND11_MODULE(_bngsim_core, m) {
         // Issues #75, #1002 — "codegen" / "partial" / "none": how much of the
         // d(func)/dp block the compiled chain rule answered (the rest is NaN).
         .def_readonly("sens_output_source", &bngsim::SteadyStateResult::sens_output_source)
+        .def_readonly("sens_output_evaluated", &bngsim::SteadyStateResult::sens_output_evaluated)
         .def_readonly("sens_jacobian_rcond", &bngsim::SteadyStateResult::sens_jacobian_rcond)
         // Issue #995 — whether the steady state is an isolated root of the
         // system dY_ss/dp was solved on, and the returned state on it.

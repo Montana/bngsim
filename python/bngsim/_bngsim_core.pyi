@@ -1393,6 +1393,9 @@ class SteadyStateResultCore:
     def sens_mask_reader_species(self) -> int:
         ...
     @property
+    def sens_output_evaluated(self) -> bool:
+        ...
+    @property
     def sens_output_source(self) -> str:
         ...
     @property

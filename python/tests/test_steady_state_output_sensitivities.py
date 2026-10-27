@@ -509,7 +509,7 @@ class TestCompiledOutputSensPath:
             fd.output_sensitivities(["expression:satA", "expression:lin"])
         message = str(refusal.value)
         assert "'expression:satA'" in message and "'expression:lin'" in message
-        assert "has no chain rule in the compiled code it was solved with" in message
+        assert "the compiled code it was solved with carries no chain rule" in message
         assert "issue #1002" in message
 
     def test_regeneration_failure_keeps_the_working_artifact(self, monkeypatch):
@@ -531,7 +531,7 @@ class TestCompiledOutputSensPath:
         assert ss.rhs_backend.startswith("codegen")  # the old artifact came back
         assert ss.sens_output_source == "none"
         assert np.isfinite(ss.sensitivity).all()
-        with pytest.raises(ValueError, match=r"'expression:flux'.*no chain rule"):
+        with pytest.raises(ValueError, match=r"'expression:flux'.*carries no chain rule"):
             ss.output_sensitivities(["expression:flux"])
 
     def test_regeneration_failure_with_nothing_to_restore_propagates(self, monkeypatch):
@@ -840,7 +840,9 @@ class TestFunctionBlockBesideARowlessSpecies:
         text = _MADE_AND_LOST + "species T in D; T := piecewise(2*P, P < 100, 3*P);\n"
         ss = _ant_steady_state(text)
         assert np.isnan(np.asarray(ss.sensitivity)[ss.species_names.index("T")]).all()
-        with pytest.raises(ValueError, match=r"'species:T'.*its rule 'T' uses unsupported"):
+        with pytest.raises(
+            ValueError, match=r"'species:T'.*none for its rule 'T' \(uses unsupported"
+        ):
             ss.output_sensitivities(["species:T"])
         np.testing.assert_allclose(ss.output_sensitivities(["species:P"])[0], _DP, rtol=1e-7)
 
@@ -905,8 +907,9 @@ class TestFunctionBlockBesideARowlessSpecies:
         )
         with pytest.raises(
             bngsim.SimulationError,
-            match=r"\['T'\].*for T, its size C has no steady-state derivative: uses "
-            r"unsupported construct: if\(\) conditional \(issue #1002\)",
+            match=r"\['T'\].*for T, its size C has no steady-state derivative \(the compiled "
+            r"code has none for its rule: uses unsupported construct: if\(\) conditional; "
+            r"issue #1002\).*written without that construct",
         ):
             _ant_steady_state(text)
 

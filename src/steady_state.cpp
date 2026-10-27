@@ -5640,6 +5640,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             std::vector<double> fs(static_cast<size_t>(np) * n_func, nan);
             rhs.eval_output_sens(0.0, y_ss, col_ptrs.data(), pidx.data(), np,
                                  /*obs_sens_out=*/nullptr, fs.data());
+            result.sens_output_evaluated = true;
 
             for (int m = 0; m < n_func; ++m) {
                 bool row_ok = true;

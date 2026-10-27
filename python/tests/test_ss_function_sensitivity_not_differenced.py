@@ -137,3 +137,80 @@ def test_every_declined_function_is_named_at_once(tmp_path):
     assert "'expression:ab'" in message and "abs()" in message
     assert "'expression:mx'" in message and "max()" in message
     assert "'expression:lin'" not in message
+
+
+# ``P`` is made at ``kp`` and lost at ``kd*P`` (P* = 5, dP*/d(kp, kd) = (5, -25));
+# ``Z`` collects what P loses at ``kz*P``, has no steady value, and is left out
+# by ``mask=``.
+_MASKED = (
+    "compartment D = 1; species P in D; P = 0; kp = 1; kd = 0.2;\n"
+    "R3: => P; kp; R4: P => ; kd*P;\n"
+    "species Z in D; Z = 0; kz = 0.1; R5: P => Z; kz*P;\n"
+)
+
+
+def _masked_steady(text):
+    m = bngsim.Model.from_antimony_string(text)
+    sim = bngsim.Simulator(m, method="ode")
+    return sim.steady_state(
+        sensitivity_params=["kp", "kd"], mask=~np.asarray(m.is_pure_sink()), tol=1e-12
+    )
+
+
+def test_a_compiled_function_alone_that_reads_a_masked_species_names_it():
+    """Main named Z too (with ``sens_output_source`` "finite-difference").
+    ``V := 2*Z`` is the model's only function, so
+    no row of the block is answered (``"none"``), though the chain rule ran: V's
+    row is NaN because Z has none. The refusal names Z and the mask; an earlier
+    version of this change said there was no chain rule."""
+    ss = _masked_steady(_MASKED + "V := 2*Z;\n")
+    assert ss.sens_output_source == "none"
+    with pytest.raises(ValueError, match=r"'expression:V'.*reads Z, which mask= left out"):
+        ss.output_sensitivities(["V"])
+
+
+def test_a_read_the_step_cannot_see_is_refused_not_zero():
+    """``V := 1e20 + Z`` with Z masked. Main stepped Z, saw ``1e20 + Z`` not
+    move, took the partial for 0 and returned dV/d(kp, kd) = (0, 0) with no
+    error; Z has no steady value, so V has no derivative. It is refused, and
+    the refusal says that the step did not see the read."""
+    ss = _masked_steady(_MASKED + "V := 1e20 + Z;\n")
+    assert np.isnan(ss.sensitivities_expressions).all()
+    with pytest.raises(
+        ValueError,
+        match=r"'expression:V'.*stepping the species mask= left out of the solve \(Z\) "
+        r"did not move its value",
+    ):
+        ss.output_sensitivities(["V"])
+
+
+def test_a_function_the_derivation_budget_cut_is_refused_with_that_reason(monkeypatch, tmp_path):
+    """Where the build-time derivation runs out of its budget (GH #97), the
+    compiled code has no derivative for a function, with the budget as the
+    reason. Main differenced it (right here: T = P², (50, -250)). It is
+    refused by name, with the budget's reason readable in the sentence, and a
+    compartment sized by such a rule refuses the solve without advice to write
+    the rule without a construct, which is not what is wrong with it."""
+    from bngsim import _codegen as cg
+
+    monkeypatch.setenv("BNGSIM_SENS_DERIV_BUDGET_S", "1e-9")
+    monkeypatch.setattr(cg, "CACHE_DIR", tmp_path)
+    base = (
+        "compartment D = 1; species P in D; P = 0; kpb = 1; kdb = 0.2;\n"
+        "R3: => P; kpb; R4: P => ; kdb*P;\n"
+    )
+    m = bngsim.Model.from_antimony_string(base + "species T in D; T := P*P;\n")
+    ss = bngsim.Simulator(m, method="ode").steady_state(sensitivity_params=["kpb", "kdb"])
+    np.testing.assert_allclose(ss.output_sensitivities(["species:P"])[0], [5, -25], rtol=1e-6)
+    with pytest.raises(
+        ValueError, match=r"'species:T'.*has none for its rule 'T' \(the build-time"
+    ) as err:
+        ss.output_sensitivities(["species:T"])
+    assert "derivation exceeded" in str(err.value)
+
+    sized = base + "C := 1 + P;\nsubstanceOnly species T in C; T := 2*P;\n"
+    m = bngsim.Model.from_antimony_string(sized)
+    with pytest.raises(bngsim.SimulationError, match=r"its size C has no steady-state") as err:
+        bngsim.Simulator(m, method="ode").steady_state(sensitivity_params=["kpb", "kdb"])
+    assert "derivation exceeded" in str(err.value)
+    assert "written without that construct" not in str(err.value)

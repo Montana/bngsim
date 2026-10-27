@@ -921,9 +921,9 @@ reports how much of the expression block it answered:
   differentiate (a table function, a function that reads `rateOf`, or a
   non-smooth construct such as `if`/`abs`/`min`/`max`/`floor` — the same
   constructs listed for `∂f/∂p` above).
-- `"none"` — none did: each function is declined, or the model has no
-  compiled output-sensitivity evaluator at all (an embedded table-function
-  wrapper).
+- `"none"` — none did: each function is declined or has a NaN row of its own
+  (it reads a species `mask=` left out, say), or the model has no compiled
+  output-sensitivity evaluator at all (an embedded table-function wrapper).
 
 A function the chain rule does not answer has no steady-state derivative: its
 row is NaN, and `output_sensitivities` refuses it by name, with the construct,
