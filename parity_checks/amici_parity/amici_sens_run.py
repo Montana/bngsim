@@ -120,7 +120,7 @@ DEFAULT_RTOL = asens.DEFAULT_RTOL
 DEFAULT_ATOL = asens.DEFAULT_ATOL
 
 
-def _compare(bn, am, param_values=None, atol=None) -> dict:
+def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
     """Compare one (state, sensitivity) pair. Returns a result-fragment dict.
 
     ``bn``/``am`` are ``(t, x, sx, species_names)``. The parameter axis needs no
@@ -131,7 +131,9 @@ def _compare(bn, am, param_values=None, atol=None) -> dict:
     ``param_values`` / ``atol`` enable the solver-resolution noise floor (see
     ``_amici_sens.sensitivity_noise_mask``): a sensitivity that is identically
     zero makes the relative metric saturate at 1.0 against the other engine's
-    integration noise, which nothing scale-relative can forgive.
+    integration noise, which nothing scale-relative can forgive. With them,
+    each parameter column is judged on its own scale (issue #1261), and
+    ``param_ids`` names the columns the row reports as not judged or failing.
     """
     bn_t, bn_x, bn_sx, bn_names = bn
     am_t, am_x, am_sx, am_names = am
@@ -154,12 +156,41 @@ def _compare(bn, am, param_values=None, atol=None) -> dict:
     # State parity first — it qualifies the sensitivity verdict below.
     sv = differ.deterministic_verdict(bn_x[:, bn_idx], am_x[:, am_idx])
 
-    # Sensitivity parity: the headline.
-    v = asens.sens_verdict(
-        bn_sx[:, bn_idx, :], am_sx[:, am_idx, :], param_values=param_values, atol=atol
-    )
-
+    # Sensitivity parity: the headline, judged a parameter column at a time
+    # (issue #1261). On the tensor as a whole, differ counted a column only past
+    # 1e-3 of the largest one's peak: 2,702 of 4,272 columns here could be
+    # zeroed, negated or multiplied by 1000 and still read PASS.
     n_p = bn_sx.shape[2]
+    bn_used, am_used = bn_sx[:, bn_idx, :], am_sx[:, am_idx, :]
+    not_judged: list = []
+    columns_diff: list = []
+    if param_values is None or atol is None:
+        # No floor to judge a column against: the tensor-wide verdict, as
+        # sens_verdict itself does without them.
+        v = asens.sens_verdict(bn_used, am_used)
+        verdicts = {None: v}
+    else:
+        judged = asens.judged_columns(bn_used, am_used, param_values, atol)
+        verdicts = asens.column_verdicts(bn_used, am_used, param_values, atol, judged)
+        names = list(param_ids) if param_ids is not None else list(range(n_p))
+        not_judged = [names[j] for j in range(n_p) if j not in verdicts]
+        columns_diff = [names[j] for j, cv in verdicts.items() if not cv["passed"]]
+        v = {
+            "passed": bool(verdicts) and not columns_diff,
+            "max_rel": max((cv["max_rel"] for cv in verdicts.values()), default=0.0),
+            "noise_decisive": not columns_diff
+            and any(cv["noise_decisive"] for cv in verdicts.values()),
+        }
+        for k in (
+            "n_fail",
+            "n_cells",
+            "n_hard_fail",
+            "n_soft_fail",
+            "budget_forgiven",
+            "n_noise_rescued",
+            "n_below_noise_floor",
+        ):
+            v[k] = sum(int(cv[k]) for cv in verdicts.values())
 
     # Degeneracy witnesses (issue #328). A job can be reported PASS when the
     # WHOLE sensitivity tensor lies below the magnitude either solver can
@@ -194,10 +225,27 @@ def _compare(bn, am, param_values=None, atol=None) -> dict:
     )
     if n_resolvable == 0:
         comment += "; DEGENERATE: no parameter column resolvable"
+    if None not in verdicts:
+        comment += f"; {len(verdicts)}/{n_p} columns judged"
+        if columns_diff:
+            comment += f"; DIFF in {columns_diff[:6]}"
+    status = "pass" if v["passed"] else "diff"
+    if None not in verdicts and not verdicts:
+        status = "bad_test"
+        comment = (
+            "no parameter column carries a sensitivity "
+            f"{asens.JUDGE_FACTOR:g}x over its atol/|p| floor: the comparison would "
+            f"establish nothing; {comment}"
+        )
     return {
-        "status": "pass" if v["passed"] else "diff",
+        "status": status,
         "value": v["max_rel"],
         "comment": comment,
+        # issue #1261 — the columns the verdict could not judge, by name, and
+        # the ones it failed.
+        "n_columns_judged": None if None in verdicts else len(verdicts),
+        "columns_not_judged": not_judged,
+        "columns_diff": columns_diff,
         "state_passed": bool(sv["passed"]),
         "state_max_rel": float(sv["max_rel"]),
         "n_common_species": len(common),
@@ -706,7 +754,9 @@ def _worker(spec: dict, q) -> None:
         return
 
     try:
-        res.update(_compare(bn, am, param_values=param_values, atol=p["atol"]))
+        res.update(
+            _compare(bn, am, param_values=param_values, atol=p["atol"], param_ids=shared_ids)
+        )
     except Exception as exc:
         cap = capture_exception("compare", exc)
         res["status"] = "exception"
@@ -1033,6 +1083,11 @@ def main() -> int:
                         "max_abs_sx",
                         "n_resolvable_params",
                         "state_span",
+                        # issue #1261 — which columns the per-column verdict
+                        # judged, left out (too small to resolve), and failed.
+                        "n_columns_judged",
+                        "columns_not_judged",
+                        "columns_diff",
                     )
                     if k in r
                 },
