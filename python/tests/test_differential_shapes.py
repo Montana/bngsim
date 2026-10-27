@@ -708,13 +708,22 @@ def test_a_model_nfsim_does_not_run_is_no_reference(monkeypatch):
     assert v.status == "no_base" and "the NFsim runs" in v.note, v
 
 
-def test_rulemonkey_refusing_a_model_is_unsupported(monkeypatch):
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        bngsim.ModelError("RuleMonkey does not support compartments (cBNGL)"),
+        # ft_total_rate, in bng_nf's corpus
+        RuntimeError("RuleMonkey cannot honor this BNG XML: RateLaw@totalrate: Rule 'RR1'"),
+    ],
+    ids=["compartments", "total-rate"],
+)
+def test_rulemonkey_refusing_a_model_is_unsupported(monkeypatch, refusal):
     def refuses(*a, **kw):
-        raise bngsim.ModelError("RuleMonkey does not support compartments (cBNGL)")
+        raise refusal
 
     monkeypatch.setattr(bngsim, "RuleMonkeySession", refuses)
     v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
-    assert v.status == "unsupported" and "compartments" in v.note, v
+    assert v.status == "unsupported" and str(refusal)[:20] in v.note, v
 
 
 def test_the_runner_reads_bng_nfs_archive_as_nf_jobs(tmp_path):

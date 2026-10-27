@@ -892,6 +892,10 @@ def check_nf(job: Job, checks=NF_CHECKS) -> dict[str, Verdict]:
         except RuntimeError as e:
             if "RuleMonkey support is not present" in str(e):
                 return Verdict("skip", note=_first_line(e))
+            if "RuleMonkey cannot honor this BNG XML" in str(e):
+                # a refusal by name: a rule whose rate the two engines define
+                # apart (TotalRate over a repeated component, ft_total_rate)
+                raise _Declined(f"{type(e).__name__}: {_first_line(e)}") from e
             raise
         if not names_r:
             return Verdict("skip", note="the model has no observables to compare")
