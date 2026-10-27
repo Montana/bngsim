@@ -683,15 +683,15 @@ def checks_for(job: Job, checks=CHECKS) -> tuple[str, ...]:
     return tuple(c for c in checks if c not in SSA_CHECKS)
 
 
-def _ssa_runs(job: Job, compiled: bool) -> tuple[list[np.ndarray], set[str]]:
-    """``job.n_rep`` SSA replicates at seeds ``job.seed`` on: the species
+def _ssa_runs(job: Job, compiled: bool, n: int | None = None) -> tuple[list[np.ndarray], set[str]]:
+    """``n`` (``job.n_rep``) SSA replicates at seeds ``job.seed`` on: the species
     trajectories and the propensity backends they report. ``compiled`` is the
     default Simulator (``codegen=True`` is refused for SSA: the default builds
     cc, or mir, where a compiler is), the other ``codegen=False``."""
     import bngsim
 
     out, backends = [], set()
-    for i in range(job.n_rep):
+    for i in range(job.n_rep if n is None else n):
         kw = {} if compiled else {"codegen": False}
         sim = bngsim.Simulator(load(job.path), method="ssa", **kw)
         r = sim.run(t_span=(job.t_start, job.t_end), n_points=job.n_points, seed=job.seed + i)
@@ -738,8 +738,15 @@ def check_ssa(job: Job, checks=SSA_CHECKS) -> dict[str, Verdict]:
 
     out: dict[str, Verdict] = {}
     try:
-        interp, interp_backends = _ssa_runs(job, compiled=False)
-        comp, comp_backends = _ssa_runs(job, compiled=True)
+        # One replicate says whether the default compiles: most of the corpus
+        # does not, and there one each way is all either check reads, not an
+        # ensemble of each (the nightly's job has a cap).
+        comp, comp_backends = _ssa_runs(job, compiled=True, n=1)
+        if comp_backends == {"interpreted"}:
+            interp, interp_backends = _ssa_runs(job, compiled=False, n=1)
+        else:
+            interp, interp_backends = _ssa_runs(job, compiled=False)
+            comp, comp_backends = _ssa_runs(job, compiled=True)
     except Exception as e:  # noqa: BLE001 - no base, as for ODE
         v = Verdict("no_base", None, f"the SSA runs: {type(e).__name__}: {_first_line(e)}")
         return {c: v for c in checks}

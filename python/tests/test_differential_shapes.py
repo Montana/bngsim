@@ -524,10 +524,10 @@ def _perturbed_compiled(monkeypatch, factor):
             model.set_param("k", factor * float(model.get_param("k")))
         return model
 
-    def runs(job, compiled):
+    def runs(job, compiled, n=None):
         on[:] = [True] if compiled else []
         try:
-            return real_runs(job, compiled)
+            return real_runs(job, compiled, n)
         finally:
             on[:] = []
 
@@ -556,10 +556,10 @@ def test_functional_laws_are_judged_in_distribution(monkeypatch):
     monkeypatch.setattr(D, "_all_elementary", lambda job: False)
     real = D._ssa_runs
 
-    def other_seeds(job, compiled):
+    def other_seeds(job, compiled, n=None):
         if compiled:
             job = D.Job(**{**job.__dict__, "seed": job.seed + 1000})
-        return real(job, compiled)
+        return real(job, compiled, n)
 
     monkeypatch.setattr(D, "_ssa_runs", other_seeds)
     same = D.check_all(_ssa_job(n_rep=30), None)["ssa_cc_vs_interp"]
@@ -573,13 +573,30 @@ def test_functional_laws_are_judged_in_distribution(monkeypatch):
 def test_codegen_false_that_runs_compiled_propensities_is_a_finding(monkeypatch):
     real = D._ssa_runs
 
-    def lies(job, compiled):
-        out, backends = real(job, compiled)
+    def lies(job, compiled, n=None):
+        out, backends = real(job, compiled, n)
         return out, ({"cc"} if not compiled else backends)
 
     monkeypatch.setattr(D, "_ssa_runs", lies)
     v = D.check_all(_ssa_job(), None)["ssa_backend_as_asked"]
     assert v.status == "diff" and "codegen=False ran" in v.note, v
+
+
+def test_a_model_the_default_runs_interpreted_takes_one_replicate_each_way(monkeypatch):
+    """Most of the corpus compiles no propensities: there both checks are
+    decided by one replicate of each, not an ensemble of each (the nightly's
+    job has a cap)."""
+    real, asked = D._ssa_runs, []
+
+    def interpreted(job, compiled, n=None):
+        asked.append((compiled, job.n_rep if n is None else n))
+        out, _ = real(job, False, n)
+        return out, {"interpreted"}
+
+    monkeypatch.setattr(D, "_ssa_runs", interpreted)
+    v = D.check_all(_ssa_job(n_rep=10), None)
+    assert asked == [(True, 1), (False, 1)], asked
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
 
 
 def test_the_runner_reads_rr_ssas_jobs_as_ssa_jobs(tmp_path):
