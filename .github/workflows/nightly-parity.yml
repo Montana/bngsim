@@ -621,10 +621,14 @@ jobs:
       # cap that finish in 22-90 s cold on an M3 Max (BIOMD0000000505: 48 s there),
       # and the slowest that finished took 248 s; a timeout that flips with runner
       # speed would alert as a regression.
+      # --timeout 1500, not 900: MODEL1006230049, 0053 and 0077 took 689-894 s
+      # across five runs on the same commit's checks, so a cap of 900 (its deadline
+      # 810, #1321) flipped their rows with runner speed. The cap costs only the
+      # few models that use it.
       - name: Run differential_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 900 --out "$RUNNER_TEMP/differential.json" || true
+        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 1500 --out "$RUNNER_TEMP/differential.json" || true
       - name: Compare
         env:
           GH_TOKEN: ${{ github.token }}
