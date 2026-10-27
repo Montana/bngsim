@@ -1012,15 +1012,22 @@ def test_every_selector_without_a_derivative_is_named_at_once():
     assert "'observable:A'" not in message
 
 
-def test_the_solve_records_no_missing_species_for_a_value_that_is_not_finite():
+@pytest.mark.parametrize("body", ["log10(L)", "sqrt(L - 1)"], ids=["-inf", "nan"])
+def test_the_solve_records_no_missing_species_for_a_value_that_is_not_finite(body):
     """The FD sweep took any nonzero partial for a read, and every partial of
     -inf is NaN, so ``logL := log10(L)`` at L = 0 recorded the masked ``B`` as
-    the species with no row it read. It reads none, and the record says so."""
+    the species with no row it read. It reads none, and the record says so.
+    A value that is NaN (``sqrt(L - 1)``) moves with every step, since NaN
+    equals nothing, and is not taken for a read either: a control, since
+    main's sweep had the same guard, which the step that only asks whether a
+    value moves keeps (issue #1002)."""
     m = bngsim.Model.from_antimony_string(
         "species A = 1; species B = 0; species L = 0; k1 = 1; k2 = 0.5; kL = 1;\n"
-        "J0: -> A; k1; J1: A -> B; k2*A; JL: L -> ; kL*L;\nlogL := log10(L);"
+        f"J0: -> A; k1; J1: A -> B; k2*A; JL: L -> ; kL*L;\nlogL := {body};"
     )
     ss = bngsim.Simulator(m, method="ode").steady_state(
         sensitivity_params=["k1", "k2"], mask=~np.asarray(m.is_pure_sink())
     )
     assert ss._expression_sens_missing[ss.expression_names.index("logL")] is None
+    with pytest.raises(ValueError, match=r"'expression:logL'.*value at the steady state is"):
+        ss.output_sensitivities("expression:logL")

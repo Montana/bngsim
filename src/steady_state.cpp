@@ -5674,9 +5674,10 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                                                                         : "partial";
 
         // The species with no row that each row left NaN reads, for the refusal
-        // to name. A function whose own value is not finite moves with no step
-        // (NaN against -inf), and its row is NaN for its value, not for a
-        // missing row.
+        // to name. A function whose own value is not finite reads as moved by
+        // every step (NaN is no value it can equal), and its row is NaN for its
+        // value, not for a missing row. Only which values move is read here,
+        // so the parameters need not be derived again for it.
         std::vector<int> rowless;
         if (!std::all_of(answered.begin(), answered.end(), [](uint8_t a) { return a != 0; })) {
             for (int i = 0; i < ns; ++i) {
@@ -5687,7 +5688,6 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             }
         }
         if (!rowless.empty()) {
-            rhs.sync_params();
             model.update_observables(y_ss);
             model.evaluate_functions(0.0);
             const std::vector<double> f0(model.function_value_cache());
