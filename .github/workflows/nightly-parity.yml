@@ -25,10 +25,11 @@ name: nightly-parity
 #                tolerance sweep of the           and one independent of AMICI (#804); the
 #                analytic columns                 sweep is what sees #1227's class (#1257)
 #   differential bngsim's own paths, each         fd-sens's 53 .net models and the BioModels
-#                against another: sensitivity     under 1 MB, x 9 checks (#1257)
+#                against another: sensitivity     under 1 MB, x 10 checks (#1257)
 #                vs plain, FD vs analytic
 #                Jacobian, KLU vs dense, cc vs
-#                interpreted and MIR, de_DE vs C
+#                interpreted and MIR, de_DE vs C,
+#                8x the output points
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
