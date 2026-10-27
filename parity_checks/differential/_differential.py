@@ -748,6 +748,16 @@ def check_ssa(job: Job, checks=SSA_CHECKS) -> dict[str, Verdict]:
 
     out: dict[str, Verdict] = {}
     try:
+        # The Simulator builds a propensity library only for a model it finds
+        # eligible, before any run: without one there is nothing compiled to tell
+        # apart, and no replicate is run (the corpus's slowest take one past the
+        # nightly's cap). #1213's class, codegen=False ignored, needs a default
+        # that compiles, so ssa_backend_as_asked has nothing to ask either.
+        import bngsim
+
+        if not getattr(bngsim.Simulator(load(job.path), method="ssa"), "_ssa_propensity_lib", ""):
+            v = Verdict("skip", note=_NOT_COMPILED)
+            return {c: v for c in checks}
         # One replicate says whether the default compiles: most of the corpus
         # does not, and there one each way is all either check reads, not an
         # ensemble of each (the nightly's job has a cap).
