@@ -37,6 +37,7 @@ import functools
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import bngsim
@@ -168,6 +169,17 @@ SHAPES = _shapes()
 REFUSED = {
     # #1240: refused by name, the state on the equality's surface
     ("equality-dwell", "sens_runs"): "unsupported",
+    # #710: steady_state() refuses a model with an event or one that reads the time
+    **{
+        (shape, check): "unsupported"
+        for shape in (
+            "event-at-a-sample",
+            "moving-compartment",
+            "pulse-width-event",
+            "pulse-width-event-midpulse",
+        )
+        for check in D.STEADY_METHODS
+    },
 }
 OPEN = {
     ("equality-dwell", "klu_vs_dense"): "#1254: KLU with the FD Jacobian on an exact equality",
@@ -465,3 +477,167 @@ def test_a_state_the_rule_cannot_reach_is_left_out_not_an_exception(monkeypatch)
     monkeypatch.setattr(bngsim.Simulator, "run", fails_on_one_interval)
     v = D.check_sparsity(base)
     assert v.status == "pass" and "at 1 states" in v.note, v
+
+
+# X' = -k·x·(x - 0.3)·(x - 1), x = X/s (issue #1001's cubic): roots 0 and 1
+# stable, 0.3 not. At s = 1e-9 the residual test accepts it one step from x0.
+_CUBIC = """begin parameters
+ 1 k 1.0
+ 2 s 1e-9
+ 3 X0 {x0}*s
+ 4 k3 k/(s*s)
+ 5 k2 k*1.3/s
+ 6 k1 k*0.3
+end parameters
+begin species
+ 1 X() X0
+end species
+begin reactions
+ 1 1,1,1 1,1 k3
+ 2 1,1 1,1,1 k2
+ 3 1 0 k1
+end reactions
+"""
+
+
+def _steady_job(name, text) -> D.Job:
+    path = _DIR / f"{name}.net"
+    path.write_text(text)
+    return D.Job(name, path, 0.0, 10.0, 21, atol=1e-20)
+
+
+_STEADY = {
+    "cubic": _steady_job("cubic", _CUBIC.format(x0=0.5)),
+    "cubic-low": _steady_job("cubic-low", _CUBIC.format(x0=0.2)),
+    # X' = k·X·(1 - X): 0 unstable, 1 stable
+    "logistic": _steady_job(
+        "logistic",
+        "begin parameters\n 1 k 1.0\nend parameters\nbegin species\n 1 X() 0.1\nend species\n"
+        "begin reactions\n 1 1 1,1 k\n 2 1,1 1 k\nend reactions\n",
+    ),
+    # A <-> B, and D counting B's flux: D never settles, A and B do (#74)
+    "counter": _steady_job(
+        "counter",
+        "begin parameters\n 1 k 1.0\nend parameters\n"
+        "begin species\n 1 A() 1\n 2 B() 0\n 3 D() 0\nend species\n"
+        "begin reactions\n 1 1 2 k\n 2 2 1 k\n 3 2 2,3 k\nend reactions\n",
+    ),
+    # A <-> B: A + B = 1 is kept, at A = B = 0.5
+    "exchange": _steady_job(
+        "exchange",
+        "begin parameters\n 1 k 1.0\nend parameters\n"
+        "begin species\n 1 A() 1\n 2 B() 0\nend species\n"
+        "begin reactions\n 1 1 2 k\n 2 2 1 k\nend reactions\n",
+    ),
+    # the Brusselator at a = 1, b = 3: a limit cycle, no state to rest at
+    "brusselator": _steady_job(
+        "brusselator",
+        "begin parameters\n 1 a 1.0\n 2 b 3.0\n 3 one 1.0\nend parameters\n"
+        "begin species\n 1 X() 1\n 2 Y() 1\nend species\n"
+        "begin reactions\n 1 0 1 a\n 2 1,1,2 1,1,1 one\n 3 1 2 b\n 4 1 0 one\nend reactions\n",
+    ),
+}
+
+
+def _plant(monkeypatch, state=None, criterion=None, converged=True):
+    """steady_state() as planted: told ``criterion``, or reporting ``converged``
+    at ``state(x)``, x the state it reached."""
+    real = bngsim.Simulator.steady_state
+
+    def planted(self, **kw):
+        ss = real(self, **({**kw, "criterion": criterion} if criterion else kw))
+        if state is None:
+            return ss
+        x = np.asarray(state(np.asarray(ss.concentrations)), dtype=float)
+        return types.SimpleNamespace(
+            converged=converged,
+            concentrations=x,
+            species_names=ss.species_names,
+            residual=ss.residual,
+        )
+
+    monkeypatch.setattr(bngsim.Simulator, "steady_state", planted)
+
+
+@pytest.mark.parametrize("method", sorted(D.STEADY_METHODS.values()))
+def test_steady_state_is_where_a_run_comes_to_rest(method):
+    """#1311: both methods, at a scale of 1e-9, against a run from x0 = 0.5."""
+    v = D.check_steady(D.Base(_STEADY["cubic"]), method)
+    assert v.status == "pass", v
+
+
+@pytest.mark.parametrize(
+    ("method", "why"),
+    [
+        ("integration", "a run from its state moves 1.0e+00; X() at 5.00022e-10"),
+        # a run from the root itself stays: the spectrum is what sees it
+        ("newton", "an unstable root (an eigenvalue of 2.10e-01), where the run comes"),
+    ],
+)
+def test_a_converged_that_a_run_leaves_is_a_finding(monkeypatch, method, why):
+    """#1001: under the residual test the cubic came back converged one step
+    from x0 (integration), and on its unstable root 0.3 (Newton); every run
+    ends at 1."""
+    _plant(monkeypatch, criterion="residual")
+    v = D.check_steady(D.Base(_STEADY["cubic"]), method)
+    assert v.status == "diff" and why in v.note, v
+
+
+def test_a_solve_that_has_not_converged_is_not_judged(monkeypatch):
+    """Judged only where both have arrived: the same wrong state, not reported
+    converged, is SKIP."""
+    base = D.Base(_STEADY["cubic"])
+    _plant(monkeypatch, state=lambda x: x * 0.5, converged=False)
+    v = D.check_steady(base, "integration")
+    assert v.status == "skip" and "did not converge" in v.note, v
+
+
+def test_another_stable_state_is_recorded_not_a_finding(monkeypatch):
+    """A solve that comes to rest on the cubic's other stable root, 0: the
+    model's bistability, which the baseline holds (SKIP, both named)."""
+    base = D.Base(_STEADY["cubic"])
+    _plant(monkeypatch, state=np.zeros_like)
+    v = D.check_steady(base, "integration")
+    assert v.status == "skip" and "two stable states" in v.note, v
+    assert "X() at 0 against 1e-09" in v.note, v.note
+
+
+def test_a_root_off_the_conserved_total_is_a_finding(monkeypatch):
+    """A = B = 1 is a stable root a run rests at, of the system whose A + B is
+    2. This one's is 1: the solve has left it."""
+    base = D.Base(_STEADY["exchange"])
+    _plant(monkeypatch, state=np.ones_like)
+    v = D.check_steady(base, "newton")
+    assert v.status == "diff" and "conservation law 0 (total 2 against the run's 1)" in v.note, v
+
+
+def test_an_unstable_root_a_run_does_not_leave_is_a_finding(monkeypatch):
+    """The logistic's 0 is a root no run from it leaves, and an unstable one: a
+    solve converged there has not found where the system rests."""
+    base = D.Base(_STEADY["logistic"])
+    _plant(monkeypatch, state=np.zeros_like)
+    v = D.check_steady(base, "newton")
+    assert v.status == "diff" and "unstable root" in v.note, v
+
+
+def test_a_run_that_has_not_settled_is_not_judged(monkeypatch):
+    """A limit cycle has no state for steady_state() to be, converged or not:
+    SKIP, said why, never a finding."""
+    base = D.Base(_STEADY["brusselator"])
+    assert D.check_steady(base, "integration").status == "skip"
+    _plant(monkeypatch, state=lambda x: x)
+    v = D.check_steady(D.Base(_STEADY["brusselator"]), "integration")
+    assert v.status == "skip" and "has not settled" in v.note, v
+
+
+def test_a_write_only_accumulator_is_left_out_of_both():
+    """A counter has no steady value: the solve is asked to settle the rest
+    (mask=~is_pure_sink()), and the run is read on the rest."""
+    v = D.check_steady(D.Base(_STEADY["counter"]), "integration")
+    assert v.status == "pass", v
+
+
+def test_a_solve_from_another_basin_is_the_run_from_there():
+    """The run starts where the solve does: from x0 = 0.2, both end at 0."""
+    v = D.check_steady(D.Base(_STEADY["cubic-low"]), "integration")
+    assert v.status == "pass", v

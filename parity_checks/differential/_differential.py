@@ -19,6 +19,9 @@ check                  path                                      reference
 ``locale``             the run under a comma-decimal locale      the base, under ``C``
 ``grid``               the run at 8x the output points, read     the base
                        at the base's own sample times
+``steady_vs_run``      ``steady_state()``                        a run to equilibrium
+                                                                 from the same state
+``newton_vs_run``      ``steady_state(method="newton")``         the same run
 =====================  ========================================  =====================
 
 and three rules for bugs whose answers are right, which no comparison of
@@ -90,6 +93,18 @@ UNJUDGEABLE_DRIFT = 1e-3
 MAX_SENS_PARAMS = 3
 #: The grid check's output points, as a multiple of the base's intervals.
 GRID_FACTOR = 8
+#: How long the steady-state checks' run is taken: ``steady_state()``'s own
+#: default ``max_time``, so the run has the time the solve has.
+STEADY_HORIZON = 1e6
+#: A run has settled when its last quarter of the horizon moves it by no more
+#: than this many times its rtol, on its own scale.
+SETTLED_RTOL_FACTOR = PATH_RTOL_FACTOR
+#: A root is unstable where its Jacobian has an eigenvalue whose real part is
+#: past this share of the spectrum's largest magnitude: a conservation law's
+#: zero is rounding, nowhere near it.
+UNSTABLE_SHARE = 1e-6
+#: The ``steady_state()`` methods judged, each against the same run.
+STEADY_METHODS = {"steady_vs_run": "integration", "newton_vs_run": "newton"}
 #: Comma-decimal locales, in the order tried.
 COMMA_LOCALES = ("de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR")
 
@@ -102,6 +117,8 @@ CHECKS = (
     "cc_vs_mir",
     "locale",
     "grid",
+    "steady_vs_run",
+    "newton_vs_run",
     "sparsity_covers_jacobian",
     "backend_as_asked",
 )
@@ -497,6 +514,171 @@ def check_grid(base: Base) -> Verdict:
     return _guard(go)
 
 
+def _steady_run(job: Job, state=None, rtol_scale: float = 1.0) -> np.ndarray:
+    """A run to :data:`STEADY_HORIZON` from the model's initial state, or from
+    ``state``: its samples at 0, 1/4, ..., all of the horizon."""
+    import bngsim
+
+    model = load(job.path)
+    if state is not None:
+        model.set_state(np.asarray(state, dtype=float))
+    sim = bngsim.Simulator(model, method="ode", **job.sim)
+    r = sim.run(
+        t_span=(0.0, STEADY_HORIZON),
+        n_points=5,
+        rtol=job.rtol * rtol_scale,
+        atol=job.atol * rtol_scale,
+        max_steps=job.max_steps,
+    )
+    return np.asarray(r.species, dtype=float)
+
+
+def _judged(model) -> np.ndarray:
+    """The species a steady state is judged on: all but the write-only
+    accumulators, which settle nowhere (all of them, where nothing else is)."""
+    sink = np.asarray(model.is_pure_sink(), dtype=bool)
+    return ~sink if not sink.all() else np.ones_like(sink)
+
+
+class _Unsettled(RuntimeError):
+    """The run has no state to compare against: it has not settled."""
+
+
+def _settled_run(base: Base):
+    """The run to equilibrium, once per base: its end, the species judged (those
+    not write-only accumulators, which settle nowhere), and the bound two
+    answers may differ by there, past how far the end moves at a tenfold
+    tighter tolerance and over the horizon's last quarter."""
+    if not hasattr(base, "_steady"):
+        try:
+            job = base.job
+            keep = _judged(load(job.path))
+            y = _steady_run(job)
+            floor = PATH_RTOL_FACTOR * job.atol
+            settle = gap(y[-1][keep], y[-2][keep], floor)
+            if not settle <= SETTLED_RTOL_FACTOR * job.rtol:
+                raise _Unsettled(
+                    f"the run has not settled by t={STEADY_HORIZON:g}: it moves "
+                    f"{settle:.1e} of its peak over the last quarter"
+                )
+            drift = gap(_steady_run(job, rtol_scale=0.1)[-1][keep], y[-1][keep], floor)
+            limit = max(PATH_RTOL_FACTOR * job.rtol, DRIFT_FACTOR * max(settle, drift))
+            base._steady = (y[-1], keep, limit, settle, drift)
+        except Exception as e:  # noqa: BLE001 - every steady check reads it
+            base._steady = e
+    if isinstance(base._steady, Exception):
+        raise base._steady
+    return base._steady
+
+
+def _refused(e: Exception) -> bool:
+    """steady_state() refusing a model by name: one with an event, one that reads
+    the time, or one whose conservation law its right-hand side breaks (#710,
+    #758). Each says it is not supported for this model."""
+    import bngsim
+
+    return isinstance(e, bngsim.SimulationError) and "is not supported for this model" in str(e)
+
+
+def _largest(x: np.ndarray, ref: np.ndarray, names, keep) -> str:
+    i = int(np.argmax(np.where(keep, np.abs(x - ref), -1.0)))
+    return f"{names[i]} at {x[i]:.6g} against {ref[i]:.6g}"
+
+
+def check_steady(base: Base, method: str) -> Verdict:
+    """``steady_state(method=...)`` is where a long run from the same initial
+    state comes to rest (#1311). Judged only where both say they have arrived:
+    the solve's ``converged``, and the run's last quarter of
+    :data:`STEADY_HORIZON` moving it by no more than
+    :data:`SETTLED_RTOL_FACTOR` times its rtol. Where the two differ, a run from
+    the solve's state says which it is: one a run leaves is a ``converged`` that
+    is not (DIFF), and so is one off the initial state's conserved totals or an
+    unstable root; one the system rests at too is another stable state, the
+    model's multistability or a tail slower than the horizon (SKIP, both named,
+    for the baseline to hold)."""
+
+    def go():
+        import bngsim
+
+        job = base.job
+        model = load(job.path)
+        keep = _judged(model)
+        sim = bngsim.Simulator(model, method="ode", **job.sim)
+        try:
+            ss = sim.steady_state(
+                method=method,
+                rtol=job.rtol,
+                atol=job.atol,
+                max_time=STEADY_HORIZON,
+                mask=None if keep.all() else keep,
+            )
+        except Exception as e:
+            if _refused(e):
+                return Verdict("unsupported", note=f"{type(e).__name__}: {_first_line(e)}")
+            raise
+        if not ss.converged:
+            return Verdict(
+                "skip",
+                note=f"steady_state(method={method!r}) did not converge (residual {ss.residual:.1e})",
+            )
+        try:
+            end, _, limit, settle, drift = _settled_run(base)
+        except _Unsettled as e:
+            return Verdict("skip", note=str(e))
+        x = np.asarray(ss.concentrations, dtype=float)
+        floor = PATH_RTOL_FACTOR * job.atol
+        g = gap(x[keep], end[keep], floor)
+        note = (
+            f"{g:.2e} of the run's peak (bound {limit:.1e}; the run moves {settle:.1e} "
+            f"over its last quarter, {drift:.1e} at a tenfold tighter tolerance)"
+        )
+        if g <= limit:
+            return Verdict("pass", g, note)
+        where = _largest(x, end, ss.species_names, keep)
+        stays = gap(_steady_run(job, state=x)[-1][keep], x[keep], floor)
+        if not stays <= limit:
+            return Verdict(
+                "diff",
+                g,
+                f"steady_state() converged where a run does not rest: a run from its state "
+                f"moves {stays:.1e}; {where} at the run's end; {note}",
+            )
+        # Another state of the same system keeps the initial state's conserved
+        # totals, which the run keeps: one that does not is another system's.
+        model = load(job.path)
+        laws = np.asarray(model.conservation_laws["coefficients"], dtype=float).reshape(-1, x.size)
+        moved = np.abs(laws @ x - laws @ end) / np.maximum(np.abs(laws) @ np.abs(end), floor)
+        if moved.size and not moved.max() <= limit:
+            k = int(np.argmax(moved))
+            return Verdict(
+                "diff",
+                g,
+                f"steady_state() converged off the initial state's conservation law {k} "
+                f"(total {laws[k] @ x:.6g} against the run's {laws[k] @ end:.6g}); "
+                f"{where} at the run's end; {note}",
+            )
+        # A run from a root does not leave it, stable or not, if nothing pushes it
+        # off: zero for an autocatalyst. Its spectrum says which.
+        lam = np.linalg.eigvals(np.asarray(model.jacobian(x), dtype=float))
+        top = float(lam.real.max()) if lam.size else 0.0
+        if top > UNSTABLE_SHARE * float(np.abs(lam).max()):
+            return Verdict(
+                "diff",
+                g,
+                f"steady_state() converged on an unstable root (an eigenvalue of {top:.2e}), "
+                f"where the run comes to rest elsewhere; {where} at the run's end; {note}",
+            )
+        return Verdict(
+            "skip",
+            g,
+            f"two stable states over the horizon: steady_state()'s, where a run from it "
+            f"rests (moves {stays:.1e}), and the run's; the model's multistability, or a "
+            f"tail slower than t={STEADY_HORIZON:g}; {where} at the run's end; {note}",
+        )
+
+    return _guard(go)
+
+
 def check_backend(base: Base) -> Verdict:
     """codegen=False runs the interpreter; codegen=True compiled code."""
 
@@ -680,6 +862,7 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
         "cc_vs_interp": check_cc_vs_interp,
         "cc_vs_mir": check_cc_vs_mir,
         "grid": check_grid,
+        **{c: (lambda b, m=m: check_steady(b, m)) for c, m in STEADY_METHODS.items()},
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
     }
