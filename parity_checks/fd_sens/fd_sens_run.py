@@ -122,8 +122,9 @@ SWEEP_SETTLED = 1e-6
 # A column that moves more than this on its own peak between the two has not
 # converged.
 SWEEP_TOL = 1e-3
-# A column under this of the state's peak is zero to the arithmetic, and is
-# not asked to converge: erk_activation's 3.9e-23 beside a state of 3e6.
+# A column under this of the state's peak, scaled by its parameter (|p|·dx/dp,
+# in the state's units), is zero to the arithmetic, and is not asked to
+# converge: erk_activation's 3.9e-23 beside a state of 3e6.
 SWEEP_ROUNDING = 1e-14
 
 
@@ -379,14 +380,16 @@ def column_verdicts(analytic, reference, gap, x_max: float, values, atol: float,
     return out
 
 
-def tolerance_sweep(runs, params, judged=None) -> dict:
+def tolerance_sweep(runs, params, judged=None, values=None) -> dict:
     """The sweep's finding on ``runs``, ``[(species, sensitivities)]`` at
     :data:`SWEEP_RTOLS` (loosest first): ``settled`` (the trajectory converged
     between them), ``state_gap``, and per parameter column of ``judged`` (all of
     ``params`` by default) above the state's rounding, how far it moved on its
     own peak (``column_gaps``). ``moving`` names the columns past
-    :data:`SWEEP_TOL`, only where the trajectory settled."""
+    :data:`SWEEP_TOL`, only where the trajectory settled. ``values`` are the
+    parameters' (1 each by default), which put a column on the state's scale."""
     judged = set(params if judged is None else judged)
+    values = [1.0] * len(params) if values is None else values
     (x1, s1), (x2, s2) = (
         (np.asarray(x, dtype=float), np.asarray(sx, dtype=float)) for x, sx in runs
     )
@@ -401,18 +404,31 @@ def tolerance_sweep(runs, params, judged=None) -> dict:
             continue
         col = s2[..., j]
         size = float(np.nanmax(np.abs(col))) if col.size else 0.0
-        if not size > SWEEP_ROUNDING * max(peak, 1.0):
+        # On the state's scale, not an absolute 1e-14: nanomolar_dimer's columns
+        # are 1e-28 and 6e-20 per unit of parameters of 2e18 and 4e9, and 17% of
+        # its 1.5e-9 peak per relative change, and an absolute floor left out both.
+        if not (peak > 0.0 and size * (abs(values[j]) or 1.0) > SWEEP_ROUNDING * peak):
             continue
         gaps[p] = float(np.nanmax(np.abs(s1[..., j] - col)) / size)
     moving = [p for p, g in gaps.items() if settled and not g <= SWEEP_TOL]
     return {"settled": settled, "state_gap": state_gap, "column_gaps": gaps, "moving": moving}
 
 
-def _sweep_runs(path: Path, params: list[str], spec: dict):
+def _sweep_runs(path: Path, params: list[str], spec: dict, deadline=None):
+    """The analytic run at each of :data:`SWEEP_RTOLS`. ``deadline`` (a
+    ``time.perf_counter()`` reading) bounds each run's integration (its build
+    is the analytic run's, cached), so a sweep too slow for the job's cap fails
+    as a sweep and leaves the verdict, instead of running the job into a
+    TIMEOUT."""
     import bngsim
 
     out = []
     for rtol in SWEEP_RTOLS:
+        budget = None
+        if deadline is not None:
+            budget = deadline - time.perf_counter()
+            if budget <= 0.0:
+                raise ReferenceOverBudget("no time left in the job's cap for the sweep")
         model = load_model(path)
         run = bngsim.Simulator(
             model,
@@ -425,6 +441,7 @@ def _sweep_runs(path: Path, params: list[str], spec: dict):
             rtol=rtol,
             atol=rtol * SWEEP_ATOL_RATIO,
             max_steps=spec.get("max_steps", 100_000),
+            timeout=budget,
         )
         out.append((run.species, run.sensitivities))
     return out
@@ -616,7 +633,8 @@ def _worker(spec: dict, q) -> None:
             and res.get("status") in ("pass", "bad_test", "diff")
         ):
             try:
-                _apply_sweep(res, tolerance_sweep(_sweep_runs(path, params, spec), params, judged))
+                runs = _sweep_runs(path, params, spec, deadline=t0 + CAP_SHARE * spec["timeout"])
+                _apply_sweep(res, tolerance_sweep(runs, params, judged, values))
             except Exception as e:  # noqa: BLE001 - a sweep that does not run judges nothing
                 res["sweep_error"] = f"{type(e).__name__}: {str(e)[:200]}"
     except Exception as e:  # noqa: BLE001 - one model's failure is that row's EXCEPTION
