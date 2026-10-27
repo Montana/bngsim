@@ -234,6 +234,26 @@ inline int fill_tracking_ewt(const AtolTracking &t, N_Vector y, N_Vector ewt) {
     return 0;
 }
 
+// What the run's error weight holds species i to at the value y: the 1/ewt_i
+// that CVODE's own rule gives there, rtol*|y| + atol_i, with atol_i the tracking
+// one (the denominator above) where tracking is on (issue #907). Without
+// tracking it is the same expression, to the bit, as a band read from the
+// scalar or the vector.
+inline double tolerance_unit(const AtolTracking &t, double rtol, double atol_i, std::size_t i,
+                             double y) {
+    if (!t.active()) {
+        return rtol * std::abs(y) + atol_i;
+    }
+    const double rel = t.rtol * std::abs(y);
+    double a = rel;
+    if (a < t.lo[i]) {
+        a = t.lo[i];
+    } else if (a > t.hi[i]) {
+        a = t.hi[i];
+    }
+    return rel + a;
+}
+
 // Hand CVODE the tolerances for this run: `CVodeWFtolerances` when `ewt_fn` is
 // non-null (issue #213), else `CVodeSVtolerances` when `atol_vec` is non-empty,
 // else `CVodeSStolerances` with the scalar. Must be called after CVodeInit

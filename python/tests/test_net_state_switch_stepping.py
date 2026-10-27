@@ -628,6 +628,68 @@ def test_a_hump_that_only_just_clears_its_band_restarts(tmp_path, t_end, rtol):
     assert float(result.species[-1][1]) == pytest.approx(0.025, rel=1e-2)
 
 
+def _clock_closed_window(n, x0_each, rate_each, thr, t_close, k=10.0):
+    """`if((Obs > thr) && (Tobs < 1), k, 0)`: open from where Obs, the sum of n
+    species each growing at rate_each, passes thr until a clock T (T' = 1)
+    reaches 1 at t_close. Y integrates k over it."""
+    species = [f"    {i + 1} X{i}() {x0_each!r}" for i in range(n)]
+    reactions = [f"    {i + 1} 0 {i + 1} ri" for i in range(n)]
+    members = ",".join(str(i + 1) for i in range(n))
+    return (
+        f"begin parameters\n    1 k {k}\n    2 ri {rate_each!r}\n    3 thr {thr!r}\n"
+        "    4 one 1.0\nend parameters\n"
+        "begin functions\n    1 r() if((Obs>thr)&&(Tobs<1),k,0)\nend functions\n"
+        "begin species\n" + "\n".join(species) + f"\n    {n + 1} T() {1.0 - t_close!r}\n"
+        f"    {n + 2} Y() 0\nend species\n"
+        "begin reactions\n" + "\n".join(reactions) + f"\n    {n + 1} 0 {n + 1} one\n"
+        f"    {n + 2} 0 {n + 2} r\nend reactions\n"
+        f"begin groups\n    1 Obs {members}\n    2 Tobs {n + 1}\nend groups\n"
+    )
+
+
+# Where the window opens: five phases of it.
+_PHASES = [5.0, 5.37, 6.13, 7.71, 9.19]
+
+
+@pytest.mark.parametrize("t_end", [20.0, 50.0])
+@pytest.mark.parametrize("n", [1, 1000])
+@pytest.mark.parametrize("t_open", _PHASES)
+def test_a_window_on_an_observable_over_many_species_is_integrated(tmp_path, n, t_open, t_end):
+    """Issue #907, case 3: Obs moves 0.1% of itself, 1e-3, across a window of
+    0.5 that a clock closes. Summed over a thousand species of 1e-3 each, the
+    band the restart test asked the crossing to clear was rtol*Obs + 1000*atol
+    times 10*sqrt(N), 3.2e-3, past the whole excursion: the crossing read as
+    unresolved, the run stepped on, and Y came out 0 on three phases of five.
+    The WRMS norm bounds the residual's error by its terms in quadrature,
+    sqrt(1000)*atol, so the bar is 1e-4. One species is the control, and two
+    run lengths give the step after the root two geometries."""
+    rate = 1e-3 / 0.5
+    text = _clock_closed_window(n, (1.0 - rate * t_open) / n, rate / n, 1.0, t_open + 0.5)
+    model = _write(tmp_path, text)
+    result = bngsim.Simulator(model).run(t_span=(0.0, t_end), n_points=3, rtol=1e-8, atol=1e-8)
+    assert float(result.species[-1][-1]) == pytest.approx(5.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("t_end", [20.0, 50.0])
+@pytest.mark.parametrize("t_open", _PHASES)
+def test_a_window_under_a_tracking_atol_is_integrated(tmp_path, t_open, t_end):
+    """Issue #907, case 5: under TrackingAtol(decades=6, ceiling=1e-8) CVODE
+    holds S, about 1e-6, to 2e-14, but the restart test read its band from the
+    1e-8 ceiling, and a window 5e-9 wide in S, closed by a clock, was lost on
+    three phases of five. The band is now what the error weight's own rule
+    holds S to, the tracked atol."""
+    rate = 5e-9 / 0.5
+    text = _clock_closed_window(1, 1e-6 - rate * t_open, rate, 1e-6, t_open + 0.5)
+    model = _write(tmp_path, text)
+    result = bngsim.Simulator(model).run(
+        t_span=(0.0, t_end),
+        n_points=3,
+        rtol=1e-8,
+        atol=bngsim.TrackingAtol(decades=6, ceiling=1e-8),
+    )
+    assert float(result.species[-1][-1]) == pytest.approx(5.0, rel=1e-6)
+
+
 def test_a_residual_too_deep_to_print_keeps_every_root(tmp_path):
     """A rate law over a sum of 400 observables has a residual that nests too
     deep for ``ast.unparse``. The RecursionError escaped the dedupe key, the
