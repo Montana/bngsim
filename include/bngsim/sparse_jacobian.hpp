@@ -338,12 +338,52 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
             terms[sp.row_indices[k]] += std::abs(jac_data[k] * y[j]);
         }
     }
-    for (const FdJumpMend &m : mends) {
-        if (!fd_jump_unparked(fy[m.col], terms[m.col])) {
-            jac_data[m.at] = m.was;
-        } else if (n_mended != nullptr) {
-            ++*n_mended;
+    // J·f with every mend in, for fd_jump_came_across's prediction along the flow.
+    double *jf = fm1;
+    std::fill(jf, jf + ns, 0.0);
+    for (int j = 0; j < ns; ++j) {
+        for (int64_t k = sp.col_ptrs[j]; k < sp.col_ptrs[j + 1]; ++k) {
+            jf[sp.row_indices[k]] += jac_data[k] * fy[j];
         }
+    }
+    auto came_across = [&](long j, std::size_t a, std::size_t b) {
+        const double tau = h_vals[j] / std::abs(fy[j]);
+        for (int k = 0; k < ns; ++k) {
+            y_pert[k] = y[k] - tau * fy[k];
+        }
+        try {
+            eval_rhs(t, y_pert, fm2);
+        } catch (...) {
+            return false;
+        }
+        for (std::size_t e = a; e < b; ++e) {
+            const int i = static_cast<int>(sp.row_indices[mends[e].at]);
+            if (fd_jump_came_across(fm2[i], fy[i] - tau * jf[i], mends[e].was * h_vals[j])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (std::size_t a = 0; a < mends.size();) {
+        const long j = mends[a].col;
+        std::size_t b = a;
+        while (b < mends.size() && mends[b].col == j) {
+            ++b;
+        }
+        bool own_row = false;
+        for (std::size_t e = a; e < b; ++e) {
+            own_row = own_row || sp.row_indices[mends[e].at] == j;
+        }
+        const bool keep = fd_jump_unparked(fy[j], terms[j]) &&
+                          (terms[j] == 0.0 || (own_row && came_across(j, a, b)));
+        for (std::size_t e = a; e < b; ++e) {
+            if (!keep) {
+                jac_data[mends[e].at] = mends[e].was;
+            } else if (n_mended != nullptr) {
+                ++*n_mended;
+            }
+        }
+        a = b;
     }
 }
 

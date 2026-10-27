@@ -396,29 +396,36 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 // `fd_step_may_cross_jump` is the half of the test the forward step gives; only
 // where it holds are the two backward points worth evaluating.
 //
-// A column is tested only where `fd_jump_testable` holds:
+// A column is tested only where `fd_jump_testable` holds, and of the mends it
+// takes, only some are kept:
 //
-// - The species is not moving toward the jump its step would cross
-//   (`fd_jump_testable`), and of the mends its column takes, those are kept
-//   where it moves away at more than kFdJumpParked of the terms of its own row
-//   in the mended matrix, or where nothing moves it (that row is zero:
-//   `fd_jump_unparked`). Then nothing forms the matrix again and the run
-//   follows its predictor, or the LU's rounding is all that moves the species.
-//   The mended matrix, because its own straddled entry swells a row's terms:
-//   X at 0.1 beside `if(X > 5, ...)·X` had terms of 6.7e6.
-//   Moving toward the jump, the large slope is what lets CVODE hold a species
-//   that parks just short of it: the #176 fixture parks V 1e-11 under a step,
-//   the closed form and a mended matrix both collapse the step there, and the
-//   straddled quotient integrates it to 2.5e-7 of the exact branch. Where the
-//   step is in a sum of species that trade among themselves while the sum
-//   parks (#903's `split`), each of them moves, so the direction is all there
-//   is to go on. Toward a jump that stays put, the run crosses it soon and its
-//   matrix is formed again beyond it. Toward one that recedes, or one the run
-//   slides along, it does not, and the run is wrong as on main (in the PR's
-//   "Left alone"). Parked, a species' rate is its solver's noise and points
-//   either way: with V's asymptote 9e-11 under the step and tolerances of
-//   1e-8, the march read V moving away at t = 27.7 and, mended, never
-//   converged (residual 18 where main reaches 5e-10).
+// - Its species is not moving toward the jump its step would cross. Moving
+//   toward it, the large slope is what lets CVODE hold a species that parks
+//   just short of it: the #176 fixture parks V 1e-11 under a step, the closed
+//   form and a mended matrix both collapse the step there, and the straddled
+//   quotient integrates it to 2.5e-7 of the exact branch. Toward a jump that
+//   stays put, the run crosses it soon and its matrix is formed again beyond
+//   it. Toward one that recedes, or one the run slides along, it does not, and
+//   the run is wrong as on main (in the PR's "Left alone").
+// - Where nothing moves the species (its row is zero), every mend is kept: its
+//   column reaches Newton only through rounding, which a jump-sized entry
+//   turns into a flip of the law.
+// - Where it moves away, at more than kFdJumpParked of the terms of its own row
+//   in the mended matrix (`fd_jump_unparked`), its mends are kept if its own
+//   row is one of them and the run came from across the jump
+//   (`fd_jump_came_across`). A large entry on the diagonal is what freezes a
+//   species in Newton's iteration, so the run follows its predictor; one in
+//   another species' row, of a species that moves, turns its corrections into
+//   that row's, which fails the iteration and forms the matrix again. In
+//   #903's `split`, V + V2 parks 1e-11 under the #176 step while V leaves at
+//   0.38 and V2 arrives at 0.38: V's step crosses, in other species' rows, and
+//   mended there the run crossed (0.633 off at rtol 1e-7, where main is right).
+//   The mended matrix, because a species' own straddled entry swells its
+//   row's terms: X at 0.1 beside `if(X > 5, ...)·X` had terms of 6.7e6.
+// - Parked, a species' rate is its solver's noise and points either way: with
+//   V's asymptote 9e-11 under the step and tolerances of 1e-8, the march read V
+//   moving away at t = 27.7 and, mended, never converged (residual 18 where
+//   main reaches 5e-10).
 // - The species is more than two steps from 0, or exactly at 0. A step wider
 //   than the species (CVODE's floor: 2.5e-2 beside a species at 1.6e-8, 7.8e13
 //   beside one at 1.7e-4 late in a march, 3.2 beside one at -3.7e-7) reads the
@@ -453,7 +460,18 @@ inline bool fd_jump_unparked(double f_self, double self_terms) {
     return self_terms == 0.0 || std::abs(f_self) > kFdJumpParked * self_terms;
 }
 
-// A mend made, and undone where its column's species turns out parked.
+// Did the run come from across the jump a mended row reads? `back` is the row
+// at the state one step of the column's species back along the flow, y −
+// τ·f(y) with τ = inc/|f_j|, `predicted` what the row would read there on the
+// state's own branch (f(y) − τ·J·f(y), J mended), `d01` the quotient's own
+// difference. A species leaving a jump came from across it; a member of a sum
+// that parks did not, though it moves, where the sum is in its own row too.
+inline bool fd_jump_came_across(double back, double predicted, double d01) {
+    return std::isfinite(back) && std::abs(back - predicted) > 0.5 * std::abs(d01);
+}
+
+// A mend made, and undone where its column's species turns out parked, or
+// where the run did not come from across the jump.
 struct FdJumpMend {
     std::size_t at; // the entry, in the solver's matrix data
     long col;       // its column

@@ -379,13 +379,20 @@ def test_a_model_with_no_jump_has_nothing_mended(
     assert "across a jump" not in capfd.readouterr().err
 
 
-def test_a_parked_sum_keeps_the_slope_that_holds_it(data_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("rtol", "atol", "n_points", "within"),
+    [(1e-8, 1e-8, 301, 1e-6), (1e-7, 1e-10, 301, 1e-5), (3e-7, 1e-8, 601, 1e-5)],
+)
+def test_a_parked_sum_keeps_the_slope_that_holds_it(
+    data_dir: Path, tmp_path: Path, rtol: float, atol: float, n_points: int, within: float
+) -> None:
     """Control. The #176 fixture with its voltage carried as V + V2, two species
     that trade at kx·time() and kx while their sum parks 1e-11 under the step at
-    50 (#903's `split`). Each of them moves, at about 0.3, so only their
-    direction, toward the step, tells them from species leaving it. The
-    straddled slope is what carries this run on the difference quotient;
-    mended, it fails as the closed form does. Main carries it too."""
+    50 (#903's `split`). At t = 18.6 V leaves at 0.38 and V2 arrives at 0.38;
+    V's step crosses the threshold, in the rows of the species the step gates,
+    not V's own. The straddled slope is what carries this run on the difference
+    quotient: mended, the run crossed, 0.633 off at rtol 1e-7 and 3e-7 (601
+    points), and failed at others. Main is within 2e-6 at each of these."""
     step = "if(((-70+Voltage_Level)<-20),0.5,0.05)"
     text = (data_dir / "ltype_calcium_discontinuous_jacobian.net").read_text()
     swaps = [
@@ -412,7 +419,7 @@ def test_a_parked_sum_keeps_the_slope_that_holds_it(data_dir: Path, tmp_path: Pa
     )
     (tmp_path / "split.net").write_text(text)
     (tmp_path / "split_exact.net").write_text(exact_text)
-    window = dict(t_span=(0.0, 150.0), n_points=301, rtol=1e-8, atol=1e-8)
+    window = dict(t_span=(0.0, 150.0), n_points=n_points, rtol=rtol, atol=atol)
     got = bngsim.Simulator(
         bngsim.Model.from_net(str(tmp_path / "split.net")), method="ode", jacobian="fd"
     ).run(**window)
@@ -421,4 +428,4 @@ def test_a_parked_sum_keeps_the_slope_that_holds_it(data_dir: Path, tmp_path: Pa
     ).run(**{**window, "rtol": 1e-12, "atol": 1e-12})
     g, w = np.asarray(got.observables), np.asarray(want.observables)
     scale = np.maximum(np.abs(w).max(axis=0), 1e-12)
-    assert float((np.abs(g - w) / scale).max()) < 1e-6
+    assert float((np.abs(g - w) / scale).max()) < within

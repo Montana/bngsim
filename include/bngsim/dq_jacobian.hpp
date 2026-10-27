@@ -146,9 +146,9 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
             }
         }
     }
-    N_VSetArrayPointer(nullptr, side);
-    N_VDestroy(side);
     if (mends.empty()) {
+        N_VSetArrayPointer(nullptr, side);
+        N_VDestroy(side);
         return 0;
     }
     double *jac = SUNDenseMatrix_Data(J);
@@ -161,13 +161,56 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
             terms[i] += std::abs(col[i] * yd[j]);
         }
     }
-    for (const FdJumpMend &m : mends) {
-        if (fd_jump_unparked(f0[m.col], terms[m.col])) {
-            ++*n_mended;
-        } else {
-            jac[m.at] = m.was;
+    // One step of species j back along the flow (fd_jump_came_across): the
+    // state is saved in fm1 and restored to the bit; the row there goes in f2.
+    auto came_across = [&](long j, std::size_t a, std::size_t b) {
+        const double inc = inc_of(j, yd[j]);
+        const double tau = inc / std::abs(f0[j]);
+        for (sunindextype k = 0; k < n; ++k) {
+            fm1[k] = yd[k];
+            yd[k] = fm1[k] - tau * f0[k];
         }
+        N_VSetArrayPointer(f2, side);
+        const bool ok = side_f(side);
+        for (sunindextype k = 0; k < n; ++k) {
+            yd[k] = fm1[k];
+        }
+        for (std::size_t e = a; ok && e < b; ++e) {
+            const auto i =
+                static_cast<sunindextype>(mends[e].at - static_cast<std::size_t>(j) * un);
+            double jf = 0.0;
+            for (sunindextype k = 0; k < n; ++k) {
+                jf += jac[static_cast<std::size_t>(k) * un + static_cast<std::size_t>(i)] * f0[k];
+            }
+            if (fd_jump_came_across(f2[i], f0[i] - tau * jf, mends[e].was * inc)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (std::size_t a = 0; a < mends.size();) {
+        const long j = mends[a].col;
+        std::size_t b = a;
+        while (b < mends.size() && mends[b].col == j) {
+            ++b;
+        }
+        bool own_row = false;
+        for (std::size_t e = a; e < b; ++e) {
+            own_row = own_row || mends[e].at == static_cast<std::size_t>(j) * (un + 1);
+        }
+        const bool keep = fd_jump_unparked(f0[j], terms[j]) &&
+                          (terms[j] == 0.0 || (own_row && came_across(j, a, b)));
+        for (std::size_t e = a; e < b; ++e) {
+            if (keep) {
+                ++*n_mended;
+            } else {
+                jac[mends[e].at] = mends[e].was;
+            }
+        }
+        a = b;
     }
+    N_VSetArrayPointer(nullptr, side);
+    N_VDestroy(side);
     return 0;
 }
 
