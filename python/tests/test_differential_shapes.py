@@ -582,10 +582,26 @@ def test_codegen_false_that_runs_compiled_propensities_is_a_finding(monkeypatch)
     assert v.status == "diff" and "codegen=False ran" in v.note, v
 
 
-def test_a_model_the_default_runs_interpreted_takes_one_replicate_each_way(monkeypatch):
-    """Most of the corpus compiles no propensities: there both checks are
-    decided by one replicate of each, not an ensemble of each (the nightly's
-    job has a cap)."""
+def test_a_model_without_a_propensity_library_runs_no_replicate(monkeypatch):
+    """Most of the corpus is not eligible for compiled propensities, which the
+    Simulator decides before any run: there is nothing to tell apart, and the
+    corpus's slowest take one replicate past the nightly's cap."""
+    import bngsim._codegen
+
+    asked = []
+    monkeypatch.setattr(bngsim._codegen, "prepare_ssa_propensity_lib", lambda model: None)
+    monkeypatch.setattr(D, "_ssa_runs", lambda *a, **kw: asked.append(a) or ([], set()))
+    v = D.check_all(_ssa_job(n_rep=10), None)
+    assert asked == [], asked
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
+
+
+def test_a_library_the_engine_declines_takes_one_replicate_each_way(monkeypatch):
+    """Where the Simulator built a library and the engine still runs the
+    interpreter (it declines events, functional laws and large networks),
+    one replicate of each decides both checks, not an ensemble of each."""
+    if not _compiled_here():
+        pytest.skip("no C compiler: no propensity library is built")
     real, asked = D._ssa_runs, []
 
     def interpreted(job, compiled, n=None):
