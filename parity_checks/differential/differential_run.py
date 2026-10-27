@@ -29,6 +29,8 @@ at its own tolerances:
   those present and under ``--max-bytes``, at most ``--max-points`` samples;
 * ``rr_parity/ssa_jobs.json`` (``--ssa-jobs``): rr_ssa's models, as SSA jobs at
   their own window and seed, at most ``--max-reps`` replicates (#1310);
+* ``--nf-archive``: bng_nf's models from its reference archive, each entry's
+  BNG-XML and recorded run, as NF jobs for NFsim against RuleMonkey (#1312);
 * ``--net-dir``: every ``.net`` under a directory, and ``--model-list``: a file
   of model paths, each over ``--default-span``.
 
@@ -41,9 +43,12 @@ generates ``de_DE.UTF-8`` first.
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as _dt
 import json
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -146,6 +151,42 @@ def ssa_jobs(path: Path, max_bytes: int, max_points: int, max_reps: int) -> list
     return out
 
 
+def nf_jobs(archive: Path, max_reps: int, xml_dir: Path) -> list[D.Job]:
+    """bng_nf's jobs, from its reference archive (``reference_archive.py fetch
+    bng_nf``): each entry holds the BNG-XML BNG2.pl wrote for the model and the
+    run it was recorded for, so the NF arm runs the NF track's own models and
+    windows without BNG2.pl. Written to ``xml_dir``. An entry recorded as a
+    multi-segment protocol is left out: one segment is not its run."""
+    import numpy as np
+
+    out = []
+    for f in sorted(Path(archive).glob("*.npz")):
+        with np.load(f, allow_pickle=False) as z:
+            meta = json.loads(bytes(z["meta"]).decode())
+        run, text = meta.get("run") or {}, (meta.get("build") or {}).get("artifact_text")
+        if meta.get("track") != "nf" or not text or run.get("mode") != "single_segment":
+            continue
+        xml = xml_dir / f"{f.stem}.xml"
+        xml.write_text(text)
+        sim = {"block_same_complex_binding": bool(meta.get("nf_bscb", True))}
+        if run.get("gml") is not None:
+            sim["molecule_limit"] = int(run["gml"])
+        out.append(
+            D.Job(
+                meta["model_id"],
+                xml,
+                float(run["t_start"]),
+                float(run["t_end"]),
+                int(run["n_steps"]) + 1,
+                sim=sim,
+                method="nf",
+                n_rep=min(int(meta.get("n_rep", max_reps)), max_reps),
+                seed=int(meta.get("seed_base", 1)),
+            )
+        )
+    return out
+
+
 def _job_of(p: Path, span: tuple[float, float]) -> D.Job:
     return D.Job(str(p.relative_to(REPO) if p.is_relative_to(REPO) else p), p, *span, 21)
 
@@ -169,7 +210,8 @@ def _worker(spec: dict, q) -> None:
         warnings.simplefilter("ignore")
         job = D.Job.from_dict(spec["job"])
         try:
-            n = len(D.load(job.path).species_names)
+            # A network-free model has no species list: its BNG-XML is the sessions'.
+            n = 0 if job.method == "nf" else len(D.load(job.path).species_names)
         except Exception as e:  # noqa: BLE001 - a refusal at load is the loader's to judge
             res["status"] = "no_base"
             res["why"] = f"does not load: {type(e).__name__}: {str(e).splitlines()[0][:300]}"
@@ -234,7 +276,10 @@ def main(argv=None) -> int:
     ap.add_argument("--fd-sens-jobs", default=str(FD_SENS_JOBS))
     ap.add_argument("--rr-jobs", default=str(RR_JOBS), help="'' leaves the BioModels out")
     ap.add_argument("--ssa-jobs", default=str(SSA_JOBS), help="'' leaves the SSA arm out")
-    ap.add_argument("--max-reps", type=int, default=DEFAULT_MAX_REPS, help="SSA replicates")
+    ap.add_argument("--max-reps", type=int, default=DEFAULT_MAX_REPS, help="SSA, NF replicates")
+    ap.add_argument(
+        "--nf-archive", default="", help="bng_nf's reference archive: the NF arm, on its models"
+    )
     ap.add_argument("--net-dir", action="append", default=[], help="every .net under it")
     ap.add_argument("--model-list", action="append", default=[], help="a file of model paths")
     ap.add_argument("--default-span", type=float, nargs=2, default=(0.0, 10.0))
@@ -270,6 +315,10 @@ def main(argv=None) -> int:
         jobs += rr_jobs(Path(args.rr_jobs), args.max_bytes, args.max_points)
     if args.ssa_jobs:
         jobs += ssa_jobs(Path(args.ssa_jobs), args.max_bytes, args.max_points, args.max_reps)
+    if args.nf_archive:
+        xml_dir = Path(tempfile.mkdtemp(prefix="differential-nf-"))
+        atexit.register(shutil.rmtree, xml_dir, ignore_errors=True)
+        jobs += nf_jobs(Path(args.nf_archive), args.max_reps, xml_dir)
     for d in args.net_dir:
         jobs += net_dir_jobs(Path(d).resolve(), tuple(args.default_span))
     for f in args.model_list:

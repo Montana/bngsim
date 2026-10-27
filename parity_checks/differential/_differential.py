@@ -69,6 +69,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -107,6 +108,8 @@ CHECKS = (
     # The SSA arm (#1310), on SSA jobs only.
     "ssa_cc_vs_interp",
     "ssa_backend_as_asked",
+    # The NF arm (#1312), on NF jobs only.
+    "nf_reject_vs_exact",
 )
 
 
@@ -132,8 +135,9 @@ class Job:
     atol: float = 1e-10
     max_steps: int = 100_000
     sim: dict = field(default_factory=dict)
-    # "ode", or "ssa" for the stochastic arm (#1310), whose replicates run at
-    # seeds seed, seed + 1, ... seed + n_rep - 1.
+    # "ode", "ssa" for the stochastic arm (#1310) or "nf" for the network-free
+    # one (#1312, ``path`` a BNG-XML), whose replicates run at seeds seed,
+    # seed + 1, ... seed + n_rep - 1.
     method: str = "ode"
     n_rep: int = 0
     seed: int = 1
@@ -676,11 +680,17 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
 SSA_CHECKS = ("ssa_cc_vs_interp", "ssa_backend_as_asked")
 
 
+# The NF arm (issue #1312): checks that apply to an NF job, and only to one.
+NF_CHECKS = ("nf_reject_vs_exact",)
+
+
 def checks_for(job: Job, checks=CHECKS) -> tuple[str, ...]:
     """The checks of ``checks`` that apply to ``job``'s method."""
     if job.method == "ssa":
         return tuple(c for c in checks if c in SSA_CHECKS)
-    return tuple(c for c in checks if c not in SSA_CHECKS)
+    if job.method == "nf":
+        return tuple(c for c in checks if c in NF_CHECKS)
+    return tuple(c for c in checks if c not in SSA_CHECKS + NF_CHECKS)
 
 
 def _ssa_runs(job: Job, compiled: bool, n: int | None = None) -> tuple[list[np.ndarray], set[str]]:
@@ -802,12 +812,155 @@ def _ssa_verdict(job, interp, comp, no_compiler, differ, oracles) -> Verdict:
     return Verdict("pass" if v["passed"] else "diff", v["max_z"], note, extra)
 
 
+#: The seconds an NF check may spend escalating a DIFF to more replicates, the
+#: way the stochastic suites do (30, then 100 each): a rung that would take
+#: longer is not walked, and the row says so.
+NF_ESCALATION_BUDGET = 300.0
+
+
+def _nf_runs(
+    job: Job, engine: str, n: int | None = None, seed: int | None = None
+) -> tuple[np.ndarray, list[str]]:
+    """``n`` (``job.n_rep``) replicates of the BNG-XML at ``job.path`` on one
+    network-free engine, ``nf_reject`` (NFsim) or ``nf_exact`` (RuleMonkey), at
+    seeds ``seed`` (``job.seed``) on: the observables, ``(n, n_time, n_obs)``,
+    and their names. ``job.sim`` is the sessions' options
+    (``block_same_complex_binding``, ``molecule_limit``), the same for both."""
+    import bngsim
+
+    cls = bngsim.NfsimSession if engine == "nf_reject" else bngsim.RuleMonkeySession
+    sess = cls(str(job.path), **job.sim)
+    out, names = [], []
+    first = job.seed if seed is None else seed
+    try:
+        for i in range(job.n_rep if n is None else n):
+            sess.initialize(seed=first + i)
+            r = sess.simulate(job.t_start, job.t_end, job.n_points)
+            out.append(np.asarray(r.observables, dtype=float))
+            names = list(r.observable_names)
+    finally:
+        sess.destroy()
+    return np.stack(out), names
+
+
+class _OverBudget(RuntimeError):
+    """A rung of escalation that would not fit in :data:`NF_ESCALATION_BUDGET`."""
+
+
+def check_nf(job: Job, checks=NF_CHECKS) -> dict[str, Verdict]:
+    """NFsim against RuleMonkey, in distribution (#1312).
+
+    The two engines sample the same process by different algorithms, so their
+    draws never match and their ensembles must: each observable's mean at each
+    sample, against the ensemble verdict the SSA parity suites use
+    (``differ.ensemble_verdict`` at ``ensemble_k_for(n_rep)``). A DIFF is
+    escalated as bng_parity's NF track escalates one (``_run_escalation``: 30,
+    then 100 replicates each, stopping where agreement stalls), within
+    :data:`NF_ESCALATION_BUDGET`, so finite-sample scatter clears and a real
+    divergence stays. A known difference (the context symmetry factor of #281,
+    #298, #300, #301) is a DIFF the baseline holds, so a new one alerts."""
+    parity = str(Path(__file__).resolve().parents[1])
+    if parity not in sys.path:
+        sys.path.insert(0, parity)
+    import bngsim
+    from _core import differ, oracles
+
+    # The stochastic suites' escalation of a DIFF, which bng_parity's NF track
+    # walks (GH #69, #185): bng_stoch_run's, so the two read a DIFF alike.
+    bng = str(Path(parity) / "bng_parity")
+    if bng not in sys.path:
+        sys.path.insert(0, bng)
+    import bng_stoch_run as stoch
+
+    if "nf_reject_vs_exact" not in checks:
+        return {}
+    start = time.perf_counter()
+    try:
+        reject, names_r = _nf_runs(job, "nf_reject")
+    except Exception as e:  # noqa: BLE001 - no base, as for ODE
+        v = Verdict("no_base", None, f"the NFsim runs: {type(e).__name__}: {_first_line(e)}")
+        return {"nf_reject_vs_exact": v}
+
+    def go():
+        try:
+            exact, names_e = _nf_runs(job, "nf_exact")
+            # one replicate of each engine, for what a rung of escalation costs
+            per_rep = (time.perf_counter() - start) / job.n_rep
+        except bngsim.ModelError as e:
+            # RuleMonkey refuses by name what it does not model (compartments).
+            raise _Declined(f"{type(e).__name__}: {_first_line(e)}") from e
+        except RuntimeError as e:
+            if "RuleMonkey support is not present" in str(e):
+                return Verdict("skip", note=_first_line(e))
+            raise
+        if not names_r:
+            return Verdict("skip", note="the model has no observables to compare")
+        if names_e != names_r:
+            return Verdict(
+                "diff", None, f"the observables differ: NFsim {names_r}, RuleMonkey {names_e}"
+            )
+
+        def judge(a, b):
+            mean_a, sem_a = oracles.ensemble_stats(a[1])
+            mean_b, sem_b = oracles.ensemble_stats(b[1])
+            n = a[1].shape[0]
+            k = differ.ensemble_k_for(n)
+            v = differ.ensemble_verdict(mean_a, sem_a, mean_b, sem_b, k=k)
+            # The observable whose means are furthest apart, on its own peak.
+            peak = np.maximum(np.nanmax(np.abs(np.stack([mean_a, mean_b])), axis=(0, 1)), 1.0)
+            worst = names_r[int(np.argmax(np.nanmax(np.abs(mean_a - mean_b), axis=0) / peak))]
+            judged[:] = [v, worst]
+            note = (
+                f"{n} replicates each: {v['frac_pass']:.3f} of cells within {k:.2f} SE, "
+                f"max z {v['max_z']:.2f}; furthest apart: {worst}"
+            )
+            status = "pass" if v["passed"] else "diff"
+            return status, v["frac_pass"], note, "frac_pass", differ.ENSEMBLE_PASS_FRAC
+
+        def escalate(delta, seed, rung):
+            cost = per_rep * delta
+            if cost > NF_ESCALATION_BUDGET - (time.perf_counter() - t0):
+                raise _OverBudget(f"~{cost:.0f}s, past the {NF_ESCALATION_BUDGET:g}s budget")
+            more = [_nf_runs(job, e, delta, seed)[0] for e in ("nf_reject", "nf_exact")]
+            return [(None, x, names_r) for x in more]
+
+        judged: list = []
+        pair = ((None, reject, names_r), (None, exact, names_e))
+        status, frac, note, *_ = judge(*pair)
+        t0 = time.perf_counter()
+        status, frac, note, _, _, rungs, stalled = stoch._run_escalation(
+            *pair,
+            status,
+            frac,
+            note,
+            "frac_pass",
+            differ.ENSEMBLE_PASS_FRAC,
+            n_rep_base=job.n_rep,
+            seed_base=job.seed,
+            compare=judge,
+            escalate=escalate,
+        )
+        v, worst = judged
+        extra = {
+            "frac_pass": v["frac_pass"],
+            "max_z": v["max_z"],
+            "worst_observable": worst,
+            "rungs": [list(r) for r in rungs],
+            "stalled": stalled,
+        }
+        return Verdict(status, v["max_z"], note, extra)
+
+    return {"nf_reject_vs_exact": _guard(go)}
+
+
 def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Verdict]:
     """Every check of ``checks`` that applies to the model. A base that does
     not run is no reference: each check is then an exception on the base."""
     checks = checks_for(job, checks)
     if job.method == "ssa":
         return check_ssa(job, checks)
+    if job.method == "nf":
+        return check_nf(job, checks)
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001

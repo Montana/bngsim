@@ -619,10 +619,22 @@ jobs:
       # cap that finish in 22-90 s cold on an M3 Max (BIOMD0000000505: 48 s there),
       # and the slowest that finished took 248 s; a timeout that flips with runner
       # speed would alert as a regression.
+      # The NF arm (#1312) runs bng_nf's models from the pinned reference archive,
+      # which holds the BNG-XML BNG2.pl wrote for each: this job has no BNG2.pl.
+      # Both engines are bngsim's, so the archive is inputs only, whatever the
+      # mode. A fetch that fails leaves the arm out, said so, not the job.
+      - name: Fetch bng_nf's models
+        run: |
+          if python3 parity_checks/nightly/reference_archive.py fetch bng_nf --dest "$RUNNER_TEMP/bng_nf"; then
+            echo "NF_FLAGS=--nf-archive $RUNNER_TEMP/bng_nf" >> "$GITHUB_ENV"
+          else
+            echo "::warning::bng_nf's archive did not fetch: the NF arm is left out tonight"
+            echo "NF_FLAGS=" >> "$GITHUB_ENV"
+          fi
       - name: Run differential_run.py
         env:
           BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
-        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 900 --out "$RUNNER_TEMP/differential.json" || true
+        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 900 $NF_FLAGS --out "$RUNNER_TEMP/differential.json" || true
       - name: Compare
         env:
           GH_TOKEN: ${{ github.token }}

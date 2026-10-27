@@ -55,7 +55,7 @@ import _differential as D  # noqa: E402
 antimony = pytest.importorskip("antimony")
 
 # The ODE checks: the SSA arm (#1310) runs on SSA jobs, which the shapes are not.
-CHECKS = tuple(c for c in D.CHECKS if c != "locale" and c not in D.SSA_CHECKS)
+CHECKS = tuple(c for c in D.CHECKS if c != "locale" and c not in D.SSA_CHECKS + D.NF_CHECKS)
 _DIR = Path(tempfile.mkdtemp(prefix="bngsim-differential-shapes-"))
 atexit.register(shutil.rmtree, _DIR, ignore_errors=True)
 
@@ -610,3 +610,143 @@ def test_the_runner_reads_rr_ssas_jobs_as_ssa_jobs(tmp_path):
     )
     (job,) = RUN.ssa_jobs(manifest, 0, 101, 20)
     assert (job.method, job.n_points, job.n_rep, job.seed) == ("ssa", 101, 20, 7)
+
+
+# The NF arm (#1312): NFsim against RuleMonkey on one BNG-XML.
+_NF_XML = _ROOT / "tests" / "data" / "nfsim" / "simple_system.xml"
+
+
+def _nf_job(n_rep=10):
+    if not _NF_XML.is_file():
+        pytest.skip(f"{_NF_XML} is not in this tree")
+    if not bngsim._bngsim_core.HAS_RULEMONKEY:
+        pytest.skip("this build has no RuleMonkey")
+    sim = {"block_same_complex_binding": True}
+    return D.Job("simple_system", _NF_XML, 0.0, 10.0, 11, sim=sim, method="nf", n_rep=n_rep)
+
+
+def _faster_on_rulemonkey(monkeypatch, tmp_path, factor):
+    """RuleMonkey reads a copy of the XML with ``kcat`` times ``factor``; NFsim
+    the original: one rate perturbed on one engine, the issue's control."""
+    text = _NF_XML.read_text()
+    old = '<Parameter id="kcat" type="Constant" value="0.7"/>'
+    assert old in text
+    moved = tmp_path / "simple_system_kcat.xml"
+    moved.write_text(text.replace(old, old.replace("0.7", repr(0.7 * factor))))
+    real = D._nf_runs
+
+    def runs(job, engine, n=None, seed=None):
+        if engine == "nf_exact":
+            job = D.Job(**{**job.__dict__, "path": moved})
+        return real(job, engine, n, seed)
+
+    monkeypatch.setattr(D, "_nf_runs", runs)
+
+
+def test_an_nf_job_runs_the_nf_check_and_no_other():
+    job = D.Job("m", _NF_XML, 0.0, 1.0, 2, method="nf", n_rep=2)
+    assert D.checks_for(job) == D.NF_CHECKS
+    assert not set(D.checks_for(SHAPES["equality-dwell"])) & set(D.NF_CHECKS)
+    assert not set(D.checks_for(_ssa_job())) & set(D.NF_CHECKS)
+
+
+def test_nfsim_and_rulemonkey_agree_in_distribution():
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "pass" and "replicates each" in v.note, v
+
+
+def test_one_rate_perturbed_on_one_engine_is_a_finding(monkeypatch, tmp_path):
+    """The issue's negative control. A DIFF is escalated to 30 replicates each,
+    as the stochastic suites do, and a real one stays a DIFF."""
+    _faster_on_rulemonkey(monkeypatch, tmp_path, 3.0)
+    seeds, real_init = [], bngsim.NfsimSession.initialize
+
+    def initialize(self, seed=None):
+        seeds.append(seed)
+        return real_init(self, seed=seed)
+
+    monkeypatch.setattr(bngsim.NfsimSession, "initialize", initialize)
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "diff", v
+    assert [n for n, _ in v.extra["rungs"]][:2] == [10, 30], v.extra
+    # the rung's replicates are new draws, not the base's again
+    assert seeds[:30] == list(range(1, 31)), seeds
+    assert v.extra["worst_observable"] in ("X_p_total", "Xp_free", "X_free"), v.extra
+
+
+def test_an_escalation_past_its_budget_is_not_walked(monkeypatch, tmp_path):
+    """A slow model's DIFF is not walked to 100 replicates each past the
+    nightly's cap: the row stays at its base rung and says so."""
+    _faster_on_rulemonkey(monkeypatch, tmp_path, 3.0)
+    monkeypatch.setattr(D, "NF_ESCALATION_BUDGET", 0.0)
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "diff" and "aborted" in v.note, v
+    assert [n for n, _ in v.extra["rungs"]] == [10], v.extra
+
+
+def test_engines_reporting_different_observables_is_a_finding(monkeypatch):
+    real = D._nf_runs
+
+    def renamed(job, engine, n=None, seed=None):
+        obs, names = real(job, engine, n, seed)
+        return obs, (names[::-1] if engine == "nf_exact" else names)
+
+    monkeypatch.setattr(D, "_nf_runs", renamed)
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "diff" and "the observables differ" in v.note, v
+
+
+def test_a_model_nfsim_does_not_run_is_no_reference(monkeypatch):
+    """NFsim is the base: where it fails there is nothing to compare RuleMonkey
+    against, and bng_parity's NF track owns the failure."""
+
+    def fails(*a, **kw):
+        raise bngsim.SimulationError("NFsim: traversal limit exceeded")
+
+    monkeypatch.setattr(bngsim, "NfsimSession", fails)
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "no_base" and "the NFsim runs" in v.note, v
+
+
+def test_rulemonkey_refusing_a_model_is_unsupported(monkeypatch):
+    def refuses(*a, **kw):
+        raise bngsim.ModelError("RuleMonkey does not support compartments (cBNGL)")
+
+    monkeypatch.setattr(bngsim, "RuleMonkeySession", refuses)
+    v = D.check_all(_nf_job(), None)["nf_reject_vs_exact"]
+    assert v.status == "unsupported" and "compartments" in v.note, v
+
+
+def test_the_runner_reads_bng_nfs_archive_as_nf_jobs(tmp_path):
+    """Each entry carries the XML BNG2.pl wrote and the run it was recorded for;
+    a multi-segment protocol is left out (one segment is not its run)."""
+    import differential_run as RUN
+
+    def entry(name, mode):
+        meta = {
+            "track": "nf",
+            "model_id": name,
+            "n_rep": 10,
+            "seed_base": 3,
+            "nf_bscb": True,
+            "build": {"artifact_text": "<xml/>"},
+            "run": {"t_start": 0.0, "t_end": 50.0, "n_steps": 100, "gml": 5000, "mode": mode},
+        }
+        blob = np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)
+        np.savez_compressed(tmp_path / f"{name}.npz", meta=blob)
+
+    entry("one", "single_segment")
+    entry("two", "multi_segment")
+    xml_dir = tmp_path / "xml"
+    xml_dir.mkdir()
+    (job,) = RUN.nf_jobs(tmp_path, 20, xml_dir)
+    assert (job.model_id, job.method, job.t_end, job.n_points, job.n_rep, job.seed) == (
+        "one",
+        "nf",
+        50.0,
+        101,
+        10,
+        3,
+    )
+    assert job.sim == {"block_same_complex_binding": True, "molecule_limit": 5000}
+    assert job.path.read_text() == "<xml/>"
