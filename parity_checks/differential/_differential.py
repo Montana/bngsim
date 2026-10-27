@@ -937,7 +937,6 @@ def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[st
         "cc_vs_mir": check_cc_vs_mir,
         "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
-        "jacobian_values": check_jacobian_values,
         "backend_as_asked": check_backend,
     }
     for name, fn in one.items():
@@ -945,4 +944,7 @@ def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[st
             out[name] = spent() or fn(base)
     if "locale" in checks:
         out["locale"] = spent() or check_locale(base, locale_name)
+    # After every check main runs (#1308), in what is left of the model's cap.
+    if "jacobian_values" in checks:
+        out["jacobian_values"] = spent() or check_jacobian_values(base)
     return {c: out[c] for c in checks if c in out}
