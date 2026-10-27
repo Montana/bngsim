@@ -32,7 +32,9 @@ nightly generates and this suite's runners do not have.
 
 from __future__ import annotations
 
+import atexit
 import functools
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -53,6 +55,7 @@ antimony = pytest.importorskip("antimony")
 
 CHECKS = tuple(c for c in D.CHECKS if c != "locale")
 _DIR = Path(tempfile.mkdtemp(prefix="bngsim-differential-shapes-"))
+atexit.register(shutil.rmtree, _DIR, ignore_errors=True)
 
 
 def _net(name, params, species, functions, reactions, groups) -> Path:
@@ -338,3 +341,127 @@ def test_the_conditioning_gate_keeps_a_chaotic_model_from_a_false_finding(monkey
     monkeypatch.setattr(D, "DRIFT_FACTOR", 0.0)
     ungated = D.check_ajac(D.Base(job))
     assert ungated.status == "diff", ungated
+
+
+def test_codegen_true_that_runs_the_interpreter_is_a_finding(monkeypatch):
+    """#1213's rule, its other half: codegen=True builds compiled code or raises,
+    so a run on the interpreter is a finding, not a machine without a compiler."""
+    monkeypatch.setattr(bngsim.Simulator, "codegen_backend", property(lambda self: "exprtk"))
+    base = D.Base(SHAPES["triangle-maxabs"])
+    v = D.check_backend(base)
+    assert v.status == "diff" and "codegen=True ran exprtk" in v.note, v
+    # and cc_vs_interp does not pass the interpreter against itself
+    assert D.check_cc_vs_interp(base).status == "skip"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Windows' compiler lookup, a missing cc, and macOS's shim without the CLT
+        "No C compiler found. Install Visual Studio Build Tools (cl.exe) or MinGW (gcc).",
+        "C compiler not found. Install Xcode Command Line Tools (macOS), gcc (Linux), ...",
+        "Codegen compilation failed:\nxcrun: error: invalid active developer path "
+        "(/Library/Developer/CommandLineTools), missing xcrun at: ...",
+    ],
+)
+def test_a_machine_without_a_compiler_skips_the_compiled_paths(monkeypatch, text):
+    base = D.Base(SHAPES["triangle-maxabs"])
+    real = D.run
+
+    def no_cc(job, **kw):
+        if kw.get("codegen") is True:
+            raise RuntimeError(
+                f"codegen=True requested, but the codegen build failed (RuntimeError: {text})."
+            )
+        return real(job, **kw)
+
+    monkeypatch.setattr(D, "run", no_cc)
+    for check in (D.check_cc_vs_interp, D.check_backend):
+        v = check(base)
+        assert v.status == "skip" and "no C compiler" in v.note, v
+
+
+def _chain(n=60) -> D.Job:
+    """A60 -> ... in a line: 60 species and a sparse Jacobian, which the
+    automatic rule sends to KLU."""
+    params = "\n".join(f" {i + 1} k{i} {0.5 + 0.01 * i}" for i in range(n))
+    species = "\n".join(f" {i + 1} A{i}() {10.0 if i == 0 else 0.0}" for i in range(n))
+    reactions = "\n".join(f" {i + 1} {i + 1} {i + 2} k{i}" for i in range(n - 1))
+    return D.Job("chain", _net("chain", params, species, "", reactions, f" 1 Aend {n}"))
+
+
+@pytest.mark.skipif(not bngsim.HAS_KLU, reason="KLU not compiled")
+def test_klu_is_compared_with_the_dense_solver_where_the_auto_rule_picks_klu(monkeypatch):
+    """The base of a sparse model of 50 species or more runs on KLU: a reference
+    left to the automatic rule is KLU against KLU."""
+    base = D.Base(_chain())
+    solvers = []
+    real = D.run
+
+    def spy(job, **kw):
+        result, sim = real(job, **kw)
+        solvers.append(result.solver_stats["linear_solver"])
+        return result, sim
+
+    monkeypatch.setattr(D, "run", spy)
+    v = D.check_klu(base)
+    assert v.status == "pass", v
+    assert len(solvers) == 2 and solvers.count(1) == 1, solvers  # 1 is KLU
+
+
+def test_a_tighter_run_that_fails_leaves_the_rules_that_compare_nothing(monkeypatch):
+    """A base whose tenfold tighter run does not complete is no reference, and
+    its comparisons are SKIP; the model still ran, and the rules that compare
+    no answers (sparsity, backend) still apply."""
+
+    def fails(job, x):
+        raise bngsim.SimulationError("too much work")
+
+    monkeypatch.setattr(D, "own_drift", fails)
+    v = D.check_all(SHAPES["triangle-maxabs"], None, ("ajac_vs_fdjac", "sparsity_covers_jacobian"))
+    assert v["ajac_vs_fdjac"].status == "skip" and "did not complete" in v["ajac_vs_fdjac"].note
+    assert v["sparsity_covers_jacobian"].status == "pass", v
+
+
+def test_a_nanomolar_state_is_stepped_on_its_own_scale():
+    """A step floor of 1e-3 absolute moved a state of 2e-9 by half its size, and
+    a saturating law's two steps then disagreed past 10%: the missing slot read
+    as unresolvable."""
+
+    class Nano(_FakeModel):
+        @staticmethod
+        def rhs(y, t=0.0):
+            a, b = y
+            return np.array([-a * b / (1e-10 + b), -a])
+
+    y = [np.array([1e-9, 2e-9])]
+    assert D.sparsity_misses(Nano(_csc([[1, 1], [1, 0]])), y) == []
+    assert D.sparsity_misses(Nano(_csc([[1, 0], [1, 0]])), y) == [(0, 1)]
+
+
+def test_a_trajectory_wholly_under_the_floor_is_not_a_pass():
+    """A BioModel in molar units peaks under 1e3·atol: every path inside the
+    floor read PASS, a path of all zeros included. It is SKIP, said why; a path
+    that clears the floor is still judged."""
+    base = D.Base(SHAPES["triangle-maxabs"])
+    tiny = base.against(base.x * 1e-12)  # a peak of ~1e-11 under a floor of 1e-7
+    v = tiny.compare(np.zeros_like(base.x))
+    assert v.status == "skip" and "under the absolute floor" in v.note, v
+    assert tiny.compare(tiny.x + 1.0).status == "diff"
+
+
+def test_a_state_the_rule_cannot_reach_is_left_out_not_an_exception(monkeypatch):
+    """The sparsity rule reads states after a one-interval run to the middle and
+    the end of the window. Where that run fails and the base's grid does not
+    (MODEL1112050001), the pattern is asked at the states that were reached."""
+    base = D.Base(SHAPES["triangle-maxabs"])
+    real = bngsim.Simulator.run
+
+    def fails_on_one_interval(self, *a, **kw):
+        if kw.get("n_points") == 2:
+            raise bngsim.SimulationError("CVODE integration failed (CV_CONV_FAILURE)")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(bngsim.Simulator, "run", fails_on_one_interval)
+    v = D.check_sparsity(base)
+    assert v.status == "pass" and "at 1 states" in v.note, v
