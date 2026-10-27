@@ -181,7 +181,8 @@ mirrored in `VENDOR.json` → `pruning`. Every upstream file is vendored except:
 `c2mir/<arch>/`), so the same tree builds on every host arch without per-arch
 pruning. The denylist is validated to reproduce the checked-in tree exactly: a
 no-op re-vendor of the pinned commit changes no source file (only the dynamic
-`VENDOR.json` fields).
+`VENDOR.json` fields) other than those with a local carry, which it reverts to
+upstream's and then exits nonzero (see "Local Carries").
 
 Change the prune in `vendor_mir.py` first if the vendor surface ever changes.
 
@@ -212,10 +213,11 @@ These behaviors are required by `mir_jit.hpp` and recorded under
   `MIR_get_global_item`, the scan still works — but verify before relying on it.
 - **Single-maintainer upstream.** MIR is effectively single-maintainer and pinned
   to an immutable commit. Refresh deliberately.
-- **Local carries: none.** The tree is stock upstream at the pinned commit.
-  `VENDOR.json` → `local_carries` records each deliberate BNGsim edit,
-  and both `vendor_mir.py --check` and `test_mir_vendoring.py` verify every
-  recorded carry is *still applied* — see "Local Carries" below.
+- **Local carries: one.** `mir-gen-x86_64.c`'s 3- and 4-byte loop-padding NOPs
+  (issue #1216; see "Current carries"). The rest of the tree is stock upstream
+  at the pinned commit. `VENDOR.json` → `local_carries` records each deliberate
+  BNGsim edit, and both `vendor_mir.py --check` and `test_mir_vendoring.py`
+  verify every recorded carry is *still applied* — see "Local Carries" below.
 
 ## Local Carries
 
@@ -249,7 +251,23 @@ would not survive — carry-adjacent facts belong in the carry entry.
 
 ### Current carries
 
-None. The tree is stock upstream at the pinned commit.
+- **`mir-gen-x86_64.c` — the 3- and 4-byte loop-padding NOPs (issue #1216),
+  carried from 2026-10-27.** From -O2, `target_translate` aligns the head of
+  each innermost loop to an 8-byte boundary with 0 to 7 bytes of NOPs from
+  `nop_pats`. Upstream's 3- and 4-byte entries are the register forms
+  `0F 1F C0` (`nopl %eax`) and `48 0F 1F C0` (`nopq %rax`). An x86-64 CPU runs
+  them, but Rosetta 2 raises SIGILL on both, so an x86_64 Python on Apple
+  Silicon died the first time it ran a 3- or 4-byte pad (one reached by falling
+  into the loop; a jump to the label skips it). -O0 and -O1 pad nothing, which
+  is why only -O2 failed. The carry uses the memory forms Intel recommends,
+  `0F 1F 00` and `0F 1F 40 00`, as upstream's 5- to 7-byte entries already are.
+  They are the same length, so no offset moves, and a NOP reads no memory
+  whatever its operand. It is carried rather than waited for because it changes
+  nothing a CPU does, and without it a MIR build is unusable at -O2 in an x86_64
+  Python on Apple Silicon. Not reported upstream as of 2026-10-27; upstream
+  master (`dc2c763f`) still has the register forms.
+  `test_mir_vendoring.py::test_mir_x86_64_loop_padding_is_intels_recommended_nops`
+  holds the table to Intel's list, and stays when upstream takes the fix.
 
 ### Past carries
 
