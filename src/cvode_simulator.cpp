@@ -16,6 +16,7 @@
 #include "bngsim/atol_vector.hpp"
 #include "bngsim/c_locale_numbers.hpp"
 #include "bngsim/codegen_abi.hpp"
+#include "bngsim/dq_jacobian.hpp"
 #include "bngsim/functional_jac_scatter.hpp"
 #include "bngsim/lapack_dense_linsol.hpp"
 #include "bngsim/mm_jacobian.hpp"
@@ -600,6 +601,17 @@ struct CvodeUserData {
     std::vector<double> colored_jac_y_pert;
     std::vector<double> colored_jac_fy_pert;
     std::vector<double> colored_jac_h_vals;
+    // The rows colored_fd_jacobian's jump test evaluates (issue #1002), 4·ns.
+    std::vector<double> colored_jac_jump_rows;
+
+    // bngsim's own dense difference quotient (issue #1002), installed where
+    // CVODE's would run: the solver it reads the error weights and step from,
+    // the right-hand side CVODE was initialised with, and the rows its jump
+    // test evaluates.
+    void *dq_cvode_mem = nullptr;
+    CVRhsFn dq_rhs = nullptr;
+    std::vector<double> dq_scratch;
+    bool dq_debug = false;
 
     // Chatter guard (GH #95): per-event "dormant" flags, or null. A non-null
     // pointer addresses an array of length n_events; a non-zero entry suppresses
@@ -1766,6 +1778,73 @@ static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMa
     });
 }
 
+// ─── Dense difference quotient (issue #1002) ─────────────────────────────────
+//
+// Where the dense solver has no closed form to call (`jacobian="fd"`, or a law
+// the closed form declines), CVODE used to difference the matrix itself. This
+// is that quotient, cvLsDenseDQJac of SUNDIALS 7.2 step for step: its
+// increment, its floor from the step and the norm of f, its column formula,
+// and its leaving the probed component as it stands when f fails, which CVODE
+// then rewinds. So a column that steps across no jump is CVODE's to the bit.
+// bngsim sets no inequality constraints, the one part of CVODE's left out. The
+// step is CVodeGetCurrentStep's cv_next_h, which CVODE writes at every change
+// of cv_h before a setup reads it.
+//
+// What it adds is the jump test of fd_jacobian.hpp: after each column one
+// point further on, and where a row may step across a jump, two points back. A
+// row whose step does cross one takes fd_entry_past_jump in place of Δf/h.
+
+// f at a state CVODE never asked about, leaving nothing a run reads afterwards:
+// the per-species maxima (#1025), the non-finite witness (#336), a parked
+// exception (#589). False where f fails there or is not finite.
+static bool dq_side_point(CvodeUserData *data, sunrealtype t, N_Vector y, N_Vector f) {
+    std::vector<double> *x_max = data->x_max;
+    data->x_max = nullptr;
+    const bool had_witness = data->nonfinite_witness.captured;
+    const bool had_error = static_cast<bool>(data->callback_error);
+    const int rc = data->dq_rhs(t, y, f, data);
+    data->x_max = x_max;
+    if (!had_witness) {
+        data->nonfinite_witness = NonFiniteWitness{};
+    }
+    if (!had_error) {
+        data->callback_error = nullptr;
+    }
+    if (rc != 0) {
+        return false;
+    }
+    const double *fd = N_VGetArrayPointer(f);
+    const sunindextype n = N_VGetLength(f);
+    for (sunindextype i = 0; i < n; ++i) {
+        if (!std::isfinite(fd[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int cvode_dense_dq_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
+                                   void *user_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    auto *data = static_cast<CvodeUserData *>(user_data);
+    int mended = 0;
+    const int rc = cvode_dense_dq_past_jumps(
+        data->dq_cvode_mem, y, fy, J, tmp1, tmp2, tmp3, data->dq_scratch,
+        [&](N_Vector out) { return data->dq_rhs(t, y, out, user_data); },
+        [&](N_Vector out) { return dq_side_point(data, t, y, out); }, &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr, "[jac] dense DQ t=%.17g: %d entries step across a jump\n",
+                     static_cast<double>(t), mended);
+    }
+    return rc;
+}
+
+static int cvode_dense_dq_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *user_data,
+                              N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_cvode_callback(user_data, [&] {
+        return cvode_dense_dq_jac_body(t, y, fy, J, user_data, tmp1, tmp2, tmp3);
+    });
+}
+
 // ─── JAX AD Dense Jacobian ───────────────────────────────────────────────────
 //
 // CVODE callback that delegates to a Python JAX function via std::function.
@@ -1977,10 +2056,18 @@ static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMat
     double *fy_pert = data->colored_jac_fy_pert.data();
     double *h_vals = data->colored_jac_h_vals.data();
 
-    colored_fd_jacobian(sp, ns, static_cast<double>(t), y_data, fy_data, jac_data, y_pert, fy_pert,
-                        h_vals, [model](double tt, const double *yy, double *ydot) {
-                            model->compute_derivs(tt, yy, ydot);
-                        });
+    if (data->colored_jac_jump_rows.size() != 4 * static_cast<std::size_t>(ns)) {
+        data->colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
+    }
+    int mended = 0;
+    colored_fd_jacobian(
+        sp, ns, static_cast<double>(t), y_data, fy_data, jac_data, y_pert, fy_pert, h_vals,
+        [model](double tt, const double *yy, double *ydot) { model->compute_derivs(tt, yy, ydot); },
+        data->colored_jac_jump_rows.data(), &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr, "[jac] colored DQ t=%.17g: %d entries step across a jump\n",
+                     static_cast<double>(t), mended);
+    }
 
     return 0; // success
 }
@@ -3720,6 +3807,8 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
             user_data.colored_jac_y_pert.resize(ns);
             user_data.colored_jac_fy_pert.resize(ns);
             user_data.colored_jac_h_vals.assign(ns, 0.0);
+            user_data.colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
+            user_data.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
         }
 
         if (!jac_fn) {
@@ -3756,19 +3845,26 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
         if (flag != CV_SUCCESS) {
             throw std::runtime_error("CVodeSetJacFn (jax) failed");
         }
-    } else if (jac_strategy != "fd") {
-        if (model.analytical_jacobian_complete() &&
-            (jac_strategy == "analytical" || jac_strategy == "auto")) {
-            CVLsJacFn dense_jac =
-                user_data.codegen_jac_fn ? cvode_codegen_dense_jac : cvode_analytical_dense_jac;
-            if (std::getenv("BNGSIM_JAC_DEBUG"))
-                std::fprintf(stderr, "[jac] dense Jacobian: %s\n",
-                             user_data.codegen_jac_fn ? "compiled (bngsim_codegen_jac)"
-                                                      : "interpreted (cvode_analytical_dense_jac)");
-            flag = CVodeSetJacFn(cvode_mem, dense_jac);
-            if (flag != CV_SUCCESS) {
-                throw std::runtime_error("CVodeSetJacFn (dense) failed");
-            }
+    } else if (jac_strategy != "fd" && model.analytical_jacobian_complete() &&
+               (jac_strategy == "analytical" || jac_strategy == "auto")) {
+        CVLsJacFn dense_jac =
+            user_data.codegen_jac_fn ? cvode_codegen_dense_jac : cvode_analytical_dense_jac;
+        if (std::getenv("BNGSIM_JAC_DEBUG"))
+            std::fprintf(stderr, "[jac] dense Jacobian: %s\n",
+                         user_data.codegen_jac_fn ? "compiled (bngsim_codegen_jac)"
+                                                  : "interpreted (cvode_analytical_dense_jac)");
+        flag = CVodeSetJacFn(cvode_mem, dense_jac);
+        if (flag != CV_SUCCESS) {
+            throw std::runtime_error("CVodeSetJacFn (dense) failed");
+        }
+    } else if (user_data.dq_rhs != nullptr) {
+        // No closed form: bngsim's own difference quotient in place of CVODE's,
+        // the same matrix but where a column steps across a jump (issue #1002).
+        user_data.dq_cvode_mem = cvode_mem;
+        user_data.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
+        flag = CVodeSetJacFn(cvode_mem, cvode_dense_dq_jac);
+        if (flag != CV_SUCCESS) {
+            throw std::runtime_error("CVodeSetJacFn (dense difference quotient) failed");
         }
     }
 }
@@ -3945,6 +4041,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
 
         w.user_data = CvodeUserData{&model};
         CVRhsFn rhs_fn = setup_codegen_rhs(opts, w.user_data, w.codegen_param_buf);
+        w.user_data.dq_rhs = rhs_fn;
 
         int flag = CVodeInit(w.cvode_mem, rhs_fn, times.t_start, w.y);
         if (flag != CV_SUCCESS) {
@@ -4321,6 +4418,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     // user_data points into it.
     CVRhsFn rhs_fn = setup_codegen_rhs(opts, user_data, codegen_param_buf);
     run_rhs_fn = rhs_fn;
+    user_data.dq_rhs = rhs_fn;
 
     int flag = CVodeInit(cvode_mem, rhs_fn, times.t_start, y);
     if (flag != CV_SUCCESS) {
