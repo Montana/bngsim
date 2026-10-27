@@ -2551,13 +2551,17 @@ class Model:
         worst = None
         for other, at, columns in ((own, "1.5e-8 of itself", changed), (half, "half that", taken)):
             for j in columns:
-                largest = float(np.max(np.abs(dense[:, j])))
+                # Over the entries that are numbers, as steady_state takes it: an
+                # entry that is none has no answer to confirm, and made the
+                # column's largest NaN, which no entry exceeded.
+                finite = np.isfinite(dense[:, j])
+                largest = float(np.max(np.abs(dense[finite, j]))) if finite.any() else 0.0
                 held_to = np.maximum(np.abs(dense[:, j]), 1e-6 * largest)
                 # An entry that is no number at the second step is as far
                 # apart as can be.
                 apart = np.abs(other[:, j] - dense[:, j])
                 apart[np.isnan(apart)] = np.inf
-                exceeds = apart > 1e-4 * held_to
+                exceeds = finite & (apart > 1e-4 * held_to)
                 if not exceeds.any():
                     continue
                 with np.errstate(divide="ignore", invalid="ignore"):
@@ -2978,7 +2982,7 @@ class Model:
 
 
 # Why a difference quotient's step can decide its answer (issue #1002), said
-# once for the Model.jacobian() warning and the steady-state refusal alike.
+# once for the Model.jacobian() refusal and the steady-state one alike.
 _STEP_DECIDES_WHY = (
     "A species far below the state's scale is stepped by many times itself at the "
     "first, which reads a term of second order in it as a secant across it, and a "

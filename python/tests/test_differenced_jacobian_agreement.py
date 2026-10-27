@@ -274,8 +274,14 @@ def test_a_row_the_own_step_sees_nothing_of_does_not_hide_a_column_it_decides(tm
     path = tmp_path / "grain_row.net"
     path.write_text(ALL_GRAIN.format(s=S, k1=K1, k2=K2, kd=KD, big=float(big), k=float(k)))
     model = bngsim.Model.from_net(path)
-    with pytest.raises(bngsim.SimulationError, match=r"dY_ss/dp .*issue #1002"):
+    with pytest.raises(bngsim.SimulationError, match=r"dY_ss/dp .*issue #1002") as err:
         _steady(model, jacobian="fd")
+    # The entry furthest apart relative to itself is X's own: the secant at
+    # the floored step, against the closed form at X's own step.
+    msg = str(err.value)
+    floored = {1e8: 0.202473, 1e10: 0.00453885}[big]
+    assert f"dX()/ds is {floored:.6g} with every species stepped" in msg
+    assert f"{DX_DS:.6g} with X() stepped by 1.5e-8 of itself" in msg
 
 
 def test_a_grain_row_beside_a_column_both_steps_agree_on_is_returned(tmp_path):
@@ -493,7 +499,16 @@ def test_a_species_at_0_the_parameter_moves_is_refused(tmp_path, big):
     is 4.7594 and 0.7705."""
     with pytest.raises(bngsim.SimulationError, match=r"issue #1002") as err:
         _steady(_model(tmp_path, big, functions=(), s=0.0), jacobian="fd")
-    assert "stepped by half the first step" in str(err.value)
+    msg = str(err.value)
+    assert "stepped by half the first step" in msg
+    # The entry furthest apart relative to itself: at G = 1e4, D's, whose
+    # floored secant k2·h·dX*/ds/kd stands for 0; at 1e8, X's own.
+    h = SQRT_EPS * float(big)
+    floored_x = 1.0 / (K1 + 2 * K2 * h)
+    if big < 1e6:
+        assert f"dD()/ds is {K2 * h * floored_x / KD:.6g}" in msg
+    else:
+        assert f"dX()/ds is {floored_x:.6g}" in msg
 
 
 @pytest.mark.parametrize("big", [1.0, 1e8])
@@ -889,3 +904,39 @@ def test_an_entry_of_rounding_residue_is_not_held_to_itself(tmp_path, monkeypatc
     assert model.jacobian(np.array([1.3 / K1, 1e8, float(out.concentrations[2])])).source == (
         "finite-difference"
     )
+
+
+def test_model_jacobian_does_not_hold_rounding_to_itself(tmp_path, monkeypatch):
+    """Control. Y is made at ``k·((X + K) − K − X)`` with K = 3, the rounding
+    of a sum: its entry in X's column is -3.7e-17 at the floored step and
+    -7.5e-17 at half of it, beside -k1 = -0.21. Held to 1e-4 of itself the
+    matrix was refused; the floor, 1e-10 of the column's largest, returns it,
+    as ``steady_state`` does its columns."""
+    text = RESIDUE.replace("    5 k   1.0\n", "    5 k   1.0\n    6 K   3.0\n").replace(
+        "((Xo + 1) - 1 - Xo)", "((Xo + K) - K - Xo)"
+    )
+    path = tmp_path / "residue_k.net"
+    path.write_text(text)
+    model = bngsim.Model.from_net(path)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    assert model.jacobian(np.array([0.3, 1e8, 0.0])).source == "finite-difference"
+
+
+def test_model_jacobian_checks_a_column_with_an_entry_that_is_no_number(tmp_path, monkeypatch):
+    """W is made at ``sqrt(X − 10)``, no number at X = 6.19, so X's column has
+    a NaN in W's row. The column's largest was NaN, which no entry exceeds,
+    and the column was not checked: G's entry, 13.871 at the floored step and
+    13.126 at half of it, was returned. The check is over the entries that
+    are numbers, as ``steady_state``'s is, and refuses it."""
+    text = SECOND_ORDER.format(s=S, k1=K1, big=1e8).replace("    1 gx() abs(Xo)*Xo + Go\n", "")
+    text = (
+        text.replace("    2 G() 100000000.0\n", "    2 G() 100000000.0\n    3 W() 0\n")
+        .replace("begin functions\n", "begin functions\n    1 wr() sqrt(Xo - 10)\n")
+        .replace("    5 2 0 dg\n", "    5 2 0 dg\n    6 0 3 wr\n")
+    )
+    path = tmp_path / "nan_row.net"
+    path.write_text(text)
+    model = bngsim.Model.from_net(path)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    with pytest.raises(bngsim.SimulationError, match=r"d\(rate of G\(\)\)/dX\(\) is 13\.8711"):
+        model.jacobian(np.array([SO_X, 1e8 + SO_X * SO_X, 0.0]))
