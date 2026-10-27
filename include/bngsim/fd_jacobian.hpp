@@ -399,14 +399,6 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 // A column is tested only where `fd_jump_testable` holds, and of the mends it
 // takes, only some are kept:
 //
-// - Its species is not moving toward the jump its step would cross. Moving
-//   toward it, the large slope is what lets CVODE hold a species that parks
-//   just short of it: the #176 fixture parks V 1e-11 under a step, the closed
-//   form and a mended matrix both collapse the step there, and the straddled
-//   quotient integrates it to 2.5e-7 of the exact branch. Toward a jump that
-//   stays put, the run crosses it soon and its matrix is formed again beyond
-//   it. Toward one that recedes, or one the run slides along, it does not, and
-//   the run is wrong as on main (in the PR's "Left alone").
 // - Where nothing moves the species (its row is zero), every mend is kept: its
 //   column reaches Newton only through rounding, which a jump-sized entry
 //   turns into a flip of the law.
@@ -416,10 +408,15 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
 //   (`fd_jump_came_across`). A large entry on the diagonal is what freezes a
 //   species in Newton's iteration, so the run follows its predictor; one in
 //   another species' row, of a species that moves, turns its corrections into
-//   that row's, which fails the iteration and forms the matrix again. In
-//   #903's `split`, V + V2 parks 1e-11 under the #176 step while V leaves at
-//   0.38 and V2 arrives at 0.38: V's step crosses, in other species' rows, and
-//   mended there the run crossed (0.633 off at rtol 1e-7, where main is right).
+//   that row's, which fails the iteration and forms the matrix again. And it is
+//   what lets CVODE hold a species that parks just short of a jump in another
+//   species' law: the #176 fixture parks V 1e-11 under the step of `v_rec`,
+//   the closed form and a mended matrix both collapse the step there, and the
+//   straddled quotient integrates it to 2.5e-7 of the exact branch. In #903's
+//   `split`, V + V2 parks there while V leaves at 0.38 and V2 arrives at 0.38:
+//   V's step crosses, in those rows, and mended there the run crossed (0.633
+//   off at rtol 1e-7, where main is right). A run that slides along a moving
+//   threshold is wrong as on main (in the PR's "Left alone").
 //   The mended matrix, because a species' own straddled entry swells its
 //   row's terms: X at 0.1 beside `if(X > 5, ...)·X` had terms of 6.7e6.
 // - Parked, a species' rate is its solver's noise and points either way: with
@@ -445,12 +442,8 @@ constexpr double kFdJumpRatio = 16.0;
 constexpr double kFdJumpNoise = 1024.0;
 constexpr double kFdJumpParked = 1e-6;
 
-// Is a time integrator's column of species j, at `y` with its own rate
-// `f_self`, stepped by `inc`, tested for a jump?
-inline bool fd_jump_testable(double y, double f_self, double inc) {
-    if (f_self * inc > 0.0) {
-        return false;
-    }
+// Is the column of species j, at `y` and stepped by `inc`, tested for a jump?
+inline bool fd_jump_testable(double y, double inc) {
     return y == 0.0 || std::abs(y) > 2.0 * std::abs(inc);
 }
 

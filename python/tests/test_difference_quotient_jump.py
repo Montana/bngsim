@@ -192,6 +192,23 @@ def test_a_law_steep_enough_to_step_like_a_jump(tmp_path: Path, kw: dict) -> Non
     assert _worst(s[:, 0], 5.0 * np.exp(-0.02 * t)) < OK
 
 
+def test_a_run_that_starts_on_a_threshold_that_recedes(tmp_path: Path) -> None:
+    """X0 = Y0 = 5 on `X > Y` (rate kx·X, kx 0.02 at or below Y, −1 above), Y
+    rising at 0.5: X rises too but never reaches Y, so X = 5·exp(0.02 t). X's
+    step crosses its own law's threshold at the start. Main: 1.5e-2 off (round
+    1 of the review)."""
+    model = _net(
+        tmp_path,
+        ["X() 5", "Y() 5", "S() 1"],
+        ["Xobs 1", "Yobs 2", "Sobs 3"],
+        ["k() kx*if(Xobs > Yobs, -1, 0.02)", "p() 0.5/Sobs"],
+        ["1 1,1 k", "3 2,3 p"],
+        declined=True,
+    )
+    t, s = _run(model, 40.0, 41, jacobian="fd")
+    assert _worst(s[:, 0], 5.0 * np.exp(0.02 * t)) < OK
+
+
 def test_a_crossing_during_the_run(tmp_path: Path) -> None:
     """Control. X0 = 10 crosses 5 at t = 17.3: no matrix is formed within a step
     of the threshold. Right on main too."""

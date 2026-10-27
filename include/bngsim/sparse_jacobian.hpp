@@ -216,9 +216,9 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // entries may step across a jump, two at minus one and minus two steps; an
 // entry that does is given fd_entry_past_jump. A column of a color leaves the
 // rows of the other columns of that color alone, so one evaluation serves them
-// all, as the quotient's own does. The session is an integrator, so a column is
-// tested only where fd_jump_testable takes it. Null leaves the quotient as it
-// was. `*n_mended` (if given) counts the entries mended.
+// all, as the quotient's own does. A column is tested where fd_jump_testable
+// takes it, and its mends are kept as fd_jacobian.hpp says. Null leaves the
+// quotient as it was. `*n_mended` (if given) counts the entries mended.
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
                                 const double *fy, double *jac_data, double *y_pert, double *fy_pert,
@@ -288,7 +288,7 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
     std::vector<FdJumpMend> mends;
     for (int c = 0; c < sp.n_colors; ++c) {
         const auto &group = sp.color_groups[c];
-        auto mendable = [&](int j) { return fd_jump_testable(y[j], fy[j], h_vals[j]); };
+        auto mendable = [&](int j) { return fd_jump_testable(y[j], h_vals[j]); };
         if (std::none_of(group.begin(), group.end(), mendable) || !side(group, 2.0, f2)) {
             continue;
         }

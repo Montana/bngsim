@@ -119,7 +119,7 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
         double *col = SUNDenseMatrix_Column(J, j);
         const double yj = yd[j];
         const double inc = inc_of(j, yj);
-        if (!fd_jump_testable(yj, f0[j], inc) || !side_at(j, yj, 2.0, f2)) {
+        if (!fd_jump_testable(yj, inc) || !side_at(j, yj, 2.0, f2)) {
             continue;
         }
         // f(y + h) is f0 + h·col to the rounding of the column formula.
