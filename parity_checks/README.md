@@ -15,6 +15,8 @@ benchmarking (`benchmarks/`).
 | [`bng_parity`](bng_parity/) | BNGL / .net | ODE, SSA, NF | legacy BNG stack (BNG2.pl / run_network / NFsim) |
 | [`amici_parity`](amici_parity/) | SBML | sensitivities / gradients | AMICI |
 | [`codegen_paths`](codegen_paths/) | BNGL → .net | ODE codegen, forward sensitivities | bngsim's own interpreter, plus finite differences: the `.net` and model-based codegen paths against each other (issue #803) |
+| [`fd_sens`](fd_sens/) | .net | forward sensitivities | central differences of bngsim's own plain runs, and a tolerance sweep of the analytic columns (issues #804, #1257) |
+| [`differential`](differential/) | .net, SBML | ODE, forward sensitivities | bngsim's own paths, each against another: sensitivity vs plain run, FD vs analytic Jacobian, KLU vs dense, compiled vs interpreted, cc vs MIR, a comma-decimal locale vs C; plus a refused sensitivity run, a sparsity pattern that misses entries, a backend other than the one asked for (issue #1257) |
 | [`_core`](_core/) | — | — | shared contracts only, **no models** |
 
 Each suite is self-contained: its own vendored `models/`, a spec manifest, an

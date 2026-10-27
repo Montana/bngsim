@@ -106,6 +106,27 @@ REFERENCE_ENGINE = "finite_difference"
 # starts at the child's spawn, before the worker's.
 CAP_SHARE = 0.9
 
+# The tolerance sweep (issue #1257): the analytic run again at two tolerances
+# far tighter than the suite's. An analytic column converges with the
+# tolerance; a column on CVODES' difference quotient that does not converge
+# still moves there, which is how the narrow clamp pulse of #1227 showed (5x
+# off, and a difference of plain runs at one tolerance did not see it). Judged
+# only where the trajectory itself settles between the two: a model that
+# amplifies every difference moves its columns with the tolerance too, and no
+# oracle can judge those (LV).
+SWEEP_RTOLS = (1e-10, 1e-12)
+# atol at each, relative to its rtol
+SWEEP_ATOL_RATIO = 1e-2
+# The trajectory settled: the two runs' states this close on their peak.
+SWEEP_SETTLED = 1e-6
+# A column that moves more than this on its own peak between the two has not
+# converged.
+SWEEP_TOL = 1e-3
+# A column under this of the state's peak, scaled by its parameter (|p|·dx/dp,
+# in the state's units), is zero to the arithmetic, and is not asked to
+# converge: erk_activation's 3.9e-23 beside a state of 3e6.
+SWEEP_ROUNDING = 1e-14
+
 
 def load_model(path: Path):
     import bngsim
@@ -359,6 +380,95 @@ def column_verdicts(analytic, reference, gap, x_max: float, values, atol: float,
     return out
 
 
+def tolerance_sweep(runs, params, judged=None, values=None) -> dict:
+    """The sweep's finding on ``runs``, ``[(species, sensitivities)]`` at
+    :data:`SWEEP_RTOLS` (loosest first): ``settled`` (the trajectory converged
+    between them), ``state_gap``, and per parameter column of ``judged`` (all of
+    ``params`` by default) above the state's rounding, how far it moved on its
+    own peak (``column_gaps``). ``moving`` names the columns past
+    :data:`SWEEP_TOL`, only where the trajectory settled. ``values`` are the
+    parameters' (1 each by default), which put a column on the state's scale."""
+    judged = set(params if judged is None else judged)
+    values = [1.0] * len(params) if values is None else values
+    (x1, s1), (x2, s2) = (
+        (np.asarray(x, dtype=float), np.asarray(sx, dtype=float)) for x, sx in runs
+    )
+    if x1.shape != x2.shape or s1.shape != s2.shape:
+        return {"settled": False, "state_gap": float("inf"), "column_gaps": {}, "moving": []}
+    peak = float(np.nanmax(np.abs(x2))) if x2.size else 0.0
+    state_gap = float(np.nanmax(np.abs(x1 - x2)) / peak) if peak > 0.0 else 0.0
+    settled = bool(np.isfinite(state_gap) and state_gap <= SWEEP_SETTLED)
+    gaps = {}
+    for j, p in enumerate(params):
+        if p not in judged:
+            continue
+        col = s2[..., j]
+        size = float(np.nanmax(np.abs(col))) if col.size else 0.0
+        # On the state's scale, not an absolute 1e-14: nanomolar_dimer's columns
+        # are 1e-28 and 6e-20 per unit of parameters of 2e18 and 4e9, and 17% of
+        # its 1.5e-9 peak per relative change, and an absolute floor left out both.
+        if not (peak > 0.0 and size * (abs(values[j]) or 1.0) > SWEEP_ROUNDING * peak):
+            continue
+        gaps[p] = float(np.nanmax(np.abs(s1[..., j] - col)) / size)
+    moving = [p for p, g in gaps.items() if settled and not g <= SWEEP_TOL]
+    return {"settled": settled, "state_gap": state_gap, "column_gaps": gaps, "moving": moving}
+
+
+def _sweep_runs(path: Path, params: list[str], spec: dict, deadline=None):
+    """The analytic run at each of :data:`SWEEP_RTOLS`. ``deadline`` (a
+    ``time.perf_counter()`` reading) bounds each run's integration (its build
+    is the analytic run's, cached), so a sweep too slow for the job's cap fails
+    as a sweep and leaves the verdict, instead of running the job into a
+    TIMEOUT."""
+    import bngsim
+
+    out = []
+    for rtol in SWEEP_RTOLS:
+        budget = None
+        if deadline is not None:
+            budget = deadline - time.perf_counter()
+            if budget <= 0.0:
+                raise ReferenceOverBudget("no time left in the job's cap for the sweep")
+        model = load_model(path)
+        run = bngsim.Simulator(
+            model,
+            method="ode",
+            sensitivity_params=list(params),
+            sensitivity_method=spec["sens_method"],
+        ).run(
+            t_span=(spec["t_start"], spec["t_end"]),
+            n_points=spec["n_points"],
+            rtol=rtol,
+            atol=rtol * SWEEP_ATOL_RATIO,
+            max_steps=spec.get("max_steps", 100_000),
+            timeout=budget,
+        )
+        out.append((run.species, run.sensitivities))
+    return out
+
+
+def _apply_sweep(res: dict, sweep: dict) -> None:
+    """The sweep's verdict over the difference's, into ``res``: a column that
+    does not converge with the tolerance where the trajectory does is a DIFF,
+    whatever the difference said (it may pass, or have been unable to judge)."""
+    res["sweep_settled"] = sweep["settled"]
+    res["sweep_state_gap"] = sweep["state_gap"]
+    res["sweep_worst"] = max(sweep["column_gaps"].values(), default=0.0)
+    if sweep["moving"] and res.get("status") in ("pass", "bad_test", "diff"):
+        worst = max(sweep["column_gaps"][p] for p in sweep["moving"])
+        res["columns_diff"] = sorted(set(res.get("columns_diff") or []) | set(sweep["moving"]))
+        res.update(
+            status="diff",
+            value=max(float(res.get("value") or 0.0), worst),
+            why=(
+                f"the analytic columns {', '.join(sweep['moving'])} still move by "
+                f"{worst:.2e} of their peak between rtol {SWEEP_RTOLS[0]:g} and "
+                f"{SWEEP_RTOLS[1]:g}, where the trajectory settles to "
+                f"{sweep['state_gap']:.1e}: they do not converge with the tolerance"
+            ),
+        )
+
+
 def _judge(res: dict, analytic, reference, gap, species, values, spec: dict) -> None:
     """The verdict on two same-shaped tensors, into ``res``: which columns are
     judged, whether the reference converged where the verdict looks, then
@@ -512,6 +622,21 @@ def _worker(spec: dict, q) -> None:
         else:
             species = np.asarray(run.species, dtype=float)
             _judge(res, analytic, reference, gap, species, values, spec)
+        # The sweep asks of the columns the verdict judged, those above the
+        # solver's resolution: a column that is 0 to the integration (the
+        # position and width of a pulse whose area holds) reads its noise, and
+        # its noise moves with the tolerance.
+        judged = [p for p in params if p not in (res.get("columns_not_judged") or ())]
+        if (
+            spec.get("sweep", True)
+            and judged
+            and res.get("status") in ("pass", "bad_test", "diff")
+        ):
+            try:
+                runs = _sweep_runs(path, params, spec, deadline=t0 + CAP_SHARE * spec["timeout"])
+                _apply_sweep(res, tolerance_sweep(runs, params, judged, values))
+            except Exception as e:  # noqa: BLE001 - a sweep that does not run judges nothing
+                res["sweep_error"] = f"{type(e).__name__}: {str(e)[:200]}"
     except Exception as e:  # noqa: BLE001 - one model's failure is that row's EXCEPTION
         captured = capture_exception("bngsim", e)
         res.update(status="exception", exception=captured.text, exception_class=captured.cls)
@@ -549,6 +674,7 @@ def make_specs(jobs: list[dict], args) -> list[dict]:
                     # atol is absolute, and the atol/|p| floor with it.
                     "atol": float(job.get("atol", args.atol)),
                     "fd_tol": args.fd_tol,
+                    "sweep": not getattr(args, "no_sweep", False),
                     "param_cap": int(job.get("param_cap", args.param_cap)),
                     "sens_method": method,
                     "timeout": float(job.get("timeout", args.timeout)),
@@ -584,6 +710,10 @@ def to_result(spec: dict, r: dict, stamp: dict) -> JobResult:
         "resolvable_columns": r.get("resolvable_columns"),
         "columns_diff": r.get("columns_diff"),
         "sens_rhs_decline_reason": r.get("sens_rhs_decline_reason"),
+        "sweep_settled": r.get("sweep_settled"),
+        "sweep_state_gap": r.get("sweep_state_gap"),
+        "sweep_worst": r.get("sweep_worst"),
+        "sweep_error": r.get("sweep_error"),
         **(r.get("verdict") or {}),
     }
     return JobResult(
@@ -623,6 +753,7 @@ def main(argv=None) -> int:
         "is declared unconverged (BAD_TEST)",
     )
     ap.add_argument("--param-cap", type=int, default=DEFAULT_PARAM_CAP)
+    ap.add_argument("--no-sweep", action="store_true", help="leave the tolerance sweep out")
     ap.add_argument("--models", default="", help="comma-separated model_id substrings")
     args = ap.parse_args(argv)
 
@@ -659,6 +790,7 @@ def main(argv=None) -> int:
             "fd_atol": FD_ATOL,
             "fd_rel_step": FD_REL_STEP,
             "fd_tol": args.fd_tol,
+            "sweep_rtols": None if args.no_sweep else list(SWEEP_RTOLS),
             "param_cap": args.param_cap,
         },
         "hardware": asens.hardware_info(),
