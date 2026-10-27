@@ -553,7 +553,14 @@ def _settled_run(base: Base):
         try:
             job = base.job
             keep = _judged(load(job.path))
-            y = _steady_run(job)
+            try:
+                y = _steady_run(job)
+                tight = _steady_run(job, rtol_scale=0.1)[-1]
+            except Exception as e:  # noqa: BLE001 - the parity suites own a run that fails
+                raise _Unsettled(
+                    f"no reference: the run to t={STEADY_HORIZON:g}, or at a tenfold tighter "
+                    f"tolerance, did not complete ({type(e).__name__}: {_first_line(e)})"
+                ) from e
             floor = PATH_RTOL_FACTOR * job.atol
             settle = gap(y[-1][keep], y[-2][keep], floor)
             if not settle <= SETTLED_RTOL_FACTOR * job.rtol:
@@ -561,9 +568,9 @@ def _settled_run(base: Base):
                     f"the run has not settled by t={STEADY_HORIZON:g}: it moves "
                     f"{settle:.1e} of its peak over the last quarter"
                 )
-            drift = gap(_steady_run(job, rtol_scale=0.1)[-1][keep], y[-1][keep], floor)
+            drift = gap(tight[keep], y[-1][keep], floor)
             limit = max(PATH_RTOL_FACTOR * job.rtol, DRIFT_FACTOR * max(settle, drift))
-            base._steady = (y[-1], keep, limit, settle, drift)
+            base._steady = (y[-1], keep, limit, settle, drift, y[0])
         except Exception as e:  # noqa: BLE001 - every steady check reads it
             base._steady = e
     if isinstance(base._steady, Exception):
@@ -622,7 +629,7 @@ def check_steady(base: Base, method: str) -> Verdict:
                 note=f"steady_state(method={method!r}) did not converge (residual {ss.residual:.1e})",
             )
         try:
-            end, _, limit, settle, drift = _settled_run(base)
+            end, _, limit, settle, drift, start = _settled_run(base)
         except _Unsettled as e:
             return Verdict("skip", note=str(e))
         x = np.asarray(ss.concentrations, dtype=float)
@@ -662,6 +669,17 @@ def check_steady(base: Base, method: str) -> Verdict:
         lam = np.linalg.eigvals(np.asarray(model.jacobian(x), dtype=float))
         top = float(lam.real.max()) if lam.size else 0.0
         if top > UNSTABLE_SHARE * float(np.abs(lam).max()):
+            if gap(x[keep], start[keep], floor) <= limit:
+                # The initial state is that root: the solve stays, as the
+                # trajectory does in exact arithmetic, and the run leaves it on
+                # rounding alone (BIOMD0000000518, at an eigenvalue of 5.6e-4).
+                return Verdict(
+                    "skip",
+                    g,
+                    f"the initial state is an unstable root (an eigenvalue of {top:.2e}): "
+                    f"the solve stays on it, the run leaves it on rounding; {where} at "
+                    f"the run's end; {note}",
+                )
             return Verdict(
                 "diff",
                 g,

@@ -620,6 +620,34 @@ def test_an_unstable_root_a_run_does_not_leave_is_a_finding(monkeypatch):
     assert v.status == "diff" and "unstable root" in v.note, v
 
 
+def test_an_initial_state_on_an_unstable_root_is_not_a_finding(monkeypatch):
+    """The cubic from x0 = 0.3 exactly: the solve stays on the root it starts
+    on, as the trajectory does in exact arithmetic; a run that leaves it on
+    rounding is no reference (BIOMD0000000518)."""
+    job = _steady_job("cubic-on-root", _CUBIC.format(x0=0.3))
+    base = D.Base(job)
+    real = D._steady_run
+
+    def rounding(job, state=None, rtol_scale=1.0):
+        return real(job, state if state is not None else [0.3e-9 * (1 + 1e-6)], rtol_scale)
+
+    monkeypatch.setattr(D, "_steady_run", rounding)
+    _plant(monkeypatch, state=lambda x: np.full_like(x, 0.3e-9))
+    v = D.check_steady(base, "integration")
+    assert v.status == "skip" and "the initial state is an unstable root" in v.note, v
+
+
+def test_a_run_to_equilibrium_that_fails_is_no_reference(monkeypatch):
+    base = D.Base(_STEADY["cubic"])
+
+    def fails(*a, **kw):
+        raise bngsim.SimulationError("CVODE integration failed (CV_CONV_FAILURE)")
+
+    monkeypatch.setattr(D, "_steady_run", fails)
+    v = D.check_steady(base, "integration")
+    assert v.status == "skip" and "no reference: the run to t=1e+06, or at a tenfold" in v.note, v
+
+
 def test_a_run_that_has_not_settled_is_not_judged(monkeypatch):
     """A limit cycle has no state for steady_state() to be, converged or not:
     SKIP, said why, never a finding."""
