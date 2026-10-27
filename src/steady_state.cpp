@@ -4871,10 +4871,17 @@ static void ss_measure_root(SteadyStateRhs &rhs, SteadyStateResult &result, cons
     rhs.eval(0.0, y_ss, f.data());
 }
 
-// How far apart the columns from the two difference-quotient matrices of issue
-// #1002 may be, as a part of the column's largest entry, before they are not
-// the same answer.
+// How far apart an entry of the columns from the difference-quotient matrices
+// of issue #1002 may be, as a part of itself, before they are not the same
+// answer. Held to 1e-4 of the column's largest entry instead, an entry small
+// within its column could be far off and pass: X + X -> X + X + G at k = 1e-6
+// beside G at 1e8 returned dG*/ds = 6.6e-5 for 5.9e-5, 1.4e-5 of dX*/ds.
 static constexpr double kFdAnswersAgree = 1e-4;
+
+// The least an entry is held to, as a part of its column's largest: an entry
+// that is the rounding of a column (1e-36 beside 4.8) cannot agree with itself
+// to 1e-4 at two steps, and is not an answer to confirm.
+static constexpr double kFdEntryFloor = 1e-6;
 
 // Issue #1002: a Jacobian that is a difference quotient is stepped at the
 // floored step (bngsim/fd_jacobian.hpp), which reads a term of second order in
@@ -4886,8 +4893,9 @@ static constexpr double kFdAnswersAgree = 1e-4;
 // species at 0, at half the floored step (fd_half_step_columns), which a
 // secant moves with and a slope does not, in a row the own step cannot read
 // too. Where either answer is further from the floored one than
-// kFdAnswersAgree of a column's largest, the entry that is furthest is put on
-// the result, which steady_state() refuses. Where they agree, the columns are
+// kFdAnswersAgree of the entry (of kFdEntryFloor of its column's largest, at
+// least), the entry that is furthest is put on the result, which
+// steady_state() refuses. Where they agree, the columns are
 // the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
 // solve that gave result.sensitivity, at the state result.concentrations.
 //
@@ -4965,11 +4973,13 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
             const double apart = std::isnan(own_apart) || std::isnan(half_apart)
                                      ? std::numeric_limits<double>::quiet_NaN()
                                      : std::max(own_apart, half_apart);
-            if (apart <= kFdAnswersAgree * largest) {
+            const double held_to =
+                std::max(std::abs(result.sensitivity[k]), kFdEntryFloor * largest);
+            if (apart <= kFdAnswersAgree * held_to) {
                 continue;
             }
-            const double share = largest > 0.0 && std::isfinite(apart)
-                                     ? apart / largest
+            const double share = held_to > 0.0 && std::isfinite(apart)
+                                     ? apart / held_to
                                      : std::numeric_limits<double>::infinity();
             if (result.sens_fd_disagree_species < 0 || share > worst) {
                 worst = share;

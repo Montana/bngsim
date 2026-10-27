@@ -1565,8 +1565,9 @@ struct SteadyStateResult {
     // state's scale at their own step (fd_own_step_columns, in
     // bngsim/fd_jacobian.hpp). sens_fd_own_step_species are the species
     // (0-based) whose columns that changed; empty where none did, and then
-    // there is nothing to compare. Where the two answers are further apart
-    // than 1e-4 of a column's largest entry, sens_fd_disagree_species and
+    // there is nothing to compare. Where an entry of the two answers is
+    // further apart than 1e-4 of itself (1e-10 of its column's largest, at
+    // least), sens_fd_disagree_species and
     // sens_fd_disagree_param are the entry furthest apart (0-based species, and
     // column into sens_param_names; -1 where none is) and sens_fd_floored and
     // sens_fd_own_step its two values, the first being the one in

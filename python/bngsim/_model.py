@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, overload
 
 import numpy as np
 
-from bngsim._exceptions import ModelError, ParameterError, UnderSpecifiedModelError
+from bngsim._exceptions import (
+    ModelError,
+    ParameterError,
+    SimulationError,
+    UnderSpecifiedModelError,
+)
 from bngsim._extension_handle import raise_cannot_pickle, raise_cannot_shallow_copy
 
 
@@ -2488,6 +2493,11 @@ class Model:
         ModelError
             If rates of change are written in terms of each other's ``rateOf``
             in a ring (an algebraic loop, which has no right-hand side).
+        SimulationError
+            If the matrix is a difference quotient whose step decides an entry
+            (issue #1002): the entry moves by more than 1e-4 of itself (1e-10 of
+            its column's largest, at least) when its column is taken again at
+            the species' own step or at half the first.
         """
         from bngsim._evaluators import (
             ANALYTICAL,
@@ -2511,29 +2521,30 @@ class Model:
                 vals = self._core.fill_sparse_analytical_jacobian(t, y_arr)
             else:
                 dense = self._core.fill_dense_fd_jacobian(t, y_arr)
-                self._warn_if_the_step_decides(t, y_arr, dense)
+                self._raise_if_the_step_decides(t, y_arr, dense)
                 vals = gather_pattern(self._core, dense)
             return csc_from_pattern(self._core, vals, source)
         if analytical:
             dense = self._core.fill_dense_analytical_jacobian(t, y_arr)
         else:
             dense = self._core.fill_dense_fd_jacobian(t, y_arr)
-            self._warn_if_the_step_decides(t, y_arr, dense)
+            self._raise_if_the_step_decides(t, y_arr, dense)
         return JacobianMatrix(dense, source)
 
-    def _warn_if_the_step_decides(self, t: float, y: np.ndarray, dense: np.ndarray) -> None:
-        """Warn where the difference quotient ``dense`` and the same matrix
-        with the columns of species far below the state's scale at their own
-        step differ by more than 1e-4 of a column's largest entry (issue
-        #1002). The first steps every species by 1.5e-8 of the state's largest
-        concentration, which reads a term of second order in a small species
-        as a secant across it; the second misses a term that reads it through a
-        sum with something much larger. The same is asked of the matrix with
-        those columns, and those of species at 0, taken whole at half the first
-        step, which a secant moves with and a slope does not, also in a row the
-        own step cannot read. ``steady_state`` refuses the columns it would
-        solve with such a matrix; here the matrix is returned, as it was, and
-        the warning names the entry."""
+    def _raise_if_the_step_decides(self, t: float, y: np.ndarray, dense: np.ndarray) -> None:
+        """Refuse the difference quotient ``dense`` where it and the same
+        matrix with the columns of species far below the state's scale at their
+        own step differ in an entry by more than 1e-4 of the entry (1e-10 of
+        its column's largest, at least; issue #1002). The first steps every
+        species by 1.5e-8 of the state's largest concentration, which reads a
+        term of second order in a small species as a secant across it; the
+        second misses a term that reads it through a sum with something much
+        larger. The same is asked of the matrix with those columns, and those
+        of species at 0, taken whole at half the first step, which a secant
+        moves with and a slope does not, also in a row the own step cannot
+        read. ``steady_state`` refuses the columns it would solve with such a
+        matrix, by the same rule. This returned the matrix beside a warning;
+        a warning beside an entry that may be wrong is no refusal."""
         floored = np.asfortranarray(dense)
         own, changed = self._core.fill_dense_fd_jacobian_own_step(t, y, floored)
         half, taken = self._core.fill_dense_fd_jacobian_half_step(t, y, floored)
@@ -2541,27 +2552,31 @@ class Model:
         for other, at, columns in ((own, "1.5e-8 of itself", changed), (half, "half that", taken)):
             for j in columns:
                 largest = float(np.max(np.abs(dense[:, j])))
+                held_to = np.maximum(np.abs(dense[:, j]), 1e-6 * largest)
                 # An entry that is no number at the second step is as far
                 # apart as can be.
                 apart = np.abs(other[:, j] - dense[:, j])
                 apart[np.isnan(apart)] = np.inf
-                i = int(np.argmax(apart))
-                share = apart[i] / largest if largest > 0.0 else np.inf
-                if apart[i] > 1e-4 * largest and (worst is None or share > worst[0]):
-                    worst = (share, i, j, other[i, j], at)
+                exceeds = apart > 1e-4 * held_to
+                if not exceeds.any():
+                    continue
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    share = np.where(exceeds, apart / held_to, 0.0)
+                share[exceeds & (held_to == 0.0)] = np.inf
+                i = int(np.argmax(share))
+                if worst is None or share[i] > worst[0]:
+                    worst = (share[i], i, j, other[i, j], at)
         if worst is None:
             return
         _, i, j, second, at = worst
         names = self.species_names
-        warnings.warn(
-            f"Model.jacobian(): the entry d(rate of {names[i]})/d{names[j]} of this "
-            f"difference quotient is {dense[i, j]:.6g} with {names[j]} stepped by 1.5e-8 of "
-            f"the state's largest concentration, and {second:.6g} stepped by {at}, more "
-            "than 1e-4 of its column's largest entry apart (issue #1002). "
-            f"{_STEP_DECIDES_WHY} The first is returned. "
-            "steady_state(sensitivity_params=...) refuses columns solved with such a matrix.",
-            UserWarning,
-            stacklevel=3,
+        raise SimulationError(
+            "Model.jacobian() does not return this difference quotient (issue #1002): "
+            f"the entry d(rate of {names[i]})/d{names[j]} is {dense[i, j]:.6g} with "
+            f"{names[j]} stepped by 1.5e-8 of the state's largest concentration, and "
+            f"{second:.6g} stepped by {at}, more than 1e-4 of itself (1e-10 of its "
+            f"column's largest, at least) apart. {_STEP_DECIDES_WHY} A model whose "
+            "rate laws all have a closed-form Jacobian has neither failure."
         )
 
     def propensities(self, y, t: float = 0.0) -> np.ndarray:
