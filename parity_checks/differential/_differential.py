@@ -52,8 +52,11 @@ paths disagree by that much, and so does one path against a tighter self
 (``LV``: 3e-6 apart at rtol 1e-12, 76% at 1e-8). A base that moves by more
 than :data:`UNJUDGEABLE_DRIFT` that way is no reference at all, and its paths
 are not judged (SKIP, said why). And a cell is judged on the
-trajectory's own scale, with the run's ``atol`` as its floor, so a state of 1e6
-is not held to an absolute 1e-3, nor one of 1e-9 let off by it.
+trajectory's own scale, past an absolute floor of the run's ``atol`` scaled as
+``rtol`` is (:data:`PATH_RTOL_FACTOR`), so a state of 1e6 is not held to an
+absolute 1e-3. A trajectory wholly under that floor (a BioModel in molar units,
+1e-6 at its atol of 1e-9) shows no difference inside it, so a path that stays
+inside is SKIP, said why, not PASS; one that clears it is still judged.
 
 Sensitivities against central differences are ``fd_sens``'s, not this module's:
 one oracle with one set of rules (``parity_checks/fd_sens``).
@@ -211,19 +214,55 @@ class Base:
         self.job = job
         self.x = np.asarray(result.species, dtype=float)
         self.backend = sim.codegen_backend
-        self.drift = own_drift(job, self.x)
+        # A tenfold tighter run that does not complete leaves the base no
+        # reference, not the model unrun: the checks that compare no answers
+        # (sparsity, backend, a sensitivity run's refusal) still apply.
+        self.drift_error = ""
+        try:
+            self.drift = own_drift(job, self.x)
+        except Exception as e:  # noqa: BLE001 - recorded on every comparison's note
+            self.drift = float("inf")
+            self.drift_error = f"{type(e).__name__}: {_first_line(e)}"
         self.limit = max(PATH_RTOL_FACTOR * job.rtol, DRIFT_FACTOR * self.drift)
 
+    def against(self, x) -> Base:
+        """This base's bound and drift, with ``x`` as the reference: another path
+        of the same model (the dense solver, the interpreter, cc)."""
+        ref = Base.__new__(Base)
+        ref.__dict__.update(self.__dict__, x=np.asarray(x, dtype=float))
+        return ref
+
     def compare(self, x, label: str = "") -> Verdict:
-        g = gap(x, self.x, PATH_RTOL_FACTOR * self.job.atol)
+        floor = PATH_RTOL_FACTOR * self.job.atol
+        g = gap(x, self.x, floor)
         note = f"{g:.2e} of the trajectory's peak (bound {self.limit:.1e}, own drift {self.drift:.1e})"
+        if self.drift_error:
+            return Verdict(
+                "skip",
+                g,
+                f"{label}no reference: the base at a tenfold tighter tolerance did not "
+                f"complete ({self.drift_error}); {note}",
+            )
         if not self.drift <= UNJUDGEABLE_DRIFT:
             return Verdict(
                 "skip",
                 g,
                 f"{label}no reference: the base itself moves by {self.drift:.1e} at a tenfold tighter tolerance; {note}",
             )
+        finite = np.abs(self.x[np.isfinite(self.x)])
+        peak = float(finite.max()) if finite.size else 0.0
+        if g == 0.0 and not peak > floor:
+            return Verdict(
+                "skip",
+                g,
+                f"{label}nothing could count: the trajectory's peak {peak:.1e} is under the "
+                f"absolute floor {floor:.1e} ({PATH_RTOL_FACTOR:g}·atol); {note}",
+            )
         return Verdict("pass" if g <= self.limit else "diff", g, f"{label}{note}")
+
+
+def _first_line(e: BaseException) -> str:
+    return str(e).splitlines()[0][:300] if str(e) else ""
 
 
 def _declined(e: Exception) -> bool:
@@ -242,9 +281,8 @@ def _declined(e: Exception) -> bool:
 
 
 def _verdict_of(e: Exception) -> Verdict:
-    text = str(e).splitlines()[0][:300] if str(e) else ""
     status = "unsupported" if _declined(e) or isinstance(e, _Declined) else "exception"
-    return Verdict(status, None, f"{type(e).__name__}: {text}")
+    return Verdict(status, None, f"{type(e).__name__}: {_first_line(e)}")
 
 
 def _guard(fn) -> Verdict:
@@ -271,7 +309,7 @@ def check_sens(base: Base) -> dict[str, Verdict]:
         # baseline makes a new one a finding. Telling them apart by the text
         # of the message would be guesswork.
         skip = Verdict("skip", note="the sensitivity run did not complete")
-        why = f"{type(e).__name__}: {str(e).splitlines()[0][:300] if str(e) else ''}"
+        why = f"{type(e).__name__}: {_first_line(e)}"
         return {"sens_runs": Verdict("unsupported", None, why), "sens_vs_plain": skip}
     rhs = "analytic" if sim.has_analytic_sens_rhs else "difference_quotient"
     extra = {"sens_rhs": rhs, "params": params}
@@ -300,7 +338,11 @@ def check_klu(base: Base) -> Verdict:
     differs is the linear solver and the Jacobian it is handed (KLU's FD
     Jacobian is colored over ``jacobian_sparsity``; the dense one differences
     every column). The FD Jacobian first, where #1254 was found; the analytic
-    one where bngsim declines KLU with the FD one."""
+    one where bngsim declines KLU with the FD one.
+
+    The reference is forced dense, not left to the automatic rule: that rule
+    sends a model of 50 species or more with a sparse Jacobian to KLU, and the
+    base with it, so an unforced reference there is KLU against KLU."""
     import bngsim
 
     if not bngsim._bngsim_core.HAS_KLU:
@@ -314,29 +356,57 @@ def check_klu(base: Base) -> Verdict:
                 if _sparse_declined(e):
                     continue
                 raise
-            ref = base
-            if jac != "auto":
-                dense, _ = run(base.job, jacobian=jac)
-                ref = Base.__new__(Base)
-                ref.__dict__.update(base.__dict__, x=np.asarray(dense.species, dtype=float))
-            return ref.compare(x.species, f'jacobian="{jac}", KLU against dense: ')
+            dense, _ = run(base.job, force_dense_linear_solver=True, jacobian=jac)
+            return base.against(dense.species).compare(
+                x.species, f'jacobian="{jac}", KLU against dense: '
+            )
         return Verdict("unsupported", None, "bngsim declines KLU on either Jacobian, by name")
 
     return _guard(go)
 
 
+#: How a machine without a C compiler shows through bngsim's build: Windows'
+#: compiler lookup, a ``cc`` that is not there (FileNotFoundError), and macOS's
+#: ``cc`` shim without the Command Line Tools.
+_NO_COMPILER = ("No C compiler found", "C compiler not found", "invalid active developer path")
+
+
 def _compiled(job: Job):
+    """A ``codegen=True`` run: the Result and the Simulator. Which backend ran is
+    the caller's to judge: ``codegen=True`` builds compiled code or raises, so
+    one that ran the interpreter is ``backend_as_asked``'s finding, not a
+    machine without a compiler."""
     try:
-        result, sim = run(job, codegen=True)
+        return run(job, codegen=True)
     except RuntimeError as e:
         if "codegen declined this model" in str(e):
-            raise _Declined(str(e).splitlines()[0][:300]) from e
-        if "No C compiler found" in str(e):  # a machine without cc: no cc path here
+            raise _Declined(_first_line(e)) from e
+        if any(s in str(e) for s in _NO_COMPILER):  # a machine without cc: no cc path here
             raise _NoCompiler("codegen=True found no C compiler") from e
         raise
-    if sim.codegen_backend == "exprtk":
-        raise _NoCompiler("codegen=True ran the interpreter: no codegen backend")
-    return result, sim
+
+
+def _paths(base: Base, key: str, fn):
+    """``fn()`` once per base: ``cc_vs_interp`` and ``backend_as_asked`` ask for
+    the same two runs. A path that raised raises again."""
+    memo = base.__dict__.setdefault("_paths", {})
+    if key not in memo:
+        try:
+            memo[key] = (fn(), None)
+        except Exception as e:  # noqa: BLE001 - re-raised to each caller
+            memo[key] = (None, e)
+    value, err = memo[key]
+    if err is not None:
+        raise err
+    return value
+
+
+def _interpreted(base: Base):
+    return _paths(base, "codegen=False", lambda: run(base.job, codegen=False))
+
+
+def _compiled_of(base: Base):
+    return _paths(base, "codegen=True", lambda: _compiled(base.job))
 
 
 class _NoCompiler(RuntimeError):
@@ -350,14 +420,17 @@ class _Declined(RuntimeError):
 
 def check_cc_vs_interp(base: Base) -> Verdict:
     def go():
-        interp, _ = run(base.job, codegen=False)
+        interp, _ = _interpreted(base)
         try:
-            compiled, sim = _compiled(base.job)
+            compiled, sim = _compiled_of(base)
         except _NoCompiler as e:
             return Verdict("skip", note=str(e))
-        ref = Base.__new__(Base)
-        ref.__dict__.update(base.__dict__, x=np.asarray(interp.species, dtype=float))
-        return ref.compare(compiled.species, f"{sim.codegen_backend} against exprtk: ")
+        if sim.codegen_backend == "exprtk":
+            # backend_as_asked's finding; here, the interpreter against itself
+            return Verdict("skip", note="codegen=True ran exprtk: no compiled path to compare")
+        return base.against(interp.species).compare(
+            compiled.species, f"{sim.codegen_backend} against exprtk: "
+        )
 
     return _guard(go)
 
@@ -390,16 +463,20 @@ def check_cc_vs_mir(base: Base) -> Verdict:
         # MIR leg sets it for its whole suite) would compare MIR with itself.
         try:
             with _env("BNGSIM_CODEGEN_JIT", None):
-                cc, _ = _compiled(base.job)
+                cc, cc_sim = _compiled(base.job)
         except _NoCompiler as e:
             return Verdict("skip", note=str(e))
+        if cc_sim.codegen_backend != "cc":
+            return Verdict(
+                "diff",
+                None,
+                f"codegen=True without BNGSIM_CODEGEN_JIT ran {cc_sim.codegen_backend}",
+            )
         with _env("BNGSIM_CODEGEN_JIT", "mir"):
             mir, sim = run(base.job, codegen=True)
         if sim.codegen_backend != "mir":
             return Verdict("diff", None, f"BNGSIM_CODEGEN_JIT=mir ran {sim.codegen_backend}")
-        ref = Base.__new__(Base)
-        ref.__dict__.update(base.__dict__, x=np.asarray(cc.species, dtype=float))
-        return ref.compare(mir.species, "mir against cc: ")
+        return base.against(cc.species).compare(mir.species, "mir against cc: ")
 
     return _guard(go)
 
@@ -425,15 +502,17 @@ def check_backend(base: Base) -> Verdict:
     """codegen=False runs the interpreter; codegen=True compiled code."""
 
     def go():
-        _, interp = run(base.job, codegen=False)
+        _, interp = _interpreted(base)
         asked = {"codegen=False": interp.codegen_backend}
         if interp.codegen_backend != "exprtk":
             return Verdict("diff", None, f"codegen=False ran {interp.codegen_backend}", asked)
         try:
-            _, sim = _compiled(base.job)
+            _, sim = _compiled_of(base)
         except _NoCompiler as e:
             return Verdict("skip", note=str(e), extra=asked)
         asked["codegen=True"] = sim.codegen_backend
+        if sim.codegen_backend == "exprtk":
+            return Verdict("diff", None, "codegen=True ran exprtk", asked)
         return Verdict("pass", note=", ".join(f"{k}: {v}" for k, v in asked.items()), extra=asked)
 
     return _guard(go)
@@ -443,8 +522,8 @@ def sparsity_misses(model, states, t=0.0, rel=1e-6, floor=1e-8) -> list[tuple[in
     """The (row, column) entries central differences of the right-hand side find
     nonzero at any of ``states``, which ``jacobian_sparsity`` has no slot for.
 
-    An entry is nonzero when, at both steps ``h`` and ``h/2`` (relative to the
-    state's own size, or to ``rel`` of its largest where it is 0), its
+    An entry is nonzero when, at both steps ``h`` and ``h/2`` (``rel`` of the
+    state's own size, or of 1e-3 of the largest state where it is smaller), its
     contribution ``|J_ij|·scale_j`` clears ``floor`` of the largest one, and the
     two steps agree to 10%: an entry the differences cannot resolve is not
     asked of the pattern.
@@ -461,7 +540,9 @@ def sparsity_misses(model, states, t=0.0, rel=1e-6, floor=1e-8) -> list[tuple[in
     for y in states:
         y = np.asarray(y, dtype=float)
         big = float(np.abs(y).max()) if y.size else 0.0
-        scale = np.maximum(np.abs(y), max(big, 1.0) * 1e-3)
+        # On the state's own scale: a floor of 1e-3 absolute stepped a nanomolar
+        # state by its whole size, past what a nonlinear law's two steps agree on
+        scale = np.maximum(np.abs(y), (big if big > 0.0 else 1.0) * 1e-3)
         jac = []
         for h_rel in (rel, rel / 2.0):
             cols_ = []
@@ -494,9 +575,16 @@ def _states(job: Job) -> list[tuple[float, np.ndarray]]:
     for t in (job.t_start, 0.5 * (job.t_start + job.t_end), job.t_end):
         model = load(job.path)
         if t > job.t_start:
-            bngsim.Simulator(model, method="ode", **job.sim).run(
-                t_span=(job.t_start, t), n_points=2, rtol=job.rtol, atol=job.atol
-            )
+            try:
+                bngsim.Simulator(model, method="ode", **job.sim).run(
+                    t_span=(job.t_start, t), n_points=2, rtol=job.rtol, atol=job.atol
+                )
+            except bngsim.SimulationError:
+                # A state this one-interval run does not reach, where the base's
+                # grid does (MODEL1112050001: CV_CONV_FAILURE before t = 50), is
+                # not asked of the pattern, as a non-finite one is not: whether a
+                # run completes is the comparisons' question, not the pattern's.
+                continue
         y = np.asarray(model.get_state(), dtype=float)
         if np.all(np.isfinite(y)):
             out.append((t, y))

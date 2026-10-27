@@ -561,3 +561,50 @@ def test_a_narrow_pulse_converges_with_the_tolerance(model_id):
         assert sweep["settled"], (method, sweep)
         assert set(sweep["column_gaps"]) == set(params), (method, sweep)
         assert sweep["moving"] == [], (method, sweep)
+
+
+def test_a_column_is_judged_on_the_states_scale_through_its_parameter():
+    """nanomolar_dimer's columns are 1e-28 and 6e-20 per unit of parameters of
+    2e18 and 4e9: an absolute rounding floor of 1e-14 left both out, though each
+    is 17% of the 1.5e-9 peak per relative change."""
+    runs = _sweep_runs(column_moves=(0.0, 0.5), sizes=(1e-28, 1e-28))
+    assert F.tolerance_sweep(runs, ["a", "b"])["column_gaps"] == {}
+    sweep = F.tolerance_sweep(runs, ["a", "b"], values=[2e18, 2e18])
+    assert set(sweep["column_gaps"]) == {"a", "b"} and sweep["moving"] == ["b"]
+
+
+def test_the_nanomolar_model_sweep_judges_its_columns():
+    """Both of nanomolar_dimer's columns are judged, on its own 1.5e-9 scale."""
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == "nanomolar_dimer"
+    )
+    path = F.REPO / job["path"]
+    model = F.load_model(path)
+    params = ["kdim", "kdis"]
+    values = [float(model.get_param(p)) for p in params]
+    spec = {
+        "t_start": 0.0,
+        "t_end": float(job["t_end"]),
+        "n_points": int(job["n_points"]),
+        "sens_method": "staggered",
+    }
+    sweep = F.tolerance_sweep(F._sweep_runs(path, params, spec), params, values=values)
+    assert sweep["settled"] and set(sweep["column_gaps"]) == set(params), sweep
+    assert sweep["moving"] == [], sweep
+
+
+def test_a_sweep_past_the_jobs_cap_fails_as_a_sweep():
+    """Two runs at rtol 1e-12 after the difference's: bounded by the job's cap,
+    so a slow one costs the sweep, not the verdict (a TIMEOUT)."""
+    import time
+
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == "pulse_triangle_clamp_narrow"
+    )
+    spec = {"t_start": 0.0, "t_end": 10.0, "n_points": 51, "sens_method": "staggered"}
+    with pytest.raises(F.ReferenceOverBudget):
+        F._sweep_runs(F.REPO / job["path"], ["kx"], spec, deadline=time.perf_counter() - 1.0)

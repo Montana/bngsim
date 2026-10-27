@@ -5,10 +5,10 @@ report (issue #1257).
 The checks are ``_differential.py``'s: a sensitivity run's state against a plain
 run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
-and four rules for bugs whose answers are right (a sensitivity run refused, a
-sparsity pattern that misses entries, analytic Jacobian entries that differences
-of the right-hand side contradict (#1308), a backend other than the one asked
-for).
+8x the output points against the base's grid, and four rules for bugs whose
+answers are right (a sensitivity run refused, a sparsity pattern that misses
+entries, analytic Jacobian entries that differences of the right-hand side
+contradict (#1308), a backend other than the one asked for).
 One row per (model, check), its ``method`` the check:
 
     the path agrees with its reference .............. PASS
@@ -26,7 +26,7 @@ not, a sensitivity run that ran and is refused, a new crash.
 The corpus is the models other suites already run, each over its own window and
 at its own tolerances:
 
-* ``fd_sens/fd_sens_jobs.json``: the 45 committed ``.net`` models;
+* ``fd_sens/fd_sens_jobs.json``: the 53 committed ``.net`` models;
 * ``rr_parity/ode_jobs.json``: the BioModels the nightly's corpus job fetched,
   those present and under ``--max-bytes``, at most ``--max-points`` samples;
 * ``--net-dir``: every ``.net`` under a directory, and ``--model-list``: a file
