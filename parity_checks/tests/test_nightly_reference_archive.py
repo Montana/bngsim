@@ -92,10 +92,38 @@ def test_pack_refuses_when_a_good_row_has_no_recorded_reference(tmp_path):
         tmp_path / "report.json",
         (_CC0, "ode", "PASS"),
         ("BIOMD0000000002", "ode", "PASS"),
-        ("BIOMD0000000003", "ode", "TIMEOUT"),  # killed before its reference: fine
+        ("BIOMD0000000003", "ode", "TIMEOUT"),  # killed before its reference: listed
     )
     with pytest.raises(SystemExit, match=r"1 PASS row.*BIOMD0000000002\|ode"):
         ra.pack("rr_ode", src, tmp_path / "out", [report])
+
+
+def test_pack_lists_the_timeouts_the_recording_left_without_a_reference(tmp_path):
+    """Issue #1290: three jobs timed out in the 2026-10-24 recording and left no
+    entry, and the night after a live night that passed them alerted on all three
+    as archive_stale. Nothing said so when the archive was published; the publish
+    summary now does. A row of another outcome may need no entry (ssa_screen
+    decides its time-event rows before it reads the archive), so only TIMEOUT
+    rows are listed."""
+    src = _recorded(tmp_path)
+    report = _report(
+        tmp_path / "report.json",
+        (_CC0, "ode", "PASS"),
+        (_MIT, "ode", "TIMEOUT"),  # an entry, saved before the kill: not listed
+        ("BIOMD0000000003", "ode", "TIMEOUT"),
+        ("BIOMD0000000004", "ssa", "DIFF"),  # a time-event row: no entry needed
+    )
+    giants = _report(tmp_path / "report-1.json", ("MODEL1504130000", "ode", "TIMEOUT"))
+    side = ra.pack("rr_ode", src, tmp_path / "out", [report, giants])
+    assert side["timed_out_unrecorded"] == ["BIOMD0000000003|ode", "MODEL1504130000|ode"]
+    for suite in ra.SUITES:
+        if suite != "rr_ode":
+            ra.pack(suite, _recorded(tmp_path / suite), tmp_path / "out")
+    (line,) = ra.caveats(tmp_path / "out")
+    assert line == (
+        "- **rr_ode**: 2 case(s) timed out before their reference was recorded; a replay "
+        "that needs it refuses them as archive_stale: BIOMD0000000003|ode, MODEL1504130000|ode"
+    )
 
 
 def test_pack_lists_baseline_good_cases_the_recording_did_not_pass(tmp_path):

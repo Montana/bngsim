@@ -16,6 +16,11 @@ word, and its concentrations came back as if the size held:
 Each is now refused, naming the compartment, its rule and why its rate is
 unknown. A size that holds is not: the rateOf of a species that never moves is
 0 for good, and a cycle of constants is solved once (#621).
+
+Since #1281, the rate of ``rateOf(S3)`` and of ``rateOf(P)`` is derived where
+nothing jumps it, and those sizes are diluted: the amount over cv(t) above. The
+refusal's naming is held here with S3 reset by an event, which jumps its rate
+where the size's jumps are not looked for, so the rate is still unknown.
 """
 
 from __future__ import annotations
@@ -68,9 +73,9 @@ def _compartment(cid, size):
     return f'<compartment id="{cid}" size="{size}" constant="false"/>'
 
 
-def doc(rules, params="", comps=None, s3_decays=True, rate_rules=()):
+def doc(rules, params="", comps=None, s3_decays=True, rate_rules=(), events=""):
     """S3 in c (decaying at 0.1·S3 unless told not to), X in cv at 0.25·X·cv,
-    and the rules given."""
+    and the rules (and events) given."""
     comps = comps or _compartment("cv", 2)
     rule_xml = "".join(
         f'<assignmentRule variable="{v}"><math {_M}>{m}</math></assignmentRule>' for v, m in rules
@@ -87,7 +92,7 @@ def doc(rules, params="", comps=None, s3_decays=True, rate_rules=()):
         f"{comps}</listOfCompartments>"
         f"<listOfSpecies>{_species('S3', 'c', 2)}{_species('X', 'cv', 4)}</listOfSpecies>"
         f"<listOfParameters>{params}</listOfParameters><listOfRules>{rule_xml}</listOfRules>"
-        f"<listOfReactions>{reactions}</listOfReactions></model></sbml>"
+        f"<listOfReactions>{reactions}</listOfReactions>{events}</model></sbml>"
     )
 
 
@@ -120,6 +125,21 @@ P_DECAYS = {
 }
 
 
+_TIME = (
+    '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol>'
+)
+# S3 reset to 10 at t = 5, past the runs: it jumps rateOf(S3), so its rate is
+# unknown to the size (#1281), and the size is refused
+RESET_S3 = (
+    '<listOfEvents><event id="reset" useValuesFromTriggerTime="true">'
+    f'<trigger initialValue="false" persistent="true"><math {_M}>{a("geq", _TIME, cn(5))}</math>'
+    f'</trigger><listOfEventAssignments><eventAssignment variable="S3"><math {_M}>{cn(10)}</math>'
+    "</eventAssignment></listOfEventAssignments></event></listOfEvents>"
+)
+# rateOf(S3) = -0.1·S3 = -0.2·e^(-t/10), and rateOf(P) the same
+RATE_T = -0.2 * np.exp(-0.1 * T)
+
+
 def _refused(xml, *names):
     with pytest.raises(ModelError) as info:
         bngsim.Model.from_sbml_string(xml)
@@ -127,17 +147,34 @@ def _refused(xml, *names):
         assert name in str(info.value), (name, str(info.value))
 
 
-def test_a_size_that_reads_a_rate_is_refused_by_name():
-    """The issue's model: cv := 2 + rateOf(S3), S3 decaying."""
-    _refused(doc([("cv", a("plus", cn(2), ROF_S3))]), "cv := 2 + rateOf(S3)", "rateOf(S3)")
+def test_a_size_that_reads_a_rate_is_diluted():
+    """The issue's model: cv := 2 + rateOf(S3), S3 decaying. Refused by name
+    from #1193 until #1281 derived the rate of the rate: now the amount over
+    cv(t), 4, 3.0826, 2.3782."""
+    x = _x(doc([("cv", a("plus", cn(2), ROF_S3))]))
+    np.testing.assert_allclose(x, _amount_over(2 + RATE_T), rtol=1e-5)
+
+
+def test_a_size_that_reads_a_rate_an_event_jumps_is_refused_by_name():
+    xml = doc([("cv", a("plus", cn(2), ROF_S3))], events=RESET_S3)
+    _refused(xml, "cv := 2 + rateOf(S3)", "rateOf(S3)")
 
 
 def test_a_size_that_reads_a_rate_through_a_rule_names_the_rule():
     xml = doc(
         [("r", ROF_S3), ("cv", a("plus", cn(2), ci("r")))],
         params='<parameter id="r" value="0" constant="false"/>',
+        events=RESET_S3,
     )
     _refused(xml, "through r", "rateOf(S3)")
+
+
+def test_a_size_that_reads_a_rate_through_a_rule_is_diluted():
+    xml = doc(
+        [("r", ROF_S3), ("cv", a("plus", cn(2), ci("r")))],
+        params='<parameter id="r" value="0" constant="false"/>',
+    )
+    np.testing.assert_allclose(_x(xml), _amount_over(2 + RATE_T), rtol=1e-5)
 
 
 def test_a_cycle_of_sizes_that_moves_is_refused_by_name():
@@ -180,11 +217,13 @@ def test_a_cycle_of_sizes_through_conditions_is_refused_by_name():
     _refused(doc([("cv", pw("cw")), ("cw", pw("cv"))], comps=CYCLE), "a cycle of rules")
 
 
-def test_a_size_that_reads_the_rate_of_a_rate_rule_variable_is_refused_by_name():
+def test_a_size_that_reads_the_rate_of_a_rate_rule_variable_is_diluted():
     """rateOf of a rate-rule parameter was read as a constant too: cv := 2 +
     rateOf(P), P' = -0.1*P, gave the held trajectory, 4, 3.1152, 2.4261, where
-    the amount over cv(t) gives 4, 3.0826, 2.3782."""
-    _refused(doc([("cv", a("plus", cn(2), rof("P")))], **P_DECAYS), "rateOf(P)")
+    the amount over cv(t) gives 4, 3.0826, 2.3782 (refused from #1193 until
+    #1281 derived the rate of P's right-hand side)."""
+    x = _x(doc([("cv", a("plus", cn(2), rof("P")))], **P_DECAYS))
+    np.testing.assert_allclose(x, _amount_over(2 + RATE_T), rtol=1e-5)
 
 
 _REASON_CHILD = textwrap.dedent(
@@ -204,7 +243,11 @@ def test_the_reason_named_does_not_move_with_the_hash_seed():
     """Two unknown rates, read through q and r: the chain rule stopped at the
     first in set order, so seeds 6 and 8 named r where 0 named q."""
     params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in "qr")
-    xml = doc([("r", ROF_S3), ("q", ROF_S3), ("cv", a("plus", cn(2), ci("r"), ci("q")))], params)
+    xml = doc(
+        [("r", ROF_S3), ("q", ROF_S3), ("cv", a("plus", cn(2), ci("r"), ci("q")))],
+        params,
+        events=RESET_S3,
+    )
     reasons = {}
     for seed in (0, 6, 8):
         proc = subprocess.run(
@@ -226,13 +269,15 @@ def test_the_reason_named_does_not_move_with_the_hash_seed():
 def test_a_rate_read_through_two_rules_names_both():
     params = "".join(f'<parameter id="{p}" value="0" constant="false"/>' for p in ("r1", "r2"))
     rules = [("r2", ROF_S3), ("r1", ci("r2")), ("cv", a("plus", cn(2), ci("r1")))]
-    _refused(doc(rules, params=params), "rate: through r1 and r2, it reads rateOf(S3)")
+    _refused(
+        doc(rules, params=params, events=RESET_S3), "rate: through r1 and r2, it reads rateOf(S3)"
+    )
 
 
 def test_a_rule_is_named_by_its_id_not_the_engine_name():
     """`in` is an ExprTk word, which the engine reads as `_ant_in`."""
     rules = [("in", ROF_S3), ("cv", a("plus", cn(2), ci("in")))]
-    xml = doc(rules, params='<parameter id="in" value="0" constant="false"/>')
+    xml = doc(rules, params='<parameter id="in" value="0" constant="false"/>', events=RESET_S3)
     _refused(xml, "rate: through in, it reads rateOf(S3)")
 
 
@@ -266,9 +311,22 @@ def test_a_rate_read_only_where_it_picks_a_piece_moves_the_size_at_the_flip(rule
     np.testing.assert_allclose(_x(doc(rules, **extra), JUMP_T), JUMPED, rtol=1e-5)
 
 
-def test_a_rate_read_in_a_piece_as_well_is_refused():
+def test_a_rate_read_in_a_piece_as_well_is_diluted_and_jumps_at_the_flip():
+    """cv = 1 + rateOf(S3) while rateOf(S3) < -0.15, then 2: diluted by the
+    rate's rate before the flip, rescaled at it (0.85 to 2), and held after.
+    Refused from #1193 until #1281."""
     piece = f"<piecewise><piece>{a('plus', cn(1), ROF_S3)}{a('lt', ROF_S3, cn(-0.15))}</piece>"
-    _refused(doc([("cv", piece + f"<otherwise>{cn(2)}</otherwise></piecewise>")]), "rateOf(S3)")
+    xml = doc([("cv", piece + f"<otherwise>{cn(2)}</otherwise></piecewise>")])
+    rate = -0.2 * np.exp(-0.1 * JUMP_T)
+    cv = np.where(rate < -0.15, 1 + rate, 2.0)
+    want = 4 * cv[0] * np.exp(-JUMP_T / 4) / cv
+    np.testing.assert_allclose(_x(xml, JUMP_T), want, rtol=1e-5)
+
+
+def test_a_rate_read_in_a_piece_as_well_is_refused_where_an_event_jumps_it():
+    piece = f"<piecewise><piece>{a('plus', cn(1), ROF_S3)}{a('lt', ROF_S3, cn(-0.15))}</piece>"
+    xml = doc([("cv", piece + f"<otherwise>{cn(2)}</otherwise></piecewise>")], events=RESET_S3)
+    _refused(xml, "rateOf(S3)")
 
 
 @pytest.mark.parametrize(

@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import gc
 import hashlib
 import json
 import os
@@ -462,6 +463,37 @@ def archive_load(directory: str | Path, spec: dict):
     return rr, "", meta.get("timing"), meta
 
 
+def _run_roadrunner(xml: str, t_int: float, p: dict):
+    """RoadRunner's side of one job: ``(rr, rr_exc, rr_timing, rr_wall)``, where
+    ``rr`` is ``(time, values, names)`` or None and ``rr_exc`` what it raised."""
+    rr = None
+    rr_exc = ""
+    rr_timing = None
+    rr_wall = 0.0
+    try:
+        t0 = time.perf_counter()
+        # Through the instants its event triggers switch at: RoadRunner fires a
+        # `time == c` event only on an output time, which the job grid seldom
+        # holds, and bngsim fires it wherever it falls (#1015).
+        rr = rc.rr_ode(
+            xml,
+            t_int,
+            p["t_end"],
+            p["n_points"],
+            p["rtol"],
+            p["atol"],
+            through_event_instants=True,
+        )
+        rr_wall = time.perf_counter() - t0
+        # rr_ode now returns (time, species, names, timing)
+        if len(rr) == 4:
+            rr_timing = rr[3]
+            rr = rr[:3]  # keep backward compat for tuple unpacking below
+    except Exception as exc:
+        rr_exc = f"roadrunner: {type(exc).__name__}: {exc}"[:400]
+    return rr, rr_exc, rr_timing, rr_wall
+
+
 def _worker(spec: dict, q) -> None:
     """Run BOTH engines for one job and put a result dict on ``q``.
 
@@ -475,8 +507,10 @@ def _worker(spec: dict, q) -> None:
       * both raised -> ``bad_test`` (no parity signal, the model is the problem).
 
     The parent synthesizes TIMEOUT (kill on overrun) and ``dead`` (a child that
-    segfaulted without a result — unattributable, so bucketed EXCEPTION).
+    segfaulted without a result — unattributable, so bucketed EXCEPTION). A
+    recording, killed later than the cap, reports its own TIMEOUT past the cap.
     """
+    t_job = time.perf_counter()
     # Per-process warmup (SymPy import for bngsim, LLVM/JIT init for RR) measured
     # ONCE here, before any model load, so the one-time SymPy import is attributed
     # to warmup rather than charged to the first model's parse/interpret. Each job
@@ -528,6 +562,21 @@ def _worker(spec: dict, q) -> None:
             return
         res["reference_version"] = archived.get("reference_version")
 
+    # Issue #1290: a recording runs RoadRunner first and saves its entry before
+    # bngsim starts. A job killed at the cap after that still leaves its reference,
+    # so a replay, which runs bngsim alone, can compare it; saved after bngsim, a
+    # job the two engines together carried past the cap left none, and every
+    # replay refused it as archive_stale.
+    rr, rr_exc, rr_timing, rr_wall = None, "", None, 0.0
+    record_to = spec.get("write_reference_archive")
+    if record_to:
+        rr, rr_exc, rr_timing, rr_wall = _run_roadrunner(xml, t_int, p)
+        archive_save(record_to, spec, rr, rr_exc, rr_timing)
+        # rc.rr_ode's event-instant walk closes over itself, so for a model with
+        # events the RoadRunner instance lives on until a collection; free it
+        # before bngsim loads the same model beside it.
+        gc.collect()
+
     # --- bngsim side (record status; do NOT short-circuit on a generic raise) ---
     bn = None
     bn_exc = ""
@@ -553,10 +602,6 @@ def _worker(spec: dict, q) -> None:
         bn_exc = f"bngsim: {type(exc).__name__}: {exc}"[:400]
 
     # --- RoadRunner side (always run; it's the reference / existence proof) ---
-    rr = None
-    rr_exc = ""
-    rr_timing = None
-    rr_wall = 0.0
     if replay:
         # Issue #805: the reference from the archive, RoadRunner not called.
         rr, rr_exc, rr_timing = archived_rr, archived_exc, archived_timing
@@ -567,30 +612,8 @@ def _worker(spec: dict, q) -> None:
                 "reference_version": archived.get("reference_version"),
                 "recorded_by_harness": archived.get("harness_git_rev"),
             }
-    else:
-        try:
-            t0 = time.perf_counter()
-            # Through the instants its event triggers switch at: RoadRunner fires a
-            # `time == c` event only on an output time, which the job grid seldom
-            # holds, and bngsim fires it wherever it falls (#1015).
-            rr = rc.rr_ode(
-                xml,
-                t_int,
-                p["t_end"],
-                p["n_points"],
-                p["rtol"],
-                p["atol"],
-                through_event_instants=True,
-            )
-            rr_wall = time.perf_counter() - t0
-            # rr_ode now returns (time, species, names, timing)
-            if len(rr) == 4:
-                rr_timing = rr[3]
-                rr = rr[:3]  # keep backward compat for tuple unpacking below
-        except Exception as exc:
-            rr_exc = f"roadrunner: {type(exc).__name__}: {exc}"[:400]
-        if spec.get("write_reference_archive"):
-            archive_save(spec["write_reference_archive"], spec, rr, rr_exc, rr_timing)
+    elif not record_to:
+        rr, rr_exc, rr_timing, rr_wall = _run_roadrunner(xml, t_int, p)
 
     # Total job wall — bngsim + reference. The per-phase `timing` dict carries the
     # fine-grained breakdown; this single number supersedes the retired
@@ -620,28 +643,61 @@ def _worker(spec: dict, q) -> None:
     # --- classify from per-engine status (the reference anchors the verdict) ---
     if bn_exc or rr_exc:
         res["status"], res["exception"] = _classify_failure(bn_exc, rr_exc)
-        q.put(res)
-        return
+    else:
+        # --- both ran: compare (shared _core.differ protocol; metric realized here) ---
+        try:
+            status, value, comment, metric, m_tol, covers = _compare_ode(bn, rr, atol=p["atol"])
+            n_instants = (rr_timing or {}).get("event_instants", 0)
+            if n_instants:
+                comment = f"{comment}; RR through {n_instants} event instants"
+            res["status"], res["value"], res["comment"] = status, value, comment
+            res["metric"], res["tol"] = metric, m_tol
+            # Only an INVALID_REFERENCE override reads this: on a DIFF, is the whole
+            # divergence in columns the reference left non-finite? (See
+            # _reference_nonfinite_covers and _apply_invalid_reference.)
+            res["rr_covers_diff"] = covers
+        except Exception as exc:
+            res["status"] = "exception"
+            res["exception"] = f"compare: {type(exc).__name__}: {exc}"[:400]
 
-    # --- both ran: compare (shared _core.differ protocol; metric realized here) ---
-    try:
-        status, value, comment, metric, m_tol, covers = _compare_ode(bn, rr, atol=p["atol"])
-        n_instants = (rr_timing or {}).get("event_instants", 0)
-        if n_instants:
-            comment = f"{comment}; RR through {n_instants} event instants"
-        res["status"], res["value"], res["comment"] = status, value, comment
-        res["metric"], res["tol"] = metric, m_tol
-        # Only an INVALID_REFERENCE override reads this: on a DIFF, is the whole
-        # divergence in columns the reference left non-finite? (See
-        # _reference_nonfinite_covers and _apply_invalid_reference.)
-        res["rr_covers_diff"] = covers
-    except Exception as exc:
-        res["status"] = "exception"
-        res["exception"] = f"compare: {type(exc).__name__}: {exc}"[:400]
+    # Issue #1290: a recording is killed later than its cap (_kill_after), so the
+    # entry can be saved; its row is judged against the cap itself, as a live night
+    # judges it. Timed from this worker's start, which leaves out the spawn.
+    if record_to and time.perf_counter() - t_job > spec["cap"]:
+        res = {k: spec[k] for k in ("key", "model_id", "method", "metric", "tol")}
+        res["status"], res["cap"] = "timeout", spec["cap"]
+        res["comment"] = (
+            f"ran past the {spec['cap']}s wall cap (a recording runs to "
+            f"{_kill_after(spec)}s to save its reference)"
+        )
     q.put(res)
 
 
-# Worker status -> _core Outcome. (timeout/dead are synthesized by the scheduler;
+# A recording's kill is never put off past this: the nightly giant pass's own
+# cap. RoadRunner alone took 1331 s and 14 GB on MODEL1504130000, so a later kill
+# records no giant that times out at 600 s, and it keeps two such processes alive
+# on a 16 GB runner.
+RECORD_KILL_CEILING = 600.0
+
+
+def _kill_after(spec: dict) -> float:
+    """When the scheduler kills a job: at its cap, or on a recording at twice it,
+    up to ``RECORD_KILL_CEILING``.
+
+    Issue #1290: three jobs that sit at the 300 s cap (about 280 s for both
+    engines on the fastest runner, RoadRunner's load most of it, and about 1.7x
+    slower on the 2026-10-24 recording's runner) timed out in that recording and
+    left no entry. The later kill gives RoadRunner time to save its reference;
+    the worker still judges the row against the cap itself.
+    """
+    cap = spec["cap"]
+    if not spec.get("write_reference_archive"):
+        return cap
+    return max(cap, min(2 * cap, RECORD_KILL_CEILING))
+
+
+# Worker status -> _core Outcome. (timeout/dead are synthesized by the scheduler,
+# and timeout by a recording's worker past the cap;
 # dead = a child that segfaulted with no per-engine status, so it can't be
 # attributed to an engine — bucketed EXCEPTION as the conservative "investigate".)
 _OUTCOME = {
@@ -780,7 +836,10 @@ def main() -> int:
         "--timeout",
         type=float,
         default=None,
-        help=f"Per-job wall-clock cap (s); defaults to {DEFAULT_ODE_TIMEOUT}s when unset.",
+        help=f"Per-job wall-clock cap (s); defaults to {DEFAULT_ODE_TIMEOUT}s when unset. "
+        "A recording (--write-reference-archive) kills a job only at twice the cap, up to "
+        f"{RECORD_KILL_CEILING:g}s, to give RoadRunner time to save its reference, and "
+        "still reports TIMEOUT past the cap.",
     )
     ap.add_argument(
         "--rtol",
@@ -798,7 +857,8 @@ def main() -> int:
     ap.add_argument(
         "--write-reference-archive",
         default="",
-        help="Also record each job's RoadRunner side here (one .npz per job; issue #805).",
+        help="Also record each job's RoadRunner side here (one .npz per job; issue #805). "
+        "RoadRunner then runs before bngsim, and its entry is saved before bngsim starts.",
     )
     ap.add_argument(
         "--reference-archive",
@@ -912,7 +972,7 @@ def main() -> int:
         specs,
         _worker,
         workers=args.workers,
-        timeout_of=lambda s: s["cap"],
+        timeout_of=_kill_after,
         on_done=_make_progress(artifacts),
     )
     elapsed = time.perf_counter() - t0
@@ -930,7 +990,8 @@ def main() -> int:
         wall = r.get("wall_sec") or 0.0
         comment = r.get("comment", "")
         if r.get("status") == "timeout":
-            comment = f"killed at {r.get('cap')}s wall cap"
+            # A recording's worker judges its own overrun (_worker) and says so.
+            comment = r.get("comment") or f"killed at {r.get('cap')}s wall cap"
         elif r.get("status") == "dead":
             comment = f"worker died (exit={r.get('exitcode')})"
         # Known-artifact allow-list: an accepted/genuine divergence (bngsim
