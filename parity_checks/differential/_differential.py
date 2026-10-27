@@ -94,6 +94,10 @@ GRID_FACTOR = 8
 #: Comma-decimal locales, in the order tried.
 COMMA_LOCALES = ("de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR")
 
+#: The ``time.monotonic()`` every run of the model being checked must finish
+#: by, which :func:`check_all` sets: None outside it, or with no cap.
+_DEADLINE: float | None = None
+
 CHECKS = (
     "sens_runs",
     "sens_vs_plain",
@@ -172,10 +176,22 @@ def sens_params(model) -> list[str]:
     return [p for p in model.primary_param_names if p not in excluded][:MAX_SENS_PARAMS]
 
 
-def run(job: Job, timeout: float | None = None, **kw):
+def _left() -> float | None:
+    """The seconds to :data:`_DEADLINE`, a run's ``timeout``: None for none. Past
+    it no run starts (``SimulationTimeout``)."""
+    if _DEADLINE is None:
+        return None
+    left = _DEADLINE - time.monotonic()
+    if left <= 0:
+        import bngsim
+
+        raise bngsim.SimulationTimeout("the model's cap is spent")
+    return left
+
+
+def run(job: Job, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
-    the Result and the Simulator. ``timeout`` is the run's wall-clock budget
-    (``bngsim.SimulationTimeout`` past it)."""
+    the Result and the Simulator. It has until :data:`_DEADLINE`."""
     import bngsim
 
     sim = bngsim.Simulator(load(job.path), method="ode", **{**job.sim, **kw})
@@ -185,7 +201,7 @@ def run(job: Job, timeout: float | None = None, **kw):
         rtol=job.rtol,
         atol=job.atol,
         max_steps=job.max_steps,
-        timeout=timeout,
+        timeout=_left(),
     )
     return result, sim
 
@@ -297,7 +313,16 @@ def _declined(e: Exception) -> bool:
     )
 
 
+def _timed_out(e: BaseException) -> bool:
+    import bngsim
+
+    return isinstance(e, bngsim.SimulationTimeout | subprocess.TimeoutExpired)
+
+
 def _verdict_of(e: Exception) -> Verdict:
+    if _timed_out(e):
+        # The model's cap, reached in this check: its own row, not every row.
+        return Verdict("timeout", None, f"not finished within the model's cap: {_first_line(e)}")
     status = "unsupported" if _declined(e) or isinstance(e, _Declined) else "exception"
     return Verdict(status, None, f"{type(e).__name__}: {_first_line(e)}")
 
@@ -320,6 +345,9 @@ def check_sens(base: Base) -> dict[str, Verdict]:
     try:
         result, sim = run(base.job, sensitivity_params=params)
     except Exception as e:  # noqa: BLE001 - that it did not complete is the verdict
+        if _timed_out(e):
+            v = _verdict_of(e)
+            return {"sens_runs": v, "sens_vs_plain": v}
         # Where the plain run completes and the sensitivity run does not: a
         # refusal by name, or a derivative that does not exist at the start
         # (a power of a species at 0), or a crash. The rule records it; the
@@ -594,7 +622,11 @@ def _states(job: Job) -> list[tuple[float, np.ndarray]]:
         if t > job.t_start:
             try:
                 bngsim.Simulator(model, method="ode", **job.sim).run(
-                    t_span=(job.t_start, t), n_points=2, rtol=job.rtol, atol=job.atol
+                    t_span=(job.t_start, t),
+                    n_points=2,
+                    rtol=job.rtol,
+                    atol=job.atol,
+                    timeout=_left(),
                 )
             except bngsim.SimulationError:
                 # A state this one-interval run does not reach, where the base's
@@ -637,25 +669,12 @@ ATTRIBUTION_TIGHTEN = 100.0
 JITTER_RTOL = (0.5, 2.0)
 
 
-def _left(deadline: float | None) -> float | None:
-    """The seconds to ``deadline`` (a ``time.monotonic()``), for a run's
-    ``timeout``: None for none. Past it no run starts: ``SimulationTimeout``."""
-    if deadline is None:
-        return None
-    left = deadline - time.monotonic()
-    if left <= 0:
-        import bngsim
-
-        raise bngsim.SimulationTimeout("the model's cap is spent")
-    return left
-
-
-def _arm_runs(base: Base, deadline: float | None = None) -> dict[str, np.ndarray]:
+def _arm_runs(base: Base) -> dict[str, np.ndarray]:
     """The third arms, each a trajectory in the base's columns: the base's own
     route at ``ATTRIBUTION_TIGHTEN`` x tighter tolerances, the base on the
     other linear solver, and libRoadRunner for SBML where it is installed. An
-    arm that does not run, does not apply, or does not finish by ``deadline``
-    is left out."""
+    arm that does not run, does not apply, or does not finish in what is left
+    of the model's cap is left out."""
     import bngsim
 
     job, out = base.job, {}
@@ -668,23 +687,19 @@ def _arm_runs(base: Base, deadline: float | None = None) -> dict[str, np.ndarray
 
     f = ATTRIBUTION_TIGHTEN
     tight = Job(**{**job.__dict__, "rtol": job.rtol / f, "atol": job.atol / f})
-    take("tighter", lambda: _species(run(tight, timeout=_left(deadline))[0], base))
+    take("tighter", lambda: _species(run(tight)[0], base))
     if base.linear_solver == 1:
         take(
             "dense",
-            lambda: _species(
-                run(job, timeout=_left(deadline), force_dense_linear_solver=True)[0], base
-            ),
+            lambda: _species(run(job, force_dense_linear_solver=True)[0], base),
         )
     elif bngsim._bngsim_core.HAS_KLU:
         take(
             "klu",
-            lambda: _species(
-                run(job, timeout=_left(deadline), force_sparse_linear_solver=True)[0], base
-            ),
+            lambda: _species(run(job, force_sparse_linear_solver=True)[0], base),
         )
     # libRoadRunner takes no wall-clock budget: past the deadline it is not asked.
-    if Path(job.path).suffix != ".net" and (deadline is None or time.monotonic() < deadline):
+    if Path(job.path).suffix != ".net" and (_DEADLINE is None or time.monotonic() < _DEADLINE):
         take("roadrunner", lambda: _roadrunner(base))
     return out
 
@@ -729,16 +744,14 @@ def contested(rows: dict[str, dict]) -> bool:
     return False
 
 
-def attribute(
-    base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None, deadline=None
-) -> dict:
+def attribute(base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None) -> dict:
     """Which side of a DIFF each third arm agrees with: the comparison's
     ``reference`` (the base, or the path it was judged against), its
     ``path``, ``both`` (the two are within the bound of the arm), or
     ``neither``. Its ``verdict`` is the one side every arm that took one
     took, ``split`` where they differ (the model is contested), or
     ``unattributed``."""
-    arms = _arm_runs(base, deadline) if arms is None else arms
+    arms = _arm_runs(base) if arms is None else arms
     atol = PATH_RTOL_FACTOR * base.job.atol
     sides = {}
     for name, x in arms.items():
@@ -753,15 +766,14 @@ def attribute(
     return {"verdict": verdict, "arms": sides}
 
 
-def check_stable(base: Base, deadline: float | None = None) -> Verdict:
+def check_stable(base: Base) -> Verdict:
     """The base's answer under a jittered grid (one point fewer, one more,
     twice as many) and tolerance (rtol x0.5, x2): a jump past the bound marks
     the model contested, its DIFFs real but unattributed and its PASSes luck.
     A grid of another length is read at its last point, which every grid
     shares; twice as many at every other point, which are the base's. Each
-    rerun has until ``deadline``: one that has not finished leaves the check
-    SKIP, said so, and the model's other rows its own."""
-    import bngsim
+    rerun has what is left of the model's cap: one it stops makes the check
+    TIMEOUT, its own row only."""
 
     def go():
         job, jumps = base.job, {}
@@ -774,15 +786,13 @@ def check_stable(base: Base, deadline: float | None = None) -> Verdict:
         ):
             if m < 2:
                 continue
-            x = _species(
-                run(Job(**{**job.__dict__, "n_points": m}), timeout=_left(deadline))[0], base
-            )
+            x = _species(run(Job(**{**job.__dict__, "n_points": m}))[0], base)
             g = gap(x[::2], base.x, atol) if m == 2 * n - 1 else gap(x[-1:], base.x[-1:], atol)
             if g > base.limit:
                 jumps[label] = g
         for f in JITTER_RTOL:
             jittered = Job(**{**job.__dict__, "rtol": job.rtol * f, "atol": job.atol * f})
-            x = _species(run(jittered, timeout=_left(deadline))[0], base)
+            x = _species(run(jittered)[0], base)
             g = gap(x, base.x, atol)
             if g > max(base.limit, f * base.limit):
                 jumps[f"rtol x{f:g}"] = g
@@ -796,13 +806,7 @@ def check_stable(base: Base, deadline: float | None = None) -> Verdict:
             )
         return Verdict("pass", 0.0, "the answer holds under a jittered grid and tolerance")
 
-    def bounded():
-        try:
-            return go()
-        except bngsim.SimulationTimeout as e:
-            return Verdict("skip", note=f"not finished within the model's cap: {_first_line(e)}")
-
-    return _guard(bounded)
+    return _guard(go)
 
 
 def comma_locale() -> str | None:
@@ -847,7 +851,7 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
             [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=timeout if _DEADLINE is None else min(timeout, _left()),
         )
         if out.returncode != 0:
             last = (out.stderr.strip().splitlines() or ["?"])[-1][:300]
@@ -858,23 +862,66 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
 
 
 def check_all(
-    job: Job, locale_name: str | None, checks=CHECKS, deadline: float | None = None
+    job: Job,
+    locale_name: str | None,
+    checks=CHECKS,
+    deadline: float | None = None,
+    on_verdict=None,
 ) -> dict[str, Verdict]:
     """Every check of ``checks`` on one model. A base that does not run is no
-    reference: each check is then an exception on the base. ``deadline`` (a
-    ``time.monotonic()``) bounds what #1309 adds, ``stable`` and the
-    attribution's arms, which run last: a model whose other checks finish in
-    its cap keeps their rows, whatever the additions would cost."""
+    reference: each check is then an exception on the base. Every run has
+    until ``deadline`` (a ``time.monotonic()``): a check that has not finished
+    by then is TIMEOUT, its own row only, where the runner's cap would take
+    every row of the model (MODEL1006230049, 0053 and 0077 take 716-751 s of
+    the nightly's 900 s, so any check added to every model tipped them over).
+    ``on_verdict(check, verdict)`` hears each as it is reached, so a caller
+    killed at the cap still has those."""
+    global _DEADLINE
+    _DEADLINE = deadline
+    try:
+        return _check_all(job, locale_name, checks, on_verdict or (lambda c, v: None))
+    finally:
+        _DEADLINE = None
+
+
+class _Heard(dict):
+    """The verdicts so far, each told to ``on_verdict`` as it is set."""
+
+    def __init__(self, on_verdict):
+        super().__init__()
+        self.on_verdict = on_verdict
+
+    def __setitem__(self, check, verdict):
+        super().__setitem__(check, verdict)
+        self.on_verdict(check, verdict)
+
+    def update(self, other):
+        for check, verdict in other.items():
+            self[check] = verdict
+
+
+def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[str, Verdict]:
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001
         # No base, no reference: not a finding of this suite's (the parity suites
         # own a model that does not load or run), and not a pass either.
         v = Verdict("no_base", None, f"the base run: {type(e).__name__}: {str(e)[:300]}")
-        return {c: v for c in checks}
-    out: dict[str, Verdict] = {}
+        return {c: _verdict_of(e) if _timed_out(e) else v for c in checks}
+    out: dict[str, Verdict] = _Heard(on_verdict)
+
+    def spent() -> Verdict | None:
+        # No check starts past the deadline: one that builds and compiles
+        # Simulators without running them (backend_as_asked) has no run to bound.
+        try:
+            _left()
+        except Exception as e:  # noqa: BLE001 - SimulationTimeout, the cap spent
+            return _verdict_of(e)
+        return None
+
     if {"sens_runs", "sens_vs_plain"} & set(checks):
-        out.update(check_sens(base))
+        v = spent()
+        out.update({"sens_runs": v, "sens_vs_plain": v} if v else check_sens(base))
     one = {
         "ajac_vs_fdjac": check_ajac,
         "klu_vs_dense": check_klu,
@@ -886,15 +933,16 @@ def check_all(
     }
     for name, fn in one.items():
         if name in checks:
-            out[name] = fn(base)
+            out[name] = spent() or fn(base)
     if "locale" in checks:
-        out["locale"] = check_locale(base, locale_name)
+        out["locale"] = spent() or check_locale(base, locale_name)
     # Every DIFF with two trajectories says which side the third arms take
-    # (#1309), the arms run once per model however many DIFFs it has.
+    # (#1309), the arms run once per model however many DIFFs it has, each in
+    # what is left of the model's cap; one that does not finish is left out.
     diffs = [v for v in out.values() if v.status == "diff" and v.path_x is not None]
     if diffs:
         try:
-            arms = _arm_runs(base, deadline)
+            arms = _arm_runs(base)
             for v in diffs:
                 v.extra["attribution"] = attribute(base, v, arms)
         except Exception as e:  # noqa: BLE001 - attribution is advice, never a verdict
@@ -903,5 +951,5 @@ def check_all(
     # Last: five reruns of the base, the costliest of what #1309 adds, in what
     # is left once the DIFFs are attributed (a stable row carries no trajectory).
     if "stable" in checks:
-        out["stable"] = check_stable(base, deadline)
+        out["stable"] = spent() or check_stable(base)
     return {c: out[c] for c in checks if c in out}
