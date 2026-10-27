@@ -49,3 +49,20 @@ the pinned commit in `VENDOR.json` and re-anchors the per-file checksums.
 `--summary` previews, `--check` is the offline tripwire that the checked-in tree
 still matches `VENDOR.json`. See `bngsim/scripts/MIR_VENDORING.md` for the full
 refresh + MIR-on build/validation flow.
+
+## The code reservation (issue #1215)
+
+Each MIR context reserves one stretch of address space for its generated code,
+`MIR_CODE_RESERVE_SIZE`, so that the code's direct branches reach each other
+(±128 MB on aarch64); code that outgrows it is mapped on its own. Upstream
+reserves 128 MB on 64-bit hosts other than Windows. That is address space, not
+memory, but a cap on the address space (`ulimit -v`, `RLIMIT_AS`, as some
+clusters set) counts it: with 128 MB, about 60 live MIR-JIT'd models filled
+8 GB. bngsim's CMake sets it to `BNGSIM_MIR_CODE_RESERVE_MB`, 32 MB by default,
+which holds the largest committed model's code in one piece (fceri_gamma's
+27.9 MB, measured on macOS arm64). bngsim generates code eagerly, and its calls
+and thunk redirects check their reach, so code mapped on its own runs the same:
+the size is address space only. Under a tight cap, configure with
+`-DBNGSIM_MIR_CODE_RESERVE_MB=8` (fceri_fyn's 7.4 MB fits), or `0` to reserve
+nothing. The value is a CMake cache entry, so a build directory keeps the last
+one passed. Windows reserves nothing either way.
