@@ -590,6 +590,16 @@ struct CvodeUserData {
     // by design. Built on first use from the model, which a run does not
     // restructure; see clamp_state_nonneg.
     std::vector<char> rhs_nonneg_mask;
+    // The run's absolute tolerance per state slot, which that clamp weighs a
+    // negative component against: one more than kClampNoiseAtols of them below 0
+    // is left as it is (see clamp_state_nonneg). Set with the tolerances, as
+    // is the solver followed_below_zero asks for its predicted state.
+    std::vector<double> clamp_atol;
+    void *clamp_cvode_mem = nullptr;
+    // Why followed_below_zero ended the run, for its failure message; empty
+    // until it does. And the run's last output time, past which it does not.
+    std::string below_zero_refusal;
+    double clamp_t_end = std::numeric_limits<double>::infinity();
 
     // Colored finite-difference Jacobian scratch (T4). cvode_colored_jac is
     // called once per Jacobian evaluation and otherwise heap-allocated three
@@ -727,6 +737,43 @@ static double codegen_tfun_eval_thunk(int tf_id, double x, void *ctx) {
 // The declared value, not initial_conc: save_concentrations() moves that to a
 // captured state, where a depleted concentration a hair below 0 still needs the
 // clamp (Species::declared_negative).
+//
+// And only a component near 0 is clamped. The clamp is the boundary value for a
+// state the solver's own error carried a little below 0. Over the rr corpus
+// (1,323 models, default and jacobian="fd", rtol 1e-4 to 1e-10) the states it
+// rescues sit 80 to 1.3e4 of the run's atol below 0, and move with atol, not
+// with the species: MODEL2001200002's L (`pow(L/T, 1.36)`, which neither
+// RoadRunner nor COPASI integrates), MODEL5952308332's NADH, BIOMD0000001065's
+// EN_0_1. A component far below that is no rounding of 0. BIOMD0000000338's
+// XIIa, tipped below 0 by the dense LU's rounding, follows its own law down to
+// the pole of v·S·XIIa/(1 + XIIa) at -1. The RHS is non-finite there, and
+// clamped it read 0 for XIIa and for K, which held both at -1: the run returned
+// XIIa = -1, K = -0.997 with no error, 1e9 atols below 0. Left as it is, the
+// RHS stays non-finite, CVODE's recoverable failure, and the run fails by name.
+// kClampNoiseAtols puts the line at 1e6 atols, 76 times the deepest rescue
+// measured and a thousandth of 338's. A run at a loose atol widens it with
+// atol: at 1e-6 the band reaches -1.
+constexpr double kClampNoiseAtols = 1e6;
+
+// Record the run's absolute tolerance per slot for clamp_state_nonneg: the
+// vector where the run has one (issue #196; with tracking, issue #213, its
+// ceiling, the widest the run allows), the scalar for every slot otherwise.
+// The last time a run reports: its last sample time, or t_end.
+static double last_output_time(const TimeSpec &times) {
+    return times.sample_times.empty() ? times.t_end : times.sample_times.back();
+}
+
+static void record_clamp_atol(CvodeUserData &data, void *cvode_mem, double atol,
+                              const std::vector<double> &atol_v, int ns) {
+    data.clamp_cvode_mem = cvode_mem;
+    data.below_zero_refusal.clear();
+    if (!atol_v.empty()) {
+        data.clamp_atol = atol_v;
+    } else {
+        data.clamp_atol.assign(static_cast<std::size_t>(ns), atol);
+    }
+}
+
 static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
     const NetworkModel &model = *data->model;
     const int ns = model.n_species();
@@ -757,9 +804,91 @@ static inline double *clamp_state_nonneg(CvodeUserData *data, const double *y_pt
         data->rhs_nonneg_scratch.assign(ns, 0.0);
     double *s = data->rhs_nonneg_scratch.data();
     const std::vector<char> &mask = nonneg_clamp_mask(data);
-    for (int i = 0; i < ns; ++i)
-        s[i] = (y_ptr[i] > 0.0 || !mask[i]) ? y_ptr[i] : 0.0;
+    const std::vector<double> &atol = data->clamp_atol;
+    const bool bounded = atol.size() == static_cast<std::size_t>(ns);
+    for (int i = 0; i < ns; ++i) {
+        const bool near_zero =
+            !bounded || y_ptr[i] >= -kClampNoiseAtols * atol[static_cast<std::size_t>(i)];
+        s[i] = (y_ptr[i] > 0.0 || !mask[i] || !near_zero) ? y_ptr[i] : 0.0;
+    }
     return s;
+}
+
+// Leaving a far-negative component unclamped makes its RHS CVODE's recoverable
+// failure, which is right where CVODE asked about a state it will not keep: a
+// Newton iterate thrown far off shrinks the step and the run goes on. It is not
+// enough where the run itself has gone there. BIOMD0000000338's dense run with
+// the closed-form Jacobian, refused that value at XIIa = -1, stepped across the
+// pole and returned XIIa = -9.46, then +61, with no error. So where the solver's
+// own predicted state is as far below 0 in the same component, the run ends:
+// true, the reason recorded for the failure message, and the callback returns
+// CVODE's unrecoverable code. A run ended that way raises as a CVODE failure,
+// which a failed closed-form attempt retries on the difference quotient (GH
+// #176).
+//
+// The predicted state is zn[0] at tn, Dky(tn, 0): the step's start extrapolated
+// from the states CVODE accepted, which is what a Newton iterate is not. The
+// accepted state itself is not handed out during a step (cvPredict has already
+// shifted the history to tn = t_n + h), and a first-order shift back misreads
+// it beside a kink: #867's S, emptied by `sqrt(S)`, was read 1e6 atols below 0
+// where it sits at 0. Before a first step the prediction is the initial state.
+//
+// Not for a step past the run's last output time: CVODE steps beyond it and
+// interpolates back, and what lies there is no part of the answer. `sqrt(X)`
+// with X = 1 - t has a value up to t = 1, and a run asked for [0, 1] steps to X
+// = -2.6e-6 (atol 1e-12) on the way there.
+static bool followed_below_zero(CvodeUserData *data, N_Vector y, const char *src) {
+    const int ns = data->model->n_species();
+    const std::vector<double> &atol = data->clamp_atol;
+    if (data->clamp_cvode_mem == nullptr || atol.size() != static_cast<std::size_t>(ns))
+        return false;
+    const std::vector<char> &mask = nonneg_clamp_mask(data);
+    const double *y_ptr = N_VGetArrayPointer(y);
+    auto far = [&](int i, double v) {
+        return mask[i] && v < -kClampNoiseAtols * atol[static_cast<std::size_t>(i)];
+    };
+    bool any = false;
+    for (int i = 0; i < ns && !any; ++i)
+        any = far(i, y_ptr[i]);
+    if (!any)
+        return false;
+    sunrealtype tn = 0.0;
+    if (CVodeGetCurrentTime(data->clamp_cvode_mem, &tn) != CV_SUCCESS || tn > data->clamp_t_end)
+        return false;
+    N_Vector pred = N_VClone(y);
+    if (pred == nullptr)
+        return false;
+    int at = -1;
+    if (CVodeGetDky(data->clamp_cvode_mem, tn, 0, pred) == CV_SUCCESS) {
+        const double *p = N_VGetArrayPointer(pred);
+        double worst = 0.0;
+        for (int i = 0; i < ns; ++i) {
+            const double depth = -y_ptr[i] / atol[static_cast<std::size_t>(i)];
+            if (far(i, y_ptr[i]) && far(i, p[i]) && depth > worst) {
+                worst = depth;
+                at = i;
+            }
+        }
+    }
+    N_VDestroy(pred);
+    if (at < 0)
+        return false;
+    if (data->below_zero_refusal.empty()) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%.6g, %.3g times the run's atol below 0, at t=%.9g",
+                      y_ptr[at], -y_ptr[at] / atol[static_cast<std::size_t>(at)],
+                      static_cast<double>(tn));
+        data->below_zero_refusal =
+            std::string(src) + " has no finite value where the run has carried concentration '" +
+            data->model->species()[static_cast<std::size_t>(at)].name + "' to " + buf +
+            ". No rounding of 0 is that far below it, so that state is not set to 0 to read "
+            "a value, which would return a trajectory that has already gone wrong: the run "
+            "is refused. Typically a rounding error tipped the species below 0 and the "
+            "model's own laws carried it to a pole or the edge of a rate law's domain, as "
+            "at an unstable equilibrium at 0 (BIOMD0000000338's XIIa). Tighter tolerances, "
+            "or a model that keeps the species nonnegative, may avoid it.";
+    }
+    return true;
 }
 
 // The sensitivity RHS's counterpart, and it snaps a strictly SMALLER set of
@@ -1092,7 +1221,10 @@ static std::string describe_nonfinite_witness(NetworkModel &model, const NonFini
 // witness, or nothing at all when it left none (GH #336). Forward-declared above
 // retry_while_advancing, which throws before CvodeUserData is a complete type.
 static std::string nonfinite_witness_suffix(CvodeUserData &data) {
-    return describe_nonfinite_witness(*data.model, data.nonfinite_witness);
+    std::string suffix = describe_nonfinite_witness(*data.model, data.nonfinite_witness);
+    if (!data.below_zero_refusal.empty())
+        suffix += " " + data.below_zero_refusal;
+    return suffix;
 }
 
 // Issue #545: a forward-sensitivity run whose step gave out where the run had just
@@ -1384,6 +1516,8 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
             // code it has always had.
             data->nonfinite_witness.capture("The RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
+            if (followed_below_zero(data, y, "The RHS"))
+                return -1;
             return 1; // still non-finite (e.g. inf from 1/conc) -> recoverable
         }
     }
@@ -1497,6 +1631,8 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
             // (GH #336).
             data->nonfinite_witness.capture("The compiled RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
+            if (followed_below_zero(data, y, "The compiled RHS"))
+                return -1;
             return 1; // still non-finite -> recoverable
         }
     }
@@ -1716,6 +1852,8 @@ static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /
         if (jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, "The Jacobian"))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1765,6 +1903,8 @@ static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy
         if (rc == 0 && jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             data->model->n_species()); // GH #336
+            if (followed_below_zero(data, y, "The compiled Jacobian"))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1796,14 +1936,19 @@ static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMa
 
 // f at a state CVODE never asked about, leaving nothing a run reads afterwards:
 // the per-species maxima (#1025), the non-finite witness (#336), a parked
-// exception (#589). False where f fails there or is not finite.
+// exception (#589), a below-zero refusal. False where f fails there or is not
+// finite.
 static bool dq_side_point(CvodeUserData *data, sunrealtype t, N_Vector y, N_Vector f) {
     std::vector<double> *x_max = data->x_max;
     data->x_max = nullptr;
     const bool had_witness = data->nonfinite_witness.captured;
     const bool had_error = static_cast<bool>(data->callback_error);
+    const bool had_refusal = !data->below_zero_refusal.empty();
     const int rc = data->dq_rhs(t, y, f, data);
     data->x_max = x_max;
+    if (!had_refusal) {
+        data->below_zero_refusal.clear();
+    }
     if (!had_witness) {
         data->nonfinite_witness = NonFiniteWitness{};
     }
@@ -1929,6 +2074,8 @@ static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/,
         if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), conc,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, "The Jacobian"))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1982,6 +2129,8 @@ static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*f
         if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, "The compiled Jacobian"))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -4050,6 +4199,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         w.user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
         apply_cvode_tolerances(w.cvode_mem, w.ctx, rtol, atol, atol_v, ns,
                                w.user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
+        record_clamp_atol(w.user_data, w.cvode_mem, atol, atol_v, ns);
         CVodeSetUserData(w.cvode_mem, &w.user_data);
         CVodeSetMaxNumSteps(w.cvode_mem, max_steps);
         if (opts.max_step_size > 0) {
@@ -4131,8 +4281,10 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
     // user_data would otherwise carry across run()s: a step an earlier run
     // recovered from must not be offered as the explanation for a later run's
     // failure. The cold run() path builds its user_data per call and needs no
-    // equivalent.
+    // equivalent. So too a below-zero refusal.
     w.user_data.nonfinite_witness = NonFiniteWitness{};
+    w.user_data.below_zero_refusal.clear();
+    w.user_data.clamp_t_end = last_output_time(times);
 
     // ─── Integration loop (no events, no sensitivities) ──────────────────────
     void *cvode_mem = w.cvode_mem;
@@ -4440,6 +4592,8 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
     apply_cvode_tolerances(cvode_mem, ctx, rtol, atol, atol_v, ns,
                            user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
+    record_clamp_atol(user_data, cvode_mem, atol, atol_v, ns);
+    user_data.clamp_t_end = last_output_time(times);
 
     flag = CVodeSetUserData(cvode_mem, &user_data);
     flag = CVodeSetMaxNumSteps(cvode_mem, max_steps);

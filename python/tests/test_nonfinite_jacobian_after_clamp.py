@@ -14,7 +14,10 @@ for a non-finite right-hand side. The run then fails as a CVODE failure, so
 ``jacobian="auto"`` retries on the difference-quotient Jacobian (GH #176) and
 returns what ``jacobian="fd"`` returns, and ``jacobian="analytical"`` raises,
 naming the Jacobian (GH #336) and the derivative that is infinite at 0 rather than
-the domain advice written for a right-hand side.
+the domain advice written for a right-hand side. Where S has drifted far below 0
+(-0.069 at the default atol of 1e-8) the right-hand side is no longer clamped to
+read it, so that failure names the right-hand side, which reads sqrt(S) there,
+not the Jacobian; S pinned at exactly 0 still names the slope.
 
 A ``run_batch`` row places the same bet. It used to call the core directly, with
 no retry, so once the Jacobian was refused a batch raised where the same
@@ -84,7 +87,7 @@ def test_auto_returns_what_the_difference_quotient_returns(text, codegen):
 @pytest.mark.parametrize("codegen", CODEGEN.values(), ids=CODEGEN.keys())
 @pytest.mark.parametrize("text", MODELS.values(), ids=MODELS.keys())
 def test_an_explicit_analytical_jacobian_fails_loudly(text, codegen):
-    with pytest.raises(bngsim.SimulationError, match=r"CVODE integration failed.*Jacobian"):
+    with pytest.raises(bngsim.SimulationError, match=r"CVODE integration failed.*non-finite"):
         _end(_sim(text, jacobian="analytical", codegen=codegen))
 
 
@@ -125,5 +128,5 @@ def test_the_sparse_callbacks_do_not_return_a_drifted_trajectory(text, codegen):
         assert "CVODE integration failed" in str(exc)
     else:
         assert abs(s_end) < 1e-6, f"S(40) = {s_end}"
-    with pytest.raises(bngsim.SimulationError, match=r"CVODE integration failed.*Jacobian"):
+    with pytest.raises(bngsim.SimulationError, match=r"CVODE integration failed.*non-finite"):
         _end(_sim(text, jacobian="analytical", codegen=codegen, force_sparse_linear_solver=True))
