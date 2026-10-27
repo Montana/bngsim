@@ -465,3 +465,118 @@ def test_a_state_the_rule_cannot_reach_is_left_out_not_an_exception(monkeypatch)
     monkeypatch.setattr(bngsim.Simulator, "run", fails_on_one_interval)
     v = D.check_sparsity(base)
     assert v.status == "pass" and "at 1 states" in v.note, v
+
+
+def test_a_run_past_the_models_deadline_does_not_start(monkeypatch):
+    import time
+
+    monkeypatch.setattr(D, "_DEADLINE", time.monotonic() - 1.0)
+    with pytest.raises(bngsim.SimulationTimeout):
+        D.run(SHAPES["triangle-maxabs"])
+
+
+def test_a_cap_spent_after_the_base_times_out_each_check_alone(monkeypatch):
+    """The pool kills a model's worker at its cap, and every row with it: on
+    the nightly MODEL1006230049, 0053 and 0077 take 716-751 s of 900, so a check
+    added to every model turned all their rows TIMEOUT. Past the deadline each
+    check is its own TIMEOUT, said why, and none is an exception or a pass."""
+    import time
+
+    real = D.Base
+
+    def base_then_spent(job):
+        b = real(job)
+        D._DEADLINE = time.monotonic() - 1.0
+        return b
+
+    monkeypatch.setattr(D, "Base", base_then_spent)
+    v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, deadline=time.monotonic() + 1e3)
+    assert {x.status for x in v.values()} <= {"timeout", "skip"}, v
+    assert v["grid"].status == "timeout", v["grid"]
+    assert "not finished within the model's cap" in v["grid"].note
+    assert v["sens_runs"].status == "timeout", v["sens_runs"]
+    assert D._DEADLINE is None
+
+
+def test_no_check_starts_past_the_deadline(monkeypatch):
+    """backend_as_asked builds and compiles Simulators without running one, so no
+    run's timeout bounds it: on MODEL1006230049 it started past a 180 s
+    deadline and took the worker to 203 s, past a 200 s cap."""
+    import time
+
+    real = D.Base
+    started = []
+
+    def base_then_spent(job):
+        b = real(job)
+        D._DEADLINE = time.monotonic() - 1.0
+        return b
+
+    monkeypatch.setattr(D, "Base", base_then_spent)
+    monkeypatch.setattr(D, "check_backend", lambda base: started.append(1) or D.Verdict("pass"))
+    v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, deadline=time.monotonic() + 1e3)
+    assert not started and v["backend_as_asked"].status == "timeout", v["backend_as_asked"]
+
+
+def test_a_base_past_the_deadline_is_a_timeout_on_every_row():
+    import time
+
+    v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, deadline=time.monotonic() - 1.0)
+    assert {x.status for x in v.values()} == {"timeout"}, v
+
+
+def test_no_deadline_bounds_nothing():
+    assert D._DEADLINE is None
+    v = D.check_all(SHAPES["triangle-maxabs"], None, ("grid",))
+    assert v["grid"].status == "pass", v
+
+
+def test_the_runner_hands_each_model_its_cap(tmp_path):
+    """The worker's deadline is the model's cap, short of it: with no time left
+    every row is a TIMEOUT of its own, not a model the pool killed."""
+    import queue
+
+    import differential_run as RUN
+
+    job = SHAPES["triangle-maxabs"]
+    spec = {
+        "key": job.model_id,
+        "job": job.as_dict(),
+        "checks": ["grid"],
+        "locale": None,
+        "max_species": 200,
+        "timeout": 1e-6,
+    }
+    q = queue.Queue()
+    RUN._worker(spec, q)
+    res = q.get_nowait()
+    assert res["status"] == "done", res
+    assert res["rows"]["grid"]["status"] == "timeout", res
+
+
+def test_a_model_killed_at_the_cap_keeps_the_rows_it_finished(tmp_path):
+    """A check compiling C past the deadline has no run to bound, and the pool
+    kills its worker at the cap: the verdicts it reached before stand, and only
+    the rest are TIMEOUT."""
+    import differential_run as RUN
+
+    job = SHAPES["triangle-maxabs"]
+    spec = {
+        "key": job.model_id,
+        "job": job.as_dict(),
+        "checks": ["grid", "backend_as_asked"],
+        "timeout": 900.0,
+        "partial": str(tmp_path / "0.json"),
+    }
+    RUN._keep(spec, "grid", D.Verdict("pass", 0.0, "agrees"))
+    rows = {r.method: r for r in RUN.to_results(spec, {"status": "timeout"}, {})}
+    assert rows["grid"].outcome == "PASS", rows["grid"]
+    assert rows["backend_as_asked"].outcome == "TIMEOUT"
+    assert rows["backend_as_asked"].exception == "cap of 900 s"
+
+
+def test_each_verdict_is_heard_as_it_is_reached():
+    heard = {}
+    v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, on_verdict=heard.__setitem__)
+    assert heard.keys() == v.keys()
+    assert all(heard[c] is v[c] for c in v)
