@@ -30,6 +30,7 @@
 #include "bngsim/atol_vector.hpp"
 #include "bngsim/codegen_abi.hpp"
 #include "bngsim/dense_eigenvalues.hpp"
+#include "bngsim/dq_jacobian.hpp"
 #include "bngsim/dynamic_library.hpp"
 #include "bngsim/fd_jacobian.hpp"
 #include "bngsim/function_columns.hpp"
@@ -366,6 +367,11 @@ struct SteadyStateUserData {
     // sized once when that callback is selected so a per-step Jacobian
     // allocates nothing. Empty on every other path.
     std::vector<double> fd_y_pert, fd_fy_pert, fd_h_vals;
+    // The dense difference quotient bngsim forms in place of CVODE's (issue
+    // #1002): the march's CVODE session and the rows its jump test evaluates.
+    void *dq_cvode_mem = nullptr;
+    std::vector<double> dq_scratch;
+    bool dq_debug = false;
     // Tracking absolute tolerance for the march (issue #213). Inactive for
     // every solve that does not ask for it.
     AtolTracking atol_tracking;
@@ -855,6 +861,57 @@ static int cvode_ss_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix 
         ud, [&] { return cvode_ss_dense_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
 }
 
+// f at a state the solver never asked about (issue #1002), through the solver's
+// own callback `call(out)`, leaving no exception parked that the solve would
+// rethrow. False where it fails or is not finite there.
+template <class Data, class Call>
+static bool ss_dq_side_point(Data *data, N_Vector f, Call &&call) {
+    const bool had_error = static_cast<bool>(data->callback_error);
+    const int rc = call(f);
+    if (!had_error) {
+        data->callback_error = nullptr;
+    }
+    if (rc != 0) {
+        return false;
+    }
+    const double *fd = N_VGetArrayPointer(f);
+    const sunindextype n = N_VGetLength(f);
+    for (sunindextype i = 0; i < n; ++i) {
+        if (!std::isfinite(fd[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The march with no closed form to install (issue #1002): the quotient CVODE
+// would difference, formed by bngsim with the jump test (bngsim/dq_jacobian.hpp).
+static int cvode_ss_dense_dq_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                      N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    auto *data = static_cast<SteadyStateUserData *>(ud);
+    int mended = 0;
+    const int rc = cvode_dense_dq_past_jumps(
+        data->dq_cvode_mem, y, fy, J, tmp1, tmp2, tmp3, data->dq_scratch,
+        [&](N_Vector out) { return cvode_ss_rhs(t, y, out, ud); },
+        [&](N_Vector out) {
+            return ss_dq_side_point(data, out,
+                                    [&](N_Vector o) { return cvode_ss_rhs(t, y, o, ud); });
+        },
+        &mended);
+    if (mended > 0 && data->dq_debug) {
+        std::fprintf(stderr,
+                     "[jac] steady-state march dense DQ t=%.17g: %d entries step across a jump\n",
+                     static_cast<double>(t), mended);
+    }
+    return rc;
+}
+
+static int cvode_ss_dense_dq_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
+                                 N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
+    return guard_ss_callback<SteadyStateUserData>(
+        ud, [&] { return cvode_ss_dense_dq_jac_body(t, y, fy, J, ud, tmp1, tmp2, tmp3); });
+}
+
 #ifdef BNGSIM_HAS_KLU
 // The same Jacobian, written into the CSC values KLU factors (issue #128), for a
 // march the routing rule sent to the sparse linear solver. The structure has to
@@ -894,6 +951,12 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix
 // matrix therefore belongs to the system being integrated even when the two
 // backends differ. cvode_colored_jac on the time-course path predates the
 // codegen RHS and still differences the interpreted one.
+//
+// Unlike the time-course quotient, this one leaves the jump test (issue #1002)
+// off. Its frozen iteration changes the march's path and not where it ends: in
+// 24 variants of a model with three basins started on a jump, and every model
+// of that issue's tests, the march on this quotient ended where the closed
+// form's did, and KLU's ordering kept a species held at 0 there.
 static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
                                      N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
@@ -1471,6 +1534,15 @@ class SteadyStateMarcher {
         if (ss_install_solver_jacobian(rhs, opts)) {
             if (CVodeSetJacFn(cvode_mem_, cvode_ss_dense_jac) != CV_SUCCESS) {
                 throw std::runtime_error("CVodeSetJacFn failed (steady_state)");
+            }
+        } else {
+            // No closed form: the quotient CVODE would form, with the jump
+            // test (issue #1002).
+            ud_.dq_cvode_mem = cvode_mem_;
+            ud_.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
+            if (CVodeSetJacFn(cvode_mem_, cvode_ss_dense_dq_jac) != CV_SUCCESS) {
+                throw std::runtime_error(
+                    "CVodeSetJacFn failed (steady_state, difference quotient)");
             }
         }
     }
