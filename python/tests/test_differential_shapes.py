@@ -505,7 +505,8 @@ def test_every_grammar_entry_is_one_bngsim_reads(fmt, op):
     leaves = [negative, G.Node("par", value=0), G.Node("num", value=1.5), G.Node("obs", value=1)]
     law = G.Node(op, leaves[: G.GRAMMAR[op][0]])
     model = G.Model(fmt, [2.0, 1.0], [0.7, 0.4], [G.Reaction([0], [1], law)])
-    path = G.write(model, _DIR / f"grammar_{fmt}_{op}")
+    # Named by position, not by op: "if<" is no file name on Windows.
+    path = G.write(model, _DIR / f"grammar_{fmt}_{_SPELLED.index((fmt, op))}")
     load = bngsim.Model.from_net if fmt == "net" else bngsim.Model.from_sbml
     r = bngsim.Simulator(load(str(path)), method="ode").run(t_span=(0, 5), n_points=6)
     assert np.isfinite(np.asarray(r.species)).all()
