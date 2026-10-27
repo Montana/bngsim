@@ -3232,8 +3232,8 @@ class Simulator:
                 # Dropping a WORKING artifact to regenerate it must not be able to
                 # turn a call that used to succeed into a refusal: the helper
                 # no-ops on an attached artifact, so before the drop this could
-                # not raise at all. Put the old one back and let the consumer take
-                # its finite-difference fallback. With nothing to put back the
+                # not raise at all. Put the old one back: its functions have no
+                # d(output)/dp, and are refused by name. With nothing to put back the
                 # refusal is the real one (GH #214) and propagates.
                 if not prev_so and not prev_src:
                     raise
@@ -11721,43 +11721,58 @@ class SteadyStateResult:
                 "nothing to show it (issue #1002)."
             )
         masked = self._caller_masked_species()
-        if kind == "species":
+        # A rule target's row is its rule's (GH #247), so what that rule reads is
+        # what the target reads.
+        rule_target = kind == "species" and meta["index"] in self._rule_target_species
+        via = self._rule_target_expressions.get(meta["name"]) if rule_target else None
+        missing_of = (
+            self._expression_names.index(via)
+            if via in self._expression_names
+            else meta["index"]
+            if kind == "expression"
+            else None
+        )
+        if kind == "species" and not rule_target:
             named = [meta["name"]] if meta["name"] in masked else []
-        elif kind == "expression" and meta["index"] < len(self._expression_sens_missing):
-            # The first species with no row that its derivative read, as the
-            # solve recorded it (function_sens_missing_species).
-            missing = self._expression_sens_missing[meta["index"]]
+        elif missing_of is not None and missing_of < len(self._expression_sens_missing):
+            # The first species with no row that the function's value read, as
+            # the solve recorded it (function_sens_missing_species).
+            missing = self._expression_sens_missing[missing_of]
             named = [missing] if missing in masked else []
         else:
             # Which species an observable sums is not recorded here, so every
             # species the mask left out is named.
             named = masked
+        subject = "it" if not rule_target else f"its rule {via!r}" if via else "its rule"
         if not named:
-            if kind == "expression" and masked:
+            if masked and (kind == "expression" or rule_target):
                 # The read is found by stepping each such species and seeing
                 # the value move, which a term far below the rest of the
-                # function does not (``1e20 + Z``).
+                # function does not (``1e20 + Z``); and a row is NaN for a
+                # derivative of its own that is not a number, too.
                 return (
                     f"output_sensitivities: {meta['selector']!r} has no finite "
-                    "steady-state derivative: its row is not finite, and stepping the "
-                    f"species mask= left out of the solve ({', '.join(masked[:3])}"
-                    f"{', ...' if len(masked) > 3 else ''}) did not move its value; a "
-                    "read too small for that step is not seen."
+                    f"steady-state derivative: its row is not finite, and {subject} was "
+                    "not found to read a species mask= left out of the solve "
+                    f"({', '.join(masked[:3])}{', ...' if len(masked) > 3 else ''}). "
+                    "Either it reads one through a term too small against the rest for "
+                    "a step of that species to move the value, or its derivative is not "
+                    "a number at this state."
                 )
             return (
                 f"output_sensitivities: {meta['selector']!r} has no finite "
                 "steady-state derivative: its row is not finite, and it reads no "
                 "species mask= left out of the solve."
             )
-        if kind == "species":
-            reads = f"is {named[0]}, which"
+        if kind == "species" and not rule_target:
+            reads = f"it is {named[0]}, which"
         elif len(named) == 1:
-            reads = f"reads {named[0]}, which"
+            reads = f"{subject} reads {named[0]}, which"
         else:
-            reads = f"reads one or more of {', '.join(named)}, which"
+            reads = f"{subject} reads one or more of {', '.join(named)}, which"
         return (
             f"output_sensitivities: {meta['selector']!r} has no steady-state "
-            f"derivative: it {reads} mask= left out of the solve, so it has no "
+            f"derivative: {reads} mask= left out of the solve, so it has no "
             "steady value (issue #74). Select outputs that do not read it, or keep "
             "it in the mask."
         )

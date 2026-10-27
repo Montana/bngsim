@@ -178,10 +178,45 @@ def test_a_read_the_step_cannot_see_is_refused_not_zero():
     assert np.isnan(ss.sensitivities_expressions).all()
     with pytest.raises(
         ValueError,
-        match=r"'expression:V'.*stepping the species mask= left out of the solve \(Z\) "
-        r"did not move its value",
+        match=r"'expression:V'.*not found to read a species mask= left out of the solve "
+        r"\(Z\)\. Either it reads one through a term too small",
     ):
         ss.output_sensitivities(["V"])
+
+
+def test_a_row_nan_of_its_own_beside_a_mask_is_not_said_to_read_it():
+    """``V := sqrt(W) + P`` with W held at 0 and Z masked: V reads no masked
+    species, and its compiled row is NaN for inf·0 (the slope of sqrt at 0
+    times W's row of 0). Main differenced it, right: (10/3, -100/9). It is
+    refused, and the refusal does not say that V reads Z: it gives both
+    reasons a row can have here."""
+    ss = _masked_steady(_MASKED + "species W in D; W = 0;\nV := sqrt(W) + P;\n")
+    with pytest.raises(ValueError, match=r"'expression:V'.*not found to read") as err:
+        ss.output_sensitivities(["V"])
+    assert "or its derivative is not a number at this state" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "rule, found",
+    [("Z*Z + P", True), ("1e20 + Z*P", False)],
+    ids=["read", "unseen"],
+)
+def test_a_rule_target_whose_rule_reads_a_masked_species_says_so(rule, found):
+    """``species T := <rule>`` with Z masked: T's row is its rule's, and the
+    rule reads Z, so T has no steady value. Main refused ``species:T`` saying
+    T reads no masked species, and for ``1e20 + Z*P``, whose read a step of Z
+    cannot see, returned (0, 0) with no error. Both are refused, naming the
+    rule, and Z where the step saw it."""
+    ss = _masked_steady(_MASKED + f"species T in D; T := {rule};\n")
+    with pytest.raises(ValueError, match=r"'species:T'.*its rule 'T'") as err:
+        ss.output_sensitivities(["species:T"])
+    if found:
+        assert "its rule 'T' reads Z, which mask= left out" in str(err.value)
+    else:
+        assert "its rule 'T' was not found to read" in str(err.value)
+    np.testing.assert_allclose(
+        ss.output_sensitivities(["species:P"])[0], [1 / 0.3, -1 / 0.09], rtol=1e-7
+    )
 
 
 def test_a_function_the_derivation_budget_cut_is_refused_with_that_reason(monkeypatch, tmp_path):

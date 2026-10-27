@@ -920,7 +920,8 @@ reports how much of the expression block it answered:
 - `"partial"` — some did. The rest are functions the codegen declines to
   differentiate (a table function, a function that reads `rateOf`, or a
   non-smooth construct such as `if`/`abs`/`min`/`max`/`floor` — the same
-  constructs listed for `∂f/∂p` above).
+  constructs listed for `∂f/∂p` above), or rows that are NaN for their own
+  reason (a species `mask=` left out that they read, say).
 - `"none"` — none did: each function is declined or has a NaN row of its own
   (it reads a species `mask=` left out, say), or the model has no compiled
   output-sensitivity evaluator at all (an embedded table-function wrapper).
