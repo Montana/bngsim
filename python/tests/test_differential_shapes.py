@@ -580,3 +580,40 @@ def test_each_verdict_is_heard_as_it_is_reached():
     v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, on_verdict=heard.__setitem__)
     assert heard.keys() == v.keys()
     assert all(heard[c] is v[c] for c in v)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # codegen=True's refusal: the compile's timeout in its text, no cause
+        RuntimeError(
+            "codegen=True requested, but the codegen build failed (RuntimeError: Codegen "
+            "compilation timed out after 600 s (4.2 MB C source at -O1). The RHS, ..."
+        ),
+        # the sensitivity build's: chained to the compile's TimeoutExpired
+        "chained",
+    ],
+    ids=["in-text", "chained"],
+)
+def test_a_compile_past_bngsims_limit_is_a_timeout_not_a_crash(error):
+    """BIOMD0000000385 compiles 4.2 MB of C, past bngsim's 600 s limit: given
+    the time to reach that compile, it read TIMEOUT -> EXCEPTION, a "new crash"
+    the nightly alerts on. A timeout, whatever wraps it."""
+    import subprocess
+
+    if error == "chained":
+        try:
+            try:
+                raise subprocess.TimeoutExpired(["cc"], 600)
+            except subprocess.TimeoutExpired as inner:
+                raise RuntimeError("Codegen compilation timed out after 600 s") from inner
+        except RuntimeError as compile_error:
+            try:
+                raise RuntimeError("Failed to build the analytical sensitivity RHS") from (
+                    compile_error
+                )
+            except RuntimeError as outer:
+                error = outer
+    v = D._verdict_of(error)
+    assert v.status == "timeout", v
+    assert D._verdict_of(RuntimeError("Codegen compilation failed: syntax")).status == "exception"
