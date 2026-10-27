@@ -396,23 +396,19 @@ def test_a_model_with_no_jump_has_nothing_mended(
     assert "across a jump" not in capfd.readouterr().err
 
 
-@pytest.mark.parametrize(
-    ("rtol", "atol", "n_points", "within"),
-    [(1e-8, 1e-8, 301, 1e-6), (1e-7, 1e-10, 301, 1e-5), (3e-7, 1e-8, 601, 1e-5)],
-)
-def test_a_parked_sum_keeps_the_slope_that_holds_it(
-    data_dir: Path, tmp_path: Path, rtol: float, atol: float, n_points: int, within: float
-) -> None:
-    """Control. The #176 fixture with its voltage carried as V + V2, two species
-    that trade at kx·time() and kx while their sum parks 1e-11 under the step at
-    50 (#903's `split`). At t = 18.6 V leaves at 0.38 and V2 arrives at 0.38;
-    V's step crosses the threshold, in the rows of the species the step gates,
-    not V's own. The straddled slope is what carries this run on the difference
-    quotient: mended, the run crossed, 0.633 off at rtol 1e-7 and 3e-7 (601
-    points), and failed at others. Main is within 2e-6 at each of these."""
+def _split(data_dir: Path, tmp_path: Path, k_v_stim: str) -> tuple[str, str]:
+    """#903's `split` twin of the #176 fixture, written beside the test: the
+    voltage carried as V + V2, two species that trade at kx·time() and kx, its
+    stimulus set to `k_v_stim`. Returns the network's path and its oracle's,
+    the same network with each step replaced by the branch the exact trajectory
+    takes."""
     step = "if(((-70+Voltage_Level)<-20),0.5,0.05)"
     text = (data_dir / "ltype_calcium_discontinuous_jacobian.net").read_text()
     swaps = [
+        (
+            "   16 k_v_stim        49.99999999999  # Constant\n",
+            f"   16 k_v_stim        {k_v_stim}  # Constant\n",
+        ),
         (
             "   19 _rateLaw2       0.01  # Constant\n",
             "   19 _rateLaw2       0.01  # Constant\n   20 kx 0.01\n",
@@ -431,18 +427,60 @@ def test_a_parked_sum_keeps_the_slope_that_holds_it(
     for old, new in swaps:
         assert text.count(old) == 1, old
         text = text.replace(old, new)
-    exact_text = text.replace(step, "0.5").replace(
-        "if((Phospho_LTCC>0),k_pka_shift,0)", "k_pka_shift"
-    )
+    exact = text.replace(step, "0.5").replace("if((Phospho_LTCC>0),k_pka_shift,0)", "k_pka_shift")
     (tmp_path / "split.net").write_text(text)
-    (tmp_path / "split_exact.net").write_text(exact_text)
-    window = dict(t_span=(0.0, 150.0), n_points=n_points, rtol=rtol, atol=atol)
+    (tmp_path / "split_exact.net").write_text(exact)
+    return str(tmp_path / "split.net"), str(tmp_path / "split_exact.net")
+
+
+def _split_deviation(net: str, exact: str, **window) -> float:
     got = bngsim.Simulator(
-        bngsim.Model.from_net(str(tmp_path / "split.net")), method="ode", jacobian="fd"
+        bngsim.Model.from_net(net),
+        method="ode",
+        jacobian=window.pop("jacobian"),
+        force_sparse_linear_solver=window.pop("sparse"),
     ).run(**window)
-    want = bngsim.Simulator(
-        bngsim.Model.from_net(str(tmp_path / "split_exact.net")), method="ode"
-    ).run(**{**window, "rtol": 1e-12, "atol": 1e-12})
+    want = bngsim.Simulator(bngsim.Model.from_net(exact), method="ode").run(
+        **{**window, "rtol": 1e-12, "atol": 1e-12}
+    )
     g, w = np.asarray(got.observables), np.asarray(want.observables)
     scale = np.maximum(np.abs(w).max(axis=0), 1e-12)
-    assert float((np.abs(g - w) / scale).max()) < within
+    return float((np.abs(g - w) / scale).max())
+
+
+@pytest.mark.parametrize(
+    ("rtol", "atol", "n_points", "within"),
+    [(1e-8, 1e-8, 301, 1e-6), (1e-7, 1e-10, 301, 1e-5), (3e-7, 1e-8, 601, 1e-5)],
+)
+def test_a_parked_sum_keeps_the_slope_that_holds_it(
+    data_dir: Path, tmp_path: Path, rtol: float, atol: float, n_points: int, within: float
+) -> None:
+    """Control. #903's `split`: V + V2 parks 1e-11 under the #176 step at 50.
+    At t = 18.6 V leaves at 0.38 and V2 arrives at 0.38; V's step crosses the
+    threshold, in the rows of the species the step gates, not V's own. The
+    straddled slope is what carries this run on the difference quotient:
+    mended, the run crossed, 0.633 off at rtol 1e-7 and 3e-7 (601 points), and
+    failed at others. Main is within 2e-6 at each of these."""
+    net, exact = _split(data_dir, tmp_path, "49.99999999999")
+    window = dict(t_span=(0.0, 150.0), n_points=n_points, rtol=rtol, atol=atol)
+    assert _split_deviation(net, exact, jacobian="fd", sparse=False, **window) < within
+
+
+@pytest.mark.parametrize(
+    ("rtol", "atol", "sparse"),
+    [(1e-6, 1e-6, False), (1e-6, 1e-8, True), (3e-7, 1e-6, True), (1e-8, 1e-12, True)],
+)
+def test_a_sum_parked_on_its_threshold_is_never_silently_wrong(
+    data_dir: Path, tmp_path: Path, rtol: float, atol: float, sparse: bool
+) -> None:
+    """Control. `split` with the stimulus at exactly 50, so V + V2 parks on the
+    step itself (the #176 fixture upstream): the run fails or is right, here
+    and on main. With V's mends kept in the gated rows it returned 0.633 off
+    with no error at each of these tolerances, where main failed loudly."""
+    net, exact = _split(data_dir, tmp_path, "50.0")
+    window = dict(t_span=(0.0, 150.0), n_points=301, rtol=rtol, atol=atol)
+    try:
+        deviation = _split_deviation(net, exact, jacobian="fd", sparse=sparse, **window)
+    except bngsim.SimulationError:
+        return
+    assert deviation < 1e-3
