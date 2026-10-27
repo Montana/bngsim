@@ -313,16 +313,33 @@ def _declined(e: Exception) -> bool:
     )
 
 
+#: The words bngsim's compile timeout is reported in (``_codegen``), where
+#: ``codegen=True``'s refusal carries it in its text and not as its cause.
+_COMPILE_TIMED_OUT = "Codegen compilation timed out"
+
+
 def _timed_out(e: BaseException) -> bool:
+    """A run stopped by the model's cap, or a compile by bngsim's own limit
+    (BIOMD0000000385's 4.2 MB of C past 600 s): a timeout, whatever wraps it,
+    and never a crash."""
     import bngsim
 
-    return isinstance(e, bngsim.SimulationTimeout | subprocess.TimeoutExpired)
+    seen, depth = e, 0
+    while seen is not None and depth < 16:
+        if isinstance(seen, bngsim.SimulationTimeout | subprocess.TimeoutExpired):
+            return True
+        seen, depth = seen.__cause__ or seen.__context__, depth + 1
+    return _COMPILE_TIMED_OUT in str(e)
 
 
 def _verdict_of(e: Exception) -> Verdict:
     if _timed_out(e):
-        # The model's cap, reached in this check: its own row, not every row.
-        return Verdict("timeout", None, f"not finished within the model's cap: {_first_line(e)}")
+        # A cap reached in this check: its own row, not every row.
+        if _COMPILE_TIMED_OUT in str(e):
+            why = f"the compile timed out: {type(e).__name__}: {_first_line(e)}"
+        else:
+            why = f"not finished within the model's cap: {_first_line(e)}"
+        return Verdict("timeout", None, why)
     status = "unsupported" if _declined(e) or isinstance(e, _Declined) else "exception"
     return Verdict(status, None, f"{type(e).__name__}: {_first_line(e)}")
 
