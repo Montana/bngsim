@@ -358,15 +358,22 @@ def test_a_seed_is_its_model():
     assert G.render_net(G.generate(7, "net")) != G.render_net(G.generate(8, "net"))
 
 
-@pytest.mark.parametrize("fmt", G.FORMATS)
-@pytest.mark.parametrize("op", sorted(G.GRAMMAR))
+# Every (format, entry) that has a spelling: a .net-only entry (rint, erf...) is
+# not drawn for SBML, so there is nothing of it to read there.
+_SPELLED = [
+    (fmt, op)
+    for fmt in G.FORMATS
+    for op in sorted(G.GRAMMAR)
+    if G.GRAMMAR[op][1 if fmt == "net" else 2] is not None
+]
+
+
+@pytest.mark.parametrize(("fmt", "op"), _SPELLED)
 def test_every_grammar_entry_is_one_bngsim_reads(fmt, op):
     """Each spelling, alone in a law, loads and integrates to a finite answer:
     a generator that writes what bngsim refuses finds nothing but refusals. Its
     first argument is negative (0 - S1), which is what each guard is for: an
     unguarded log or square root of it is NaN."""
-    if G.GRAMMAR[op][1 if fmt == "net" else 2] is None:
-        pytest.skip(f"{op} has no {fmt} spelling")
     negative = G.Node("sub", [G.Node("num", value=0.0), G.Node("obs", value=0)])
     leaves = [negative, G.Node("par", value=0), G.Node("num", value=1.5), G.Node("obs", value=1)]
     law = G.Node(op, leaves[: G.GRAMMAR[op][0]])
