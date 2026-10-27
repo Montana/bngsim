@@ -5,8 +5,10 @@ report (issue #1257).
 The checks are ``_differential.py``'s: a sensitivity run's state against a plain
 run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
-and three rules for bugs whose answers are right (a sensitivity run refused, a
-sparsity pattern that misses entries, a backend other than the one asked for).
+and four rules for bugs whose answers are right (a sensitivity run refused, a
+sparsity pattern that misses entries, analytic Jacobian entries that differences
+of the right-hand side contradict (#1308), a backend other than the one asked
+for).
 One row per (model, check), its ``method`` the check:
 
     the path agrees with its reference .............. PASS
