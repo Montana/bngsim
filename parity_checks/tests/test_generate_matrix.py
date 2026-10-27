@@ -592,3 +592,10 @@ def test_a_no_signal_diff_keeps_its_tallies(mod):
     assert "agreement" not in note
     assert note.startswith("50 of 150 compared points (over 3 shared species)")
     assert "50 beyond the hard ceiling" in note
+
+
+def test_a_recordings_own_timeout_note_is_dropped_like_a_kill():
+    """Issue #1290: a recording's worker reports TIMEOUT past the cap with its own
+    note; like "killed at", the per-engine footnote already says it."""
+    comment = "ran past the 300.0s wall cap (a recording runs to 600.0s to save its reference)"
+    assert gm.humanize_comment({"comment": comment, "outcome": "TIMEOUT"}) == ""
