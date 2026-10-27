@@ -101,6 +101,10 @@ CHECKS = (
     "grid",
     "sparsity_covers_jacobian",
     "backend_as_asked",
+    # State leaks (#1307): a restarted run, a reused Model or Simulator, a batch.
+    "restart",
+    "reuse",
+    "batch",
 )
 
 
@@ -209,6 +213,9 @@ class Base:
         result, sim = run(job)
         self.job = job
         self.x = np.asarray(result.species, dtype=float)
+        # The columns of x, by name: a Result's species, which leave out a
+        # parameter an event promotes into the state (Model.species_names has it).
+        self.species_names = list(result.species_names)
         self.backend = sim.codegen_backend
         self.drift = own_drift(job, self.x)
         self.limit = max(PATH_RTOL_FACTOR * job.rtol, DRIFT_FACTOR * self.drift)
@@ -521,6 +528,158 @@ def check_sparsity(base: Base) -> Verdict:
     return _guard(go)
 
 
+# State-leak checks (issue #1307). Every other check runs a fresh model, by
+# design; callers reuse one, and "the solver leaves scratch state in the
+# user's Model, or drops state it should carry" is a family of its own (#786;
+# #748, #705, #693). Each run here is compared with the base as every path is.
+
+BATCH_FACTORS = (1.0, 1.1, 0.9, 1.05)
+BATCH_THREADS = 4
+
+
+def _species(result, base: Base) -> np.ndarray:
+    """A Result's species in the base's column order."""
+    names = list(result.species_names)
+    x = np.asarray(result.species, dtype=float)
+    return x[:, [names.index(n) for n in base.species_names]]
+
+
+def _worst(verdicts: list[tuple[str, Verdict]]) -> Verdict:
+    """The verdict of several comparisons: a DIFF if any is, else the first."""
+    for _label, v in verdicts:
+        if v.status != "pass":
+            return v
+    return Verdict(
+        "pass", max(v.value or 0.0 for _, v in verdicts), "; ".join(v.note for _, v in verdicts)
+    )
+
+
+def _solver(job: Job) -> dict:
+    return {"rtol": job.rtol, "atol": job.atol, "max_steps": job.max_steps}
+
+
+def check_restart(base: Base) -> Verdict:
+    """A run to the middle sample, continued to the end, is the base. Leg by
+    leg with ``run_until`` on one Simulator, which carries the events' trigger
+    state and pending delays across the stop (#693); and, for a model without
+    events, a fresh Model given the state saved at the middle, which cannot
+    know which triggers were already true and so is not asked to."""
+    import bngsim
+
+    def go():
+        job = base.job
+        n = job.n_points
+        m = (n - 1) // 2
+        t_mid = job.t_start + (job.t_end - job.t_start) * m / (n - 1)
+        out = []
+
+        sim = bngsim.Simulator(load(job.path), method="ode", **job.sim)
+        if job.t_start != 0.0:
+            sim.set_time(job.t_start)
+        first = sim.run_until(t_mid, n_points=m + 1, **_solver(job))
+        second = sim.run_until(job.t_end, n_points=n - m, **_solver(job))
+        legs = np.vstack([_species(first, base), _species(second, base)[1:]])
+        out.append(("run_until", base.compare(legs, "run_until to the middle and on: ")))
+
+        model = load(job.path)
+        if model._core.n_events == 0:
+            sim = bngsim.Simulator(model, method="ode", **job.sim)
+            head = sim.run(t_span=(job.t_start, t_mid), n_points=m + 1, **_solver(job))
+            state = np.asarray(sim.get_state(), dtype=float)
+            fresh = bngsim.Simulator(load(job.path), method="ode", **job.sim)
+            fresh.set_state(state, time=t_mid)
+            tail = fresh.run(t_span=(t_mid, job.t_end), n_points=n - m, **_solver(job))
+            joined = np.vstack([_species(head, base), _species(tail, base)[1:]])
+            out.append(("fresh", base.compare(joined, "a fresh model from the middle's state: ")))
+        return _worst(out)
+
+    return _guard(go)
+
+
+def check_reuse(base: Base) -> Verdict:
+    """A second run is the base: a second ``run()`` on the same Simulator, and
+    a first one on a second Simulator over the same Model, each after the
+    first run is undone with ``snapshot()``/``restore()`` (species, parameters,
+    and the events' trigger state, #693). ``Model.reset()`` restores species
+    only, so an event that writes a parameter would leave it written; restore
+    is the documented way back."""
+    import bngsim
+
+    def go():
+        job = base.job
+        span = {"t_span": (job.t_start, job.t_end), "n_points": job.n_points, **_solver(job)}
+        out = []
+
+        sim = bngsim.Simulator(load(job.path), method="ode", **job.sim)
+        snap = sim.snapshot()
+        sim.run(**span)
+        sim.restore(snap)
+        again = sim.run(**span)
+        out.append(
+            ("run", base.compare(_species(again, base), "a second run() on one Simulator: "))
+        )
+
+        model = load(job.path)
+        first = bngsim.Simulator(model, method="ode", **job.sim)
+        snap = first.snapshot()
+        first.run(**span)
+        first.restore(snap)
+        second = bngsim.Simulator(model, method="ode", **job.sim).run(**span)
+        out.append(
+            ("model", base.compare(_species(second, base), "a second Simulator on one Model: "))
+        )
+        return _worst(out)
+
+    return _guard(go)
+
+
+def check_batch(base: Base) -> Verdict:
+    """``run_batch`` on ``BATCH_THREADS`` threads is the same points run one
+    at a time, and its unchanged point is the base. The points scale the
+    first parameter a sensitivity run would take (``sens_params``); a model
+    with none runs the same point four times, which still asks whether the
+    threads share anything."""
+    import bngsim
+
+    def go():
+        job = base.job
+        model = load(job.path)
+        knobs = sens_params(model)
+        if knobs:
+            p, v = knobs[0], float(model.get_param(knobs[0]))
+            points = [{p: v * f} for f in BATCH_FACTORS]
+        else:
+            points = [{} for _ in BATCH_FACTORS]
+        kw = {
+            "t_span": (job.t_start, job.t_end),
+            "n_points": job.n_points,
+            "params": points,
+            **_solver(job),
+        }
+        # One at a time first: a point that does not integrate alone (a model
+        # at the edge of its domain, moved 10% off its own parameter) is not
+        # the batch's to judge. Threads failing where it runs is.
+        try:
+            serial = bngsim.Simulator(load(job.path), method="ode", **job.sim).run_batch(**kw)
+        except bngsim.SimulationError as e:
+            first = str(e).splitlines()[0][:200]
+            return Verdict(
+                "skip", note=f"a point of the sweep does not run one at a time: {first}"
+            )
+        sim = bngsim.Simulator(model, method="ode", **job.sim)
+        threaded = sim.run_batch(num_processors=BATCH_THREADS, **kw)
+        out = [("point 0", base.compare(_species(threaded[0], base), "the batch's own point: "))]
+        for i, (a, b) in enumerate(zip(threaded, serial, strict=True)):
+            g = gap(_species(a, base), _species(b, base), PATH_RTOL_FACTOR * job.atol)
+            note = (
+                f"point {i} on {BATCH_THREADS} threads against one at a time: {g:.2e} of its peak"
+            )
+            out.append((f"point {i}", Verdict("pass" if g <= base.limit else "diff", g, note)))
+        return _worst(out)
+
+    return _guard(go)
+
+
 def comma_locale() -> str | None:
     """A comma-decimal LC_NUMERIC this machine has, or None. Asked of a child
     process, so this one's locale is never set."""
@@ -594,6 +753,9 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
         "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
+        "restart": check_restart,
+        "reuse": check_reuse,
+        "batch": check_batch,
     }
     for name, fn in one.items():
         if name in checks:

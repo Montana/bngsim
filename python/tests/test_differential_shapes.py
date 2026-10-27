@@ -338,3 +338,120 @@ def test_the_conditioning_gate_keeps_a_chaotic_model_from_a_false_finding(monkey
     monkeypatch.setattr(D, "DRIFT_FACTOR", 0.0)
     ungated = D.check_ajac(D.Base(job))
     assert ungated.status == "diff", ungated
+
+
+# ── State leaks (#1307): a model mutated between runs reads DIFF ──
+
+# equality-dwell is a .net whose parameters all move it; event-at-a-sample an
+# SBML model with an event, which restart crosses leg by leg.
+LEAKED_ON = ("equality-dwell", "event-at-a-sample")
+
+
+def _double_first_knob(model):
+    knob = D.sens_params(model)[0]
+    model.set_param(knob, 2.0 * float(model.get_param(knob)))
+
+
+@pytest.mark.parametrize("shape", LEAKED_ON)
+def test_a_model_changed_between_the_legs_of_a_restart_is_a_finding(monkeypatch, shape):
+    real = bngsim.Simulator.run_until
+    legs = []
+
+    def leaky(self, t, **kw):
+        if legs:
+            _double_first_knob(self._model)
+        legs.append(t)
+        return real(self, t, **kw)
+
+    monkeypatch.setattr(bngsim.Simulator, "run_until", leaky)
+    v = D.check_restart(_base(shape))
+    assert v.status == "diff" and "run_until" in v.note, v
+
+
+def test_a_fresh_model_given_a_state_it_does_not_hold_is_a_finding(monkeypatch):
+    """The second restart: a fresh model from the middle's saved state, which
+    a model without events takes (equality-dwell has none)."""
+    real = bngsim.Simulator.set_state
+
+    def leaky(self, state, **kw):
+        real(self, state, **kw)
+        _double_first_knob(self._model)
+
+    monkeypatch.setattr(bngsim.Simulator, "set_state", leaky)
+    v = D.check_restart(_base("equality-dwell"))
+    assert v.status == "diff" and "fresh model" in v.note, v
+
+
+@pytest.mark.parametrize("shape", LEAKED_ON)
+def test_a_restore_that_leaves_a_parameter_changed_is_a_finding(monkeypatch, shape):
+    """Reuse rests on snapshot()/restore(): one that leaves the first run's
+    mark reads as the leak it is."""
+    real = bngsim.Simulator.restore
+
+    def leaky(self, snapshot=None):
+        real(self, snapshot)
+        _double_first_knob(self._model)
+
+    monkeypatch.setattr(bngsim.Simulator, "restore", leaky)
+    v = D.check_reuse(_base(shape))
+    assert v.status == "diff", v
+
+
+@pytest.mark.parametrize("shape", LEAKED_ON)
+def test_a_batch_point_run_on_another_parameter_is_a_finding(monkeypatch, shape):
+    """One threaded point run on a parameter other than its own, as a clone
+    that shared its parent's state would be."""
+    real_batch, real_one = bngsim.Simulator.run_batch, bngsim.Simulator._run_single_batch
+    threaded = []
+
+    def batch(self, *a, num_processors=None, **kw):
+        threaded.append(bool(num_processors and num_processors > 1))
+        try:
+            return real_batch(self, *a, num_processors=num_processors, **kw)
+        finally:
+            threaded.pop()
+
+    def one(self, i, p, *a, **kw):
+        if threaded and threaded[-1] and i == 1:
+            p = {k: 2.0 * v for k, v in p.items()}
+        return real_one(self, i, p, *a, **kw)
+
+    monkeypatch.setattr(bngsim.Simulator, "run_batch", batch)
+    monkeypatch.setattr(bngsim.Simulator, "_run_single_batch", one)
+    v = D.check_batch(_base(shape))
+    assert v.status == "diff" and "point 1" in v.note, v
+
+
+def _failing_point(monkeypatch, only_threaded):
+    """Point 1 of the batch raises, on threads only or always."""
+    real_batch, real_one = bngsim.Simulator.run_batch, bngsim.Simulator._run_single_batch
+    threaded = []
+
+    def batch(self, *a, num_processors=None, **kw):
+        threaded.append(bool(num_processors and num_processors > 1))
+        try:
+            return real_batch(self, *a, num_processors=num_processors, **kw)
+        finally:
+            threaded.pop()
+
+    def one(self, i, p, *a, **kw):
+        if i == 1 and (threaded[-1] or not only_threaded):
+            raise bngsim.SimulationError(f"Batch simulation {i} failed: CVODE (planted)")
+        return real_one(self, i, p, *a, **kw)
+
+    monkeypatch.setattr(bngsim.Simulator, "run_batch", batch)
+    monkeypatch.setattr(bngsim.Simulator, "_run_single_batch", one)
+
+
+def test_a_sweep_point_that_does_not_run_alone_is_not_the_batchs_to_judge(monkeypatch):
+    """BIOMD0000000763's: a point 10% off its parameter fails to integrate one
+    at a time as on threads, which is the model, not a leak."""
+    _failing_point(monkeypatch, only_threaded=False)
+    v = D.check_batch(_base("equality-dwell"))
+    assert v.status == "skip" and "one at a time" in v.note, v
+
+
+def test_a_point_that_fails_only_on_threads_is_a_finding(monkeypatch):
+    _failing_point(monkeypatch, only_threaded=True)
+    v = D.check_batch(_base("equality-dwell"))
+    assert v.status == "exception", v

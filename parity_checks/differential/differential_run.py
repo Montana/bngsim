@@ -7,6 +7,9 @@ run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
 and three rules for bugs whose answers are right (a sensitivity run refused, a
 sparsity pattern that misses entries, a backend other than the one asked for).
+Three more reuse what every other check makes fresh (#1307): a run stopped and
+continued, a second run on a Simulator or a Model a first one ran, and a batch
+on threads against the same points one at a time.
 One row per (model, check), its ``method`` the check:
 
     the path agrees with its reference .............. PASS
