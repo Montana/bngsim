@@ -527,8 +527,8 @@ def test_an_entry_near_0_the_step_moves_is_refused(tmp_path):
 def test_an_entry_small_within_its_column_is_held_to_itself(tmp_path):
     """``X + X -> X + X + G`` at k = 1e-6 beside G at 1e8: dG*/ds =
     2·k·X*/k1 = 5.896e-5, and the floored step reads k·(2X* + h)/k1 =
-    6.605e-5, 12% off. The half step reads it 6% off, which is 8e-7 of the
-    column's largest entry (dX*/ds = 4.76): held to 1e-4 of that, main
+    6.605e-5, 12% off. The half step reads it 6% off, 3.6e-6 from the first,
+    which is 7.5e-7 of the column's largest entry (dX*/ds = 4.76): held to 1e-4 of that, main
     returned it with no error. Held to 1e-4 of itself, it is refused."""
     text = SECOND_ORDER.replace("    3 k   1.0\n", "    3 k   1e-6\n").format(s=S, k1=K1, big=1e8)
     text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
@@ -823,3 +823,69 @@ def test_model_jacobian_refuses_where_the_half_step_decides(tmp_path, monkeypatc
         match=r"d\(rate of G\(\)\)/dX\(\) is 13\.8711 .* 13\.126 stepped by half that",
     ):
         model.jacobian(y)
+
+
+def test_model_jacobian_holds_an_entry_small_within_its_column_to_itself(tmp_path, monkeypatch):
+    """``X + X -> X + X + G`` at k = 1e-6 beside G at 1e8: in X's column,
+    d(rate of G)/dX = 2·k·X* = 1.2e-5 sits beside -k1 = -0.21, and the
+    floored step reads k·(2X* + h) for it, the half step k·(2X* + h/2). The
+    two are 7.5e-7 apart, 3.5e-6 of the column's largest entry, which passed;
+    held to 1e-4 of itself the entry is refused."""
+    text = SECOND_ORDER.replace("    3 k   1.0\n", "    3 k   1e-6\n").format(s=S, k1=K1, big=1e8)
+    text = text.replace("    1 gx() abs(Xo)*Xo + Go\n", "")
+    path = tmp_path / "small_entry.net"
+    path.write_text(text)
+    model = bngsim.Model.from_net(path)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    with pytest.raises(bngsim.SimulationError, match=r"d\(rate of G\(\)\)/dX\(\)"):
+        model.jacobian(np.array([SO_X, 1e8 + 1e-6 * SO_X * SO_X]))
+
+
+RESIDUE = """begin parameters
+    1 s   1.3
+    2 k1  0.21
+    3 sg  1e8
+    4 dg  1.0
+    5 k   1.0
+end parameters
+begin species
+    1 X() 0
+    2 G() 1e8
+    3 Y() 0
+end species
+begin groups
+    1 Xo 1
+end groups
+begin functions
+    1 res() k*((Xo + 1) - 1 - Xo)
+end functions
+begin reactions
+    1 0 1 s
+    2 1 0 k1
+    3 0 2 sg
+    4 2 0 dg
+    5 0 3 res
+    6 3 0 dg
+end reactions
+"""
+
+
+def test_an_entry_of_rounding_residue_is_not_held_to_itself(tmp_path, monkeypatch):
+    """Control. Y is made at ``k·((X + 1) − 1 − X)``, the rounding of a sum,
+    so dY*/ds is rounding too: -2.8e-15 beside dX*/ds = 4.76, and another
+    rounding at half the step. An entry is held to 1e-4 of itself only down
+    to 1e-10 of its column's largest; held to itself alone, this column, a
+    right answer to its last bits, was refused. ``Model.jacobian()`` keeps the
+    same floor."""
+    path = tmp_path / "residue.net"
+    path.write_text(RESIDUE)
+    out = _steady(bngsim.Model.from_net(path), jacobian="fd")
+    sens = np.asarray(out.sensitivity)[:, 0]
+    assert sens[0] == pytest.approx(1 / K1, rel=1e-9)
+    assert abs(sens[2]) < 1e-12
+    assert "Y()" in out.sens_fd_half_step_species
+    model = bngsim.Model.from_net(path)
+    monkeypatch.setattr(type(model), "prepare_analytical_jacobian", lambda self: False)
+    assert model.jacobian(np.array([1.3 / K1, 1e8, float(out.concentrations[2])])).source == (
+        "finite-difference"
+    )
