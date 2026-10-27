@@ -139,6 +139,16 @@ static std::string sensitivity_restart_hint(double t_now, const CvodeUserData &d
 // with the time the batch started at. If it answers true the caller has dealt
 // with the stall itself (issue #928) and the retry ends, the flag left as it
 // is.
+// Whether `t` lies in the last step CVODE took, [tn - hu, tn], within the fuzz
+// CVodeGetDky itself allows: where CVODE can interpolate to it (issue #1301).
+static bool inside_last_step(double t, double tn, double hu) {
+    const double fuzz =
+        100.0 * std::numeric_limits<double>::epsilon() * (std::fabs(tn) + std::fabs(hu));
+    const double lo = hu >= 0.0 ? tn - hu - fuzz : tn + fuzz;
+    const double hi = hu >= 0.0 ? tn + fuzz : tn - hu - fuzz;
+    return t >= lo && t <= hi;
+}
+
 static void retry_while_advancing(void *cvode_mem, sunrealtype t_target, N_Vector y,
                                   sunrealtype *t_ret, int &flag, const char *context,
                                   CvodeUserData &data, const std::function<void()> &check_budget,
@@ -15622,6 +15632,9 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         ss_derivs.resize(ns);
     }
     int last_recorded_index = 0;
+    // Rows read where the run stood, CVODE having returned the time asked for
+    // from a step that does not span it (issue #1301).
+    int rows_outside_last_step = 0;
     bool ss_reached = false;
     double ss_residual_last = 0.0;
 
@@ -16505,8 +16518,36 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         std::to_string(cf));
                 }
             } else {
-                flag = CVode(cvode_mem, look_tout, y, &t_ret,
-                             (one_step || first_alone) ? CV_ONE_STEP : CV_NORMAL);
+                const int itask = (one_step || first_alone) ? CV_ONE_STEP : CV_NORMAL;
+                flag = CVode(cvode_mem, look_tout, y, &t_ret, itask);
+                // CV_NORMAL returns tout by interpolating to it in the last step,
+                // and does not check that the interpolation succeeded. After the
+                // sensitivity RHS has refused a state (the recoverable return of
+                // GH #395) CVODES can return tout from a step that does not span
+                // it: its CVodeGetDky refuses, `y` is left as it was, and the row
+                // took the state of the call before, at the time asked for, with
+                // its sensitivities left at zero (issue #1301, MODEL2001200002).
+                // Where tout is outside the last step, the row is read where the
+                // run stands, as a run with sensitivity columns records its rows.
+                if (flag == CV_SUCCESS && itask == CV_NORMAL && sens.n_total > 0 &&
+                    t_ret == look_tout) {
+                    sunrealtype tn_now = t_ret, hu_now = 0.0;
+                    CVodeGetCurrentTime(cvode_mem, &tn_now);
+                    CVodeGetLastStep(cvode_mem, &hu_now);
+                    if (!inside_last_step(static_cast<double>(look_tout),
+                                          static_cast<double>(tn_now),
+                                          static_cast<double>(hu_now))) {
+                        const int df = CVodeGetDky(cvode_mem, tn_now, 0, y);
+                        if (df != CV_SUCCESS) {
+                            throw std::runtime_error(
+                                "CVODE returned an output time outside its last step, and "
+                                "the state where it stands could not be read: " +
+                                std::to_string(df));
+                        }
+                        t_ret = tn_now;
+                        ++rows_outside_last_step;
+                    }
+                }
                 // The double before the stop reached: the stop is taken from
                 // there, with that one double integrated on the branch that
                 // ends (t_crossing_cvode above). Left out, it was half a double
@@ -18055,7 +18096,20 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
-            flag = CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
+            // Read at the row's own time, which is where CVODES returned except
+            // where tout lay outside its last step (above): CVodeGetSens reads
+            // at the time CVODES last returned, which there is the one asked for.
+            flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            if (flag != CV_SUCCESS) {
+                // A row whose sensitivities cannot be read is refused, never
+                // recorded as the zeros the buffer starts as, which read as a
+                // sensitivity of 0 (issue #1301).
+                std::ostringstream msg;
+                msg << "CVODES could not read the sensitivities at the output point t="
+                    << std::setprecision(17) << static_cast<double>(t_ret) << " (index " << i
+                    << "), flag " << flag << ": its interpolation does not reach that time.";
+                throw std::runtime_error(msg.str());
+            }
             if (flag == CV_SUCCESS) {
                 std::vector<const double *> sens_ptrs(n_sens);
                 for (int s = 0; s < n_sens; ++s) {
@@ -18114,6 +18168,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     // ─── Solver statistics ───────────────────────────────────────────────────
 
     impl_->record_solver_stats(cvode_mem, LS_guard, result);
+    result.solver_stats().n_rows_outside_last_step = rows_outside_last_step;
 
     if (check_ss) {
         result.solver_stats().steady_state_reached = ss_reached;
