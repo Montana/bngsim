@@ -1,0 +1,25 @@
+# A pulse over the clock T = k_clock*t, centred at T = 5 (t = 2.5), of width
+# 0.5 in T, moving X to Y (issue #1257: a narrow one, at a tolerance sweep,
+# is what found #1227). Samples every 0.2 in t: none on the pulse's edges.
+# Its centre and width are numbers, not parameters: X after the pulse does
+# not depend on them, so their columns are 0 and hold only the integration's
+# error, which no column judged on its own scale can judge.
+begin parameters
+    1 kx 1
+    2 k_clock 2
+end parameters
+begin species
+    1 T() 0
+    2 X() 10
+    3 Y() 0
+end species
+begin functions
+    1 f() kx*(1/0.5)*max(0,1-abs(Tobs-5)/(0.5/2))
+end functions
+begin reactions
+    1 0 1 k_clock
+    2 2 3 f
+end reactions
+begin groups
+    1 Tobs 1
+end groups

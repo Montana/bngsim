@@ -20,9 +20,16 @@ name: nightly-parity
 #   amici-sens   AMICI forward sensitivities      48 of the 50 curated BioModels x 2 methods
 #   rr-ssa       libRoadRunner gillespie          the 269 of the 306 SSA-screen BioModels
 #                                                 candidates the corpus holds (#806)
-#   fd-sens      central differences of bngsim's  45 committed .net models x 2 methods: the
-#                own trajectories                 only sensitivity oracle a .net model has,
-#                                                 and one independent of AMICI (#804)
+#   fd-sens      central differences of bngsim's  53 committed .net models x 2 methods: the
+#                own trajectories, and a          only sensitivity oracle a .net model has,
+#                tolerance sweep of the           and one independent of AMICI (#804); the
+#                analytic columns                 sweep is what sees #1227's class (#1257)
+#   differential bngsim's own paths, each         fd-sens's 53 .net models and the BioModels
+#                against another: sensitivity     under 1 MB, x 10 checks (#1257)
+#                vs plain, FD vs analytic
+#                Jacobian, KLU vs dense, cc vs
+#                interpreted and MIR, de_DE vs C,
+#                8x the output points
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -95,6 +102,7 @@ on:
       - ".github/workflows/nightly-parity.yml"
       - "parity_checks/nightly/**"
       - "parity_checks/fd_sens/**"
+      - "parity_checks/differential/**"
       # A re-baseline PR only copies a verdict file a nightly already produced;
       # re-running hours of sweeps to validate that would buy nothing.
       - "!parity_checks/nightly/baselines/**"
@@ -572,6 +580,61 @@ jobs:
           retention-days: 30
 
   # ------------------------------------------------------------------------- #
+  # bngsim's own paths that should give the same answer, each against another
+  # (#1257): a sensitivity run's state against a plain run's, the FD Jacobian
+  # against the analytic one, KLU against dense, compiled against interpreted
+  # (and cc against MIR on a MIR build), the run under a comma-decimal
+  # LC_NUMERIC against C; and three rules for bugs whose answers are right (a
+  # sensitivity run refused, a sparsity pattern that misses entries, a backend
+  # other than the one asked for). No reference engine: every path is bngsim's.
+  # The locale check needs de_DE.UTF-8, which the runner image lacks; without
+  # it the runner stops (exit 2), and the missing report alerts.
+  # ------------------------------------------------------------------------- #
+  differential:
+    name: Path-agreement check
+    needs: [corpus]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: parity_checks/rr_parity/models
+          key: ${{ needs.corpus.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Generate the comma-decimal locale
+        run: |
+          sudo locale-gen de_DE.UTF-8
+          locale -a | grep -i '^de_DE'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; print('bngsim', bngsim.__version__); bp.print_identity()"
+      # --timeout 900, not 300: three of a model's paths compile C, and the cache
+      # starts empty each night. On the PR's first run nine models passed the 300 s
+      # cap that finish in 22-90 s cold on an M3 Max (BIOMD0000000505: 48 s there),
+      # and the slowest that finished took 248 s; a timeout that flips with runner
+      # speed would alert as a regression.
+      - name: Run differential_run.py
+        env:
+          BNGSIM_CODEGEN_CACHE_DIR: ${{ runner.temp }}/codegen
+        run: uv run --no-sync python parity_checks/differential/differential_run.py --workers 4 --timeout 900 --out "$RUNNER_TEMP/differential.json" || true
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh differential core "$RUNNER_TEMP/differential.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-differential
+          path: nightly-out/differential/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
   # Stochastic tracks against run_network's SSA and standalone NFsim. Seeds are
   # fixed on both sides.
   # ------------------------------------------------------------------------- #
@@ -813,7 +876,7 @@ jobs:
   # ------------------------------------------------------------------------- #
   report:
     name: Report
-    needs: [plan, corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens, rr-ssa, fd-sens, publish]
+    needs: [plan, corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens, rr-ssa, fd-sens, differential, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
