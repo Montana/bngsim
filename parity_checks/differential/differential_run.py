@@ -60,6 +60,9 @@ FD_SENS_JOBS = HERE.parent / "fd_sens" / "fd_sens_jobs.json"
 RR_JOBS = HERE.parent / "rr_parity" / "ode_jobs.json"
 REFERENCE_ENGINE = "bngsim_paths"
 DEFAULT_TIMEOUT = 600.0
+#: The share of a model's cap its checks may use before the pool kills it: the
+#: rest is the margin for the run that ends past the deadline, and the reply.
+CAP_SHARE = 0.9
 DEFAULT_MAX_SPECIES = 200
 
 _OUTCOME = {
@@ -150,7 +153,10 @@ def _worker(spec: dict, q) -> None:
             res["status"] = "over"
             res["why"] = f"{n} species, over the cap of {spec['max_species']}"
         else:
-            verdicts = D.check_all(job, spec["locale"], tuple(spec["checks"]))
+            # What #1309 adds runs in what is left of the cap, short of it: the
+            # pool kills a worker at the cap, and every row of its model with it.
+            deadline = time.monotonic() + spec["timeout"] * CAP_SHARE - (time.perf_counter() - t0)
+            verdicts = D.check_all(job, spec["locale"], tuple(spec["checks"]), deadline)
             res["rows"] = {
                 c: {"status": v.status, "value": v.value, "note": v.note, "extra": v.extra}
                 for c, v in verdicts.items()

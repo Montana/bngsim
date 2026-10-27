@@ -69,6 +69,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -171,9 +172,10 @@ def sens_params(model) -> list[str]:
     return [p for p in model.primary_param_names if p not in excluded][:MAX_SENS_PARAMS]
 
 
-def run(job: Job, **kw):
+def run(job: Job, timeout: float | None = None, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
-    the Result and the Simulator."""
+    the Result and the Simulator. ``timeout`` is the run's wall-clock budget
+    (``bngsim.SimulationTimeout`` past it)."""
     import bngsim
 
     sim = bngsim.Simulator(load(job.path), method="ode", **{**job.sim, **kw})
@@ -183,6 +185,7 @@ def run(job: Job, **kw):
         rtol=job.rtol,
         atol=job.atol,
         max_steps=job.max_steps,
+        timeout=timeout,
     )
     return result, sim
 
@@ -634,11 +637,25 @@ ATTRIBUTION_TIGHTEN = 100.0
 JITTER_RTOL = (0.5, 2.0)
 
 
-def _arm_runs(base: Base) -> dict[str, np.ndarray]:
+def _left(deadline: float | None) -> float | None:
+    """The seconds to ``deadline`` (a ``time.monotonic()``), for a run's
+    ``timeout``: None for none. Past it no run starts: ``SimulationTimeout``."""
+    if deadline is None:
+        return None
+    left = deadline - time.monotonic()
+    if left <= 0:
+        import bngsim
+
+        raise bngsim.SimulationTimeout("the model's cap is spent")
+    return left
+
+
+def _arm_runs(base: Base, deadline: float | None = None) -> dict[str, np.ndarray]:
     """The third arms, each a trajectory in the base's columns: the base's own
     route at ``ATTRIBUTION_TIGHTEN`` x tighter tolerances, the base on the
     other linear solver, and libRoadRunner for SBML where it is installed. An
-    arm that does not run, or does not apply, is left out."""
+    arm that does not run, does not apply, or does not finish by ``deadline``
+    is left out."""
     import bngsim
 
     job, out = base.job, {}
@@ -651,12 +668,23 @@ def _arm_runs(base: Base) -> dict[str, np.ndarray]:
 
     f = ATTRIBUTION_TIGHTEN
     tight = Job(**{**job.__dict__, "rtol": job.rtol / f, "atol": job.atol / f})
-    take("tighter", lambda: _species(run(tight)[0], base))
+    take("tighter", lambda: _species(run(tight, timeout=_left(deadline))[0], base))
     if base.linear_solver == 1:
-        take("dense", lambda: _species(run(job, force_dense_linear_solver=True)[0], base))
+        take(
+            "dense",
+            lambda: _species(
+                run(job, timeout=_left(deadline), force_dense_linear_solver=True)[0], base
+            ),
+        )
     elif bngsim._bngsim_core.HAS_KLU:
-        take("klu", lambda: _species(run(job, force_sparse_linear_solver=True)[0], base))
-    if Path(job.path).suffix != ".net":
+        take(
+            "klu",
+            lambda: _species(
+                run(job, timeout=_left(deadline), force_sparse_linear_solver=True)[0], base
+            ),
+        )
+    # libRoadRunner takes no wall-clock budget: past the deadline it is not asked.
+    if Path(job.path).suffix != ".net" and (deadline is None or time.monotonic() < deadline):
         take("roadrunner", lambda: _roadrunner(base))
     return out
 
@@ -701,14 +729,16 @@ def contested(rows: dict[str, dict]) -> bool:
     return False
 
 
-def attribute(base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None) -> dict:
+def attribute(
+    base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None, deadline=None
+) -> dict:
     """Which side of a DIFF each third arm agrees with: the comparison's
     ``reference`` (the base, or the path it was judged against), its
     ``path``, ``both`` (the two are within the bound of the arm), or
     ``neither``. Its ``verdict`` is the one side every arm that took one
     took, ``split`` where they differ (the model is contested), or
     ``unattributed``."""
-    arms = _arm_runs(base) if arms is None else arms
+    arms = _arm_runs(base, deadline) if arms is None else arms
     atol = PATH_RTOL_FACTOR * base.job.atol
     sides = {}
     for name, x in arms.items():
@@ -723,12 +753,15 @@ def attribute(base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None)
     return {"verdict": verdict, "arms": sides}
 
 
-def check_stable(base: Base) -> Verdict:
+def check_stable(base: Base, deadline: float | None = None) -> Verdict:
     """The base's answer under a jittered grid (one point fewer, one more,
     twice as many) and tolerance (rtol x0.5, x2): a jump past the bound marks
     the model contested, its DIFFs real but unattributed and its PASSes luck.
     A grid of another length is read at its last point, which every grid
-    shares; twice as many at every other point, which are the base's."""
+    shares; twice as many at every other point, which are the base's. Each
+    rerun has until ``deadline``: one that has not finished leaves the check
+    SKIP, said so, and the model's other rows its own."""
+    import bngsim
 
     def go():
         job, jumps = base.job, {}
@@ -741,14 +774,15 @@ def check_stable(base: Base) -> Verdict:
         ):
             if m < 2:
                 continue
-            x = _species(run(Job(**{**job.__dict__, "n_points": m}))[0], base)
+            x = _species(
+                run(Job(**{**job.__dict__, "n_points": m}), timeout=_left(deadline))[0], base
+            )
             g = gap(x[::2], base.x, atol) if m == 2 * n - 1 else gap(x[-1:], base.x[-1:], atol)
             if g > base.limit:
                 jumps[label] = g
         for f in JITTER_RTOL:
-            x = _species(
-                run(Job(**{**job.__dict__, "rtol": job.rtol * f, "atol": job.atol * f}))[0], base
-            )
+            jittered = Job(**{**job.__dict__, "rtol": job.rtol * f, "atol": job.atol * f})
+            x = _species(run(jittered, timeout=_left(deadline))[0], base)
             g = gap(x, base.x, atol)
             if g > max(base.limit, f * base.limit):
                 jumps[f"rtol x{f:g}"] = g
@@ -762,7 +796,13 @@ def check_stable(base: Base) -> Verdict:
             )
         return Verdict("pass", 0.0, "the answer holds under a jittered grid and tolerance")
 
-    return _guard(go)
+    def bounded():
+        try:
+            return go()
+        except bngsim.SimulationTimeout as e:
+            return Verdict("skip", note=f"not finished within the model's cap: {_first_line(e)}")
+
+    return _guard(bounded)
 
 
 def comma_locale() -> str | None:
@@ -817,9 +857,14 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
     return _guard(go)
 
 
-def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Verdict]:
+def check_all(
+    job: Job, locale_name: str | None, checks=CHECKS, deadline: float | None = None
+) -> dict[str, Verdict]:
     """Every check of ``checks`` on one model. A base that does not run is no
-    reference: each check is then an exception on the base."""
+    reference: each check is then an exception on the base. ``deadline`` (a
+    ``time.monotonic()``) bounds what #1309 adds, ``stable`` and the
+    attribution's arms, which run last: a model whose other checks finish in
+    its cap keeps their rows, whatever the additions would cost."""
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001
@@ -838,7 +883,6 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
         "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
-        "stable": check_stable,
     }
     for name, fn in one.items():
         if name in checks:
@@ -850,10 +894,14 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
     diffs = [v for v in out.values() if v.status == "diff" and v.path_x is not None]
     if diffs:
         try:
-            arms = _arm_runs(base)
+            arms = _arm_runs(base, deadline)
             for v in diffs:
                 v.extra["attribution"] = attribute(base, v, arms)
         except Exception as e:  # noqa: BLE001 - attribution is advice, never a verdict
             for v in diffs:
                 v.extra["attribution"] = {"verdict": "unattributed", "error": str(e)[:300]}
+    # Last: five reruns of the base, the costliest of what #1309 adds, in what
+    # is left once the DIFFs are attributed (a stable row carries no trajectory).
+    if "stable" in checks:
+        out["stable"] = check_stable(base, deadline)
     return {c: out[c] for c in checks if c in out}

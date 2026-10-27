@@ -576,3 +576,37 @@ def test_1304s_model_reads_contested_with_each_arms_side_named():
     a = v.extra["attribution"]
     assert a["verdict"] == "split", a
     assert a["arms"]["tighter"]["side"] == "path" and a["arms"]["dense"]["side"] == "reference", a
+
+
+def test_what_1309_adds_runs_in_what_is_left_of_the_cap():
+    """The pool kills a model's worker at its cap, and every row with it: four of
+    the nightly's slowest models read TIMEOUT on every check once ``stable``
+    reran them (BIOMD0000000810's jittered rerun ground past 900 s). With the
+    deadline passed, ``stable`` is SKIP, said why, and each other row is what it
+    is without one."""
+    import time
+
+    job = SHAPES["triangle-maxabs-narrow"]
+    free = D.check_all(job, None, CHECKS)
+    bounded = D.check_all(job, None, CHECKS, deadline=time.monotonic())
+    assert bounded["stable"].status == "skip", bounded["stable"]
+    assert "not finished within the model's cap" in bounded["stable"].note
+    assert {c: v.status for c, v in bounded.items() if c != "stable"} == {
+        c: v.status for c, v in free.items() if c != "stable"
+    }
+
+
+def test_an_arm_past_the_deadline_is_left_out(monkeypatch):
+    """A DIFF's attribution in a spent cap asks no arm, and says nothing."""
+    import time
+
+    def planted(base):
+        moved = base.x * 1.5
+        return D.Verdict("diff", 0.5, "planted", ref_x=base.x, path_x=moved)
+
+    monkeypatch.setattr(D, "check_grid", planted)
+    job = SHAPES["triangle-maxabs-narrow"]
+    free = D.check_all(job, None, ("grid",))["grid"].extra["attribution"]
+    assert free["arms"], free
+    spent = D.check_all(job, None, ("grid",), deadline=time.monotonic())["grid"]
+    assert spent.extra["attribution"] == {"verdict": "unattributed", "arms": {}}, spent.extra
