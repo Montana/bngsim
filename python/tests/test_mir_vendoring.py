@@ -195,35 +195,9 @@ def test_cmake_gates_mir_behind_option():
 # 128 MB counted against a cap on the address space (`ulimit -v`) for every
 # live MIR-JIT'd model, about 60 to 8 GB. CMake sets 32 MB, which holds the
 # largest committed model's code in one piece on macOS arm64 (fceri_gamma,
-# 27.9 MB).
-
-_RESERVE_PROBE = """
-import os, subprocess, sys
-import bngsim
-
-def vsize_kb():
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmSize:"):
-                    return int(line.split()[1])
-    except OSError:
-        pass
-    out = subprocess.run(["ps", "-o", "vsz=", "-p", str(os.getpid())],
-                         capture_output=True, text=True, check=True)
-    return int(out.stdout.split()[0])
-
-def live():
-    sim = bngsim.Simulator(bngsim.Model.from_net(sys.argv[1]), method="ode", codegen=True)
-    sim.run(t_span=(0.0, 1.0), n_points=2)
-    assert sim.codegen_backend == "mir", sim.codegen_backend
-    return sim
-
-keep = [live() for _ in range(3)]
-before = vsize_kb()
-keep += [live() for _ in range(int(sys.argv[2]))]
-print((vsize_kb() - before) / 1024 / int(sys.argv[2]))
-"""
+# 27.9 MB). The live models' address space is measured in
+# test_mir_equivalence.py, which runs only on a MIR build: a skip here would be
+# one run_tests.sh's walk-up probe counts against it.
 
 
 def test_cmake_sizes_the_mir_code_reservation():
@@ -233,33 +207,3 @@ def test_cmake_sizes_the_mir_code_reservation():
     # The vendored default it overrides is still upstream's, so a refresh that
     # moves it is seen here.
     assert "#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)" in (MIR_DIR / "mir.c").read_text()
-
-
-def test_a_live_mir_model_holds_far_less_than_upstreams_reservation():
-    """Address space, not memory: 20 live MIR-JIT'd models of a two-species
-    network. With upstream's 128 MB reservation each held 128 MB; with the
-    default 32 MB, a little over 32. The bound catches a fall back to
-    upstream's size, not the exact setting: a build configured at 0 passes too."""
-    import os
-    import subprocess
-    import sys
-
-    import bngsim
-    import pytest
-
-    if not getattr(bngsim, "HAS_MIR", False):
-        pytest.skip("bngsim built without the MIR backend (configure with -DBNGSIM_ENABLE_MIR=ON)")
-    if sys.platform == "win32":
-        pytest.skip("POSIX-specific: MIR reserves no address space for its code on Windows")
-    net = BNGSIM_ROOT / "tests" / "data" / "simple_decay.net"
-    env = {**os.environ, "BNGSIM_CODEGEN_JIT": "mir"}
-    done = subprocess.run(
-        [sys.executable, "-c", _RESERVE_PROBE, str(net), "20"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=600,
-    )
-    assert done.returncode == 0, done.stderr[-2000:]
-    per_model_mb = float(done.stdout.strip().splitlines()[-1])
-    assert per_model_mb <= 40.0, per_model_mb
