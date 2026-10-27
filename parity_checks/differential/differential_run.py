@@ -41,9 +41,12 @@ generates ``de_DE.UTF-8`` first.
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as _dt
 import json
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -62,6 +65,9 @@ FD_SENS_JOBS = HERE.parent / "fd_sens" / "fd_sens_jobs.json"
 RR_JOBS = HERE.parent / "rr_parity" / "ode_jobs.json"
 REFERENCE_ENGINE = "bngsim_paths"
 DEFAULT_TIMEOUT = 600.0
+#: The share of a model's cap its checks may use before the pool kills it: the
+#: rest is the margin for the run that ends past the deadline, and the reply.
+CAP_SHARE = 0.9
 DEFAULT_MAX_SPECIES = 200
 
 _OUTCOME = {
@@ -131,6 +137,25 @@ def list_jobs(listing: Path, span: tuple[float, float]) -> list[D.Job]:
     return [_job_of(Path(x).resolve(), span) for x in listing.read_text().split() if x]
 
 
+def _row(v) -> dict:
+    return {"status": v.status, "value": v.value, "note": v.note, "extra": v.extra}
+
+
+def _keep(spec: dict, check: str, v) -> None:
+    """Each verdict as it is reached, to ``spec["partial"]``: a worker the pool
+    kills at the cap (one compiling C past the deadline) leaves the runner every
+    row it finished, and only the rest TIMEOUT."""
+    path = spec.get("partial")
+    if not path:
+        return
+    path = Path(path)
+    rows = json.loads(path.read_text()) if path.is_file() else {}
+    rows[check] = _row(v)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, default=str))
+    tmp.replace(path)
+
+
 def _worker(spec: dict, q) -> None:
     """One model's checks in a child process; puts one result dict on ``q``."""
     t0 = time.perf_counter()
@@ -152,11 +177,17 @@ def _worker(spec: dict, q) -> None:
             res["status"] = "over"
             res["why"] = f"{n} species, over the cap of {spec['max_species']}"
         else:
-            verdicts = D.check_all(job, spec["locale"], tuple(spec["checks"]))
-            res["rows"] = {
-                c: {"status": v.status, "value": v.value, "note": v.note, "extra": v.extra}
-                for c, v in verdicts.items()
-            }
+            # Short of the cap, at which the pool kills the worker and every row
+            # of the model with it: past the deadline a check is its own TIMEOUT.
+            deadline = time.monotonic() + spec["timeout"] * CAP_SHARE - (time.perf_counter() - t0)
+            verdicts = D.check_all(
+                job,
+                spec["locale"],
+                tuple(spec["checks"]),
+                deadline,
+                lambda c, v: _keep(spec, c, v),
+            )
+            res["rows"] = {c: _row(v) for c, v in verdicts.items()}
             res["status"] = "done"
     except Exception as e:  # noqa: BLE001 - a model that does not load is its rows' EXCEPTION
         res["status"] = "exception"
@@ -172,6 +203,15 @@ def _value(v):
 def to_results(spec: dict, r: dict, stamp: dict) -> list[JobResult]:
     now = _dt.datetime.now().isoformat(timespec="seconds")
     rows = r.get("rows")
+    kept = spec.get("partial") and Path(spec["partial"])
+    if rows is None and r.get("status") in ("timeout", "dead") and kept and kept.is_file():
+        # Killed at the cap: what it finished stands, the rest timed out.
+        note = f"cap of {spec['timeout']:.0f} s"
+        done = json.loads(kept.read_text())
+        rows = {
+            c: done.get(c) or {"status": r["status"], "value": None, "note": note, "extra": {}}
+            for c in spec["checks"]
+        }
     if rows is None:  # the model as a whole: over the cap, raised, timed out or died
         status = {"over": "skip"}.get(r.get("status"), r.get("status", "exception"))
         note = r.get("why") or (f"cap of {spec['timeout']:.0f} s" if status == "timeout" else "")
@@ -250,6 +290,9 @@ def main(argv=None) -> int:
     if args.models:
         subs = [s.strip() for s in args.models.split(",") if s.strip()]
         unique = [j for j in unique if any(s in j.model_id for s in subs)]
+    # Each model's verdicts as its worker reaches them (_keep), for one the pool kills.
+    kept = Path(tempfile.mkdtemp(prefix="differential-rows-"))
+    atexit.register(shutil.rmtree, kept, ignore_errors=True)
     specs = [
         {
             "key": j.model_id,
@@ -258,8 +301,9 @@ def main(argv=None) -> int:
             "locale": locale,
             "max_species": args.max_species,
             "timeout": args.timeout,
+            "partial": str(kept / f"{i}.json"),
         }
-        for j in unique
+        for i, j in enumerate(unique)
     ]
     print(f"differential: {len(specs)} models x {len(checks)} checks; locale {locale}")
     t0 = time.perf_counter()
