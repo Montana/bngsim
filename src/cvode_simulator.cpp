@@ -7681,6 +7681,42 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
             "' where the order of the two is confirmed, and the fire cannot be named to "
             "confirm it (issues #945, #1025). Drop sensitivities for this run.");
     }
+    // Issue #1277: #49's refusal, below, of two events on one instant whose
+    // times move differently, asked across batches too. A fire on the clock at
+    // a fixed time and one a requested column moves cross on one instant and
+    // fire as two batches, a root's slack apart. #49 asks one batch and sees
+    // neither with the other. Their order flips with the parameter, the result
+    // jumps there, and the run returned one side's slope with no error: dS/dk =
+    // 1.25 where S(3) goes from 3.75 to 4.25 across k = 1.
+    {
+        const double slack = 2.0 * kEventRootSlack * kSwitchInstantUlps *
+                             std::numeric_limits<double>::epsilon() *
+                             std::max(std::fabs(t_evt), 1.0);
+        for (const EventFire &earlier : event_fires) {
+            if (earlier.moves == fire_moves || !(std::fabs(t_evt - earlier.t) <= slack)) {
+                continue;
+            }
+            const auto name = [&](int ei) {
+                return ei >= 0 && !events_outer[ei].id.empty() ? events_outer[ei].id
+                                                               : std::to_string(ei);
+            };
+            const std::string before = earlier.occurrences.empty()
+                                           ? "an event"
+                                           : "'" + name(earlier.occurrences.front().first) + "'";
+            const std::string now = "'" + name(fired.front()) + "'";
+            const std::string &moving = fire_moves ? now : before;
+            const std::string &fixed = fire_moves ? before : now;
+            std::ostringstream msg;
+            msg << "Forward sensitivity: events " << before << " and " << now
+                << " fire on one instant, t=" << t_evt << ", in two batches, and their times "
+                << "move differently with the requested parameters: " << fixed
+                << " does not move and " << moving
+                << " does. Their order flips across the parameter, so the result jumps there "
+                   "and has no derivative (issues #49, #1277). Separate the trigger times, or "
+                   "drop the parameters that move them from sensitivity_params.";
+            throw std::runtime_error(msg.str());
+        }
+    }
     if (event_fires.size() >= kFiresKept) {
         event_fires.erase(event_fires.begin());
     }

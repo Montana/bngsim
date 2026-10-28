@@ -273,3 +273,51 @@ def test_the_same_pair_runs_when_nothing_requested_pulls_it_apart(T, params):
     decay = np.exp(-0.4 * 1.4)
     want = {"p": 2 * 2 * decay, "b": 2 * decay, "T": 0.0}
     np.testing.assert_allclose(s, [want[q] for q in params], rtol=1e-6, atol=1e-9)
+
+
+# ── The same pair in two batches (issue #1277) ──────────────────────────────
+#
+# E0 fires at t = 2.5 whatever k is; E1 when q = k·t reaches its trigger, so at
+# trigger/k. With the trigger on 2.5 they cross on one instant but fire as two
+# batches, a root's slack apart, and the refusal above, asked of one batch,
+# saw neither with the other. S(3) is 3.75 with E0 first and 4.25 with E1
+# first, and k picks which: the run returned dS/dk = 1.25, one side's slope.
+
+TWO_BATCHES = (
+    "species S; S = 3; q = 0; k = 1; a = 1\n"
+    "q' = k; S' = a\n"
+    "E0: at (time >= 2.5): S = S + 1\n"
+    "E1: at (q >= {trigger!r}): S = S/2\n"
+)
+TWO_BATCH_TIMES = [0.0, 1.0, 2.0, 2.5, 3.0]
+
+
+def _two_batches(trigger, params):
+    model = bngsim.Model.from_antimony_string(TWO_BATCHES.format(trigger=trigger))
+    return bngsim.Simulator(model, method="ode", sensitivity_params=params).run(
+        sample_times=TWO_BATCH_TIMES, rtol=1e-10, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("offset", [-1e-13, 0.0, 1e-13], ids=["E1 first", "on", "E0 first"])
+def test_a_fixed_fire_and_a_moving_one_in_two_batches_are_refused(offset):
+    """Either way round: the fire that moves comes first just below 2.5, and
+    last just above it."""
+    with pytest.raises(Exception, match=r"move differently.*issues #49, #1277") as err:
+        _two_batches(2.5 + offset, ["k"])
+    assert "'E0' does not move and 'E1' does" in str(err.value)
+
+
+@pytest.mark.parametrize("trigger", [2.5 - 1e-6, 2.5 + 1e-6], ids=["E1 first", "E0 first"])
+def test_the_pair_a_millionth_apart_runs(trigger):
+    """Apart, the order holds across k and S(3) has a slope: t* = trigger/k,
+    and S(3) = 5.5 - t*/2 or 5 - t*/2 by the order, so dS/dk = trigger/2."""
+    s = np.asarray(_two_batches(trigger, ["k"]).sensitivities)[-1, 0, 0]
+    assert s == pytest.approx(trigger / 2.0, rel=1e-6)
+
+
+def test_the_pair_on_one_instant_runs_where_no_column_moves_either():
+    """Requested a, which moves neither fire: dS(3)/da = 2.5/2 + 0.5 in either
+    order, and the run gives it."""
+    s = np.asarray(_two_batches(2.5, ["a"]).sensitivities)[-1, 0, 0]
+    assert s == pytest.approx(1.75, rel=1e-6)
