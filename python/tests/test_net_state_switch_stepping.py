@@ -649,6 +649,13 @@ def _clock_closed_window(n, x0_each, rate_each, thr, t_close, k=10.0):
 
 # Where the window opens: five phases of it.
 _PHASES = [5.0, 5.37, 6.13, 7.71, 9.19]
+# The oracle: Obs reaches thr at t_open and T reaches 1 at t_open + 0.5, by
+# construction, so r = k = 10 for 0.5 and Y = 5. A lost window gives Y = 0.
+# The tolerance: CVODE holds Y to rtol 1e-8, and the 30 runs below are at most
+# 3.1e-8 off (measured). 1e-6 leaves 30x and still fails a window that loses
+# more than 5e-7 of its 0.5 (k*5e-7 = 5e-6 = 1e-6 of Y).
+_WINDOW_Y = 5.0
+_WINDOW_REL = 1e-6
 
 
 @pytest.mark.parametrize("t_end", [20.0, 50.0])
@@ -667,7 +674,7 @@ def test_a_window_on_an_observable_over_many_species_is_integrated(tmp_path, n, 
     text = _clock_closed_window(n, (1.0 - rate * t_open) / n, rate / n, 1.0, t_open + 0.5)
     model = _write(tmp_path, text)
     result = bngsim.Simulator(model).run(t_span=(0.0, t_end), n_points=3, rtol=1e-8, atol=1e-8)
-    assert float(result.species[-1][-1]) == pytest.approx(5.0, rel=1e-6)
+    assert float(result.species[-1][-1]) == pytest.approx(_WINDOW_Y, rel=_WINDOW_REL)
 
 
 @pytest.mark.parametrize("t_end", [20.0, 50.0])
@@ -687,7 +694,7 @@ def test_a_window_under_a_tracking_atol_is_integrated(tmp_path, t_open, t_end):
         rtol=1e-8,
         atol=bngsim.TrackingAtol(decades=6, ceiling=1e-8),
     )
-    assert float(result.species[-1][-1]) == pytest.approx(5.0, rel=1e-6)
+    assert float(result.species[-1][-1]) == pytest.approx(_WINDOW_Y, rel=_WINDOW_REL)
 
 
 def test_a_residual_too_deep_to_print_keeps_every_root(tmp_path):
