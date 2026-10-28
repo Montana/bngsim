@@ -116,12 +116,64 @@ def test_a_column_under_its_floor_is_named_and_not_judged():
     assert res["n_columns_judged"] == 1
 
 
+@pytest.mark.parametrize("over_floor", [5.0, 15.0])
+@pytest.mark.parametrize("corrupt", ["zero", "negate"])
+def test_a_column_under_20x_its_floor_gone_wrong_still_reads_diff(over_floor, corrupt):
+    """dx/dk2 at 5x or 15x its 1e-10 floor is not judged alone, but zeroed or
+    negated it is that far past the floor, and 1e-2 of the tensor's peak:
+    the tensor-wide verdict main gave reads DIFF, and so must this one. Judged
+    per column only, it read PASS."""
+    shape = np.sin(0.3 * T + 0.2)[:, None] * np.array([1.0, -0.5])[None, :]
+    am = np.stack([1e-7 * shape, over_floor * 1e-10 * shape], axis=2)
+    bn = am.copy()
+    bn[..., 1] = 0.0 if corrupt == "zero" else -bn[..., 1]
+    res = run._compare(
+        (T, X, bn, NAMES),
+        (T, X.copy(), am, NAMES),
+        param_values=[1.0, 1.0],
+        atol=ATOL,
+        param_ids=["k1", "k2"],
+    )
+    assert res["columns_not_judged"] == ["k2"], "precondition: k2 is not judged alone"
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == ["k2"]
+
+
+def test_a_model_wide_silent_zero_under_20x_is_a_diff_not_a_bad_test():
+    """Every column at 10x its floor and bngsim returning zeros: nothing is
+    judged alone, but the engines disagree far past the floor. That is a DIFF
+    (scoring), as main called it, not a non-scoring BAD_TEST."""
+    shape = np.sin(0.3 * T + 0.2)[:, None] * np.array([1.0, -0.5])[None, :]
+    am = np.stack([1e-9 * shape, 1e-9 * shape], axis=2)
+    res = _compare(np.zeros_like(am), am)
+    assert res["n_columns_judged"] == 0
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == [0, 1]
+
+
 def test_a_row_with_no_column_to_judge_is_a_bad_test():
-    """#328's vacuous pass, now refused rather than reported as one."""
+    """#328's vacuous pass, now refused rather than reported as one, with a
+    key a census can group it by (#324)."""
     am = np.full((len(T), 2, 2), 1e-14)
     res = _compare(am.copy(), am)
     assert res["status"] == "bad_test"
     assert res["n_columns_judged"] == 0
+    assert res["exception_class"] == "columns:none-judged"
+    assert res["exception"]
+
+
+def test_below_noise_floor_counts_the_whole_tensor():
+    """n_below_noise_floor says how much of the tensor is under solver
+    resolution (#316): a column left out of the per-column verdict is still
+    part of the tensor."""
+    am = _tensor(1e-10)
+    res = _compare(am.copy(), am)
+    assert res["columns_not_judged"] == [1]
+    assert res["n_below_noise_floor"] == am.size
+
+
+def test_no_parameter_judges_no_column():
+    assert asens.judged_columns(np.zeros((3, 2, 0)), np.zeros((3, 2, 0)), [], ATOL) == []
 
 
 def test_without_parameter_values_the_tensor_is_judged_whole():

@@ -871,16 +871,21 @@ def judged_columns(bn_sx, ref_sx, param_values, atol: float, extra_floors=None) 
 
     A column's peak, the larger of the two sides', has to clear its
     ``atol/|p|`` floor (:func:`sens_resolution_floors`), and each of
-    ``extra_floors`` if given, by :data:`JUDGE_FACTOR`. Below that the verdict
-    would forgive its disagreement anyway, so a PASS on it would establish
-    nothing; it is left out and named on the row instead.
+    ``extra_floors`` if given, by :data:`JUDGE_FACTOR`. Below that the floor
+    forgives errors of many percent of the column's peak, so a PASS on it
+    would establish little; it is left out and named on the row instead. A
+    gross error there (a column zeroed or negated) is still past the floor,
+    and is not forgiven by it: amici_sens judges such a column in its
+    tensor-wide verdict, as it did before #1261.
 
     Either side's peak counts, so a column one side gets wrong is judged
     whichever way it is wrong: a wrongly large one on its own peak, a silent
     zero on the other side's. A column with a non-finite cell peaks at ``inf``
     and is always judged.
     """
-    floors = np.asarray(sens_resolution_floors(param_values, atol), dtype=float)
+    floors = sens_resolution_floors(param_values, atol)
+    if floors is None:
+        return []
     if extra_floors is not None:
         floors = np.maximum(floors, np.asarray(extra_floors, dtype=float))
     peaks = np.maximum(column_peaks(bn_sx), column_peaks(ref_sx))
@@ -908,6 +913,8 @@ def column_verdicts(
     """
     bn_sx = np.asarray(bn_sx, dtype=float)
     ref_sx = np.asarray(ref_sx, dtype=float)
+    if forgive_mask is not None:
+        forgive_mask = np.asarray(forgive_mask, dtype=bool)
     out = {}
     for j in judged:
         a, r = bn_sx[..., [j]], ref_sx[..., [j]]
@@ -915,7 +922,7 @@ def column_verdicts(
         mags = mags[np.isfinite(mags)]
         peak = float(mags.max()) if mags.size else 0.0
         c = 1.0 / peak if peak > 0.0 else 1.0
-        mask = None if forgive_mask is None else np.asarray(forgive_mask, dtype=bool)[..., [j]]
+        mask = None if forgive_mask is None else forgive_mask[..., [j]]
         out[j] = sens_verdict(
             a * c, r * c, param_values=[param_values[j]], atol=atol * c, forgive_mask=mask
         )
