@@ -167,3 +167,24 @@ def test_an_extinction_that_stops_rtols_of_its_start_below_0_is_clamped():
     x = np.asarray(result.species, dtype=float)[:, list(result.species_names).index("X")]
     assert np.abs(x - exact).max() / x0 < 10 * rtol
     assert x.min() < -1e6 * atol  # the depth this guards
+
+
+def test_one_species_overflow_does_not_get_another_refused():
+    # X empties through X^0.05 and stops far below 0, where its laws are only NaN
+    # (clamped as on main). W empties through W^0.5, and exp(-0.01*(A/W - 1))
+    # (BIOMD0000000554's form) overflows at W's undershoot. Spared only where its
+    # own reading is infinite, X is read at 0 as on main and the run returns.
+    x0, ax, w0, aw = 10.0, 0.05, 1e-3, 0.5
+    kx = x0 ** (1 - ax) / ((1 - ax) * 2.0)
+    kw = w0 ** (1 - aw) / ((1 - aw) * 3.0)
+    text = (
+        f"species X = {x0}; species W = {w0}; species Y = 0; species Z = 0; A = 1\n"
+        f"R1: X -> ; {kx!r}*X^{ax}\nR2: -> Y; X^{ax}\n"
+        f"R3: W -> ; {kw!r}*W^{aw}\nR5: -> Z; exp(-0.01*(A/W - 1))\n"
+    )
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(text), "ode")
+    result = sim.run(t_span=(0.0, 5.0), n_points=51, rtol=1e-6, atol=1e-10, max_steps=100000)
+    t = np.asarray(result.time)
+    x = np.asarray(result.species, dtype=float)[:, list(result.species_names).index("X")]
+    exact = np.maximum(0.0, x0 ** (1 - ax) - (1 - ax) * kx * t) ** (1 / (1 - ax))
+    assert np.abs(x - exact).max() / x0 < 20 * 1e-6

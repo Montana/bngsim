@@ -905,61 +905,81 @@ static inline double *clamp_state_nonneg(CvodeUserData *data, N_Vector y,
     return s;
 }
 
+// What an evaluation of the right-hand side or of a closed-form Jacobian read:
+// all finite, a NaN and no infinity, or an infinity.
+enum class ClampReading { finite, nan_only, infinite };
+
+static ClampReading read_values(const double *v, std::size_t n) {
+    bool nan = false;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (std::isinf(v[k]))
+            return ClampReading::infinite;
+        nan = nan || std::isnan(v[k]);
+    }
+    return nan ? ClampReading::nan_only : ClampReading::finite;
+}
+
 // The slots the clamp leaves alone at `y`: where `values` (the right-hand side
 // or a closed-form Jacobian, `count` of them, as first evaluated there) has an
-// infinite entry, a pole, those the step started far below 0; none otherwise,
-// and none where it is only NaN.
+// infinite entry, those the step started far below 0 whose own reading is
+// infinite, every other slot read at 0 (`read_at(state)` evaluates at a state
+// and says what it read; it may overwrite `values`, which are scanned first).
+// None otherwise: not where the value is only NaN, and not a far slot whose
+// laws are only NaN while another species' law is what is infinite.
+template <class ReadAt>
 static const char *spare_at_pole(CvodeUserData *data, N_Vector y, const double *values,
-                                 std::size_t count) {
+                                 std::size_t count, ReadAt &&read_at) {
     data->clamp_far_any = false;
-    for (std::size_t k = 0; k < count; ++k) {
-        if (std::isinf(values[k])) {
-            mark_far_at_step_start(data, y);
-            break;
-        }
+    bool infinite = false;
+    for (std::size_t k = 0; k < count && !infinite; ++k)
+        infinite = std::isinf(values[k]);
+    if (!infinite)
+        return nullptr;
+    mark_far_at_step_start(data, y);
+    if (!data->clamp_far_any)
+        return nullptr;
+    const double *y_ptr = N_VGetArrayPointer(y);
+    bool any = false;
+    for (std::size_t i = 0; i < data->clamp_far.size(); ++i) {
+        if (!data->clamp_far[i])
+            continue;
+        double *x = clamp_state_nonneg(data, y);
+        x[i] = y_ptr[i];
+        if (read_at(x) == ClampReading::infinite)
+            any = true;
+        else
+            data->clamp_far[i] = 0;
     }
-    return data->clamp_far_any ? data->clamp_far.data() : nullptr;
+    data->clamp_far_any = any;
+    return any ? data->clamp_far.data() : nullptr;
 }
 
 // Has the run itself carried a species to a pole? The callbacks ask where the
 // right-hand side (or a closed-form Jacobian) stays non-finite with the slots
-// spare_at_pole spared; `finite_at(state)` evaluates it at a
-// state and says whether it is finite (it may overwrite the callback's output,
-// which the caller then returns as a failure). True where it turns finite once
-// the spared slots are read at 0 too: that reading is what held BIOMD0000000338
-// at its pole, and refused it on its closed-form Jacobian the run stepped across
-// the pole and returned XIIa = -9.46, then +61. The run ends there: the reason is
-// recorded for the failure message (the witness taken again at this state, so
-// the two agree), and the callback returns CVODE's unrecoverable code. A run
-// ended that way raises as a CVODE failure, which a failed closed-form attempt
-// retries on the difference quotient (GH #176). Named are the spared slots
-// whose own reading keeps the value non-finite, the rest read at 0; all the
-// spared slots where no one does alone. A species a finite law carries below 0
-// beside them is not named: it is no cause.
-template <class FiniteAt>
+// spare_at_pole spared, and `read_at` is theirs (see spare_at_pole). True where
+// it turns finite once those too are read at 0: that reading is what held
+// BIOMD0000000338 at its pole, and refused it on its closed-form Jacobian the
+// run stepped across the pole and returned XIIa = -9.46, then +61. The run ends
+// there: the reason is recorded for the failure message (the witness taken
+// again at this state, so the two agree), and the callback returns CVODE's
+// unrecoverable code. A run ended that way raises as a CVODE failure, which a
+// failed closed-form attempt retries on the difference quotient (GH #176). The
+// spared slots are named, deepest first: each is one whose own reading is
+// infinite.
+template <class ReadAt>
 static bool followed_below_zero(CvodeUserData *data, N_Vector y, double t, const char *src,
-                                FiniteAt &&finite_at) {
+                                ReadAt &&read_at) {
     const int ns = data->model->n_species();
-    const auto uns = static_cast<std::size_t>(ns);
-    if (!data->clamp_far_any || !finite_at(clamp_state_nonneg(data, y)))
+    if (!data->clamp_far_any || read_at(clamp_state_nonneg(data, y)) != ClampReading::finite)
         return false;
     if (!data->below_zero_refusal.empty())
         return true;
-    const std::vector<char> far = data->clamp_far;
     std::vector<std::pair<double, int>> named_slots; // (depth in atols, slot)
-    std::vector<std::pair<double, int>> spared;
-    for (std::size_t i = 0; i < uns; ++i) {
-        if (!far[i])
-            continue;
-        const double depth = -data->clamp_start[i] / data->clamp_atol[i];
-        spared.emplace_back(depth, static_cast<int>(i));
-        double *x = clamp_state_nonneg(data, y);
-        x[i] = N_VGetArrayPointer(y)[i];
-        if (!finite_at(x))
-            named_slots.emplace_back(depth, static_cast<int>(i));
+    for (std::size_t i = 0; i < data->clamp_far.size(); ++i) {
+        if (data->clamp_far[i])
+            named_slots.emplace_back(-data->clamp_start[i] / data->clamp_atol[i],
+                                     static_cast<int>(i));
     }
-    if (named_slots.empty())
-        named_slots = spared;
     std::sort(named_slots.begin(), named_slots.end(), std::greater<>());
     sunrealtype tn = 0.0;
     sunrealtype h = 0.0;
@@ -984,9 +1004,9 @@ static bool followed_below_zero(CvodeUserData *data, N_Vector y, double t, const
         ", and none is set to 0 there: no rounding of 0 is that far below it, and reading "
         "it at 0 would return a trajectory that has already gone wrong, so the run is "
         "refused. Typically a rounding error tipped the species below 0 and the model's "
-        "own laws carried it to a pole or the edge of a rate law's domain, as at an "
-        "unstable equilibrium at 0 (BIOMD0000000338's XIIa). Tighter tolerances, or a "
-        "model that keeps the species nonnegative, may avoid it.";
+        "own laws carried it to a pole of a rate law, as at an unstable equilibrium at 0 "
+        "(BIOMD0000000338's XIIa). Tighter tolerances, or a model that keeps the species "
+        "nonnegative, may avoid it.";
     data->nonfinite_witness = NonFiniteWitness{};
     data->nonfinite_witness.capture(src, t, N_VGetArrayPointer(y), ns);
     return true;
@@ -1290,8 +1310,7 @@ static std::string describe_nonfinite_witness(NetworkModel &model, const NonFini
             os << " The Jacobian is refused only after a second evaluation with every"
                   " concentration below zero set to 0, so either a law is read outside"
                   " its domain at a value that retry leaves alone (a rate-rule"
-                  " variable, a species declared negative, or one the run has carried"
-                  " far below zero), or a derivative is"
+                  " variable, or a species declared negative), or a derivative is"
                   " infinite at 0 itself — the slope of sqrt(S), or of S^p with"
                   " p < 1 — which no constraint on S removes. jacobian=\"fd\""
                   " differences the right-hand side instead (issue #867).";
@@ -1610,22 +1629,21 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
         // e.g. -k·conc self-corrects back toward 0 — is byte-identical and keeps
         // that restoring behavior; clamping unconditionally would freeze such a
         // species at a small negative value and make the solve chatter.
-        data->model->compute_derivs(
-            static_cast<double>(t),
-            clamp_state_nonneg(data, y,
-                               spare_at_pole(data, y, ydot_ptr,
-                                             static_cast<std::size_t>(data->model->n_species()))),
-            ydot_ptr);
+        auto read_at = [&](double *x) {
+            data->model->compute_derivs(static_cast<double>(t), x, ydot_ptr);
+            return read_values(ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        };
+        const char *spare = spare_at_pole(
+            data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()), read_at);
+        data->model->compute_derivs(static_cast<double>(t), clamp_state_nonneg(data, y, spare),
+                                    ydot_ptr);
         if (rhs_has_nonfinite(data, ydot_ptr)) {
             // Nothing left to clamp: keep the state as evidence in case the run
             // does not survive this (GH #336), then hand CVODE the recoverable
             // code it has always had.
             data->nonfinite_witness.capture("The RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
-            if (followed_below_zero(data, y, static_cast<double>(t), "The RHS", [&](double *x) {
-                    data->model->compute_derivs(static_cast<double>(t), x, ydot_ptr);
-                    return !rhs_has_nonfinite(data, ydot_ptr);
-                }))
+            if (followed_below_zero(data, y, static_cast<double>(t), "The RHS", read_at))
                 return -1;
             return 1; // still non-finite (e.g. inf from 1/conc) -> recoverable
         }
@@ -1730,8 +1748,13 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
         // Conditional nonnegative-clamp retry, identical rationale to cvode_rhs:
         // byte-identical wherever the RHS is finite, engages only on a genuine
         // non-finite (e.g. pow(conc, 3.98) at a transiently-negative conc).
-        const char *spare =
-            spare_at_pole(data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        auto read_at = [&](double *x) {
+            if (data->codegen_fn(static_cast<double>(t), x, ydot_ptr, &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        };
+        const char *spare = spare_at_pole(
+            data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()), read_at);
         rc = data->codegen_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), ydot_ptr,
                               &data->codegen_so_data);
         if (rc != 0)
@@ -1742,12 +1765,7 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
             // (GH #336).
             data->nonfinite_witness.capture("The compiled RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
-            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled RHS",
-                                    [&](double *x) {
-                                        return data->codegen_fn(static_cast<double>(t), x, ydot_ptr,
-                                                                &data->codegen_so_data) == 0 &&
-                                               !rhs_has_nonfinite(data, ydot_ptr);
-                                    }))
+            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled RHS", read_at))
                 return -1;
             return 1; // still non-finite -> recoverable
         }
@@ -1963,17 +1981,17 @@ static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /
     // transiently-negative concentration. Byte-identical otherwise.
     const std::size_t n = static_cast<std::size_t>(model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
-        const char *spare = spare_at_pole(data, y, jac, n * n);
+        auto read_at = [&](double *x) {
+            model->fill_dense_analytical_jacobian(static_cast<double>(t), x, jac);
+            return read_values(jac, n * n);
+        };
+        const char *spare = spare_at_pole(data, y, jac, n * n, read_at);
         model->fill_dense_analytical_jacobian(static_cast<double>(t),
                                               clamp_state_nonneg(data, y, spare), jac);
         if (jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
-            if (followed_below_zero(
-                    data, y, static_cast<double>(t), "The Jacobian", [&](double *x) {
-                        model->fill_dense_analytical_jacobian(static_cast<double>(t), x, jac);
-                        return !jac_has_nonfinite(jac, n * n);
-                    }))
+            if (followed_below_zero(data, y, static_cast<double>(t), "The Jacobian", read_at))
                 return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
@@ -2019,18 +2037,19 @@ static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy
     // memsets the matrix first, so the re-fill on the clamped state overwrites it.
     const std::size_t n = static_cast<std::size_t>(data->model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
-        const char *spare = spare_at_pole(data, y, jac, n * n);
+        auto read_at = [&](double *x) {
+            if (data->codegen_jac_fn(static_cast<double>(t), x, jac, &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(jac, n * n);
+        };
+        const char *spare = spare_at_pole(data, y, jac, n * n, read_at);
         rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), jac,
                                   &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             data->model->n_species()); // GH #336
             if (followed_below_zero(data, y, static_cast<double>(t), "The compiled Jacobian",
-                                    [&](double *x) {
-                                        return data->codegen_jac_fn(static_cast<double>(t), x, jac,
-                                                                    &data->codegen_so_data) == 0 &&
-                                               !jac_has_nonfinite(jac, n * n);
-                                    }))
+                                    read_at))
                 return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
@@ -2196,17 +2215,18 @@ static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/,
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the sparse fill
     // memsets the nnz value array first, so the re-fill cleanly overwrites it.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
-        const char *spare = spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz));
+        auto read_at = [&](double *x) {
+            model->fill_sparse_analytical_jacobian(static_cast<double>(t), x, jac_data);
+            return read_values(jac_data, static_cast<std::size_t>(sp.nnz));
+        };
+        const char *spare =
+            spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz), read_at);
         model->fill_sparse_analytical_jacobian(static_cast<double>(t),
                                                clamp_state_nonneg(data, y, spare), jac_data);
         if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), conc,
                                             model->n_species()); // GH #336
-            if (followed_below_zero(
-                    data, y, static_cast<double>(t), "The Jacobian", [&](double *x) {
-                        model->fill_sparse_analytical_jacobian(static_cast<double>(t), x, jac_data);
-                        return !jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz));
-                    }))
+            if (followed_below_zero(data, y, static_cast<double>(t), "The Jacobian", read_at))
                 return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
@@ -2256,18 +2276,21 @@ static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*f
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the compiled
     // sparse mirror memsets the nnz value array first.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
-        const char *spare = spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz));
+        auto read_at = [&](double *x) {
+            if (data->codegen_jac_sparse_fn(static_cast<double>(t), x, jac_data,
+                                            &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(jac_data, static_cast<std::size_t>(sp.nnz));
+        };
+        const char *spare =
+            spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz), read_at);
         rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare),
                                          jac_data, &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
-            if (followed_below_zero(
-                    data, y, static_cast<double>(t), "The compiled Jacobian", [&](double *x) {
-                        return data->codegen_jac_sparse_fn(static_cast<double>(t), x, jac_data,
-                                                           &data->codegen_so_data) == 0 &&
-                               !jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz));
-                    }))
+            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled Jacobian",
+                                    read_at))
                 return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
