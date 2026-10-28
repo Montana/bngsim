@@ -231,6 +231,10 @@ class NetworkModel:
         """
         The one-sided finite-difference Jacobian of compute_derivs at (t, conc) as a float64 ndarray (n_species, n_species), J[i, j] = ∂f_i/∂x_j, stepped by the steady-state solver's own rule. Issue #523.
         """
+    def fill_dense_fd_jacobian_half_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
+        """
+        The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale, and of species at 0, taken whole at half the floored step (fd_half_step_columns), and the species (0-based) whose columns were taken. Issue #1002.
+        """
     def fill_dense_fd_jacobian_own_step(self, t: typing.SupportsFloat | typing.SupportsIndex, conc: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], floored: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> tuple[numpy.typing.NDArray[numpy.float64], list[int]]:
         """
         The finite-difference Jacobian `floored` (fill_dense_fd_jacobian at the same point) with the columns of species far below the state's scale taken at their own step where the rules of fd_own_step_columns allow, and the species (0-based) whose columns that changed. Issue #1002.
@@ -1356,9 +1360,6 @@ class SteadyStateResultCore:
     def sens_dfdp_source(self) -> str:
         ...
     @property
-    def sens_fd_disagree_function(self) -> int:
-        ...
-    @property
     def sens_fd_disagree_param(self) -> int:
         ...
     @property
@@ -1368,13 +1369,10 @@ class SteadyStateResultCore:
     def sens_fd_floored(self) -> float:
         ...
     @property
-    def sens_fd_function_floored(self) -> float:
+    def sens_fd_half_step(self) -> float:
         ...
     @property
-    def sens_fd_function_own_step(self) -> float:
-        ...
-    @property
-    def sens_fd_function_param(self) -> int:
+    def sens_fd_half_step_species(self) -> list[int]:
         ...
     @property
     def sens_fd_own_step(self) -> float:
@@ -1393,6 +1391,9 @@ class SteadyStateResultCore:
         ...
     @property
     def sens_mask_reader_species(self) -> int:
+        ...
+    @property
+    def sens_output_evaluated(self) -> bool:
         ...
     @property
     def sens_output_source(self) -> str:

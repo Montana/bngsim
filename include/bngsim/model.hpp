@@ -512,6 +512,13 @@ class NetworkModel {
     std::vector<int> fill_dense_fd_jacobian_own_step(double t, const double *conc,
                                                      const double *floored, double *jac);
 
+    // The same matrix with the columns of species far below the state's scale,
+    // and of species at 0, taken whole at half the floored step
+    // (fd_half_step_columns, issue #1002). Returns the species (0-based) whose
+    // columns were taken.
+    std::vector<int> fill_dense_fd_jacobian_half_step(double t, const double *conc,
+                                                      const double *floored, double *jac);
+
     // (species_idx0, param_idx0) pairs for species whose initial
     // concentration is set directly by a parameter (.net "begin species"
     // entries with a parameter name in the IC column). Used by forward

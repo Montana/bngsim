@@ -40,7 +40,8 @@ constexpr double kFdEps = 1.4901161193847656e-8;
 // to stay out of the cancellation noise.
 //
 // What the floor costs a species far below the state's scale, a step of many
-// times itself, is checked by `fd_own_step_columns` below (issue #1002).
+// times itself, is checked by `fd_own_step_columns` and `fd_half_step_columns`
+// below (issue #1002).
 inline double state_fd_step(double y, double y_scale) {
     return kFdEps * std::max(std::abs(y), y_scale);
 }
@@ -284,6 +285,63 @@ inline std::vector<int> fd_own_step_columns(Eval &&eval, const double *y, int ns
     return changed;
 }
 
+// ─── Curvature in a row the own step does not read (issue #1002) ─────────────
+//
+// fd_own_step_columns takes an entry again only where the own step reads its
+// row, and a row that a much larger species is in is not read there: its
+// rounding over the own step is more than the entry. A term of second order in
+// the small species in such a row, `k·X²` in the rate of a species at 1e8, is
+// a secant across the floored step that nothing compares with anything:
+// dG*/ds came back 66.05 for 58.96 with jacobian="fd", and no error.
+//
+// So the column of each species far below the state's scale is also taken
+// again at half the floored step, over which a row's rounding comes to twice
+// the quotient it comes to over the floored step, and no more. A secant moves
+// with its step (k·(2X + h) for k·X²), and a slope does not: an answer that
+// both steps give is not the curvature's. A column is taken whole, every entry
+// at the one step, so that rows that add up to nothing in the right-hand side
+// add up to nothing in it. A species at 0 is taken again too: the floored step
+// is all the step it has, and k·X² there reads k·h for 0.
+//
+// `D_half` is `D` with those columns at half the floored step. Returns the
+// species whose columns were taken (0-based, ascending). One more `eval` per
+// such species. A species `excluded` names is taken too: the solve reads the
+// column of one that is a conservation law's dependent, or a fixed species a
+// parameter sets.
+template <class Eval>
+inline std::vector<int> fd_half_step_columns(Eval &&eval, const double *y, int ns, int n_out,
+                                             const std::vector<int> &excluded, const double *g0,
+                                             const double *D, double *D_half) {
+    const auto un = static_cast<std::size_t>(ns);
+    const auto um = static_cast<std::size_t>(n_out);
+    std::memcpy(D_half, D, un * um * sizeof(double));
+    std::vector<int> taken;
+    const double y_scale = state_probe_scale(y, ns, excluded);
+    std::vector<double> g1(um), y_pert(y, y + un);
+    for (int j = 0; j < ns; ++j) {
+        const auto uj = static_cast<std::size_t>(j);
+        const double h_req = state_fd_step(y[j], y_scale);
+        double unused = 0.0;
+        const double h = fd_probe(y[j], h_req, &unused);
+        if (y[j] != 0.0 && !(h > kFdRefineRatio * kFdEps * std::abs(y[j]))) {
+            continue; // stepped by about its own step: no curvature to speak of
+        }
+        const double h_half = fd_probe(y[j], 0.5 * h_req, &y_pert[uj]);
+        if (!(h_half > 0.0) || !(h_half < h)) {
+            y_pert[uj] = y[j];
+            continue; // no smaller step that a double holds
+        }
+        eval(y_pert.data(), g1.data());
+        y_pert[uj] = y[j];
+        double *col = D_half + uj * um;
+        for (std::size_t i = 0; i < um; ++i) {
+            col[i] = (g1[i] - g0[i]) / h_half;
+        }
+        taken.push_back(j);
+    }
+    return taken;
+}
+
 // Dense COLUMN-MAJOR J (ns×ns, J[j*ns + i] = ∂f_i/∂y_j) at (t, y) by one-sided
 // differences: J[:,j] = (f(t, y + h·e_j) − f(t, y)) / h, one `eval` per column
 // plus one for the base point. `eval(t, y, ydot)` is the RHS; `excluded` (0-based,
@@ -304,6 +362,141 @@ inline void fd_dense_state_jacobian(Eval &&eval, double t, const double *y, int 
             col[i] = (f1[i] - f0[i]) / h;
         }
     }
+}
+
+// ─── A quotient that steps across a jump (issue #1002) ───────────────────────
+//
+// A rate law with a jump in it (`if(X > 5, a, b)`, a comparison, `ceil`,
+// `rint`) differenced from a state within one step of the threshold reads the
+// jump over the step, Δf/h, where the row has a slope. Beside X = 5,
+// `if(X > 5, 0.04, 0.02)·X` came back with −1.3e6 for −0.02. CVODE's Newton
+// iteration under that matrix takes corrections a millionth of their size,
+// calls them converged at once, and the run follows its predictor (X = 5 − 0.1t,
+// 166% off at t = 60, with no error). A species held at 0 under `if(I > 0, …)`
+// is stepped by the solver's floor, far under 1e-12; the entry is larger still,
+// and the LU's rounding through it leaks 1e-36 into I, which turns the
+// condition true (490% off).
+//
+// What tells a jump from a slope is the row over the steps beside the
+// quotient's own. A slope, a kink, an extremum or an inflection moves the row
+// over one step by no more than a small factor of what it moves over the steps
+// either side; a jump moves it by the jump, however short the step. So the
+// quotient's difference d = f(y + h) − f(y) reads a jump where |d| is more than
+// kFdJumpRatio times both f(y + 2h) − f(y + h) and f(y − h) − f(y − 2h). The
+// outer steps, not f(y) − f(y − h): on `X == 0` at X = 0 both inner steps cross.
+//
+// And more than kFdJumpNoise last bits of the row's terms (`fd_jump_floor`):
+// a row whose terms cancel answers a short step in counts of their last bit,
+// which is a jump at that grain and none in the model. A branch of a rate law
+// changes a term by a part of itself. The terms are the row's value and each
+// entry times its species, from the matrix the solver formed: BIOMD0000000091,
+// mass action alone, had two entries taken for jumps against a floor of the
+// row's value.
+//
+// `fd_step_may_cross_jump` is the half of the test the forward step gives; only
+// where it holds are the two backward points worth evaluating.
+//
+// A column is tested only where `fd_jump_testable` holds, and of the mends it
+// takes, only some are kept:
+//
+// - Where nothing moves the species (its row is zero), every mend is kept: its
+//   column reaches Newton only through rounding, which a jump-sized entry
+//   turns into a flip of the law.
+// - Where it moves away, at more than kFdJumpParked of the terms of its own row
+//   in the mended matrix (`fd_jump_unparked`), its mends are kept if its own
+//   row is one of them and the run came from across the jump
+//   (`fd_jump_came_across`). A large entry on the diagonal is what freezes a
+//   species in Newton's iteration, so the run follows its predictor; one in
+//   another species' row, of a species that moves, turns its corrections into
+//   that row's, which fails the iteration and forms the matrix again. And it is
+//   what lets CVODE hold a species that parks just short of a jump in another
+//   species' law: the #176 fixture parks V 1e-11 under the step of `v_rec`,
+//   the closed form and a mended matrix both collapse the step there, and the
+//   straddled quotient integrates it to 2.5e-7 of the exact branch. In #903's
+//   `split`, V + V2 parks there while V leaves at 0.38 and V2 arrives at 0.38:
+//   V's step crosses, in those rows, and mended there the run crossed (0.633
+//   off at rtol 1e-7, where main is right). A run that slides along a moving
+//   threshold is wrong as on main (in the PR's "Left alone").
+//   The mended matrix, because a species' own straddled entry swells its
+//   row's terms: X at 0.1 beside `if(X > 5, ...)·X` had terms of 6.7e6.
+// - Parked, a species' rate is its solver's noise and points either way: with
+//   V's asymptote 9e-11 under the step and tolerances of 1e-8, the march read V
+//   moving away at t = 27.7 and, mended, never converged (residual 18 where
+//   main reaches 5e-10).
+// - The species is more than two steps from 0, or exactly at 0. A step wider
+//   than the species (CVODE's floor: 2.5e-2 beside a species at 1.6e-8, 7.8e13
+//   beside one at 1.7e-4 late in a march, 3.2 beside one at -3.7e-7) reads the
+//   model on the other side of 0, where a saturating law is nothing like
+//   itself; six corpus models had a saturation or a pole taken for a jump that
+//   way. A species at exactly 0 stays there unless something makes it, and
+//   then it moves toward its step; its column reaches Newton only through
+//   rounding, which a jump-sized entry turns into a flip of the law.
+//
+// A row that cancels inside one rate law has terms its matrix does not show,
+// and can still have a last bit taken for a jump: BIOMD0000000520 had an entry
+// of 1e-9 mended, against an iteration that cannot feel it (the run was bit
+// for bit). Weighing an entry by the solver's step does not tell those apart:
+// a run's first step is 1.9e-10 beside `if(X > 5, ...)` at X = 5, and the
+// matrix formed there is used at steps 1e10 times longer.
+constexpr double kFdJumpRatio = 16.0;
+constexpr double kFdJumpNoise = 1024.0;
+constexpr double kFdJumpParked = 1e-6;
+
+// Is the column of species j, at `y` and stepped by `inc`, tested for a jump?
+inline bool fd_jump_testable(double y, double inc) {
+    return y == 0.0 || std::abs(y) > 2.0 * std::abs(inc);
+}
+
+// Are the mends of a tested column kept, its species' own rate `f_self` out of
+// its row's terms `self_terms` in the mended matrix?
+inline bool fd_jump_unparked(double f_self, double self_terms) {
+    return self_terms == 0.0 || std::abs(f_self) > kFdJumpParked * self_terms;
+}
+
+// Did the run come from across the jump a mended row reads? `back` is the row
+// at the state one step of the column's species back along the flow, y −
+// τ·f(y) with τ = inc/|f_j|, `predicted` what the row would read there on the
+// state's own branch (f(y) − τ·J·f(y), J mended), `d01` the quotient's own
+// difference. A species leaving a jump came from across it; a member of a sum
+// that parks did not, though it moves, where the sum is in its own row too.
+inline bool fd_jump_came_across(double back, double predicted, double d01) {
+    return std::isfinite(back) && std::abs(back - predicted) > 0.5 * std::abs(d01);
+}
+
+// A mend made, and undone where its column's species turns out parked, or
+// where the run did not come from across the jump.
+struct FdJumpMend {
+    std::size_t at; // the entry, in the solver's matrix data
+    long col;       // its column
+    double was;     // what the quotient had read
+};
+
+// The least change a row reads as a jump, from the sum of its terms' sizes.
+inline double fd_jump_floor(double row_terms) {
+    return kFdJumpNoise * std::numeric_limits<double>::epsilon() * row_terms;
+}
+
+// The tests over one row, in the row's differences: d01 the quotient's own,
+// d12 one step further on, dmm two steps back, dm the step back.
+inline bool fd_step_may_cross_jump(double d01, double d12, double floor) {
+    return std::isfinite(d01) && std::isfinite(d12) &&
+           std::abs(d01) > kFdJumpRatio * std::abs(d12) + floor;
+}
+
+inline bool fd_step_crosses_jump(double dmm, double d01, double d12, double floor) {
+    return fd_step_may_cross_jump(d01, d12, floor) && std::isfinite(dmm) &&
+           std::abs(d01) > kFdJumpRatio * std::max(std::abs(dmm), std::abs(d12)) + floor;
+}
+
+// The entry a row whose quotient crosses a jump takes instead: the backward
+// quotient dm/h, the slope of the branch the state is on, where that step
+// crosses nothing by the same test against the same outer steps; 0 where it
+// does, as on `X == 0` at X = 0, whose rows have no slope to give.
+inline double fd_entry_past_jump(double dmm, double dm, double d12, double floor, double h) {
+    const bool clean =
+        std::isfinite(dm) &&
+        std::abs(dm) <= kFdJumpRatio * std::max(std::abs(dmm), std::abs(d12)) + floor;
+    return clean ? dm / h : 0.0;
 }
 
 } // namespace bngsim
