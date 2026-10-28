@@ -798,6 +798,11 @@ def check_ssa(job: Job, checks=SSA_CHECKS) -> dict[str, Verdict]:
     from _core import differ, oracles
 
     out: dict[str, Verdict] = {}
+    if job.n_rep < 1:
+        # No seed to compare: no ensemble is a PASS of nothing, and no backend
+        # is a "codegen=False ran []" that is no finding either.
+        v = Verdict("skip", note=f"no replicates asked (n_rep {job.n_rep})")
+        return {c: v for c in checks}
     try:
         # The Simulator builds a propensity library only for a model it finds
         # eligible, before any run: without one there is nothing compiled to tell
