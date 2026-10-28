@@ -4292,6 +4292,15 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         }
         const double final_t = (check_ss && ss_reached) ? t_out[last_recorded_index] : times.t_end;
         model.set_current_time(final_t);
+        // The functions, and the parameters assignment rules set, at the state
+        // the run ends on, as run() leaves them by its refresh at each row
+        // (issue #1358). A parameter an assignment rule sets is written by the
+        // interpreter's evaluate_functions; the compiled right-hand side
+        // computes the rule in its own func[] and writes nothing back, and the
+        // rows here read the functions through fill_row without writing them
+        // either. So after a compiled run get_param read the value at load
+        // (q 1.0, where an interpreted run read 0.0183).
+        sync_model_at(final_t, y_data, ns);
 
         // GH #210 — the warm path never computes sensitivities, so it advances
         // the state (carry-over) without tracking dx/dθ: mark the state dirty
