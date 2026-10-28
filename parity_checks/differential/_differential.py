@@ -127,6 +127,8 @@ CHECKS = (
     "restart",
     "reuse",
     "batch",
+    # #1309: the base's answer under a jittered grid and tolerance.
+    "stable",
 )
 
 
@@ -136,6 +138,10 @@ class Verdict:
     value: float | None = None
     note: str = ""
     extra: dict = field(default_factory=dict)
+    # The two trajectories a comparison judged, kept for attribution (#1309)
+    # and never written to a report.
+    ref_x: np.ndarray | None = field(default=None, repr=False, compare=False)
+    path_x: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -261,6 +267,9 @@ class Base:
         # The columns of x, by name: a Result's species, which leave out a
         # parameter an event promotes into the state (Model.species_names has it).
         self.species_names = list(result.species_names)
+        # The linear solver the base ran on (0 dense, 1 KLU, 2 BLAS dense), so
+        # attribution can run it on the other one (#1309).
+        self.linear_solver = int(result.solver_stats.get("linear_solver", 0))
         self.backend = sim.codegen_backend
         # A tenfold tighter run that does not complete leaves the base no
         # reference, not the model unrun: the checks that compare no answers
@@ -306,7 +315,10 @@ class Base:
                 f"{label}nothing could count: the trajectory's peak {peak:.1e} is under the "
                 f"absolute floor {floor:.1e} ({PATH_RTOL_FACTOR:g}·atol); {note}",
             )
-        return Verdict("pass" if g <= self.limit else "diff", g, f"{label}{note}")
+        status = "pass" if g <= self.limit else "diff"
+        return Verdict(
+            status, g, f"{label}{note}", ref_x=self.x, path_x=np.asarray(x, dtype=float)
+        )
 
 
 def _first_line(e: BaseException) -> str:
@@ -914,6 +926,65 @@ def check_transform(base: Base, kind: str) -> Verdict:
 
 BATCH_FACTORS = (1.0, 1.1, 0.9, 1.05)
 BATCH_THREADS = 4
+# Attribution and branch stability (issue #1309). A DIFF says two paths
+# disagree, not which is wrong, and a small own drift does not make an answer
+# uncontested: on #1304's BIOMD0000000338 the KLU base moved 1e-7 at a tenfold
+# tighter tolerance while dense and libRoadRunner sat 3.5% away, and dense once
+# landed on KLU's branch.
+
+ATTRIBUTION_TIGHTEN = 100.0
+JITTER_RTOL = (0.5, 2.0)
+
+
+def _arm_runs(base: Base) -> dict[str, np.ndarray]:
+    """The third arms, each a trajectory in the base's columns: the base's own
+    route at ``ATTRIBUTION_TIGHTEN`` x tighter tolerances, the base on the
+    other linear solver, and libRoadRunner for SBML where it is installed. An
+    arm that does not run, does not apply, or does not finish in what is left
+    of the model's cap is left out."""
+    import bngsim
+
+    job, out = base.job, {}
+
+    def take(name, fn):
+        # An arm that cannot run (libRoadRunner gives up, KLU is declined) says
+        # nothing, and is left out of the attribution.
+        with contextlib.suppress(Exception):
+            out[name] = fn()
+
+    f = ATTRIBUTION_TIGHTEN
+    tight = Job(**{**job.__dict__, "rtol": job.rtol / f, "atol": job.atol / f})
+    take("tighter", lambda: _species(run(tight)[0], base))
+    if base.linear_solver == 1:
+        take(
+            "dense",
+            lambda: _species(run(job, force_dense_linear_solver=True)[0], base),
+        )
+    elif bngsim._bngsim_core.HAS_KLU:
+        take(
+            "klu",
+            lambda: _species(run(job, force_sparse_linear_solver=True)[0], base),
+        )
+    # libRoadRunner takes no wall-clock budget: past the deadline it is not asked.
+    if Path(job.path).suffix != ".net" and (_DEADLINE is None or time.monotonic() < _DEADLINE):
+        take("roadrunner", lambda: _roadrunner(base))
+    return out
+
+
+def _roadrunner(base: Base) -> np.ndarray:
+    import roadrunner
+
+    job = base.job
+    r = roadrunner.RoadRunner(str(job.path))
+    r.integrator.relative_tolerance = job.rtol
+    r.integrator.absolute_tolerance = job.atol
+    # A species' concentration, as bngsim reports it, is [id] in libRoadRunner
+    # (the bare id is its amount); a rate rule's parameter is its id. As
+    # rr_parity selects them.
+    species = set(r.model.getFloatingSpeciesIds()) | set(r.model.getBoundarySpeciesIds())
+    sel = [f"[{n}]" if n in species else n for n in base.species_names]
+    out = r.simulate(job.t_start, job.t_end, job.n_points, sel)
+    return np.asarray(out, dtype=float)
 
 
 def _species(result, base: Base) -> np.ndarray:
@@ -1070,6 +1141,93 @@ def check_batch(base: Base) -> Verdict:
             )
             out.append((f"point {i}", Verdict("pass" if g <= base.limit else "diff", g, note)))
         return _worst(out)
+
+    return _guard(go)
+def contested(rows: dict[str, dict]) -> bool:
+    """Whether a model's rows mark it contested: its ``stable`` row reads DIFF
+    (the answer jumps under a jittered grid or tolerance), or a DIFF's third
+    arms split between its two sides (#1304's BIOMD0000000338: KLU at a
+    hundredfold tighter tolerance sides with KLU, the dense solver and
+    libRoadRunner with dense). Its DIFFs are real but unattributed, its PASSes
+    luck. ``rows`` maps a check to ``{"status", "extra"}``, as a report holds
+    them."""
+    for check, row in rows.items():
+        extra = row.get("extra") or {}
+        if check == "stable" and row.get("status") == "diff":
+            return True
+        if (extra.get("attribution") or {}).get("verdict") == "split":
+            return True
+    return False
+
+
+def attribute(base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None) -> dict:
+    """Which side of a DIFF each third arm agrees with: the comparison's
+    ``reference`` (the base, or the path it was judged against), its
+    ``path``, ``both`` (the two are within the bound of the arm), or
+    ``neither``. Its ``verdict`` is the one side every arm that took one
+    took, ``split`` where they differ (the model is contested), or
+    ``unattributed``."""
+    arms = _arm_runs(base) if arms is None else arms
+    atol = PATH_RTOL_FACTOR * base.job.atol
+    sides = {}
+    for name, x in arms.items():
+        to_ref, to_path = gap(x, v.ref_x, atol), gap(x, v.path_x, atol)
+        near_ref, near_path = to_ref <= base.limit, to_path <= base.limit
+        side = {(True, False): "reference", (False, True): "path", (True, True): "both"}.get(
+            (near_ref, near_path), "neither"
+        )
+        sides[name] = {"side": side, "to_reference": to_ref, "to_path": to_path}
+    taken = {a["side"] for a in sides.values() if a["side"] in ("reference", "path")}
+    verdict = taken.pop() if len(taken) == 1 else ("split" if taken else "unattributed")
+    return {"verdict": verdict, "arms": sides}
+
+
+def check_stable(base: Base) -> Verdict:
+    """The base's answer under a jittered grid (one point fewer, one more,
+    twice as many) and tolerance (rtol x0.5, x2): a jump past the bound marks
+    the model contested, its DIFFs real but unattributed and its PASSes luck.
+    A grid of another length is read at its last point, which every grid
+    shares; twice as many at every other point, which are the base's. Each
+    rerun has what is left of the model's cap: one it stops makes the check
+    TIMEOUT, its own row only."""
+
+    def go():
+        # Where nothing could jump past the bound, SKIP, said why, as
+        # Base.compare says it: a base whose tighter run failed (base.limit is
+        # inf) or one wholly under the absolute floor. A base that moves past
+        # UNJUDGEABLE_DRIFT is judged: a jump past ten times that is contested.
+        unjudged = base.compare(base.x, "stable: ")
+        if unjudged.status == "skip" and (base.drift_error or base.drift <= UNJUDGEABLE_DRIFT):
+            return unjudged
+        job, jumps = base.job, {}
+        atol = PATH_RTOL_FACTOR * job.atol
+        n = job.n_points
+        for label, m in (
+            ("n_points-1", n - 1),
+            ("n_points+1", n + 1),
+            ("2x the points", 2 * n - 1),
+        ):
+            if m < 2:
+                continue
+            x = _species(run(Job(**{**job.__dict__, "n_points": m}))[0], base)
+            g = gap(x[::2], base.x, atol) if m == 2 * n - 1 else gap(x[-1:], base.x[-1:], atol)
+            if g > base.limit:
+                jumps[label] = g
+        for f in JITTER_RTOL:
+            jittered = Job(**{**job.__dict__, "rtol": job.rtol * f, "atol": job.atol * f})
+            x = _species(run(jittered)[0], base)
+            g = gap(x, base.x, atol)
+            if g > max(base.limit, f * base.limit):
+                jumps[f"rtol x{f:g}"] = g
+        if jumps:
+            shown = ", ".join(f"{k} {g:.1e}" for k, g in jumps.items())
+            return Verdict(
+                "diff",
+                max(jumps.values()),
+                f"contested: the answer jumps past its bound {base.limit:.1e} under {shown}",
+                {"contested": True, "jumps": jumps},
+            )
+        return Verdict("pass", 0.0, "the answer holds under a jittered grid and tolerance")
 
     return _guard(go)
 
@@ -1531,4 +1689,20 @@ def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[st
     for name, fn in (("restart", check_restart), ("reuse", check_reuse), ("batch", check_batch)):
         if name in checks:
             out[name] = spent() or fn(base)
+    # Every DIFF with two trajectories says which side the third arms take
+    # (#1309), the arms run once per model however many DIFFs it has, each in
+    # what is left of the model's cap; one that does not finish is left out.
+    diffs = [v for v in out.values() if v.status == "diff" and v.path_x is not None]
+    if diffs:
+        try:
+            arms = _arm_runs(base)
+            for v in diffs:
+                v.extra["attribution"] = attribute(base, v, arms)
+        except Exception as e:  # noqa: BLE001 - attribution is advice, never a verdict
+            for v in diffs:
+                v.extra["attribution"] = {"verdict": "unattributed", "error": str(e)[:300]}
+    # Last: five reruns of the base, the costliest of what #1309 adds, in what
+    # is left once the DIFFs are attributed (a stable row carries no trajectory).
+    if "stable" in checks:
+        out["stable"] = spent() or check_stable(base)
     return {c: out[c] for c in checks if c in out}

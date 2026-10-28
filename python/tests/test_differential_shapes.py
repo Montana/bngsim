@@ -38,6 +38,7 @@ import json
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import bngsim
@@ -1748,3 +1749,189 @@ def test_a_point_that_fails_only_on_threads_is_a_finding(monkeypatch):
     _failing_point(monkeypatch, only_threaded=True)
     v = D.check_batch(_base("equality-dwell"))
     assert v.status == "exception", v
+# ── Attribution and branch stability (#1309) ──
+
+
+def _verdict(ref, path):
+    return D.Verdict("diff", 1.0, "", ref_x=np.asarray(ref, float), path_x=np.asarray(path, float))
+
+
+def test_each_arm_names_the_side_it_takes():
+    """An arm on the reference's side, one on the path's, one between: a
+    split, which marks the model contested."""
+    base = _base("derived-log10")
+    ref = base.x
+    path = ref * 1.5
+    v = _verdict(ref, path)
+    a = D.attribute(
+        base, v, {"tighter": path.copy(), "dense": ref.copy(), "roadrunner": ref * 1.25}
+    )
+    assert a["verdict"] == "split"
+    assert a["arms"]["tighter"]["side"] == "path"
+    assert a["arms"]["dense"]["side"] == "reference"
+    assert a["arms"]["roadrunner"]["side"] == "neither"
+    assert D.contested({"klu_vs_dense": {"status": "diff", "extra": {"attribution": a}}})
+
+
+def test_arms_that_agree_attribute_the_diff_to_one_side():
+    base = _base("derived-log10")
+    v = _verdict(base.x, base.x * 1.5)
+    a = D.attribute(base, v, {"tighter": base.x.copy(), "dense": base.x.copy()})
+    assert a["verdict"] == "reference"
+    assert not D.contested({"klu_vs_dense": {"status": "diff", "extra": {"attribution": a}}})
+
+
+def test_a_diff_is_attributed_by_real_arms(monkeypatch):
+    """check_all attributes every DIFF: here a planted cc_vs_interp that moves
+    the path by 50%, which the real arms (the base at a hundredfold tighter
+    tolerance, the other solver) all put on the reference's side."""
+    base = _base("derived-log10")
+
+    def planted(b):
+        return b.compare(b.x * 1.5, "planted: ")
+
+    monkeypatch.setattr(D, "check_cc_vs_interp", planted)
+    v = D.check_all(SHAPES["derived-log10"], None, ("cc_vs_interp",))["cc_vs_interp"]
+    assert v.status == "diff"
+    a = v.extra["attribution"]
+    assert a["verdict"] == "reference", a
+    assert {"tighter"} <= set(a["arms"]), a
+    assert base.x.shape == v.path_x.shape
+
+
+def test_an_answer_that_jumps_with_the_tolerance_is_contested(monkeypatch):
+    """A branch that flips at rtol x2: check_stable reads DIFF, and the model
+    is contested."""
+    base = _base("equality-dwell")
+    real = D.run
+
+    def flips(job, **kw):
+        result, sim = real(job, **kw)
+        if job.rtol > base.job.rtol * 1.5:
+            result = type(
+                "R",
+                (),
+                {
+                    "species": np.asarray(result.species) * 1.5,
+                    "species_names": result.species_names,
+                },
+            )()
+        return result, sim
+
+    monkeypatch.setattr(D, "run", flips)
+    v = D.check_stable(base)
+    assert v.status == "diff" and "rtol x2" in v.note, v
+    assert D.contested({"stable": {"status": "diff", "extra": v.extra}})
+
+
+def test_a_base_with_no_reference_is_not_stable_by_default(monkeypatch):
+    """A base whose tenfold tighter run fails has no bound (base.limit is
+    inf): the jitters are SKIP, said why, as every comparison against it is,
+    and not the PASS an answer doubled at rtol x2 also read."""
+
+    def own_drift(job, x):
+        raise bngsim.SimulationError("CVODE integration failed (planted)")
+
+    monkeypatch.setattr(D, "own_drift", own_drift)
+    base = D.Base(SHAPES["equality-dwell"])
+    real = D.run
+
+    def doubled(job, **kw):
+        result, sim = real(job, **kw)
+        if job.rtol > base.job.rtol * 1.5:
+            result = types.SimpleNamespace(
+                species=np.asarray(result.species) * 2.0, species_names=result.species_names
+            )
+        return result, sim
+
+    monkeypatch.setattr(D, "run", doubled)
+    v = D.check_stable(base)
+    assert v.status == "skip" and "no reference" in v.note, v
+
+
+def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
+    base = _base("equality-dwell")
+    real = D.run
+
+    def flips(job, **kw):
+        result, sim = real(job, **kw)
+        if job.n_points == base.job.n_points + 1:
+            x = np.asarray(result.species).copy()
+            x[-1] *= 1.5
+            result = type("R", (), {"species": x, "species_names": result.species_names})()
+        return result, sim
+
+    monkeypatch.setattr(D, "run", flips)
+    v = D.check_stable(base)
+    assert v.status == "diff" and "n_points+1" in v.note, v
+
+
+_B338 = _ROOT / "parity_checks/rr_parity/models/BIOMD0000000338/BIOMD0000000338_url.xml"
+
+
+@pytest.mark.skipif(
+    not _B338.exists(), reason="rr_parity corpus model BIOMD0000000338 not present"
+)
+@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
+def test_1304s_model_reads_contested_with_each_arms_side_named():
+    """#1304: KLU reads Fg 311 at t = 2 and dense 0.73. The base runs on KLU,
+    so the KLU route at a hundredfold tighter tolerance sides with KLU, and
+    the dense solver with dense: split, contested."""
+    job = D.Job("BIOMD0000000338", _B338, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
+    v = D.check_all(job, None, ("klu_vs_dense",))["klu_vs_dense"]
+    assert v.status == "diff", v
+    a = v.extra["attribution"]
+    assert a["verdict"] == "split", a
+    assert a["arms"]["tighter"]["side"] == "path" and a["arms"]["dense"]["side"] == "reference", a
+
+
+def test_what_1309_adds_runs_in_what_is_left_of_the_cap(monkeypatch):
+    """The pool kills a model's worker at its cap, and every row with it: four of
+    the nightly's slowest models read TIMEOUT on every check once ``stable``
+    reran them (BIOMD0000000810's jittered rerun ground past 900 s). ``stable``
+    runs after every check main runs: with the cap spent there, it is TIMEOUT,
+    said why, and each other row is what it is without a cap."""
+    import time
+
+    job = SHAPES["triangle-maxabs-narrow"]
+    free = D.check_all(job, None, CHECKS)
+    real = D.check_backend
+
+    def backend_then_spent(base):
+        v = real(base)
+        D._DEADLINE = time.monotonic() - 1.0
+        return v
+
+    monkeypatch.setattr(D, "check_backend", backend_then_spent)
+    heard = []
+    bounded = D.check_all(
+        job, None, CHECKS, deadline=time.monotonic() + 1e3, on_verdict=lambda c, v: heard.append(c)
+    )
+    assert bounded["stable"].status == "timeout", bounded["stable"]
+    assert "not finished within the model's cap" in bounded["stable"].note
+    # What finished before the cap was spent is what it is without one; what
+    # comes after (stable, and any check another change adds after main's) is
+    # TIMEOUT.
+    done = heard[: heard.index("backend_as_asked") + 1]
+    assert {c: bounded[c].status for c in done} == {c: free[c].status for c in done}
+    assert {bounded[c].status for c in heard[len(done) :]} == {"timeout"}, bounded
+
+
+def test_an_arm_past_the_deadline_is_left_out(monkeypatch):
+    """A DIFF's attribution in a spent cap asks no arm, and says nothing."""
+    import time
+
+    spend = []
+
+    def planted(base):
+        if spend:
+            D._DEADLINE = time.monotonic() - 1.0
+        return D.Verdict("diff", 0.5, "planted", ref_x=base.x, path_x=base.x * 1.5)
+
+    monkeypatch.setattr(D, "check_grid", planted)
+    job = SHAPES["triangle-maxabs-narrow"]
+    free = D.check_all(job, None, ("grid",))["grid"].extra["attribution"]
+    assert free["arms"], free
+    spend.append(1)
+    spent = D.check_all(job, None, ("grid",), deadline=time.monotonic() + 1e3)["grid"]
+    assert spent.extra["attribution"] == {"verdict": "unattributed", "arms": {}}, spent.extra
