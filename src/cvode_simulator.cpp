@@ -633,6 +633,9 @@ struct CvodeUserData {
     std::vector<double> colored_jac_h_vals;
     // The rows colored_fd_jacobian's jump test evaluates (issue #1002), 4·ns.
     std::vector<double> colored_jac_jump_rows;
+    // f at the unperturbed state from the function the columns are differenced
+    // on, where CVODE's own f came from the compiled right-hand side (#1254).
+    std::vector<double> colored_jac_f_base;
 
     // bngsim's own dense difference quotient (issue #1002), installed where
     // CVODE's would run: the solver it reads the error weights and step from,
@@ -2346,7 +2349,7 @@ static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNM
 // (issue #128); what stays here is the CVODE plumbing around it.
 
 static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
-                                  void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                  void *user_data, N_Vector tmp1, N_Vector /*tmp2*/,
                                   N_Vector /*tmp3*/) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
@@ -2381,14 +2384,40 @@ static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMat
     double *fy_pert = data->colored_jac_fy_pert.data();
     double *h_vals = data->colored_jac_h_vals.data();
 
+    // Each column's step on the scale the error test judges it by, as CVODE's
+    // dense difference quotient (cvLsDenseDQJac) takes it (#1254): the session's
+    // error weights, in tmp1 (CVODE's scratch for this callback), and its step.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
+    // Both sides of each difference from one function. The columns are the
+    // interpreted right-hand side; CVODE's fy is the compiled one where codegen
+    // is attached (256+ species, which KLU's routing reaches). Over the step
+    // above, min_inc/ewt_j beside a species at 0, the last bits between the two
+    // read as slope: fceri_ji's compiled run took 241 steps where the
+    // interpreted one took 251, 1.6e-10 of its peak away. So there the
+    // interpreted f at y is the base, at one call more.
+    const double *f_base = fy_data;
+    if (data->codegen_fn != nullptr) {
+        if (static_cast<int>(data->colored_jac_f_base.size()) != ns) {
+            data->colored_jac_f_base.resize(ns);
+        }
+        model->compute_derivs(static_cast<double>(t), y_data, data->colored_jac_f_base.data());
+        f_base = data->colored_jac_f_base.data();
+    }
+
     if (data->colored_jac_jump_rows.size() != 4 * static_cast<std::size_t>(ns)) {
         data->colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
     }
     int mended = 0;
     colored_fd_jacobian(
-        sp, ns, static_cast<double>(t), y_data, fy_data, jac_data, y_pert, fy_pert, h_vals,
+        sp, ns, static_cast<double>(t), y_data, f_base, jac_data, y_pert, fy_pert, h_vals,
         [model](double tt, const double *yy, double *ydot) { model->compute_derivs(tt, yy, ydot); },
-        data->colored_jac_jump_rows.data(), &mended);
+        data->colored_jac_jump_rows.data(), &mended, ewt, min_inc);
     if (mended > 0 && data->dq_debug) {
         std::fprintf(stderr, "[jac] colored DQ t=%.17g: %d entries step across a jump\n",
                      static_cast<double>(t), mended);
@@ -4133,6 +4162,9 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
             user_data.colored_jac_fy_pert.resize(ns);
             user_data.colored_jac_h_vals.assign(ns, 0.0);
             user_data.colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
+            // The solver whose error weights and step each column's step is
+            // taken on (#1254), as the dense quotient reads them.
+            user_data.dq_cvode_mem = cvode_mem;
             user_data.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
         }
 
