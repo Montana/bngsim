@@ -38,9 +38,10 @@ answers sees:
 Each returns a :class:`Verdict`: ``pass``, ``diff`` (a finding, with its size),
 ``unsupported`` (the path declined by type: not a wrong answer), ``skip`` (the
 path does not apply here, said why), ``exception`` (a path raised where the base
-ran: a finding) or ``no_base`` (the model does not load or its plain run does
+ran: a finding), ``no_base`` (the model does not load or its plain run does
 not complete, so there is nothing to compare against: the parity suites own
-that).
+that) or ``timeout`` (not finished within the model's cap, or a compile past
+bngsim's own limit: that row only).
 
 The oracle has to be careful
 ----------------------------
@@ -115,7 +116,7 @@ CHECKS = (
 
 @dataclass
 class Verdict:
-    status: str  # pass | diff | unsupported | skip | exception | no_base
+    status: str  # pass | diff | unsupported | skip | exception | no_base | timeout
     value: float | None = None
     note: str = ""
     extra: dict = field(default_factory=dict)
@@ -878,12 +879,21 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
 
     def go():
         here = str(Path(__file__).resolve().parent)
-        out = subprocess.run(
-            [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
-            capture_output=True,
-            text=True,
-            timeout=timeout if _DEADLINE is None else min(timeout, _left()),
-        )
+        # The model's cap, where less of it is left than this run's own limit.
+        limit = timeout if _DEADLINE is None else min(timeout, _left())
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
+                capture_output=True,
+                text=True,
+                timeout=limit,
+            )
+        except subprocess.TimeoutExpired as e:
+            if limit < timeout:  # the model's cap: TIMEOUT, this row only
+                raise
+            # Its own limit, where the run under C finished: a crash, as it read
+            # before the cap. A run the locale stalls is this check's finding.
+            return Verdict("exception", None, f"{type(e).__name__}: {_first_line(e)}")
         if out.returncode != 0:
             last = (out.stderr.strip().splitlines() or ["?"])[-1][:300]
             return Verdict("diff", None, f"runs under C, fails under {name}: {last}")

@@ -707,7 +707,7 @@ def test_a_cap_spent_after_the_base_times_out_each_check_alone(monkeypatch):
 
     monkeypatch.setattr(D, "Base", base_then_spent)
     v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, deadline=time.monotonic() + 1e3)
-    assert {x.status for x in v.values()} <= {"timeout", "skip"}, v
+    assert {x.status for x in v.values()} == {"timeout"}, v
     assert v["grid"].status == "timeout", v["grid"]
     assert "not finished within the model's cap" in v["grid"].note
     assert v["sens_runs"].status == "timeout", v["sens_runs"]
@@ -789,6 +789,71 @@ def test_a_model_killed_at_the_cap_keeps_the_rows_it_finished(tmp_path):
     assert rows["grid"].outcome == "PASS", rows["grid"]
     assert rows["backend_as_asked"].outcome == "TIMEOUT"
     assert rows["backend_as_asked"].exception == "cap of 900 s"
+
+
+@pytest.mark.parametrize(
+    ("r", "note"),
+    [
+        ({"status": "dead", "exitcode": -11}, "the worker died (exit code -11)"),
+        ({"status": "exception", "why": "ValueError: boom"}, "ValueError: boom"),
+    ],
+    ids=["died", "raised"],
+)
+def test_a_model_that_died_or_raised_keeps_the_rows_it_finished(tmp_path, r, note):
+    """A worker that segfaults, or raises past check_all, has finished what it
+    kept as surely as one killed at the cap. The rest say what happened to the
+    worker: one that died did not reach the cap."""
+    import differential_run as RUN
+
+    job = SHAPES["triangle-maxabs"]
+    spec = {
+        "key": job.model_id,
+        "job": job.as_dict(),
+        "checks": ["grid", "backend_as_asked"],
+        "timeout": 900.0,
+        "partial": str(tmp_path / "0.json"),
+    }
+    RUN._keep(spec, "grid", D.Verdict("pass", 0.0, "agrees"))
+    rows = {x.method: x for x in RUN.to_results(spec, r, {})}
+    assert rows["grid"].outcome == "PASS", rows["grid"]
+    assert rows["backend_as_asked"].outcome == "EXCEPTION"
+    assert rows["backend_as_asked"].exception == note
+
+
+def _locale_runs_out(monkeypatch, left):
+    """``check_locale`` on a child that never finishes, with ``left`` seconds of
+    the model's cap (None for no cap): the timeout the child was given, and the
+    verdict."""
+    import subprocess
+    import time
+
+    base = D.Base(SHAPES["triangle-maxabs"])
+    given = []
+
+    def never_finishes(cmd, timeout=None, **kw):
+        given.append(timeout)
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(D.subprocess, "run", never_finishes)
+    monkeypatch.setattr(D, "_DEADLINE", None if left is None else time.monotonic() + left)
+    return given, D.check_locale(base, "de_DE.UTF-8", timeout=600.0)
+
+
+def test_a_locale_run_past_the_models_cap_is_a_timeout(monkeypatch):
+    given, v = _locale_runs_out(monkeypatch, left=30.0)
+    assert given[0] <= 30.0, given
+    assert v.status == "timeout" and "the model's cap" in v.note, v
+
+
+@pytest.mark.parametrize("left", [None, 1e4], ids=["no-cap", "cap-to-spare"])
+def test_a_locale_run_past_its_own_limit_is_not_the_caps(monkeypatch, left):
+    """The run under C finished; the same run under a comma-decimal locale
+    did not, in 600 s. That stays an EXCEPTION, as before the cap, and not a
+    TIMEOUT the baseline reads as a changed state: a locale that stalls a run is
+    the check's finding (#1235's class)."""
+    given, v = _locale_runs_out(monkeypatch, left=left)
+    assert given == [600.0], given
+    assert v.status == "exception" and "TimeoutExpired" in v.note, v
 
 
 def test_each_verdict_is_heard_as_it_is_reached():
