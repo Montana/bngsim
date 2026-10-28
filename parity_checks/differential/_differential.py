@@ -794,6 +794,13 @@ def check_stable(base: Base) -> Verdict:
     TIMEOUT, its own row only."""
 
     def go():
+        # Where nothing could jump past the bound, SKIP, said why, as
+        # Base.compare says it: a base whose tighter run failed (base.limit is
+        # inf) or one wholly under the absolute floor. A base that moves past
+        # UNJUDGEABLE_DRIFT is judged: a jump past ten times that is contested.
+        unjudged = base.compare(base.x, "stable: ")
+        if unjudged.status == "skip" and (base.drift_error or base.drift <= UNJUDGEABLE_DRIFT):
+            return unjudged
         job, jumps = base.job, {}
         atol = PATH_RTOL_FACTOR * job.atol
         n = job.n_points

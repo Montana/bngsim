@@ -37,6 +37,7 @@ import functools
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import bngsim
@@ -759,6 +760,31 @@ def test_an_answer_that_jumps_with_the_tolerance_is_contested(monkeypatch):
     assert D.contested({"stable": {"status": "diff", "extra": v.extra}})
 
 
+def test_a_base_with_no_reference_is_not_stable_by_default(monkeypatch):
+    """A base whose tenfold tighter run fails has no bound (base.limit is
+    inf): the jitters are SKIP, said why, as every comparison against it is,
+    and not the PASS an answer doubled at rtol x2 also read."""
+
+    def own_drift(job, x):
+        raise bngsim.SimulationError("CVODE integration failed (planted)")
+
+    monkeypatch.setattr(D, "own_drift", own_drift)
+    base = D.Base(SHAPES["equality-dwell"])
+    real = D.run
+
+    def doubled(job, **kw):
+        result, sim = real(job, **kw)
+        if job.rtol > base.job.rtol * 1.5:
+            result = types.SimpleNamespace(
+                species=np.asarray(result.species) * 2.0, species_names=result.species_names
+            )
+        return result, sim
+
+    monkeypatch.setattr(D, "run", doubled)
+    v = D.check_stable(base)
+    assert v.status == "skip" and "no reference" in v.note, v
+
+
 def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
     base = _base("equality-dwell")
     real = D.run
@@ -776,7 +802,7 @@ def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
     assert v.status == "diff" and "n_points+1" in v.note, v
 
 
-_B338 = Path("parity_checks/rr_parity/models/BIOMD0000000338/BIOMD0000000338_url.xml")
+_B338 = _ROOT / "parity_checks/rr_parity/models/BIOMD0000000338/BIOMD0000000338_url.xml"
 
 
 @pytest.mark.skipif(
@@ -813,12 +839,18 @@ def test_what_1309_adds_runs_in_what_is_left_of_the_cap(monkeypatch):
         return v
 
     monkeypatch.setattr(D, "check_backend", backend_then_spent)
-    bounded = D.check_all(job, None, CHECKS, deadline=time.monotonic() + 1e3)
+    heard = []
+    bounded = D.check_all(
+        job, None, CHECKS, deadline=time.monotonic() + 1e3, on_verdict=lambda c, v: heard.append(c)
+    )
     assert bounded["stable"].status == "timeout", bounded["stable"]
     assert "not finished within the model's cap" in bounded["stable"].note
-    assert {c: v.status for c, v in bounded.items() if c != "stable"} == {
-        c: v.status for c, v in free.items() if c != "stable"
-    }
+    # What finished before the cap was spent is what it is without one; what
+    # comes after (stable, and any check another change adds after main's) is
+    # TIMEOUT.
+    done = heard[: heard.index("backend_as_asked") + 1]
+    assert {c: bounded[c].status for c in done} == {c: free[c].status for c in done}
+    assert {bounded[c].status for c in heard[len(done) :]} == {"timeout"}, bounded
 
 
 def test_an_arm_past_the_deadline_is_left_out(monkeypatch):
