@@ -17791,6 +17791,12 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
         } // end while (true) — inner integration loop
 
+        // Set where a sensitivity run short of the row fired there and was
+        // restarted on it (issue #1276): CVODE's last return time is then the
+        // time it stood at before, short of where it now starts, and its
+        // columns are read at the row instead.
+        bool restarted_short_of_row = false;
+
         // An output taken as reached from a double or two short of it. A
         // trigger that turns true in between (`time > 0.7`, stopped at on 0.7,
         // with the sample on the next double) is true at the time the row is
@@ -17821,7 +17827,15 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 !past) {
                 t_now = static_cast<sunrealtype>(t_out[i]);
             }
-        } else if (n_events > 0 && static_cast<double>(t_now) == t_out[i]) {
+        } else if (n_events > 0 && (static_cast<double>(t_now) == t_out[i] ||
+                                    (sens.n_total > 0 && static_cast<double>(t_now) < t_out[i]))) {
+            // A run with sensitivity columns takes the row as reached from up
+            // to 1e-12 short of it after a step (reached_output), and is read
+            // ahead the same way from there (issue #1276). Stopped that close
+            // before the sample by another root, it never read ahead, and the
+            // row held the state from before an event that crosses at the
+            // sample, where the run without columns held it after.
+            const bool short_of_row = static_cast<double>(t_now) < t_out[i];
             // An output CVODE interpolated to, from a step that went past it,
             // with a trigger on the state that crosses within CVODE's root
             // tolerance after it (issue #1124, item 2). `q' = 1; at q >= 2.5`
@@ -17859,7 +17873,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // never rises). So the state ahead is a step of f at the row's own
             // state there.
             bool read_ahead = true;
-            if (h_last == 0.0) {
+            if (short_of_row) {
+                // CVODE's history ends where the run stands, which is short of
+                // the row: past it, CVodeGetDky refuses the time. Within 1e-12
+                // of it, a step of f is the state there to well inside the
+                // tolerances.
+                std::vector<double> f_now(static_cast<size_t>(ns), 0.0);
+                for (int si = 0; si < ns; ++si) {
+                    sp_vec_outer[si].concentration = y_data[si];
+                }
+                model.compute_derivs(static_cast<double>(t_now), y_data, f_now.data());
+                double *x_step = row_ahead.data();
+                for (int si = 0; si < ns; ++si) {
+                    x_step[si] = y_data[si] + (t_ahead - static_cast<double>(t_now)) *
+                                                  f_now[static_cast<size_t>(si)];
+                }
+            } else if (h_last == 0.0) {
                 std::vector<double> f_row(static_cast<size_t>(ns), 0.0);
                 for (int si = 0; si < ns; ++si) {
                     sp_vec_outer[si].concentration = y_data[si];
@@ -17929,6 +17958,11 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         impl_->apply_event_sensitivity_jump(
                             opts, cvode_mem, ns, t_out[i], firing, executed_fires, x_minus, s_minus,
                             sens, /*at_run_start=*/false, clock_crossings_at(t_out[i]));
+                        // Restarted on the row: it is taken there.
+                        if (short_of_row) {
+                            t_now = static_cast<sunrealtype>(t_out[i]);
+                            restarted_short_of_row = true;
+                        }
                     } else {
                         std::copy(x_row.begin(), x_row.end(), y_data);
                     }
@@ -18055,7 +18089,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
-            flag = CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
+            flag = restarted_short_of_row ? CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr)
+                                          : CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
             if (flag == CV_SUCCESS) {
                 std::vector<const double *> sens_ptrs(n_sens);
                 for (int s = 0; s < n_sens; ++s) {

@@ -282,3 +282,46 @@ def test_a_fire_after_one_on_the_row_is_named_with_it_counted(gap):
         truth = 0.7 * (3 - t_s) * (0.625 + t2 / 2)
     got = np.asarray(run.sensitivities)[-1, names.index("W"), 0]
     assert got == pytest.approx(truth, rel=1e-8)
+
+
+# ── A row reached from short of the sample (issue #1276) ─────────────────────
+#
+# A sensitivity run takes a row as reached from up to 1e-12 short of it after a
+# step. Where another root stops it that close before the sample (E2, on q a
+# hair below 2.5), it never read ahead, and the row held the state from before
+# E1, which crosses at the sample: [S] 5.5 at t = 2.4999999999999, where the run
+# without columns held 2.75 at 2.5.
+
+_SHORT = (
+    "species S, R; S = 3; R = 0; q = 0; k = 1; q' = k; S' = 1;"
+    "E1: at (q >= 2.5): S = S/2; E2: at (q >= {e2!r}): R = 1;"
+)
+_SHORT_TIMES = [0.0, 1.0, 2.0, 2.5, 3.0]
+
+
+@pytest.mark.parametrize("off", [1e-13, 5e-13, 2e-12])
+def test_a_row_reached_from_short_of_the_sample_holds_the_event(off):
+    """2e-12 is outside the 1e-12 the row is taken from, and agreed before."""
+    text = _SHORT.format(e2=2.5 - off)
+    r, j, s = _sens_run(text, _SHORT_TIMES, sensitivity_params=["k"], sensitivity_ic=["S"])
+    assert float(np.asarray(r.time)[3]) == 2.5
+    np.testing.assert_allclose(s, _column(text, _SHORT_TIMES, "S"), rtol=1e-12)
+    np.testing.assert_allclose(s, [3, 4, 5, 2.75, 3.25], rtol=1e-6)
+    names = list(r.species_names)
+    assert float(np.asarray(r.species)[3, names.index("R")]) == 1.0
+
+
+@pytest.mark.parametrize("off", [1e-13, 5e-13])
+def test_its_columns_jump_at_the_row(off):
+    """t* = 2.5/k: S = (3 + t*)/2 + (t − t*) after it, so dS/dk = 1.25 and
+    dS/dS0 = 0.5 from the row on; before it, 0 and 1."""
+    r, j, _ = _sens_run(
+        _SHORT.format(e2=2.5 - off), _SHORT_TIMES, sensitivity_params=["k"], sensitivity_ic=["S"]
+    )
+    after = np.array(_SHORT_TIMES) >= 2.5
+    np.testing.assert_allclose(
+        np.asarray(r.sensitivities)[:, j, 0], np.where(after, 1.25, 0.0), atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(r.sensitivities_ic)[:, j, 0], np.where(after, 0.5, 1.0), atol=1e-6
+    )
