@@ -66,7 +66,6 @@ one oracle with one set of rules (``parity_checks/fd_sens``).
 from __future__ import annotations
 
 import contextlib
-import functools
 import json
 import os
 import subprocess
@@ -845,11 +844,16 @@ def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[st
         "grid": check_grid,
         "sparsity_covers_jacobian": check_sparsity,
         "backend_as_asked": check_backend,
-        **{kind: functools.partial(check_transform, kind=kind) for kind in TRANSFORMS},
     }
     for name, fn in one.items():
         if name in checks:
             out[name] = spent() or fn(base)
     if "locale" in checks:
         out["locale"] = spent() or check_locale(base, locale_name)
+    # After every check main runs (#1305), in what is left of the model's cap:
+    # four more runs ahead of locale could tip a slow model's locale row, which
+    # the baseline holds, to TIMEOUT.
+    for kind in TRANSFORMS:
+        if kind in checks:
+            out[kind] = spent() or check_transform(base, kind)
     return {c: out[c] for c in checks if c in out}

@@ -261,6 +261,9 @@ _SBML = {
 _BLOCK = re.compile(r"^\s*begin\s+(\w+)\s*$")
 _END = re.compile(r"^\s*end\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A name in an expression, and not the exponent of a number: in 2e1 or 1E0 a
+# parameter named e1 or E0 is no part of the literal.
+_NAME = re.compile(r"(?<![\w.])[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass
@@ -315,7 +318,7 @@ class _Net:
 
 
 def _subst(expr: str, names: dict[str, str]) -> str:
-    return _IDENT.sub(lambda m: names.get(m.group(0), m.group(0)), expr)
+    return _NAME.sub(lambda m: names.get(m.group(0), m.group(0)), expr)
 
 
 def _net_reorder(text: str, out: Path) -> Transformed:

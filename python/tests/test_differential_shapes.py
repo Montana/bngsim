@@ -456,6 +456,47 @@ def test_a_net_rate_law_keyword_and_a_spaced_expression_keep_their_answer(kind):
     assert v.status == "pass", v
 
 
+def test_a_parameter_named_like_an_exponent_is_renamed_outside_numbers_only():
+    """rename's substitution read the exponent of 2e1 as a parameter named e1,
+    and wrote 2mt_p1, which does not load."""
+    assert X._subst("2e1*e1 + 1E0*E0 + 1.5e1", {"e1": "p", "E0": "q"}) == "2e1*p + 1E0*q + 1.5e1"
+    path = _DIR / "exponent_names.net"
+    path.write_text(
+        "begin parameters\n    1 e1 0.5\n    2 k 2e1*e1\nend parameters\n"
+        "begin species\n    1 A() 10\n    2 B() 0\nend species\n"
+        "begin reactions\n    1 1 2 k\nend reactions\n"
+    )
+    v = D.check_transform(_job_of("exponent_names", path), "rename")
+    assert v.status == "pass", v
+
+
+def test_the_transforms_run_after_every_check_main_runs():
+    """A model's checks share its cap (#1321): four more runs ahead of main's
+    checks could tip a slow model's locale row, which the baseline holds, to
+    TIMEOUT. They run after them, as every check added since does."""
+    main = (
+        "sens_runs",
+        "sens_vs_plain",
+        "ajac_vs_fdjac",
+        "klu_vs_dense",
+        "cc_vs_interp",
+        "cc_vs_mir",
+        "locale",
+        "grid",
+        "sparsity_covers_jacobian",
+        "backend_as_asked",
+    )
+    heard = []
+    D.check_all(
+        SHAPES["equality-dwell"],
+        None,
+        (*main, *X.TRANSFORMS),
+        on_verdict=lambda c, v: heard.append(c),
+    )
+    assert set(heard) == {*main, *X.TRANSFORMS}, heard
+    assert max(heard.index(c) for c in main) < min(heard.index(k) for k in X.TRANSFORMS), heard
+
+
 def test_an_id_bngsim_respells_is_aligned_by_its_respelling():
     """An SBML id its expressions reserve (null, In, time) is reported as
     _ant_<id>; renamed, the map back gives the id, and twenty BioModels read as
