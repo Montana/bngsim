@@ -1,5 +1,5 @@
 {
- "_comment": "Models parity_checks/fd_sens/fd_sens_run.py checks bngsim's analytic forward sensitivities against central differences of its own trajectories (issue #804). Every path is a tracked .net file, so the nightly needs no corpus fetch and no BNG2.pl. Two groups: tests/data fixtures for the derivative shapes past defects broke (derived and nested-derived rate constants, Hill/Sat rewrites, the MM tQSSA forms, expression and observable chains, initial values from derived parameters, max/min/abs kinks), and published or tutorial networks from benchmarks/models/net/ode (four carry a scientific-notation rate factor, #689's shape). A model is left out, with its measurement, where a central difference is not a reference for it.",
+ "_comment": "Models parity_checks/fd_sens/fd_sens_run.py checks bngsim's analytic forward sensitivities against central differences of its own trajectories (issue #804). Every path is a tracked .net file, so the nightly needs no corpus fetch and no BNG2.pl. Two groups: tests/data fixtures for the derivative shapes past defects broke (derived and nested-derived rate constants, Hill/Sat rewrites, the MM tQSSA forms, expression and observable chains, initial values from derived parameters, max/min/abs kinks), and published or tutorial networks from benchmarks/models/net/ode (four carry a scientific-notation rate factor, #689's shape). And pulses over the clock written with max/abs, clamp and if(), each narrow (w = 0.01) and wide (parity_checks/fd_sens/models, issue #1257): a narrow one, at the tolerance sweep, is what found #1227. A model is left out, with its measurement, where a central difference is not a reference for it.",
  "jobs": [
   {
    "model_id": "derived_rate_const",
@@ -270,6 +270,54 @@
    "model_id": "wofsy_goldstein",
    "path": "benchmarks/models/net/ode/wofsy_goldstein.net",
    "t_end": 50,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_maxabs_narrow",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_maxabs_narrow.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_maxabs_wide",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_maxabs_wide.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_clamp_narrow",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_clamp_narrow.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_clamp_wide",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_clamp_wide.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_if_narrow",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_if_narrow.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_triangle_if_wide",
+   "path": "parity_checks/fd_sens/models/pulse_triangle_if_wide.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_ramp_clamp_narrow",
+   "path": "parity_checks/fd_sens/models/pulse_ramp_clamp_narrow.net",
+   "t_end": 10,
+   "n_points": 51
+  },
+  {
+   "model_id": "pulse_ramp_clamp_wide",
+   "path": "parity_checks/fd_sens/models/pulse_ramp_clamp_wide.net",
+   "t_end": 10,
    "n_points": 51
   }
  ],

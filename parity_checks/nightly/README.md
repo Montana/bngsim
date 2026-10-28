@@ -14,7 +14,8 @@ a regression. Nothing here blocks a PR.
 | `bng_ssa`, `bng_nf` | run_network SSA, NFsim | 110 SSA + 235 NF committed BNGL jobs |
 | `amici_sens` | AMICI forward sensitivities | 48 of the 50 curated BioModels, staggered + simultaneous |
 | `rr_ssa` | libRoadRunner gillespie (`rr_parity/ssa_screen.py`) | the 269 of the 306 SSA-screen BioModels candidates the corpus holds (#806) |
-| `fd_sens` | central differences of bngsim's own trajectories (`fd_sens/fd_sens_run.py`) | 45 committed `.net` models, staggered + simultaneous; the only sensitivity oracle a `.net` model has (#804) |
+| `fd_sens` | central differences of bngsim's own trajectories (`fd_sens/fd_sens_run.py`), and a tolerance sweep: an analytic column that still moves between rtol 1e-10 and 1e-12 where the trajectory settles is a DIFF (#1257) | 53 committed `.net` models, staggered + simultaneous, 8 of them narrow and wide pulses over the clock; the only sensitivity oracle a `.net` model has (#804) |
+| `differential` | bngsim's own paths, each against another (`differential/differential_run.py`): sensitivity vs plain run, FD vs analytic Jacobian, KLU vs dense, compiled vs interpreted, cc vs MIR, `de_DE.UTF-8` vs C; and a refused sensitivity run, a sparsity pattern that misses entries, a backend other than the one asked for | `fd_sens`'s 53 models and the BioModels under 1 MB, one row per (model, check) (#1257) |
 
 **The BioModels corpus.** 992 of the 1,323 BioModels come from sys-bio/temp-biomodels
 on GitHub. The other 331 come only from BioModels itself, whose CloudFront refuses

@@ -466,3 +466,145 @@ def test_the_manifest_names_tracked_models_and_why_some_are_left_out():
             ).stdout.split()
         )
         assert tracked == {j["path"] for j in payload["jobs"]}, "a manifest model is not tracked"
+
+
+# The tolerance sweep (issue #1257): runs at SWEEP_RTOLS, (species, sensitivities)
+
+
+def _sweep_runs(state_move=0.0, column_moves=(0.0, 0.0), sizes=(1.0, 1.0)):
+    x = np.full((5, 2), 10.0)
+    s = np.stack([np.full((5, 2), z) for z in sizes], axis=-1)
+    x1 = x * (1 + state_move)
+    s1 = s.copy()
+    for j, m in enumerate(column_moves):
+        s1[..., j] *= 1 + m
+    return [(x1, s1), (x, s)]
+
+
+def test_the_sweep_names_a_column_that_moves_where_the_trajectory_settles():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 0.5)), ["a", "b"])
+    assert sweep["settled"] and sweep["moving"] == ["b"]
+    assert sweep["column_gaps"]["b"] == pytest.approx(0.5)
+
+
+def test_the_sweep_judges_nothing_where_the_trajectory_does_not_settle():
+    """A model that amplifies every difference moves its columns with the
+    tolerance too (LV): no oracle can judge those."""
+    sweep = F.tolerance_sweep(_sweep_runs(state_move=1e-3, column_moves=(0.5, 0.5)), ["a", "b"])
+    assert not sweep["settled"] and sweep["moving"] == []
+
+
+def test_the_sweep_leaves_out_a_column_at_the_states_rounding():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 5.0), sizes=(1.0, 1e-16)), ["a", "b"])
+    assert "b" not in sweep["column_gaps"] and sweep["moving"] == []
+
+
+def test_the_sweep_asks_only_of_the_judged_columns():
+    """A column under the solver's resolution reads its noise, which moves
+    with the tolerance: a narrow pulse's position, whose true column is 0."""
+    runs = _sweep_runs(column_moves=(0.0, 5.0))
+    assert F.tolerance_sweep(runs, ["a", "b"], judged=["a"])["moving"] == []
+    assert F.tolerance_sweep(runs, ["a", "b"], judged=["a", "b"])["moving"] == ["b"]
+
+
+def test_a_column_that_converged_is_not_named():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(1e-6, 1e-6)), ["a", "b"])
+    assert sweep["settled"] and sweep["moving"] == []
+
+
+def test_the_sweep_turns_a_pass_or_an_unjudged_row_into_a_diff():
+    sweep = F.tolerance_sweep(_sweep_runs(column_moves=(0.0, 0.5)), ["a", "b"])
+    for status in ("pass", "bad_test"):
+        res = {"status": status, "value": 0.0}
+        F._apply_sweep(res, sweep)
+        assert res["status"] == "diff" and res["columns_diff"] == ["b"]
+        assert "do not converge with the tolerance" in res["why"]
+    refused = {"status": "unsupported"}
+    F._apply_sweep(refused, sweep)
+    assert refused["status"] == "unsupported"
+
+
+def test_a_sweep_that_finds_nothing_leaves_the_verdict():
+    res = {"status": "pass", "value": 1e-6}
+    F._apply_sweep(res, F.tolerance_sweep(_sweep_runs(), ["a", "b"]))
+    assert res["status"] == "pass" and res["sweep_settled"] is True
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "pulse_triangle_maxabs_narrow",
+        "pulse_triangle_clamp_narrow",
+        "pulse_triangle_if_narrow",
+        "pulse_ramp_clamp_narrow",
+    ],
+)
+def test_a_narrow_pulse_converges_with_the_tolerance(model_id):
+    """The sweep on every pull request, not only the nightly: a narrow pulse's
+    columns settle between rtol 1e-10 and 1e-12 with the trajectory. Before
+    #1242, triangle_clamp_narrow's k_clock column moved 107% there (and
+    ramp_clamp_narrow's 1.2e-3), while a difference of plain runs passed both."""
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == model_id
+    )
+    params = ["kx", "k_clock"]
+    for method in F.SENS_METHODS:
+        spec = {
+            "t_start": 0.0,
+            "t_end": float(job["t_end"]),
+            "n_points": int(job["n_points"]),
+            "sens_method": method,
+        }
+        sweep = F.tolerance_sweep(F._sweep_runs(F.REPO / job["path"], params, spec), params)
+        assert sweep["settled"], (method, sweep)
+        assert set(sweep["column_gaps"]) == set(params), (method, sweep)
+        assert sweep["moving"] == [], (method, sweep)
+
+
+def test_a_column_is_judged_on_the_states_scale_through_its_parameter():
+    """nanomolar_dimer's columns are 1e-28 and 6e-20 per unit of parameters of
+    2e18 and 4e9: an absolute rounding floor of 1e-14 left both out, though each
+    is 17% of the 1.5e-9 peak per relative change."""
+    runs = _sweep_runs(column_moves=(0.0, 0.5), sizes=(1e-28, 1e-28))
+    assert F.tolerance_sweep(runs, ["a", "b"])["column_gaps"] == {}
+    sweep = F.tolerance_sweep(runs, ["a", "b"], values=[2e18, 2e18])
+    assert set(sweep["column_gaps"]) == {"a", "b"} and sweep["moving"] == ["b"]
+
+
+def test_the_nanomolar_model_sweep_judges_its_columns():
+    """Both of nanomolar_dimer's columns are judged, on its own 1.5e-9 scale."""
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == "nanomolar_dimer"
+    )
+    path = F.REPO / job["path"]
+    model = F.load_model(path)
+    params = ["kdim", "kdis"]
+    values = [float(model.get_param(p)) for p in params]
+    spec = {
+        "t_start": 0.0,
+        "t_end": float(job["t_end"]),
+        "n_points": int(job["n_points"]),
+        "sens_method": "staggered",
+    }
+    sweep = F.tolerance_sweep(F._sweep_runs(path, params, spec), params, values=values)
+    assert sweep["settled"] and set(sweep["column_gaps"]) == set(params), sweep
+    assert sweep["moving"] == [], sweep
+
+
+def test_a_sweep_past_the_jobs_cap_fails_as_a_sweep():
+    """Two runs at rtol 1e-12 after the difference's: bounded by the job's cap,
+    so a slow one costs the sweep, not the verdict (a TIMEOUT)."""
+    import time
+
+    job = next(
+        j
+        for j in json.loads((_FD / "fd_sens_jobs.json").read_text())["jobs"]
+        if j["model_id"] == "pulse_triangle_clamp_narrow"
+    )
+    spec = {"t_start": 0.0, "t_end": 10.0, "n_points": 51, "sens_method": "staggered"}
+    with pytest.raises(F.ReferenceOverBudget):
+        F._sweep_runs(F.REPO / job["path"], ["kx"], spec, deadline=time.perf_counter() - 1.0)
