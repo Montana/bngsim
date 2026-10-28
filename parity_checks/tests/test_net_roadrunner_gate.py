@@ -120,3 +120,59 @@ def test_ungated_roadrunner_would_diverge_on_homodimer() -> None:
         rr_final.append(res[-1, 1])
     # Ungated RoadRunner diverges from the exact 0: it fires 2A -> C at A = 1.
     assert sum(c > 0 for c in rr_final) > n_rep // 2
+
+
+# ── A wall budget that holds inside a replicate (issue #1288) ────────────────
+
+
+@pytest.mark.skipif(not nrr.roadrunner_available(), reason="libroadrunner not installed")
+def test_the_ensemble_in_its_child_is_the_ensemble_in_process() -> None:
+    """The budget runs the replicates in a child process, fixed-step as before, so
+    the draws, and every reference recorded from them, are unchanged."""
+    import numpy as np
+
+    grid = np.linspace(0.0, 5.0, 11)
+    got = nrr.net_roadrunner_ensemble(_CLEAN, grid, n_rep=8, seed_base=3)
+    assert got is not None
+    text = nrr._faithful_sbml_text(_CLEAN)
+    ids = [nrr._observable_id_map(text)[n] for n in got[2]]
+    direct = nrr._gillespie_ensemble(text, ids, 0.0, 5.0, 11, 8, 3)
+    np.testing.assert_array_equal(got[1], direct)
+
+
+def test_a_child_past_the_budget_is_stopped() -> None:
+    import time
+
+    t0 = time.perf_counter()
+    assert nrr._within_wall_budget(time.sleep, (60,), 1.0) is None
+    assert time.perf_counter() - t0 < 30
+
+
+def _roadrunner_stops_at_a_negative_count() -> bool:
+    if not nrr.roadrunner_available():
+        return True
+    import roadrunner
+
+    major, minor, patch = (int(p) for p in roadrunner.__version__.split(".")[:3])
+    return (major, minor, patch) < (2, 9, 3)
+
+
+@pytest.mark.skipif(
+    _roadrunner_stops_at_a_negative_count(),
+    reason="libroadrunner before 2.9.3 stops a Gillespie run at a negative count",
+)
+def test_a_replicate_that_never_returns_is_stopped_by_the_budget() -> None:
+    """The homodimer, ungated: on libRoadRunner >= 2.9.3, ``0.5*k1*A*A`` fires
+    infinitely many events before t = 10, and 64 replicates never return. The
+    budget now stops them inside a replicate, where it used to be read only
+    between replicates."""
+    import time
+
+    from bngsim.convert import net_to_sbml
+
+    text = net_to_sbml(_HOMODIMER, out_path=None, validate="L1", strict=True).output_text
+    ids = [nrr._observable_id_map(text)["C_tot"]]
+    t0 = time.perf_counter()
+    vals = nrr._within_wall_budget(nrr._gillespie_ensemble, (text, ids, 0.0, 10.0, 11, 64, 0), 5.0)
+    assert vals is None
+    assert time.perf_counter() - t0 < 60

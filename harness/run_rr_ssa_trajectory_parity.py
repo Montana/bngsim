@@ -67,6 +67,9 @@ DEFAULT_N = 200
 DEFAULT_SEED_BASE = 2000
 DEFAULT_MEAN_Z_TOL = 5.0
 DEFAULT_MAX_FAILURES_RECORDED = 50
+# One model's RoadRunner ensemble at the default 200 replicates; a run that
+# never returns (issue #1288) is stopped here and reported as that model's error.
+DEFAULT_RR_WALL_BUDGET = 600.0
 
 
 def _bn_replicates(
@@ -165,6 +168,44 @@ def _rr_replicates(
     return times, np.stack(out, axis=0), species_names
 
 
+def _rr_child(args, out) -> None:
+    try:
+        out.put(("ok", _rr_replicates(*args)))
+    except Exception as exc:  # noqa: BLE001 - reported by the parent, as before
+        out.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _rr_replicates_within(args: tuple, wall_budget_sec: float):
+    """:func:`_rr_replicates` in a child process, killed past ``wall_budget_sec``.
+
+    Since libRoadRunner 2.9.3 a Gillespie run no longer stops when a species goes
+    negative (RoadRunner #1322), and a law such as ``0.5*k1*A*A`` then fires
+    infinitely many events before a finite time: the replicate never returns, and
+    nothing here stopped it (issue #1288). The child keeps the fixed-step run and
+    its draws; RoadRunner's own ``max_output_rows`` caps only variable-step runs,
+    whose draws differ for the same seed."""
+    import multiprocessing as mp
+    import queue
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    proc = ctx.Process(target=_rr_child, args=(args, out), daemon=True)
+    proc.start()
+    try:
+        kind, value = out.get(timeout=max(wall_budget_sec, 0.0))
+    except queue.Empty:
+        raise TimeoutError(
+            f"RoadRunner's Gillespie ensemble did not return within {wall_budget_sec:g} s"
+        ) from None
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=5)
+    if kind == "error":
+        raise RuntimeError(value)
+    return value
+
+
 def _align_columns(
     bn_names: list[str], rr_names: list[str]
 ) -> tuple[list[int], list[int], list[str]] | None:
@@ -189,6 +230,7 @@ def _run_one(
     seed_base: int,
     mean_z_tol: float,
     max_failures_recorded: int,
+    rr_wall_budget: float = DEFAULT_RR_WALL_BUDGET,
 ) -> dict:
     name = model_meta["name"]
     t_end = float(model_meta["t_end"])
@@ -231,8 +273,8 @@ def _run_one(
 
     try:
         t0 = time.perf_counter()
-        rr_times, rr_arr, rr_names = _rr_replicates(
-            str(xml_path), t_end, n_steps, n_replicates, seed_base
+        rr_times, rr_arr, rr_names = _rr_replicates_within(
+            (str(xml_path), t_end, n_steps, n_replicates, seed_base), rr_wall_budget
         )
         entry["elapsed_sec_rr"] = round(time.perf_counter() - t0, 3)
     except Exception as exc:
@@ -308,6 +350,13 @@ def main() -> int:
     )
     p.add_argument("--seed-base", type=int, default=DEFAULT_SEED_BASE, help="Seed schedule base.")
     p.add_argument(
+        "--rr-wall-budget",
+        type=float,
+        default=DEFAULT_RR_WALL_BUDGET,
+        help="Seconds RoadRunner's ensemble of one model may take before it is stopped "
+        f"(default {DEFAULT_RR_WALL_BUDGET:g}).",
+    )
+    p.add_argument(
         "--mean-z-tol",
         type=float,
         default=DEFAULT_MEAN_Z_TOL,
@@ -371,6 +420,7 @@ def main() -> int:
             n_replicates=args.n,
             seed_base=args.seed_base,
             mean_z_tol=args.mean_z_tol,
+            rr_wall_budget=args.rr_wall_budget,
             max_failures_recorded=DEFAULT_MAX_FAILURES_RECORDED,
         )
         if entry["status"] == "error":
