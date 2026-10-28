@@ -32,11 +32,17 @@ authored from scratch. Oracles, in order of authority:
     value the FD oracle differentiates, never gates the suite.
 """
 
+import os
+import sys
 import warnings
 
 import bngsim
 import numpy as np
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _codegen_backend import under_jit_no_cc_artifact  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -279,6 +285,7 @@ class TestComputeAllSensitivitiesRedirect:
             2.0 * A * (-A0 * t * np.exp(-KD * t)),
         )
 
+    @under_jit_no_cc_artifact
     def test_nonlinear_redirect_when_plain_codegen_preattached(self):
         # GH #205 follow-up: when a plain-RHS codegen artifact is ALREADY attached
         # at construction (here pinned via codegen=True; also happens for a

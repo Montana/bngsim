@@ -20,12 +20,18 @@ and ``steady_state()``, which routes its march by the same rule.
 from __future__ import annotations
 
 import ctypes
+import os
 import shutil
+import sys
 from pathlib import Path
 
 import bngsim
 import numpy as np
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _codegen_backend import under_jit_engine_name  # noqa: E402
 
 _NETS_DIR = Path(__file__).resolve().parents[2] / "benchmarks" / "models" / "net" / "ode"
 
@@ -188,6 +194,7 @@ class TestCodegenAgreesWithTheSolver:
         assert sim.model._core.codegen_jacobian_plan()["routes_sparse"] is sparse
 
     @needs_cc
+    @under_jit_engine_name
     def test_fill_routed_model_compiles_a_dense_jacobian(self):
         sim = _sim(_FILL_MODEL, codegen=True)
         assert sim.codegen_backend == "cc"

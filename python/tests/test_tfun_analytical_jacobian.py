@@ -22,13 +22,19 @@ trajectory against ``jacobian="fd"``.
 
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 import textwrap
 from pathlib import Path
 
 import bngsim
 import numpy as np
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _codegen_backend import under_jit_engine_name  # noqa: E402
 
 _CC = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
 needs_cc = pytest.mark.skipif(_CC is None, reason="no C compiler on PATH")
@@ -160,6 +166,7 @@ class TestCompiledJacobianReadsTheTable:
     @pytest.mark.parametrize(
         ("n_chain", "symbol"), [(0, "bngsim_codegen_jac("), (60, "bngsim_codegen_jac_sparse(")]
     )
+    @under_jit_engine_name
     def test_emits_and_matches_fd(self, tmp_path, n_chain, symbol):
         from bngsim._codegen import generate_jacobian_from_model
 

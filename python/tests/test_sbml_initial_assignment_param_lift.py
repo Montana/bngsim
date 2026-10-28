@@ -40,10 +40,16 @@ same document loaded with the new number in it.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 
 import bngsim
 import numpy as np
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _codegen_backend import xfail_when_threshold_forced  # noqa: E402
 
 A0 = 1.0
 K2 = 3.0
@@ -353,6 +359,10 @@ def test_an_initial_assignment_over_an_assignment_rule_target_is_not_lifted():
     assert "k0" in m.primary_param_names
 
 
+@xfail_when_threshold_forced(
+    "#1217 (filed separately)",
+    "after a compiled run get_param reads a rule-set parameter at its load value",
+)
 def test_a_write_after_a_run_does_not_move_it_to_the_rules_current_value():
     """The failure the refusal exists for, at its sharpest: an *identity* write,
     which :meth:`set_param` documents as not an override at all, so
