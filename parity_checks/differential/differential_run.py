@@ -15,7 +15,8 @@ One row per (model, check), its ``method`` the check:
     the path does not apply here (no KLU, no MIR),
       or the model does not load or run at all ....... SKIP
     it raised where the base ran .................... EXCEPTION
-    the model's cap was exceeded .................... TIMEOUT
+    it did not finish within the model's cap, or its
+      compile within bngsim's own limit ............. TIMEOUT
 
 The baseline (``nightly/baselines/differential.json``) holds tonight's known
 findings, so a night alerts on what changed: a model whose paths agreed and do
@@ -201,20 +202,19 @@ def _value(v):
 def to_results(spec: dict, r: dict, stamp: dict) -> list[JobResult]:
     now = _dt.datetime.now().isoformat(timespec="seconds")
     rows = r.get("rows")
-    kept = spec.get("partial") and Path(spec["partial"])
-    if rows is None and r.get("status") in ("timeout", "dead") and kept and kept.is_file():
-        # Killed at the cap: what it finished stands, the rest timed out.
-        note = f"cap of {spec['timeout']:.0f} s"
-        done = json.loads(kept.read_text())
-        rows = {
-            c: done.get(c) or {"status": r["status"], "value": None, "note": note, "extra": {}}
-            for c in spec["checks"]
-        }
     if rows is None:  # the model as a whole: over the cap, raised, timed out or died
         status = {"over": "skip"}.get(r.get("status"), r.get("status", "exception"))
-        note = r.get("why") or (f"cap of {spec['timeout']:.0f} s" if status == "timeout" else "")
+        note = r.get("why") or {
+            "timeout": f"cap of {spec['timeout']:.0f} s",
+            "dead": f"the worker died (exit code {r.get('exitcode')})",
+        }.get(status, "")
+        # What a worker killed at the cap, or one that died or raised, finished
+        # stands (_keep): only the rest take the model's outcome.
+        kept = spec.get("partial") and Path(spec["partial"])
+        done = json.loads(kept.read_text()) if kept and kept.is_file() else {}
         rows = {
-            c: {"status": status, "value": None, "note": note, "extra": {}} for c in spec["checks"]
+            c: done.get(c) or {"status": status, "value": None, "note": note, "extra": {}}
+            for c in spec["checks"]
         }
     out = []
     for check, row in rows.items():
