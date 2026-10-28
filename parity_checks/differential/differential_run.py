@@ -5,7 +5,8 @@ report (issue #1257).
 The checks are ``_differential.py``'s: a sensitivity run's state against a plain
 run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
-8x the output points against the base's grid, and four rules for bugs whose
+8x the output points against the base's grid, ``steady_state()`` (integrated
+and Newton-polished) against a run to equilibrium, and four rules for bugs whose
 answers are right (a sensitivity run refused, a sparsity pattern that misses
 entries, analytic Jacobian entries that differences of the right-hand side
 contradict (#1308), a backend other than the one asked for).
