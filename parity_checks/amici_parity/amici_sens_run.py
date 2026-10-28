@@ -189,9 +189,10 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
         if not whole["passed"]:
             # The columns left out that the tensor's DIFF lies in: each one past
             # its floor somewhere, judged at the tensor's scale with every other
-            # column forgiven. A DIFF only several make together (a soft-fail
-            # budget they exceed only jointly) names none of them, and the row
-            # is a DIFF all the same.
+            # column forgiven. Under differ's present gates every DIFF the
+            # tensor finds is in a column named here or above (a left-out
+            # column's error past its floor is past 5% of its peak, so hard),
+            # but the row requires the tensor's verdict itself, not that.
             past = ~asens.sensitivity_noise_mask(bn_used, am_used, param_values, atol)
             for j in range(n_p):
                 if j in verdicts or not past[..., j].any():
