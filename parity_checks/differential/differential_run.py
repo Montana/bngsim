@@ -13,6 +13,9 @@ Four more transform the model file itself, where the answer is known to follow,
 which the loader reads a second way (#1305, ``_transforms.py``): its species and
 reactions reordered, its names renamed, each reaction split in two at half the
 rate, and, where it does not read the clock, every rate and the window rescaled.
+Three more reuse what every other check makes fresh (#1307): a run stopped and
+continued, a second run on a Simulator or a Model a first one ran, and a batch
+on threads against the same points one at a time.
 One row per (model, check), its ``method`` the check:
 
     the path agrees with its reference .............. PASS
