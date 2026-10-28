@@ -288,6 +288,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-locale", action="store_true", help="leave the locale check out")
     ap.add_argument("--models", default="", help="comma-separated model_id substrings")
     args = ap.parse_args(argv)
+    if args.max_reps < 1:
+        ap.error(f"--max-reps must be at least 1, got {args.max_reps}")
 
     checks = [c for c in args.checks.split(",") if c and not (args.no_locale and c == "locale")]
     unknown = sorted(set(checks) - set(D.CHECKS))

@@ -767,6 +767,21 @@ def test_a_library_the_engine_declines_takes_one_replicate_each_way(monkeypatch)
     assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
 
 
+def test_an_ssa_job_with_no_replicates_is_skipped_not_judged(tmp_path):
+    """Job's n_rep defaults to 0: two empty ensembles read PASS, "all 0 seeds
+    identical", and no backend read DIFF, "codegen=False ran []". Nothing was
+    compared, so both are SKIP, said why; the runner refuses --max-reps 0."""
+    import differential_run as RUN
+
+    v = D.check_all(_ssa_job(n_rep=0), None)
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
+    assert all("no replicates" in x.note for x in v.values()), v
+    # An empty corpus, so a runner that took --max-reps 0 returns at once.
+    empty = ["--fd-sens-jobs", "", "--rr-jobs", "", "--ssa-jobs", "", "--no-locale"]
+    with pytest.raises(SystemExit):
+        RUN.main([*empty, "--max-reps", "0", "--out", str(tmp_path / "r.json")])
+
+
 def test_the_runner_reads_rr_ssas_jobs_as_ssa_jobs(tmp_path):
     import differential_run as RUN
 
