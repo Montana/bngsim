@@ -838,6 +838,13 @@ def test_nfsim_and_rulemonkey_agree_in_distribution():
     assert v.status == "pass" and "replicates each" in v.note, v
 
 
+def test_an_nf_job_with_no_replicates_is_skipped_not_no_base():
+    """With n_rep 0 there is no ensemble to stack, which read as NFsim failing
+    ("the NFsim runs: ValueError: need at least one array"): SKIP, said why."""
+    v = D.check_all(_nf_job(n_rep=0), None)["nf_reject_vs_exact"]
+    assert v.status == "skip" and "no replicates" in v.note, v
+
+
 def test_one_rate_perturbed_on_one_engine_is_a_finding(monkeypatch, tmp_path):
     """The issue's negative control. A DIFF is escalated to 30 replicates each,
     as the stochastic suites do, and a real one stays a DIFF."""

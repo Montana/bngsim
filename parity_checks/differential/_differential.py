@@ -940,6 +940,9 @@ def check_nf(job: Job, checks=NF_CHECKS) -> dict[str, Verdict]:
 
     if "nf_reject_vs_exact" not in checks:
         return {}
+    if job.n_rep < 1:
+        # No replicates: nothing to compare, and no NFsim run to be the base.
+        return {"nf_reject_vs_exact": Verdict("skip", note=f"no replicates asked (n_rep {job.n_rep})")}
     start = time.perf_counter()
     try:
         reject, names_r = _nf_runs(job, "nf_reject")
