@@ -184,9 +184,9 @@ REFUSED = {
         for check in D.STEADY_METHODS
     },
 }
-OPEN = {
-    ("equality-dwell", "klu_vs_dense"): "#1254: KLU with the FD Jacobian on an exact equality",
-}
+# Empty since #1254 was fixed (KLU's colored difference quotient steps on the
+# error weights); a newly found bug goes here.
+OPEN: dict[tuple[str, str], str] = {}
 
 
 @functools.cache
@@ -200,8 +200,8 @@ def _cases():
             marks = ()
             if (shape, check) in OPEN:
                 # Only where the path runs: a build without KLU skips the KLU
-                # check, which is right, and is no pass of #1254's (the MIR leg
-                # builds without it).
+                # check, which is right, and is no pass of a KLU bug's (the MIR
+                # leg builds without it).
                 marks = pytest.mark.xfail(
                     condition=check != "klu_vs_dense" or bool(bngsim._bngsim_core.HAS_KLU),
                     strict=True,
