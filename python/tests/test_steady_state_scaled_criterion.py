@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import platform
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -1939,3 +1940,45 @@ def test_a_march_whose_integrator_fails_is_still_retried_on_difference_quotients
     if sys.platform == "darwin" and platform.machine() == "arm64":
         assert ss.solver_jacobian_retried
         assert ss.converged
+
+
+_CC_ON_PATH = any(shutil.which(c) for c in ("cc", "gcc", "clang"))
+
+
+@pytest.mark.skipif(not _CC_ON_PATH, reason="no C compiler on PATH for the codegen leg")
+def test_a_run_test_the_closed_form_cannot_take_is_taken_on_differences(data_dir):
+    """Issue #1357. glioblastoma-egfrviii's march on the compiled right-hand
+    side, whose closed-form Jacobian is the interpreter's to the bit, comes to a
+    state at residual 2e-39, its rounding a few ulps from the interpreter's.
+    The run test from there stopped at t = 3.9e5 on the closed form, and the
+    state was refused with a run measure of inf. The run test is now taken once
+    more on differences, as the march and the hold run are. The state is the
+    solve's, so the answer is no retry's."""
+    path = str(data_dir / "glioblastoma_egfrviii_seed.net")
+    compiled = bngsim.Simulator(
+        bngsim.Model.from_net(path), method="ode", codegen=True
+    ).steady_state(method="integration")
+    assert compiled.converged
+    assert compiled.continued_run_distance <= 1.0
+    assert compiled.solver_jacobian_source == "codegen"
+    assert not compiled.solver_jacobian_retried
+    interpreted = bngsim.Simulator(bngsim.Model.from_net(path), method="ode").steady_state(
+        method="integration"
+    )
+    # At the march's own tolerances (rtol and atol 1e-8): a species at 0 here
+    # is 9.1e-10 there, and the rest agree to the digit.
+    np.testing.assert_allclose(
+        compiled.concentrations, interpreted.concentrations, rtol=1e-8, atol=1e-8
+    )
+
+
+@pytest.mark.skipif(not _CC_ON_PATH, reason="no C compiler on PATH for the codegen leg")
+def test_an_explicit_closed_form_is_not_called_off_in_the_run_test(data_dir):
+    """Control: jacobian="analytical" is a choice, and the run test it cannot
+    take is left as it is, as the march's failure is (#127)."""
+    path = str(data_dir / "glioblastoma_egfrviii_seed.net")
+    ss = bngsim.Simulator(
+        bngsim.Model.from_net(path), method="ode", codegen=True, jacobian="analytical"
+    ).steady_state(method="integration")
+    assert not ss.converged
+    assert ss.continued_run_distance == math.inf

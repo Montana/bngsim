@@ -6221,6 +6221,24 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         if (residual < effective->tol) {
             result.continued_run_distance =
                 ss_continued_run(model, rhs, *effective, sub, result.concentrations);
+            // As the solve itself does where the closed-form Jacobian stops the
+            // integrator (issue #127), and as the hold run below does: a run
+            // test the closed form could not take to its time is taken once
+            // more on differences (issue #1357). The compiled right-hand side
+            // led glioblastoma_egfrviii's march to a state at residual 2e-39,
+            // its rounding a few ulps from the interpreter's, and the run from
+            // there stopped at t = 3.9e5 on the closed form, which is the
+            // interpreter's to the bit: the state was refused with a run
+            // measure of inf, and nothing retried it. The state returned is the
+            // solve's either way, so solver_jacobian_retried, which says the
+            // answer is a retry's, is not set.
+            if (!std::isfinite(result.continued_run_distance) && effective->jacobian == "auto" &&
+                ss_install_solver_jacobian(rhs, *effective)) {
+                SteadyStateOptions by_differences = *effective;
+                by_differences.jacobian = "fd";
+                result.continued_run_distance =
+                    ss_continued_run(model, rhs, by_differences, sub, result.concentrations);
+            }
             result.converged = result.continued_run_distance <= 1.0;
         } else {
             result.converged = false;
