@@ -168,6 +168,11 @@ jobs:
           # Keep the antimony floor in step with the [antimony]/[test] extras in
           # pyproject.toml -- 3.1.2 was never published to PyPI, 3.1.3 is the
           # first release carrying the repeated-conversion memory fix.
+          # Unlocked on purpose (issue #1288): every uv-sync leg runs the
+          # uv.lock version, and this one runs the newest antimony that
+          # `pip install bngsim[antimony]` gives a user, so a release that breaks
+          # bngsim shows here before the lock moves to it. Antimony 3.2.0 broke a
+          # test for weeks while every leg ran the locked 3.1.3.
           python -m pip install "pytest>=8.0" "scipy>=1.15" "antimony>=3.1.3"
 
       - name: Show build / capability / compiler info
