@@ -686,10 +686,13 @@ def _species(result, base: Base) -> np.ndarray:
 
 
 def _worst(verdicts: list[tuple[str, Verdict]]) -> Verdict:
-    """The verdict of several comparisons: a DIFF if any is, else the first."""
-    for _label, v in verdicts:
-        if v.status != "pass":
-            return v
+    """The verdict of several comparisons: the first DIFF if any is, else the
+    first that is not a PASS, else a PASS. A SKIP of one (point 0 against a
+    base too unconverged to judge) must not hide another's DIFF (a threaded
+    point against the same point run alone, which needs no base)."""
+    bad = [v for _label, v in verdicts if v.status != "pass"]
+    if bad:
+        return next((v for v in bad if v.status == "diff"), bad[0])
     return Verdict(
         "pass", max(v.value or 0.0 for _, v in verdicts), "; ".join(v.note for _, v in verdicts)
     )

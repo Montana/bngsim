@@ -741,10 +741,8 @@ def test_a_restore_that_leaves_a_parameter_changed_is_a_finding(monkeypatch, sha
     assert v.status == "diff", v
 
 
-@pytest.mark.parametrize("shape", LEAKED_ON)
-def test_a_batch_point_run_on_another_parameter_is_a_finding(monkeypatch, shape):
-    """One threaded point run on a parameter other than its own, as a clone
-    that shared its parent's state would be."""
+def _threaded_point_1_doubled(monkeypatch):
+    """Point 1 of a threaded batch run at twice its parameters."""
     real_batch, real_one = bngsim.Simulator.run_batch, bngsim.Simulator._run_single_batch
     threaded = []
 
@@ -762,7 +760,26 @@ def test_a_batch_point_run_on_another_parameter_is_a_finding(monkeypatch, shape)
 
     monkeypatch.setattr(bngsim.Simulator, "run_batch", batch)
     monkeypatch.setattr(bngsim.Simulator, "_run_single_batch", one)
+
+
+@pytest.mark.parametrize("shape", LEAKED_ON)
+def test_a_batch_point_run_on_another_parameter_is_a_finding(monkeypatch, shape):
+    """One threaded point run on a parameter other than its own, as a clone
+    that shared its parent's state would be."""
+    _threaded_point_1_doubled(monkeypatch)
     v = D.check_batch(_base(shape))
+    assert v.status == "diff" and "point 1" in v.note, v
+
+
+def test_a_skip_against_the_base_does_not_hide_a_threaded_points_diff(monkeypatch):
+    """Point 0 is judged against the base, and reads SKIP where the base moves
+    past UNJUDGEABLE_DRIFT at a tighter tolerance; a threaded point against
+    the same point run alone needs no base, and its DIFF is the row's."""
+    monkeypatch.setattr(D, "own_drift", lambda job, x: 2.0 * D.UNJUDGEABLE_DRIFT)
+    base = D.Base(SHAPES["equality-dwell"])
+    assert base.compare(base.x).status == "skip"
+    _threaded_point_1_doubled(monkeypatch)
+    v = D.check_batch(base)
     assert v.status == "diff" and "point 1" in v.note, v
 
 
