@@ -360,7 +360,7 @@ def test_an_initial_assignment_over_an_assignment_rule_target_is_not_lifted():
 
 
 @xfail_when_threshold_forced(
-    "#1217 (filed separately)",
+    "#1358",
     "after a compiled run get_param reads a rule-set parameter at its load value",
 )
 def test_a_write_after_a_run_does_not_move_it_to_the_rules_current_value():

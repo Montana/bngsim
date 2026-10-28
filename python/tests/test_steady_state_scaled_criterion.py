@@ -45,7 +45,7 @@ from _codegen_backend import xfail_when_threshold_forced  # noqa: E402
 # The compiled march, on its compiled Jacobian, refuses both of these models'
 # steady states (one at residual 2e-39) and never retries on difference quotients.
 _COMPILED_MARCH_REFUSES = xfail_when_threshold_forced(
-    "#1217 (filed separately)",
+    "#1357",
     "the compiled march refuses the state and is not retried on difference quotients",
 )
 
