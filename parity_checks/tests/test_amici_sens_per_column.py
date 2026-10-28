@@ -298,6 +298,8 @@ def test_a_floor_decisive_in_the_tensor_alone_is_decisive():
     assert res["columns_not_judged"] == [1]
     assert res["status"] == "pass"
     assert res["noise_decisive"] is True
+    # The judged column rescued nothing; the tensor's floor did, and says so.
+    assert res["n_noise_rescued"] == 0 and res["n_noise_rescued_whole"] > 0
     assert "whole tensor ok" in res["comment"] and "DECISIVE" in res["comment"]
 
 
@@ -310,6 +312,31 @@ def test_a_column_left_out_is_named_only_if_the_tensor_fails_it():
     bn = am.copy()
     bn[..., 0] = 0.0
     bn[3, 0, 1] += 1.5e-10
+    res = run._compare(
+        (T, X, bn, NAMES),
+        (T, X.copy(), am, NAMES),
+        param_values=[1.0, 1.0],
+        atol=ATOL,
+        param_ids=["k1", "k2"],
+    )
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == ["k1"]
+
+
+@pytest.mark.parametrize("side", ["bngsim", "amici"])
+def test_a_non_finite_cell_elsewhere_names_no_other_column(side):
+    """One side's NaN or inf in dx/dk1 (judged, DIFF), beside a dx/dk2 at 5x
+    its floor off past the floor on one cell, at 1e-12 of the tensor's peak:
+    only k1 is named. differ never forgives a one-sided non-finite cell, so
+    a k2 judged with k1 merely forgiven would be named too."""
+    am = _tensor(1.0)
+    am[..., 1] *= 5e-10 / np.abs(am[..., 1]).max()
+    bn = am.copy()
+    if side == "bngsim":
+        bn[4, 1, 0] = np.nan
+    else:
+        am[4, 1, 0] = np.inf
+    bn[0, 0, 1] += 1.5e-10
     res = run._compare(
         (T, X, bn, NAMES),
         (T, X.copy(), am, NAMES),

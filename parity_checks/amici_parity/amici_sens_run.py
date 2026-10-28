@@ -188,8 +188,10 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
         columns_diff = [names[j] for j, cv in verdicts.items() if not cv["passed"]]
         if not whole["passed"]:
             # The columns left out that the tensor's DIFF lies in: each one past
-            # its floor somewhere, judged at the tensor's scale with every other
-            # column forgiven. Under differ's present gates every DIFF the
+            # its floor somewhere that is still a DIFF with every other column
+            # of bngsim's set to AMICI's. Set, not forgiven: differ never
+            # forgives a one-sided NaN, so one in another column would name
+            # every column here. Under differ's present gates every DIFF the
             # tensor finds is in a column named here or above (a left-out
             # column's error past its floor is past 5% of its peak, so hard),
             # but the row requires the tensor's verdict itself, not that.
@@ -197,11 +199,13 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
             for j in range(n_p):
                 if j in verdicts or not past[..., j].any():
                     continue
-                others = np.ones(bn_used.shape, dtype=bool)
-                others[..., j] = False
-                alone = asens.sens_verdict(
-                    bn_used, am_used, param_values=param_values, atol=atol, forgive_mask=others
-                )
+                only_j = am_used.copy()
+                only_j[..., j] = bn_used[..., j]
+                # AMICI's inf, copied, is inf - inf = NaN on both sides: a match.
+                with np.errstate(invalid="ignore"):
+                    alone = asens.sens_verdict(
+                        only_j, am_used, param_values=param_values, atol=atol
+                    )
                 if not alone["passed"]:
                     columns_diff.append(names[j])
         passed = bool(verdicts) and whole["passed"] and not columns_diff
@@ -226,6 +230,9 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
             "n_noise_rescued",
         ):
             v[k] = sum(int(cv[k]) for cv in verdicts.values())
+        # The whole tensor's own, so a PASS the floor decided there alone
+        # (noise_decisive with n_noise_rescued 0) shows in the fields too.
+        v["n_noise_rescued_whole"] = int(whole["n_noise_rescued"])
 
     # Degeneracy witnesses (issue #328). A job can be reported PASS when the
     # WHOLE sensitivity tensor lies below the magnitude either solver can
@@ -305,6 +312,9 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
         # what made this row a PASS (decision).
         "n_below_noise_floor": int(v["n_below_noise_floor"]),
         "n_noise_rescued": int(v["n_noise_rescued"]),
+        # issue #1261 — with the columns judged alone, n_noise_rescued is
+        # theirs and this the whole tensor's; noise_decisive is either's.
+        "n_noise_rescued_whole": v.get("n_noise_rescued_whole"),
         "noise_decisive": bool(v["noise_decisive"]),
         # issue #328 — the two numbers a vacuous-pass census needs.
         "max_abs_sx": sx_peak,
@@ -1121,6 +1131,7 @@ def main() -> int:
                         # verdict it rescued, and whether it decided the row.
                         "n_below_noise_floor",
                         "n_noise_rescued",
+                        "n_noise_rescued_whole",
                         "noise_decisive",
                         # issue #328 — degeneracy witnesses, so a vacuous-pass
                         # census is a query over the report rather than a re-run.
