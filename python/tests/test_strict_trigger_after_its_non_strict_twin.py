@@ -41,6 +41,11 @@ TAUS = [3.0, 7.3, 14.0, 14.145775408033089, 5.1, 9.9, 123.456] + [
     10 ** _RNG.uniform(-2, 4) for _ in range(53)
 ]
 SEQUENCE = 0.3 * 0.5
+# No reaction moves X (J0's rate is 0), so X after the pair is the events' own
+# arithmetic, two IEEE multiplications: all 300 runs of the first test give
+# 0.15 to the bit (measured). 1e-12 leaves room for an evaluator that
+# reassociates them, and the batch's 0.5 is 2.3 away.
+EXACT = 1e-12
 
 
 def _pair(lhs_gt, lhs_ge, extra=""):
@@ -74,7 +79,9 @@ def test_the_pair_executes_in_sequence_whatever_the_rounding(lhs, scale):
     for tau in TAUS:
         t_cross = tau + 1 if scale is None else scale * tau
         got.append(_final(text, tau, t_cross)[0])
-    batched = [tau for tau, x in zip(TAUS, got, strict=True) if x != pytest.approx(SEQUENCE)]
+    batched = [
+        tau for tau, x in zip(TAUS, got, strict=True) if x != pytest.approx(SEQUENCE, rel=EXACT)
+    ]
     assert batched == []
 
 
@@ -93,7 +100,7 @@ def test_the_threshold_and_orientation_are_read_as_one_comparison(gt, ge, cross)
     where the trigger turns true."""
     text = _pair(gt, ge)
     for tau in TAUS:
-        assert _final(text, tau, cross(tau))[0] == pytest.approx(SEQUENCE), tau
+        assert _final(text, tau, cross(tau))[0] == pytest.approx(SEQUENCE, rel=EXACT), tau
 
 
 @pytest.mark.parametrize(
@@ -107,7 +114,7 @@ def test_priorities_do_not_reorder_the_two_sub_instants(extra, p_gt, p_ge):
         f"E2: at (time/3 >= tau){extra}, priority = {p_ge}: X = 0.5*X\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, 3 * tau)[0] == pytest.approx(SEQUENCE), tau
+        assert _final(text, tau, 3 * tau)[0] == pytest.approx(SEQUENCE, rel=EXACT), tau
 
 
 def test_the_held_event_reads_the_state_the_first_left():
@@ -119,7 +126,7 @@ def test_the_held_event_reads_the_state_the_first_left():
         "E2: at (time/3 >= tau), priority = 2: X = 0.5*X\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, 3 * tau)[1] == pytest.approx(0.5), tau
+        assert _final(text, tau, 3 * tau)[1] == pytest.approx(0.5, rel=EXACT), tau
 
 
 def test_priority_orders_the_events_within_each_sub_instant():
@@ -132,8 +139,10 @@ def test_priority_orders_the_events_within_each_sub_instant():
         "Eb: at (time/3 >= tau), priority = 2, fromTrigger=false: X = 10*X + 2\n"
         "Ea: at (time/3 >= tau), priority = 1, fromTrigger=false: X = 10*X + 1\n"
     )
+    # X = 10*X + d from 0: Eb gives 2, Ea 21, then Es 213. One batch by
+    # priority, 3, 2, 1, gave 321.
     for tau in TAUS:
-        assert _final(text, tau, 3 * tau)[0] == 213.0, tau
+        assert _final(text, tau, 3 * tau)[0] == pytest.approx(213.0, rel=EXACT), tau
 
 
 def test_two_strict_triggers_on_one_residual_stay_one_batch():
@@ -142,7 +151,24 @@ def test_two_strict_triggers_on_one_residual_stay_one_batch():
     frozen 0.5 is written last."""
     text = _pair("time/3 > tau", "time/3 > tau")
     for tau in TAUS:
-        assert _final(text, tau, 3 * tau)[0] == pytest.approx(0.5), tau
+        assert _final(text, tau, 3 * tau)[0] == pytest.approx(0.5, rel=EXACT), tau
+
+
+def test_two_strict_triggers_on_one_residual_keep_their_priority_beside_a_third():
+    """The two strict triggers, and Ec, which reads the same clock comparison
+    inside an `&&` and is not one comparison itself, rise at one read. Not held,
+    the three execute as one batch by priority: X = 10*X + d from 0 gives 3,
+    32, 321. Holding the two strict ones behind Ec gives 1, 13, 132. Alone, two
+    held strict triggers are released together and look like one batch, so only
+    a third event shows the order."""
+    text = (
+        "species X; X = 0; tau = 3\nJ0: -> X; 0\n"
+        "Es1: at (time/3 > tau), priority = 3, fromTrigger=false: X = 10*X + 3\n"
+        "Es2: at (time/3 > tau), priority = 2, fromTrigger=false: X = 10*X + 2\n"
+        "Ec: at ((time/3 > tau) && (tau > -1)), priority = 1, fromTrigger=false: X = 10*X + 1\n"
+    )
+    for tau in TAUS:
+        assert _final(text, tau, 3 * tau)[0] == pytest.approx(321.0, rel=EXACT), tau
 
 
 def test_a_state_trigger_pair_executes_in_sequence():
@@ -153,7 +179,7 @@ def test_a_state_trigger_pair_executes_in_sequence():
         "E2: at (A >= tau), priority = 2: X = 0.5*X\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, tau)[0] == pytest.approx(SEQUENCE), tau
+        assert _final(text, tau, tau)[0] == pytest.approx(SEQUENCE, rel=EXACT), tau
 
 
 def test_a_delayed_strict_event_freezes_its_values_after_the_non_strict_one():
@@ -165,7 +191,7 @@ def test_a_delayed_strict_event_freezes_its_values_after_the_non_strict_one():
         "E2: at (time/3 >= tau), priority = 2: X = 0.5*X\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, 3 * tau)[0] == pytest.approx(SEQUENCE), tau
+        assert _final(text, tau, 3 * tau)[0] == pytest.approx(SEQUENCE, rel=EXACT), tau
 
 
 def test_a_pair_true_at_the_start_is_one_batch():
@@ -177,8 +203,8 @@ def test_a_pair_true_at_the_start_is_one_batch():
         "E1: at (A > tau), t0=false, priority = 3: X = 0.3*X\n"
         "E2: at (A >= tau), t0=false, priority = 2: X = 0.5*X\n"
     )
-    assert _final(text, 3.0, 1.0)[0] == pytest.approx(0.5)
-    assert _final(text, 3.0, 1.0, method="ssa")[0] == pytest.approx(0.5)
+    assert _final(text, 3.0, 1.0)[0] == pytest.approx(0.5, rel=EXACT)
+    assert _final(text, 3.0, 1.0, method="ssa")[0] == pytest.approx(0.5, rel=EXACT)
 
 
 def test_a_pair_a_jump_turns_true_is_one_batch():
@@ -189,7 +215,7 @@ def test_a_pair_a_jump_turns_true_is_one_batch():
         "E1: at (f > 1), priority = 3: X = 0.3*X\n"
         "E2: at (f >= 1), priority = 2: X = 0.5*X\n"
     )
-    assert _final(text, 3.0, 5.0)[0] == pytest.approx(0.5)
+    assert _final(text, 3.0, 5.0)[0] == pytest.approx(0.5, rel=EXACT)
 
 
 def test_ssa_a_pair_a_firing_turns_true_is_one_batch():
@@ -203,8 +229,10 @@ def test_ssa_a_pair_a_firing_turns_true_is_one_batch():
     for seed in range(5):
         run = bngsim.Simulator(model, method="ssa").run(t_span=(0.0, 40.0), n_points=3, seed=seed)
         x, z = np.asarray(run.species)[-1]
+        # X(40) is Poisson(40): it stays below 3 with probability
+        # e^-40·(1 + 40 + 800) = 3.6e-15, so the crossing happened, for any seed.
         assert x >= 3
-        assert z == pytest.approx(0.5), seed
+        assert z == pytest.approx(0.5, rel=EXACT), seed
         model.reset()
 
 
@@ -217,7 +245,8 @@ def test_a_held_trigger_the_first_event_turns_false_never_fires():
         "E2: at (A >= tau), priority = 2: A = 0\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, tau)[0] == 0.0, tau
+        # Only E1 writes Y, so Y is exactly 0 unfired and 1 fired.
+        assert _final(text, tau, tau)[0] == pytest.approx(0.0, abs=EXACT), tau
 
 
 def test_a_sensitivity_run_refuses_a_held_pair_that_reads_the_first_write():
@@ -238,7 +267,10 @@ def test_a_sensitivity_run_refuses_a_held_pair_that_reads_the_first_write():
             assert re.search(r"'E1'.*'E2'.*issue #947", str(e)), str(e)
             refused += 1
         else:
-            assert x == pytest.approx(SEQUENCE), tau
+            assert x == pytest.approx(SEQUENCE, rel=EXACT), tau
+    # CVODE's located root lands past the crossing for most tau: 57 of the 60
+    # refuse on macOS arm64 (measured). A run that never refused would be
+    # returning the plain run's sequence with sensitivities it cannot compose.
     assert refused > 0
 
 
@@ -261,9 +293,22 @@ def test_a_sensitivity_run_keeps_a_pair_that_touches_nothing_of_the_other():
         names = list(run.species_names)
         x = dict(zip(names, np.asarray(run.species)[-1], strict=True))
         s = dict(zip(names, np.asarray(run.sensitivities)[-1, :, 0], strict=True))
-        assert (x["Y"], x["Z"]) == (1.0, 2.0), tau
-        assert s["A"] == pytest.approx(times[-1], rel=1e-6), tau
-        assert (s["Y"], s["Z"]) == (pytest.approx(0.0, abs=1e-9), pytest.approx(0.0, abs=1e-9))
+        assert (x["Y"], x["Z"]) == (
+            pytest.approx(1.0, rel=EXACT),
+            pytest.approx(2.0, rel=EXACT),
+        ), tau
+        # A = k·t is linear in t, which BDF integrates exactly, and the run is at
+        # rtol 1e-10: dA/dk is 6e-16 off T at worst (measured); 1e-8 is 100x the
+        # solver's tolerance.
+        assert s["A"] == pytest.approx(times[-1], rel=1e-8), tau
+        # Y and Z are written constants with Y' = Z' = 0 on both sides of the
+        # crossing, so the event-time jump adds nothing: 0 in every run
+        # (measured). A jump that moved them by dt*/dk = -tau/k would be off by
+        # tau, at least 0.01 here.
+        assert (s["Y"], s["Z"]) == (
+            pytest.approx(0.0, abs=EXACT),
+            pytest.approx(0.0, abs=EXACT),
+        ), tau
 
 
 @pytest.mark.parametrize("lhs, scale", [("0.1*time", 10.0), ("time/3", 3.0)])
@@ -274,4 +319,6 @@ def test_ssa_executes_the_pair_in_sequence(lhs, scale):
         f"E2: at ({lhs} >= tau), priority = 2: X = 0.5*X\n"
     )
     for tau in TAUS:
-        assert _final(text, tau, scale * tau, method="ssa")[0] == pytest.approx(15.0), tau
+        assert _final(text, tau, scale * tau, method="ssa")[0] == pytest.approx(15.0, rel=EXACT), (
+            tau
+        )
