@@ -1095,6 +1095,8 @@ def check_jacobian_values(base: Base) -> Verdict:
         return Verdict("pass", 0.0, f"every judged entry agrees at {len(states)} states")
 
     return _guard(go)
+
+
 def check_transform(base: Base, kind: str) -> Verdict:
     """The model file transformed (``_transforms.py``, #1305) and run again: the
     answer must transform with it. Every other check here starts from the one
@@ -1135,6 +1137,8 @@ def check_transform(base: Base, kind: str) -> Verdict:
         return base.compare(x, f"{kind} ({tr.note}): ")
 
     return _guard(go)
+
+
 # State-leak checks (issue #1307). Every other check runs a fresh model, by
 # design; callers reuse one, and "the solver leaves scratch state in the
 # user's Model, or drops state it should carry" is a family of its own (#786;
@@ -1359,6 +1363,8 @@ def check_batch(base: Base) -> Verdict:
         return _worst(out)
 
     return _guard(go)
+
+
 def contested(rows: dict[str, dict]) -> bool:
     """Whether a model's rows mark it contested: its ``stable`` row reads DIFF
     (the answer jumps under a jittered grid or tolerance), or a DIFF's third

@@ -1460,6 +1460,8 @@ def test_the_runner_reads_bng_nfs_archive_as_nf_jobs(tmp_path):
     )
     assert job.sim == {"block_same_complex_binding": True, "molecule_limit": 5000}
     assert job.path.read_text() == "<xml/>"
+
+
 # ── Generated models and the shrinker (#1306) ──
 
 import _generate as G  # noqa: E402
@@ -1628,6 +1630,8 @@ def test_a_worker_that_dies_is_dead_not_a_timeout(monkeypatch):
     monkeypatch.setattr(GEN, "_worker", print)
     (res,) = GEN.run([{"seed": 0, "format": "net"}], workers=1, timeout=60)
     assert res["status"] == "dead" and res["exitcode"] == 0, res
+
+
 # ── State leaks (#1307): a model mutated between runs reads DIFF ──
 
 # equality-dwell is a .net whose parameters all move it; event-at-a-sample an
@@ -1760,6 +1764,8 @@ def test_a_point_that_fails_only_on_threads_is_a_finding(monkeypatch):
     _failing_point(monkeypatch, only_threaded=True)
     v = D.check_batch(_base("equality-dwell"))
     assert v.status == "exception", v
+
+
 # ── Attribution and branch stability (#1309) ──
 
 
