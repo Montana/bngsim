@@ -40,10 +40,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _codegen_backend import xfail_when_threshold_forced  # noqa: E402
+from _codegen_backend import threshold_forced, xfail_when_threshold_forced  # noqa: E402
 
-# The compiled march, on its compiled Jacobian, refuses both of these models'
-# steady states (one at residual 2e-39) and never retries on difference quotients.
+# The compiled march, on its compiled Jacobian, refuses glioblastoma-egfrviii's
+# steady state at residual 2e-39: its run test is never retried on difference
+# quotients.
 _COMPILED_MARCH_REFUSES = xfail_when_threshold_forced(
     "#1357",
     "the compiled march refuses the state and is not retried on difference quotients",
@@ -1940,7 +1941,10 @@ def test_a_singular_jacobian_is_singular_on_every_platform(tmp_path, jacobian):
     assert list(ss.concentrations[1:]) == pytest.approx([0.75, 0.25], rel=1e-9)
 
 
-@_COMPILED_MARCH_REFUSES
+# Compiled, the march comes to the same root without its integrator failing
+# (residual 1.05e-15, within 1.6e-6 of the interpreter's state), so it is not
+# retried: this pins the arm64 interpreter's route there, not its answer.
+@threshold_forced
 def test_a_march_whose_integrator_fails_is_still_retried_on_difference_quotients(data_dir):
     # MODEL1712050008's march passes the residual test, goes on, and its
     # integrator fails; the step does not take the state it passed (202
