@@ -607,14 +607,12 @@ struct CvodeUserData {
     // by design. Built on first use from the model, which a run does not
     // restructure; see clamp_state_nonneg.
     std::vector<char> rhs_nonneg_mask;
-    // What that clamp weighs a negative component against (see
-    // clamp_state_nonneg): the run's tolerances, set with them, the largest each
-    // slot has been where the run reported it, and the solver it asks for the
-    // state a step started from. clamp_far marks the slots that state has far
-    // below 0 (clamp_far_any: any), clamp_start holds it.
+    // What that clamp weighs a negative component against where it reads a pole
+    // (see spare_at_pole): the run's atol per slot, set with the tolerances,
+    // and the solver it asks for the state a step started from. clamp_far marks
+    // the slots that state has far below 0 (clamp_far_any: any), clamp_start
+    // holds it.
     std::vector<double> clamp_atol;
-    double clamp_rtol = 0.0;
-    std::vector<double> clamp_scale;
     void *clamp_cvode_mem = nullptr;
     std::vector<char> clamp_far;
     std::vector<double> clamp_start;
@@ -760,53 +758,37 @@ static double codegen_tfun_eval_thunk(int tf_id, double x, void *ctx) {
 // captured state, where a depleted concentration a hair below 0 still needs the
 // clamp (Species::declared_negative).
 //
-// And only where the run itself is near 0. The clamp is the boundary value for a
-// state the solver's own error carried a little below 0, and that error is the
-// run's tolerance: atol near 0, plus rtol of what a species was where it fell
-// from. Over the rr corpus (1,323 models, default and jacobian="fd", rtol 1e-4
-// to 1e-10) the states it rescues sit 80 to 1.3e4 atols below 0, and a species
-// emptied by `-k·X^a` stops up to 8.2 rtols of its start below 0 (X0 = 1, a =
-// 0.05, rtol 1e-5, atol 1e-12: 8e7 atols). BIOMD0000000338's XIIa, tipped below
-// 0 by the dense LU's rounding at 2e-7, follows its own law down to the pole of
-// v·S·XIIa/(1 + XIIa) at -1. The RHS is non-finite there, and clamped it read 0
-// for XIIa and K, which held both at -1: the run returned XIIa = -1, K = -0.997
-// with no error. So a slot whose step started more than kClampNoiseAtols atols
-// plus kClampNoiseRtols rtols of its largest reported value below 0 is not read
-// at 0 (followed_below_zero says what follows). A predictor or Newton iterate
-// that overshoots further, from a step that started near 0, is clamped as
-// before: `S -> P; 50*S^2.5/(0.01^2.5 + S^2.5)` from S = 100 is predicted to S =
-// -9.7, 1e9 atols, on the straight line of its saturated phase, and its error
-// test rejects that step. 1e6 atols is 76 times the deepest rescue measured,
-// 1e3 rtols 120 times the deepest extinction; a run at a loose atol widens the
-// band with it (at 1e-6 it reaches 338's pole).
+// And not at a pole the run has carried a species to. The clamp is the boundary
+// value for a state the solver's own error put a little below 0, where a law
+// that reads it has no value: sqrt, a fractional power, a logarithm, which are
+// NaN there and whose value at 0 is their limit from above. A pole is no such
+// edge. BIOMD0000000338's XIIa and K activate each other through
+// v·S·E/(1 + E), so each has a pole at -1; the dense LU's rounding tips XIIa
+// below 0 at 2e-7, the laws carry it to the pole, and there the RHS is -inf.
+// Clamped, it read XIIa and K at 0, which held both at -1: the run returned
+// XIIa = -1, K = -0.997 with no error. So where the value read is infinite, a
+// slot the step started more than kClampNoiseAtols of its atol below 0 is not
+// read at 0 (spare_at_pole), and followed_below_zero says what follows. Over
+// the rr corpus the states the clamp rescues sit 80 to 1.3e4 atols below 0;
+// 338's pole is at 1e9. A NaN is clamped as before, at any depth: a species
+// emptied from X0 stops up to 8.2 rtols of X0 below 0 within its tolerance (8e7
+// atols at atol 1e-12), and an undershoot of a spike between two rows, or one a
+// run starts from, has no scale to be judged on. A run at a loose atol widens
+// the band with it (at 1e-6 it reaches 338's pole).
 constexpr double kClampNoiseAtols = 1e6;
-constexpr double kClampNoiseRtols = 1e3;
 
-// Record the run's tolerances for clamp_state_nonneg: rtol, and atol per slot,
-// the vector where the run has one (issue #196; with tracking, issue #213, its
-// ceiling, the widest the run allows), the scalar for every slot otherwise.
-// Starts the run's scale and refusal afresh.
-static void record_clamp_tolerances(CvodeUserData &data, void *cvode_mem, double rtol, double atol,
+// Record the run's atol per slot for spare_at_pole: the vector where the run has
+// one (issue #196; with tracking, issue #213, its ceiling, the widest the run
+// allows), the scalar for every slot otherwise. Starts the run's refusal afresh.
+static void record_clamp_tolerances(CvodeUserData &data, void *cvode_mem, double atol,
                                     const std::vector<double> &atol_v, int ns) {
     data.clamp_cvode_mem = cvode_mem;
-    data.clamp_rtol = rtol;
-    data.clamp_scale.assign(static_cast<std::size_t>(ns), 0.0);
     data.clamp_far_any = false;
     data.below_zero_refusal.clear();
     if (!atol_v.empty()) {
         data.clamp_atol = atol_v;
     } else {
         data.clamp_atol.assign(static_cast<std::size_t>(ns), atol);
-    }
-}
-
-// Folds a state the run reports (its rows, the initial one included) into the
-// scale: the largest value each slot has had there. Values below 0 are left out,
-// so an excursion does not widen its own band.
-static void note_clamp_scale(CvodeUserData &data, const double *y) {
-    for (std::size_t i = 0; i < data.clamp_scale.size(); ++i) {
-        if (y[i] > data.clamp_scale[i])
-            data.clamp_scale[i] = y[i];
     }
 }
 
@@ -873,15 +855,16 @@ static bool step_start_state(void *cvode_mem, N_Vector like, N_Vector out) {
     return ok;
 }
 
-// Mark the masked slots the current step started far below 0 (clamp_far,
-// clamp_start, clamp_far_any), for a state `y` with a masked slot below 0.
-// Nothing is marked where the run has no recorded tolerances or no step.
+// Mark the masked slots the current step started more than kClampNoiseAtols
+// atols below 0 (clamp_far, clamp_start, clamp_far_any), for a state `y` with a
+// masked slot below 0. Nothing is marked where the run has no recorded
+// tolerances or no step.
 static void mark_far_at_step_start(CvodeUserData *data, N_Vector y) {
     data->clamp_far_any = false;
     const int ns = data->model->n_species();
     const auto uns = static_cast<std::size_t>(ns);
     const std::vector<double> &atol = data->clamp_atol;
-    if (data->clamp_cvode_mem == nullptr || atol.size() != uns || data->clamp_scale.size() != uns)
+    if (data->clamp_cvode_mem == nullptr || atol.size() != uns)
         return;
     const std::vector<char> &mask = nonneg_clamp_mask(data);
     const double *y_ptr = N_VGetArrayPointer(y);
@@ -898,9 +881,7 @@ static void mark_far_at_step_start(CvodeUserData *data, N_Vector y) {
         data->clamp_far.assign(uns, 0);
         data->clamp_start.assign(y0, y0 + ns);
         for (std::size_t i = 0; i < uns; ++i) {
-            const double band = kClampNoiseAtols * atol[i] +
-                                kClampNoiseRtols * data->clamp_rtol * data->clamp_scale[i];
-            if (mask[i] && y0[i] < -band) {
+            if (mask[i] && y0[i] < -kClampNoiseAtols * atol[i]) {
                 data->clamp_far[i] = 1;
                 data->clamp_far_any = true;
             }
@@ -909,27 +890,40 @@ static void mark_far_at_step_start(CvodeUserData *data, N_Vector y) {
     N_VDestroy(start);
 }
 
-// The state `y` with its masked slots below 0 set to 0, but for those the step
-// started far below 0 where `spare_far` (marked here). Returns the (lazily
-// sized) scratch.
-static inline double *clamp_state_nonneg(CvodeUserData *data, N_Vector y, bool spare_far = true) {
+// The state `y` with its masked slots below 0 set to 0, but for those `spare`
+// marks. Returns the (lazily sized) scratch.
+static inline double *clamp_state_nonneg(CvodeUserData *data, N_Vector y,
+                                         const char *spare = nullptr) {
     const int ns = data->model->n_species();
     if (data->rhs_nonneg_scratch.size() != static_cast<std::size_t>(ns))
         data->rhs_nonneg_scratch.assign(ns, 0.0);
     double *s = data->rhs_nonneg_scratch.data();
     const double *y_ptr = N_VGetArrayPointer(y);
     const std::vector<char> &mask = nonneg_clamp_mask(data);
-    if (spare_far)
-        mark_far_at_step_start(data, y);
-    const char *far = spare_far && data->clamp_far_any ? data->clamp_far.data() : nullptr;
     for (int i = 0; i < ns; ++i)
-        s[i] = (y_ptr[i] > 0.0 || !mask[i] || (far != nullptr && far[i])) ? y_ptr[i] : 0.0;
+        s[i] = (y_ptr[i] > 0.0 || !mask[i] || (spare != nullptr && spare[i])) ? y_ptr[i] : 0.0;
     return s;
 }
 
-// Has the run itself gone far below 0 where a law has no value? The callbacks
-// ask where the right-hand side (or a closed-form Jacobian) stays non-finite
-// with the slots clamp_state_nonneg spared; `finite_at(state)` evaluates it at a
+// The slots the clamp leaves alone at `y`: where `values` (the right-hand side
+// or a closed-form Jacobian, `count` of them, as first evaluated there) has an
+// infinite entry, a pole, those the step started far below 0; none otherwise,
+// and none where it is only NaN.
+static const char *spare_at_pole(CvodeUserData *data, N_Vector y, const double *values,
+                                 std::size_t count) {
+    data->clamp_far_any = false;
+    for (std::size_t k = 0; k < count; ++k) {
+        if (std::isinf(values[k])) {
+            mark_far_at_step_start(data, y);
+            break;
+        }
+    }
+    return data->clamp_far_any ? data->clamp_far.data() : nullptr;
+}
+
+// Has the run itself carried a species to a pole? The callbacks ask where the
+// right-hand side (or a closed-form Jacobian) stays non-finite with the slots
+// spare_at_pole spared; `finite_at(state)` evaluates it at a
 // state and says whether it is finite (it may overwrite the callback's output,
 // which the caller then returns as a failure). True where it turns finite once
 // the spared slots are read at 0 too: that reading is what held BIOMD0000000338
@@ -947,7 +941,7 @@ static bool followed_below_zero(CvodeUserData *data, N_Vector y, double t, const
                                 FiniteAt &&finite_at) {
     const int ns = data->model->n_species();
     const auto uns = static_cast<std::size_t>(ns);
-    if (!data->clamp_far_any || !finite_at(clamp_state_nonneg(data, y, false)))
+    if (!data->clamp_far_any || !finite_at(clamp_state_nonneg(data, y)))
         return false;
     if (!data->below_zero_refusal.empty())
         return true;
@@ -959,7 +953,7 @@ static bool followed_below_zero(CvodeUserData *data, N_Vector y, double t, const
             continue;
         const double depth = -data->clamp_start[i] / data->clamp_atol[i];
         spared.emplace_back(depth, static_cast<int>(i));
-        double *x = clamp_state_nonneg(data, y, false);
+        double *x = clamp_state_nonneg(data, y);
         x[i] = N_VGetArrayPointer(y)[i];
         if (!finite_at(x))
             named_slots.emplace_back(depth, static_cast<int>(i));
@@ -1616,7 +1610,12 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
         // e.g. -k·conc self-corrects back toward 0 — is byte-identical and keeps
         // that restoring behavior; clamping unconditionally would freeze such a
         // species at a small negative value and make the solve chatter.
-        data->model->compute_derivs(static_cast<double>(t), clamp_state_nonneg(data, y), ydot_ptr);
+        data->model->compute_derivs(
+            static_cast<double>(t),
+            clamp_state_nonneg(data, y,
+                               spare_at_pole(data, y, ydot_ptr,
+                                             static_cast<std::size_t>(data->model->n_species()))),
+            ydot_ptr);
         if (rhs_has_nonfinite(data, ydot_ptr)) {
             // Nothing left to clamp: keep the state as evidence in case the run
             // does not survive this (GH #336), then hand CVODE the recoverable
@@ -1731,7 +1730,9 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
         // Conditional nonnegative-clamp retry, identical rationale to cvode_rhs:
         // byte-identical wherever the RHS is finite, engages only on a genuine
         // non-finite (e.g. pow(conc, 3.98) at a transiently-negative conc).
-        rc = data->codegen_fn(static_cast<double>(t), clamp_state_nonneg(data, y), ydot_ptr,
+        const char *spare =
+            spare_at_pole(data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        rc = data->codegen_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), ydot_ptr,
                               &data->codegen_so_data);
         if (rc != 0)
             return rc;
@@ -1962,8 +1963,9 @@ static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /
     // transiently-negative concentration. Byte-identical otherwise.
     const std::size_t n = static_cast<std::size_t>(model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
-        model->fill_dense_analytical_jacobian(static_cast<double>(t), clamp_state_nonneg(data, y),
-                                              jac);
+        const char *spare = spare_at_pole(data, y, jac, n * n);
+        model->fill_dense_analytical_jacobian(static_cast<double>(t),
+                                              clamp_state_nonneg(data, y, spare), jac);
         if (jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
@@ -2017,7 +2019,8 @@ static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy
     // memsets the matrix first, so the re-fill on the clamped state overwrites it.
     const std::size_t n = static_cast<std::size_t>(data->model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
-        rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y), jac,
+        const char *spare = spare_at_pole(data, y, jac, n * n);
+        rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), jac,
                                   &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
@@ -2193,8 +2196,9 @@ static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/,
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the sparse fill
     // memsets the nnz value array first, so the re-fill cleanly overwrites it.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
-        model->fill_sparse_analytical_jacobian(static_cast<double>(t), clamp_state_nonneg(data, y),
-                                               jac_data);
+        const char *spare = spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz));
+        model->fill_sparse_analytical_jacobian(static_cast<double>(t),
+                                               clamp_state_nonneg(data, y, spare), jac_data);
         if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), conc,
                                             model->n_species()); // GH #336
@@ -2252,7 +2256,8 @@ static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*f
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the compiled
     // sparse mirror memsets the nnz value array first.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
-        rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y),
+        const char *spare = spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz));
+        rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare),
                                          jac_data, &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
@@ -4332,7 +4337,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         w.user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
         apply_cvode_tolerances(w.cvode_mem, w.ctx, rtol, atol, atol_v, ns,
                                w.user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
-        record_clamp_tolerances(w.user_data, w.cvode_mem, rtol, atol, atol_v, ns);
+        record_clamp_tolerances(w.user_data, w.cvode_mem, atol, atol_v, ns);
         CVodeSetUserData(w.cvode_mem, &w.user_data);
         CVodeSetMaxNumSteps(w.cvode_mem, max_steps);
         if (opts.max_step_size > 0) {
@@ -4417,7 +4422,6 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
     // equivalent. So too a below-zero refusal.
     w.user_data.nonfinite_witness = NonFiniteWitness{};
     w.user_data.below_zero_refusal.clear();
-    w.user_data.clamp_scale.assign(static_cast<std::size_t>(ns), 0.0);
 
     // ─── Integration loop (no events, no sensitivities) ──────────────────────
     void *cvode_mem = w.cvode_mem;
@@ -4482,7 +4486,6 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
     {
         const double *fvals0 = fill_row(times.t_start);
         result.record(0, times.t_start, y_data, obs_buf.data());
-        note_clamp_scale(w.user_data, y_data);
         if (n_func > 0) {
             result.record_expressions(0, fvals0);
         }
@@ -4535,7 +4538,6 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         }
 
         result.record(i, static_cast<double>(t_ret), y_data, obs_buf.data());
-        note_clamp_scale(w.user_data, y_data);
         if (n_func > 0) {
             result.record_expressions(i, fvals);
         }
@@ -4727,7 +4729,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
     apply_cvode_tolerances(cvode_mem, ctx, rtol, atol, atol_v, ns,
                            user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
-    record_clamp_tolerances(user_data, cvode_mem, rtol, atol, atol_v, ns);
+    record_clamp_tolerances(user_data, cvode_mem, atol, atol_v, ns);
 
     flag = CVodeSetUserData(cvode_mem, &user_data);
     flag = CVodeSetMaxNumSteps(cvode_mem, max_steps);
@@ -6432,11 +6434,19 @@ bool CvodeSimulator::Impl::stop_would_lose(void *cvode_mem, double t, N_Vector y
     // reads a stop this took cost a model of 3,000 reactions 46% of its run.
     NVectorGuard before(N_VClone(y));
     NVectorGuard after(N_VClone(y));
-    if (!before || !after ||
+    // Reads CVODE did not ask for: a below-zero refusal one of them records is
+    // no part of the run's failure (see followed_below_zero).
+    auto *data = static_cast<CvodeUserData *>(user_data);
+    const bool had_refusal = !data->below_zero_refusal.empty();
+    const bool read =
+        before && after &&
         run_rhs_fn(
             static_cast<sunrealtype>(std::nextafter(t, -std::numeric_limits<double>::infinity())),
-            y, static_cast<N_Vector>(before), user_data) != 0 ||
-        run_rhs_fn(static_cast<sunrealtype>(t), y, static_cast<N_Vector>(after), user_data) != 0) {
+            y, static_cast<N_Vector>(before), user_data) == 0 &&
+        run_rhs_fn(static_cast<sunrealtype>(t), y, static_cast<N_Vector>(after), user_data) == 0;
+    if (!had_refusal)
+        data->below_zero_refusal.clear();
+    if (!read) {
         return false;
     }
     const double *y_data = N_VGetArrayPointer(y);
@@ -15852,7 +15862,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         obs_buf[j] = model.observables()[j].total;
     }
     result.record(0, times.t_start, y_data, obs_buf.data());
-    note_clamp_scale(user_data, y_data);
 
     // Record function values at t=0
     if (n_func > 0) {
@@ -18336,7 +18345,6 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // columns keeps the time it stands at: its columns are read there,
         // and may hold a switch's jump the time asked for is still before.)
         result.record(i, t_row, y_data, obs_buf.data());
-        note_clamp_scale(user_data, y_data);
 
         // Record function values
         if (n_func > 0) {

@@ -40,11 +40,6 @@ Reproducing CVODE's exact predictor overshoot in a minimal model is unreliable
 non-integer-power rate law reads it. Before the relevant half of the fix this
 raised CV_CONV_FAILURE at the event time; after it, the conditional clamp keeps the
 RHS (and Jacobian) finite and the solve runs to completion.
-
-The clamp is for a state near 0: within 1e6 of the run's atol (the corpus's
-rescues sit at 80 to 1.3e4). The event forces X to -1e-5, 1e5 atols below 0. It
-forced -1e-3 until the clamp was bounded, 1e7 atols, which is now refused by name
-(test_clamp_far_below_zero.py says why).
 """
 
 from __future__ import annotations
@@ -54,7 +49,7 @@ import numpy as np
 import pytest
 
 # X decays slowly (a finite, well-behaved mass-action law); Y is produced at rate
-# Vmax * X^3.98 — NaN for X < 0. An event at t=0.5 forces X = -1e-5, so the very
+# Vmax * X^3.98 — NaN for X < 0. An event at t=0.5 forces X = -1e-3, so the very
 # next RHS evaluation reads a negative base.
 _SBML_FRAC_POW_EVENT = """<?xml version="1.0" encoding="UTF-8"?>
 <sbml xmlns="http://www.sbml.org/sbml/level3/version1/core" level="3" version="1"><model id="frac_pow_neg">
@@ -72,7 +67,7 @@ _SBML_FRAC_POW_EVENT = """<?xml version="1.0" encoding="UTF-8"?>
 <listOfEvents>
 <event id="force_neg" useValuesFromTriggerTime="true">
 <trigger initialValue="false" persistent="true"><math xmlns="http://www.w3.org/1998/Math/MathML"><apply><geq/><csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol><cn>0.5</cn></apply></math></trigger>
-<listOfEventAssignments><eventAssignment variable="X"><math xmlns="http://www.w3.org/1998/Math/MathML"><apply><minus/><cn>1e-05</cn></apply></math></eventAssignment></listOfEventAssignments>
+<listOfEventAssignments><eventAssignment variable="X"><math xmlns="http://www.w3.org/1998/Math/MathML"><apply><minus/><cn>0.001</cn></apply></math></eventAssignment></listOfEventAssignments>
 </event></listOfEvents>
 </model></sbml>"""
 
@@ -144,19 +139,3 @@ def test_clamp_is_noop_on_a_valid_trajectory(monkeypatch: pytest.MonkeyPatch, an
     # X = exp(-kx t); Y = ∫ Vmax X^h dt — both smooth and well above noise.
     iX = list(r.species_names).index("X")
     assert sp[10, iX] == pytest.approx(np.exp(-0.1 * r.time[10]), rel=1e-5)
-
-
-@pytest.mark.parametrize("analytical", ["1", "0"], ids=["analytical_jac", "fd_jac"])
-def test_a_state_forced_far_below_zero_is_refused_not_clamped(
-    monkeypatch: pytest.MonkeyPatch, analytical: str
-):
-    """The same law at X = -1e-3, 1e7 atols below 0: no rounding of 0 is that far
-    below it, and X^3.98 has no value there. Clamped, the run returned Y frozen
-    from the event on; it is refused, naming X."""
-    monkeypatch.setenv("BNGSIM_ANALYTICAL_FUNCTIONAL_JAC", analytical)
-    far = _SBML_FRAC_POW_EVENT.replace("<cn>1e-05</cn>", "<cn>0.001</cn>")
-    m = bngsim.Model.from_sbml_string(far)
-    with pytest.raises(bngsim.SimulationError, match="carried concentration 'X'"):
-        bngsim.Simulator(m, method="ode").run(
-            t_span=(0.0, 2.0), n_points=40, rtol=1e-8, atol=1e-10
-        )
