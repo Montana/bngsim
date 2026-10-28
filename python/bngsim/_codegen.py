@@ -7265,11 +7265,11 @@ def _topological_function_order(
         # The names the translator reads (a dotted `k.f` is one), and the tables
         # read as `tfun_<table>` by any spelling of the call (issue #1212). A
         # dotted name the model does not have is read by its parts, as before.
-        names: list[str] = []
+        read: list[str] = []
         for tok in _NAME_RE.findall(f["expression"]):
             known = tok in name_to_idx or tok.removeprefix("tfun_") in owner_by_table
-            names.extend([tok] if known or "." not in tok else tok.split("."))
-        for name in names:
+            read.extend([tok] if known or "." not in tok else tok.split("."))
+        for name in read:
             j = name_to_idx.get(name)
             if j is not None and j != i:
                 deps.add(j)

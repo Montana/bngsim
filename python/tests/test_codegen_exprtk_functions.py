@@ -57,7 +57,10 @@ INF = float("inf")
 # negative and a positive side, the edges of a range, a half-way value, the
 # region a guard tests for, and a NaN where the comparisons decide the answer.
 FUNCTIONS: dict[str, tuple[str, tuple[tuple[float, ...], ...]]] = {
-    "frac": ("frac(A)", ((2.75,), (-2.75,), (0.0,), (-0.0,), (5.0,), (1e300,), (NAN,))),
+    # Not past 2**63: built by MSVC, which reports __cplusplus as 199711L,
+    # ExprTk's trunc is its pre-C++11 (long long)v, undefined out there.
+    "frac": ("frac(A)", ((2.75,), (-2.75,), (0.0,), (-0.0,), (5.0,), (4503599627370495.5,),
+                         (-4503599627370495.5,), (NAN,))),
     "inrange": (
         "inrange(A, B, C)",
         ((0.0, 0.5, 1.0), (0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (0.0, -0.1, 1.0), (0.0, 1.1, 1.0),
@@ -350,12 +353,12 @@ def test_codegen_true_runs_it_and_matches_the_interpreter(tmp_path, name):
 
 
 @needs_mir
-@pytest.mark.parametrize("name", list(_LAWS))
-def test_the_mir_jit_runs_it_and_matches_the_interpreter(tmp_path, name):
+def test_the_mir_jit_runs_each_and_matches_the_interpreter(tmp_path):
     """Under MIR they were refused by name, so automatic codegen fell over where
-    cc fell back."""
-    out = _runs(tmp_path, _LAWS[name], "mir")
-    np.testing.assert_allclose(out["True"], out["False"], rtol=1e-9, atol=1e-12)
+    cc fell back. One test over every law, so a build without MIR skips once."""
+    for name, law in _LAWS.items():
+        out = _runs(tmp_path, law, "mir")
+        np.testing.assert_allclose(out["True"], out["False"], rtol=1e-9, atol=1e-12, err_msg=name)
 
 
 # ── Implicit products and names with a dot ───────────────────────────────────
