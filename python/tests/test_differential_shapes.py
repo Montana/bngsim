@@ -347,6 +347,24 @@ def test_a_differenced_jacobian_is_not_judged():
     assert D.jacobian_misfits(_JacModel(source="finite-difference"), y) is None
 
 
+def test_a_model_whose_difference_quotient_jacobian_refuses_is_skipped(monkeypatch):
+    """Model.jacobian() refuses a difference quotient whose step decides an
+    entry (#1002), where it returned one: a model without the closed form is
+    SKIP, as the baseline holds it, not an EXCEPTION. BIOMD0000000053 and six
+    more BioModels read EXCEPTION once main refused."""
+    base = _base("derived-log10")
+
+    def refuses(self, y, t=0.0, **kw):
+        raise bngsim.SimulationError(
+            "Model.jacobian() does not return this difference quotient (issue #1002)"
+        )
+
+    monkeypatch.setattr(bngsim.Model, "prepare_analytical_jacobian", lambda self: False)
+    monkeypatch.setattr(bngsim.Model, "jacobian", refuses)
+    v = D.check_jacobian_values(base)
+    assert v.status == "skip" and "no analytic Jacobian" in v.note, v
+
+
 def test_rounding_in_a_large_rhs_is_not_a_finding():
     """blbr's false alarm: f is 1e11, so a difference over a small step rounds by
     eps·|f|/h. At a step of 1e-6 its differences agreed on 2.0345 at two steps

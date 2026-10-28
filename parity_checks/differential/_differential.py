@@ -715,6 +715,12 @@ def jacobian_misfits(model, states, t=0.0, steps=JAC_STEPS) -> list[dict] | None
     kink, is not judged (see the constants above). A non-finite analytic entry
     is off wherever some step resolves the entry.
     """
+    # Asked before Model.jacobian(), which refuses a difference quotient whose
+    # step decides an entry (#1002) where it returned one: a model without the
+    # closed form has nothing of it to judge, whichever it would do.
+    prepare = getattr(model, "prepare_analytical_jacobian", None)
+    if prepare is not None and not prepare():
+        return None
     out: dict[tuple[int, int], dict] = {}
     for y in states:
         y = np.asarray(y, dtype=float)
