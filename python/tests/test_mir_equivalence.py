@@ -192,4 +192,8 @@ def test_a_live_mir_model_holds_far_less_than_upstreams_reservation():
     )
     assert done.returncode == 0, done.stderr[-2000:]
     per_model_mb = float(done.stdout.strip().splitlines()[-1])
+    # Measured on macOS arm64: 32.1 MB a model at the default 32, 128.1 at
+    # upstream's 128 and 0.1 at 0, so a model's other mappings come to about
+    # 0.1 MB. 40 leaves 8 MB of that for an allocator that maps more, and
+    # upstream's 128 still fails it by a factor of three.
     assert per_model_mb <= 40.0, per_model_mb
