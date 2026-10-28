@@ -14,7 +14,9 @@ per-species ``volume_factor``/``amount_valued``, no events). Constructs that
 cannot be represented faithfully are surfaced via :func:`capability_report` and
 raise :class:`bngsim.ConversionError` (or warn under ``strict=False``); ``<event>``
 elements are dropped with a :class:`bngsim.ConversionWarning` because they belong
-to the simulation-protocol channel (a SED-ML sidecar), not the network.
+to the simulation-protocol channel (a SED-ML sidecar), not the network. A species
+an assignment rule sets is written so that bngsim reads it back exactly and
+BioNetGen's ``run_network`` does not: that is warned, never refused (issue #1274).
 """
 
 from __future__ import annotations
@@ -123,9 +125,12 @@ def _psvs_needs_per_species_divide(rxn: dict[str, Any], species: list[dict[str, 
 def capability_report(model: Model) -> dict[str, list[str]]:
     """Inspect a model for constructs the plain ``.net`` text format cannot carry.
 
-    Returns ``{"dropped": [...], "lossy": [...]}`` of plain-English notes.
-    ``dropped`` is non-fatal (the network is still emitted); ``lossy`` is fatal
-    under ``strict=True``. Pure; performs no I/O and emits no warnings.
+    Returns ``{"dropped": [...], "lossy": [...], "bngsim_only": [...]}`` of
+    plain-English notes. ``dropped`` is non-fatal (the network is still emitted);
+    ``lossy`` is fatal under ``strict=True``; ``bngsim_only`` is what bngsim's own
+    reader reproduces and BioNetGen's ``run_network`` does not, which is warned and
+    never fatal (the file is exact for bngsim). Pure; performs no I/O and emits no
+    warnings.
     """
     core = model._core
     data = core.codegen_data()
@@ -223,15 +228,42 @@ def capability_report(model: Model) -> dict[str, list[str]]:
             "parameters block or runs the function as its first word"
         )
 
-    return {"dropped": dropped, "lossy": lossy}
+    # A species an assignment rule sets is written `$`-fixed, beside the
+    # observable or function that holds its rule under the species' own name.
+    # bngsim's reader takes the pair as the rule (_ar_report_map_from_net, #515);
+    # run_network holds the species at its initial value for the whole run, so
+    # every rate law that reads it is wrong there too (#1274: BIOMD0000000144's
+    # $Wee1Pc ends at 0.8001 in run_network, 0.7803 in bngsim). The reader's own
+    # rule, read off the model being written, names exactly those species.
+    from bngsim._model import _ar_report_map_from_net
+
+    bngsim_only: list[str] = []
+    rule_species = sorted(_ar_report_map_from_net(core))
+    if rule_species:
+        bngsim_only.append(
+            f"{len(rule_species)} species set by an assignment rule (e.g. "
+            f"{_eg(rule_species)}) are written $-fixed beside the observable or function "
+            "of the same name: bngsim reads the pair as the rule, but BioNetGen's "
+            "run_network holds each at its initial value for the whole run, and so "
+            "runs every rate law that reads one wrong"
+        )
+
+    return {"dropped": dropped, "lossy": lossy, "bngsim_only": bngsim_only}
 
 
 def _apply_capability_policy(
     report: dict[str, list[str]], *, strict: bool, model_name: str
 ) -> None:
-    """Warn on dropped constructs; raise (strict) or warn (lenient) on lossy ones."""
+    """Warn on dropped constructs; raise (strict) or warn (lenient) on lossy ones;
+    warn, whatever ``strict`` is, on what only bngsim's reader reproduces."""
     for note in report["dropped"]:
         warnings.warn(f"{model_name}: dropping {note}", ConversionWarning, stacklevel=3)
+    for note in report.get("bngsim_only", []):
+        warnings.warn(
+            f"{model_name}: a network only bngsim reads as written — {note}",
+            ConversionWarning,
+            stacklevel=3,
+        )
     if report["lossy"]:
         joined = "; ".join(report["lossy"])
         if strict:
