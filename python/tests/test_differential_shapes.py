@@ -1448,3 +1448,171 @@ def test_the_runner_reads_bng_nfs_archive_as_nf_jobs(tmp_path):
     )
     assert job.sim == {"block_same_complex_binding": True, "molecule_limit": 5000}
     assert job.path.read_text() == "<xml/>"
+# ── Generated models and the shrinker (#1306) ──
+
+import _generate as G  # noqa: E402
+import differential_generate as GEN  # noqa: E402
+
+
+def test_a_seed_is_its_model():
+    """A finding is reproduced from its seed alone."""
+    for fmt in G.FORMATS:
+        a, b = G.generate(7, fmt), G.generate(7, fmt)
+        assert (
+            G.render_net(a) == G.render_net(b)
+            if fmt == "net"
+            else G.render_sbml(a) == G.render_sbml(b)
+        )
+    assert G.render_net(G.generate(7, "net")) != G.render_net(G.generate(8, "net"))
+
+
+# Every (format, entry) that has a spelling: a .net-only entry (rint, erf...) is
+# not drawn for SBML, so there is nothing of it to read there.
+_SPELLED = [
+    (fmt, op)
+    for fmt in G.FORMATS
+    for op in sorted(G.GRAMMAR)
+    if G.GRAMMAR[op][1 if fmt == "net" else 2] is not None
+]
+
+
+@pytest.mark.parametrize(("fmt", "op"), _SPELLED)
+def test_every_grammar_entry_is_one_bngsim_reads(fmt, op):
+    """Each spelling, alone in a law, loads and integrates to a finite answer:
+    a generator that writes what bngsim refuses finds nothing but refusals. Its
+    first argument is negative (0 - S1), which is what each guard is for: an
+    unguarded log or square root of it is NaN."""
+    negative = G.Node("sub", [G.Node("num", value=0.0), G.Node("obs", value=0)])
+    leaves = [negative, G.Node("par", value=0), G.Node("num", value=1.5), G.Node("obs", value=1)]
+    law = G.Node(op, leaves[: G.GRAMMAR[op][0]])
+    model = G.Model(fmt, [2.0, 1.0], [0.7, 0.4], [G.Reaction([0], [1], law)])
+    # Named by position, not by op: "if<" is no file name on Windows.
+    path = G.write(model, _DIR / f"grammar_{fmt}_{_SPELLED.index((fmt, op))}")
+    load = bngsim.Model.from_net if fmt == "net" else bngsim.Model.from_sbml
+    r = bngsim.Simulator(load(str(path)), method="ode").run(t_span=(0, 5), n_points=6)
+    assert np.isfinite(np.asarray(r.species)).all()
+
+
+@pytest.mark.parametrize("fmt", G.FORMATS)
+def test_generated_models_load_and_stay_finite(fmt):
+    """The guards hold: a law is finite on the window, so a finding is a
+    disagreement and not a domain error."""
+    load = bngsim.Model.from_net if fmt == "net" else bngsim.Model.from_sbml
+    for seed in range(12):
+        path = G.write(G.generate(seed, fmt), _DIR / f"generated_{fmt}_{seed}")
+        r = bngsim.Simulator(load(str(path)), method="ode").run(t_span=(0, 10), n_points=11)
+        assert np.isfinite(np.asarray(r.species)).all(), (fmt, seed)
+
+
+def _ops(model):
+    return [n.op for rx in model.reactions for _, n in G._nodes(rx.law)]
+
+
+def test_the_shrinker_cuts_down_to_what_still_finds():
+    """A predicate that holds of any model with a floor() in it: the shrinker
+    keeps one, and drops every reaction and node it can."""
+    seed = next(s for s in range(200) if "floor" in _ops(G.generate(s, "net")))
+    model = G.generate(seed, "net")
+
+    def holds(m):
+        return "floor" in _ops(m)
+
+    small = G.shrink(model, holds)
+    assert holds(small)
+    assert len(small.reactions) == 1
+    assert G.size(small) <= 3 < G.size(model), (G.size(small), G.size(model))
+
+
+def test_the_shrinker_replaces_a_named_leaf_by_a_number():
+    """A leaf that names a species, a parameter or the clock, replaced by a
+    number, is no fewer nodes, and the shrinker refused every such cut: a
+    reproducer kept its observables and its time() for nothing."""
+    law = G.Node("floor", [G.Node("obs", value=0)])
+    model = G.Model("net", [2.0, 1.0], [0.7, 0.4], [G.Reaction([0], [1], law)])
+    small = G.shrink(model, lambda m: "floor" in _ops(m))
+    assert _ops(small) == ["floor", "num"], _ops(small)
+
+
+def _spec(tmp_path, seed, checks=("cc_vs_interp",)):
+    return {
+        "seed": seed,
+        "format": "net",
+        "checks": list(checks),
+        "depth": 3,
+        "t_end": 10.0,
+        "n_points": 11,
+        "rtol": 1e-8,
+        "atol": 1e-10,
+        "max_steps": GEN.DEFAULT_MAX_STEPS,
+        "shrink_budget": GEN.DEFAULT_SHRINK_BUDGET,
+        "repro_dir": str(tmp_path),
+    }
+
+
+def test_a_planted_defect_is_found_and_shrunk_to_a_reproducer(tmp_path, monkeypatch):
+    """The runner end to end: cc_vs_interp made to read DIFF on any model whose
+    text has a rint() in it, as #1212's spelling bug read DIFF on one with an
+    implicit product. The seed's finding is shrunk to a model that still has
+    the rint() and little else, written out where the report says."""
+    seed = next(s for s in range(200) if "rint" in _ops(G.generate(s, "net")))
+
+    def planted(base):
+        if "rint(" in Path(base.job.path).read_text():
+            return D.Verdict("diff", 1.0, "planted: rint() spelled differently")
+        return D.Verdict("pass", 0.0, "")
+
+    monkeypatch.setattr(D, "check_cc_vs_interp", planted)
+    res = GEN.investigate(_spec(tmp_path, seed))
+    assert res["status"] == "done", res
+    (finding,) = res["findings"]
+    assert finding["check"] == "cc_vs_interp" and finding["status"] == "diff"
+    text = Path(finding["reproducer"]).read_text()
+    assert "rint(" in text
+    assert finding["shrunk_size"] < finding["size"]
+    assert text.count("f1()") == 1 and "f2()" not in text  # one reaction left
+
+
+def test_no_finding_is_reported_where_every_check_passes(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "check_cc_vs_interp", lambda base: D.Verdict("pass", 0.0, ""))
+    res = GEN.investigate(_spec(tmp_path, 3))
+    assert res["status"] == "done" and res["findings"] == [], res
+
+
+def _plant_rint(monkeypatch):
+    """cc_vs_interp reads DIFF on any model whose text has a rint() in it."""
+
+    def planted(base):
+        if "rint(" in Path(base.job.path).read_text():
+            return D.Verdict("diff", 1.0, "planted: rint() spelled differently")
+        return D.Verdict("pass", 0.0, "")
+
+    monkeypatch.setattr(D, "check_cc_vs_interp", planted)
+
+
+def test_a_finding_is_written_before_it_is_shrunk(tmp_path, monkeypatch):
+    """The seed's cap covers the shrink, up to its budget of check runs: a
+    seed killed mid-shrink left no reproducer at all. The model as found is
+    written first, its note saying it is not shrunk."""
+    import json
+
+    seed = next(s for s in range(200) if "rint" in _ops(G.generate(s, "net")))
+    _plant_rint(monkeypatch)
+
+    def killed(*a, **kw):
+        raise RuntimeError("killed mid-shrink (planted)")
+
+    monkeypatch.setattr(G, "shrink", killed)
+    res = GEN.investigate(_spec(tmp_path, seed))
+    assert res["status"] == "error", res
+    note = json.loads((tmp_path / f"net_{seed}_cc_vs_interp.json").read_text())
+    assert note["shrunk_size"] is None and note["check"] == "cc_vs_interp", note
+    assert "rint(" in Path(note["reproducer"]).read_text()
+
+
+def test_a_worker_that_dies_is_dead_not_a_timeout(monkeypatch):
+    """A worker gone without a result (a segfault in bngsim looks so) is a
+    crash, the finding a generator is for; it read as a timeout, at once."""
+    # print takes (spec, q), puts nothing on the queue, and returns: exit 0.
+    monkeypatch.setattr(GEN, "_worker", print)
+    (res,) = GEN.run([{"seed": 0, "format": "net"}], workers=1, timeout=60)
+    assert res["status"] == "dead" and res["exitcode"] == 0, res
