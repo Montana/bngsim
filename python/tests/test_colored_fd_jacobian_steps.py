@@ -11,11 +11,17 @@ route, takes ``max(sqrt(eps)*|y_j|, min_inc/ewt_j)``: the error weights' scale.
 The colored one now does too.
 
 * #1254's equality, ``if(Bobs==0, kb, 0)``: Y(10) = 2 ln 5 exactly. KLU with
-  the FD Jacobian gave 3.215642 at rtol 1e-8 and 3.203796 at 1e-10 (the error
-  grew as the tolerance tightened), where dense with the same Jacobian was
-  within 6e-6. It is now as close as dense is.
+  the FD Jacobian was 7.7e-5 to 1.5e-2 off it, 145 to 598 times dense's error
+  with the same Jacobian. It now takes dense's steps and reads dense's value.
 * A dimerization chain at nanomolar scale: right on KLU either way, but the
   wrong Jacobian cost 781 steps and 100 Jacobians, where dense took 299 and 40.
+* The compiled right-hand side: at 256+ species CVODE's f(y) comes from codegen,
+  while the columns are the interpreted RHS. Over a step of min_inc/ewt_j their
+  last bits read as slope, and fceri_ji's run moved 1.6e-10 of its peak off the
+  interpreted one; the quotient's base is now the interpreted f(y) as well.
+* The steady-state march's colored quotient took the same absolute step: a
+  nanomolar reversible chain marched 3574 steps on KLU without converging, where
+  dense converged in 197. It now steps on the march's error weights too.
 
 Found by #1257's ``klu_vs_dense`` check, which also had four BioModels fail or
 read 3% off on this route (BIOMD0000000827, MODEL1006230034, MODEL2002030001,
@@ -25,6 +31,7 @@ MODEL1912090001); those now agree with dense to 2e-4 or better.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import bngsim
 import numpy as np
@@ -78,14 +85,15 @@ def _y10(path, rtol, n_points, **kw):
 @pytest.mark.parametrize("rtol", [1e-8, 1e-10])
 def test_the_equality_on_klu_is_as_right_as_on_dense(tmp_path, rtol, n_points):
     """B is 0 exactly until A falls below q at t* = 2 ln 5, and Y grows at kb
-    while B == 0, so Y(10) = t*. KLU with the FD Jacobian was 1.0e-3 to 1.2e-2
-    off it, where dense with the FD Jacobian was 1.4e-7 to 5.7e-6; it is now as
-    close as dense is, or closer.
+    while B == 0, so Y(10) = t*. KLU with the FD Jacobian was 145 to 598 times
+    as far off it as dense with the FD Jacobian (7.7e-5 to 1.5e-2, where dense
+    was 1.3e-7 to 3.9e-5); it now reads dense's value in all four cases.
 
     Not asked: that either is exact. An equality on a state has no root to
     stop the solver at, and where its switch flips depends on where the steps
-    fall, on every route: dense with the analytic Jacobian is 1.1e-3 off at
-    rtol 1e-10 and 1001 samples."""
+    fall, on every route: dense with the analytic Jacobian is 3.4e-3 off at
+    rtol 1e-10 and 1001 samples. The bound against dense is not a margin on that
+    luck: the two routes now form one matrix and so take the same steps."""
     path = _net(tmp_path, _EQUALITY)
     exact = 2 * math.log(5)
     dense = abs(_y10(path, rtol, n_points, jacobian="fd") - exact)
@@ -122,9 +130,70 @@ def test_a_nanomolar_model_takes_the_steps_dense_takes(tmp_path):
     assert klu.solver_stats["n_jac_evals"] <= 1.2 * dense.solver_stats["n_jac_evals"]
 
 
-def test_the_analytic_jacobian_on_klu_is_untouched(tmp_path):
-    """The control: the analytic route never reads the colored step."""
+def test_the_chain_on_klu_with_the_closed_form_agrees_with_dense(tmp_path):
+    """The fixture's control, not a guard of the step (the closed form never
+    reads it): with an exact Jacobian KLU and dense agree on the chain, so what
+    the test above measures is the difference quotient, not the linear solver."""
     path = _net(tmp_path, _CHAIN)
     a = _run(path, force_sparse_linear_solver=True)
     b = _run(path, jacobian="auto")
     np.testing.assert_allclose(a.species, b.species, rtol=1e-6, atol=1e-20)
+
+
+_NETS_DIR = Path(__file__).resolve().parents[2] / "benchmarks" / "models" / "net" / "ode"
+
+
+def test_a_compiled_rhs_on_klu_gives_the_interpreted_runs_matrix():
+    """fceri_ji, 354 species: codegen compiles its right-hand side, so CVODE's
+    f(y) is the compiled one while the colored columns are the interpreted one.
+    Differenced over CVODE's step, their last bits were part of the matrix: the
+    compiled run took 241 steps where the interpreted one took 251, and read
+    1.6e-10 of the peak away from it. With the interpreted f(y) as the base
+    both runs form one matrix: 251 steps each, 4e-15 apart."""
+    path = _NETS_DIR / "fceri_ji.net"
+    assert path.is_file(), f"vendored net missing from tracked corpus: {path}"
+    runs = {}
+    for codegen in (False, True):
+        sim = bngsim.Simulator(
+            bngsim.Model.from_net(str(path)), method="ode", codegen=codegen, **KLU_FD
+        )
+        if codegen and sim.codegen_backend == "none":
+            pytest.skip("no C compiler: codegen built no right-hand side")
+        runs[codegen] = np.asarray(sim.run(t_span=(0.0, 100.0), n_points=51, rtol=1e-8).species)
+    peak = float(np.max(np.abs(runs[False])))
+    assert np.max(np.abs(runs[True] - runs[False])) <= 1e-12 * peak
+
+
+# 2 A_i <-> A_{i+1} at 1e9 /M/s and 1 /s from A_0 = 1 nM
+_REVERSIBLE_CHAIN = (
+    "begin parameters\n    1 kf 1e9\n    2 kr 1.0\nend parameters\nbegin species\n"
+    + "".join(f"    {i + 1} A{i}() {'1e-9' if i == 0 else '0'}\n" for i in range(6))
+    + "end species\nbegin reactions\n"
+    + "".join(
+        f"    {2 * i + 1} {i + 1},{i + 1} {i + 2} kf\n    {2 * i + 2} {i + 2} {i + 1},{i + 1} kr\n"
+        for i in range(5)
+    )
+    + "end reactions\n"
+)
+
+
+def test_the_steady_state_march_on_klu_takes_the_steps_dense_takes(tmp_path):
+    """The march's colored quotient had the same absolute step. On this chain
+    KLU marched 3574 steps and did not converge, where dense converged in 197;
+    it now steps on the march's error weights, as the dense quotient does, and
+    converges where dense does."""
+    path = _net(tmp_path, _REVERSIBLE_CHAIN)
+
+    def solve(**kw):
+        sim = bngsim.Simulator(bngsim.Model.from_net(path), method="ode", jacobian="fd", **kw)
+        return sim.steady_state(tol=1e-9, max_time=1e6)
+
+    dense = solve(force_dense_linear_solver=True)
+    klu = solve(force_sparse_linear_solver=True)
+    assert dense.converged and klu.converged, (dense.n_steps, klu.n_steps)
+    assert klu.linear_solver == "klu"
+    assert klu.n_steps <= 1.2 * dense.n_steps, (klu.n_steps, dense.n_steps)
+    scale = float(np.max(np.abs(dense.concentrations)))
+    np.testing.assert_allclose(
+        klu.concentrations, dense.concentrations, rtol=1e-6, atol=1e-7 * scale
+    )

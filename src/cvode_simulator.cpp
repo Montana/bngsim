@@ -603,6 +603,9 @@ struct CvodeUserData {
     std::vector<double> colored_jac_h_vals;
     // The rows colored_fd_jacobian's jump test evaluates (issue #1002), 4·ns.
     std::vector<double> colored_jac_jump_rows;
+    // f at the unperturbed state from the function the columns are differenced
+    // on, where CVODE's own f came from the compiled right-hand side (#1254).
+    std::vector<double> colored_jac_f_base;
 
     // bngsim's own dense difference quotient (issue #1002), installed where
     // CVODE's would run: the solver it reads the error weights and step from,
@@ -2066,12 +2069,28 @@ static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMat
         ewt = N_VGetArrayPointer(tmp1);
     }
 
+    // Both sides of each difference from one function. The columns are the
+    // interpreted right-hand side; CVODE's fy is the compiled one where codegen
+    // is attached (256+ species, which KLU's routing reaches). Over the step
+    // above, min_inc/ewt_j beside a species at 0, the last bits between the two
+    // read as slope: fceri_ji's compiled run took 241 steps where the
+    // interpreted one took 251, 1.6e-10 of its peak away. So there the
+    // interpreted f at y is the base, at one call more.
+    const double *f_base = fy_data;
+    if (data->codegen_fn != nullptr) {
+        if (static_cast<int>(data->colored_jac_f_base.size()) != ns) {
+            data->colored_jac_f_base.resize(ns);
+        }
+        model->compute_derivs(static_cast<double>(t), y_data, data->colored_jac_f_base.data());
+        f_base = data->colored_jac_f_base.data();
+    }
+
     if (data->colored_jac_jump_rows.size() != 4 * static_cast<std::size_t>(ns)) {
         data->colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
     }
     int mended = 0;
     colored_fd_jacobian(
-        sp, ns, static_cast<double>(t), y_data, fy_data, jac_data, y_pert, fy_pert, h_vals,
+        sp, ns, static_cast<double>(t), y_data, f_base, jac_data, y_pert, fy_pert, h_vals,
         [model](double tt, const double *yy, double *ydot) { model->compute_derivs(tt, yy, ydot); },
         data->colored_jac_jump_rows.data(), &mended, ewt, min_inc);
     if (mended > 0 && data->dq_debug) {
