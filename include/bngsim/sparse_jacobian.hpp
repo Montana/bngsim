@@ -220,13 +220,14 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // takes it, and its mends are kept as fd_jacobian.hpp says. Null leaves the
 // quotient as it was. `*n_mended` (if given) counts the entries mended.
 //
-// The step. With the session's error weights `ewt` (and `min_inc` from them), a
-// column's step is CVODE's own dense difference quotient's (cvLsDenseDQJac):
-// max(sqrt(eps)*|y_j|, min_inc/ewt_j), on the scale the error test judges y_j by.
-// Without them, sqrt(eps)*max(|y_j|, 1): a floor of 1 in absolute terms, which
-// moved a species of 1e-9 by fifteen times itself, so the matrix KLU factored
-// was the Jacobian somewhere else, and Newton failed to converge or reached a
-// state with no finite rate where dense differences, on the weights, ran (#1254).
+// The step. With the session's error weights `ewt` (and `min_inc` from them,
+// cvode_dq_min_inc), a column's step is CVODE's own dense difference
+// quotient's (cvLsDenseDQJac): max(sqrt(eps)*|y_j|, min_inc/ewt_j), on the
+// scale the error test judges y_j by. Without them, sqrt(eps)*max(|y_j|, 1): a
+// floor of 1 in absolute terms, which moved a species of 1e-9 by fifteen times
+// itself, so the matrix KLU factored was the Jacobian somewhere else, and Newton
+// failed to converge or reached a state with no finite rate where dense
+// differences, on the weights, ran (#1254).
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
                                 const double *fy, double *jac_data, double *y_pert, double *fy_pert,

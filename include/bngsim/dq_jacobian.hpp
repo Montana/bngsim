@@ -27,6 +27,26 @@
 
 namespace bngsim {
 
+// The floor of CVODE's difference-quotient increment, minInc = 1000·|h|·uround·
+// n·‖fy‖_WRMS (1 where that norm is 0), as cvLsDenseDQJac forms it, with the
+// session's error weights left in `ewt`. False where CVODE gives neither the
+// weights nor the step. The dense quotient below and the colored one of
+// sparse_jacobian.hpp (#1254) both step on it.
+inline bool cvode_dq_min_inc(void *cvode_mem, N_Vector fy, N_Vector ewt, sunindextype n,
+                             sunrealtype *min_inc) {
+    if (CVodeGetErrWeights(cvode_mem, ewt) != CV_SUCCESS) {
+        return false;
+    }
+    sunrealtype h = 0.0;
+    if (CVodeGetCurrentStep(cvode_mem, &h) != CV_SUCCESS) {
+        return false;
+    }
+    const sunrealtype uround = SUN_UNIT_ROUNDOFF;
+    const sunrealtype fnorm = N_VWrmsNorm(fy, ewt);
+    *min_inc = (fnorm != 0.0) ? (1000.0 * SUNRabs(h) * uround * n * fnorm) : 1.0;
+    return true;
+}
+
 // The dense J at CVODE's Jacobian setup, for a callback handed (y, fy, J, tmp1,
 // tmp2, tmp3). CVODE's increment is max(√uround·|y_j|, minInc/ewt_j), with
 // minInc = 1000·|h|·uround·n·‖fy‖_WRMS (1 where that norm is 0), from CVODE's
@@ -49,17 +69,11 @@ inline int cvode_dense_dq_past_jumps(void *cvode_mem, N_Vector y, N_Vector fy, S
                                      std::vector<double> &scratch, SolverF &&solver_f,
                                      SideF &&side_f, int *n_mended) {
     const sunindextype n = SUNDenseMatrix_Columns(J);
-    if (CVodeGetErrWeights(cvode_mem, tmp2) != CV_SUCCESS) {
+    sunrealtype min_inc = 1.0;
+    if (!cvode_dq_min_inc(cvode_mem, fy, tmp2, n, &min_inc)) {
         return -1;
     }
-    sunrealtype h = 0.0;
-    if (CVodeGetCurrentStep(cvode_mem, &h) != CV_SUCCESS) {
-        return -1;
-    }
-    const sunrealtype uround = SUN_UNIT_ROUNDOFF;
-    const sunrealtype srur = SUNRsqrt(uround);
-    const sunrealtype fnorm = N_VWrmsNorm(fy, tmp2);
-    const sunrealtype min_inc = (fnorm != 0.0) ? (1000.0 * SUNRabs(h) * uround * n * fnorm) : 1.0;
+    const sunrealtype srur = SUNRsqrt(SUN_UNIT_ROUNDOFF);
     const double *ewt = N_VGetArrayPointer(tmp2);
     auto inc_of = [&](sunindextype j, double yj) {
         const sunrealtype by_self = srur * SUNRabs(yj);

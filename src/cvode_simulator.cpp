@@ -395,10 +395,6 @@ struct StateSwitchHold {
 
 struct CvodeUserData {
     NetworkModel *model;
-    // The session these callbacks belong to, set where this is registered with
-    // CVodeSetUserData: the colored FD Jacobian reads its error weights and
-    // step (#1254). Null where nothing has registered it.
-    void *cvode_mem = nullptr;
     // The largest |x| of each species at any state the right-hand side is
     // asked at, where a run keeps it (issue #1025): an error made where a
     // species was large is carried to where it is small, between outputs as
@@ -2061,17 +2057,13 @@ static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMat
     double *h_vals = data->colored_jac_h_vals.data();
 
     // Each column's step on the scale the error test judges it by, as CVODE's
-    // dense difference quotient (cvLsDenseDQJac) takes it: the session's error
-    // weights, in tmp1 (CVODE's scratch for this callback), and its step size.
+    // dense difference quotient (cvLsDenseDQJac) takes it (#1254): the session's
+    // error weights, in tmp1 (CVODE's scratch for this callback), and its step.
     const double *ewt = nullptr;
-    double min_inc = 1.0;
-    if (data->cvode_mem != nullptr && CVodeGetErrWeights(data->cvode_mem, tmp1) == CV_SUCCESS) {
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
         ewt = N_VGetArrayPointer(tmp1);
-        sunrealtype h = 0.0;
-        CVodeGetCurrentStep(data->cvode_mem, &h);
-        const double fnorm = N_VWrmsNorm(fy, tmp1);
-        constexpr double uround = 2.220446049250313e-16;
-        min_inc = fnorm != 0.0 ? 1000.0 * std::abs(h) * uround * ns * fnorm : 1.0;
     }
 
     if (data->colored_jac_jump_rows.size() != 4 * static_cast<std::size_t>(ns)) {
@@ -3826,6 +3818,9 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
             user_data.colored_jac_fy_pert.resize(ns);
             user_data.colored_jac_h_vals.assign(ns, 0.0);
             user_data.colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
+            // The solver whose error weights and step each column's step is
+            // taken on (#1254), as the dense quotient reads them.
+            user_data.dq_cvode_mem = cvode_mem;
             user_data.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
         }
 
@@ -4068,7 +4063,6 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         w.user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
         apply_cvode_tolerances(w.cvode_mem, w.ctx, rtol, atol, atol_v, ns,
                                w.user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
-        w.user_data.cvode_mem = w.cvode_mem;
         CVodeSetUserData(w.cvode_mem, &w.user_data);
         CVodeSetMaxNumSteps(w.cvode_mem, max_steps);
         if (opts.max_step_size > 0) {
@@ -4460,7 +4454,6 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     apply_cvode_tolerances(cvode_mem, ctx, rtol, atol, atol_v, ns,
                            user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
 
-    user_data.cvode_mem = cvode_mem;
     flag = CVodeSetUserData(cvode_mem, &user_data);
     flag = CVodeSetMaxNumSteps(cvode_mem, max_steps);
 
