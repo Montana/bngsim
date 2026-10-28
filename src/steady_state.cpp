@@ -958,7 +958,7 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix
 // of that issue's tests, the march on this quotient ended where the closed
 // form's did, and KLU's ordering kept a species held at 0 there.
 static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
-                                     N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+                                     N_Vector tmp1, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const int ns = data->model->n_species();
     // Bare accessor: the marcher materialized the coloring before installing
@@ -967,6 +967,16 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
 
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
 
+    // Each column's step as the march's dense quotient takes it, on its error
+    // weights (in tmp1, CVODE's scratch for this callback) and its step (#1254),
+    // so the two routes of one march form one matrix.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
     // Sized once, when the callback was selected, so this hot path allocates
     // nothing per Jacobian evaluation.
     SteadyStateRhs *rhs = data->rhs;
@@ -974,7 +984,8 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
+        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); }, nullptr,
+        nullptr, ewt, min_inc);
     return 0;
 }
 
@@ -1517,6 +1528,9 @@ class SteadyStateMarcher {
                 ud_.fd_y_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_fy_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_h_vals.assign(static_cast<size_t>(ns_), 0.0);
+                // Each column's step on the march's error weights, as the
+                // dense quotient takes it (#1254).
+                ud_.dq_cvode_mem = cvode_mem_;
             }
             if (CVodeSetJacFn(cvode_mem_, analytical ? cvode_ss_sparse_jac
                                                      : cvode_ss_colored_jac) != CV_SUCCESS) {
@@ -4871,10 +4885,17 @@ static void ss_measure_root(SteadyStateRhs &rhs, SteadyStateResult &result, cons
     rhs.eval(0.0, y_ss, f.data());
 }
 
-// How far apart the columns from the two difference-quotient matrices of issue
-// #1002 may be, as a part of the column's largest entry, before they are not
-// the same answer.
+// How far apart an entry of the columns from the difference-quotient matrices
+// of issue #1002 may be, as a part of itself, before they are not the same
+// answer. Held to 1e-4 of the column's largest entry instead, an entry small
+// within its column could be far off and pass: X + X -> X + X + G at k = 1e-6
+// beside G at 1e8 returned dG*/ds = 6.6e-5 for 5.9e-5, 1.4e-5 of dX*/ds.
 static constexpr double kFdAnswersAgree = 1e-4;
+
+// The least an entry is held to, as a part of its column's largest: an entry
+// that is the rounding of a column (1e-36 beside 4.8) cannot agree with itself
+// to 1e-4 at two steps, and is not an answer to confirm.
+static constexpr double kFdEntryFloor = 1e-6;
 
 // Issue #1002: a Jacobian that is a difference quotient is stepped at the
 // floored step (bngsim/fd_jacobian.hpp), which reads a term of second order in
@@ -4886,8 +4907,9 @@ static constexpr double kFdAnswersAgree = 1e-4;
 // species at 0, at half the floored step (fd_half_step_columns), which a
 // secant moves with and a slope does not, in a row the own step cannot read
 // too. Where either answer is further from the floored one than
-// kFdAnswersAgree of a column's largest, the entry that is furthest is put on
-// the result, which steady_state() refuses. Where they agree, the columns are
+// kFdAnswersAgree of the entry (of kFdEntryFloor of its column's largest, at
+// least), the entry that is furthest is put on the result, which
+// steady_state() refuses. Where they agree, the columns are
 // the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
 // solve that gave result.sensitivity, at the state result.concentrations.
 //
@@ -4965,11 +4987,13 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
             const double apart = std::isnan(own_apart) || std::isnan(half_apart)
                                      ? std::numeric_limits<double>::quiet_NaN()
                                      : std::max(own_apart, half_apart);
-            if (apart <= kFdAnswersAgree * largest) {
+            const double held_to =
+                std::max(std::abs(result.sensitivity[k]), kFdEntryFloor * largest);
+            if (apart <= kFdAnswersAgree * held_to) {
                 continue;
             }
-            const double share = largest > 0.0 && std::isfinite(apart)
-                                     ? apart / largest
+            const double share = held_to > 0.0 && std::isfinite(apart)
+                                     ? apart / held_to
                                      : std::numeric_limits<double>::infinity();
             if (result.sens_fd_disagree_species < 0 || share > worst) {
                 worst = share;
@@ -5474,46 +5498,33 @@ compute_ss_sensitivity(NetworkModel &model, SteadyStateRhs &rhs, SteadyStateResu
 // Observables are Σ factor·x, so ∂obs/∂x is exactly the group factor and the
 // observable projection is exact.
 //
-// The function total derivative prefers the compiled chain rule and falls back to
-// finite differences per function (issue #75), the same shape ∂f/∂p has in
-// compute_ss_sensitivity since #63:
+// The function total derivative comes from the compiled chain rule,
+// `bngsim_codegen_output_sens` (GH #198, issue #75): the evaluator the CVODES
+// forward-sensitivity path uses, handed the solved dY_ss/dp columns. Both terms
+// are closed form, in the same artifact as the RHS, so value and derivative
+// cannot diverge.
 //
-//   preferred — `bngsim_codegen_output_sens` (GH #198), the evaluator the CVODES
-//               forward-sensitivity path already uses, handed the solved dY_ss/dp
-//               columns. Both terms are closed form, in the same artifact as the
-//               RHS, so value and derivative cannot diverge.
-//   fallback  — the finite-difference primitive compute_ss_sensitivity uses: the
-//               state-chain Jacobian ∂func/∂x from per-species perturbations, plus
-//               the function's explicit parameter dependence ∂func/∂p (e.g.
-//               `k3/(K4+G)` w.r.t. k3) from per-parameter perturbations at the
-//               fixed steady state. BOTH terms are needed for the total
-//               derivative; dropping either is a confidently wrong gradient.
+// A row it does not answer has no derivative here, and is left NaN (issue
+// #1002). That is a function the analysis declines (written NaN: an if()
+// conditional, a max(), an abs(), and the others its per-function reason
+// names), one it leaves outside the user-function closure (left untouched: the
+// auto-generated _rateLawN), every row of an artifact with no evaluator, and a
+// supported function that reads a species with no row. Until #1002 these rows
+// were differenced, at a step of 1.5e-8 of the state's largest concentration in
+// each species and √eps of each parameter. Beside a species at 1e8 that step is
+// 1.5 in a species at 0: `abs(X)*abs(X)/(K^2 + X^2) + G` at X* = 0 with
+// K = 1.05 read 2.13 for a derivative of 0, and no comparison of steps can
+// catch it, since its secants at the step and at half of it are the same. An
+// if() of a parameter at 0 was differenced across its jump (1.1e7 for 0 in the
+// corpus). After a run, output_sensitivities refuses such a function by name,
+// and the Python layer refuses it here the same way, with the analysis' reason.
 //
-// The fallback is not vestigial. It answers a whole-model decline (no compiled
-// artifact, an artifact built without `_want_output_sens`, or a model
-// `_analyze_output_sens` declines whole, for a reason its `decline` field gives)
-// AND the per-function cases inside a live artifact: a function the emitter marked
-// unsupported (written NaN; an if() conditional, a max(), and the others its
-// per-function reason names) and one it left outside the user-function closure
-// (left untouched). Both are detected the same way — pre-fill the buffer with NaN,
-// and any row that comes back non-finite is one the compiled evaluator did not
-// answer. A supported function that reads a species with no row comes back NaN
-// too, and the FD sweep then records which species it was. Rows it did answer are
-// skipped by the FD sweep, so a model where every function is supported never pays
-// for the ns species perturbations at all.
-//
-// The ∂func/∂p probe goes through SteadyStateRhs::sync_params for the same reason
-// the ∂f/∂p probe does (issue #63, and #2 before it): neither update_observables
-// nor evaluate_functions re-derives ConstantExpression parameters — only
-// set_param does — so writing `kon` straight into the Parameter vector leaves a
-// BNG2.pl-derived `_rateLaw{N} = chi*kon` at its nominal value, and a function
-// that reads `_rateLaw{N}` silently loses the ∂func/∂_rateLaw1·∂_rateLaw1/∂kon
-// chain-rule term. sync_params(pi) re-derives everything except the probed
-// parameter itself, matching set_param's detach-then-refresh rule; the restore
-// needs the same call, or the derived parameters stay at their perturbed values
-// and corrupt every later column and the caller's model. The compiled evaluator
-// needs none of that — it carries the derived-parameter chain rule in closed form
-// (`plist[c]` selects the primary, and the emitter expands ∂p_derived/∂primary).
+// A row is NaN where an input is, too: a species mask= leaves out, and a rule
+// target (whose row the Python layer fills from its rule afterwards), have NaN
+// rows. Which such species a row reads is recorded, for the refusal to name
+// (function_sens_missing_species): each species with no row is stepped, and a
+// function whose value moves reads it. No quotient of the step is returned. A
+// solve with no such species steps nothing.
 //
 // Getting the symbol here at all took a Python-side re-prep: it is emitted only
 // when the model carries `_want_output_sens`, which Simulator.__init__ set from its
@@ -5601,16 +5612,17 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
         }
     }
 
-    // ── Functions: compiled chain rule, differenced where it declines ─────────
+    // ── Functions: the compiled chain rule, and no derivative where it has none ──
     if (n_func > 0) {
-        result.function_sensitivity.assign(static_cast<size_t>(n_func) * np, 0.0);
-        result.function_sens_missing_species.assign(static_cast<size_t>(n_func), -1);
         const double nan = std::numeric_limits<double>::quiet_NaN();
+        // NaN until the compiled evaluator answers the row (issue #1002).
+        result.function_sensitivity.assign(static_cast<size_t>(n_func) * np, nan);
+        result.function_sens_missing_species.assign(static_cast<size_t>(n_func), -1);
 
         // param_names[p] was validated to exist by compute_ss_sensitivity, which
         // throws on an unknown name — so a -1 here cannot happen on the live path.
-        // It is still checked below rather than asserted, since both branches have
-        // a correct answer for it (skip the parameter's explicit term).
+        // It is still checked below rather than asserted: the compiled evaluator
+        // is not called with one, and every row stays NaN.
         const auto &params = model.parameters();
         std::vector<int> pidx(np, -1);
         for (int p = 0; p < np; ++p) {
@@ -5622,13 +5634,10 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             }
         }
 
-        // Which function rows the compiled evaluator did not answer. Everything,
-        // until it says otherwise.
-        std::vector<uint8_t> need_fd(n_func, 1);
-        int n_need_fd = n_func;
-        bool any_codegen = false;
+        // Which function rows the compiled evaluator answered. None, until it
+        // says otherwise.
+        std::vector<uint8_t> answered(n_func, 0);
 
-        // ── Preferred: the compiled d(func)/dθ (issue #75) ────────────────────
         if (rhs.has_analytical_output_sens() &&
             std::all_of(pidx.begin(), pidx.end(), [](int i) { return i >= 0; })) {
             rhs.sync_params();
@@ -5655,6 +5664,7 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
             std::vector<double> fs(static_cast<size_t>(np) * n_func, nan);
             rhs.eval_output_sens(0.0, y_ss, col_ptrs.data(), pidx.data(), np,
                                  /*obs_sens_out=*/nullptr, fs.data());
+            result.sens_output_evaluated = true;
 
             for (int m = 0; m < n_func; ++m) {
                 bool row_ok = true;
@@ -5662,247 +5672,66 @@ static void compute_ss_output_sensitivity(NetworkModel &model, SteadyStateRhs &r
                     row_ok = std::isfinite(fs[static_cast<size_t>(p) * n_func + m]);
                 }
                 if (!row_ok) {
-                    continue; // leave need_fd[m] set
+                    continue; // left NaN
                 }
                 for (int p = 0; p < np; ++p) {
                     result.function_sensitivity[static_cast<size_t>(m) * np + p] =
                         fs[static_cast<size_t>(p) * n_func + m];
                 }
-                need_fd[m] = 0;
-                --n_need_fd;
-                any_codegen = true;
+                answered[m] = 1;
             }
         }
 
-        result.sens_output_source =
-            !any_codegen ? "finite-difference" : (n_need_fd == 0 ? "codegen" : "mixed");
+        // Counted over the rows a result returns: an auto-generated _rateLawN
+        // is not among them, and the evaluator does not differentiate one
+        // outside the user-function closure.
+        int n_returned = 0;
+        int n_returned_answered = 0;
+        for (int m = 0; m < n_func; ++m) {
+            if (!is_auto_rate_law(result.function_names[static_cast<size_t>(m)])) {
+                ++n_returned;
+                n_returned_answered += answered[m];
+            }
+        }
+        result.sens_output_source = n_returned == 0                     ? ""
+                                    : n_returned_answered == n_returned ? "codegen"
+                                    : n_returned_answered == 0          ? "none"
+                                                                        : "partial";
 
-        // ── Fallback: finite-difference total derivative, per declined row ────
-        // Skipped entirely when the compiled evaluator answered every function —
-        // that is where the ns species perturbations (a full observable + function
-        // re-evaluation each) stop being paid.
-        if (n_need_fd > 0) {
-            // A declined row may hold the NaN the evaluator wrote; the FD sweep
-            // accumulates, so clear it back to zero first.
-            for (int m = 0; m < n_func; ++m) {
-                if (need_fd[m]) {
-                    for (int p = 0; p < np; ++p) {
-                        result.function_sensitivity[static_cast<size_t>(m) * np + p] = 0.0;
-                    }
+        // The species with no row that each row left NaN reads, for the refusal
+        // to name. A function whose own value is not finite reads as moved by
+        // every step (NaN is no value it can equal), and its row is NaN for its
+        // value, not for a missing row. Only which values move is read here,
+        // so the parameters need not be derived again for it.
+        std::vector<int> rowless;
+        if (!std::all_of(answered.begin(), answered.end(), [](uint8_t a) { return a != 0; })) {
+            for (int i = 0; i < ns; ++i) {
+                const double *dxi = result.sensitivity.data() + static_cast<size_t>(i) * np;
+                if (!std::all_of(dxi, dxi + np, [](double v) { return std::isfinite(v); })) {
+                    rowless.push_back(i);
                 }
             }
-
-            // Base function values at the steady state with the original
-            // parameters. function_value_cache() returns a reference reused by
-            // every subsequent evaluate_functions() call, so snapshot it into f0.
-            // sync_params() first, so the baseline is taken against freshly
-            // derived expression parameters — the same ordering
-            // compute_ss_sensitivity uses for its own f0.
-            rhs.sync_params();
+        }
+        if (!rowless.empty()) {
             model.update_observables(y_ss);
             model.evaluate_functions(0.0);
             const std::vector<double> f0(model.function_value_cache());
-            std::vector<double> f1;
-            std::vector<double> y_pert(ns);
-
-            // State-chain term: ∂func_m/∂x_i via one-sided FD (perturb one
-            // species, re-evaluate observables + functions), folded into
-            // Σ_i (∂func_m/∂x_i)·dY_ss_i/dp as each species column is produced.
-            //
-            // The same sweep accumulates each function's TERM SCALE,
-            // Σ_i |∂func_m/∂x_i|·|x_i| — the size of the quantities func_m is
-            // assembled from, which the explicit-parameter probe below needs as
-            // its roundoff floor (issue #123). It is the function-side analogue
-            // of the Jacobian row sum compute_ss_sensitivity uses, and it comes
-            // free: the partials are already in hand.
-            //
-            // A species the solve leaves out has a NaN row: a caller's mask= species
-            // (issue #74), and every assignment-rule target, which
-            // _ss_mask_excluding_ar_species takes out of the solve (GH #247). A
-            // function that does not read such a species has a partial of exactly
-            // zero for it, since its value is evaluated from bit-identical inputs,
-            // and it takes nothing from that row. The product 0·NaN is NaN, though,
-            // so the term is skipped rather than added: `W := piecewise(P, …)`
-            // beside `T := 2*P` came back NaN where it is [5, −25]. A rule
-            // target is never read through its own slot, because its rule lives
-            // under the species' name and shadows it, so a function that reads T
-            // reads the rule and gets its derivative through P's row. A function
-            // that does read a species with no row keeps the NaN, which is the
-            // honest answer, and the first such species is recorded for it so
-            // that a refusal can name it (function_sens_missing_species).
-            //
-            // The partials are kept, column-major (n_func × ns), for issue
-            // #1002's check below.
             const double y_scale = state_probe_scale(y_ss, ns, result.excluded_species);
-            std::vector<double> func_term_scale(static_cast<size_t>(n_func), 0.0);
-            std::vector<double> D_func(static_cast<size_t>(n_func) * ns, 0.0);
-            for (int i = 0; i < ns; ++i) {
+            std::vector<double> y_pert(ns);
+            for (const int i : rowless) {
                 std::memcpy(y_pert.data(), y_ss, ns * sizeof(double));
-                const double h = fd_probe(y_ss[i], state_fd_step(y_ss[i], y_scale), &y_pert[i]);
+                fd_probe(y_ss[i], state_fd_step(y_ss[i], y_scale), &y_pert[i]);
                 model.update_observables(y_pert.data());
                 model.evaluate_functions(0.0);
-                f1 = model.function_value_cache();
-                const double *dxi = result.sensitivity.data() + static_cast<size_t>(i) * np;
-                const bool has_row =
-                    std::all_of(dxi, dxi + np, [](double v) { return std::isfinite(v); });
+                const std::vector<double> &f1 = model.function_value_cache();
                 for (int m = 0; m < n_func; ++m) {
-                    if (!need_fd[m]) {
-                        continue;
-                    }
-                    const double dfm_dxi = (f1[m] - f0[m]) / h;
-                    D_func[static_cast<size_t>(i) * n_func + m] = dfm_dxi;
-                    if (dfm_dxi == 0.0) {
-                        continue; // func_m does not read x_i
-                    }
-                    // A function whose own value is not finite has a NaN partial
-                    // for every species, read or not (-inf - -inf), so it would
-                    // record the first species with no row whatever it reads.
-                    // Its row is NaN for its value, not for a missing row.
-                    if (!has_row && result.function_sens_missing_species[m] < 0 &&
-                        std::isfinite(f0[m])) {
+                    if (!answered[m] && result.function_sens_missing_species[m] < 0 &&
+                        std::isfinite(f0[m]) && f1[m] != f0[m]) {
                         result.function_sens_missing_species[m] = i;
-                    }
-                    func_term_scale[static_cast<size_t>(m)] += std::abs(dfm_dxi * y_ss[i]);
-                    double *out = result.function_sensitivity.data() + static_cast<size_t>(m) * np;
-                    for (int p = 0; p < np; ++p) {
-                        out[p] += dfm_dxi * dxi[p];
-                    }
-                }
-            }
-
-            // Explicit-parameter term: ∂func_m/∂p at the fixed steady state
-            // (perturb one parameter, keep the state fixed). Observables are
-            // functions of species only, so update_observables(y_ss) restores the
-            // same totals; the function evaluator picks up the live parameter
-            // value.
-            // Two probes here as well (issue #123): a function whose dependence
-            // on p is a small fraction of its own magnitude loses the narrow
-            // probe's response to roundoff, and takes the wide one instead.
-            std::vector<double> f_wide;
-            for (int p = 0; p < np; ++p) {
-                const int pi = pidx[p];
-                if (pi < 0) {
-                    continue;
-                }
-                const double pval = params[pi].value;
-
-                // Perturb, re-deriving every expression parameter but the probed
-                // one; restore and re-derive again afterwards, or the derived
-                // parameters keep the perturbed values this probe gave them.
-                auto probe = [&](double h_request, std::vector<double> &into) {
-                    double p_plus = 0.0;
-                    const double h = fd_probe(pval, h_request, &p_plus);
-                    const_cast<std::vector<Parameter> &>(params)[pi].value = p_plus;
-                    rhs.sync_params(pi);
-                    model.update_observables(y_ss);
-                    model.evaluate_functions(0.0);
-                    into = model.function_value_cache();
-                    const_cast<std::vector<Parameter> &>(params)[pi].value = pval;
-                    rhs.sync_params(pi);
-                    return h;
-                };
-
-                const double h = probe(param_fd_step(pval), f1);
-                const double h_wide_req = param_fd_wide_step(pval);
-                const bool have_wide = h_wide_req > param_fd_step(pval);
-                const double h_wide = have_wide ? probe(h_wide_req, f_wide) : 0.0;
-
-                for (int m = 0; m < n_func; ++m) {
-                    if (!need_fd[m]) {
-                        continue;
-                    }
-                    const double narrow = f1[m] - f0[m];
-                    double dfm_dp = narrow / h;
-                    if (have_wide &&
-                        param_fd_widen(narrow, f0[m], func_term_scale[static_cast<size_t>(m)])) {
-                        dfm_dp = (f_wide[m] - f0[m]) / h_wide;
-                    }
-                    result.function_sensitivity[static_cast<size_t>(m) * np + p] += dfm_dp;
-                }
-            }
-
-            // Issue #1002: the state-chain term again, with the partials of
-            // species far below the state's scale at their own step
-            // (fd_own_step_columns), and again with them, and those of
-            // species at 0, at half the floored step (fd_half_step_columns).
-            // Where either total is further from the floored one than
-            // kFdAnswersAgree of the largest function sensitivity in the
-            // column, the furthest is put on the result, which steady_state()
-            // refuses. The values returned are the floored ones either way.
-            const auto eval_functions = [&](const double *yy, double *g) {
-                model.update_observables(yy);
-                model.evaluate_functions(0.0);
-                const std::vector<double> &cache = model.function_value_cache();
-                std::copy(cache.begin(), cache.begin() + n_func, g);
-            };
-            std::vector<double> D_own(D_func.size());
-            const std::vector<int> retaken =
-                fd_own_step_columns(eval_functions, y_ss, ns, n_func, result.excluded_species,
-                                    f0.data(), D_func.data(), D_own.data());
-            std::vector<double> D_half(D_func.size());
-            const std::vector<int> halved =
-                fd_half_step_columns(eval_functions, y_ss, ns, n_func, result.excluded_species,
-                                     f0.data(), D_func.data(), D_half.data());
-            // A rate law BNG2.pl wrote as a function (`_rateLawN`) is not among
-            // the function sensitivities a result returns.
-            std::vector<uint8_t> asked(static_cast<size_t>(n_func), 0);
-            for (int m = 0; m < n_func; ++m) {
-                asked[static_cast<size_t>(m)] =
-                    need_fd[m] && !is_auto_rate_law(result.function_names[static_cast<size_t>(m)]);
-            }
-            // The change a set of retaken partials makes to func_m's total in
-            // column p.
-            const auto change_by = [&](const std::vector<int> &species,
-                                       const std::vector<double> &D_other, int m, int p) {
-                double change = 0.0;
-                for (const int i : species) {
-                    const size_t k = static_cast<size_t>(i) * n_func + m;
-                    const double dxi = result.sensitivity[static_cast<size_t>(i) * np + p];
-                    // (A partial that is no number at half the step, times
-                    // an entry of 0, adds nothing.)
-                    if (std::isfinite(dxi) && dxi != 0.0) {
-                        change += (D_other[k] - D_func[k]) * dxi;
-                    }
-                }
-                return change;
-            };
-            double worst = 0.0;
-            for (int p = 0; p < np && !(retaken.empty() && halved.empty()); ++p) {
-                double largest = 0.0;
-                for (int m = 0; m < n_func; ++m) {
-                    const double v = result.function_sensitivity[static_cast<size_t>(m) * np + p];
-                    if (asked[static_cast<size_t>(m)] && std::isfinite(v)) {
-                        largest = std::max(largest, std::abs(v));
-                    }
-                }
-                for (int m = 0; m < n_func; ++m) {
-                    const double v = result.function_sensitivity[static_cast<size_t>(m) * np + p];
-                    if (!asked[static_cast<size_t>(m)] || !std::isfinite(v)) {
-                        continue;
-                    }
-                    const double change = change_by(retaken, D_own, m, p);
-                    const double change_half = change_by(halved, D_half, m, p);
-                    const double apart = std::isnan(change) || std::isnan(change_half)
-                                             ? std::numeric_limits<double>::quiet_NaN()
-                                             : std::max(std::abs(change), std::abs(change_half));
-                    if (apart <= kFdAnswersAgree * largest) {
-                        continue;
-                    }
-                    const double share = largest > 0.0 && std::isfinite(apart)
-                                             ? apart / largest
-                                             : std::numeric_limits<double>::infinity();
-                    if (result.sens_fd_disagree_function < 0 || share > worst) {
-                        worst = share;
-                        result.sens_fd_disagree_function = m;
-                        result.sens_fd_function_param = p;
-                        result.sens_fd_function_floored = v;
-                        result.sens_fd_function_own_step = v + change;
-                        result.sens_fd_function_half_step = v + change_half;
                     }
                 }
             }
         }
-
         // Leave the model evaluated at the steady state with original parameters.
         model.update_observables(y_ss);
         model.evaluate_functions(0.0);
