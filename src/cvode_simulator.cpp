@@ -922,10 +922,13 @@ static ClampReading read_values(const double *v, std::size_t n) {
 // The slots the clamp leaves alone at `y`: where `values` (the right-hand side
 // or a closed-form Jacobian, `count` of them, as first evaluated there) has an
 // infinite entry, those the step started far below 0 whose own reading is
-// infinite, every other slot read at 0 (`read_at(state)` evaluates at a state
-// and says what it read; it may overwrite `values`, which are scanned first).
-// None otherwise: not where the value is only NaN, and not a far slot whose
-// laws are only NaN while another species' law is what is infinite.
+// infinite, every other slot read at 0, and finite a relative 2^-20 to either
+// side (`read_at(state)` evaluates at a state and says what it read; it may
+// overwrite `values`, which are scanned first). None otherwise: not where the
+// value is only NaN, not a far slot whose laws are only NaN while another
+// species' law is what is infinite, and not an overflow. Each spared candidate
+// costs one evaluation, and each one infinite on its own two more; none of
+// this runs unless an infinity was read at a step started far below 0.
 template <class ReadAt>
 static const char *spare_at_pole(CvodeUserData *data, N_Vector y, const double *values,
                                  std::size_t count, ReadAt &&read_at) {
@@ -945,7 +948,19 @@ static const char *spare_at_pole(CvodeUserData *data, N_Vector y, const double *
             continue;
         double *x = clamp_state_nonneg(data, y);
         x[i] = y_ptr[i];
-        if (read_at(x) == ClampReading::infinite)
+        bool pole = read_at(x) == ClampReading::infinite;
+        // A pole the run has landed on is infinite at that one point and finite
+        // a hair to either side of it; an overflow is infinite over a stretch:
+        // exp(-1/S), 0 at S = 0, overflows for every S in (-1/709.8, 0), where an
+        // extinct species' in-tolerance undershoot can sit (round 3's F1).
+        for (const double side : {1.0 + 0x1p-20, 1.0 - 0x1p-20}) {
+            if (!pole)
+                break;
+            x = clamp_state_nonneg(data, y);
+            x[i] = y_ptr[i] * side;
+            pole = read_at(x) != ClampReading::infinite;
+        }
+        if (pole)
             any = true;
         else
             data->clamp_far[i] = 0;
