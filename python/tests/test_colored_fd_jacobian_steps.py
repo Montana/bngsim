@@ -81,24 +81,27 @@ def _y10(path, rtol, n_points, **kw):
     return r.species[-1][list(r.species_names).index("Y()")]
 
 
-@pytest.mark.parametrize("n_points", [101, 1001])
-@pytest.mark.parametrize("rtol", [1e-8, 1e-10])
+# Not rtol 1e-10 at 1001 samples, which the PR also ran: there dense with the
+# analytic Jacobian is 3.4e-3 off, as far as KLU with the wrong step was, so the
+# case cannot tell a wrong matrix from where the steps happened to fall.
+@pytest.mark.parametrize(("rtol", "n_points"), [(1e-8, 101), (1e-8, 1001), (1e-10, 101)])
 def test_the_equality_on_klu_is_as_right_as_on_dense(tmp_path, rtol, n_points):
     """B is 0 exactly until A falls below q at t* = 2 ln 5, and Y grows at kb
-    while B == 0, so Y(10) = t*. KLU with the FD Jacobian was 145 to 598 times
+    while B == 0, so Y(10) = t*. KLU with the FD Jacobian was 382 to 598 times
     as far off it as dense with the FD Jacobian (7.7e-5 to 1.5e-2, where dense
-    was 1.3e-7 to 3.9e-5); it now reads dense's value in all four cases.
+    was 1.3e-7 to 3.9e-5); it now reads dense's value in all three cases.
 
     Not asked: that either is exact. An equality on a state has no root to
     stop the solver at, and where its switch flips depends on where the steps
-    fall, on every route: dense with the analytic Jacobian is 3.4e-3 off at
-    rtol 1e-10 and 1001 samples. The bound against dense is not a margin on that
-    luck: the two routes now form one matrix and so take the same steps."""
+    fall, on every route. The two routes now difference on one step rule but
+    still factor and mend differently, and their step counts can part (202 and
+    214 at rtol 1e-8 and 1001 samples, on the same Y(10)), so the bound leaves
+    10x of room against that, and main still fails it by 38x or more."""
     path = _net(tmp_path, _EQUALITY)
     exact = 2 * math.log(5)
     dense = abs(_y10(path, rtol, n_points, jacobian="fd") - exact)
     klu = abs(_y10(path, rtol, n_points, **KLU_FD) - exact)
-    assert klu <= max(2 * dense, 1e-9 * exact), (klu, dense)
+    assert klu <= max(10 * dense, 1e-9 * exact), (klu, dense)
 
 
 # 2 A_i -> A_{i+1} at 1e9 /M/s from A_0 = 1 nM: O(1) dynamics in a second
@@ -149,7 +152,11 @@ def test_a_compiled_rhs_on_klu_gives_the_interpreted_runs_matrix():
     Differenced over CVODE's step, their last bits were part of the matrix: the
     compiled run took 241 steps where the interpreted one took 251, and read
     1.6e-10 of the peak away from it. With the interpreted f(y) as the base
-    both runs form one matrix: 251 steps each, 4e-15 apart."""
+    both runs form one matrix: 251 steps each, 4e-15 apart.
+
+    A guard of that base under the new step, not of #1254 itself: on the old
+    step, 1.5e-8 and wider, the last bits were too small a part of each
+    difference to show, and main passes it (256 steps each, 2.4e-15 apart)."""
     path = _NETS_DIR / "fceri_ji.net"
     assert path.is_file(), f"vendored net missing from tracked corpus: {path}"
     runs = {}
