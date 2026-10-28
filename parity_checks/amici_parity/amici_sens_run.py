@@ -164,8 +164,8 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
     # zeroed, negated or multiplied by 1000 and still read PASS.
     n_p = bn_sx.shape[2]
     bn_used, am_used = bn_sx[:, bn_idx, :], am_sx[:, am_idx, :]
-    not_judged: list = []
-    columns_diff: list = []
+    # None where no column was assessed alone, as n_columns_judged.
+    not_judged = columns_diff = None
     whole = None
     if param_values is None or atol is None:
         # No floor to judge a column against: the tensor-wide verdict, as
@@ -187,30 +187,44 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
         not_judged = [names[j] for j in range(n_p) if j not in verdicts]
         columns_diff = [names[j] for j, cv in verdicts.items() if not cv["passed"]]
         if not whole["passed"]:
-            # Where the tensor's DIFF can lie besides: the columns left out
-            # that disagree past their floor somewhere.
+            # The columns left out that the tensor's DIFF lies in: each one past
+            # its floor somewhere, judged at the tensor's scale with every other
+            # column forgiven. A DIFF only several make together (a soft-fail
+            # budget they exceed only jointly) names none of them, and the row
+            # is a DIFF all the same.
             past = ~asens.sensitivity_noise_mask(bn_used, am_used, param_values, atol)
-            columns_diff += [
-                names[j] for j in range(n_p) if j not in verdicts and past[..., j].any()
-            ]
+            for j in range(n_p):
+                if j in verdicts or not past[..., j].any():
+                    continue
+                others = np.ones(bn_used.shape, dtype=bool)
+                others[..., j] = False
+                alone = asens.sens_verdict(
+                    bn_used, am_used, param_values=param_values, atol=atol, forgive_mask=others
+                )
+                if not alone["passed"]:
+                    columns_diff.append(names[j])
         passed = bool(verdicts) and whole["passed"] and not columns_diff
         v = {
             "passed": passed,
             "max_rel": max([whole["max_rel"], *(cv["max_rel"] for cv in verdicts.values())]),
+            # Whether the floor made this row a PASS: in either verdict.
             "noise_decisive": passed
             and (whole["noise_decisive"] or any(cv["noise_decisive"] for cv in verdicts.values())),
             # How much of the tensor is under solver resolution is a statement
             # about the data (#316), so it is the whole tensor's, as before.
             "n_below_noise_floor": int(whole["n_below_noise_floor"]),
         }
-        for k in ("n_fail", "n_cells", "n_hard_fail", "n_soft_fail", "budget_forgiven"):
+        # The tallies are the judged columns'; the comment gives the whole
+        # tensor's beside them where they decide anything.
+        for k in (
+            "n_fail",
+            "n_cells",
+            "n_hard_fail",
+            "n_soft_fail",
+            "budget_forgiven",
+            "n_noise_rescued",
+        ):
             v[k] = sum(int(cv[k]) for cv in verdicts.values())
-        # The larger of the two verdicts' counts, so a floor that decided
-        # either one shows.
-        v["n_noise_rescued"] = max(
-            int(whole["n_noise_rescued"]),
-            sum(int(cv["n_noise_rescued"]) for cv in verdicts.values()),
-        )
 
     # Degeneracy witnesses (issue #328). A job can be reported PASS when the
     # WHOLE sensitivity tensor lies below the magnitude either solver can
@@ -235,24 +249,29 @@ def _compare(bn, am, param_values=None, atol=None, param_ids=None) -> dict:
     # the tensor sits inside it. The old "noise N" was the latter under a name
     # that read as the former, so a row could say "noise 4820" while the floor
     # had changed nothing about the verdict.
+    if whole is None:
+        judged_txt, decisive = "", v["noise_decisive"]
+    else:
+        judged_txt = f"{len(verdicts)}/{n_p} columns judged: "
+        decisive = passed and any(cv["noise_decisive"] for cv in verdicts.values())
     comment = (
-        f"{len(common)} sp x {n_p} par; fail {v['n_fail']}/{v['n_cells']} "
+        f"{len(common)} sp x {n_p} par; {judged_txt}fail {v['n_fail']}/{v['n_cells']} "
         f"(hard {v['n_hard_fail']}, soft {v['n_soft_fail']}, "
         f"forgiven {v['budget_forgiven']}, noise-rescued {v['n_noise_rescued']}"
-        f"{' DECISIVE' if v['noise_decisive'] else ''}); "
+        f"{' DECISIVE' if decisive else ''}); "
         f"state {'ok' if sv['passed'] else 'DIFF'}"
     )
+    if whole is not None and (not whole["passed"] or (passed and whole["noise_decisive"])):
+        comment += (
+            f"; whole tensor {'ok' if whole['passed'] else 'DIFF'}: "
+            f"fail {whole['n_fail']}/{whole['n_cells']} (hard {whole['n_hard_fail']}, "
+            f"noise-rescued {whole['n_noise_rescued']}"
+            f"{' DECISIVE' if passed and whole['noise_decisive'] else ''})"
+        )
     if n_resolvable == 0:
         comment += "; DEGENERATE: no parameter column resolvable"
-    if whole is not None:
-        comment += f"; {len(verdicts)}/{n_p} columns judged"
-        if not whole["passed"]:
-            comment += (
-                f"; whole tensor DIFF (fail {whole['n_fail']}/{whole['n_cells']}, "
-                f"hard {whole['n_hard_fail']})"
-            )
-        if columns_diff:
-            comment += f"; DIFF in {columns_diff[:6]}"
+    if columns_diff:
+        comment += f"; DIFF in {columns_diff[:6]}"
     status = "pass" if v["passed"] else "diff"
     extra = {}
     if whole is not None and whole["passed"] and not verdicts:

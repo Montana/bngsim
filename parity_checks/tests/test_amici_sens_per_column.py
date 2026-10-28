@@ -149,6 +149,8 @@ def test_a_model_wide_silent_zero_under_20x_is_a_diff_not_a_bad_test():
     assert res["n_columns_judged"] == 0
     assert res["status"] == "diff"
     assert res["columns_diff"] == [0, 1]
+    # The tensor's own measure, as main reported it: a silent zero is 1.0.
+    assert res["value"] == pytest.approx(1.0)
 
 
 def test_a_row_with_no_column_to_judge_is_a_bad_test():
@@ -182,31 +184,166 @@ def test_without_parameter_values_the_tensor_is_judged_whole():
     am = _tensor(0.1)
     res = run._compare((T, X, am.copy(), NAMES), (T, X.copy(), am, NAMES))
     assert res["status"] == "pass"
+    # Not assessed, rather than "all judged, none failed".
     assert res["n_columns_judged"] is None
+    assert res["columns_not_judged"] is None and res["columns_diff"] is None
 
 
-def test_fd_sens_judges_by_the_same_rule():
-    """One rule in two suites: fd_sens's factor and per-column verdict are
-    _amici_sens's."""
+def _fd_sens():
     path = Path(__file__).resolve().parents[1] / "fd_sens" / "fd_sens_run.py"
     spec = importlib.util.spec_from_file_location("fd_sens_run", path)
     F = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(F)
+    return F
 
+
+def _peaking_at(peak):
+    """dx/dk1 at 1e3 and dx/dk2 peaking at exactly ``peak``."""
+    am = _tensor(1.0)
+    am[..., 1] *= peak / np.abs(am[..., 1]).max()
+    return am
+
+
+def test_fd_sens_judges_on_the_larger_of_its_two_floors():
+    """fd_sens shares the rule and adds the difference's own floor to it: a
+    column 20x over its atol/|p| floor but not over its difference's is not
+    judged there, and is just over both."""
+    F = _fd_sens()
     assert F.JUDGE_FACTOR == asens.JUDGE_FACTOR
-    am = _tensor(0.1)
+    floor = max(F.fd_noise_floor(1.0, 1.0), 100.0 * ATOL)
+    assert F.fd_noise_floor(1.0, 1.0) > 100.0 * ATOL, "precondition: the difference's floor rules"
+    under, over = _peaking_at(15.0 * floor), _peaking_at(25.0 * floor)
+    assert F.judgeable_columns(under, under, 1.0, [1.0, 1.0], ATOL) == [0]
+    assert F.judgeable_columns(over, over, 1.0, [1.0, 1.0], ATOL) == [0, 1]
+
+
+def test_fd_sens_judges_a_nan_valued_parameter_on_its_atol_floor():
+    """A NaN parameter value makes the difference's floor NaN; fd_sens judged
+    the column on its atol/|p| floor then (Python's max ignores the NaN), and
+    still does."""
+    F = _fd_sens()
+    ones = np.ones((3, 2, 2))
+    assert F.judgeable_columns(ones, ones, 1.0, [1.0, float("nan")], ATOL) == [0, 1]
+
+
+def test_a_column_only_bngsim_makes_large_is_judged_on_bngsims_peak():
+    """AMICI's dx/dk2 is under its floor, bngsim's 1e-7 of dx/dk1: either
+    side's peak counts, so the column is judged, and reads DIFF. On AMICI's
+    peak alone it would be left out, and the tensor cannot see it."""
+    am = _tensor(1e-12)
     bn = am.copy()
-    bn[..., 1] = 0.0
-    gap = np.zeros_like(am)
-    ours = F.column_verdicts(bn, am, gap, 1.0, [1.0, 1.0], ATOL, [0, 1])
-    shared = asens.column_verdicts(
-        bn,
-        am,
-        [1.0, 1.0],
-        ATOL,
-        [0, 1],
-        forgive_mask=F.reference_settled(bn, am, 1.0, [1.0, 1.0])
-        | F.reference_uncertain(bn, am, gap),
+    bn[..., 1] *= 1e8
+    res = run._compare(
+        (T, X, bn, NAMES),
+        (T, X.copy(), am, NAMES),
+        param_values=[1.0, 1.0],
+        atol=ATOL,
+        param_ids=["k1", "k2"],
     )
-    assert {j: v["passed"] for j, v in ours.items()} == {j: v["passed"] for j, v in shared.items()}
-    assert not ours[1]["passed"]
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == ["k2"]
+
+
+def test_a_column_just_over_20x_its_floor_is_judged():
+    """dx/dk2 peaks at 22x its 1e-10 floor, 2e-12 of dx/dk1: judged alone,
+    negated, it reads DIFF, worst column 2.0 of its peak. A factor over 22
+    would leave it out, and an atol not scaled down with the column would
+    forgive the whole of it."""
+    am = _peaking_at(22.0 * 1e-10)
+    bn = am.copy()
+    bn[..., 1] = -bn[..., 1]
+    res = run._compare(
+        (T, X, bn, NAMES),
+        (T, X.copy(), am, NAMES),
+        param_values=[1.0, 1.0],
+        atol=ATOL,
+        param_ids=["k1", "k2"],
+    )
+    assert res["columns_not_judged"] == []
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == ["k2"]
+    assert res["value"] == pytest.approx(2.0)
+
+
+def _noisy_moving_column(k1_peak, k2_over_floor):
+    """dx/dk2 at ``k2_over_floor`` x its 1e-10 floor, and bngsim off by 0.9 of
+    the floor on every cell of species A: solver noise, which the floor
+    forgives, and which the movement gate (1% of a column's range) or the
+    relative ceiling would fail without it."""
+    am = _tensor(1.0)
+    am[..., 0] *= k1_peak / np.abs(am[..., 0]).max()
+    am[..., 1] *= k2_over_floor * 1e-10 / np.abs(am[..., 1]).max()
+    bn = am.copy()
+    bn[:, 0, 1] += 0.9e-10
+    return bn, am
+
+
+def test_the_floor_survives_a_columns_scaling():
+    """A column judged alone is scaled to a peak of 1 and its atol with it, so
+    the floor forgives the same noise: the row passes, and the floor decided
+    it. An atol left unscaled would shrink the floor by the column's peak."""
+    bn, am = _noisy_moving_column(1e3, 30.0)
+    res = _compare(bn, am)
+    assert res["columns_not_judged"] == []
+    assert res["status"] == "pass"
+    assert res["noise_decisive"] is True
+    assert res["n_noise_rescued"] > 0
+
+
+def test_a_floor_decisive_in_the_tensor_alone_is_decisive():
+    """dx/dk2 at 5x its floor is not judged alone; the tensor's verdict passes
+    it only on the floor. The row's PASS rested on the floor."""
+    bn, am = _noisy_moving_column(1e-7, 5.0)
+    res = _compare(bn, am)
+    assert res["columns_not_judged"] == [1]
+    assert res["status"] == "pass"
+    assert res["noise_decisive"] is True
+    assert "whole tensor ok" in res["comment"] and "DECISIVE" in res["comment"]
+
+
+def test_a_column_left_out_is_named_only_if_the_tensor_fails_it():
+    """dx/dk1 zeroed (judged, DIFF) beside a dx/dk2 at 5x its floor that is
+    off past the floor on one cell, at 1e-12 of the tensor's peak, which the
+    tensor forgives: only k1 is named."""
+    am = _tensor(1.0)
+    am[..., 1] *= 5e-10 / np.abs(am[..., 1]).max()
+    bn = am.copy()
+    bn[..., 0] = 0.0
+    bn[3, 0, 1] += 1.5e-10
+    res = run._compare(
+        (T, X, bn, NAMES),
+        (T, X.copy(), am, NAMES),
+        param_values=[1.0, 1.0],
+        atol=ATOL,
+        param_ids=["k1", "k2"],
+    )
+    assert res["status"] == "diff"
+    assert res["columns_diff"] == ["k1"]
+
+
+def test_a_non_finite_cell_peaks_at_inf():
+    sx = np.ones((2, 1, 3))
+    sx[1, 0, 0] = np.nan
+    sx[0, 0, 1] = -np.inf
+    assert list(asens.column_peaks(sx)) == [np.inf, np.inf, 1.0]
+
+
+def test_a_bad_test_row_leads_with_its_key_in_the_matrix(tmp_path):
+    import json
+
+    import generate_amici_sens_matrix as gsm
+
+    row = {
+        "model_id": "tiny",
+        "method": "sens/staggered",
+        "outcome": "BAD_TEST",
+        "value": 0.0,
+        "comment": "no parameter column carries a sensitivity 20x over its floor",
+        "exception": "no parameter column carries a sensitivity 20x over its floor",
+        "exception_class": "columns:none-judged",
+        "extra": {"sens_method": "staggered"},
+    }
+    report = tmp_path / "report_sens.json"
+    report.write_text(json.dumps({"_meta": {"tally": {"BAD_TEST": 1}}, "results": [row]}))
+    gsm.generate_html(report, tmp_path / "sens.html")
+    assert "[columns:none-judged] no parameter column" in (tmp_path / "sens.html").read_text()

@@ -887,7 +887,9 @@ def judged_columns(bn_sx, ref_sx, param_values, atol: float, extra_floors=None) 
     if floors is None:
         return []
     if extra_floors is not None:
-        floors = np.maximum(floors, np.asarray(extra_floors, dtype=float))
+        # fmax, not maximum: a NaN extra floor (fd_sens's, for a NaN parameter
+        # value) leaves the atol/|p| floor in force, as max() did there.
+        floors = np.fmax(floors, np.asarray(extra_floors, dtype=float))
     peaks = np.maximum(column_peaks(bn_sx), column_peaks(ref_sx))
     return [j for j in range(len(floors)) if peaks[j] > JUDGE_FACTOR * floors[j]]
 
