@@ -280,6 +280,29 @@ if(BNGSIM_USE_SYSTEM_SUNDIALS)
     )
     message(STATUS "Using system SUNDIALS: ${SUNDIALS_DIR}")
 
+    # include/bngsim/dq_jacobian.hpp forms the dense difference quotient that
+    # CVODE forms with no Jacobian, cvLsDenseDQJac, as the vendored release forms
+    # it, bit for bit, so that a row whose step crosses a jump can be mended
+    # (issue #1002). Against another release the quotient is still a valid one,
+    # but need not be that release's own: a run can differ from its own CVODE's
+    # in the last digits. No CI leg builds against another release (issue #1335).
+    file(READ "${BNGSIM_SUNDIALS_VENDOR_METADATA}" _bngsim_sundials_vendor_json)
+    string(JSON _bngsim_sundials_vendored_tag ERROR_VARIABLE _bngsim_sundials_tag_error
+        GET "${_bngsim_sundials_vendor_json}" source authoritative_release_tag)
+    string(REGEX MATCH "[0-9]+\\.[0-9]+" _bngsim_sundials_vendored_mm
+        "${_bngsim_sundials_vendored_tag}")
+    string(REGEX MATCH "^[0-9]+\\.[0-9]+" _bngsim_sundials_system_mm "${SUNDIALS_VERSION}")
+    if(NOT _bngsim_sundials_tag_error AND _bngsim_sundials_vendored_mm
+            AND NOT _bngsim_sundials_system_mm STREQUAL _bngsim_sundials_vendored_mm)
+        message(WARNING
+            "System SUNDIALS ${SUNDIALS_VERSION} is not the vendored "
+            "${_bngsim_sundials_vendored_tag}. bngsim's dense difference quotient "
+            "(jacobian=\"fd\", or a law the closed form declines) reproduces CVODE "
+            "${_bngsim_sundials_vendored_mm}'s. With this release it is still a valid "
+            "quotient, but can differ from this CVODE's own in the last digits, and no "
+            "CI leg tests the combination (issue #1335).")
+    endif()
+
     # Verify the system SUNDIALS really provides KLU instead of assuming it: a
     # conda-forge/system SUNDIALS can be built without the KLU solver even when
     # SuiteSparse headers are installed on the box.
