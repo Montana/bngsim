@@ -38,9 +38,10 @@ answers sees:
 Each returns a :class:`Verdict`: ``pass``, ``diff`` (a finding, with its size),
 ``unsupported`` (the path declined by type: not a wrong answer), ``skip`` (the
 path does not apply here, said why), ``exception`` (a path raised where the base
-ran: a finding) or ``no_base`` (the model does not load or its plain run does
+ran: a finding), ``no_base`` (the model does not load or its plain run does
 not complete, so there is nothing to compare against: the parity suites own
-that).
+that) or ``timeout`` (not finished within the model's cap, or a compile past
+bngsim's own limit: that row only).
 
 The oracle has to be careful
 ----------------------------
@@ -71,6 +72,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -96,6 +98,10 @@ GRID_FACTOR = 8
 #: Comma-decimal locales, in the order tried.
 COMMA_LOCALES = ("de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR")
 
+#: The ``time.monotonic()`` every run of the model being checked must finish
+#: by, which :func:`check_all` sets: None outside it, or with no cap.
+_DEADLINE: float | None = None
+
 CHECKS = (
     "sens_runs",
     "sens_vs_plain",
@@ -117,7 +123,7 @@ CHECKS = (
 
 @dataclass
 class Verdict:
-    status: str  # pass | diff | unsupported | skip | exception | no_base
+    status: str  # pass | diff | unsupported | skip | exception | no_base | timeout
     value: float | None = None
     note: str = ""
     extra: dict = field(default_factory=dict)
@@ -173,9 +179,22 @@ def sens_params(model) -> list[str]:
     return [p for p in model.primary_param_names if p not in excluded][:MAX_SENS_PARAMS]
 
 
+def _left() -> float | None:
+    """The seconds to :data:`_DEADLINE`, a run's ``timeout``: None for none. Past
+    it no run starts (``SimulationTimeout``)."""
+    if _DEADLINE is None:
+        return None
+    left = _DEADLINE - time.monotonic()
+    if left <= 0:
+        import bngsim
+
+        raise bngsim.SimulationTimeout("the model's cap is spent")
+    return left
+
+
 def run(job: Job, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
-    the Result and the Simulator."""
+    the Result and the Simulator. It has until :data:`_DEADLINE`."""
     import bngsim
 
     sim = bngsim.Simulator(load(job.path), method="ode", **{**job.sim, **kw})
@@ -185,6 +204,7 @@ def run(job: Job, **kw):
         rtol=job.rtol,
         atol=job.atol,
         max_steps=job.max_steps,
+        timeout=_left(),
     )
     return result, sim
 
@@ -290,7 +310,33 @@ def _declined(e: Exception) -> bool:
     )
 
 
+#: The words bngsim's compile timeout is reported in (``_codegen``), where
+#: ``codegen=True``'s refusal carries it in its text and not as its cause.
+_COMPILE_TIMED_OUT = "Codegen compilation timed out"
+
+
+def _timed_out(e: BaseException) -> bool:
+    """A run stopped by the model's cap, or a compile by bngsim's own limit
+    (BIOMD0000000385's 4.2 MB of C past 600 s): a timeout, whatever wraps it,
+    and never a crash."""
+    import bngsim
+
+    seen, depth = e, 0
+    while seen is not None and depth < 16:
+        if isinstance(seen, bngsim.SimulationTimeout | subprocess.TimeoutExpired):
+            return True
+        seen, depth = seen.__cause__ or seen.__context__, depth + 1
+    return _COMPILE_TIMED_OUT in str(e)
+
+
 def _verdict_of(e: Exception) -> Verdict:
+    if _timed_out(e):
+        # A cap reached in this check: its own row, not every row.
+        if _COMPILE_TIMED_OUT in str(e):
+            why = f"the compile timed out: {type(e).__name__}: {_first_line(e)}"
+        else:
+            why = f"not finished within the model's cap: {_first_line(e)}"
+        return Verdict("timeout", None, why)
     status = "unsupported" if _declined(e) or isinstance(e, _Declined) else "exception"
     return Verdict(status, None, f"{type(e).__name__}: {_first_line(e)}")
 
@@ -313,6 +359,9 @@ def check_sens(base: Base) -> dict[str, Verdict]:
     try:
         result, sim = run(base.job, sensitivity_params=params)
     except Exception as e:  # noqa: BLE001 - that it did not complete is the verdict
+        if _timed_out(e):
+            v = _verdict_of(e)
+            return {"sens_runs": v, "sens_vs_plain": v}
         # Where the plain run completes and the sensitivity run does not: a
         # refusal by name, or a derivative that does not exist at the start
         # (a power of a species at 0), or a crash. The rule records it; the
@@ -587,7 +636,11 @@ def _states(job: Job) -> list[tuple[float, np.ndarray]]:
         if t > job.t_start:
             try:
                 bngsim.Simulator(model, method="ode", **job.sim).run(
-                    t_span=(job.t_start, t), n_points=2, rtol=job.rtol, atol=job.atol
+                    t_span=(job.t_start, t),
+                    n_points=2,
+                    rtol=job.rtol,
+                    atol=job.atol,
+                    timeout=_left(),
                 )
             except bngsim.SimulationError:
                 # A state this one-interval run does not reach, where the base's
@@ -700,12 +753,21 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
 
     def go():
         here = str(Path(__file__).resolve().parent)
-        out = subprocess.run(
-            [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        # The model's cap, where less of it is left than this run's own limit.
+        limit = timeout if _DEADLINE is None else min(timeout, _left())
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
+                capture_output=True,
+                text=True,
+                timeout=limit,
+            )
+        except subprocess.TimeoutExpired as e:
+            if limit < timeout:  # the model's cap: TIMEOUT, this row only
+                raise
+            # Its own limit, where the run under C finished: a crash, as it read
+            # before the cap. A run the locale stalls is this check's finding.
+            return Verdict("exception", None, f"{type(e).__name__}: {_first_line(e)}")
         if out.returncode != 0:
             last = (out.stderr.strip().splitlines() or ["?"])[-1][:300]
             return Verdict("diff", None, f"runs under C, fails under {name}: {last}")
@@ -714,19 +776,67 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
     return _guard(go)
 
 
-def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Verdict]:
+def check_all(
+    job: Job,
+    locale_name: str | None,
+    checks=CHECKS,
+    deadline: float | None = None,
+    on_verdict=None,
+) -> dict[str, Verdict]:
     """Every check of ``checks`` on one model. A base that does not run is no
-    reference: each check is then an exception on the base."""
+    reference: each check is then an exception on the base. Every run has
+    until ``deadline`` (a ``time.monotonic()``): a check that has not finished
+    by then is TIMEOUT, its own row only, where the runner's cap would take
+    every row of the model (MODEL1006230049, 0053 and 0077 take 716-751 s of
+    the nightly's 900 s, so any check added to every model tipped them over).
+    ``on_verdict(check, verdict)`` hears each as it is reached, so a caller
+    killed at the cap still has those."""
+    global _DEADLINE
+    _DEADLINE = deadline
+    try:
+        return _check_all(job, locale_name, checks, on_verdict or (lambda c, v: None))
+    finally:
+        _DEADLINE = None
+
+
+class _Heard(dict):
+    """The verdicts so far, each told to ``on_verdict`` as it is set."""
+
+    def __init__(self, on_verdict):
+        super().__init__()
+        self.on_verdict = on_verdict
+
+    def __setitem__(self, check, verdict):
+        super().__setitem__(check, verdict)
+        self.on_verdict(check, verdict)
+
+    def update(self, other):
+        for check, verdict in other.items():
+            self[check] = verdict
+
+
+def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[str, Verdict]:
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001
         # No base, no reference: not a finding of this suite's (the parity suites
         # own a model that does not load or run), and not a pass either.
         v = Verdict("no_base", None, f"the base run: {type(e).__name__}: {str(e)[:300]}")
-        return {c: v for c in checks}
-    out: dict[str, Verdict] = {}
+        return {c: _verdict_of(e) if _timed_out(e) else v for c in checks}
+    out: dict[str, Verdict] = _Heard(on_verdict)
+
+    def spent() -> Verdict | None:
+        # No check starts past the deadline: one that builds and compiles
+        # Simulators without running them (backend_as_asked) has no run to bound.
+        try:
+            _left()
+        except Exception as e:  # noqa: BLE001 - SimulationTimeout, the cap spent
+            return _verdict_of(e)
+        return None
+
     if {"sens_runs", "sens_vs_plain"} & set(checks):
-        out.update(check_sens(base))
+        v = spent()
+        out.update({"sens_runs": v, "sens_vs_plain": v} if v else check_sens(base))
     one = {
         "ajac_vs_fdjac": check_ajac,
         "klu_vs_dense": check_klu,
@@ -739,7 +849,7 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
     }
     for name, fn in one.items():
         if name in checks:
-            out[name] = fn(base)
+            out[name] = spent() or fn(base)
     if "locale" in checks:
-        out["locale"] = check_locale(base, locale_name)
+        out["locale"] = spent() or check_locale(base, locale_name)
     return {c: out[c] for c in checks if c in out}
