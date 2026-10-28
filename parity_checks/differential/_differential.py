@@ -70,11 +70,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from _transforms import TRANSFORMS, Inapplicable, transform
 
 #: How many times the run's rtol two correct paths may differ by, before the
 #: reference's own drift is counted: their errors are each about rtol, scaled by
@@ -116,6 +118,11 @@ CHECKS = (
     "ssa_backend_as_asked",
     # The NF arm (#1312), on NF jobs only.
     "nf_reject_vs_exact",
+    # Metamorphic (#1305): the model file transformed, the answer known.
+    "reorder",
+    "rename",
+    "split",
+    "rescale_time",
 )
 
 
@@ -247,6 +254,9 @@ class Base:
         result, sim = run(job)
         self.job = job
         self.x = np.asarray(result.species, dtype=float)
+        # The columns of x, by name: a Result's species, which leave out a
+        # parameter an event promotes into the state (Model.species_names has it).
+        self.species_names = list(result.species_names)
         self.backend = sim.codegen_backend
         # A tenfold tighter run that does not complete leaves the base no
         # reference, not the model unrun: the checks that compare no answers
@@ -853,6 +863,46 @@ def check_jacobian_values(base: Base) -> Verdict:
         return Verdict("pass", 0.0, f"every judged entry agrees at {len(states)} states")
 
     return _guard(go)
+def check_transform(base: Base, kind: str) -> Verdict:
+    """The model file transformed (``_transforms.py``, #1305) and run again: the
+    answer must transform with it. Every other check here starts from the one
+    loaded model, so a bug in the loader, the model build or the parser makes
+    them agree on the wrong answer; this one reads the file a second way. Its
+    trajectories are taken by name and judged as every path is, with
+    ``Base.compare``: a transform changes the order of floating-point sums, so
+    equality is not what is asked."""
+
+    def go():
+        with tempfile.TemporaryDirectory(prefix=f"differential_{kind}_") as d:
+            try:
+                tr = transform(kind, base.job.path, Path(d))
+            except Inapplicable as e:
+                return Verdict("skip", note=f"{kind} does not apply: {e}")
+            c = tr.time_scale
+            job = Job(
+                **{
+                    **base.job.__dict__,
+                    "path": tr.path,
+                    "t_start": base.job.t_start / c,
+                    "t_end": base.job.t_end / c,
+                }
+            )
+            result, _ = run(job)
+        want = base.species_names
+        # An SBML id bngsim cannot spell as it is (null, In, time, NaN: a word
+        # its expressions reserve) is reported as _ant_<id>, and the map back
+        # from a fresh name gives the id itself.
+        spelled = {w[len("_ant_") :]: w for w in want if w.startswith("_ant_")}
+        got = [tr.names.get(n, n) for n in result.species_names]
+        got = [g if g in want else spelled.get(g, g) for g in got]
+        if sorted(got) != sorted(want):
+            odd = sorted(set(got) ^ set(want))[:5]
+            return Verdict("diff", None, f"{kind}: the species are not the base's: {odd}")
+        at = {n: i for i, n in enumerate(got)}
+        x = np.asarray(result.species, dtype=float)[:, [at[n] for n in want]]
+        return base.compare(x, f"{kind} ({tr.note}): ")
+
+    return _guard(go)
 
 
 def comma_locale() -> str | None:
@@ -1302,4 +1352,10 @@ def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[st
     # After every check main runs (#1308), in what is left of the model's cap.
     if "jacobian_values" in checks:
         out["jacobian_values"] = spent() or check_jacobian_values(base)
+    # After every check main runs (#1305), in what is left of the model's cap:
+    # four more runs ahead of locale could tip a slow model's locale row, which
+    # the baseline holds, to TIMEOUT.
+    for kind in TRANSFORMS:
+        if kind in checks:
+            out[kind] = spent() or check_transform(base, kind)
     return {c: out[c] for c in checks if c in out}

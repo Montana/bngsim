@@ -51,6 +51,7 @@ _ROOT = bngsim_source_root() or Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "parity_checks" / "differential"))
 
 import _differential as D  # noqa: E402
+import _transforms as X  # noqa: E402
 
 antimony = pytest.importorskip("antimony")
 
@@ -513,6 +514,223 @@ def test_jacobian_values_on_a_real_model_with_a_wrong_entry_is_a_diff(monkeypatc
     monkeypatch.setattr(bngsim.Model, "jacobian", wrong)
     v = D.check_jacobian_values(base)
     assert v.status == "diff", v
+
+
+# ── Metamorphic transforms (#1305) ──
+#
+# Every SBML shape above has an event, the clock or a rateOf, so none is one
+# rescale_time applies to; this is. A + B -> P, P -> A: every species moves,
+# and a rate rule (Z) that R2 reads, which the rescale must scale too.
+_AUTONOMOUS = D.Job(
+    "autonomous",
+    _sbml(
+        "autonomous",
+        "compartment C = 1; species A in C, B in C, P in C; A = 10; B = 4; P = 0;"
+        " k1 = 0.3; k2 = 0.05; Z = 1; Z' = -0.1*Z;"
+        " R1: A + B -> P; k1*A*B; R2: P -> A; k2*P*(2 - Z);",
+    ),
+    0.0,
+    20.0,
+    21,
+)
+
+
+@functools.cache
+def _job_base(name):
+    return D.Base(_AUTONOMOUS if name == "autonomous" else SHAPES[name])
+
+
+@pytest.mark.parametrize("kind", X.TRANSFORMS)
+def test_an_autonomous_sbml_model_keeps_its_answer_under_each_transform(kind):
+    v = D.check_transform(_job_base("autonomous"), kind)
+    assert v.status == "pass", v
+
+
+def _misapplied(monkeypatch, fix):
+    """Each transform as written, then ``fix`` applied to what it made: the
+    transform done wrong, which its check is there to see."""
+    real = X.transform
+
+    def wrong(kind, path, workdir):
+        tr = real(kind, path, workdir)
+        fix(tr)
+        return tr
+
+    monkeypatch.setattr(D, "transform", wrong)
+
+
+def _swap_first_and_last_initial_values(tr):
+    """The data left in the old order under the new labels: the first and the
+    last species' initial values exchanged in the transformed file (in both
+    models those differ; equality-dwell's first two are both 0)."""
+    if tr.path.suffix == ".net":
+        net = X._Net.parse(tr.path.read_text())
+        rows = net.entries("species")
+        (f0, c0), (f1, c1) = rows[0], rows[-1]
+        rows[0], rows[-1] = ([*f0[:2], f1[2], *f0[3:]], c0), ([*f1[:2], f0[2], *f1[3:]], c1)
+        net.set_entries("species", rows)
+        tr.path.write_text(net.text())
+        return
+    import libsbml
+
+    doc = libsbml.readSBMLFromFile(str(tr.path))
+    m = doc.getModel()
+    s0, s1 = m.getSpecies(0), m.getSpecies(m.getNumSpecies() - 1)
+    v0, v1 = s0.getInitialConcentration(), s1.getInitialConcentration()
+    s0.setInitialConcentration(v1)
+    s1.setInitialConcentration(v0)
+    libsbml.writeSBMLToFile(doc, str(tr.path))
+
+
+# equality-dwell is a .net whose three species all move; autonomous an SBML.
+MISAPPLIED_ON = ("equality-dwell", "autonomous")
+
+
+@pytest.mark.parametrize("model", MISAPPLIED_ON)
+def test_a_reorder_that_leaves_the_values_behind_is_a_finding(monkeypatch, model):
+    _misapplied(monkeypatch, _swap_first_and_last_initial_values)
+    v = D.check_transform(_job_base(model), "reorder")
+    assert v.status == "diff", v
+
+
+@pytest.mark.parametrize("model", MISAPPLIED_ON)
+def test_a_rename_that_crosses_two_names_is_a_finding(monkeypatch, model):
+    def cross(tr):
+        a, b = list(tr.names)[:2]
+        tr.names[a], tr.names[b] = tr.names[b], tr.names[a]
+
+    _misapplied(monkeypatch, cross)
+    v = D.check_transform(_job_base(model), "rename")
+    assert v.status == "diff", v
+
+
+@pytest.mark.parametrize("model", MISAPPLIED_ON)
+def test_a_split_that_keeps_the_whole_rate_on_each_half_is_a_finding(monkeypatch, model):
+    monkeypatch.setattr(X, "SPLIT_SHARE", 1.0)
+    v = D.check_transform(_job_base(model), "split")
+    assert v.status == "diff", v
+
+
+@pytest.mark.parametrize("model", MISAPPLIED_ON)
+def test_a_rescale_of_the_rates_and_not_the_window_is_a_finding(monkeypatch, model):
+    _misapplied(monkeypatch, lambda tr: setattr(tr, "time_scale", 1.0))
+    v = D.check_transform(_job_base(model), "rescale_time")
+    assert v.status == "diff", v
+
+
+def test_a_transform_that_does_not_apply_is_skipped_by_name():
+    """An event's time is not a rate: rescale_time does not keep the answer of
+    a model with one, so the row says so rather than judging."""
+    v = D.check_transform(_job_base("pulse-width-event"), "rescale_time")
+    assert v.status == "skip" and "events" in v.note, v
+
+
+def _job_of(name, path, t_end=10.0):
+    return D.Base(D.Job(name, path, 0.0, t_end, 21))
+
+
+def test_a_rate_rule_that_reads_a_reaction_rate_is_not_rescaled():
+    """A reaction's id in math is its rate, which the rescale scales already:
+    BIOMD0000000556's rate rules read their reactions', and scaled again came
+    out 9x. Refused by name instead (and RoadRunner agrees the naive rescale is
+    wrong: it is the transform, not bngsim)."""
+    path = _sbml(
+        "reads_a_reaction",
+        "compartment C = 1; species A in C; A = 10; Z = 0; k = 0.3; J1: A -> ; k*A; Z' = J1;",
+    )
+    v = D.check_transform(_job_of("reads_a_reaction", path), "rescale_time")
+    assert v.status == "skip" and "reaction's rate" in v.note, v
+
+
+_KEYWORD_NET = """begin parameters
+    1 kcat 2.0
+    2 Km   5.0
+    3 E0   1.0
+    4 kd   if((kcat>=1)&&(kcat<10), 0.1, 0.2)
+end parameters
+begin species
+    1 E() E0
+    2 S() 20
+    3 P() 0
+end species
+begin reactions
+    1 1,2 1,3 MM kcat Km
+    2 3 0 kd
+end reactions
+begin groups
+    1 Ptot 3
+end groups
+"""
+
+
+@pytest.mark.parametrize("kind", X.TRANSFORMS)
+def test_a_net_rate_law_keyword_and_a_spaced_expression_keep_their_answer(kind):
+    """BNG's MM kcat Km is a keyword and its arguments, linear in kcat (split
+    and rescale_time scale that, mm_tqssa failed to load before), and kd's value
+    holds spaces (rename substituted only its first word, ic_derived_compound)."""
+    path = _DIR / "keyword.net"
+    path.write_text(_KEYWORD_NET)
+    v = D.check_transform(_job_of("keyword", path), kind)
+    assert v.status == "pass", v
+
+
+def test_a_parameter_named_like_an_exponent_is_renamed_outside_numbers_only():
+    """rename's substitution read the exponent of 2e1 as a parameter named e1,
+    and wrote 2mt_p1, which does not load."""
+    assert X._subst("2e1*e1 + 1E0*E0 + 1.5e1", {"e1": "p", "E0": "q"}) == "2e1*p + 1E0*q + 1.5e1"
+    path = _DIR / "exponent_names.net"
+    path.write_text(
+        "begin parameters\n    1 e1 0.5\n    2 k 2e1*e1\nend parameters\n"
+        "begin species\n    1 A() 10\n    2 B() 0\nend species\n"
+        "begin reactions\n    1 1 2 k\nend reactions\n"
+    )
+    v = D.check_transform(_job_of("exponent_names", path), "rename")
+    assert v.status == "pass", v
+
+
+def test_the_transforms_run_after_every_check_main_runs():
+    """A model's checks share its cap (#1321): four more runs ahead of main's
+    checks could tip a slow model's locale row, which the baseline holds, to
+    TIMEOUT. They run after them, as every check added since does."""
+    main = (
+        "sens_runs",
+        "sens_vs_plain",
+        "ajac_vs_fdjac",
+        "klu_vs_dense",
+        "cc_vs_interp",
+        "cc_vs_mir",
+        "locale",
+        "grid",
+        "sparsity_covers_jacobian",
+        "backend_as_asked",
+    )
+    heard = []
+    D.check_all(
+        SHAPES["equality-dwell"],
+        None,
+        (*main, *X.TRANSFORMS),
+        on_verdict=lambda c, v: heard.append(c),
+    )
+    assert set(heard) == {*main, *X.TRANSFORMS}, heard
+    assert max(heard.index(c) for c in main) < min(heard.index(k) for k in X.TRANSFORMS), heard
+
+
+def test_an_id_bngsim_respells_is_aligned_by_its_respelling():
+    """An SBML id its expressions reserve (null, In, time) is reported as
+    _ant_<id>; renamed, the map back gives the id, and twenty BioModels read as
+    species missing before."""
+    import libsbml
+
+    doc = libsbml.readSBMLFromFile(str(_AUTONOMOUS.path))
+    doc.getModel().getSpecies("P").setId("null")
+    for el in doc.getModel().getListOfAllElements():
+        el.renameSIdRefs("P", "null")
+    path = _DIR / "respelled.xml"
+    libsbml.writeSBMLToFile(doc, str(path))
+    base = _job_of("respelled", path, 20.0)
+    assert "_ant_null" in base.species_names, base.species_names
+    v = D.check_transform(base, "rename")
+    assert v.status == "pass", v
 
 
 def test_a_backend_other_than_the_one_asked_is_a_finding(monkeypatch):
