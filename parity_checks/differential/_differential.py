@@ -717,7 +717,20 @@ def check_steady(base: Base, method: str) -> Verdict:
             )
         # A run from a root does not leave it, stable or not, if nothing pushes it
         # off: zero for an autocatalyst. Its spectrum says which.
-        lam = np.linalg.eigvals(np.asarray(model.jacobian(x), dtype=float))
+        try:
+            jac = np.asarray(model.jacobian(x), dtype=float)
+        except bngsim.SimulationError as e:
+            # Model.jacobian() refuses a difference quotient whose step decides
+            # an entry (#1002): no spectrum, so stable or not is not judged, and
+            # its refusal is no finding against steady_state().
+            return Verdict(
+                "skip",
+                g,
+                f"steady_state() rests where a run from it stays, apart from the run's "
+                f"end, and its stability is not judged: {_first_line(e)}; {where} at the "
+                f"run's end; {note}",
+            )
+        lam = np.linalg.eigvals(jac)
         top = float(lam.real.max()) if lam.size else 0.0
         if top > UNSTABLE_SHARE * float(np.abs(lam).max()):
             if gap(x[keep], start[keep], floor) <= limit:

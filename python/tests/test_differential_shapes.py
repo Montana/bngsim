@@ -754,6 +754,24 @@ def test_another_stable_state_is_recorded_not_a_finding(monkeypatch):
     assert "X() at 0 against 1e-09" in v.note, v.note
 
 
+def test_a_root_whose_jacobian_is_refused_is_not_judged(monkeypatch):
+    """Model.jacobian() refuses a difference quotient whose step decides an
+    entry (#1002): the spectrum that tells an unstable root from another
+    stable state is not to be had, so the row is SKIP, said why, not an
+    EXCEPTION against steady_state()."""
+    base = D.Base(_STEADY["cubic"])
+    _plant(monkeypatch, state=np.zeros_like)
+
+    def refuses(self, y, t=0.0, **kw):
+        raise bngsim.SimulationError(
+            "Model.jacobian() does not return this difference quotient (issue #1002)"
+        )
+
+    monkeypatch.setattr(bngsim.Model, "jacobian", refuses)
+    v = D.check_steady(base, "integration")
+    assert v.status == "skip" and "stability is not judged" in v.note, v
+
+
 def test_a_root_off_the_conserved_total_is_a_finding(monkeypatch):
     """A = B = 1 is a stable root a run rests at, of the system whose A + B is
     2. This one's is 1: the solve has left it."""
