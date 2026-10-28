@@ -111,6 +111,9 @@ CHECKS = (
     "sparsity_covers_jacobian",
     "jacobian_values",
     "backend_as_asked",
+    # The SSA arm (#1310), on SSA jobs only.
+    "ssa_cc_vs_interp",
+    "ssa_backend_as_asked",
 )
 
 
@@ -136,6 +139,11 @@ class Job:
     atol: float = 1e-10
     max_steps: int = 100_000
     sim: dict = field(default_factory=dict)
+    # "ode", or "ssa" for the stochastic arm (#1310), whose replicates run at
+    # seeds seed, seed + 1, ... seed + n_rep - 1.
+    method: str = "ode"
+    n_rep: int = 0
+    seed: int = 1
 
     def as_dict(self) -> dict:
         return {
@@ -148,6 +156,9 @@ class Job:
             "atol": self.atol,
             "max_steps": self.max_steps,
             "sim": self.sim,
+            "method": self.method,
+            "n_rep": self.n_rep,
+            "seed": self.seed,
         }
 
     @classmethod
@@ -902,6 +913,151 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
     return _guard(go)
 
 
+# The SSA arm (issue #1310): checks that apply to an SSA job, and only to one.
+SSA_CHECKS = ("ssa_cc_vs_interp", "ssa_backend_as_asked")
+
+
+def checks_for(job: Job, checks=CHECKS) -> tuple[str, ...]:
+    """The checks of ``checks`` that apply to ``job``'s method."""
+    if job.method == "ssa":
+        return tuple(c for c in checks if c in SSA_CHECKS)
+    return tuple(c for c in checks if c not in SSA_CHECKS)
+
+
+def _ssa_runs(job: Job, compiled: bool, n: int | None = None) -> tuple[list[np.ndarray], set[str]]:
+    """``n`` (``job.n_rep``) SSA replicates at seeds ``job.seed`` on: the species
+    trajectories and the propensity backends they report. ``compiled`` is the
+    default Simulator (``codegen=True`` is refused for SSA: the default builds
+    cc, or mir, where a compiler is), the other ``codegen=False``."""
+    import bngsim
+
+    out, backends = [], set()
+    for i in range(job.n_rep if n is None else n):
+        kw = {} if compiled else {"codegen": False}
+        sim = bngsim.Simulator(load(job.path), method="ssa", **kw)
+        r = sim.run(t_span=(job.t_start, job.t_end), n_points=job.n_points, seed=job.seed + i)
+        out.append(np.asarray(r.species, dtype=float))
+        backends.add(r.ssa_diagnostics.get("propensity_backend", "unknown"))
+    return out, backends
+
+
+def _all_elementary(job: Job) -> bool:
+    """Every reaction mass action: the compiled and interpreted propensities
+    then compute the same doubles, and a seed's draws must agree one for one."""
+    reactions = load(job.path)._core.codegen_data()["reactions"]
+    return all(r["type"] == "elementary" for r in reactions)
+
+
+# Compiled propensities serve exact SSA on mass-action models without events,
+# up to a size (GH #190); bngsim runs every other model interpreted whatever is
+# asked, and a machine without a compiler runs them all so. In the rr_ssa
+# corpus 23 models are compiled, 8 mass-action models are not, and 235 with
+# functional laws are not.
+_NOT_COMPILED = (
+    "the default ran interpreted as well: compiled propensities serve exact SSA on "
+    "mass-action models without events, up to a size, on a machine with a compiler"
+)
+
+
+def check_ssa(job: Job, checks=SSA_CHECKS) -> dict[str, Verdict]:
+    """Compiled propensities against interpreted ones, seed for seed (#1310).
+
+    Every seed's trajectory equal is a PASS. Where they are not, a model of
+    mass-action laws alone is a DIFF (both compute the same doubles there, so
+    the event sequence must match draw for draw); any other, where rounding in
+    a functional law can change a selection, is judged in distribution, by the
+    ensemble verdict the SSA parity suites use (``differ.ensemble_verdict`` at
+    ``ensemble_k_for(n_rep)``). ``ssa_backend_as_asked`` asks that
+    ``codegen=False`` ran the interpreter and the default compiled code, as
+    ``backend_as_asked`` does for ODE."""
+    # _core, the SSA suites' statistics, sits beside this directory, which a
+    # caller that put only this one on the path does not reach.
+    parity = str(Path(__file__).resolve().parents[1])
+    if parity not in sys.path:
+        sys.path.insert(0, parity)
+    from _core import differ, oracles
+
+    out: dict[str, Verdict] = {}
+    if job.n_rep < 1:
+        # No seed to compare: no ensemble is a PASS of nothing, and no backend
+        # is a "codegen=False ran []" that is no finding either.
+        v = Verdict("skip", note=f"no replicates asked (n_rep {job.n_rep})")
+        return {c: v for c in checks}
+    try:
+        # The Simulator builds a propensity library only for a model it finds
+        # eligible, before any run: without one there is nothing compiled to tell
+        # apart, and no replicate is run (the corpus's slowest take one past the
+        # nightly's cap). #1213's class, codegen=False ignored, needs a default
+        # that compiles, so ssa_backend_as_asked has nothing to ask either.
+        import bngsim
+
+        if not getattr(bngsim.Simulator(load(job.path), method="ssa"), "_ssa_propensity_lib", ""):
+            v = Verdict("skip", note=_NOT_COMPILED)
+            return {c: v for c in checks}
+        # One replicate says whether the default compiles: most of the corpus
+        # does not, and there one each way is all either check reads, not an
+        # ensemble of each (the nightly's job has a cap).
+        comp, comp_backends = _ssa_runs(job, compiled=True, n=1)
+        if comp_backends == {"interpreted"}:
+            interp, interp_backends = _ssa_runs(job, compiled=False, n=1)
+        else:
+            interp, interp_backends = _ssa_runs(job, compiled=False)
+            comp, comp_backends = _ssa_runs(job, compiled=True)
+    except Exception as e:  # noqa: BLE001 - no base, as for ODE
+        v = Verdict("no_base", None, f"the SSA runs: {type(e).__name__}: {_first_line(e)}")
+        return {c: v for c in checks}
+    no_compiler = comp_backends == {"interpreted"}
+    if "ssa_backend_as_asked" in checks:
+        asked = {"codegen=False": sorted(interp_backends), "default": sorted(comp_backends)}
+        if interp_backends != {"interpreted"}:
+            out["ssa_backend_as_asked"] = Verdict(
+                "diff", None, f"codegen=False ran {sorted(interp_backends)}", asked
+            )
+        elif no_compiler:
+            out["ssa_backend_as_asked"] = Verdict("skip", note=_NOT_COMPILED, extra=asked)
+        else:
+            out["ssa_backend_as_asked"] = Verdict(
+                "pass",
+                note=f"codegen=False interpreted; default {sorted(comp_backends)}",
+                extra=asked,
+            )
+    if "ssa_cc_vs_interp" in checks:
+        out["ssa_cc_vs_interp"] = _guard(
+            lambda: _ssa_verdict(job, interp, comp, no_compiler, differ, oracles)
+        )
+    return out
+
+
+def _ssa_verdict(job, interp, comp, no_compiler, differ, oracles) -> Verdict:
+    if no_compiler:
+        return Verdict("skip", note=_NOT_COMPILED)
+    differing = [
+        i for i, (a, b) in enumerate(zip(interp, comp, strict=True)) if not np.array_equal(a, b)
+    ]
+    n = len(interp)
+    if not differing:
+        return Verdict("pass", 0.0, f"all {n} seeds identical, draw for draw")
+    if _all_elementary(job):
+        i = differing[0]
+        return Verdict(
+            "diff",
+            float(len(differing)),
+            f"mass-action laws alone, and {len(differing)} of {n} seeds differ "
+            f"(first at seed {job.seed + i})",
+            {"seeds_differing": [job.seed + j for j in differing]},
+        )
+    mean_a, sem_a = oracles.ensemble_stats(np.stack(interp))
+    mean_b, sem_b = oracles.ensemble_stats(np.stack(comp))
+    k = differ.ensemble_k_for(n)
+    v = differ.ensemble_verdict(mean_a, sem_a, mean_b, sem_b, k=k)
+    note = (
+        f"{len(differing)} of {n} seeds differ draw for draw (functional laws); in "
+        f"distribution {v['frac_pass']:.3f} of cells within {k:.2f} SE, max z {v['max_z']:.2f}"
+    )
+    extra = {"seeds_differing": len(differing), "frac_pass": v["frac_pass"], "max_z": v["max_z"]}
+    return Verdict("pass" if v["passed"] else "diff", v["max_z"], note, extra)
+
+
 def check_all(
     job: Job,
     locale_name: str | None,
@@ -920,6 +1076,8 @@ def check_all(
     global _DEADLINE
     _DEADLINE = deadline
     try:
+        # Only the checks the job's method has: an SSA job the SSA arm's.
+        checks = checks_for(job, checks)
         return _check_all(job, locale_name, checks, on_verdict or (lambda c, v: None))
     finally:
         _DEADLINE = None
@@ -942,6 +1100,10 @@ class _Heard(dict):
 
 
 def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[str, Verdict]:
+    if job.method == "ssa":
+        heard = _Heard(on_verdict)
+        heard.update(check_ssa(job, checks))
+        return dict(heard)
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001

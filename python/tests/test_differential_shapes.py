@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import json
 import shutil
 import sys
 import tempfile
@@ -53,7 +54,8 @@ import _differential as D  # noqa: E402
 
 antimony = pytest.importorskip("antimony")
 
-CHECKS = tuple(c for c in D.CHECKS if c != "locale")
+# The ODE checks: the SSA arm (#1310) runs on SSA jobs, which the shapes are not.
+CHECKS = tuple(c for c in D.CHECKS if c != "locale" and c not in D.SSA_CHECKS)
 _DIR = Path(tempfile.mkdtemp(prefix="bngsim-differential-shapes-"))
 atexit.register(shutil.rmtree, _DIR, ignore_errors=True)
 
@@ -898,3 +900,177 @@ def test_a_compile_past_bngsims_limit_is_a_timeout_not_a_crash(error):
     v = D._verdict_of(error)
     assert v.status == "timeout", v
     assert D._verdict_of(RuntimeError("Codegen compilation failed: syntax")).status == "exception"
+
+
+# ── The SSA arm (#1310): compiled propensities against interpreted ones ──
+
+_DIMER = """begin parameters
+    1 k 0.01
+    2 kd 0.5
+end parameters
+begin species
+    1 A() 100
+    2 B() 0
+end species
+begin reactions
+    1 1,1 2 k
+    2 2 1,1 kd
+end reactions
+"""
+
+
+def _ssa_job(n_rep=10):
+    path = _DIR / "dimer_ssa.net"
+    path.write_text(_DIMER)
+    return D.Job("dimer", path, 0.0, 5.0, 11, method="ssa", n_rep=n_rep, seed=1)
+
+
+def _compiled_here():
+    r = bngsim.Simulator(D.load(_ssa_job().path), method="ssa").run(
+        t_span=(0, 1), n_points=2, seed=1
+    )
+    return r.ssa_diagnostics["propensity_backend"] != "interpreted"
+
+
+def test_an_ssa_job_runs_the_ssa_checks_and_an_ode_job_does_not():
+    assert set(D.checks_for(_ssa_job())) == set(D.SSA_CHECKS)
+    assert not set(D.checks_for(SHAPES["equality-dwell"])) & set(D.SSA_CHECKS)
+
+
+def test_compiled_and_interpreted_mass_action_agree_draw_for_draw():
+    if not _compiled_here():
+        pytest.skip("no C compiler: the default SSA runs interpreted too")
+    v = D.check_all(_ssa_job(), None)
+    assert v["ssa_cc_vs_interp"].status == "pass" and "draw for draw" in v["ssa_cc_vs_interp"].note
+    assert v["ssa_backend_as_asked"].status == "pass", v["ssa_backend_as_asked"]
+
+
+def _perturbed_compiled(monkeypatch, factor):
+    """One propensity perturbed, on the compiled side only: its rate constant
+    k scaled by ``factor`` in the models the compiled runs load."""
+    real_runs, real_load = D._ssa_runs, D.load
+    on = []
+
+    def load(path):
+        model = real_load(path)
+        if on:
+            model.set_param("k", factor * float(model.get_param("k")))
+        return model
+
+    def runs(job, compiled, n=None):
+        on[:] = [True] if compiled else []
+        try:
+            return real_runs(job, compiled, n)
+        finally:
+            on[:] = []
+
+    monkeypatch.setattr(D, "load", load)
+    monkeypatch.setattr(D, "_ssa_runs", runs)
+
+
+def test_one_perturbed_propensity_is_a_finding(monkeypatch):
+    """The issue's negative control: mass-action laws alone, so one draw off
+    is a DIFF. 1% off one rate constant moves draws in every seed here (a
+    change of 1e-9 moves none: it shifts each event time by as little, which
+    crosses no sample)."""
+    if not _compiled_here():
+        pytest.skip("no C compiler: the default SSA runs interpreted too")
+    _perturbed_compiled(monkeypatch, 1.01)
+    v = D.check_all(_ssa_job(), None)["ssa_cc_vs_interp"]
+    assert v.status == "diff" and "mass-action" in v.note, v
+
+
+def test_functional_laws_are_judged_in_distribution(monkeypatch):
+    """Where rounding in a functional law may change a selection, the seeds
+    may differ and the ensembles must not: the same ensemble at other seeds
+    passes, one with a propensity doubled does not."""
+    if not _compiled_here():
+        pytest.skip("no C compiler: the default SSA runs interpreted too")
+    monkeypatch.setattr(D, "_all_elementary", lambda job: False)
+    real = D._ssa_runs
+
+    def other_seeds(job, compiled, n=None):
+        if compiled:
+            job = D.Job(**{**job.__dict__, "seed": job.seed + 1000})
+        return real(job, compiled, n)
+
+    monkeypatch.setattr(D, "_ssa_runs", other_seeds)
+    same = D.check_all(_ssa_job(n_rep=30), None)["ssa_cc_vs_interp"]
+    assert same.status == "pass" and "in distribution" in same.note, same
+    monkeypatch.setattr(D, "_ssa_runs", real)
+    _perturbed_compiled(monkeypatch, 3.0)
+    moved = D.check_all(_ssa_job(n_rep=30), None)["ssa_cc_vs_interp"]
+    assert moved.status == "diff" and "in distribution" in moved.note, moved
+
+
+def test_codegen_false_that_runs_compiled_propensities_is_a_finding(monkeypatch):
+    real = D._ssa_runs
+
+    def lies(job, compiled, n=None):
+        out, backends = real(job, compiled, n)
+        return out, ({"cc"} if not compiled else backends)
+
+    monkeypatch.setattr(D, "_ssa_runs", lies)
+    v = D.check_all(_ssa_job(), None)["ssa_backend_as_asked"]
+    assert v.status == "diff" and "codegen=False ran" in v.note, v
+
+
+def test_a_model_without_a_propensity_library_runs_no_replicate(monkeypatch):
+    """Most of the corpus is not eligible for compiled propensities, which the
+    Simulator decides before any run: there is nothing to tell apart, and the
+    corpus's slowest take one replicate past the nightly's cap."""
+    import bngsim._codegen
+
+    asked = []
+    monkeypatch.setattr(bngsim._codegen, "prepare_ssa_propensity_lib", lambda model: None)
+    monkeypatch.setattr(D, "_ssa_runs", lambda *a, **kw: asked.append(a) or ([], set()))
+    v = D.check_all(_ssa_job(n_rep=10), None)
+    assert asked == [], asked
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
+
+
+def test_a_library_the_engine_declines_takes_one_replicate_each_way(monkeypatch):
+    """Where the Simulator built a library and the engine still runs the
+    interpreter (it declines events, functional laws and large networks),
+    one replicate of each decides both checks, not an ensemble of each."""
+    if not _compiled_here():
+        pytest.skip("no C compiler: no propensity library is built")
+    real, asked = D._ssa_runs, []
+
+    def interpreted(job, compiled, n=None):
+        asked.append((compiled, job.n_rep if n is None else n))
+        out, _ = real(job, False, n)
+        return out, {"interpreted"}
+
+    monkeypatch.setattr(D, "_ssa_runs", interpreted)
+    v = D.check_all(_ssa_job(n_rep=10), None)
+    assert asked == [(True, 1), (False, 1)], asked
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
+
+
+def test_an_ssa_job_with_no_replicates_is_skipped_not_judged(tmp_path):
+    """Job's n_rep defaults to 0: two empty ensembles read PASS, "all 0 seeds
+    identical", and no backend read DIFF, "codegen=False ran []". Nothing was
+    compared, so both are SKIP, said why; the runner refuses --max-reps 0."""
+    import differential_run as RUN
+
+    v = D.check_all(_ssa_job(n_rep=0), None)
+    assert {c: x.status for c, x in v.items()} == dict.fromkeys(D.SSA_CHECKS, "skip"), v
+    assert all("no replicates" in x.note for x in v.values()), v
+    # An empty corpus, so a runner that took --max-reps 0 returns at once.
+    empty = ["--fd-sens-jobs", "", "--rr-jobs", "", "--ssa-jobs", "", "--no-locale"]
+    with pytest.raises(SystemExit):
+        RUN.main([*empty, "--max-reps", "0", "--out", str(tmp_path / "r.json")])
+
+
+def test_the_runner_reads_rr_ssas_jobs_as_ssa_jobs(tmp_path):
+    import differential_run as RUN
+
+    (tmp_path / "m.net").write_text(_DIMER)
+    manifest = tmp_path / "ssa_jobs.json"
+    params = {"t_start": 0.0, "t_end": 5.0, "n_points": 1001, "seed": 7, "n_rep": 50}
+    manifest.write_text(
+        json.dumps({"jobs": [{"model_id": "m", "model": "m.net", "params": params}]})
+    )
+    (job,) = RUN.ssa_jobs(manifest, 0, 101, 20)
+    assert (job.method, job.n_points, job.n_rep, job.seed) == ("ssa", 101, 20, 7)

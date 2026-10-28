@@ -30,6 +30,8 @@ at its own tolerances:
 * ``fd_sens/fd_sens_jobs.json``: the 53 committed ``.net`` models;
 * ``rr_parity/ode_jobs.json``: the BioModels the nightly's corpus job fetched,
   those present and under ``--max-bytes``, at most ``--max-points`` samples;
+* ``rr_parity/ssa_jobs.json`` (``--ssa-jobs``): rr_ssa's models, as SSA jobs at
+  their own window and seed, at most ``--max-reps`` replicates (#1310);
 * ``--net-dir``: every ``.net`` under a directory, and ``--model-list``: a file
   of model paths, each over ``--default-span``.
 
@@ -64,6 +66,9 @@ from _core.versions import git_rev  # noqa: E402
 
 FD_SENS_JOBS = HERE.parent / "fd_sens" / "fd_sens_jobs.json"
 RR_JOBS = HERE.parent / "rr_parity" / "ode_jobs.json"
+# The SSA arm's corpus (#1310): rr_ssa's jobs, each at its own window and seed.
+SSA_JOBS = HERE.parent / "rr_parity" / "ssa_jobs.json"
+DEFAULT_MAX_REPS = 20
 REFERENCE_ENGINE = "bngsim_paths"
 DEFAULT_TIMEOUT = 600.0
 #: The share of a model's cap its checks may use before the pool kills it: the
@@ -120,6 +125,31 @@ def rr_jobs(path: Path, max_bytes: int, max_points: int) -> list[D.Job]:
                 min(int(p["n_points"]), max_points),
                 float(p["rtol"]),
                 float(p["atol"]),
+            )
+        )
+    return out
+
+
+def ssa_jobs(path: Path, max_bytes: int, max_points: int, max_reps: int) -> list[D.Job]:
+    """rr_ssa's SBML jobs whose model is on disk and no larger than
+    ``max_bytes``, as SSA jobs: their own window and seed, at most
+    ``max_points`` samples and ``max_reps`` replicates."""
+    out = []
+    for j in json.loads(path.read_text())["jobs"]:
+        model = path.parent / j["model"]
+        if not model.is_file() or (max_bytes and model.stat().st_size > max_bytes):
+            continue
+        p = j["params"]
+        out.append(
+            D.Job(
+                j["model_id"],
+                model,
+                float(p.get("initial_time", p["t_start"])),
+                float(p["t_end"]),
+                min(int(p["n_points"]), max_points),
+                method="ssa",
+                n_rep=min(int(p.get("n_rep", max_reps)), max_reps),
+                seed=int(p.get("seed", 1)),
             )
         )
     return out
@@ -245,6 +275,8 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--fd-sens-jobs", default=str(FD_SENS_JOBS))
     ap.add_argument("--rr-jobs", default=str(RR_JOBS), help="'' leaves the BioModels out")
+    ap.add_argument("--ssa-jobs", default=str(SSA_JOBS), help="'' leaves the SSA arm out")
+    ap.add_argument("--max-reps", type=int, default=DEFAULT_MAX_REPS, help="SSA replicates")
     ap.add_argument("--net-dir", action="append", default=[], help="every .net under it")
     ap.add_argument("--model-list", action="append", default=[], help="a file of model paths")
     ap.add_argument("--default-span", type=float, nargs=2, default=(0.0, 10.0))
@@ -258,6 +290,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-locale", action="store_true", help="leave the locale check out")
     ap.add_argument("--models", default="", help="comma-separated model_id substrings")
     args = ap.parse_args(argv)
+    if args.max_reps < 1:
+        ap.error(f"--max-reps must be at least 1, got {args.max_reps}")
 
     checks = [c for c in args.checks.split(",") if c and not (args.no_locale and c == "locale")]
     unknown = sorted(set(checks) - set(D.CHECKS))
@@ -278,14 +312,17 @@ def main(argv=None) -> int:
     jobs = fd_sens_jobs(Path(args.fd_sens_jobs)) if args.fd_sens_jobs else []
     if args.rr_jobs:
         jobs += rr_jobs(Path(args.rr_jobs), args.max_bytes, args.max_points)
+    if args.ssa_jobs:
+        jobs += ssa_jobs(Path(args.ssa_jobs), args.max_bytes, args.max_points, args.max_reps)
     for d in args.net_dir:
         jobs += net_dir_jobs(Path(d).resolve(), tuple(args.default_span))
     for f in args.model_list:
         jobs += list_jobs(Path(f), tuple(args.default_span))
     seen, unique = set(), []
-    for j in jobs:  # the first manifest to name a model keeps it
-        if j.model_id not in seen and j.path.resolve() not in seen:
-            seen |= {j.model_id, j.path.resolve()}
+    for j in jobs:  # the first manifest to name a model keeps it, per method
+        ids = {(j.method, j.model_id), (j.method, j.path.resolve())}
+        if not ids & seen:
+            seen |= ids
             unique.append(j)
     if args.models:
         subs = [s.strip() for s in args.models.split(",") if s.strip()]
@@ -295,9 +332,10 @@ def main(argv=None) -> int:
     atexit.register(shutil.rmtree, kept, ignore_errors=True)
     specs = [
         {
-            "key": j.model_id,
+            "key": j.model_id if j.method == "ode" else f"{j.model_id}:{j.method}",
             "job": j.as_dict(),
-            "checks": checks,
+            # A job runs the checks its method has: an SSA job the SSA arm's.
+            "checks": list(D.checks_for(j, checks)),
             "locale": locale,
             "max_species": args.max_species,
             "timeout": args.timeout,
