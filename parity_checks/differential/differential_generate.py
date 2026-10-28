@@ -107,9 +107,26 @@ def investigate(spec: dict) -> dict:
                         got = find(m, spec, work, (check,))
                         return got is not None and _kind(got[check]) == want
 
+                    # The model as found, written before shrinking, which this
+                    # seed's cap also covers: a seed killed mid-shrink leaves it.
+                    name = f"{spec['format']}_{spec['seed']}_{check}"
+                    found = G.write(model, Path(spec["repro_dir"]) / name)
+                    found.with_suffix(".json").write_text(
+                        json.dumps(
+                            {
+                                "seed": spec["seed"],
+                                "check": check,
+                                "status": v.status,
+                                "note": v.note[:500],
+                                "size": G.size(model),
+                                "shrunk_size": None,
+                                "reproducer": str(found),
+                            },
+                            indent=1,
+                        )
+                    )
                     small = G.shrink(model, holds, spec["shrink_budget"])
                     final = find(small, spec, work, (check,))
-                    name = f"{spec['format']}_{spec['seed']}_{check}"
                     repro = G.write(small, Path(spec["repro_dir"]) / name)
                     res["findings"].append(
                         {
@@ -168,12 +185,19 @@ def run(specs: list[dict], workers: int, timeout: float) -> list[dict]:
             if done or not p.is_alive() or time.monotonic() - t0 > timeout:
                 res = q.get() if not q.empty() else None
                 if res is None:
+                    # Still running at the cap is a timeout; gone without a
+                    # result is a crash (a segfault in bngsim), the finding a
+                    # generator is for, and not to be read as slowness.
+                    alive = p.is_alive()
                     p.kill()
+                    p.join(timeout=5)
                     res = {
                         "seed": spec["seed"],
                         "format": spec["format"],
-                        "status": "timeout" if p.is_alive() or done is False else "dead",
+                        "status": "timeout" if alive else "dead",
                     }
+                    if not alive:
+                        res["exitcode"] = p.exitcode
                 p.join(timeout=5)
                 out.append(res)
                 running.remove(item)

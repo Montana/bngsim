@@ -338,17 +338,34 @@ def size(model: Model) -> int:
     return sum(len(list(_nodes(rx.law))) for rx in model.reactions) + len(model.reactions)
 
 
+def _named_leaves(model: Model) -> int:
+    return sum(
+        1
+        for rx in model.reactions
+        for _, n in _nodes(rx.law)
+        if n.op in ("par", "obs", "time", "rateof")
+    )
+
+
+def _smaller(a: Model, b: Model) -> bool:
+    """``a`` is smaller than ``b``: fewer nodes, or as many and fewer leaves
+    that name something (a parameter, a species, the clock), which a number in
+    its place leaves the same size."""
+    return (size(a), _named_leaves(a)) < (size(b), _named_leaves(b))
+
+
 def shrink(model: Model, holds: Callable[[Model], bool], budget: int = 400) -> Model:
-    """The smallest model, by :func:`size`, that ``holds`` still holds of,
-    reached by taking the first candidate cut that keeps it, until no cut does
-    or ``budget`` evaluations are spent. ``holds(model)`` is assumed true."""
+    """The smallest model, by :func:`size` and then by the leaves that name
+    something, that ``holds`` still holds of, reached by taking the first
+    candidate cut that keeps it, until no cut does or ``budget`` evaluations
+    are spent. ``holds(model)`` is assumed true."""
     spent = 0
     while spent < budget:
         for cand in _candidates(model):
             spent += 1
             if spent > budget:
                 break
-            if size(cand) < size(model) and holds(cand):
+            if _smaller(cand, model) and holds(cand):
                 model = cand
                 break
         else:

@@ -682,6 +682,8 @@ def test_a_compile_past_bngsims_limit_is_a_timeout_not_a_crash(error):
     v = D._verdict_of(error)
     assert v.status == "timeout", v
     assert D._verdict_of(RuntimeError("Codegen compilation failed: syntax")).status == "exception"
+
+
 # ── Generated models and the shrinker (#1306) ──
 
 import _generate as G  # noqa: E402
@@ -757,6 +759,16 @@ def test_the_shrinker_cuts_down_to_what_still_finds():
     assert G.size(small) <= 3 < G.size(model), (G.size(small), G.size(model))
 
 
+def test_the_shrinker_replaces_a_named_leaf_by_a_number():
+    """A leaf that names a species, a parameter or the clock, replaced by a
+    number, is no fewer nodes, and the shrinker refused every such cut: a
+    reproducer kept its observables and its time() for nothing."""
+    law = G.Node("floor", [G.Node("obs", value=0)])
+    model = G.Model("net", [2.0, 1.0], [0.7, 0.4], [G.Reaction([0], [1], law)])
+    small = G.shrink(model, lambda m: "floor" in _ops(m))
+    assert _ops(small) == ["floor", "num"], _ops(small)
+
+
 def _spec(tmp_path, seed, checks=("cc_vs_interp",)):
     return {
         "seed": seed,
@@ -800,3 +812,43 @@ def test_no_finding_is_reported_where_every_check_passes(tmp_path, monkeypatch):
     monkeypatch.setattr(D, "check_cc_vs_interp", lambda base: D.Verdict("pass", 0.0, ""))
     res = GEN.investigate(_spec(tmp_path, 3))
     assert res["status"] == "done" and res["findings"] == [], res
+
+
+def _plant_rint(monkeypatch):
+    """cc_vs_interp reads DIFF on any model whose text has a rint() in it."""
+
+    def planted(base):
+        if "rint(" in Path(base.job.path).read_text():
+            return D.Verdict("diff", 1.0, "planted: rint() spelled differently")
+        return D.Verdict("pass", 0.0, "")
+
+    monkeypatch.setattr(D, "check_cc_vs_interp", planted)
+
+
+def test_a_finding_is_written_before_it_is_shrunk(tmp_path, monkeypatch):
+    """The seed's cap covers the shrink, up to its budget of check runs: a
+    seed killed mid-shrink left no reproducer at all. The model as found is
+    written first, its note saying it is not shrunk."""
+    import json
+
+    seed = next(s for s in range(200) if "rint" in _ops(G.generate(s, "net")))
+    _plant_rint(monkeypatch)
+
+    def killed(*a, **kw):
+        raise RuntimeError("killed mid-shrink (planted)")
+
+    monkeypatch.setattr(G, "shrink", killed)
+    res = GEN.investigate(_spec(tmp_path, seed))
+    assert res["status"] == "error", res
+    note = json.loads((tmp_path / f"net_{seed}_cc_vs_interp.json").read_text())
+    assert note["shrunk_size"] is None and note["check"] == "cc_vs_interp", note
+    assert "rint(" in Path(note["reproducer"]).read_text()
+
+
+def test_a_worker_that_dies_is_dead_not_a_timeout(monkeypatch):
+    """A worker gone without a result (a segfault in bngsim looks so) is a
+    crash, the finding a generator is for; it read as a timeout, at once."""
+    # print takes (spec, q), puts nothing on the queue, and returns: exit 0.
+    monkeypatch.setattr(GEN, "_worker", print)
+    (res,) = GEN.run([{"seed": 0, "format": "net"}], workers=1, timeout=60)
+    assert res["status"] == "dead" and res["exitcode"] == 0, res
