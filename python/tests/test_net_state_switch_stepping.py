@@ -34,7 +34,10 @@ What this locks:
      one on an unstable surface all keep main's answers; a residual parked at
      exactly 0.0 is not read as a second root; and a real crossing on a curved
      residual, whose window opens and closes inside one step, still restarts;
-  7. a residual too deep for ``ast.unparse`` keeps every root, and one that
+  7. the band a crossing has to clear is what CVODE's error weights hold each
+     species to, added in quadrature (issue #907): a window on an observable
+     over a thousand species, and one under a tracking atol, are integrated;
+  8. a residual too deep for ``ast.unparse`` keeps every root, and one that
      starts at exactly zero does not print a SUNDIALS warning.
 """
 

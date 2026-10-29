@@ -373,8 +373,8 @@ struct StateSwitchHold {
     std::vector<double> tested_to;
     double rtol = 0.0;
     // The run's tracking atol, which the band reads where it is on (issue #907).
-    const AtolTracking *tracking = nullptr;
-    static inline const AtolTracking kNoTracking{};
+    // Held by value: inactive (empty) until run() copies the run's in.
+    AtolTracking tracking;
     int n_held = 0;
     // The run's logger, while a hold has its error log in the null sink.
     SUNLogger muted = nullptr;
@@ -420,9 +420,8 @@ struct StateSwitchHold {
         }
         const double band = state_switch_band(held_terms.size(), [&](std::size_t s) {
             const Term &k = held_terms[s];
-            return k.weight * tolerance_unit(tracking != nullptr ? *tracking : kNoTracking, rtol,
-                                             k.atol, static_cast<std::size_t>(k.species),
-                                             x[k.species]);
+            return k.weight * tolerance_unit(tracking, rtol, k.atol,
+                                             static_cast<std::size_t>(k.species), x[k.species]);
         });
         if (!(band > 0.0)) {
             return -1.0;
@@ -9843,15 +9842,15 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(
         // the rule alone could hold it tighter than CVODE did. So under
         // tracking the unit is no narrower than those weights. Without
         // tracking the atol floors both, and the rule alone is main's band.
+        // The weights land in scratch, which nothing has read yet, and are
+        // copied out before the first reading writes it.
         std::vector<double> step_unit;
-        if (tracking.active()) {
-            NVectorGuard ewt(N_VClone(scratch));
-            if (CVodeGetErrWeights(cvode_mem, ewt) == CV_SUCCESS) {
-                const double *w = ewt.data();
-                step_unit.assign(static_cast<std::size_t>(ns), 0.0);
-                for (int i = 0; i < ns; ++i)
-                    step_unit[static_cast<std::size_t>(i)] =
-                        w[i] > 0.0 ? 1.0 / w[i] : std::numeric_limits<double>::infinity();
+        if (tracking.active() && CVodeGetErrWeights(cvode_mem, scratch) == CV_SUCCESS) {
+            const double *w = N_VGetArrayPointer(scratch);
+            step_unit.assign(static_cast<std::size_t>(ns), 0.0);
+            for (int i = 0; i < ns; ++i) {
+                step_unit[static_cast<std::size_t>(i)] =
+                    w[i] > 0.0 ? 1.0 / w[i] : std::numeric_limits<double>::infinity();
             }
         }
         auto unit_of = [&](int j, double xj) {
@@ -14073,7 +14072,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         state_switch_hold.run.assign(n_ss, 0);
         state_switch_hold.last_step.assign(n_ss, 0);
         state_switch_hold.rtol = rtol;
-        state_switch_hold.tracking = &user_data.atol_tracking;
+        state_switch_hold.tracking = user_data.atol_tracking;
         user_data.state_switch_hold = &state_switch_hold;
     }
     const int n_roots = n_events + n_disc + n_state_switch;
@@ -17341,6 +17340,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             const NetworkModel::StateSwitch &sw = *state_switches[jx];
                             const double k_resolve = state_switch_resolve_factor(ns);
                             std::vector<StateSwitchHold::Term> terms;
+                            std::vector<double> units; // each term's tolerance_unit at x0
                             bool measurable = true;
                             for (int sp : sw.species) {
                                 const auto sx = static_cast<size_t>(sp);
@@ -17355,19 +17355,21 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                 term.weight = w;
                                 term.atol = atol_v.empty() ? atol : atol_v[sx];
                                 term.x0 = y_data[sp];
-                                term.drift = kStateSwitchHoldShare * k_resolve *
-                                             tolerance_unit(user_data.atol_tracking, rtol,
-                                                            term.atol, sx, term.x0);
+                                const double unit = tolerance_unit(user_data.atol_tracking, rtol,
+                                                                   term.atol, sx, term.x0);
+                                term.drift = kStateSwitchHoldShare * k_resolve * unit;
                                 measurable = measurable && term.drift > 0.0;
                                 terms.push_back(term);
+                                units.push_back(unit);
                             }
-                            // Half the restart test's band, as it reads it (issue
-                            // #907): the error weight's rule, in quadrature.
+                            // Half the restart test's band at the root (issue #907):
+                            // the error weight's rule, in quadrature. Under a
+                            // tracking atol the test also floors each unit at the
+                            // step's error weights and this does not, so it is at
+                            // most half, the side that keeps the band under the
+                            // test's.
                             const double band = state_switch_band(terms.size(), [&](std::size_t s) {
-                                const StateSwitchHold::Term &k = terms[s];
-                                return k.weight *
-                                       tolerance_unit(user_data.atol_tracking, rtol, k.atol,
-                                                      static_cast<size_t>(k.species), k.x0);
+                                return terms[s].weight * units[s];
                             });
                             // flow_carries_state_switch left the model at the root.
                             const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
