@@ -702,9 +702,17 @@ if(BNGSIM_ENABLE_MIR)
         # their reach, so code mapped on its own is correct too: the size is
         # address space only. 0 reserves nothing. Windows keeps MIR's own 0.
         set(BNGSIM_MIR_CODE_RESERVE_MB "32" CACHE STRING
-            "Address space in MB each MIR context reserves for its code (issue #1215; 0 = none)")
+            "Address space in MB each MIR context reserves for its code (issue #1215; 0 = none, at most 2048)")
         if(NOT BNGSIM_MIR_CODE_RESERVE_MB MATCHES "^[0-9]+$")
             message(FATAL_ERROR "BNGSIM_MIR_CODE_RESERVE_MB must be a whole number of MB, "
+                                "not '${BNGSIM_MIR_CODE_RESERVE_MB}'")
+        endif()
+        # x86-64's ±2 GB is the farthest any MIR target's direct branches reach,
+        # so a larger reservation keeps no more code in reach. And math(EXPR) is
+        # 64-bit: from 2^43 MB up it wraps the byte count to a negative or zero
+        # size, which MIR would quietly turn into no reservation at all.
+        if(BNGSIM_MIR_CODE_RESERVE_MB GREATER 2048)
+            message(FATAL_ERROR "BNGSIM_MIR_CODE_RESERVE_MB must be at most 2048 MB, "
                                 "not '${BNGSIM_MIR_CODE_RESERVE_MB}'")
         endif()
         if(NOT WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)

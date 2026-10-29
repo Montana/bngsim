@@ -204,6 +204,16 @@ def test_cmake_sizes_the_mir_code_reservation():
     text = CMAKE_LISTS.read_text()
     assert 'set(BNGSIM_MIR_CODE_RESERVE_MB "32" CACHE STRING' in text
     assert "MIR_CODE_RESERVE_SIZE=${BNGSIM_MIR_CODE_RESERVE_BYTES}" in text
-    # The vendored default it overrides is still upstream's, so a refresh that
-    # moves it is seen here.
-    assert "#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)" in (MIR_DIR / "mir.c").read_text()
+    assert "if(BNGSIM_MIR_CODE_RESERVE_MB GREATER 2048)" in text
+    # The vendored default it overrides is still upstream's, under the #ifndef
+    # that lets the define override it, so a refresh that moves either is seen
+    # here. bngsim_mir compiles with -w: without the guard, mir.c's own #define
+    # would replace CMake's with no warning, and every context would reserve
+    # 128 MB again.
+    mir_c = (MIR_DIR / "mir.c").read_text()
+    assert (
+        "#ifndef MIR_CODE_RESERVE_SIZE\n"
+        "#if UINTPTR_MAX == 0xffffffffffffffffu && !defined(_WIN32)\n"
+        "#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)\n"
+    ) in mir_c
+    assert mir_c.count("#define MIR_CODE_RESERVE_SIZE") == 2
