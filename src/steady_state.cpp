@@ -378,7 +378,7 @@ struct SteadyStateUserData {
     AtolTracking atol_tracking;
     // The run test's GH #135 retry (issue #1357): on for the run test alone,
     // which then integrates as the time course does; see ss_eval_rhs. Its
-    // slots and clamped state are built on the first non-finite f.
+    // slots and clamped state are built on the first NaN f.
     bool clamp_nonfinite = false;
     std::vector<char> nonneg_mask;
     std::vector<double> nonneg_scratch;
@@ -836,28 +836,33 @@ static const double *ss_clamped_state(SteadyStateUserData *data, const double *y
     return data->nonneg_scratch.data();
 }
 
-static bool ss_any_nonfinite(const double *v, std::size_t n) {
-    for (std::size_t i = 0; i < n; ++i)
-        if (!std::isfinite(v[i]))
-            return true;
-    return false;
+// A NaN, and no infinity, in v.
+static bool ss_nan_and_no_inf(const double *v, std::size_t n) {
+    bool nan = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (std::isinf(v[i]))
+            return false;
+        nan = nan || std::isnan(v[i]);
+    }
+    return nan;
 }
 
 // f for the march. In the run test (clamp_nonfinite), with the time course's
-// GH #135 retry (issue #1357): where f is not finite, it is taken again at the
+// GH #135 retry (issue #1357): where f is NaN, it is taken again at the
 // nonnegative-clamped state, and only then, so a model whose f is finite is
-// run as before to the bit. A species at 0 that a corrector iterate takes an
-// ulp below it makes a fractional power of it NaN, for any step:
-// glioblastoma_egfrviii raises AKT(s~P) to 3.5, and the compiled march came to
-// it at exactly 0 on x86-64 Linux. CVODE could not take one step from there on
-// either Jacobian, the run test measured inf, and a state at residual 2e-40 was
-// refused, though Simulator.run from it, which clamps, moves nothing. The march
-// itself is left unclamped: its residual is not clamped, and a march that went
-// on through such a state ended at one where the residual was NaN.
+// run as before to the bit. An infinite f is left as it was: the time course
+// spares a slot it reads at a pole (spare_at_pole, BIOMD0000000338), and a run
+// test that met one was refused before and still is. A species at 0 that a corrector iterate takes
+// an ulp below it makes a fractional power of it NaN, for any step: glioblastoma_egfrviii raises
+// AKT(s~P) to 3.5, and the compiled march came to it at exactly 0 on x86-64 Linux. CVODE could not
+// take one step from there on either Jacobian, the run test measured inf, and a state at residual
+// 2e-40 was refused, though Simulator.run from it, which clamps, moves nothing. The march itself is
+// left unclamped: its residual is not clamped, and a march that went on through such a state ended
+// at one where the residual was NaN.
 static void ss_eval_rhs(SteadyStateUserData *data, double t, const double *y, double *ydot) {
     data->rhs->eval(t, y, ydot);
     const auto un = static_cast<std::size_t>(data->model->n_species());
-    if (data->clamp_nonfinite && ss_any_nonfinite(ydot, un))
+    if (data->clamp_nonfinite && ss_nan_and_no_inf(ydot, un))
         data->rhs->eval(t, ss_clamped_state(data, y), ydot);
 }
 
@@ -992,7 +997,7 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix
 // of that issue's tests, the march on this quotient ended where the closed
 // form's did, and KLU's ordering kept a species held at 0 there.
 static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
-                                     N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+                                     N_Vector tmp1, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const int ns = data->model->n_species();
     // Bare accessor: the marcher materialized the coloring before installing
@@ -1001,15 +1006,25 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
 
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
 
+    // Each column's step as the march's dense quotient takes it, on its error
+    // weights (in tmp1, CVODE's scratch for this callback) and its step (#1254),
+    // so the two routes of one march form one matrix.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
     // Sized once, when the callback was selected, so this hot path allocates
-    // nothing per Jacobian evaluation.
-    // f as the march takes it (ss_eval_rhs), so the quotient is formed from
-    // the f that fy is.
+    // nothing per Jacobian evaluation. f as the march takes it (ss_eval_rhs),
+    // so the quotient is formed from the f that fy is.
     colored_fd_jacobian(
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [data](double tt, const double *yy, double *ydot) { ss_eval_rhs(data, tt, yy, ydot); });
+        [data](double tt, const double *yy, double *ydot) { ss_eval_rhs(data, tt, yy, ydot); },
+        nullptr, nullptr, ewt, min_inc);
     return 0;
 }
 
@@ -1431,8 +1446,8 @@ class SteadyStateMarcher {
     // at most.
     void allow_error_test_failures(int n) { CVodeSetMaxErrTestFails(cvode_mem_, n); }
 
-    // Retry a non-finite f at the clamped state, as the time course does
-    // (GH #135), for the run test (issue #1357; ss_eval_rhs).
+    // Retry a NaN f at the clamped state, as the time course does (GH #135),
+    // for the run test (issue #1357; ss_eval_rhs).
     void clamp_nonfinite_as_the_time_course() { ud_.clamp_nonfinite = true; }
 
     // Make the marches of this session a run that is taken on: `steps` steps
@@ -1556,6 +1571,9 @@ class SteadyStateMarcher {
                 ud_.fd_y_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_fy_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_h_vals.assign(static_cast<size_t>(ns_), 0.0);
+                // Each column's step on the march's error weights, as the
+                // dense quotient takes it (#1254).
+                ud_.dq_cvode_mem = cvode_mem_;
             }
             if (CVodeSetJacFn(cvode_mem_, analytical ? cvode_ss_sparse_jac
                                                      : cvode_ss_colored_jac) != CV_SUCCESS) {
