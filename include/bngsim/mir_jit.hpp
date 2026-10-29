@@ -212,8 +212,8 @@ class DiagStream {
 // So every MIR context MirJit makes allocates through mir_alloc, maps its code
 // through a MirCodeMaps, and reports through mir_error, and all three, while
 // MirJit::compile has a call into MIR under way, longjmp back to it with the
-// message. MIR's README offers setjmp/longjmp for exactly this. compile() then
-// throws (see MirJit::throw_mir_failure for what becomes of the context).
+// message. (MIR.md asks only that an error function never return.) compile()
+// then throws (see MirJit::throw_mir_failure for what becomes of the context).
 // Nothing between the setjmp and the longjmp may own a destructor: the frames
 // in between are MIR's C and the steps compile() hands to mir_guarded, which
 // keep only trivially destructible locals.
