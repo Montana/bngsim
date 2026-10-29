@@ -229,6 +229,7 @@ class Result:
     """
 
     __slots__ = (
+        "_stop_condition",
         "_time",
         "_species",
         "_observables",
@@ -572,6 +573,10 @@ class Result:
         # initial-condition chain rule reads this to know what not to add again.
         self._ic_sensitivity_seed: dict[str, dict[str, float]] | None = _ic_sensitivity_seed
 
+        # The label of the stop condition this run ended at, which the result
+        # was cut at; None where none was met (issue #1369).
+        self._stop_condition: str | None = None
+
         self.custom_attrs: dict[str, Any] = custom_attrs or {}
 
     # ─── Core data ──────────────────────────────────────────────────
@@ -593,6 +598,20 @@ class Result:
         objects from ``Simulator.run_batch(..., squeeze=False)``.
         """
         return self._seed
+
+    @property
+    def stop_condition(self) -> str | None:
+        """The stop condition this run met, by its label, or ``None``.
+
+        A condition registered with :meth:`Simulator.add_stop_condition` cuts
+        the result at the first sample it holds at: :meth:`Simulator.run`
+        raises :class:`StopConditionMet` with that result, and
+        :meth:`Simulator.run_batch` and :meth:`Simulator.run_replicates`
+        return it in their list, with this set, beside the rows that ran to
+        the end (issue #1369). A condition registered without a label reads
+        as its expression.
+        """
+        return self._stop_condition
 
     @property
     def ic_sensitivity_seed(self) -> dict[str, dict[str, float]] | None:
@@ -3294,9 +3313,25 @@ class Result:
         -------
         Result
             A batch result with 3D arrays.
+
+        Raises
+        ------
+        ValueError
+            If ``results`` is empty, or a stop condition cut any of them short
+            (:attr:`stop_condition`, issue #1369).
         """
         if not results:
             raise ValueError("Cannot squeeze empty result list")
+        stopped = [i for i, r in enumerate(results) if r._stop_condition is not None]
+        if stopped:
+            # A stack has one time axis and says of no row that it stopped
+            # (issue #1369).
+            raise ValueError(
+                f"Cannot squeeze results a stop condition cut short (rows {stopped}): "
+                "a stack holds rows of one length and does not say which stopped. "
+                "Read them from the list (squeeze=False), where "
+                "Result.stop_condition names the condition."
+            )
         if len(results) == 1:
             return results[0]
 

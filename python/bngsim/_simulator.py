@@ -5556,6 +5556,11 @@ class Simulator:
 
         logger.info("Batch complete: %d results", len(results))
 
+        # Each row meets the stop conditions as run() does, and one that meets
+        # one comes back cut there, beside the rest (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
+
         # Each row is stamped already, against its own clone (issues #698, #743).
         if squeeze:
             return Result.squeeze(results)
@@ -5716,6 +5721,10 @@ class Simulator:
             finally:
                 self._model.set_state(invocation_state)
                 self._restore_carryover_state(invocation_carry)
+
+        # As run_batch's rows (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
 
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
@@ -9581,6 +9590,17 @@ class Simulator:
         label : str
             Human-readable label for the condition.
 
+        Notes
+        -----
+        A result that meets a condition is cut at the first sample it holds
+        at, and :attr:`Result.stop_condition` names the condition (its label,
+        else its expression). :meth:`run` raises :class:`StopConditionMet`
+        with that result. :meth:`run_batch` and :meth:`run_replicates` check
+        every row the same way and return the cut rows in their list, beside
+        the rest, raising nothing; ``squeeze=True`` refuses a list with a cut
+        row (issue #1369). Conditions are checked in the order they were added,
+        and the first one met cuts the row.
+
         Examples
         --------
         >>> sim.add_stop_condition("A_tot < 10", label="low_A")
@@ -9710,28 +9730,39 @@ class Simulator:
                 stacklevel=3,
             )
 
+    def _stopped(self, result: Result) -> Result:
+        """*result* cut at the first registered stop condition it meets, in
+        the order they were added, with :attr:`Result.stop_condition` naming
+        it; *result* itself where none is met. One rule for :meth:`run`, which
+        raises with the cut result, and for the rows of :meth:`run_batch` and
+        :meth:`run_replicates`, which keep it (issue #1369)."""
+        for sc in self._stop_conditions:
+            trigger_idx = sc.check(result)
+            if trigger_idx is not None:
+                trunc = self._truncate_result(result, trigger_idx + 1)
+                trunc._stop_condition = sc.label or str(sc)
+                logger.info(
+                    "Stop condition triggered at t=%.6g: %s",
+                    result.time[trigger_idx],
+                    trunc._stop_condition,
+                )
+                return trunc
+        return result
+
     def _check_stop_conditions(self, result: Result) -> None:
         """Check stop conditions against a completed result.
 
         If any condition triggers, raises StopConditionMet with
         the result truncated to the trigger point.
         """
-        for sc in self._stop_conditions:
-            trigger_idx = sc.check(result)
-            if trigger_idx is not None:
-                # Truncate result to the trigger point
-                trunc = self._truncate_result(result, trigger_idx + 1)
-                label = sc.label or str(sc)
-                logger.info(
-                    "Stop condition triggered at t=%.6g: %s",
-                    result.time[trigger_idx],
-                    label,
-                )
-                raise StopConditionMet(
-                    f"Stop condition '{label}' triggered at t={result.time[trigger_idx]:.6g}",
-                    result=trunc,
-                    condition=label,
-                )
+        stopped = self._stopped(result)
+        if stopped is not result:
+            label = str(stopped._stop_condition)
+            raise StopConditionMet(
+                f"Stop condition '{label}' triggered at t={stopped.time[-1]:.6g}",
+                result=stopped,
+                condition=label,
+            )
 
     @staticmethod
     def _truncate_result(result: Result, n: int) -> Result:
@@ -9810,6 +9841,7 @@ class Simulator:
         )
         out._varvol_conc_factor = cut_map(result._varvol_conc_factor)
         out._varvol_amount_factor = cut_map(result._varvol_amount_factor)
+        out._stop_condition = result._stop_condition
         return out
 
     # ─── Interactive simulation ─────────────────────────────────────
