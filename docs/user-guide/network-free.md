@@ -24,6 +24,13 @@ rm = bngsim.Simulator(model, method="nf_exact", xml_path="model.xml")
 result = rm.run(t_span=(0, 100), n_points=101, seed=42)
 ```
 
+Each run uses the model's parameters. NFsim and RuleMonkey read the XML, so a
+run passes them every parameter set on the model with `Model.set_param` since it
+was loaded, before or after the `Simulator` was built. Parameters that depend on
+it, and seed amounts that read it, follow. A parameter set back to its loaded
+value runs as the XML has it. `run_batch` does not run a network-free method:
+scan point by point with `Model.set_param` and `Simulator.run`.
+
 ### NFsim connectivity option
 
 BNGsim's in-process NFsim wrapper defaults to `connectivity=False`.

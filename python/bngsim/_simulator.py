@@ -720,6 +720,7 @@ class Simulator:
         "_requested_method",
         "_sim",
         "_rm_clock_offset",
+        "_xml_param_names",
         "_rtol",
         "_atol",
         # Issue #196 — per-species absolute tolerance, or None for the scalar
@@ -866,6 +867,8 @@ class Simulator:
         self._canonical_method = canonical
         self._xml_path = xml_path
         self._rm_clock_offset = False
+        # nf/rm: the ids of the XML's <Parameter> elements (issue #1360).
+        self._xml_param_names: frozenset[str] = frozenset()
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
@@ -1033,6 +1036,7 @@ class Simulator:
                 refuse_nfsim_stale_local_functions,
                 refuse_time_dependent_rate_laws,
             )
+            from bngsim._network_free_params import xml_parameter_names
 
             refuse_time_dependent_rate_laws(xml_path, "nfsim")
             refuse_nfsim_rate_laws(xml_path)
@@ -1040,6 +1044,9 @@ class Simulator:
             refuse_nfsim_compartments(xml_path)
             refuse_nfsim_linear_time_tables(xml_path)
             self._sim = NfsimSimulator(xml_path)
+            # The parameters the backend has, which each run hands it the model's
+            # values of where the model has changed them (issue #1360).
+            self._xml_param_names = xml_parameter_names(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             if connectivity is not None:
@@ -1072,6 +1079,7 @@ class Simulator:
                 refuse_rulemonkey_compartments,
                 rulemonkey_clock,
             )
+            from bngsim._network_free_params import xml_parameter_names
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
             refuse_rulemonkey_compartments(xml_path)
@@ -1094,6 +1102,7 @@ class Simulator:
                     self._sim = RuleMonkeySimulator(rm_xml)
             else:
                 self._sim = RuleMonkeySimulator(xml_path)
+            self._xml_param_names = xml_parameter_names(xml_path)
             warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
             self._sim.set_reads_clock(reads_clock and not self._rm_clock_offset)
             if gml is not None:
@@ -5226,6 +5235,16 @@ class Simulator:
                 self._apply_ssa_breakpoints([self._sim], self._model, t_start, t_end)
                 core_result = self._sim.run_psa(times, used_seed, self._poplevel, timeout_seconds)
             elif self._method == "nfsim" or self._method == "rulemonkey":
+                from bngsim._network_free_params import parameter_overrides
+
+                # The backend runs on the XML's parameters unless told otherwise:
+                # hand it every one the model has changed since it was loaded,
+                # afresh at each run, so a value set back to the loaded one runs
+                # as the XML has it again (issue #1360). Before the clock's
+                # offset, which the clear would drop.
+                self._sim.clear_param_overrides()
+                for name, value in parameter_overrides(self._model, self._xml_param_names).items():
+                    self._sim.set_param(name, value)
                 if self._method == "rulemonkey" and self._rm_clock_offset:
                     from bngsim._rulemonkey_clock import OFFSET_PARAM
 
@@ -5418,6 +5437,16 @@ class Simulator:
         >>> batch.species.shape
         (3, 101, n_species)
         """
+        if self._method in ("nfsim", "rulemonkey"):
+            # Each point builds an engine on a clone of the model's network, and a
+            # network-free backend is built from the XML, not the network: this
+            # failed at the first point as "Unknown method: nfsim" (issue #1360).
+            raise ValueError(
+                f"run_batch does not run method={self._requested_method!r}. Scan a "
+                "network-free model point by point: set each point's parameters "
+                "with Model.set_param and call Simulator.run, which hands the "
+                "backend every parameter the model has changed."
+            )
         if params is None or len(params) == 0:
             raise ValueError("params must be a non-empty sequence of dicts")
 
