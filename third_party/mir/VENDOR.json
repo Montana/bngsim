@@ -35,13 +35,13 @@
   },
   "files": {
     "mir.c": {
-      "sha256": "dcfba7c13ba4be7482b05cb6af708a2ed647fa8aacbdbe11a49695e5fc2bc667"
+      "sha256": "14cb1e9bb5718fca74256c7772fe1da5666aff9f6a96b39d41e50892e5843928"
     },
     "mir-gen.c": {
       "sha256": "172b93b71f69b3fd9d4b222c6b68220258b8afe60bdf609d454fc624168cb610"
     },
     "c2mir/c2mir.c": {
-      "sha256": "8df5bfecc4c31ec98eaa9e4568b3fb77947377e1e348c618983ddfea9a4743e9"
+      "sha256": "2343e3801968b6ed1867ec2eb2bedd8fca4d61c9f03ffe1429a9ba1e09000537"
     },
     "mir.h": {
       "sha256": "c1cd21d417ad0b19c5b8c8c0593e48a890ab784e19706126bc545b1edf1e020f"
@@ -75,7 +75,30 @@
     "api_find_func_by_iteration": "MIR_get_global_item is declared in mir.h but not defined in this commit; locate the JIT'd function by scanning module->items for a MIR_func_item whose name matches (the version-stable approach c2mir-driver uses).",
     "single_maintainer_upstream": "MIR is effectively single-maintainer. Pinned to an immutable commit; refresh deliberately."
   },
-  "local_carries": [],
+  "local_carries": [
+    {
+      "file": "mir.c",
+      "function": "_MIR_get_default_code_alloc (new)",
+      "marker": "BNGsim local carry (lanl/bngsim#1215)",
+      "issue": "https://github.com/lanl/bngsim/issues/1215",
+      "upstream_status": "Not reported upstream as of 2026-10-29; upstream master dc2c763f (2026-10-23) still has the code this replaces.",
+      "summary": "MIR answers a failed code mapping with a NULL code address that most callers write through, and its default error function answers every other failure with exit(1), so under a cap on the address space enough live MIR-compiled models end the process. MirJit (include/bngsim/mir_jit.hpp) hands each context a code allocator that wraps MIR's default one and reports a failed mapping, as its allocator and error function report the rest, back to MirJit, which raises. The default allocator is static in mir.c; the carry adds a one-line accessor for it, so that MirJit wraps it rather than copying its platform code (MAP_JIT and the per-thread write protection on Apple Silicon, VirtualAlloc on Windows).",
+      "reapply": "A refresh rewrites mir.c from upstream and drops the accessor; the build then fails to link _MIR_get_default_code_alloc, and scripts/vendor_mir.py --check fails while the marker is absent. Re-add the function after the #include of mir-code-alloc-default.c. python/tests/test_mir_equivalence.py's #1215 tests are the behavioral regression.",
+      "upstream_file_sha256": "dcfba7c13ba4be7482b05cb6af708a2ed647fa8aacbdbe11a49695e5fc2bc667",
+      "upstream_file_sha256_note": "sha256 of mir.c as vendored from the pinned commit, before the carry. A refresh whose file matches this is upstream-unchanged, so the carry re-applies verbatim; a different hash means read the new code first."
+    },
+    {
+      "file": "c2mir/c2mir.c",
+      "function": "new_macro, new_macro_call, new_ifstate",
+      "marker": "BNGsim local carry (lanl/bngsim#1215)",
+      "issue": "https://github.com/lanl/bngsim/issues/1215",
+      "upstream_status": "Not reported upstream as of 2026-10-29; upstream master dc2c763f (2026-10-23) still has the code this replaces.",
+      "summary": "c2mir's preprocessor allocates its macro, macro-call and #if records with plain malloc and writes through the result unchecked, so a failed allocation there is a segfault, out of reach of the allocator MirJit hands MIR. The carry checks each and reports a null through MIR's error function as an allocation error, as c2mir_calloc already does, so MirJit raises its out-of-memory error. new_macro_call and new_ifstate take c2m_ctx for it.",
+      "reapply": "A refresh rewrites c2mir.c from upstream and drops the checks; scripts/vendor_mir.py --check fails while the marker is absent, and python/tests/test_mir_vendoring.py checks that every plain malloc of a struct in c2mir.c is checked. Re-add the three checks (and the c2m_ctx parameter where the function lacks one).",
+      "upstream_file_sha256": "8df5bfecc4c31ec98eaa9e4568b3fb77947377e1e348c618983ddfea9a4743e9",
+      "upstream_file_sha256_note": "sha256 of c2mir/c2mir.c as vendored from the pinned commit, before the carry. A refresh whose file matches this is upstream-unchanged, so the carry re-applies verbatim; a different hash means read the new code first."
+    }
+  ],
   "notes": [
     "Prototype vendoring for GH #78. Gated behind the BNGSIM_ENABLE_MIR CMake option (default OFF); the cc-subprocess + dlopen codegen backend and the ExprTk fallback are unchanged when MIR is off.",
     "Refresh via bngsim/scripts/vendor_mir.py (prunes the tree from a vnmakarov/mir checkout and re-anchors this file's commit + files{} checksums); --check is the offline tripwire that the checked-in tree still matches this metadata. See bngsim/scripts/MIR_VENDORING.md."
