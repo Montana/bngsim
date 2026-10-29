@@ -36,6 +36,7 @@
 #include "bngsim/function_columns.hpp"
 #include "bngsim/mir_jit.hpp"
 #include "bngsim/model.hpp"
+#include "bngsim/nonneg_clamp.hpp"
 #include "bngsim/types.hpp"
 
 #include <cvodes/cvodes.h>
@@ -375,6 +376,12 @@ struct SteadyStateUserData {
     // Tracking absolute tolerance for the march (issue #213). Inactive for
     // every solve that does not ask for it.
     AtolTracking atol_tracking;
+    // The run test's GH #135 retry (issue #1357): on for the run test alone,
+    // which then integrates as the time course does; see ss_eval_rhs. Its
+    // slots and clamped state are built on the first non-finite f.
+    bool clamp_nonfinite = false;
+    std::vector<char> nonneg_mask;
+    std::vector<double> nonneg_scratch;
     // What a callback threw, if one did (issue #589). SUNDIALS is C, so an
     // exception must not unwind through its frames; guard_ss_callback parks the
     // first one here and returns the unrecoverable-failure code, and the solve
@@ -820,11 +827,43 @@ template <class Data> static void rethrow_ss_callback_error(Data &data) {
     }
 }
 
+// The march's state clamped as the time course clamps it (GH #135), over the
+// slots issue #706 allows (bngsim/nonneg_clamp.hpp).
+static const double *ss_clamped_state(SteadyStateUserData *data, const double *y) {
+    if (data->nonneg_mask.size() != static_cast<std::size_t>(data->model->n_species()))
+        data->nonneg_mask = nonneg_clamp_mask_of(*data->model);
+    clamp_nonneg_into(data->nonneg_mask, y, data->nonneg_scratch);
+    return data->nonneg_scratch.data();
+}
+
+static bool ss_any_nonfinite(const double *v, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        if (!std::isfinite(v[i]))
+            return true;
+    return false;
+}
+
+// f for the march. In the run test (clamp_nonfinite), with the time course's
+// GH #135 retry (issue #1357): where f is not finite, it is taken again at the
+// nonnegative-clamped state, and only then, so a model whose f is finite is
+// run as before to the bit. A species at 0 that a corrector iterate takes an
+// ulp below it makes a fractional power of it NaN, for any step:
+// glioblastoma_egfrviii raises AKT(s~P) to 3.5, and the compiled march came to
+// it at exactly 0 on x86-64 Linux. CVODE could not take one step from there on
+// either Jacobian, the run test measured inf, and a state at residual 2e-40 was
+// refused, though Simulator.run from it, which clamps, moves nothing. The march
+// itself is left unclamped: its residual is not clamped, and a march that went
+// on through such a state ended at one where the residual was NaN.
+static void ss_eval_rhs(SteadyStateUserData *data, double t, const double *y, double *ydot) {
+    data->rhs->eval(t, y, ydot);
+    const auto un = static_cast<std::size_t>(data->model->n_species());
+    if (data->clamp_nonfinite && ss_any_nonfinite(ydot, un))
+        data->rhs->eval(t, ss_clamped_state(data, y), ydot);
+}
+
 static int cvode_ss_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
-    const double *yp = N_VGetArrayPointer(y);
-    double *yp_dot = N_VGetArrayPointer(ydot);
-    data->rhs->eval(static_cast<double>(t), yp, yp_dot);
+    ss_eval_rhs(data, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(ydot));
     return 0;
 }
 
@@ -840,12 +879,11 @@ static int cvode_ss_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
 // it CVODE differences its own, at one RHS evaluation per species per setup.
 //
 // The mirror of CvodeSimulator's cvode_analytical_dense_jac / cvode_codegen_
-// dense_jac, minus their GH #135 nonnegative-clamp retry: that guard exists
-// because the time-course path's RHS is clamped too, so a state where the
-// analytical Jacobian goes non-finite (a fractional power of a transiently
-// negative concentration) is one the RHS still integrated through. This RHS is
-// not clamped — such a state already fails the march on its f(y) alone — so
-// there is no asymmetry here for the retry to repair.
+// dense_jac, minus their GH #135 nonnegative-clamp retry. The run test retries
+// f at the clamped state (ss_eval_rhs, issue #1357); the Jacobian is taken at
+// CVODE's prediction, not at the corrector's iterates, and a clamp here as well
+// changed no test (glioblastoma_egfrviii's run test passes without it), so
+// there is none.
 static int cvode_ss_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
                                    void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
                                    N_Vector /*tmp3*/) {
@@ -918,11 +956,7 @@ static int cvode_ss_dense_dq_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatr
 // be reinstalled first: CVODE may SUNMatZero() before the callback, and
 // SUNMatZero_Sparse clears the index arrays along with the values.
 //
-// Like cvode_ss_dense_jac, and unlike its two time-course mirrors, this carries
-// no GH #135 nonnegative-clamp retry — for the reason given there: that guard
-// exists because the time-course RHS is clamped and this one is not, so a state
-// where the closed form goes non-finite is one the march has already failed on
-// f(y) alone.
+// Like cvode_ss_dense_jac, this carries no GH #135 nonnegative-clamp retry.
 static int cvode_ss_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
                                     void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
                                     N_Vector /*tmp3*/) {
@@ -969,12 +1003,13 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
 
     // Sized once, when the callback was selected, so this hot path allocates
     // nothing per Jacobian evaluation.
-    SteadyStateRhs *rhs = data->rhs;
+    // f as the march takes it (ss_eval_rhs), so the quotient is formed from
+    // the f that fy is.
     colored_fd_jacobian(
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
+        [data](double tt, const double *yy, double *ydot) { ss_eval_rhs(data, tt, yy, ydot); });
     return 0;
 }
 
@@ -1395,6 +1430,10 @@ class SteadyStateMarcher {
     // for a rate of 1e14, and each failure brings it down by a factor of five
     // at most.
     void allow_error_test_failures(int n) { CVodeSetMaxErrTestFails(cvode_mem_, n); }
+
+    // Retry a non-finite f at the clamped state, as the time course does
+    // (GH #135), for the run test (issue #1357; ss_eval_rhs).
+    void clamp_nonfinite_as_the_time_course() { ud_.clamp_nonfinite = true; }
 
     // Make the marches of this session a run that is taken on: `steps` steps
     // in all, and no stopping because the residual has ceased to fall, which
@@ -5793,6 +5832,11 @@ static double ss_continued_run_once(NetworkModel &model, SteadyStateRhs &rhs,
     try {
         SteadyStateMarcher run(model, rhs, run_opts, sub);
         run.allow_error_test_failures(kHoldErrorTestFailures);
+        // The run test asks what a run from the state does, so it integrates
+        // as the time course does (issue #1357). A run whose end is adopted
+        // (`end`) is the march's, and is left as the march is.
+        if (end == nullptr)
+            run.clamp_nonfinite_as_the_time_course();
         run.take_on_for(kRunSteps * static_cast<long>(opts.max_steps));
         double left = 0.0;
         run.march(0.0, &left);
@@ -6221,24 +6265,6 @@ SteadyStateResult find_steady_state(NetworkModel &model, const SteadyStateOption
         if (residual < effective->tol) {
             result.continued_run_distance =
                 ss_continued_run(model, rhs, *effective, sub, result.concentrations);
-            // As the solve itself does where the closed-form Jacobian stops the
-            // integrator (issue #127), and as the hold run below does: a run
-            // test the closed form could not take to its time is taken once
-            // more on differences (issue #1357). The compiled right-hand side
-            // led glioblastoma_egfrviii's march to a state at residual 2e-39,
-            // its rounding a few ulps from the interpreter's, and the run from
-            // there stopped at t = 3.9e5 on the closed form, which is the
-            // interpreter's to the bit: the state was refused with a run
-            // measure of inf, and nothing retried it. The state returned is the
-            // solve's either way, so solver_jacobian_retried, which says the
-            // answer is a retry's, is not set.
-            if (!std::isfinite(result.continued_run_distance) && effective->jacobian == "auto" &&
-                ss_install_solver_jacobian(rhs, *effective)) {
-                SteadyStateOptions by_differences = *effective;
-                by_differences.jacobian = "fd";
-                result.continued_run_distance =
-                    ss_continued_run(model, rhs, by_differences, sub, result.concentrations);
-            }
             result.converged = result.continued_run_distance <= 1.0;
         } else {
             result.converged = false;

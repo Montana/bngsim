@@ -21,6 +21,7 @@
 #include "bngsim/lapack_dense_linsol.hpp"
 #include "bngsim/mm_jacobian.hpp"
 #include "bngsim/model.hpp"
+#include "bngsim/nonneg_clamp.hpp"
 #include "bngsim/platform_compat.hpp" // POSIX ssize_t shim for Windows (GH #150)
 #include "bngsim/result.hpp"
 #include "bngsim/simulator.hpp"
@@ -727,39 +728,18 @@ static double codegen_tfun_eval_thunk(int tf_id, double x, void *ctx) {
 // The declared value, not initial_conc: save_concentrations() moves that to a
 // captured state, where a depleted concentration a hair below 0 still needs the
 // clamp (Species::declared_negative).
+// The rule is nonneg_clamp_mask_of (bngsim/nonneg_clamp.hpp), which the
+// steady-state march shares (issue #1357).
 static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
-    const NetworkModel &model = *data->model;
-    const int ns = model.n_species();
-    if (data->rhs_nonneg_mask.size() == static_cast<std::size_t>(ns))
-        return data->rhs_nonneg_mask;
-    std::vector<char> mask(ns, 1);
-    const auto &species = model.species();
-    for (int i = 0; i < ns; ++i) {
-        const Species &sp = species[i];
-        if (sp.fixed || !sp.reported || sp.declared_negative)
-            mask[i] = 0;
-    }
-    for (const Reaction &rxn : model.reactions()) {
-        if (!rxn.is_rate_rule_ode)
-            continue;
-        for (int si : rxn.product_indices) {
-            if (si >= 1 && si <= ns)
-                mask[si - 1] = 0;
-        }
-    }
-    data->rhs_nonneg_mask = std::move(mask);
+    const int ns = data->model->n_species();
+    if (data->rhs_nonneg_mask.size() != static_cast<std::size_t>(ns))
+        data->rhs_nonneg_mask = nonneg_clamp_mask_of(*data->model);
     return data->rhs_nonneg_mask;
 }
 
 static inline double *clamp_state_nonneg(CvodeUserData *data, const double *y_ptr) {
-    const int ns = data->model->n_species();
-    if (data->rhs_nonneg_scratch.size() != static_cast<std::size_t>(ns))
-        data->rhs_nonneg_scratch.assign(ns, 0.0);
-    double *s = data->rhs_nonneg_scratch.data();
-    const std::vector<char> &mask = nonneg_clamp_mask(data);
-    for (int i = 0; i < ns; ++i)
-        s[i] = (y_ptr[i] > 0.0 || !mask[i]) ? y_ptr[i] : 0.0;
-    return s;
+    clamp_nonneg_into(nonneg_clamp_mask(data), y_ptr, data->rhs_nonneg_scratch);
+    return data->rhs_nonneg_scratch.data();
 }
 
 // The sensitivity RHS's counterpart, and it snaps a strictly SMALLER set of

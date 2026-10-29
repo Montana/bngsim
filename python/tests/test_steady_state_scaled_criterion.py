@@ -1946,14 +1946,15 @@ _CC_ON_PATH = any(shutil.which(c) for c in ("cc", "gcc", "clang"))
 
 
 @pytest.mark.skipif(not _CC_ON_PATH, reason="no C compiler on PATH for the codegen leg")
-def test_a_run_test_the_closed_form_cannot_take_is_taken_on_differences(data_dir):
-    """Issue #1357. glioblastoma-egfrviii's march on the compiled right-hand
-    side, whose closed-form Jacobian is the interpreter's to the bit, comes to a
-    state at residual 2e-39, its rounding a few ulps from the interpreter's.
-    The run test from there stopped at t = 3.9e5 on the closed form, and the
-    state was refused with a run measure of inf. The run test is now taken once
-    more on differences, as the march and the hold run are. The state is the
-    solve's, so the answer is no retry's."""
+def test_a_compiled_march_to_a_fractional_power_at_zero_is_not_refused(data_dir):
+    """Issue #1357. glioblastoma-egfrviii raises AKT(s~P) to 3.5, and the march
+    on the compiled right-hand side comes to it at 0 or within 1e-52 of it, at
+    residual 2e-39. A corrector iterate an ulp below 0 makes the power NaN, so
+    the run test could not be taken to its time (at t = 3.9e5 on arm64 macOS,
+    at its first step on x86-64 Linux), and the state was refused with a run
+    measure of inf. The run test now integrates as the time course does, which
+    takes f again at the clamped state where it is NaN (GH #135). No retry is
+    the answer's."""
     path = str(data_dir / "glioblastoma_egfrviii_seed.net")
     compiled = bngsim.Simulator(
         bngsim.Model.from_net(path), method="ode", codegen=True
@@ -1965,20 +1966,53 @@ def test_a_run_test_the_closed_form_cannot_take_is_taken_on_differences(data_dir
     interpreted = bngsim.Simulator(bngsim.Model.from_net(path), method="ode").steady_state(
         method="integration"
     )
-    # At the march's own tolerances (rtol and atol 1e-8): a species at 0 here
-    # is 9.1e-10 there, and the rest agree to the digit.
+    # At the march's own tolerances (rtol and atol 1e-8): AKT(s~P) is 0 here
+    # and 1e-9 there, and the rest agree to the digit.
     np.testing.assert_allclose(
         compiled.concentrations, interpreted.concentrations, rtol=1e-8, atol=1e-8
     )
 
 
-@pytest.mark.skipif(not _CC_ON_PATH, reason="no C compiler on PATH for the codegen leg")
-def test_an_explicit_closed_form_is_not_called_off_in_the_run_test(data_dir):
-    """Control: jacobian="analytical" is a choice, and the run test it cannot
-    take is left as it is, as the march's failure is (#127)."""
+# Where the compiled march ended on x86-64 Linux, to the bit: AKT(s~P), the
+# last, and Oncogenic_Output() are exactly 0, and the residual is 1.56e-40.
+_GLIOBLASTOMA_AT_ZERO = [
+    -4.5627044333513721e-44,
+    2.0000000000000088e02,
+    1.0000000000000007e03,
+    -2.8516902708446076e-45,
+    0.0,
+    -6.0212043388956984e-45,
+    -4.2897249239143463e-42,
+    2.7026996748452282e-45,
+    4.0693707403992688e-42,
+    0.0,
+]
+
+
+@pytest.mark.parametrize(
+    ("jacobian", "sparse"),
+    [("auto", False), ("fd", False), ("fd", True)],
+    ids=["auto", "fd", "fd colored"],
+)
+def test_a_run_test_from_a_fractional_power_at_zero_is_taken_to_its_time(
+    data_dir, jacobian, sparse
+):
+    """Issue #1357, on every platform: a solve started where the Linux march
+    ended. On difference quotients, CVODE could not take the march or the run
+    test one step from it (the corrector's iterate put AKT(s~P) below 0, where
+    AKT(s~P)^3.5 is NaN), and the state was refused at residual 1.56e-40. A
+    time course from it moves nothing. `fd colored` is the quotient KLU
+    factors, formed from the same f."""
     path = str(data_dir / "glioblastoma_egfrviii_seed.net")
-    ss = bngsim.Simulator(
-        bngsim.Model.from_net(path), method="ode", codegen=True, jacobian="analytical"
-    ).steady_state(method="integration")
-    assert not ss.converged
-    assert ss.continued_run_distance == math.inf
+    sim = bngsim.Simulator(
+        bngsim.Model.from_net(path),
+        method="ode",
+        jacobian=jacobian,
+        force_sparse_linear_solver=sparse,
+    )
+    sim.set_state(np.array(_GLIOBLASTOMA_AT_ZERO))
+    ss = sim.steady_state(method="integration")
+    assert (ss.linear_solver == "klu") == sparse
+    assert ss.converged
+    assert ss.continued_run_distance <= 1.0
+    np.testing.assert_allclose(ss.concentrations, _GLIOBLASTOMA_AT_ZERO, rtol=1e-8, atol=1e-8)
