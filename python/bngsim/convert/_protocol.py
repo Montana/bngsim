@@ -46,6 +46,7 @@ replaying trailing actions the reference engine would have skipped.
 from __future__ import annotations
 
 import json
+import math
 import re
 import warnings
 from collections.abc import Mapping
@@ -467,6 +468,10 @@ def parse_bngl_protocol(source: str | Path, *, strict: bool = True) -> ProtocolS
     dropped: list[str] = []
     lossy: list[str] = []
     network_gen: str | None = None
+    # BNG2.pl's model time, which a ``continue=>1`` run starts from: 0 at load,
+    # and the end of each simulate after it (``BNGAction.pm``: ``$model->Time``).
+    # None once an end cannot be read without the model (issue #1364).
+    model_time: float | None = 0.0
     for verb, argstr in _iter_action_calls(text):
         low = verb.lower()
         if low == "quit":
@@ -477,7 +482,16 @@ def parse_bngl_protocol(source: str | Path, *, strict: bool = True) -> ProtocolS
             dropped.append(verb)
             break
         if low in _SIMULATE_VERBS:
-            steps.append(_build_experiment(verb, argstr))
+            exp, reasons, model_time = _build_experiment(verb, argstr, model_time)
+            steps.append(exp)
+            for why in reasons:
+                _flag_lossy(
+                    verb,
+                    why,
+                    strict=strict,
+                    lossy=lossy,
+                    head="has an argument the protocol cannot hold exactly",
+                )
         elif low in _STATE_VERBS:
             steps.append(_build_state_change(_STATE_VERBS[low], argstr))
         elif low == "setoption":
@@ -538,11 +552,16 @@ def _setoption_lossy_reason(argstr: str) -> str | None:
     )
 
 
-def _flag_lossy(verb: str, reason: str, *, strict: bool, lossy: list[str]) -> None:
+def _flag_lossy(
+    verb: str, reason: str, *, strict: bool, lossy: list[str], head: str | None = None
+) -> None:
     """Disposition a fidelity-affecting action BNGsim does not execute: raise
-    under ``strict``, else warn and record it in ``lossy``."""
+    under ``strict``, else warn and record it in ``lossy``. ``head`` replaces the
+    message's opening, for an action it does execute but whose arguments the
+    protocol holds only approximately (issue #1364)."""
+    opening = head or "affects results but BNGsim does not execute it"
     msg = (
-        f"BNGL action {verb!r} affects results but BNGsim does not execute it: "
+        f"BNGL action {verb!r} {opening}: "
         f"{reason}. Pass strict=False / --allow-lossy to record it as a lossy "
         "(best-effort) conversion instead of refusing."
     )
@@ -663,57 +682,179 @@ def write_bngl_protocol(protocol: ProtocolSpec, out_path: str | Path | None = No
     return text
 
 
-def _build_experiment(verb: str, argstr: str) -> Experiment:
+def _num_list(v: Any) -> list[float] | None:
+    """A BNGL ``[a,b,…]`` of numbers, else ``None`` (not a list, or an entry
+    that cannot be read without the model)."""
+    if not isinstance(v, str):
+        return None
+    t = v.strip()
+    if not (t.startswith("[") and t.endswith("]")):
+        return None
+    out: list[float] = []
+    for tok in _split_top_level(t[1:-1]):
+        x = _num_or(_scalar(tok), None)
+        if x is None:
+            return None
+        out.append(x)
+    return out
+
+
+def _evenly_spaced(values: list[float], *, log: bool = False) -> bool:
+    """Whether *values* (at least two) step evenly, or evenly in log10."""
+    if len(values) < 2:
+        return False
+    if log:
+        if any(x <= 0.0 for x in values):
+            return False
+        values = [math.log10(x) for x in values]
+    step = (values[-1] - values[0]) / (len(values) - 1)
+    if step <= 0.0:
+        return False
+    scale = max(abs(values[0]), abs(values[-1]), abs(step))
+    return all(abs(x - (values[0] + i * step)) <= 1e-12 * scale for i, x in enumerate(values))
+
+
+def _build_experiment(
+    verb: str, argstr: str, model_time: float | None
+) -> tuple[Experiment, list[str], float | None]:
+    """The :class:`Experiment` a ``simulate``/``parameter_scan`` call runs, the
+    reasons it is not that experiment exactly (each a ``lossy`` entry), and the
+    model time after it.
+
+    The time course follows BNG2.pl's ``simulate`` (``BNGAction.pm``, issue
+    #1364): ``continue=>1`` starts at the model time, where an earlier run
+    ended; ``n_output_steps`` is ``n_steps``, both is an error, and neither is
+    one step; ``sample_times`` sets the grid where neither is given, ending at
+    its last time (or ``t_end``). A scan reads ``par_scan_vals`` where
+    ``par_min``/``par_max`` are not given. A grid the IR's uniform
+    ``(t_span, n_points)`` and a scan its ``(min, max, points, log)`` cannot hold
+    are recorded as lossy, with the nearest they can.
+    """
     kind, forced_method = _SIMULATE_VERBS[verb.lower()]
     args = _parse_hash(argstr)
     method = forced_method or str(args.get("method", "ode")).lower()
-    t_start = _num_or(args.get("t_start"), 0.0)
+    reasons: list[str] = []
+
+    continued = _as_bool(args.get("continue", 0))
+    if "t_start" in args:
+        t_start = _num_or(args.get("t_start"), 0.0)
+    elif continued:
+        if model_time is None:
+            reasons.append(
+                "continue=>1 starts at the model time, which an earlier action's "
+                "unresolved t_end leaves unknown; taken as 0"
+            )
+        t_start = model_time if model_time is not None else 0.0
+    else:
+        t_start = 0.0
+
+    if "n_steps" in args and "n_output_steps" in args:
+        raise ConversionError(
+            f"{verb}: 'n_steps' and 'n_output_steps' are the same argument; BNG2.pl refuses both"
+        )
+    steps_arg = args.get("n_steps", args.get("n_output_steps"))
     # ``t_end`` may be absent or a parameter-referencing expression we can't
     # resolve without the model; leave it == t_start so the experiment carries
     # no numeric horizon and the gate falls back to its blanket grid.
-    t_end = _num_or(args.get("t_end"), t_start)
-    n_steps = int(_num_or(args.get("n_steps"), 100.0))
-    n_points = max(n_steps + 1, 1)
+    t_end = _num_or(args.get("t_end"), None)
+    sample_times = _num_list(args.get("sample_times")) if steps_arg is None else None
+    if steps_arg is None and "sample_times" in args:
+        if sample_times is None or len(sample_times) < 2:
+            reasons.append("sample_times is not a list of at least two numbers")
+            n_points = 2
+        else:
+            grid = sorted(sample_times)
+            if t_end is not None and t_end > grid[-1]:
+                grid.append(t_end)
+            t_end = grid[-1]
+            n_points = len(grid)
+            if not (grid[0] == t_start and _evenly_spaced(grid)):
+                reasons.append(
+                    f"sample_times {grid} is not an even grid from t_start={t_start:g}; "
+                    f"carried as {n_points} even points over ({t_start:g}, {t_end:g})"
+                )
+    else:
+        # BNG2.pl's default is one step. One the parse cannot read without the
+        # model keeps the blanket 100 it has always had here.
+        n_steps = 1 if steps_arg is None else int(_num_or(steps_arg, 100.0))
+        n_points = max(n_steps + 1, 1)
+    if t_end is None:
+        t_end = t_start
 
     consumed = {
         "method",
         "t_start",
         "t_end",
         "n_steps",
+        "n_output_steps",
+        "sample_times",
         "parameter",
         "par_min",
         "par_max",
         "n_scan_pts",
+        "par_scan_vals",
         "log_scale",
         "reset_conc",
         "suffix",
     }
+    # ``continue`` stays in ``extra``: re-emitted beside the t_start it implies,
+    # which BNG2.pl accepts (it checks the two agree), it keeps a phased run
+    # appending to one output file (convert/_events.py writes such phases).
     extra = {k: v for k, v in args.items() if k not in consumed}
+    after = None if "t_end" in args and _num_or(args.get("t_end"), None) is None else t_end
 
     if kind == "scan":
-        return Experiment(
-            kind="scan",
+        scan_log = _as_bool(args.get("log_scale", 0))
+        scan_min = _num_or(args.get("par_min"), None)
+        scan_max = _num_or(args.get("par_max"), None)
+        scan_points = (
+            int(_num_or(args.get("n_scan_pts"), 0)) or None if "n_scan_pts" in args else None
+        )
+        if ("par_min" not in args or "par_max" not in args) and "par_scan_vals" in args:
+            values = _num_list(args.get("par_scan_vals"))
+            if values is None or not values:
+                reasons.append("par_scan_vals is not a list of numbers")
+            else:
+                values = sorted(values)
+                scan_min, scan_max, scan_points = values[0], values[-1], len(values)
+                if len(values) == 1 or _evenly_spaced(values):
+                    scan_log = False
+                elif _evenly_spaced(values, log=True):
+                    scan_log = True
+                else:
+                    reasons.append(
+                        f"par_scan_vals {values} is not evenly spaced, linearly or in log; "
+                        f"carried as {len(values)} points over ({values[0]:g}, {values[-1]:g})"
+                    )
+        return (
+            Experiment(
+                kind="scan",
+                method=method,
+                t_span=(t_start, t_end),
+                n_points=n_points,
+                scan_parameter=str(args["parameter"]) if "parameter" in args else None,
+                scan_min=scan_min,
+                scan_max=scan_max,
+                scan_points=scan_points,
+                scan_log=scan_log,
+                reset_between=_as_bool(args.get("reset_conc", 1)),
+                label=str(args["suffix"]) if "suffix" in args else None,
+                extra=extra,
+            ),
+            reasons,
+            after,
+        )
+    return (
+        Experiment(
+            kind="simulate",
             method=method,
             t_span=(t_start, t_end),
             n_points=n_points,
-            scan_parameter=str(args["parameter"]) if "parameter" in args else None,
-            scan_min=_num_or(args.get("par_min"), None),
-            scan_max=_num_or(args.get("par_max"), None),
-            scan_points=(
-                int(_num_or(args.get("n_scan_pts"), 0)) or None if "n_scan_pts" in args else None
-            ),
-            scan_log=_as_bool(args.get("log_scale", 0)),
-            reset_between=_as_bool(args.get("reset_conc", 1)),
             label=str(args["suffix"]) if "suffix" in args else None,
             extra=extra,
-        )
-    return Experiment(
-        kind="simulate",
-        method=method,
-        t_span=(t_start, t_end),
-        n_points=n_points,
-        label=str(args["suffix"]) if "suffix" in args else None,
-        extra=extra,
+        ),
+        reasons,
+        after,
     )
 
 
