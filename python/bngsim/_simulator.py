@@ -5334,7 +5334,8 @@ class Simulator:
         For each parameter set:
         1. Clone the model (independent copy)
         2. Apply parameters via ``set_params``
-        3. Reset species to initial conditions
+        3. Reset species to initial conditions (:meth:`Model.reset`), not to the
+           model's current state, and warn where the two differ (issue #1362)
         4. Run the simulation (GIL released during each run)
         5. Collect the result
 
@@ -5502,6 +5503,24 @@ class Simulator:
         # method='ode' on the per-sim path.
         base_seed = _resolve_seed(seed) if self._method != "ode" else 0
 
+        # Every row starts from the initial conditions (a clone's reset()), as
+        # documented. Where the model is elsewhere, from a set_concentration or
+        # a run, that is not where a caller who wrote it expects the rows to
+        # start, and they did with no word (issue #1362).
+        at_reset = self._model.clone()
+        at_reset.reset()
+        if not np.array_equal(at_reset.get_state(), self._model.get_state(), equal_nan=True):
+            warnings.warn(
+                "run_batch starts every point from the model's initial conditions "
+                "(Model.reset), not from its current state, which differs from them "
+                "(a set_concentration, or the end of a run). To start each point "
+                "from the current state, use parameter_scan, or call "
+                "Model.save_concentrations() first, which makes it the state reset "
+                "returns to.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if self._method == "ode":
             # Every row runs on a clone, and a clone inherits these scans only
             # if the parent has already made them. Made here, once, before any
@@ -5582,6 +5601,13 @@ class Simulator:
         so on low-activity models the per-replicate cost collapses to the actual
         trajectory work rather than the fixed clone + graph-rebuild overhead.
 
+        Every replicate starts from the model's state at this call, as
+        :meth:`run` does: a :meth:`Model.set_concentration` made first is the
+        start of each (issue #1362), and after a :meth:`run` so is that run's
+        end state, as it is for a second :meth:`run`. Call
+        :meth:`Model.reset` first to start each from the initial conditions.
+        The model is left in the state it was in at the call.
+
         Replicate *i* uses ``seed_base + i`` (``seed_base`` resolved once from
         ``seed``, or from system entropy when ``seed is None``; each value is
         exposed via the corresponding ``Result.seed``), matching the seed
@@ -5646,11 +5672,19 @@ class Simulator:
             ts.n_points = n_points
             return ts
 
+        # Every replicate starts where the model is at this call, as run() and
+        # parameter_scan start (issue #1362): reset() alone took each one back
+        # to the seed, and a set_concentration made first was lost, A(0) = 0 for
+        # 500 with no warning.
+        start_state = self._model.get_state()
+
         def _run_one(sim: Any, model: Model, times: Any, i: int) -> Result:
-            # reset() restores species to initial conditions and zeroes time;
-            # the simulator (hence the cached dependency graph) is reused. A
-            # fresh seed per replicate makes each trajectory independent.
+            # reset() zeroes time and clears what a run leaves behind, and the
+            # state goes back to the call's; the simulator (hence the cached
+            # dependency graph) is reused. A fresh seed per replicate makes each
+            # trajectory independent.
             model.reset()
+            model.set_state(start_state)
             used = base_seed + i
             # Translated as run() translates them, so `except SimulationError`
             # sees a refusal on the sequential path as it does on the threaded one.
