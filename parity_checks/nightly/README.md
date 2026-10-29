@@ -173,7 +173,9 @@ refuses it as `archive_stale`, which alerts the night after any live night that
 passes it (#1290). To keep that list short, `rr_run.py` records RoadRunner's side
 first, before bngsim starts, and kills a job only at twice the cap, up to 600 s
 (the giant pass's cap, which it does not extend); the row is still TIMEOUT past
-the cap itself, as on a live night. The
+the cap itself, as on a live night. `ssa_screen.py`, which saves its entry after
+every RoadRunner call, likewise takes a model's row at its cap as a live run does
+and kills the worker only at twice the cap. The
 publish job then creates the next `reference-data-vN` release with all six assets,
 or none if any suite failed to pack, and writes the manifest into the run summary
 and the `reference-manifest` artifact. Nothing replays from the new release until
