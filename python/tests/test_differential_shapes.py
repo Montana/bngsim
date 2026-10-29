@@ -181,9 +181,9 @@ REFUSED = {
         for check in D.STEADY_METHODS
     },
 }
-OPEN = {
-    ("equality-dwell", "klu_vs_dense"): "#1254: KLU with the FD Jacobian on an exact equality",
-}
+# Empty since #1254 was fixed (KLU's colored difference quotient steps on the
+# error weights); a newly found bug goes here.
+OPEN: dict[tuple[str, str], str] = {}
 
 
 @functools.cache
@@ -197,8 +197,8 @@ def _cases():
             marks = ()
             if (shape, check) in OPEN:
                 # Only where the path runs: a build without KLU skips the KLU
-                # check, which is right, and is no pass of #1254's (the MIR leg
-                # builds without it).
+                # check, which is right, and is no pass of a KLU bug's (the MIR
+                # leg builds without it).
                 marks = pytest.mark.xfail(
                     condition=check != "klu_vs_dense" or bool(bngsim._bngsim_core.HAS_KLU),
                     strict=True,
@@ -307,6 +307,222 @@ def test_an_entry_the_differences_cannot_resolve_is_not_asked_of_the_pattern():
             return np.array([-a + 1e-14 * b, -a])
 
     assert D.sparsity_misses(Tiny(_csc([[1, 0], [1, 0]])), [np.array([1.0, 2.0])]) == []
+
+
+class _JacModel(_FakeModel):
+    """_FakeModel with an analytic Jacobian, ``wrong`` written over its entries."""
+
+    def __init__(self, wrong=None, source="analytical"):
+        super().__init__(_csc([[1, 1], [1, 0]]))
+        self.wrong, self.source = wrong or {}, source
+
+    def jacobian(self, y, t=0.0):
+        from bngsim._evaluators import JacobianMatrix
+
+        a, b = y
+        J = np.array([[-2.0 * b, -2.0 * a], [-1.0, 0.0]])
+        for (i, j), v in self.wrong.items():
+            J[i, j] = v
+        return JacobianMatrix(J, self.source)
+
+
+def test_a_jacobian_with_one_wrong_entry_is_a_finding():
+    """#1308's control: d(dA/dt)/dB is -2a = -2; written as -2.2 (10% off), the
+    check names that entry and no other."""
+    y = [np.array([1.0, 2.0])]
+    assert D.jacobian_misfits(_JacModel(), y) == []
+    found = D.jacobian_misfits(_JacModel({(0, 1): -2.2}), y)
+    assert [m["entry"] for m in found] == [(0, 1)]
+    assert found[0]["off"] == pytest.approx(0.2 / 2.2, rel=1e-3)
+
+
+def test_a_one_percent_error_is_a_finding():
+    found = D.jacobian_misfits(_JacModel({(1, 0): -1.01}), [np.array([1.0, 2.0])])
+    assert [m["entry"] for m in found] == [(1, 0)]
+
+
+def test_a_spurious_entry_where_the_rhs_reads_nothing_is_a_finding():
+    """d(dB/dt)/dB is 0 in the RHS; an analytic -0.5 there is wrong."""
+    found = D.jacobian_misfits(_JacModel({(1, 1): -0.5}), [np.array([1.0, 2.0])])
+    assert [m["entry"] for m in found] == [(1, 1)]
+
+
+def test_a_non_finite_analytic_entry_is_a_finding():
+    found = D.jacobian_misfits(_JacModel({(0, 0): float("nan")}), [np.array([1.0, 2.0])])
+    assert [m["entry"] for m in found] == [(0, 0)] and found[0]["off"] == float("inf")
+
+
+def test_a_differenced_jacobian_is_not_judged():
+    """Model.jacobian differences the RHS where the closed form is incomplete:
+    nothing analytic to judge."""
+    y = [np.array([1.0, 2.0])]
+    assert D.jacobian_misfits(_JacModel(source="finite-difference"), y) is None
+
+
+def test_a_model_whose_difference_quotient_jacobian_refuses_is_skipped(monkeypatch):
+    """Model.jacobian() refuses a difference quotient whose step decides an
+    entry (#1002), where it returned one: a model without the closed form is
+    SKIP, as the baseline holds it, not an EXCEPTION. BIOMD0000000053 and six
+    more BioModels read EXCEPTION once main refused."""
+    base = _base("derived-log10")
+
+    def refuses(self, y, t=0.0, **kw):
+        raise bngsim.SimulationError(
+            "Model.jacobian() does not return this difference quotient (issue #1002)"
+        )
+
+    monkeypatch.setattr(bngsim.Model, "prepare_analytical_jacobian", lambda self: False)
+    monkeypatch.setattr(bngsim.Model, "jacobian", refuses)
+    v = D.check_jacobian_values(base)
+    assert v.status == "skip" and "no analytic Jacobian" in v.note, v
+
+
+def test_rounding_in_a_large_rhs_is_not_a_finding():
+    """blbr's false alarm: f is 1e11, so a difference over a small step rounds by
+    eps·|f|/h. At a step of 1e-6 its differences agreed on 2.0345 at two steps
+    where the entry is 2. The gaps between neighbouring steps bound that
+    rounding, so it does not read as a wrong entry even on a ladder of small
+    steps only, while on the check's own ladder a 10% error still reads as one.
+
+    (Rounding is the limit of what this check can judge: an entry no step
+    resolves is not judged at all.)"""
+
+    class Big(_JacModel):
+        @staticmethod
+        def rhs(y, t=0.0):
+            a, b = y
+            return np.array([1e9 - 2.0 * a * b, -a])
+
+    y = [np.array([1.0, 2.0])]
+    assert D.jacobian_misfits(Big(), y) == []
+    assert D.jacobian_misfits(Big(), y, steps=(1e-6, 5e-7, 2.5e-7)) == []
+    assert [m["entry"] for m in D.jacobian_misfits(Big({(0, 1): -2.2}), y)] == [(0, 1)]
+
+
+def test_an_entry_on_a_kink_is_not_judged():
+    """The #368 trap: dA/dt = -|b - 2| at b = 2. Every central difference reads
+    0, the mean of the slopes -1 and +1 either side; the analytic entry is one
+    side. Neither is the derivative, so the entry is not judged."""
+    from bngsim._evaluators import JacobianMatrix
+
+    class Kink(_FakeModel):
+        @staticmethod
+        def rhs(y, t=0.0):
+            return np.array([-abs(y[1] - 2.0), -y[0]])
+
+        def jacobian(self, y, t=0.0):
+            return JacobianMatrix(np.array([[0.0, -1.0], [-1.0, 0.0]]), "analytical")
+
+    assert D.jacobian_misfits(Kink(_csc([[0, 1], [1, 0]])), [np.array([1.0, 2.0])]) == []
+
+
+def test_a_feature_narrower_than_the_coarse_steps_is_not_a_finding():
+    """BIOMD0000000498's shape: dA/dt = 5 - 2b + 1e-9·tanh(b/1e-9) at b = 0. Its
+    slope at the point is -1, the analytic entry; at steps far over 1e-9 the
+    differences settle, step after step, on the secant -2, and with the
+    constant's rounding at the fine steps that plateau is the steps' tightest.
+    A finding needs the analytic entry contradicted at every step that
+    resolves it, and the fine steps agree with it; judged at the tightest step
+    alone, this read as a wrong entry.
+
+    (A feature narrower still than any step rounding lets the ladder resolve
+    is past what the check can tell from a wrong entry: at 1e-10 under a
+    constant of 10 it reads as one.)"""
+    from bngsim._evaluators import JacobianMatrix
+
+    class Narrow(_FakeModel):
+        @staticmethod
+        def rhs(y, t=0.0):
+            return np.array([5.0 - 2.0 * y[1] + 1e-9 * np.tanh(y[1] / 1e-9), -y[0]])
+
+        def jacobian(self, y, t=0.0):
+            return JacobianMatrix(np.array([[0.0, -1.0], [-1.0, 0.0]]), "analytical")
+
+    y = [np.array([1.0, 0.0])]
+    assert D.jacobian_misfits(Narrow(_csc([[0, 1], [1, 0]])), y) == []
+    # and with the analytic entry the coarse secant's -2, which no fine step
+    # bears out, it is no finding either: the steps disagree with each other.
+    wrong = Narrow(_csc([[0, 1], [1, 0]]))
+    wrong.jacobian = lambda yy, t=0.0: JacobianMatrix(
+        np.array([[0.0, -3.0], [-1.0, 0.0]]), "analytical"
+    )
+    assert [m["entry"] for m in D.jacobian_misfits(wrong, y)] == [(0, 1)]
+
+
+def test_a_slope_rounded_away_at_the_fine_steps_is_not_a_finding():
+    """BIOMD0000000393's shape (#533): dA/dt = (N/2)(sqrt(1 + 4b/N) - 1)
+    + 100(b - 1)^3 - 0.3b at b = 1, with 4b/N = 1e-10. Under a step of about
+    2e-6 of b, 1 + 4b/N rounds to what it was, so the root's slope of 1 is
+    lost and the fine steps agree, step after step, on -0.3; the analytic
+    entry is 0.7. The coarse steps, a few percent apart from each other for
+    the cubic, read 0.7: too noisy to resolve the entry, which the fine steps
+    seem to, but enough to bear the analytic entry out, so it is no finding.
+
+    (Rounding lost deeper inside a law than the coarse steps can speak to is
+    past what the check can tell from a wrong entry: at 4b/N = 1e-11 with no
+    cubic it reads as one.)"""
+    from bngsim._evaluators import JacobianMatrix
+
+    N = 4.0 / 1e-10
+
+    class Plateau(_FakeModel):
+        @staticmethod
+        def rhs(y, t=0.0):
+            b = y[1]
+            root = 0.5 * N * (np.sqrt(1.0 + 4.0 * b / N) - 1.0)
+            return np.array([root + 100.0 * (b - 1.0) ** 3 - 0.3 * b, -y[0]])
+
+        def jacobian(self, y, t=0.0):
+            slope = 1.0 / np.sqrt(1.0 + 4.0 * y[1] / N) - 0.3
+            return JacobianMatrix(np.array([[0.0, slope], [-1.0, 0.0]]), "analytical")
+
+    assert D.jacobian_misfits(Plateau(_csc([[0, 1], [1, 0]])), [np.array([1.0, 1.0])]) == []
+
+
+def test_a_column_of_noise_is_not_judged_against_itself():
+    """mm_tqssa_stiff's false alarm: a column whose analytic entries are 2e-19
+    and whose differences are 0, beside entries of order 1. On its own peak it
+    reads 100% off; against the matrix it is noise."""
+    from bngsim._evaluators import JacobianMatrix
+
+    class Noise(_FakeModel):
+        """dA/dt = 1 - a, dB/dt = 0, at its steady state a = 1: nothing reads
+        B, so column B is 0, and the analytic side carries 2e-19 there. f is 0
+        at the state, so the differences round to nothing either, and only the
+        matrix's own scale says 2e-19 is noise."""
+
+        @staticmethod
+        def rhs(y, t=0.0):
+            return np.array([1.0 - y[0], 0.0])
+
+        def jacobian(self, y, t=0.0):
+            return JacobianMatrix(np.array([[-1.0, 2e-19], [0.0, 0.0]]), "analytical")
+
+    assert D.jacobian_misfits(Noise(_csc([[1, 1], [0, 0]])), [np.array([1.0, 2.0])]) == []
+
+
+def test_jacobian_values_on_a_real_model_with_a_wrong_entry_is_a_diff(monkeypatch):
+    """The check end to end: a real shape's analytic Jacobian, its largest entry
+    10% off. derived-log10's entries are of order 2 at every state; the
+    triangle pulses' are all 0 (their rates read the clock only), where a
+    scaled entry changes nothing."""
+    from bngsim._evaluators import JacobianMatrix
+
+    real = bngsim.Model.jacobian
+
+    def wrong(self, y, t=0.0, **kw):
+        J = real(self, y, t, **kw)
+        out = np.array(J, dtype=float)
+        k = np.unravel_index(np.argmax(np.abs(out)), out.shape)
+        assert out[k] != 0.0, "the corruption must change the matrix"
+        out[k] *= 1.1
+        return JacobianMatrix(out, J.source)
+
+    base = _base("derived-log10")
+    assert D.check_jacobian_values(base).status == "pass"
+    monkeypatch.setattr(bngsim.Model, "jacobian", wrong)
+    v = D.check_jacobian_values(base)
+    assert v.status == "diff", v
 
 
 def test_a_backend_other_than_the_one_asked_is_a_finding(monkeypatch):
@@ -503,7 +719,7 @@ def test_a_cap_spent_after_the_base_times_out_each_check_alone(monkeypatch):
 
     monkeypatch.setattr(D, "Base", base_then_spent)
     v = D.check_all(SHAPES["triangle-maxabs"], None, CHECKS, deadline=time.monotonic() + 1e3)
-    assert {x.status for x in v.values()} <= {"timeout", "skip"}, v
+    assert {x.status for x in v.values()} == {"timeout"}, v
     assert v["grid"].status == "timeout", v["grid"]
     assert "not finished within the model's cap" in v["grid"].note
     assert v["sens_runs"].status == "timeout", v["sens_runs"]
@@ -585,6 +801,71 @@ def test_a_model_killed_at_the_cap_keeps_the_rows_it_finished(tmp_path):
     assert rows["grid"].outcome == "PASS", rows["grid"]
     assert rows["backend_as_asked"].outcome == "TIMEOUT"
     assert rows["backend_as_asked"].exception == "cap of 900 s"
+
+
+@pytest.mark.parametrize(
+    ("r", "note"),
+    [
+        ({"status": "dead", "exitcode": -11}, "the worker died (exit code -11)"),
+        ({"status": "exception", "why": "ValueError: boom"}, "ValueError: boom"),
+    ],
+    ids=["died", "raised"],
+)
+def test_a_model_that_died_or_raised_keeps_the_rows_it_finished(tmp_path, r, note):
+    """A worker that segfaults, or raises past check_all, has finished what it
+    kept as surely as one killed at the cap. The rest say what happened to the
+    worker: one that died did not reach the cap."""
+    import differential_run as RUN
+
+    job = SHAPES["triangle-maxabs"]
+    spec = {
+        "key": job.model_id,
+        "job": job.as_dict(),
+        "checks": ["grid", "backend_as_asked"],
+        "timeout": 900.0,
+        "partial": str(tmp_path / "0.json"),
+    }
+    RUN._keep(spec, "grid", D.Verdict("pass", 0.0, "agrees"))
+    rows = {x.method: x for x in RUN.to_results(spec, r, {})}
+    assert rows["grid"].outcome == "PASS", rows["grid"]
+    assert rows["backend_as_asked"].outcome == "EXCEPTION"
+    assert rows["backend_as_asked"].exception == note
+
+
+def _locale_runs_out(monkeypatch, left):
+    """``check_locale`` on a child that never finishes, with ``left`` seconds of
+    the model's cap (None for no cap): the timeout the child was given, and the
+    verdict."""
+    import subprocess
+    import time
+
+    base = D.Base(SHAPES["triangle-maxabs"])
+    given = []
+
+    def never_finishes(cmd, timeout=None, **kw):
+        given.append(timeout)
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(D.subprocess, "run", never_finishes)
+    monkeypatch.setattr(D, "_DEADLINE", None if left is None else time.monotonic() + left)
+    return given, D.check_locale(base, "de_DE.UTF-8", timeout=600.0)
+
+
+def test_a_locale_run_past_the_models_cap_is_a_timeout(monkeypatch):
+    given, v = _locale_runs_out(monkeypatch, left=30.0)
+    assert given[0] <= 30.0, given
+    assert v.status == "timeout" and "the model's cap" in v.note, v
+
+
+@pytest.mark.parametrize("left", [None, 1e4], ids=["no-cap", "cap-to-spare"])
+def test_a_locale_run_past_its_own_limit_is_not_the_caps(monkeypatch, left):
+    """The run under C finished; the same run under a comma-decimal locale
+    did not, in 600 s. That stays an EXCEPTION, as before the cap, and not a
+    TIMEOUT the baseline reads as a changed state: a locale that stalls a run is
+    the check's finding (#1235's class)."""
+    given, v = _locale_runs_out(monkeypatch, left=left)
+    assert given == [600.0], given
+    assert v.status == "exception" and "TimeoutExpired" in v.note, v
 
 
 def test_each_verdict_is_heard_as_it_is_reached():
