@@ -1439,15 +1439,21 @@ struct SteadyStateResult {
     // ∂f/∂p the codegen sensitivity RHS emits) or "finite-difference"; ""
     // when no sensitivity was requested.
     std::string sens_dfdp_source;
-    // output_source: how the d(func)/dp block below was built (issue #75) —
-    // "codegen" (the compiled bngsim_codegen_output_sens chain rule answered
-    // every function), "finite-difference" (it answered none: no symbol, or a
-    // whole-model decline), or "mixed" (it answered some and the rest were
-    // differenced — a function it marks unsupported, or one outside the
-    // user-function closure). "" when no sensitivity was requested or the model
-    // has no global functions. The observable block is an exact linear
-    // projection either way and is not covered by this field.
+    // output_source: how much of the d(func)/dp block below the compiled
+    // bngsim_codegen_output_sens chain rule answered (issues #75, #1002), over
+    // the functions a result returns (not the auto-generated _rateLawN):
+    // "codegen" (every one), "partial" (some; the rest are NaN rows), or
+    // "none" (not one: each declined or NaN for its own reason, no symbol, or a
+    // whole-model decline). A row
+    // the chain rule does not answer is not differenced. "" when no
+    // sensitivity was requested or the model has no function a result
+    // returns. The observable block is an exact linear projection either way
+    // and is not covered by this field.
     std::string sens_output_source;
+    // Whether that chain rule was called at all: false where the artifact has
+    // none (no symbol, a whole-model decline), so that a refusal of a NaN row
+    // can tell "no chain rule" from a row it gave NaN for (issue #1002).
+    bool sens_output_evaluated = false;
     // How close to singular the factored (reduced) Jacobian was:
     // min|U_jj| / max|U_jj| from its LU. dY_ss/dp only exists when that Jacobian
     // has full rank; a steady state that is a continuum rather than an isolated
@@ -1559,23 +1565,21 @@ struct SteadyStateResult {
     // state's scale at their own step (fd_own_step_columns, in
     // bngsim/fd_jacobian.hpp). sens_fd_own_step_species are the species
     // (0-based) whose columns that changed; empty where none did, and then
-    // there is nothing to compare. Where the two answers are further apart
-    // than 1e-4 of a column's largest entry, sens_fd_disagree_species and
+    // there is nothing to compare. Where an entry of the two answers is
+    // further apart than 1e-4 of itself (1e-10 of its column's largest, at
+    // least), sens_fd_disagree_species and
     // sens_fd_disagree_param are the entry furthest apart (0-based species, and
     // column into sens_param_names; -1 where none is) and sens_fd_floored and
     // sens_fd_own_step its two values, the first being the one in
-    // `sensitivity`. sens_fd_disagree_function is the same for the
-    // state-chain term of a function sensitivity that was differenced (an
-    // index into function_names), with the two totals in
-    // sens_fd_function_floored and sens_fd_function_own_step.
+    // `sensitivity`.
     //
     // They are solved a third time with the matrix that has the columns of
     // those species, and of species at 0, at half the floored step, whole
     // (fd_half_step_columns): sens_fd_half_step_species are the species whose
     // columns were taken. The entry put on the result is the one furthest from
-    // the floored answer by either, and sens_fd_half_step (and
-    // sens_fd_function_half_step) its value at half the step. Where a matrix
-    // has no column taken, its value is the floored one.
+    // the floored answer by either, and sens_fd_half_step its value at half
+    // the step. Where a matrix has no column taken, its value is the floored
+    // one.
     std::vector<int> sens_fd_own_step_species;
     std::vector<int> sens_fd_half_step_species;
     int sens_fd_disagree_species = -1;
@@ -1583,11 +1587,6 @@ struct SteadyStateResult {
     double sens_fd_floored = 0.0;
     double sens_fd_own_step = 0.0;
     double sens_fd_half_step = 0.0;
-    int sens_fd_disagree_function = -1;
-    int sens_fd_function_param = -1;
-    double sens_fd_function_floored = 0.0;
-    double sens_fd_function_own_step = 0.0;
-    double sens_fd_function_half_step = 0.0;
 
     // ─── Observable / function output sensitivities at steady state (GH #12) ───
     // The chain-rule projection of the species dY_ss/dp above onto the model's
@@ -1599,8 +1598,8 @@ struct SteadyStateResult {
     // The function total derivative carries BOTH the state-chain term and the
     // function's explicit parameter dependence (e.g. `k3/(K4+G)` w.r.t. k3). It
     // comes from the same compiled bngsim_codegen_output_sens evaluator the CVODES
-    // forward-sensitivity path uses, falling back to finite differences per
-    // function where that evaluator declines — see sens_output_source. IC-axis output
+    // forward-sensitivity path uses, and a function's row is NaN where that
+    // evaluator declines (issue #1002) — see sens_output_source. IC-axis output
     // sensitivities are structurally zero at a stable steady state (∂x*/∂x(0)=0)
     // and are not stored. Both blocks are row-major (n_rows × n_sens_params) and
     // empty unless sensitivity was requested AND the solve converged; the
@@ -1611,12 +1610,11 @@ struct SteadyStateResult {
     std::vector<std::string> function_names;    // n_functions (raw, incl _rateLawN)
     std::vector<double> observable_sensitivity; // (n_observables × n_sens_params)
     std::vector<double> function_sensitivity;   // (n_functions × n_sens_params)
-    // For each raw function, the first species (0-based) whose dY_ss/dp row its
-    // finite-difference derivative needed and the solve has none of: one mask=
+    // For each raw function the compiled evaluator did not answer, the first
+    // species (0-based) its value reads that has no dY_ss/dp row: one mask=
     // left out, or a rule target (whose row the Python layer fills from its
-    // rule afterwards). That function's row is NaN. -1 where the derivative
-    // needed no such row, which includes every row the compiled evaluator
-    // answered; empty when function_sensitivity is.
+    // rule afterwards). -1 where it reads no such species, and for every row
+    // the compiled evaluator answered; empty when function_sensitivity is.
     std::vector<int> function_sens_missing_species;
 
     // ─── What the convergence test covered, and why it failed (issue #74) ─────

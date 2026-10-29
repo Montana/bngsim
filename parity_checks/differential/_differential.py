@@ -38,9 +38,10 @@ answers sees:
 Each returns a :class:`Verdict`: ``pass``, ``diff`` (a finding, with its size),
 ``unsupported`` (the path declined by type: not a wrong answer), ``skip`` (the
 path does not apply here, said why), ``exception`` (a path raised where the base
-ran: a finding) or ``no_base`` (the model does not load or its plain run does
+ran: a finding), ``no_base`` (the model does not load or its plain run does
 not complete, so there is nothing to compare against: the parity suites own
-that).
+that) or ``timeout`` (not finished within the model's cap, or a compile past
+bngsim's own limit: that row only).
 
 The oracle has to be careful
 ----------------------------
@@ -69,6 +70,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -93,6 +95,10 @@ GRID_FACTOR = 8
 #: Comma-decimal locales, in the order tried.
 COMMA_LOCALES = ("de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "fr_FR")
 
+#: The ``time.monotonic()`` every run of the model being checked must finish
+#: by, which :func:`check_all` sets: None outside it, or with no cap.
+_DEADLINE: float | None = None
+
 CHECKS = (
     "sens_runs",
     "sens_vs_plain",
@@ -103,13 +109,14 @@ CHECKS = (
     "locale",
     "grid",
     "sparsity_covers_jacobian",
+    "jacobian_values",
     "backend_as_asked",
 )
 
 
 @dataclass
 class Verdict:
-    status: str  # pass | diff | unsupported | skip | exception | no_base
+    status: str  # pass | diff | unsupported | skip | exception | no_base | timeout
     value: float | None = None
     note: str = ""
     extra: dict = field(default_factory=dict)
@@ -165,9 +172,22 @@ def sens_params(model) -> list[str]:
     return [p for p in model.primary_param_names if p not in excluded][:MAX_SENS_PARAMS]
 
 
+def _left() -> float | None:
+    """The seconds to :data:`_DEADLINE`, a run's ``timeout``: None for none. Past
+    it no run starts (``SimulationTimeout``)."""
+    if _DEADLINE is None:
+        return None
+    left = _DEADLINE - time.monotonic()
+    if left <= 0:
+        import bngsim
+
+        raise bngsim.SimulationTimeout("the model's cap is spent")
+    return left
+
+
 def run(job: Job, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
-    the Result and the Simulator."""
+    the Result and the Simulator. It has until :data:`_DEADLINE`."""
     import bngsim
 
     sim = bngsim.Simulator(load(job.path), method="ode", **{**job.sim, **kw})
@@ -177,6 +197,7 @@ def run(job: Job, **kw):
         rtol=job.rtol,
         atol=job.atol,
         max_steps=job.max_steps,
+        timeout=_left(),
     )
     return result, sim
 
@@ -279,7 +300,33 @@ def _declined(e: Exception) -> bool:
     )
 
 
+#: The words bngsim's compile timeout is reported in (``_codegen``), where
+#: ``codegen=True``'s refusal carries it in its text and not as its cause.
+_COMPILE_TIMED_OUT = "Codegen compilation timed out"
+
+
+def _timed_out(e: BaseException) -> bool:
+    """A run stopped by the model's cap, or a compile by bngsim's own limit
+    (BIOMD0000000385's 4.2 MB of C past 600 s): a timeout, whatever wraps it,
+    and never a crash."""
+    import bngsim
+
+    seen, depth = e, 0
+    while seen is not None and depth < 16:
+        if isinstance(seen, bngsim.SimulationTimeout | subprocess.TimeoutExpired):
+            return True
+        seen, depth = seen.__cause__ or seen.__context__, depth + 1
+    return _COMPILE_TIMED_OUT in str(e)
+
+
 def _verdict_of(e: Exception) -> Verdict:
+    if _timed_out(e):
+        # A cap reached in this check: its own row, not every row.
+        if _COMPILE_TIMED_OUT in str(e):
+            why = f"the compile timed out: {type(e).__name__}: {_first_line(e)}"
+        else:
+            why = f"not finished within the model's cap: {_first_line(e)}"
+        return Verdict("timeout", None, why)
     status = "unsupported" if _declined(e) or isinstance(e, _Declined) else "exception"
     return Verdict(status, None, f"{type(e).__name__}: {_first_line(e)}")
 
@@ -302,6 +349,9 @@ def check_sens(base: Base) -> dict[str, Verdict]:
     try:
         result, sim = run(base.job, sensitivity_params=params)
     except Exception as e:  # noqa: BLE001 - that it did not complete is the verdict
+        if _timed_out(e):
+            v = _verdict_of(e)
+            return {"sens_runs": v, "sens_vs_plain": v}
         # Where the plain run completes and the sensitivity run does not: a
         # refusal by name, or a derivative that does not exist at the start
         # (a power of a species at 0), or a crash. The rule records it; the
@@ -576,7 +626,11 @@ def _states(job: Job) -> list[tuple[float, np.ndarray]]:
         if t > job.t_start:
             try:
                 bngsim.Simulator(model, method="ode", **job.sim).run(
-                    t_span=(job.t_start, t), n_points=2, rtol=job.rtol, atol=job.atol
+                    t_span=(job.t_start, t),
+                    n_points=2,
+                    rtol=job.rtol,
+                    atol=job.atol,
+                    timeout=_left(),
                 )
             except bngsim.SimulationError:
                 # A state this one-interval run does not reach, where the base's
@@ -605,6 +659,184 @@ def check_sparsity(base: Base) -> Verdict:
                 {"missed": misses[:50]},
             )
         return Verdict("pass", 0.0, f"pattern covers every entry at {len(states)} states")
+
+    return _guard(go)
+
+
+# jacobian_values (issue #1308). Each entry is differenced over a ladder of
+# steps, JAC_STEPS of its column's scale, and each step's difference carries
+# its own error bound: the larger of its gaps to the neighbouring steps', which
+# moves with truncation at the coarse end and with rounding at the fine end,
+# the steps being a decade apart. A step is resolvable where
+# that bound is under JAC_AGREE of the entry, and has a say where it is under
+# JAC_HEARD. The entry is off only where the analytic one contradicts the
+# difference at every resolvable step, by more than ten times that step's bound
+# plus JAC_TOL of its column's peak and JAC_FLOOR of the whole matrix's, and no
+# step with a say bears it out (within twice its bound).
+#
+# A say for a step a little noisier than a resolvable one, because rounding
+# can make a fine step look resolved and be wrong: in sqrt(1 + u) - 1 with
+# u ≈ 1e-6 (BIOMD0000000393's quadratic roots, #533), a step under
+# ulp(1)·N/4 leaves 1 + u as it was, so the term's whole slope rounds away and
+# the fine steps agree, from 1e-8 to 1e-10, on 0.661 where the entry is
+# -1.96e-4. The coarse steps, 2-3% apart from one another, read -1.96e-4. No
+# bound on rounding from |f| could see that loss, which happens inside the law.
+#
+# Every step, and not the best one: a feature narrower than the coarser steps
+# (a saturation k·s/(Km + s) with a Km far under the species' scale) holds two
+# plateaus, the secant across it at coarse steps and the slope at the point at
+# fine ones, and the analytic entry is the second. BIOMD0000000498's dS26/dS26
+# is -13.74 to 1e-6 and -13.11 at 1e-8, the analytic -13.11; BIOMD0000000480's
+# s1 sits at -1e-14 under a saturation with Km 1e-3, its analytic entry 2,000
+# off the coarse secant. A wrong entry is wrong at every scale.
+#
+# Rounding in a large f is what the gaps bound: blbr's f is 1e11, and at a
+# step of 1e-6 its differences came out 2.0345 at two steps a factor of two
+# apart, alike, where the entry is 2; a decade either side they do not. The
+# floor is what a near-zero column costs: mm_tqssa_stiff's carries
+# 2e-19 against entries of order 1, which on its own peak reads 100% off.
+JAC_STEPS = tuple(10.0**-k for k in range(2, 11))
+JAC_AGREE = 1e-2
+JAC_HEARD = 1e-1
+JAC_SMOOTH = 1e-3
+JAC_TOL = 1e-4
+JAC_FLOOR = 1e-8
+
+
+def jacobian_misfits(model, states, t=0.0, steps=JAC_STEPS) -> list[dict] | None:
+    """The entries of the analytic Jacobian that central differences of the
+    right-hand side contradict, at any of ``states``; ``None`` when
+    ``Model.jacobian`` does not give the analytic one there (nothing of the
+    closed form to judge).
+
+    Each column is scaled by the state's own size, as :func:`sparsity_misses`
+    scales it, and judged on its own peak (the larger of the analytic one and
+    the difference's), so an entry in units of one species is never held to
+    another's. An entry the differences cannot resolve at any step, or one on a
+    kink, is not judged (see the constants above). A non-finite analytic entry
+    is off wherever some step resolves the entry.
+    """
+    # Asked before Model.jacobian(), which refuses a difference quotient whose
+    # step decides an entry (#1002) where it returned one: a model without the
+    # closed form has nothing of it to judge, whichever it would do.
+    prepare = getattr(model, "prepare_analytical_jacobian", None)
+    if prepare is not None and not prepare():
+        return None
+    out: dict[tuple[int, int], dict] = {}
+    for y in states:
+        y = np.asarray(y, dtype=float)
+        n = y.size
+        if n == 0:
+            continue
+        J = model.jacobian(y, t)
+        if getattr(J, "source", None) != "analytical":
+            return None
+        big = float(np.abs(y).max())
+        scale = np.maximum(np.abs(y), max(big, 1.0) * 1e-3)
+        f0 = np.asarray(model.rhs(y, t))
+        cen, fwd, bwd = [], [], []
+        for h_rel in steps:
+            c_, f_, b_ = [], [], []
+            for j in range(n):
+                h = h_rel * scale[j]
+                up, dn = y.copy(), y.copy()
+                up[j] += h
+                dn[j] -= h
+                f_up, f_dn = np.asarray(model.rhs(up, t)), np.asarray(model.rhs(dn, t))
+                c_.append((f_up - f_dn) / (2 * h))
+                f_.append((f_up - f0) / h)
+                b_.append((f0 - f_dn) / h)
+            sc = scale[np.newaxis, :]
+            cen.append(np.stack(c_, axis=1) * sc)
+            fwd.append(np.stack(f_, axis=1) * sc)
+            bwd.append(np.stack(b_, axis=1) * sc)
+        cen, fwd, bwd = map(np.stack, (cen, fwd, bwd))  # (n_steps, n, n)
+        finite = np.isfinite(cen)
+        k_steps = len(steps)
+        # The truncation bound: the larger gap to a neighbouring step.
+        trunc = np.full_like(cen, np.inf)
+        for k in range(k_steps):
+            gaps = [np.abs(cen[k] - cen[m]) for m in (k - 1, k + 1) if 0 <= m < k_steps]
+            trunc[k] = np.max(np.stack(gaps), axis=0)
+        err = np.where(finite, trunc, np.inf)
+        a = np.asarray(J, dtype=float) * scale[np.newaxis, :]
+        mag = np.where(finite, np.abs(cen), 0.0)
+        peak = np.maximum(
+            mag.max(axis=(0, 1)), np.where(np.isfinite(a), np.abs(a), 0.0).max(axis=0)
+        )
+        top = float(peak.max()) if peak.size else 0.0
+        size = np.maximum(mag, JAC_FLOOR * peak[np.newaxis, np.newaxis, :])
+        resolvable = finite & (err <= JAC_AGREE * size)
+        any_res = resolvable.any(axis=0)
+        # A kink in the state (max(0, x) at x = 0, an if() on a species on its
+        # threshold) is the #368 trap: the central differences converge, at
+        # every step, to the mean of the two one-sided slopes, which no analytic
+        # entry is. The one-sided differences tell it at the finest resolvable
+        # step: they differ there by the slope's jump, and by O(h) where the law
+        # is smooth. MODEL2105110001's NEU sits at -4e-216 on a kink whose sides
+        # are 0.3% apart, and its analytic entry is the side it is on.
+        finest = np.where(any_res, k_steps - 1 - np.argmax(resolvable[::-1], axis=0), 0)
+        at = finest[np.newaxis]
+        fwd_f, bwd_f, size_f, err_f = (
+            np.take_along_axis(x, at, axis=0)[0] for x in (fwd, bwd, size, err)
+        )
+        kink = np.abs(fwd_f - bwd_f) > JAC_SMOOTH * size_f + 4.0 * err_f
+        slack = JAC_TOL * peak[np.newaxis, :] + JAC_FLOOR * top
+        contradicts = np.abs(a[np.newaxis] - cen) > 10.0 * err + slack[np.newaxis]
+        everywhere = np.all(~resolvable | contradicts, axis=0)
+        # A noisier step's say is a veto, and only where it bears the analytic
+        # entry out, within twice its own bound: one that merely fails to
+        # contradict it at ten times that bound would excuse any error.
+        heard = finite & (err <= JAC_HEARD * size)
+        vetoed = np.any(
+            heard & (np.abs(a[np.newaxis] - cen) <= 2.0 * err + slack[np.newaxis]), axis=0
+        )
+        off = any_res & (~np.isfinite(a) | (~kink & everywhere & ~vetoed))
+        best = np.argmin(np.where(resolvable, err, np.inf), axis=0)
+        d_best = np.take_along_axis(cen, best[np.newaxis], axis=0)[0]
+        for i, j in zip(*np.nonzero(off), strict=True):
+            finite_a = np.isfinite(a[i, j]) and peak[j] > 0
+            e = float(abs(a[i, j] - d_best[i, j]) / peak[j]) if finite_a else float("inf")
+            key = (int(i), int(j))
+            if key not in out or e > out[key]["off"]:
+                out[key] = {
+                    "entry": key,
+                    "t": float(t),
+                    "analytic": float(J[i, j]),
+                    "difference": float(d_best[i, j] / scale[j]),
+                    "off": e,
+                }
+    return sorted(out.values(), key=lambda m: -m["off"])
+
+
+def check_jacobian_values(base: Base) -> Verdict:
+    def go():
+        model = load(base.job.path)
+        states = _states(base.job)
+        worst: dict[tuple[int, int], dict] = {}
+        for t, y in states:
+            found = jacobian_misfits(model, [y], t=t)
+            if found is None:
+                return Verdict(
+                    "skip", note="no analytic Jacobian: Model.jacobian differences the RHS"
+                )
+            for m in found:
+                if m["entry"] not in worst or m["off"] > worst[m["entry"]]["off"]:
+                    worst[m["entry"]] = m
+        if worst:
+            names = list(model.species_names)
+            ranked = sorted(worst.values(), key=lambda m: -m["off"])
+            shown = ", ".join(
+                f"d{names[m['entry'][0]]}/d{names[m['entry'][1]]} {m['off']:.1e}"
+                for m in ranked[:5]
+            )
+            return Verdict(
+                "diff",
+                ranked[0]["off"],
+                f"{len(ranked)} analytic entries off the differences (of their column's peak): {shown}",
+                {"off": [{**m, "entry": list(m["entry"])} for m in ranked[:50]]},
+            )
+        return Verdict("pass", 0.0, f"every judged entry agrees at {len(states)} states")
 
     return _guard(go)
 
@@ -647,12 +879,21 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
 
     def go():
         here = str(Path(__file__).resolve().parent)
-        out = subprocess.run(
-            [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        # The model's cap, where less of it is left than this run's own limit.
+        limit = timeout if _DEADLINE is None else min(timeout, _left())
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", _LOCALE_PROBE, name, json.dumps(base.job.as_dict()), here],
+                capture_output=True,
+                text=True,
+                timeout=limit,
+            )
+        except subprocess.TimeoutExpired as e:
+            if limit < timeout:  # the model's cap: TIMEOUT, this row only
+                raise
+            # Its own limit, where the run under C finished: a crash, as it read
+            # before the cap. A run the locale stalls is this check's finding.
+            return Verdict("exception", None, f"{type(e).__name__}: {_first_line(e)}")
         if out.returncode != 0:
             last = (out.stderr.strip().splitlines() or ["?"])[-1][:300]
             return Verdict("diff", None, f"runs under C, fails under {name}: {last}")
@@ -661,19 +902,67 @@ def check_locale(base: Base, name: str | None, timeout: float = 600.0) -> Verdic
     return _guard(go)
 
 
-def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Verdict]:
+def check_all(
+    job: Job,
+    locale_name: str | None,
+    checks=CHECKS,
+    deadline: float | None = None,
+    on_verdict=None,
+) -> dict[str, Verdict]:
     """Every check of ``checks`` on one model. A base that does not run is no
-    reference: each check is then an exception on the base."""
+    reference: each check is then an exception on the base. Every run has
+    until ``deadline`` (a ``time.monotonic()``): a check that has not finished
+    by then is TIMEOUT, its own row only, where the runner's cap would take
+    every row of the model (MODEL1006230049, 0053 and 0077 take 716-751 s of
+    the nightly's 900 s, so any check added to every model tipped them over).
+    ``on_verdict(check, verdict)`` hears each as it is reached, so a caller
+    killed at the cap still has those."""
+    global _DEADLINE
+    _DEADLINE = deadline
+    try:
+        return _check_all(job, locale_name, checks, on_verdict or (lambda c, v: None))
+    finally:
+        _DEADLINE = None
+
+
+class _Heard(dict):
+    """The verdicts so far, each told to ``on_verdict`` as it is set."""
+
+    def __init__(self, on_verdict):
+        super().__init__()
+        self.on_verdict = on_verdict
+
+    def __setitem__(self, check, verdict):
+        super().__setitem__(check, verdict)
+        self.on_verdict(check, verdict)
+
+    def update(self, other):
+        for check, verdict in other.items():
+            self[check] = verdict
+
+
+def _check_all(job: Job, locale_name: str | None, checks, on_verdict) -> dict[str, Verdict]:
     try:
         base = Base(job)
     except Exception as e:  # noqa: BLE001
         # No base, no reference: not a finding of this suite's (the parity suites
         # own a model that does not load or run), and not a pass either.
         v = Verdict("no_base", None, f"the base run: {type(e).__name__}: {str(e)[:300]}")
-        return {c: v for c in checks}
-    out: dict[str, Verdict] = {}
+        return {c: _verdict_of(e) if _timed_out(e) else v for c in checks}
+    out: dict[str, Verdict] = _Heard(on_verdict)
+
+    def spent() -> Verdict | None:
+        # No check starts past the deadline: one that builds and compiles
+        # Simulators without running them (backend_as_asked) has no run to bound.
+        try:
+            _left()
+        except Exception as e:  # noqa: BLE001 - SimulationTimeout, the cap spent
+            return _verdict_of(e)
+        return None
+
     if {"sens_runs", "sens_vs_plain"} & set(checks):
-        out.update(check_sens(base))
+        v = spent()
+        out.update({"sens_runs": v, "sens_vs_plain": v} if v else check_sens(base))
     one = {
         "ajac_vs_fdjac": check_ajac,
         "klu_vs_dense": check_klu,
@@ -685,7 +974,10 @@ def check_all(job: Job, locale_name: str | None, checks=CHECKS) -> dict[str, Ver
     }
     for name, fn in one.items():
         if name in checks:
-            out[name] = fn(base)
+            out[name] = spent() or fn(base)
     if "locale" in checks:
-        out["locale"] = check_locale(base, locale_name)
+        out["locale"] = spent() or check_locale(base, locale_name)
+    # After every check main runs (#1308), in what is left of the model's cap.
+    if "jacobian_values" in checks:
+        out["jacobian_values"] = spent() or check_jacobian_values(base)
     return {c: out[c] for c in checks if c in out}
