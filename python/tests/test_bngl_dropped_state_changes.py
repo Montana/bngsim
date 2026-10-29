@@ -144,7 +144,40 @@ def test_a_change_the_loaded_model_does_not_hold_is_warned(tmp_path):
     assert "protocol=True" in text
 
 
-@needs_bng2
+# The network BNG2.pl generates from MODEL, written by hand, so the judging of
+# each action against a network needs no BioNetGen (only the three tests that
+# go through from_bngl itself do).
+NET = """\
+begin parameters
+    1 k   1
+    2 A0  100
+    3 k2  0
+end parameters
+begin species
+    1 A(b) A0
+    2 B(x,y,z) 5
+end species
+begin reactions
+    1 1 0 k
+end reactions
+begin groups
+    1 Atot 1
+end groups
+"""
+
+
+def _changes(tmp_path: Path, actions: str) -> list[str]:
+    from bngsim._bngl_loader import dropped_state_changes
+
+    net = tmp_path / "m.net"
+    net.write_text(NET)
+    return dropped_state_changes(bngsim.Model.from_net(str(net)), MODEL + actions)
+
+
+def _before_a_run(change: str) -> str:
+    return f"generate_network({{overwrite=>1}})\n{change}\nsimulate({{t_end=>1}})\n"
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -162,51 +195,27 @@ def test_a_change_the_loaded_model_does_not_hold_is_warned(tmp_path):
         "adding 0",
     ],
 )
-def test_a_change_to_what_the_model_already_holds_is_not_warned(tmp_path, change):
+def test_a_change_to_what_the_model_already_holds_is_not_named(tmp_path, change):
     """Control: 53 of the 94 repo files whose actions set something before their
     first run set it to what the model already holds (``egfr_path`` sets EGF to
     its declared 0). A warning there would be wrong."""
-    _model, caught = _load(
-        tmp_path, f"generate_network({{overwrite=>1}})\n{change}\nsimulate({{t_end=>1}})\n"
-    )
-    assert caught == []
+    assert _changes(tmp_path, _before_a_run(change)) == []
 
 
-@needs_bng2
-def test_adding_to_a_species_is_warned(tmp_path):
-    actions = (
-        'generate_network({overwrite=>1})\naddConcentration("A(b)",5)\nsimulate({t_end=>1})\n'
-    )
-    _model, caught = _load(tmp_path, actions)
-    assert len(caught) == 1 and "addConcentration('A(b)', '5')" in str(caught[0].message)
+def test_adding_to_a_species_is_named(tmp_path):
+    assert _changes(tmp_path, _before_a_run('addConcentration("A(b)",5)')) == [
+        "addConcentration('A(b)', '5')"
+    ]
 
 
-@needs_bng2
 def test_only_the_actions_that_change_something_are_named(tmp_path):
-    actions = (
-        'generate_network({overwrite=>1})\nsetParameter("k2",0)\nsetParameter("k",3)\n'
-        "simulate({t_end=>1})\n"
-    )
-    _model, caught = _load(tmp_path, actions)
-    assert len(caught) == 1
-    assert "'k2'" not in str(caught[0].message) and "setParameter('k', '3')" in str(
-        caught[0].message
-    )
+    actions = _before_a_run('setParameter("k2",0)\nsetParameter("k",3)')
+    assert _changes(tmp_path, actions) == ["setParameter('k', '3')"]
 
 
-@needs_bng2
 def test_a_species_the_network_does_not_name_counts_as_a_change(tmp_path):
     """Where the effect cannot be read, say so rather than stay quiet."""
-    actions = (
-        'generate_network({overwrite=>1})\nsetConcentration("A(b!1).A(b!1)",3)\n'
-        "simulate({t_end=>1})\n"
-    )
-    path = tmp_path / "m.bngl"
-    path.write_text(MODEL + actions)
-    from bngsim._bngl_loader import dropped_state_changes
-
-    model = bngsim.Model.from_net(str(bngsim._bngl_loader.bngl_to_net(path, cache=False)))
-    assert dropped_state_changes(model, path.read_text()) == [
+    assert _changes(tmp_path, _before_a_run('setConcentration("A(b!1).A(b!1)",3)')) == [
         "setConcentration('A(b!1).A(b!1)', '3')"
     ]
 
