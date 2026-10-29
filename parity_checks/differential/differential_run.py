@@ -5,8 +5,10 @@ report (issue #1257).
 The checks are ``_differential.py``'s: a sensitivity run's state against a plain
 run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
-8x the output points against the base's grid, and three rules for bugs whose answers are right (a sensitivity run refused, a
-sparsity pattern that misses entries, a backend other than the one asked for).
+8x the output points against the base's grid, and four rules for bugs whose
+answers are right (a sensitivity run refused, a sparsity pattern that misses
+entries, analytic Jacobian entries that differences of the right-hand side
+contradict (#1308), a backend other than the one asked for).
 Four more transform the model file itself, where the answer is known to follow,
 which the loader reads a second way (#1305, ``_transforms.py``): its species and
 reactions reordered, its names renamed, each reaction split in two at half the
