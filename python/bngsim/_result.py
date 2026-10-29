@@ -1647,8 +1647,8 @@ class Result:
                 sens = sens[:, observable_indices, :]
             # A row that reads a refused species (GH #221) is NaN, and is carried
             # as _contract_dL_dY carries a refused species row.
-            refused = np.isnan(sens).any(axis=(0, 2))
-            return Y, sens, refused if refused.any() else None
+            unknown = np.isnan(sens).any(axis=(0, 2))
+            return Y, sens, unknown if unknown.any() else None
         raise ValueError(f"target must be 'species' or 'observables', got {target!r}")
 
     def _check_data_shape(
