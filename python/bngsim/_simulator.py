@@ -51,6 +51,7 @@ from bngsim._codegen import (
     read_sens_decline_note,
 )
 from bngsim._exceptions import (
+    AtolScaleWarning,
     DenseSolverFallbackWarning,
     ModelError,
     SensitivityUnsupportedError,
@@ -5297,6 +5298,7 @@ class Simulator:
         # stay on result.ssa_diagnostics regardless of warning filters. No-op on
         # non-SSA backends (counts are zero there).
         self._warn_ssa_boundary(result)
+        self._warn_atol_above_scale(result, atol)
 
         # Check stop conditions on the result
         if self._stop_conditions:
@@ -5309,6 +5311,59 @@ class Simulator:
         )
 
         return result
+
+    # A species below atol is one the run controls no error of. It matters
+    # where it is a part of the model's own scale, at least this fraction of the
+    # largest species (issue #1361); in a model of molecule counts, a species
+    # that stays near 0 is rounding, 1e-17 of the rest, and is left alone.
+    _ATOL_SCALE_RELEVANT = 1e-6
+
+    def _warn_atol_above_scale(self, result: Result, atol: AtolLike | None) -> None:
+        """Warn when the default scalar ``atol`` is above species that matter
+        in an ODE run (issue #1361).
+
+        The default, ``1e-8``, is BNG2.pl's, for species held as molecule
+        counts. A species whose every value on the run is below it has its
+        error controlled by nothing but the tolerance: a binding model of
+        species near 1e-9 M returned a concentration of -8.7e-10 for 4.1e-10 at
+        t = 5000, and BIOMD0000000002, whose ligand is at 1e-5 M and whose
+        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Warned only where the
+        caller gave no ``atol`` (here or in :meth:`set_tolerances`), and only for
+        a species that reaches at least ``_ATOL_SCALE_RELEVANT`` of the largest
+        species of the run.
+        """
+        if self._method != "ode" or atol is not None or self._atol_set:
+            return
+        if self._atol_vec is not None or self._atol_track is not None:
+            return
+        species = np.asarray(result._species, dtype=np.float64)
+        if species.ndim != 2 or species.size == 0:
+            return
+        with np.errstate(invalid="ignore"):
+            peaks = np.nanmax(np.where(np.isfinite(species), np.abs(species), np.nan), axis=0)
+        peaks = np.nan_to_num(peaks, nan=0.0)
+        largest = float(peaks.max())
+        below = (
+            (peaks < self._atol) & (peaks > 0.0) & (peaks >= self._ATOL_SCALE_RELEVANT * largest)
+        )
+        if not below.any():
+            return
+        names = [n for n, b in zip(result._species_names, below, strict=False) if b]
+        shown = ", ".join(repr(n) for n in names[:5]) + (
+            f" and {len(names) - 5} more" if len(names) > 5 else ""
+        )
+        warnings.warn(
+            f"{len(names)} species of this ODE run stay below the absolute tolerance "
+            f"atol={self._atol:g} throughout (largest of them {float(peaks[below].max()):.3g}; "
+            f"the largest species reaches {largest:.3g}): {shown}. The run controls no "
+            "error of these, so their trajectories can be wrong by their own size, or "
+            "negative, with no solver error. The default atol is for species held as "
+            "molecule counts; for a model in molar or other small units, pass "
+            "atol='auto' (a tolerance per species, from its scale), or a scalar atol "
+            "well below these species (issue #1361).",
+            AtolScaleWarning,
+            stacklevel=3,
+        )
 
     # ─── Batch ──────────────────────────────────────────────────────
 
