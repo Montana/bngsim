@@ -61,3 +61,72 @@ def parameter_overrides(model: Any, xml_names: frozenset[str]) -> dict[str, floa
         if loaded.get(name) != value:
             out[name] = value
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Seed amounts (issue #1373)
+# --------------------------------------------------------------------------- #
+# The species-side twin of the above: a Model.set_concentration reached neither
+# backend, so a run started from the XML's amounts (L0 = 300 for the 0 set).
+# Each run now hands the backend the amount of every species the model holds at
+# an amount other than its amount at load, by the id of the XML's <Species>
+# with that BNGL name (BNG2.pl writes the same canonical string, ``$`` and
+# ``@c::`` included, as the .net's species line). The model's amount at load,
+# not the XML's, for the reason given for parameters above.
+
+
+def xml_seed_species(xml_path: str | Path) -> dict[str, str | None]:
+    """The model's seed species in *xml_path*: BNGL name -> ``<Species id=>``,
+    or ``None`` for a name more than one seed species has. Empty when the file
+    cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return {}
+    out: dict[str, str | None] = {}
+    for model in root:
+        if _local(model.tag) != "model":
+            continue
+        for lst in model:
+            if _local(lst.tag) != "ListOfSpecies":
+                continue
+            for sp in lst:
+                name, sid = sp.get("name"), sp.get("id")
+                if _local(sp.tag) != "Species" or not name or not sid:
+                    continue
+                out[name] = None if name in out else sid
+    return out
+
+
+def species_amounts(model: Any, seeds: dict[str, str | None], method: str) -> dict[str, float]:
+    """``<Species id=>`` -> amount, for each species *model* holds at an amount
+    other than its amount at load. Raises ``ValueError`` for one the backend
+    cannot be told: no seed species of that name (the backend starts it at 0),
+    or more than one."""
+    names = model._core.species_names
+    state = model._core.get_state()
+    loaded = model._loaded_state
+    out: dict[str, float] = {}
+    for i, name in enumerate(names):
+        amount = float(state[i])
+        if i < len(loaded) and loaded[i] == amount:
+            continue
+        sid = seeds.get(name)
+        if sid is not None:
+            out[sid] = amount
+            continue
+        if name not in seeds and amount == 0.0:
+            # Not a seed species, so the backend starts it at 0 as asked.
+            continue
+        why = (
+            "more than one of the XML's seed species has that name"
+            if name in seeds
+            else "the XML has no seed species of that name, so the run would start it at 0"
+        )
+        raise ValueError(
+            f"method={method!r} cannot start species {name!r} at the amount the model "
+            f"holds, {amount:g}: {why}. Network-free runs are seeded from the XML's "
+            "<Species> list. Write the XML with this species as a seed species, or "
+            "start it from the network with method='ssa'."
+        )
+    return out

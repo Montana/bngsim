@@ -145,6 +145,7 @@ class Model:
         "_volume_factors_memo",
         "_frozen_params",
         "_loaded_params",
+        "_loaded_state",
     )
 
     def __init__(
@@ -158,6 +159,9 @@ class Model:
         self._loaded_params: dict[str, float] = {
             name: float(_core.get_param(name)) for name in _core.param_names
         }
+        # And every species' amount, which it hands the backend the same way
+        # where the model has changed it (issue #1373).
+        self._loaded_state: tuple[float, ...] = tuple(float(x) for x in _core.get_state())
         self._codegen_so_path: str = ""
         # GH #198: whether codegen should emit the expression output-sensitivity
         # evaluator. Set by the Simulator before codegen prep (only a sensitivity
@@ -1311,6 +1315,7 @@ class Model:
         """
         m = Model(_core=self._core.clone(), _guarded=self._guarded_functions)
         m._loaded_params = dict(self._loaded_params)
+        m._loaded_state = self._loaded_state
         m._net_path = self._net_path
         m._want_output_sens = self._want_output_sens
         m._codegen_so_path = self._codegen_so_path

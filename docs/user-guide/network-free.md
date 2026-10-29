@@ -31,6 +31,14 @@ it, and seed amounts that read it, follow. A parameter set back to its loaded
 value runs as the XML has it. `run_batch` does not run a network-free method:
 scan point by point with `Model.set_param` and `Simulator.run`.
 
+It starts from the model's species amounts the same way. A run passes the
+backend every species amount changed since the model was loaded, whether by
+`Model.set_concentration` or by an earlier run on the model. Each amount is
+rounded half-up to a count, as every seed is. It takes precedence over the
+parameter that species' seed amount reads. The XML has to list the species as
+a seed species, under the name the `.net` gives it. If it doesn't, a nonzero
+amount is refused, because the backend would start that species at 0.
+
 ### NFsim connectivity option
 
 BNGsim's in-process NFsim wrapper defaults to `connectivity=False`.
