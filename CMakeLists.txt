@@ -434,15 +434,17 @@ else()
     FetchContent_MakeAvailable(sundials)
 
     file(READ "${sundials_SOURCE_DIR}/src/cvodes/cvodes.c" _bngsim_cvodes_c)
-    string(FIND "${_bngsim_cvodes_c}" "BNGSIM LOCAL CARRY (lanl/bngsim#1301)" _bngsim_carry_at)
+    string(FIND "${_bngsim_cvodes_c}" "BNGSIM LOCAL CARRY (lanl/bngsim#1301, r2)" _bngsim_carry_at)
     unset(_bngsim_cvodes_c)
     if(_bngsim_carry_at EQUAL -1)
         message(FATAL_ERROR
-            "The SUNDIALS source at ${sundials_SOURCE_DIR} lacks the lanl/bngsim#1301 "
-            "carry, which forward-sensitivity runs need to be right. Apply it with\n"
+            "The SUNDIALS source at ${sundials_SOURCE_DIR} lacks the current "
+            "lanl/bngsim#1301 carry, which forward-sensitivity runs need to be right. "
+            "A build tree fetched before this revision: delete its _deps/sundials-* "
+            "directories and configure again. A FETCHCONTENT_SOURCE_DIR_SUNDIALS copy: "
+            "apply it with\n"
             "  cmake -DSUNDIALS_SOURCE_DIR=${sundials_SOURCE_DIR} -P "
-            "${BNGSIM_SUNDIALS_DIR}/carry_cvodes_staggered_restore.cmake\n"
-            "or drop FETCHCONTENT_SOURCE_DIR_SUNDIALS.")
+            "${BNGSIM_SUNDIALS_DIR}/carry_cvodes_staggered_restore.cmake")
     endif()
     set(BNGSIM_SUNDIALS_CARRIES_1301 ON)
 

@@ -93,7 +93,7 @@
     {
       "file": "src/cvodes/cvodes.c",
       "function": "cvStep",
-      "marker": "BNGSIM LOCAL CARRY (lanl/bngsim#1301)",
+      "marker": "BNGSIM LOCAL CARRY (lanl/bngsim#1301, r2)",
       "issue": "https://github.com/lanl/bngsim/issues/1301",
       "applied_by": "third_party/sundials/carry_cvodes_staggered_restore.cmake",
       "upstream_status": "Not reported upstream yet. The code is unchanged in LLNL/sundials main as of 2026-10-29 (v7.9.0 and after).",
