@@ -121,6 +121,23 @@ static void select_spent_batch_handler(SUNContext ctx) {
     }
 }
 
+// Whether CVODE's last step spans `t`: CVodeGetDky's own test, fuzz and all,
+// so true exactly where CVODE can interpolate to it (issue #1301).
+static bool inside_last_step(void *cvode_mem, sunrealtype t) {
+    sunrealtype tn = 0.0;
+    sunrealtype hu = 0.0;
+    CVodeGetCurrentTime(cvode_mem, &tn);
+    CVodeGetLastStep(cvode_mem, &hu);
+    sunrealtype fuzz =
+        100.0 * std::numeric_limits<sunrealtype>::epsilon() * (std::fabs(tn) + std::fabs(hu));
+    if (hu < 0.0) {
+        fuzz = -fuzz;
+    }
+    const sunrealtype tp = tn - hu - fuzz;
+    const sunrealtype tn1 = tn + fuzz;
+    return !((t - tp) * (t - tn1) > 0.0);
+}
+
 // Retry a CV_TOO_MUCH_WORK return, but only while the integrator is still
 // getting somewhere (issue #54).
 //
@@ -16003,11 +16020,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
     // Record initial sensitivities. Param cols are zero at t=0 for a fresh
     // start (or the carried-over dx/dθ seed under carry_sensitivities, GH
-    // #210); IC cols are e_k at t=0 (seeded above).
+    // #210); IC cols are e_k at t=0 (seeded above). The seed is kept for a row
+    // recorded before the first step (issue #1301, below).
+    std::vector<double> sens_seed;
     if (n_sens > 0) {
         std::vector<const double *> sens_ptrs(n_sens);
         for (int s = 0; s < n_sens; ++s) {
             sens_ptrs[s] = N_VGetArrayPointer(yS_guard[s]);
+            sens_seed.insert(sens_seed.end(), sens_ptrs[s], sens_ptrs[s] + ns);
         }
         if (n_sens_p > 0) {
             result.record_sensitivities(0, sens_ptrs.data(), ns, n_sens_p);
@@ -17013,6 +17033,34 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             budget.check();
                     },
                     carry_if_pinned, watch ? static_cast<long>(max_steps) : 0L, steps_at_call);
+            }
+            // CV_NORMAL returns tout by interpolating to it in its last step and
+            // does not check that the interpolation succeeded: where that step
+            // does not span tout, `y` is left as the call before had it (issue
+            // #1301). Unpatched CVODES got there by stepping past a state the
+            // RHS refused without correcting the step, so the run is refused,
+            // not read where it stands. Asked of the retry's return too.
+            if (flag == CV_SUCCESS && sens.n_total > 0 &&
+                (t_ret == look_tout || t_ret == t_target) && !inside_last_step(cvode_mem, t_ret)) {
+                sunrealtype tn = 0.0;
+                sunrealtype hu = 0.0;
+                CVodeGetCurrentTime(cvode_mem, &tn);
+                CVodeGetLastStep(cvode_mem, &hu);
+                std::ostringstream msg;
+                msg << std::setprecision(17) << "CVODES returned the output time t=" << t_ret
+                    << " from a step [" << (tn - hu) << ", " << tn
+                    << "] that does not span it, so the state there was never read. "
+#ifdef BNGSIM_SUNDIALS_CARRIES_1301
+                    << "This build carries the lanl/bngsim#1301 fix that should prevent it "
+                       "(unless BNGSIM_SUNDIALS_STAGGERED_RESTORE=0 turned it off); please "
+                       "report the model."
+#else
+                    << "This build uses a system SUNDIALS without the lanl/bngsim#1301 fix "
+                       "to its staggered sensitivity corrector; build with the fetched "
+                       "SUNDIALS, or pass sensitivity_method=\"simultaneous\"."
+#endif
+                    ;
+                throw std::runtime_error(msg.str());
             }
             // Issue #998: after a root or a stop CVODE returned on, it reports
             // the step it took (or cut to end on the stop) as the next one, not
@@ -18496,7 +18544,35 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
-            flag = CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
+            // Read at the row's own time. CVodeGetSens reads at the time CVODES
+            // last returned, whatever this row was recorded at. A row recorded
+            // before the first step (a start time named twice) is the seed row
+            // 0 recorded: CVODES has no step size yet, and its interpolation
+            // divides 0 by 0. Not after a restart, which may have moved the
+            // columns; there the read below refuses the nan.
+            long steps_now = 0;
+            CVodeGetNumSteps(cvode_mem, &steps_now);
+            if (steps_now == 0 && impl_->closed_segments.steps == 0 &&
+                std::isnan(user_data.last_restart_t)) {
+                for (int s = 0; s < n_sens; ++s) {
+                    std::copy(sens_seed.begin() + static_cast<std::ptrdiff_t>(s) * ns,
+                              sens_seed.begin() + static_cast<std::ptrdiff_t>(s + 1) * ns,
+                              N_VGetArrayPointer(yS_guard[s]));
+                }
+                flag = CV_SUCCESS;
+            } else {
+                flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            }
+            if (flag != CV_SUCCESS) {
+                // A row whose sensitivities cannot be read is refused, never
+                // recorded as the zeros the buffer starts as, which read as a
+                // sensitivity of 0 (issue #1301).
+                std::ostringstream msg;
+                msg << "CVODES could not read the sensitivities at the output point t="
+                    << std::setprecision(17) << static_cast<double>(t_ret) << " (index " << i
+                    << "), flag " << flag << ": its interpolation does not reach that time.";
+                throw std::runtime_error(msg.str());
+            }
             if (flag == CV_SUCCESS) {
                 std::vector<const double *> sens_ptrs(n_sens);
                 for (int s = 0; s < n_sens; ++s) {

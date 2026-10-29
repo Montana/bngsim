@@ -419,13 +419,34 @@ else()
         message(STATUS "BNGsim: sparse Jacobian support explicitly disabled")
     endif()
 
+    # The one local carry in the fetched source (VENDOR.json, local_carries):
+    # CVODES's staggered sensitivity corrector, which did not restore a step
+    # its RHS refused (lanl/bngsim#1301). Checked below, since a
+    # FETCHCONTENT_SOURCE_DIR_SUNDIALS override skips the patch step.
     FetchContent_Declare(
         sundials
         URL "${BNGSIM_SUNDIALS_SOURCE_URL}"
         URL_HASH "SHA256=${BNGSIM_SUNDIALS_SOURCE_SHA256}"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        PATCH_COMMAND "${CMAKE_COMMAND}" -DSUNDIALS_SOURCE_DIR=<SOURCE_DIR>
+                      -P "${BNGSIM_SUNDIALS_DIR}/carry_cvodes_staggered_restore.cmake"
     )
     FetchContent_MakeAvailable(sundials)
+
+    file(READ "${sundials_SOURCE_DIR}/src/cvodes/cvodes.c" _bngsim_cvodes_c)
+    string(FIND "${_bngsim_cvodes_c}" "BNGSIM LOCAL CARRY (lanl/bngsim#1301, r2)" _bngsim_carry_at)
+    unset(_bngsim_cvodes_c)
+    if(_bngsim_carry_at EQUAL -1)
+        message(FATAL_ERROR
+            "The SUNDIALS source at ${sundials_SOURCE_DIR} lacks the current "
+            "lanl/bngsim#1301 carry, which forward-sensitivity runs need to be right. "
+            "A build tree fetched before this revision: delete its _deps/sundials-* "
+            "directories and configure again. A FETCHCONTENT_SOURCE_DIR_SUNDIALS copy: "
+            "apply it with\n"
+            "  cmake -DSUNDIALS_SOURCE_DIR=${sundials_SOURCE_DIR} -P "
+            "${BNGSIM_SUNDIALS_DIR}/carry_cvodes_staggered_restore.cmake")
+    endif()
+    set(BNGSIM_SUNDIALS_CARRIES_1301 ON)
 
     if(ENABLE_KLU)
         set(BNGSIM_LINK_KLU ON)
@@ -893,6 +914,18 @@ endif()
 
 if(BNGSIM_BUILD_RULEMONKEY)
     target_compile_definitions(bngsim PUBLIC BNGSIM_HAS_RULEMONKEY=1)
+endif()
+
+# Whether CVODES carries the lanl/bngsim#1301 fix (the fetched source always
+# does). A system SUNDIALS does not: a sensitivity run there can step past a
+# refused state uncorrected, and is refused only where an output falls in it.
+if(BNGSIM_SUNDIALS_CARRIES_1301)
+    target_compile_definitions(bngsim PRIVATE BNGSIM_SUNDIALS_CARRIES_1301=1)
+else()
+    message(WARNING
+        "System SUNDIALS lacks the lanl/bngsim#1301 fix to CVODES's staggered "
+        "sensitivity corrector: a forward-sensitivity run whose RHS refuses a state "
+        "can come back wrong. Use the fetched SUNDIALS for sensitivity work.")
 endif()
 
 # MIR micro-JIT backend (GH #78). Linked PRIVATE — the JIT is an internal

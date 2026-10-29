@@ -132,7 +132,17 @@ This updates:
 
 - `bngsim/third_party/sundials/VENDOR.json`
 
-Current local carries inside the fetched SUNDIALS source: none
+Current local carries inside the fetched SUNDIALS source: one, listed in
+`VENDOR.json` → `local_carries`, which a refresh keeps.
+
+- **lanl/bngsim#1301**, `src/cvodes/cvodes.c` (`cvStep`): a recoverable RHS
+  failure at the converged state in the staggered sensitivity corrector is
+  restored and the step cut, through `cvHandleNFlag`, instead of being retried
+  from the advanced time. `third_party/sundials/carry_cvodes_staggered_restore.cmake`
+  applies it as the FetchContent `PATCH_COMMAND`, and the configure fails if
+  the fetched source lacks its marker. On a refresh, that script fails if the
+  upstream block has moved: re-derive the carry against the new `cvStep`, or
+  drop it once upstream fixes the defect.
 
 ### 3. Validate Inside BNGsim
 
