@@ -212,7 +212,7 @@ These behaviors are required by `mir_jit.hpp` and recorded under
   `MIR_get_global_item`, the scan still works — but verify before relying on it.
 - **Single-maintainer upstream.** MIR is effectively single-maintainer and pinned
   to an immutable commit. Refresh deliberately.
-- **Local carries: none.** The tree is stock upstream at the pinned commit.
+- **Local carries: two, both for issue #1215** (see "Current carries" below).
   `VENDOR.json` → `local_carries` records each deliberate BNGsim edit,
   and both `vendor_mir.py --check` and `test_mir_vendoring.py` verify every
   recorded carry is *still applied* — see "Local Carries" below.
@@ -249,7 +249,24 @@ would not survive — carry-adjacent facts belong in the carry entry.
 
 ### Current carries
 
-None. The tree is stock upstream at the pinned commit.
+Both are issue #1215, which made running out of memory or address space a
+`RuntimeError` from `MirJit` instead of the end of the process, and both are
+marked `BNGsim local carry (lanl/bngsim#1215)`. Neither is reported upstream yet;
+upstream master `dc2c763f` (2026-10-23) still has the code they replace.
+
+- **`mir.c` — `_MIR_get_default_code_alloc`.** MirJit hands each context a code
+  allocator that wraps MIR's default one, so that a failed mapping is reported
+  instead of coming back as a NULL code address MIR writes through. The default
+  is static in `mir.c`; the carry adds a one-line accessor for it, so MirJit
+  wraps it rather than copying its platform code. A refresh that drops it fails
+  to link.
+- **`c2mir/c2mir.c` — `new_macro`, `new_macro_call`, `new_ifstate`.** c2mir's
+  preprocessor allocates these records with plain `malloc` and writes through
+  the result unchecked, out of reach of the allocator MirJit hands MIR. The
+  carry checks each and reports a null through MIR's error function as an
+  allocation error, as `c2mir_calloc` already does. `test_mir_vendoring.py`
+  checks every plain `malloc` of a struct in `c2mir.c`, so a refresh that adds
+  another fails it too.
 
 ### Past carries
 
