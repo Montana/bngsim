@@ -378,7 +378,7 @@ struct SteadyStateUserData {
     AtolTracking atol_tracking;
     // The run test's GH #135 retry (issue #1357): on for the run test alone,
     // which then integrates as the time course does; see ss_eval_rhs. Its
-    // slots and clamped state are built on the first NaN f.
+    // slots and clamped state are built on the first NaN f or Jacobian.
     bool clamp_nonfinite = false;
     std::vector<char> nonneg_mask;
     std::vector<double> nonneg_scratch;
@@ -884,17 +884,23 @@ static int cvode_ss_rhs(sunrealtype t, N_Vector y, N_Vector ydot, void *ud) {
 // it CVODE differences its own, at one RHS evaluation per species per setup.
 //
 // The mirror of CvodeSimulator's cvode_analytical_dense_jac / cvode_codegen_
-// dense_jac, minus their GH #135 nonnegative-clamp retry. The run test retries
-// f at the clamped state (ss_eval_rhs, issue #1357); the Jacobian is taken at
-// CVODE's prediction, not at the corrector's iterates, and a clamp here as well
-// changed no test (glioblastoma_egfrviii's run test passes without it), so
-// there is none.
+// dense_jac. In the run test, with their GH #135 retry, as f has it there
+// (ss_eval_rhs, issue #1357): a Jacobian with a NaN and no infinity is filled
+// again at the clamped state. CVODE takes it at its prediction, which a species
+// at 0 that falls puts below 0 at the first step: glioblastoma_egfrviii's
+// AKT(s~P), at exactly 0 on x86-64 Linux with f = -1e-39, where
+// d/dx x^3.5 = 3.5·x^2.5 is NaN.
 static int cvode_ss_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
                                    void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
                                    N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
+    const auto un = static_cast<std::size_t>(data->model->n_species());
     data->rhs->fill_dense_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                    SUNDenseMatrix_Data(J));
+    if (data->clamp_nonfinite && ss_nan_and_no_inf(SUNDenseMatrix_Data(J), un * un))
+        data->rhs->fill_dense_jacobian(static_cast<double>(t),
+                                       ss_clamped_state(data, N_VGetArrayPointer(y)),
+                                       SUNDenseMatrix_Data(J));
     return 0;
 }
 
@@ -961,7 +967,7 @@ static int cvode_ss_dense_dq_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatr
 // be reinstalled first: CVODE may SUNMatZero() before the callback, and
 // SUNMatZero_Sparse clears the index arrays along with the values.
 //
-// Like cvode_ss_dense_jac, this carries no GH #135 nonnegative-clamp retry.
+// In the run test, with the GH #135 retry, as cvode_ss_dense_jac has it.
 static int cvode_ss_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, SUNMatrix J,
                                     void *ud, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
                                     N_Vector /*tmp3*/) {
@@ -970,6 +976,11 @@ static int cvode_ss_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, 
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
     data->rhs->fill_sparse_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                     SUNSparseMatrix_Data(J));
+    if (data->clamp_nonfinite &&
+        ss_nan_and_no_inf(SUNSparseMatrix_Data(J), static_cast<std::size_t>(sp.nnz)))
+        data->rhs->fill_sparse_jacobian(static_cast<double>(t),
+                                        ss_clamped_state(data, N_VGetArrayPointer(y)),
+                                        SUNSparseMatrix_Data(J));
     return 0;
 }
 
@@ -1446,8 +1457,8 @@ class SteadyStateMarcher {
     // at most.
     void allow_error_test_failures(int n) { CVodeSetMaxErrTestFails(cvode_mem_, n); }
 
-    // Retry a NaN f at the clamped state, as the time course does (GH #135),
-    // for the run test (issue #1357; ss_eval_rhs).
+    // Retry a NaN f and Jacobian at the clamped state, as the time course does
+    // (GH #135), for the run test (issue #1357; ss_eval_rhs).
     void clamp_nonfinite_as_the_time_course() { ud_.clamp_nonfinite = true; }
 
     // Make the marches of this session a run that is taken on: `steps` steps
