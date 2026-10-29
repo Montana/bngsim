@@ -105,7 +105,9 @@ def test_n_steps_takes_precedence_over_sample_times():
 
 
 def test_an_uneven_sample_grid_is_lossy():
-    with pytest.raises(ConversionError, match=r"sample_times \[0.0, 1.0, 5.0, 10.0\] is not an even"):
+    with pytest.raises(
+        ConversionError, match=r"sample_times \[0.0, 1.0, 5.0, 10.0\] is not an even"
+    ):
         _parse('simulate({method=>"ode",sample_times=>[0,1,5,10]})')
     with pytest.warns(ConversionWarning):
         spec = _parse('simulate({method=>"ode",sample_times=>[0,1,5,10]})', strict=False)
@@ -115,7 +117,11 @@ def test_an_uneven_sample_grid_is_lossy():
 
 @pytest.mark.parametrize(
     ("values", "expected"),
-    [("[1,2,3]", (1.0, 3.0, 3, False)), ("[0.1,1,10]", (0.1, 10.0, 3, True)), ("[3,1,2]", (1.0, 3.0, 3, False))],
+    [
+        ("[1,2,3]", (1.0, 3.0, 3, False)),
+        ("[0.1,1,10]", (0.1, 10.0, 3, True)),
+        ("[3,1,2]", (1.0, 3.0, 3, False)),
+    ],
     ids=["linear", "log", "unsorted"],
 )
 def test_par_scan_vals_are_the_scan(values, expected):
@@ -135,7 +141,9 @@ def test_par_min_and_par_max_take_precedence_over_par_scan_vals():
 
 
 def test_uneven_par_scan_vals_are_lossy():
-    with pytest.raises(ConversionError, match=r"par_scan_vals \[1.0, 2.0, 7.0\] is not evenly spaced"):
+    with pytest.raises(
+        ConversionError, match=r"par_scan_vals \[1.0, 2.0, 7.0\] is not evenly spaced"
+    ):
         _parse('parameter_scan({parameter=>"k",par_scan_vals=>[1,2,7],t_end=>1})')
 
 
@@ -147,7 +155,9 @@ def test_the_sedml_export_carries_the_grid_and_the_scan():
         'parameter_scan({parameter=>"k",par_scan_vals=>[1,2,3],method=>"ode",t_end=>10,n_steps=>5})',
     )
     x = write_sedml_protocol(spec)
-    grids = re.findall(r'outputStartTime="([^"]*)" outputEndTime="([^"]*)" numberOfPoints="([^"]*)"', x)
+    grids = re.findall(
+        r'outputStartTime="([^"]*)" outputEndTime="([^"]*)" numberOfPoints="([^"]*)"', x
+    )
     assert ("10", "20", "10") in grids and ("0", "10", "5") in grids
     assert "repeatedTask" in x
 
