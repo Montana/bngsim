@@ -15,6 +15,8 @@ under the MIR CI job.
 
 import os
 import shutil
+import subprocess
+import sys
 
 import bngsim
 import numpy as np
@@ -137,3 +139,61 @@ def test_capabilities_reports_mir():
     """The public capability surface agrees this build has MIR."""
     assert bngsim.HAS_MIR is True
     assert bngsim.capabilities()["features"]["mir"] is True
+
+
+# ── Issue #1215: the address space each MIR context reserves for its code ────
+# MIR reserves MIR_CODE_RESERVE_SIZE of address space per context; CMake sets
+# 32 MB, where upstream's 128 MB held that much of a cap on the address space
+# (`ulimit -v`) for every live MIR-JIT'd model.
+_RESERVE_PROBE = """
+import os, subprocess, sys
+import bngsim
+
+def vsize_kb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    out = subprocess.run(["ps", "-o", "vsz=", "-p", str(os.getpid())],
+                         capture_output=True, text=True, check=True)
+    return int(out.stdout.split()[0])
+
+def live():
+    sim = bngsim.Simulator(bngsim.Model.from_net(sys.argv[1]), method="ode", codegen=True)
+    sim.run(t_span=(0.0, 1.0), n_points=2)
+    assert sim.codegen_backend == "mir", sim.codegen_backend
+    return sim
+
+keep = [live() for _ in range(3)]
+before = vsize_kb()
+keep += [live() for _ in range(int(sys.argv[2]))]
+print((vsize_kb() - before) / 1024 / int(sys.argv[2]))
+"""
+
+
+def test_a_live_mir_model_holds_far_less_than_upstreams_reservation():
+    """Address space, not memory: 20 live MIR-JIT'd models of a two-species
+    network. With upstream's 128 MB reservation each held 128 MB; with the
+    default 32 MB, a little over 32. The bound catches a fall back to
+    upstream's size, not the exact setting: a build configured at 0 passes too."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX-specific: MIR reserves no address space for its code on Windows")
+    net = os.path.join(DATA, "simple_decay.net")
+    env = {**os.environ, "BNGSIM_CODEGEN_JIT": "mir"}
+    done = subprocess.run(
+        [sys.executable, "-c", _RESERVE_PROBE, str(net), "20"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    per_model_mb = float(done.stdout.strip().splitlines()[-1])
+    # Measured on macOS arm64: 32.1 MB a model at the default 32, 128.1 at
+    # upstream's 128 and 0.1 at 0, so a model's other mappings come to about
+    # 0.1 MB. 40 leaves 8 MB of that for an allocator that maps more, and
+    # upstream's 128 still fails it by a factor of three.
+    assert per_model_mb <= 40.0, per_model_mb
