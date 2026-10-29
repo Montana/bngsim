@@ -5334,10 +5334,13 @@ class Simulator:
         For each parameter set:
         1. Clone the model (independent copy)
         2. Apply parameters via ``set_params``
-        3. Reset species to initial conditions (:meth:`Model.reset`), not to the
-           model's current state, and warn where the two differ (issue #1362)
+        3. Reset species to initial conditions
         4. Run the simulation (GIL released during each run)
         5. Collect the result
+
+        Step 3 starts each point from the initial conditions (:meth:`Model.reset`),
+        not from the model's current state, and warns where the two differ
+        (issue #1362).
 
         Parameters
         ----------
