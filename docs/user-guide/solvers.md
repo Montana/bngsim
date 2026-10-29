@@ -338,7 +338,7 @@ dense LU, `1` for sparse KLU, `2` for the BLAS dense factor.
 
 | Route | When (default options) |
 |---|---|
-| KLU (sparse) | at least 50 species, a Jacobian under 10% dense, and an LU factor that stays sparse (below) |
+| KLU (sparse) | at least 50 species, a Jacobian under 10% dense with a structural nonzero to factor, and an LU factor that stays sparse (below) |
 | BLAS dense factor | a model KLU would take whose LU factor fills in, on a build with BLAS |
 | built-in dense LU | everything else |
 

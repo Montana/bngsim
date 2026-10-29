@@ -747,13 +747,11 @@ static bool ss_fill_routed_dense(NetworkModel &model, const SteadyStateOptions &
 // a sparse route needs either the closed form or a graph coloring, and a
 // pattern with no structural nonzero has neither.
 //
-// run() refuses that case with a legible error instead, and rightly: there the
-// only way to ask for a sparse route was force_sparse_linear_solver, so the
-// refusal answers a request the caller made. Here the AUTO rule can ask for it
-// unprompted — a model with 50+ species and no reactions has density
-// 0 < SPARSE_DENSITY_MAX — and such a model solves immediately, f(y) ≡ 0 being
-// a steady state. Failing it would be a regression, so the march declines the
-// route and factors densely, exactly as it did before #128.
+// Such a pattern reaches this check only under force_sparse_linear_solver: the
+// shared rule's automatic test sends it to the dense solver (issue #1296).
+// run() takes that request, on KLU with the closed form and with a refusal by
+// name under jacobian="fd". The march declines it and factors densely, exactly
+// as it did before #128: f(y) ≡ 0 is a steady state, which solves immediately.
 //
 // One predicate, so the marcher and the reported name cannot disagree about
 // what ran.
