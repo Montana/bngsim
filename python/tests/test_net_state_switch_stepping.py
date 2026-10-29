@@ -1301,8 +1301,8 @@ def test_a_released_hold_logs_what_main_logs(tmp_path):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="found with #1286, on main as well: a run with a crossing stop keeps "
-    "the hold's error log in the null sink after the hold ends",
+    reason="#1389, found with #1286 and on main as well: a run with a crossing stop "
+    "keeps the hold's error log in the null sink after the hold ends",
 )
 def test_a_released_hold_logs_what_main_logs_with_a_crossing_stop_too(tmp_path):
     """The previous test, with a crossing stop at t = 3 from a condition that
