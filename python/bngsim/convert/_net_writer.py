@@ -233,7 +233,7 @@ def capability_report(model: Model) -> dict[str, list[str]]:
     # bngsim's reader takes the pair as the rule (_ar_report_map_from_net, #515);
     # run_network holds the species at its initial value for the whole run. Its
     # rate laws read the name, which is the observable or the function, so they
-    # read the rule and only the species' own column is wrong there (#1274:
+    # read the rule and only the species' own column can be wrong there (#1274:
     # BIOMD0000000144's $Wee1Pc ends at 0.8001 in run_network, 0.7803 in bngsim,
     # and every other species agrees to 5e-8). The reader's own rule, read off
     # the model being written, names exactly those species.
@@ -248,7 +248,7 @@ def capability_report(model: Model) -> dict[str, list[str]]:
             "of the same name: bngsim reads the pair as the rule, but BioNetGen's "
             "run_network holds each at its initial value for the whole run. Its rate "
             "laws read the rule through that observable or function, so only those "
-            "species' own columns are wrong there"
+            "species' own columns can be wrong there"
         )
 
     return {"dropped": dropped, "lossy": lossy, "bngsim_only": bngsim_only}
@@ -258,15 +258,10 @@ def _apply_capability_policy(
     report: dict[str, list[str]], *, strict: bool, model_name: str
 ) -> None:
     """Warn on dropped constructs; raise (strict) or warn (lenient) on lossy ones;
-    warn, whatever ``strict`` is, on what only bngsim's reader reproduces."""
+    warn, whatever ``strict`` is, on what only bngsim's reader reproduces of a
+    file that is written (not before a refusal, where no file is)."""
     for note in report["dropped"]:
         warnings.warn(f"{model_name}: dropping {note}", ConversionWarning, stacklevel=3)
-    for note in report.get("bngsim_only", []):
-        warnings.warn(
-            f"{model_name}: a network only bngsim reads as written — {note}",
-            ConversionWarning,
-            stacklevel=3,
-        )
     if report["lossy"]:
         joined = "; ".join(report["lossy"])
         if strict:
@@ -278,6 +273,12 @@ def _apply_capability_policy(
             warnings.warn(
                 f"{model_name}: lossy conversion — {note}", ConversionWarning, stacklevel=3
             )
+    for note in report.get("bngsim_only", []):
+        warnings.warn(
+            f"{model_name}: a network only bngsim reads as written — {note}",
+            ConversionWarning,
+            stacklevel=3,
+        )
 
 
 # ─── Expressions as one token ─────────────────────────────────────────────

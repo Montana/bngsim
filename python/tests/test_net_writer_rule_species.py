@@ -18,7 +18,7 @@ import bngsim
 import numpy as np
 import pytest
 from bngsim._bngpath import resolve_bng
-from bngsim.convert import capability_report, sbml_to_net, write_net
+from bngsim.convert import capability_report, sbml_to_net, validate_conversion, write_net
 
 _BNG = resolve_bng()
 
@@ -52,7 +52,7 @@ def test_a_rule_species_is_warned_and_still_written(tmp_path, antimony, kind):
     rule = [m for m in said if "only bngsim reads as written" in m]
     assert len(rule) == 1, said
     assert "'B'" in rule[0] and "run_network holds each at its initial value" in rule[0]
-    assert "only those species' own columns are wrong" in rule[0]
+    assert "only those species' own columns can be wrong" in rule[0]
 
 
 def test_strict_does_not_refuse_it(tmp_path):
@@ -61,6 +61,24 @@ def test_strict_does_not_refuse_it(tmp_path):
     path = tmp_path / "rule.net"
     _write(RULE, path, strict=True)
     assert path.is_file()
+
+
+def test_a_refused_file_is_not_warned_as_written(tmp_path):
+    """Where strict refuses the model for something else (an amount-valued
+    species in a compartment of volume 2), no file is written, and the note
+    that says how one is written is not given."""
+    model = bngsim.Model.from_antimony_string(
+        "compartment c = 2; species A in c = 10; substanceOnly species B in c; "
+        "k = 0.5; J: A -> ; k*A; B := 2*A"
+    )
+    assert capability_report(model)["bngsim_only"]  # the rule species is there
+    path = tmp_path / "rule.net"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(bngsim.ConversionError, match="amount-valued"):
+            write_net(model, str(path), strict=True)
+    assert not path.exists()
+    assert not [w for w in caught if "only bngsim reads as written" in str(w.message)]
 
 
 @pytest.mark.parametrize(
@@ -88,18 +106,28 @@ def test_the_report_names_it_apart_from_lossy():
     assert report["lossy"] == []
 
 
-def test_sbml_to_net_reports_it(tmp_path):
-    """The report sbml_to_net returns carries the note, and its summary prints
-    it, as it does what was dropped: a caller reading the report, and not the
-    warnings, is told too."""
+def _sbml(tmp_path):
     import antimony
 
     antimony.loadAntimonyString(f"model m\n  {RULE}\nend")
     sbml = tmp_path / "rule.xml"
     sbml.write_text(antimony.getSBMLString("m"))
+    return sbml
+
+
+@pytest.mark.parametrize("entry", ["sbml_to_net", "validate_conversion"])
+def test_the_conversion_reports_carry_it(tmp_path, entry):
+    """The reports sbml_to_net and validate_conversion return carry the note,
+    and their summaries print it, as they do what was dropped: a caller reading
+    the report, and not the warnings, is told too."""
+    sbml = _sbml(tmp_path)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", bngsim.ConversionWarning)
-        report = sbml_to_net(sbml, tmp_path / "rule.net")
+        if entry == "sbml_to_net":
+            report = sbml_to_net(sbml, tmp_path / "rule.net")
+        else:
+            report = validate_conversion(sbml, levels=("L0", "L1"), out_dir=tmp_path)
+            assert report.to_dict()["bngsim_only"] == report.bngsim_only
     assert len(report.bngsim_only) == 1 and "'B'" in report.bngsim_only[0]
     assert f"bngsim-only: {report.bngsim_only[0]}" in report.summary()
 
@@ -130,13 +158,15 @@ def test_run_network_holds_only_its_column(tmp_path, rule, initial):
     if not run_network.is_file():
         pytest.skip(f"BNG2.pl unavailable: no run_network at {run_network}")
     out = tmp_path / "rn"
-    subprocess.run(
+    run = subprocess.run(
         [str(run_network), "-o", str(out), "-p", "cvode", "-a", "1e-12", "-r", "1e-10"]
         + ["-g", str(path), str(path), "5", "1"],
-        check=True,
         capture_output=True,
+        text=True,
+        timeout=120,
         cwd=tmp_path,
     )
+    assert run.returncode == 0, run.stdout[-600:] + run.stderr[-600:]
     a, b, c = np.loadtxt(f"{out}.cdat")[-1, 1:]
     assert b == pytest.approx(initial)  # B, held
     r = bngsim.Simulator(bngsim.Model.from_net(str(path)), method="ode").run(
