@@ -117,7 +117,10 @@ def test_the_sensitivities_match_finite_differences(sens_run):
         step = 1e-4 * base
         fd = (_plain_species(name, base + step) - _plain_species(name, base - step)) / (2 * step)
         scale = np.abs(fd).max(axis=0)
-        cols = scale > 1e-8 * scale.max()
+        # A column the parameter does not reach (Treg for sigma_nk) is the
+        # difference's own noise, within a factor of 10 of 1e-8 of the largest
+        # and moving with the platform's libm, so the cut sits well above it.
+        cols = scale > 1e-6 * scale.max()
         err = np.abs(s[:, cols, k] - fd[:, cols]) / scale[cols]
         assert err.max() < 1e-4, f"d/d{name}: {err.max():.3e}"
 
@@ -128,3 +131,22 @@ def test_a_fine_grid_keeps_its_times():
     grid = np.linspace(0, 100, 2001)
     run = _sens_run(n_points=len(grid))
     np.testing.assert_array_equal(np.asarray(run.time), grid)
+
+
+def test_a_start_time_named_twice_reads_the_seed():
+    """A row recorded before the first step is the seed. CVODES has no step
+    size there yet, so its interpolation divides 0 by 0: the per-row read
+    refused the nan, and main, reading at another time, recorded dA/dA0 = 0
+    at the second t = 2 with no error."""
+    model = bngsim.Model.from_antimony_string(
+        "model a\n J1: A => B; k*A\n J2: B => ; k2*B\n A = 1; B = 0; k = 0.5; k2 = 0.3\nend"
+    )
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["k"], sensitivity_ic=["A"])
+    run = sim.run(sample_times=[2.0, 2.0, 3.0], t_span=(2.0, 3.0))
+    a = list(run.species_names).index("A")
+    s_ic = np.asarray(run.sensitivities_ic)
+    s_p = np.asarray(run.sensitivities)
+    np.testing.assert_array_equal(s_ic[1], s_ic[0])
+    np.testing.assert_array_equal(s_p[1], s_p[0])
+    assert s_ic[1, a, 0] == 1.0
+    np.testing.assert_allclose(s_ic[2, a, 0], np.exp(-0.5), rtol=1e-5)

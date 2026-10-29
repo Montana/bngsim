@@ -16020,11 +16020,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
     // Record initial sensitivities. Param cols are zero at t=0 for a fresh
     // start (or the carried-over dx/dθ seed under carry_sensitivities, GH
-    // #210); IC cols are e_k at t=0 (seeded above).
+    // #210); IC cols are e_k at t=0 (seeded above). The seed is kept for a row
+    // recorded before the first step (issue #1301, below).
+    std::vector<double> sens_seed;
     if (n_sens > 0) {
         std::vector<const double *> sens_ptrs(n_sens);
         for (int s = 0; s < n_sens; ++s) {
             sens_ptrs[s] = N_VGetArrayPointer(yS_guard[s]);
+            sens_seed.insert(sens_seed.end(), sens_ptrs[s], sens_ptrs[s] + ns);
         }
         if (n_sens_p > 0) {
             result.record_sensitivities(0, sens_ptrs.data(), ns, n_sens_p);
@@ -17037,8 +17040,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // #1301). Unpatched CVODES got there by stepping past a state the
             // RHS refused without correcting the step, so the run is refused,
             // not read where it stands. Asked of the retry's return too.
-            if (flag == CV_SUCCESS && sens.n_total > 0 && t_ret == look_tout &&
-                !inside_last_step(cvode_mem, t_ret)) {
+            if (flag == CV_SUCCESS && sens.n_total > 0 &&
+                (t_ret == look_tout || t_ret == t_target) && !inside_last_step(cvode_mem, t_ret)) {
                 sunrealtype tn = 0.0;
                 sunrealtype hu = 0.0;
                 CVodeGetCurrentTime(cvode_mem, &tn);
@@ -18542,8 +18545,24 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
             // Read at the row's own time. CVodeGetSens reads at the time CVODES
-            // last returned, whatever this row was recorded at.
-            flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            // last returned, whatever this row was recorded at. A row recorded
+            // before the first step (a start time named twice) is the seed row
+            // 0 recorded: CVODES has no step size yet, and its interpolation
+            // divides 0 by 0. Not after a restart, which may have moved the
+            // columns; there the read below refuses the nan.
+            long steps_now = 0;
+            CVodeGetNumSteps(cvode_mem, &steps_now);
+            if (steps_now == 0 && impl_->closed_segments.steps == 0 &&
+                std::isnan(user_data.last_restart_t)) {
+                for (int s = 0; s < n_sens; ++s) {
+                    std::copy(sens_seed.begin() + static_cast<std::ptrdiff_t>(s) * ns,
+                              sens_seed.begin() + static_cast<std::ptrdiff_t>(s + 1) * ns,
+                              N_VGetArrayPointer(yS_guard[s]));
+                }
+                flag = CV_SUCCESS;
+            } else {
+                flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            }
             if (flag != CV_SUCCESS) {
                 // A row whose sensitivities cannot be read is refused, never
                 // recorded as the zeros the buffer starts as, which read as a
