@@ -1260,13 +1260,17 @@ def test_a_held_slide_prints_nothing(tmp_path):
     assert "mxstep" not in done.stdout + done.stderr
 
 
-def _batch_ends_between(path, hold, start, stop):
+def _batch_ends_between(path, hold, start, stop, *, pulse_stops=True):
     """The times CVODE logs a batch ending at, between ``start`` and ``stop``,
     in a run of ``path`` with holding on or off; in a subprocess, as above.
     A spent batch is logged only under BNGSIM_LOG_SPENT_BATCHES=1 (issue #1124,
-    item 13), which leaves SUNDIALS' handler, and the hold's mute, as they were."""
+    item 13), which leaves SUNDIALS' handler, and the hold's mute, as they were.
+    ``pulse_stops=False`` places no stop on a smooth bump of the clock (issue
+    #1286)."""
     script = textwrap.dedent(f"""
-        import bngsim
+        import bngsim, bngsim._smooth_pulses as spm
+        if not {pulse_stops!r}:
+            spm.smooth_pulse_stops = lambda *a, **k: []
         m = bngsim.Model.from_net({str(path)!r})
         bngsim.Simulator(m).run(sample_times=[0.0, 4.0], rtol=1e-6, atol=1e-8,
                                 max_step=0.05, max_steps=20)
@@ -1288,8 +1292,30 @@ def test_a_released_hold_logs_what_main_logs(tmp_path):
     run last returned, so the times are not compared."""
     path = tmp_path / "leave.net"
     path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
-    assert _batch_ends_between(path, "0", 1.0, 2.4)
-    assert _batch_ends_between(path, "1", 1.0, 2.4)
+    # v() is a Gaussian of the clock, which issue #1286 stops on; a run with a
+    # crossing stop keeps the mute (the next test), so this one is asked of the
+    # run without that stop, which is the run this test was written for.
+    assert _batch_ends_between(path, "0", 1.0, 2.4, pulse_stops=False)
+    assert _batch_ends_between(path, "1", 1.0, 2.4, pulse_stops=False)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="found with #1286, on main as well: a run with a crossing stop keeps "
+    "the hold's error log in the null sink after the hold ends",
+)
+def test_a_released_hold_logs_what_main_logs_with_a_crossing_stop_too(tmp_path):
+    """The previous test, with a crossing stop at t = 3 from a condition that
+    changes nothing. With holding off the run logs its batch ends between t = 1
+    and 2.4; with holding on it logs none, in the whole run."""
+    path = tmp_path / "leave.net"
+    path.write_text(
+        _SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]).replace(
+            "4 dn() -dlt", "4 dn() -dlt + if(time() > 3, 0, 0)"
+        )
+    )
+    assert _batch_ends_between(path, "0", 1.0, 2.4, pulse_stops=False)
+    assert _batch_ends_between(path, "1", 1.0, 2.4, pulse_stops=False)
 
 
 # Issue #1064: a slide along S = 1 written over a scale H. Each spelling is the
