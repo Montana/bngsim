@@ -8112,9 +8112,11 @@ class Simulator:
         that sum's last bit, and the small step does not see it at all.
         Nothing in a row tells the two apart in every case. So the columns are
         solved with both, and returned where they agree, as the first gives
-        them; where they are further apart than 1e-4 of a column's largest
-        entry they are refused. Curvature moves the first answer and rounding
-        grain the second, so one both give is neither.
+        them; where an entry of them is further apart than 1e-4 of itself
+        (1e-10 of its column's largest, at least) they are refused. Curvature
+        moves the first answer and rounding grain the second, so one both give
+        is neither. (Held to 1e-4 of the column's largest entry, an entry small
+        within its column passed 12% off.)
 
         The own step reads a term only where the row's rounding over it is
         smaller, and in a row that a much larger species is in, it is not:
@@ -8174,7 +8176,7 @@ class Simulator:
                     result.sens_fd_half_step,
                     listed(result.sens_fd_own_step_species),
                     listed(result.sens_fd_half_step_species),
-                    "the column's largest entry",
+                    "itself (1e-10 of its column's largest, at least)",
                 )
                 + f" {why}"
             )
@@ -11245,7 +11247,8 @@ class SteadyStateResult:
     sens_fd_disagree_species, sens_fd_disagree_param : str or None
     sens_fd_floored, sens_fd_own_step, sens_fd_half_step : float
         The entry of ``dY_ss/dp`` furthest from the floored answer, by more
-        than 1e-4 of the column's largest entry, and its three values: the one
+        than 1e-4 of itself (1e-10 of its column's largest, at least), and its
+        three values: the one
         with every species stepped against the state's scale, which is what
         ``sensitivity`` holds, the one with those species at their own step,
         and the one with them at half the floored step (each the floored one

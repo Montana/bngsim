@@ -958,7 +958,7 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix
 // of that issue's tests, the march on this quotient ended where the closed
 // form's did, and KLU's ordering kept a species held at 0 there.
 static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
-                                     N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+                                     N_Vector tmp1, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const int ns = data->model->n_species();
     // Bare accessor: the marcher materialized the coloring before installing
@@ -967,6 +967,16 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
 
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
 
+    // Each column's step as the march's dense quotient takes it, on its error
+    // weights (in tmp1, CVODE's scratch for this callback) and its step (#1254),
+    // so the two routes of one march form one matrix.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
     // Sized once, when the callback was selected, so this hot path allocates
     // nothing per Jacobian evaluation.
     SteadyStateRhs *rhs = data->rhs;
@@ -974,7 +984,8 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
+        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); }, nullptr,
+        nullptr, ewt, min_inc);
     return 0;
 }
 
@@ -1517,6 +1528,9 @@ class SteadyStateMarcher {
                 ud_.fd_y_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_fy_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_h_vals.assign(static_cast<size_t>(ns_), 0.0);
+                // Each column's step on the march's error weights, as the
+                // dense quotient takes it (#1254).
+                ud_.dq_cvode_mem = cvode_mem_;
             }
             if (CVodeSetJacFn(cvode_mem_, analytical ? cvode_ss_sparse_jac
                                                      : cvode_ss_colored_jac) != CV_SUCCESS) {
@@ -4871,10 +4885,17 @@ static void ss_measure_root(SteadyStateRhs &rhs, SteadyStateResult &result, cons
     rhs.eval(0.0, y_ss, f.data());
 }
 
-// How far apart the columns from the two difference-quotient matrices of issue
-// #1002 may be, as a part of the column's largest entry, before they are not
-// the same answer.
+// How far apart an entry of the columns from the difference-quotient matrices
+// of issue #1002 may be, as a part of itself, before they are not the same
+// answer. Held to 1e-4 of the column's largest entry instead, an entry small
+// within its column could be far off and pass: X + X -> X + X + G at k = 1e-6
+// beside G at 1e8 returned dG*/ds = 6.6e-5 for 5.9e-5, 1.4e-5 of dX*/ds.
 static constexpr double kFdAnswersAgree = 1e-4;
+
+// The least an entry is held to, as a part of its column's largest: an entry
+// that is the rounding of a column (1e-36 beside 4.8) cannot agree with itself
+// to 1e-4 at two steps, and is not an answer to confirm.
+static constexpr double kFdEntryFloor = 1e-6;
 
 // Issue #1002: a Jacobian that is a difference quotient is stepped at the
 // floored step (bngsim/fd_jacobian.hpp), which reads a term of second order in
@@ -4886,8 +4907,9 @@ static constexpr double kFdAnswersAgree = 1e-4;
 // species at 0, at half the floored step (fd_half_step_columns), which a
 // secant moves with and a slope does not, in a row the own step cannot read
 // too. Where either answer is further from the floored one than
-// kFdAnswersAgree of a column's largest, the entry that is furthest is put on
-// the result, which steady_state() refuses. Where they agree, the columns are
+// kFdAnswersAgree of the entry (of kFdEntryFloor of its column's largest, at
+// least), the entry that is furthest is put on the result, which
+// steady_state() refuses. Where they agree, the columns are
 // the floored matrix's, as they were. `solve_columns(J, sens, rcond)` is the
 // solve that gave result.sensitivity, at the state result.concentrations.
 //
@@ -4965,11 +4987,13 @@ static void ss_confirm_differenced_columns(SteadyStateRhs &rhs, SteadyStateResul
             const double apart = std::isnan(own_apart) || std::isnan(half_apart)
                                      ? std::numeric_limits<double>::quiet_NaN()
                                      : std::max(own_apart, half_apart);
-            if (apart <= kFdAnswersAgree * largest) {
+            const double held_to =
+                std::max(std::abs(result.sensitivity[k]), kFdEntryFloor * largest);
+            if (apart <= kFdAnswersAgree * held_to) {
                 continue;
             }
-            const double share = largest > 0.0 && std::isfinite(apart)
-                                     ? apart / largest
+            const double share = held_to > 0.0 && std::isfinite(apart)
+                                     ? apart / held_to
                                      : std::numeric_limits<double>::infinity();
             if (result.sens_fd_disagree_species < 0 || share > worst) {
                 worst = share;
