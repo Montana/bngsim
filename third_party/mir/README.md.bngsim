@@ -64,5 +64,7 @@ which holds the largest committed model's code in one piece (fceri_gamma's
 and thunk redirects check their reach, so code mapped on its own runs the same:
 the size is address space only. Under a tight cap, configure with
 `-DBNGSIM_MIR_CODE_RESERVE_MB=8` (fceri_fyn's 7.4 MB fits), or `0` to reserve
-nothing. The value is a CMake cache entry, so a build directory keeps the last
-one passed. Windows reserves nothing either way.
+nothing. The value is a CMake cache entry, so a `pip`/`uv` install keeps the
+last one passed in its build directory. `scripts/rebuild_editable.py` passes
+32 on every rebuild instead (GH #459); set `BNGSIM_MIR_CODE_RESERVE_MB` in its
+environment to ask for another. Windows reserves nothing either way.
