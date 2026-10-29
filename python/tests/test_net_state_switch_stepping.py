@@ -1292,28 +1292,11 @@ def test_a_released_hold_logs_what_main_logs(tmp_path):
     run last returned, so the times are not compared."""
     path = tmp_path / "leave.net"
     path.write_text(_SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]))
-    # v() is a Gaussian of the clock, which issue #1286 stops on; a run with a
-    # crossing stop keeps the mute (the next test), so this one is asked of the
-    # run without that stop, which is the run this test was written for.
-    assert _batch_ends_between(path, "0", 1.0, 2.4, pulse_stops=False)
-    assert _batch_ends_between(path, "1", 1.0, 2.4, pulse_stops=False)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1389, found with #1286 and on main as well: a run with a crossing stop "
-    "keeps the hold's error log in the null sink after the hold ends",
-)
-def test_a_released_hold_logs_what_main_logs_with_a_crossing_stop_too(tmp_path):
-    """The previous test, with a crossing stop at t = 3 from a condition that
-    changes nothing. With holding off the run logs its batch ends between t = 1
-    and 2.4; with holding on it logs none, in the whole run."""
-    path = tmp_path / "leave.net"
-    path.write_text(
-        _SLIDE_LEAVE_NET.format(**_HOLD_CASES["leaves its band, then crosses"]).replace(
-            "4 dn() -dlt", "4 dn() -dlt + if(time() > 3, 0, 0)"
-        )
-    )
+    # v() is a Gaussian of the clock, which issue #1286 stops on. A run with a
+    # crossing stop takes the stretch it has not looked inside one step at a
+    # time (#998), and a step at a time ends no batch, so there is nothing for
+    # the log to show either way (#1389). This is asked of the run without that
+    # stop, the run it was written for.
     assert _batch_ends_between(path, "0", 1.0, 2.4, pulse_stops=False)
     assert _batch_ends_between(path, "1", 1.0, 2.4, pulse_stops=False)
 
