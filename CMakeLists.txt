@@ -649,6 +649,37 @@ endif()
 # codegen backend and the ExprTk fallback are unchanged when MIR is disabled.
 option(BNGSIM_ENABLE_MIR "Build the vendored MIR micro-JIT backend for the codegen RHS (GH #78, prototype)" OFF)
 
+# Issue #1215. A MIR context carves its generated code out of one reservation
+# of address space, MIR_CODE_RESERVE_SIZE, so that the code's direct branches
+# reach each other (±128 MB on aarch64); code that outgrows it is mapped on its
+# own, as MIR did before it reserved. Upstream reserves 128 MB on 64-bit hosts
+# other than Windows. That holds no memory, but it counts against a cap on the
+# address space (`ulimit -v`, RLIMIT_AS): each live MIR-JIT'd model held 128 MB
+# of it, about 60 to 8 GB. 32 MB holds the largest committed model's code in
+# one piece on macOS arm64 (fceri_gamma, 27.9 MB; fceri_fyn, 7.4 MB). bngsim
+# generates eagerly, and its calls and thunk redirects check their reach, so
+# code mapped on its own is correct too: the size is address space only. 0
+# reserves nothing. Windows keeps MIR's own 0.
+#
+# Declared and checked outside the MIR block, so that it is read on every
+# configure: scripts/rebuild_editable.py passes it every time (GH #459), and a
+# value passed but never read draws CMake's "not used by the project" warning
+# on every build without MIR.
+set(BNGSIM_MIR_CODE_RESERVE_MB "32" CACHE STRING
+    "Address space in MB each MIR context reserves for its code (issue #1215; 0 = none, at most 2048)")
+if(NOT BNGSIM_MIR_CODE_RESERVE_MB MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "BNGSIM_MIR_CODE_RESERVE_MB must be a whole number of MB, "
+                        "not '${BNGSIM_MIR_CODE_RESERVE_MB}'")
+endif()
+# x86-64's ±2 GB is the farthest any MIR target's direct branches reach, so a
+# larger reservation keeps no more code in reach. And math(EXPR) is 64-bit:
+# from 2^43 MB up it wraps the byte count to a negative or zero size, which MIR
+# would quietly turn into no reservation at all.
+if(BNGSIM_MIR_CODE_RESERVE_MB GREATER 2048)
+    message(FATAL_ERROR "BNGSIM_MIR_CODE_RESERVE_MB must be at most 2048 MB, "
+                        "not '${BNGSIM_MIR_CODE_RESERVE_MB}'")
+endif()
+
 if(BNGSIM_ENABLE_MIR)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mir/c2mir/c2mir.c")
         message(STATUS "Building vendored MIR micro-JIT from: third_party/mir/")
@@ -689,6 +720,14 @@ if(BNGSIM_ENABLE_MIR)
             $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>
             $<$<C_COMPILER_ID:MSVC>:/w>
         )
+        # Issue #1215: the size of MIR's code reservation, from
+        # BNGSIM_MIR_CODE_RESERVE_MB (declared and checked above).
+        if(NOT WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+            math(EXPR BNGSIM_MIR_CODE_RESERVE_BYTES "${BNGSIM_MIR_CODE_RESERVE_MB} * 1024 * 1024")
+            target_compile_definitions(bngsim_mir PRIVATE
+                MIR_CODE_RESERVE_SIZE=${BNGSIM_MIR_CODE_RESERVE_BYTES})
+            message(STATUS "MIR code reservation: ${BNGSIM_MIR_CODE_RESERVE_MB} MB per context")
+        endif()
     else()
         message(WARNING "Vendored MIR source not found at third_party/mir/, "
                         "disabling BNGSIM_ENABLE_MIR")

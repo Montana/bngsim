@@ -188,3 +188,32 @@ def test_cmake_gates_mir_behind_option():
     for rel in TRANSLATION_UNITS:
         assert f"third_party/mir/{rel}" in text
     assert "BNGSIM_HAS_MIR=1" in text
+
+
+# ── Issue #1215: the address space each MIR context reserves for its code ────
+# MIR reserves MIR_CODE_RESERVE_SIZE of address space per context. Upstream's
+# 128 MB counted against a cap on the address space (`ulimit -v`) for every
+# live MIR-JIT'd model, about 60 to 8 GB. CMake sets 32 MB, which holds the
+# largest committed model's code in one piece on macOS arm64 (fceri_gamma,
+# 27.9 MB). The live models' address space is measured in
+# test_mir_equivalence.py, which runs only on a MIR build: a skip here would be
+# one run_tests.sh's walk-up probe counts against it.
+
+
+def test_cmake_sizes_the_mir_code_reservation():
+    text = CMAKE_LISTS.read_text()
+    assert 'set(BNGSIM_MIR_CODE_RESERVE_MB "32" CACHE STRING' in text
+    assert "MIR_CODE_RESERVE_SIZE=${BNGSIM_MIR_CODE_RESERVE_BYTES}" in text
+    assert "if(BNGSIM_MIR_CODE_RESERVE_MB GREATER 2048)" in text
+    # The vendored default it overrides is still upstream's, under the #ifndef
+    # that lets the define override it, so a refresh that moves either is seen
+    # here. bngsim_mir compiles with -w: without the guard, mir.c's own #define
+    # would replace CMake's with no warning, and every context would reserve
+    # 128 MB again.
+    mir_c = (MIR_DIR / "mir.c").read_text()
+    assert (
+        "#ifndef MIR_CODE_RESERVE_SIZE\n"
+        "#if UINTPTR_MAX == 0xffffffffffffffffu && !defined(_WIN32)\n"
+        "#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)\n"
+    ) in mir_c
+    assert mir_c.count("#define MIR_CODE_RESERVE_SIZE") == 2
