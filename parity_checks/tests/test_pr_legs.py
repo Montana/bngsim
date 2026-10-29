@@ -134,8 +134,13 @@ def _imported_dirs(script: str) -> set[str]:
                 rel = pathlib.Path(f).resolve().relative_to(repo)
             except ValueError:
                 continue
-            if rel.parts[0] != "python":
-                dirs.add(str(rel.parent))
+            # Not bngsim (python/), and not an environment inside the checkout
+            # (CI's .venv/ is), whose packages are no leg's code.
+            if rel.parts[0] == "python" or rel.parts[0].startswith("."):
+                continue
+            if "site-packages" in rel.parts:
+                continue
+            dirs.add(str(rel.parent))
         print(json.dumps(sorted(dirs)))
     """)
     done = subprocess.run(
