@@ -42,11 +42,6 @@ struct SolverStats {
     int n_sens_err_test_fails = 0;    // CVodeGetSensNumErrTestFails
     int n_sens_nonlin_conv_fails = 0; // CVodeGetSensNumNonlinSolvConvFails
 
-    // Rows CVODE returned for an output time outside its last step, which it
-    // cannot interpolate to and does not say so (issue #1301): each was read
-    // where the run stood instead. 0 on a run with no sensitivities.
-    int n_rows_outside_last_step = 0;
-
     int linear_solver = LINEAR_SOLVER_DENSE; // LinearSolverKind actually used
 
     // GH #132 adaptive gate: of this run's dense factorizations, how many took the

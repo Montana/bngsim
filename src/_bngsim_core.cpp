@@ -899,7 +899,6 @@ PYBIND11_MODULE(_bngsim_core, m) {
         .def_readwrite("n_nonlin_conv_fails", &bngsim::SolverStats::n_nonlin_conv_fails)
         .def_readwrite("n_sens_err_test_fails", &bngsim::SolverStats::n_sens_err_test_fails)
         .def_readwrite("n_sens_nonlin_conv_fails", &bngsim::SolverStats::n_sens_nonlin_conv_fails)
-        .def_readwrite("n_rows_outside_last_step", &bngsim::SolverStats::n_rows_outside_last_step)
         .def_readwrite("linear_solver", &bngsim::SolverStats::linear_solver)
         .def_readwrite("n_dense_blas_factorizations",
                        &bngsim::SolverStats::n_dense_blas_factorizations)
@@ -925,7 +924,6 @@ PYBIND11_MODULE(_bngsim_core, m) {
             d["n_nonlin_conv_fails"] = s.n_nonlin_conv_fails;
             d["n_sens_err_test_fails"] = s.n_sens_err_test_fails;
             d["n_sens_nonlin_conv_fails"] = s.n_sens_nonlin_conv_fails;
-            d["n_rows_outside_last_step"] = s.n_rows_outside_last_step;
             d["linear_solver"] = s.linear_solver;
             d["steady_state_reached"] = s.steady_state_reached;
             d["steady_state_residual"] = s.steady_state_residual;

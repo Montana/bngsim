@@ -389,9 +389,6 @@ class Result:
                 # still report `n_err_test_fails == 0`. 0 with sensitivities off.
                 "n_sens_err_test_fails": stats.n_sens_err_test_fails,
                 "n_sens_nonlin_conv_fails": stats.n_sens_nonlin_conv_fails,
-                # Rows CVODE returned for an output time outside its last step,
-                # read where the run stood instead (issue #1301).
-                "n_rows_outside_last_step": stats.n_rows_outside_last_step,
                 # Which direct linear solver the ODE engine actually used, as the
                 # ``LinearSolverKind`` enum (include/bngsim/result.hpp). Pinned
                 # mapping — DO NOT reinterpret as a SUNDIALS solver-id:
@@ -461,7 +458,6 @@ class Result:
                 "n_nonlin_conv_fails": 0,
                 "n_sens_err_test_fails": 0,
                 "n_sens_nonlin_conv_fails": 0,
-                "n_rows_outside_last_step": 0,
                 "linear_solver": 0,
                 "n_dense_blas_factorizations": 0,
                 "steady_state_reached": 0,
@@ -2080,10 +2076,7 @@ class Result:
 
         Keys: ``n_steps``, ``n_rhs_evals``, ``n_jac_evals``,
         ``n_err_test_fails``, ``n_nonlin_iters``, ``n_nonlin_conv_fails``,
-        ``n_sens_err_test_fails``, ``n_sens_nonlin_conv_fails``,
-        ``n_rows_outside_last_step`` (rows of a sensitivity run CVODE returned
-        for an output time outside its last step, read where the run stood,
-        issue #1301).
+        ``n_sens_err_test_fails``, ``n_sens_nonlin_conv_fails``.
         """
         return self._solver_stats
 
