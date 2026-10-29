@@ -231,21 +231,24 @@ def capability_report(model: Model) -> dict[str, list[str]]:
     # A species an assignment rule sets is written `$`-fixed, beside the
     # observable or function that holds its rule under the species' own name.
     # bngsim's reader takes the pair as the rule (_ar_report_map_from_net, #515);
-    # run_network holds the species at its initial value for the whole run, so
-    # every rate law that reads it is wrong there too (#1274: BIOMD0000000144's
-    # $Wee1Pc ends at 0.8001 in run_network, 0.7803 in bngsim). The reader's own
-    # rule, read off the model being written, names exactly those species.
+    # run_network holds the species at its initial value for the whole run. Its
+    # rate laws read the name, which is the observable or the function, so they
+    # read the rule and only the species' own column is wrong there (#1274:
+    # BIOMD0000000144's $Wee1Pc ends at 0.8001 in run_network, 0.7803 in bngsim,
+    # and every other species agrees to 5e-8). The reader's own rule, read off
+    # the model being written, names exactly those species.
     from bngsim._model import _ar_report_map_from_net
 
     bngsim_only: list[str] = []
-    rule_species = sorted(_ar_report_map_from_net(core))
+    rule_species = sorted(_ar_report_map_from_net(core, data))
     if rule_species:
         bngsim_only.append(
             f"{len(rule_species)} species set by an assignment rule (e.g. "
             f"{_eg(rule_species)}) are written $-fixed beside the observable or function "
             "of the same name: bngsim reads the pair as the rule, but BioNetGen's "
-            "run_network holds each at its initial value for the whole run, and so "
-            "runs every rate law that reads one wrong"
+            "run_network holds each at its initial value for the whole run. Its rate "
+            "laws read the rule through that observable or function, so only those "
+            "species' own columns are wrong there"
         )
 
     return {"dropped": dropped, "lossy": lossy, "bngsim_only": bngsim_only}
