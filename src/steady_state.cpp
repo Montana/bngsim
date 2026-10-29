@@ -958,7 +958,7 @@ static int cvode_ss_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix
 // of that issue's tests, the march on this quotient ended where the closed
 // form's did, and KLU's ordering kept a species held at 0 there.
 static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *ud,
-                                     N_Vector /*tmp1*/, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
+                                     N_Vector tmp1, N_Vector /*tmp2*/, N_Vector /*tmp3*/) {
     auto *data = static_cast<SteadyStateUserData *>(ud);
     const int ns = data->model->n_species();
     // Bare accessor: the marcher materialized the coloring before installing
@@ -967,6 +967,16 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
 
     install_csc_structure(SUNSparseMatrix_IndexPointers(J), SUNSparseMatrix_IndexValues(J), sp);
 
+    // Each column's step as the march's dense quotient takes it, on its error
+    // weights (in tmp1, CVODE's scratch for this callback) and its step (#1254),
+    // so the two routes of one march form one matrix.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
     // Sized once, when the callback was selected, so this hot path allocates
     // nothing per Jacobian evaluation.
     SteadyStateRhs *rhs = data->rhs;
@@ -974,7 +984,8 @@ static int cvode_ss_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUN
         sp, ns, static_cast<double>(t), N_VGetArrayPointer(y), N_VGetArrayPointer(fy),
         SUNSparseMatrix_Data(J), data->fd_y_pert.data(), data->fd_fy_pert.data(),
         data->fd_h_vals.data(),
-        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); });
+        [rhs](double tt, const double *yy, double *ydot) { rhs->eval(tt, yy, ydot); }, nullptr,
+        nullptr, ewt, min_inc);
     return 0;
 }
 
@@ -1517,6 +1528,9 @@ class SteadyStateMarcher {
                 ud_.fd_y_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_fy_pert.resize(static_cast<size_t>(ns_));
                 ud_.fd_h_vals.assign(static_cast<size_t>(ns_), 0.0);
+                // Each column's step on the march's error weights, as the
+                // dense quotient takes it (#1254).
+                ud_.dq_cvode_mem = cvode_mem_;
             }
             if (CVodeSetJacFn(cvode_mem_, analytical ? cvode_ss_sparse_jac
                                                      : cvode_ss_colored_jac) != CV_SUCCESS) {

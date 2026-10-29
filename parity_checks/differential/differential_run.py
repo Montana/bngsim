@@ -5,8 +5,10 @@ report (issue #1257).
 The checks are ``_differential.py``'s: a sensitivity run's state against a plain
 run's, the FD Jacobian against the analytic one, KLU against the dense solver,
 compiled against interpreted, cc against MIR, a comma-decimal locale against C,
-8x the output points against the base's grid, and three rules for bugs whose answers are right (a sensitivity run refused, a
-sparsity pattern that misses entries, a backend other than the one asked for).
+8x the output points against the base's grid, and four rules for bugs whose
+answers are right (a sensitivity run refused, a sparsity pattern that misses
+entries, analytic Jacobian entries that differences of the right-hand side
+contradict (#1308), a backend other than the one asked for).
 Three more reuse what every other check makes fresh (#1307): a run stopped and
 continued, a second run on a Simulator or a Model a first one ran, and a batch
 on threads against the same points one at a time.
