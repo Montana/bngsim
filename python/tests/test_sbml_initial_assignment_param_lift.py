@@ -387,6 +387,8 @@ _EVENT_FAR_AWAY = AR_DEPENDENT.replace(
     'xmlns="http://www.w3.org/1998/Math/MathML"><cn>0</cn></math></eventAssignment>'
     "</listOfEventAssignments></event></listOfEvents>",
 )
+# Without the event the "cold" cases below would run the warm path and pass.
+assert "<listOfEvents>" in _EVENT_FAR_AWAY, "fixture text drifted"
 
 
 @pytest.mark.parametrize(
@@ -409,15 +411,7 @@ def test_a_run_leaves_the_rules_value_in_the_parameter(xml, kw):
     assert m.get_param("q") == pytest.approx(math.exp(-4.0), rel=1e-5)
 
 
-@pytest.mark.skipif(
-    not getattr(bngsim, "HAS_MIR", False),
-    reason="bngsim built without the MIR backend (configure with -DBNGSIM_ENABLE_MIR=ON)",
-)
-def test_a_run_through_the_jit_leaves_it_too(monkeypatch):
-    monkeypatch.setenv("BNGSIM_CODEGEN_JIT", "mir")
-    m = bngsim.Model.from_sbml_string(AR_DEPENDENT)
-    sim = bngsim.Simulator(m, method="ode", codegen=True)
-    assert sim.codegen_backend == "mir"
-    r = sim.run(t_span=T_SPAN, n_points=N_POINTS)
-    a_end = float(np.asarray(r.species)[-1, list(r.species_names).index("A")])
-    assert m.get_param("q") == pytest.approx(0.5 * a_end, rel=1e-12)
+# The same check under the MIR JIT is
+# test_codegen_outputs.py::test_a_compiled_run_leaves_the_rule_set_parameters_at_its_end:
+# the mir-jit leg runs that file under BNGSIM_CODEGEN_JIT=mir, and runs this
+# one nowhere.
