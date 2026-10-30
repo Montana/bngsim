@@ -886,6 +886,12 @@ PYBIND11_MODULE(_bngsim_core, m) {
             py::object exc = cls(py::str(e.what()), py::arg("timeout") = e.timeout_seconds(),
                                  py::arg("elapsed") = e.elapsed_seconds());
             PyErr_SetObject(cls.ptr(), exc.ptr());
+        } catch (const bngsim::SensitivityUnsupported &e) {
+            // Issue #1279: a refusal the solver reaches mid-run is typed as the
+            // ones raised before a run are.
+            py::object cls =
+                py::module_::import("bngsim._exceptions").attr("SensitivityUnsupportedError");
+            PyErr_SetObject(cls.ptr(), cls(py::str(e.what())).ptr());
         }
     });
 
@@ -1253,6 +1259,17 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "judged over the whole right-hand side, as before; an empty entry means "
             "no listed rate law reads it, so the crossing is continuous. A jump the "
             "listed reactions do not account for is judged as before.")
+        .def(
+            "set_held_equality_conditions",
+            [](bngsim::SolverOptions &self, const std::vector<std::string> &conditions) {
+                self.sensitivity.held_equality_conditions = conditions;
+            },
+            py::arg("conditions"),
+            "Issue #1279: rate-law equalities over model state, as source text "
+            "(`Bobs==0`), that a sensitivity run reads at each event. One an "
+            "event's assignments put the state on, where the flow keeps it, is "
+            "refused there with SensitivityUnsupportedError, as a run that starts "
+            "on it is (issue #1228). Empty (the default) watches none.")
         .def(
             "set_state_switch_guards",
             [](bngsim::SolverOptions &self, const std::vector<std::string> &guards) {

@@ -9445,6 +9445,46 @@ def state_switch_conditions(core, ctx=None) -> list[str]:
     return conditions
 
 
+def rate_law_equalities(core, ctx=None) -> list[tuple[str, str]]:
+    """The plain equalities over live state a functional rate law branches on.
+
+    Each as ``(atom, residual)``, one per residual: an equality (or ``!=``) of
+    things that move smoothly, in a rate law or a function one reaches (one an
+    output alone reads moves nothing). An equality over a step or bend call
+    (``floor(T/24) == 3``) is a window like any other and is not one. These
+    are the surfaces :func:`equalities_held_at_start` reads at the start, and
+    the solver reads at each event of a sensitivity run (issue #1279). ``[]``
+    for a model with no conditional rate law, before anything is probed.
+    """
+    from bngsim._jacobian import _inline_functions
+
+    if core.n_functions == 0:
+        return []
+    if ctx is None:
+        ctx = core.functional_jacobian_context()
+    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
+        return []
+    func_map = _scan_function_map(ctx)
+    memo: dict[str, str] = {}
+    # The rate laws, with the functions they reach written in. Each law and each
+    # atom is read once, however many reactions share it.
+    atoms: dict[str, None] = {}
+    for law in dict.fromkeys(_scan_rate_law(rxn) for rxn in ctx["functional_reactions"]):
+        flat = _inline_functions(law, func_map, memo=memo) or law
+        if _IF_CALL.search(flat):
+            atoms.update(dict.fromkeys(_iter_condition_atoms(flat)))
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for whole in atoms:
+        if not is_equality_atom(whole) or _STEP_CALL.search(whole) or _BEND_CALL.search(whole):
+            continue
+        residual = state_switch_residual(core, whole)
+        if residual and residual not in seen:
+            seen.add(residual)
+            candidates.append((whole, residual))
+    return candidates
+
+
 def equalities_held_at_start(core, ctx=None, t0: float = 0.0) -> list[str]:
     """The rate-law equalities over model state that the run starts on (issue #1228).
 
@@ -9488,37 +9528,11 @@ def equalities_held_at_start(core, ctx=None, t0: float = 0.0) -> list[str]:
     are left refreshed from the start state.
 
     Only the start is read. A state that an event puts on the surface mid-run
-    is not seen here (issue #1279).
+    is refused by the solver, at the event, by the same test (issue #1279).
     """
     import numpy as np
 
-    from bngsim._jacobian import _inline_functions
-
-    if core.n_functions == 0:
-        return []
-    if ctx is None:
-        ctx = core.functional_jacobian_context()
-    if not any(_IF_CALL.search(body) for body in dict(ctx["function_map"]).values()):
-        return []
-    func_map = _scan_function_map(ctx)
-    memo: dict[str, str] = {}
-    # The rate laws, with the functions they reach written in: an equality in a
-    # function that only an output reads moves no trajectory and no column. Each
-    # law and each atom is read once, however many reactions share it.
-    atoms: dict[str, None] = {}
-    for law in dict.fromkeys(_scan_rate_law(rxn) for rxn in ctx["functional_reactions"]):
-        flat = _inline_functions(law, func_map, memo=memo) or law
-        if _IF_CALL.search(flat):
-            atoms.update(dict.fromkeys(_iter_condition_atoms(flat)))
-    candidates: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for whole in atoms:
-        if not is_equality_atom(whole) or _STEP_CALL.search(whole) or _BEND_CALL.search(whole):
-            continue
-        residual = state_switch_residual(core, whole)
-        if residual and residual not in seen:
-            seen.add(residual)
-            candidates.append((whole, residual))
+    candidates = rate_law_equalities(core, ctx)
     if not candidates:
         return []
 

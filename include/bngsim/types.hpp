@@ -16,6 +16,16 @@
 
 namespace bngsim {
 
+// A forward-sensitivity run the solver declines partway, by declaration: it
+// reached a construct whose derivative it cannot produce, and refuses rather
+// than return columns it knows are wrong (issue #1279). The pybind11 layer
+// maps it to bngsim.SensitivityUnsupportedError, the type the Python checks
+// raise before a run, where a std::runtime_error became a SimulationError.
+class SensitivityUnsupported : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 // ─── Rate law types ─────────────────────────────────────────────────────────
 //
 // Three native rate law types. Legacy BioNetGen Sat/Hill tokens are not
@@ -1164,6 +1174,14 @@ struct SensitivityOptions {
     // branch is off, which changes nothing, rather than restart there. Empty
     // (the default) restarts at every crossing, as before.
     std::vector<std::string> state_switch_guards;
+
+    // Issue #1279: the rate-law equalities over model state (`Bobs==0`), as
+    // source text, that a sensitivity run watches at each event. One an event's
+    // assignments put the state on, where the flow keeps it, holds for a
+    // stretch, and leaving it is a switch nothing locates: the run is refused
+    // there, as one that starts on it is (issue #1228). Empty (the default)
+    // watches none. Read only by a run with sensitivity columns.
+    std::vector<std::string> held_equality_conditions;
 
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event

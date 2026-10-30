@@ -2846,7 +2846,8 @@ class Simulator:
 
         A rate-law equality over state that the run starts on, at *t_start*, and
         stays on is refused first (issue #1228): leaving it is a switch nothing
-        locates.
+        locates. One an event puts the state on is refused by the solver at
+        that event (issue #1279).
 
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
@@ -2855,6 +2856,7 @@ class Simulator:
         from bngsim._switch_sensitivity import (
             _surface_key,
             equalities_held_at_start,
+            rate_law_equalities,
             state_switch_conditions,
             state_switch_reactions,
             state_switch_residual,
@@ -2887,6 +2889,17 @@ class Simulator:
                 "inequality, `Bobs<=0`, is refused at its tangency. Or drop sensitivities "
                 "for this run."
             )
+        # An event can put the state on such a surface mid-run, which the start
+        # does not show: the solver reads each equality at every event and
+        # refuses there (issue #1279). Only a model with events can.
+        if core.n_events:
+            try:
+                equalities = [atom for atom, _ in rate_law_equalities(core, ctx)]
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Equality detection for events failed (%s) (issue #1279).", e)
+                equalities = []
+            if equalities:
+                opts.set_held_equality_conditions(equalities)
 
         try:
             conditions = state_switch_conditions(core, ctx)
@@ -7397,6 +7410,10 @@ class Simulator:
 
         try:
             core_result = sim.run(ts, opts)
+        except SensitivityUnsupportedError:
+            # The solver's refusal of the model mid-run (issue #1279), typed as
+            # one raised while the chunk sets up: no column runs alone either.
+            raise
         except RuntimeError as e:
             raise SimulationError(f"Sensitivity chunk failed (params={sens_params}): {e}") from e
 

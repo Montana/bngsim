@@ -3571,6 +3571,10 @@ struct CvodeSimulator::Impl {
     // Every state switch registered for this run, so a crossing can find the
     // others its own probe pair straddles (issue #763).
     std::vector<const NetworkModel::StateSwitch *> state_switch_all;
+    // Issue #1279: the rate-law equalities over state this sensitivity run reads
+    // at each event, each with its source text and its residual. Empty unless
+    // the run has sensitivity columns and the model has such an equality.
+    std::vector<std::pair<std::string, int>> held_equalities;
     // The switches whose jump a recent restart applied, each with the time of
     // that restart (issue #763): a crossing that follows closely enough for its
     // probe pair to cross one of them again would read that jump a second time.
@@ -7661,6 +7665,60 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
 
     if (n_sens == 0 || fired.empty() || s_minus.empty()) {
         return;
+    }
+
+    // Issue #1279: an event that puts the state on a rate-law equality's
+    // surface, where the flow keeps it, starts a stretch on which the equality
+    // holds. Leaving it is a switch nothing locates, an equality being rooted
+    // nowhere, so the columns of whatever ends the stretch would come back 0
+    // with no jump: an SBML washout setting B = 0 under `piecewise(kb, B == 0,
+    // 0)` returned dY/da = 0 for -6.44. Refused here, by the test a run that
+    // starts on one is refused by (issue #1228): the residual is exactly 0 at
+    // the state the event left and still exactly 0 a step along the flow.
+    if (!held_equalities.empty()) {
+        constexpr double kStep = 1e-6; // equalities_held_at_start's step
+        std::vector<double> x_left(static_cast<std::size_t>(ns), 0.0);
+        for (int i = 0; i < ns; ++i) {
+            x_left[static_cast<std::size_t>(i)] = sp_vec_outer[i].concentration;
+        }
+        std::vector<double> stepped;
+        const std::string *held = nullptr;
+        for (const auto &[cond, gidx] : held_equalities) {
+            sync_model_at(t_evt, x_left.data(), ns);
+            if (eval_ref_outer.evaluate(gidx) != 0.0) {
+                continue;
+            }
+            if (stepped.empty()) {
+                stepped.assign(static_cast<std::size_t>(ns), 0.0);
+                model.compute_derivs(t_evt, x_left.data(), stepped.data());
+                for (int i = 0; i < ns; ++i) {
+                    stepped[static_cast<std::size_t>(i)] =
+                        x_left[static_cast<std::size_t>(i)] +
+                        kStep * stepped[static_cast<std::size_t>(i)];
+                }
+            }
+            sync_model_at(t_evt + kStep, stepped.data(), ns);
+            if (eval_ref_outer.evaluate(gidx) == 0.0) {
+                held = &cond;
+                break;
+            }
+        }
+        sync_model_at(t_evt, x_left.data(), ns);
+        if (held != nullptr) {
+            std::ostringstream msg;
+            msg << "Forward sensitivity is not supported for this model: a rate law branches "
+                   "on '"
+                << *held << "', and event '" << events_outer[fired.front()].id
+                << "' puts the state on that equality's surface at t=" << t_evt
+                << ", where it stays, so the condition holds one value for a stretch rather "
+                   "than an instant. Leaving the surface is a switch bngsim does not locate, "
+                   "so the columns of whatever ends the stretch would come back 0 with no "
+                   "jump (issue #1279; a run that starts on the surface is refused the same "
+                   "way, issue #1228). Write the switch as the crossing that ends the "
+                   "stretch, which is located and jumped, or drop sensitivities for this "
+                   "run.";
+            throw SensitivityUnsupported(msg.str());
+        }
     }
 
     // What the triggers that fired read (issue #945, below).
@@ -14411,6 +14469,31 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
         }
         impl_->state_switch_all = state_switches;
+    }
+    impl_->held_equalities.clear();
+    if (sens.n_total > 0 && !opts.sensitivity.held_equality_conditions.empty()) {
+        // The species a reaction can change. A surface over none of them is
+        // left only at an event, whose own jump is right: BIOMD0000000301's
+        // `pulse_flag == 1`, set and cleared by events alone, matches a central
+        // difference to 1e-7. Unknown support (a rateOf) reads every species.
+        std::vector<char> moved(static_cast<std::size_t>(ns), 0);
+        for (const Reaction &rxn : model.reactions()) {
+            for (const auto *side : {&rxn.net_loss, &rxn.net_gain}) {
+                for (const auto &[idx0, mult] : *side) {
+                    if (mult != 0.0 && idx0 >= 0 && idx0 < ns && !model.species()[idx0].fixed) {
+                        moved[static_cast<std::size_t>(idx0)] = 1;
+                    }
+                }
+            }
+        }
+        for (const auto &cond : opts.sensitivity.held_equality_conditions) {
+            const NetworkModel::StateSwitch *sw = model.state_switch(cond);
+            if (sw != nullptr && std::any_of(sw->species.begin(), sw->species.end(), [&](int idx0) {
+                    return idx0 >= 0 && idx0 < ns && moved[static_cast<std::size_t>(idx0)] != 0;
+                })) {
+                impl_->held_equalities.emplace_back(cond, sw->residual_expr_idx);
+            }
+        }
     }
     const int n_state_switch = static_cast<int>(state_switch_roots.size());
     state_switch_zero_hold.assign(static_cast<size_t>(n_state_switch), 0.0);
