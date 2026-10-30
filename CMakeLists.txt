@@ -474,7 +474,7 @@ else()
     FetchContent_MakeAvailable(sundials)
 
     file(READ "${sundials_SOURCE_DIR}/src/cvodes/cvodes.c" _bngsim_cvodes_c)
-    string(FIND "${_bngsim_cvodes_c}" "BNGSIM LOCAL CARRY (lanl/bngsim#1301, r2)" _bngsim_carry_at)
+    string(FIND "${_bngsim_cvodes_c}" "BNGSIM LOCAL CARRY (lanl/bngsim#1301, r3)" _bngsim_carry_at)
     unset(_bngsim_cvodes_c)
     if(_bngsim_carry_at EQUAL -1)
         message(FATAL_ERROR
