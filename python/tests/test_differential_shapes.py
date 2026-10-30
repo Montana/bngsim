@@ -1798,6 +1798,41 @@ def test_arms_that_agree_attribute_the_diff_to_one_side():
     assert not D.contested({"klu_vs_dense": {"status": "diff", "extra": {"attribution": a}}})
 
 
+def test_an_arm_takes_a_side_within_the_bound_and_none_past_it():
+    """Arms half the bound off each side take that side; twice it off, neither.
+    Arms that copy a side exactly pass under any bound at all, a far too tight
+    one included, and #1304's dense arm reads neither on some grids anyway."""
+    base = _base("derived-log10")
+    ref, path = base.x, base.x * 1.5
+    v = _verdict(ref, path)
+    near, far = 1.0 + 0.5 * base.limit, 1.0 + 2.0 * base.limit
+    a = D.attribute(base, v, {"tighter": path * near, "dense": ref * near})
+    assert a["verdict"] == "split", a
+    assert a["arms"]["tighter"]["side"] == "path" and a["arms"]["dense"]["side"] == "reference", a
+    a = D.attribute(base, v, {"tighter": path * far, "dense": ref * far})
+    assert a["verdict"] == "unattributed", a
+    assert {s["side"] for s in a["arms"].values()} == {"neither"}, a
+
+
+@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
+def test_klu_and_dense_are_compared_on_one_jacobian(monkeypatch):
+    """``klu_vs_dense`` differs in the linear solver alone: its dense reference
+    runs on the Jacobian its KLU path ran on."""
+    asked = []
+    real = D.run
+
+    def spy(job, **kw):
+        asked.append(kw)
+        return real(job, **kw)
+
+    monkeypatch.setattr(D, "run", spy)
+    v = D.check_klu(_base("derived-log10"))
+    assert v.status == "pass", v
+    sparse = [kw["jacobian"] for kw in asked if kw.get("force_sparse_linear_solver")]
+    dense = [kw["jacobian"] for kw in asked if kw.get("force_dense_linear_solver")]
+    assert sparse and dense == sparse[-1:], asked
+
+
 def test_a_diff_is_attributed_by_real_arms(monkeypatch):
     """check_all attributes every DIFF: here a planted cc_vs_interp that moves
     the path by 50%, which the real arms (the base at a hundredfold tighter
@@ -1897,9 +1932,9 @@ def test_1304s_models_attribute_each_arm_to_the_side_it_takes(model):
     when depend on the CPU and the output grid. So the check reads a coin with
     three faces:
 
-    * Broken upward, dense takes the activated branch (338's Fg 0.73 against
-      KLU's 311, which libRoadRunner reads too; 339 1.8e-2 of the peak apart),
-      and the dense arm lands with the reference: the arms split, and the
+    * Broken upward, dense takes the activated branch, as libRoadRunner does
+      (338's Fg 0.73 against KLU's 311; 339 1.8e-2 of the peak apart), and
+      the dense arm lands with the reference: the arms split, and the
       model is contested. Both models at this window on arm64; 339 on x86-64.
     * Broken upward, but the dense arm, on the default Jacobian, leaves 0 at
       another moment than the reference on the FD one, and lands within the
@@ -1934,26 +1969,33 @@ def test_1304s_models_attribute_each_arm_to_the_side_it_takes(model):
     assert a["verdict"] == ("split" if "reference" in sides.values() else "path"), a
 
 
-@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
 def test_a_klu_base_takes_the_dense_solver_as_its_other_arm(monkeypatch):
-    """The third arm on the other linear solver is dense for a base KLU took.
-    Every other attribution test's base is dense, so without this the dense arm
-    is read only by #1304's corpus models, which CI has none of. A base that
-    ran dense stands in for one KLU took: the dense arm reruns it exactly."""
-    base = _base("derived-log10")
+    """The third arms of a base KLU took: its own route at a hundredfold tighter
+    tolerance, and the dense solver. Every other attribution test's base is
+    dense, so without this the dense arm is read only by #1304's corpus models,
+    which CI has none of. A copy of a base that ran dense stands in for one KLU
+    took (the cached base is shared): the dense arm reruns it exactly."""
+    shared = _base("derived-log10")
+    base = shared.against(shared.x)
     base.linear_solver = 1
     asked = []
     real = D.run
 
     def spy(job, **kw):
-        asked.append(kw)
+        asked.append((job, kw))
         return real(job, **kw)
 
     monkeypatch.setattr(D, "run", spy)
     arms = D._arm_runs(base)
     assert set(arms) == {"tighter", "dense"}, sorted(arms)
-    assert [kw for kw in asked if kw] == [{"force_dense_linear_solver": True}], asked
+    (tight, tight_kw), (job, dense_kw) = asked
+    assert tight_kw == {} and (tight.rtol, tight.atol) == (
+        base.job.rtol / 100,
+        base.job.atol / 100,
+    )
+    assert job == base.job and dense_kw == {"force_dense_linear_solver": True}, asked
     assert D.gap(arms["dense"], base.x, base.job.atol) == 0.0
+    assert shared.linear_solver == 0
 
 
 def test_what_1309_adds_runs_in_what_is_left_of_the_cap(monkeypatch):
