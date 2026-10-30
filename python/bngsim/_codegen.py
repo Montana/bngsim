@@ -5579,9 +5579,19 @@ _EXPRTK_TOKEN_RE = re.compile(
     re.S,
 )
 
-# The token pairs ExprTk multiplies (commutative_inserter in exprtk.hpp): a
-# number against a name or an opening bracket, a name against a number, a
-# closing bracket against a number or a name, and two names.
+# The reserved words that join two operands. A bracket after any other one
+# (`if(`, `not(`) opens its call.
+_EXPRTK_OPERATOR_WORDS = frozenset(
+    {"and", "or", "nand", "nor", "xor", "xnor", "in", "like", "ilike", "shl", "shr"}
+)
+
+# The token pairs ExprTk's lexer multiplies (commutative_inserter in exprtk.hpp):
+# a number against a name or an opening bracket, a name against a number, a
+# closing bracket against a number or a name, and two names. Its parser
+# multiplies two more, which depend on what the name or the bracket is
+# (post_variable_process and post_bracket_process): a variable, and a bracketed
+# group, against the opening bracket after it. _insert_implicit_products writes
+# those from the model's names.
 _IMPLICIT_PRODUCT_PAIRS = frozenset(
     {("num", "sym"), ("sym", "num"), ("sym", "sym")}
     | {("num", b) for b in "([{"}
@@ -5589,25 +5599,59 @@ _IMPLICIT_PRODUCT_PAIRS = frozenset(
     | {(b, "sym") for b in ")]}"}
 )
 
-# Any text that might hold one of those pairs; most rate laws hold none, and
-# skip the tokenizer.
-_IMPLICIT_PRODUCT_HINT = re.compile(r"\d\s*[A-Za-z_(\[{]|[)\]}]\s*[\w.]|[\w.]\s+[\w.]")
+# Any text that might hold one of those pairs, a bracket after a bracket, or a
+# square or curly bracket (a number may end in its dot: `2.A`); most rate laws
+# hold none, and skip the tokenizer.
+_IMPLICIT_PRODUCT_HINT = re.compile(
+    r"\d\.?\s*[A-Za-z_(\[{]|[)\]}]\s*[\w.(\[{]|[\w.]\s+[\w.]|[\[{]"
+)
+# A name before an opening bracket: a product when the name is a variable.
+_NAME_BEFORE_BRACKET_RE = re.compile("(" + _NAME + r")\s*[(\[{]")
 
 
-def _insert_implicit_products(expr: str) -> str:
+def _insert_implicit_products(expr: str, lookup: dict[str, tuple[str, bool]] | None = None) -> str:
     """Write out the ``*`` ExprTk reads between two operands written side by side.
 
     ExprTk's lexer multiplies ``2x``, ``2(x + 1)``, ``(a)b`` and ``x y``, so
-    ``2tfun_kf()/2`` is twice the table. Copied through, ``2.0tfun_kf`` is not C
+    ``2tfun_kf()/2`` is twice the table. Its parser multiplies a variable, and a
+    bracketed group, against the bracket after it: ``k(x + 1)``, ``g()(x)`` and
+    ``(a)(b)``. Copied through, ``2.0tfun_kf`` and ``p[0](obs[1])`` are not C
     (issue #1212). Its reserved words (``and``, ``or``, ``if``...) are not
-    operands and are never multiplied.
+    operands and are never multiplied. A variable is a scalar of the model or a
+    constant, as *lookup* holds them; ``time`` and a table are calls. With no
+    lookup, no name is a variable.
+
+    ExprTk groups with square and curly brackets as with round ones, and they
+    are written as round ones. After a call, a bracket opens a second statement,
+    whose value the engine gives for the whole expression (``k*exp(-x)(y)`` is
+    ``y``). There is no C for that here, and the translator declines it.
     """
-    if not _IMPLICIT_PRODUCT_HINT.search(expr):
+
+    def variable(name: str) -> bool:
+        entry = lookup.get(name) if lookup else None
+        return (
+            entry is not None
+            and entry[1]
+            and name != "time"
+            and not entry[0].startswith("data->tfun_eval(")
+        )
+
+    if not _IMPLICIT_PRODUCT_HINT.search(expr) and not any(
+        variable(m.group(1)) for m in _NAME_BEFORE_BRACKET_RE.finditer(expr)
+    ):
         return expr
+    tokens = [(m.lastgroup, m.group()) for m in _EXPRTK_TOKEN_RE.finditer(expr)]
     out: list[str] = []
     prev: str | None = None
-    for m in _EXPRTK_TOKEN_RE.finditer(expr):
-        kind, text = m.lastgroup, m.group()
+    prev_text = ""
+    # Whether the previous token is a variable, or the bracket that closed a
+    # group, which the parser multiplies against an opening bracket.
+    prev_operand = False
+    # The call the previous token closed the bracket of.
+    prev_call: str | None = None
+    # For each bracket still open, the call it opened, or None.
+    opened: list[str | None] = []
+    for i, (kind, text) in enumerate(tokens):
         if kind == "ws":
             out.append(text)
             continue
@@ -5615,10 +5659,47 @@ def _insert_implicit_products(expr: str) -> str:
             kind = text
         elif kind == "sym" and text.lower() in _EXPRTK_RESERVED_WORDS:
             kind = "word"
+        if kind in _BRACKET_CLOSES:
+            if prev_call is not None:
+                shown = expr if len(expr) <= 200 else expr[:200] + "..."
+                raise CodegenDeclined(
+                    f"codegen has no C for the bracket after the call to {prev_call!r} in the "
+                    f"expression {shown!r}: the engine reads it as a second statement and gives "
+                    "that statement's value for the whole expression, so the interpreted engine "
+                    "runs this model instead (issue #1212)"
+                )
+            j = i + 1
+            while j < len(tokens) and tokens[j][0] == "ws":
+                j += 1
+            if (
+                prev == "sym"
+                and prev_operand
+                and kind == "("
+                and tokens[j : j + 1] == [("other", ")")]
+            ):
+                opened.append(None)  # `g()`: the variable, whose `()` the engine drops
+            elif prev_operand or (prev, kind) in _IMPLICIT_PRODUCT_PAIRS:
+                out.append("*")
+                opened.append(None)
+            elif prev == "sym" or (
+                prev == "word" and prev_text.lower() not in _EXPRTK_OPERATOR_WORDS
+            ):
+                opened.append(prev_text)
+            else:
+                opened.append(None)
+            out.append("(")
+            prev, prev_text, prev_operand, prev_call = kind, text, False, None
+            continue
+        if kind in _CLOSING_BRACKETS:
+            call = opened.pop() if opened else None
+            out.append(")")
+            prev, prev_text, prev_operand, prev_call = kind, text, call is None, call
+            continue
         if (prev, kind) in _IMPLICIT_PRODUCT_PAIRS:
             out.append("*")
         out.append(text)
-        prev = kind
+        prev, prev_text, prev_call = kind, text, None
+        prev_operand = kind == "sym" and variable(text)
     return "".join(out)
 
 
@@ -5836,7 +5917,7 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
     """
     # The products ExprTk reads between operands written side by side, first,
     # while the text is still the model's (issue #1212).
-    result = _insert_implicit_products(expr)
+    result = _insert_implicit_products(expr, lookup)
     # ExprTk's reading of =, <>, -- and relational chains made explicit before
     # anything else, since each is copied through as text (issue #734).
     result = _normalize_exprtk_operators(result)
@@ -5859,6 +5940,9 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
 
     def _in_a_number(pos: int) -> bool:
         nonlocal numbers
+        # An exponent follows its digits, or its number's dot, directly.
+        if pos == 0 or text[pos - 1] not in "0123456789.":
+            return False
         if numbers is None:
             numbers = [m.span() for m in _NUMBER_RE.finditer(text)]
         return any(a <= pos < b for a, b in numbers)
@@ -5869,15 +5953,17 @@ def _translate_expr_to_c(expr: str, lookup: dict[str, tuple[str, bool]]) -> str:
         builtin = _call_form_builtin(name, empty_call)
         if builtin is not None:
             return builtin  # `time()` is the clock, even beside a scalar `time` (#776)
+        start = base + m.start()
+        if _in_a_number(start):
+            # The exponent of a number: `e3` in `1.5e3`, and `e` in `2e-3` beside a
+            # model name `e`, which the lookup would otherwise write into it.
+            return m.group(0)
         entry = lookup.get(name)
         if entry is None:
-            start = base + m.start()
             if "." in name:
                 # Not a name of the model: read its parts, as before a name
                 # could hold a dot.
                 return _IDENT_PART_OR_EMPTY_CALL_RE.sub(lambda pm: _repl(pm, start), m.group(0))
-            if _in_a_number(start):
-                return m.group(0)  # the exponent of a number: `e3` in `1.5e3`
             if (
                 empty_call is None
                 and (name in _C_CALLS_AS_WRITTEN or name in _PRELUDE_HELPERS)

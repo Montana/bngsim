@@ -9,7 +9,10 @@ no meaning for:
   ``base_function_list``), and two it has under the same name with other
   arithmetic (``hypot``, ``log2``);
 * a table read as ``tfun_kf`` or ``tfun_kf ()`` rather than ``tfun_kf()``, a name
-  with a dot in it (``k.f``), and ExprTk's implicit product (``2tfun_kf()/2``);
+  with a dot in it (``k.f``), and ExprTk's implicit products (``2tfun_kf()/2``,
+  ``k(x + 1)``, ``(a)(b)``) and square and curly brackets;
+* a parameter named ``e`` beside a literal such as ``2e-3``, which was written
+  into its exponent;
 * the physical constants other than ``_pi`` and ``_e`` (``_R``, ``_NA``...).
 
 cc refused such a source, after the compile automatic codegen then fell back
@@ -115,11 +118,11 @@ FUNCTIONS: dict[str, tuple[str, tuple[tuple[float, ...], ...]]] = {
 OBS = ("A", "B", "C")
 
 
-def _interpreter(expr: str, args: tuple[float, ...], t: float = 0.0) -> float:
+def _interpreter(expr: str, args: tuple[float, ...], t: float = 0.0, param: str = "k") -> float:
     """``expr`` as the engine computes it: the derivative of ``0 -> PROBE`` at that
-    rate, from the same ``compute_derivs`` CVODE reads."""
+    rate, from the same ``compute_derivs`` CVODE reads. The one parameter is 0.5."""
     builder = ModelBuilder()
-    builder.add_parameter("k", 0.5)
+    builder.add_parameter(param, 0.5)
     values = (*args, *(1.0,) * (len(OBS) - len(args)))
     for idx, (name, value) in enumerate(zip(OBS, values, strict=False)):
         builder.add_species(f"S_{name}", value)
@@ -162,10 +165,10 @@ def _c_double(x: float) -> str:
     return "-0.0" if x == 0.0 and math.copysign(1.0, x) < 0 else repr(x)
 
 
-def _compiled(expr: str, rows: list[tuple[float, ...]]) -> list[float]:
+def _compiled(expr: str, rows: list[tuple[float, ...]], param: str = "k") -> list[float]:
     """``expr`` through the codegen translator, compiled with the generated
     source's own prelude, at each row of observable values."""
-    body = cg._expr_to_c(expr, ["k"], [], list(OBS), [])
+    body = cg._expr_to_c(expr, [param], [], list(OBS), [])
     padded = [(*r, *(1.0,) * (len(OBS) - len(r))) for r in rows]
     source = _C_PROGRAM.format(
         prelude="\n".join(cg._CODEGEN_PRELUDE_LINES),
@@ -271,7 +274,8 @@ begin species
     2 B() 0
 end species
 begin functions
-    1 f() {law}
+    1 g() Atot + 1
+    2 f() {law}
 end functions
 begin reactions
     1 1 2 f #_R1
@@ -311,8 +315,22 @@ _LAWS = {
     "_kB": "k*_kB*Atot*1e23",
     "_h": "k*_h*Atot*1e34",
     "_F": "k*_F*Atot*1e-5",
+    # The parser's products: a bracket after a group, an observable, a function
+    # of the model, its empty call and a constant; a number ending in its dot;
+    # square and curly brackets.
+    "group_bracket": "k*(Atot)(k + 1)",
+    "observable_bracket": "k*Atot(k + 1)",
+    "function_bracket": "k*g(Atot)/2",
+    "empty_call_bracket": "k*g()(Atot)/2",
+    "constant_bracket": "k*_pi(Atot)/3",
+    "number_dot": "2.k*Atot",
+    "square_curly": "k*[Atot + 1]{k}",
 }
 
+# The runs below are at rtol=1e-10, atol=1e-12. On macOS arm64 the compiled and
+# interpreted runs of every law here agree bit for bit, under cc and MIR. The
+# bounds allow for a platform whose compiled law rounds a bit apart, which CVODE
+# carries into the trajectory at about its own tolerance: 10x its rtol, its atol.
 _RUN_IN_A_CHILD = """
 import sys, json
 import bngsim
@@ -325,9 +343,9 @@ print(json.dumps(out))
 """
 
 
-def _runs(tmp_path, law: str, jit: str | None) -> dict:
+def _runs(tmp_path, law: str, jit: str | None, template: str = _NET) -> dict:
     net = tmp_path / "m.net"
-    net.write_text(_NET.format(law=law))
+    net.write_text(template.format(law=law))
     env = {k: v for k, v in os.environ.items() if k != "BNGSIM_CODEGEN_JIT"}
     if jit:
         env["BNGSIM_CODEGEN_JIT"] = jit
@@ -376,6 +394,11 @@ def test_the_mir_jit_runs_each_and_matches_the_interpreter(tmp_path):
         ("k A", "k *A"),
         ("1.5e3k", "1.5e3*k"),
         ("2k.f/2", "2*k.f/2"),
+        ("(k)(A)", "(k)*(A)"),
+        ("[k]{A}", "(k)*(A)"),
+        ("2[k]", "2*(k)"),
+        ("2.k", "2.*k"),
+        ("2.(k)", "2.*(k)"),
     ],
 )
 def test_an_implicit_product_is_written_out(text, written):
@@ -401,12 +424,115 @@ def test_text_with_no_implicit_product_is_left_alone(text):
     assert cg._insert_implicit_products(text) == text
 
 
+# What a name is decides what a bracket after it is: a product after a variable
+# (a scalar of the model, or a constant), a call after anything else.
+_LOOKUP = cg._build_ident_lookup_model(
+    {"k": "p[0]"}, {}, {"A": "obs[0]", "B": "obs[1]"}, {"g": "func[0]"}
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "written"),
+    [
+        ("k(A)", "k*(A)"),
+        ("k (A)", "k *(A)"),
+        ("A[k]", "A*(k)"),
+        ("g(A)", "g*(A)"),
+        ("g()(A)", "g()*(A)"),
+        ("_pi(A)", "_pi*(A)"),
+        ("k(A)(B)", "k*(A)*(B)"),
+    ],
+)
+def test_a_bracket_after_a_variable_is_a_product(text, written):
+    assert cg._insert_implicit_products(text, _LOOKUP) == written
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["exp(A)", "sin (A)", "max(A, B)", "g()", "g() + k", "time()", "if(A > 1, k, B)", "k*(A)"],
+)
+def test_a_bracket_after_anything_else_is_left_alone(text):
+    assert cg._insert_implicit_products(text, _LOOKUP) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "exp(A)(B)",
+        "k*exp(-A)(B)",
+        "if(A > 1, 1, 2)(B)",
+        "not(A > 1)(B)",
+        "time() (B)",
+        "max(A, k)[B]",
+    ],
+)
+def test_a_bracket_after_a_call_declines(text):
+    """The engine reads the bracket as a second statement, and gives its value
+    for the whole expression: each of these is B. There is no C for that here."""
+    assert _interpreter(text, (2.5, 0.75)) == 0.75
+    with pytest.raises(cg.CodegenDeclined, match="second statement"):
+        cg._insert_implicit_products(text, _LOOKUP)
+
+
+def test_a_bracket_after_a_table_declines():
+    """A table is a call to the engine, as ``time`` is: ``2*tfun_kf()(Atot)`` is
+    Atot, the second statement, though the lookup holds the table's name."""
+    model = _table_model("tfun_kf()(Atot)")
+    assert model._core.compute_derivs(0.0, np.array([0.0, 1.0]))[0] == 1.0
+    with pytest.raises(cg.CodegenDeclined, match="'tfun_kf'.*second statement"):
+        cg.generate_rhs_from_model(model)
+
+
+# The parser's products besides the lexer's (post_variable_process and
+# post_bracket_process in exprtk.hpp), each with the precedence of a written `*`
+# (`2/A(B)` is 2/A times B); square and curly brackets; a number ending in its
+# dot. And what is not a product: a call, and a number's exponent, which stays
+# in its number.
+_PRODUCTS = [
+    "(A)(B)", "(A + 1)(B + 1)", "2(A)(B)", "(A)(B)C", "A(B)", "A(B + 1)", "A (B)", "(A) (B)",
+    "A()(B)", "k(A)", "_pi(A)", "A(B)(C)", "A(B)^2", "2/A(B)", "A^2(B)", "-A(B)", "sin(A(B))",
+    "A[B]", "(A)[B](C)", "{A}[B]", "2[A]", "[A + B]k", "2.A", "2. A", "2.(A)",
+    "exp(A)B", "max(A, B)C", "sin (A)", "frac(A)B",
+    "2.e3*A", "2.e-3A", "1.e5*A", ".5e2A", "3.E+2*A", "(A > 1) and (B)(C)",
+]  # fmt: skip
+
+
 @needs_cc
-@pytest.mark.parametrize("expr", ["2k*A", "2(A + 1)", "(A + 1)2", "(A)B", "k 2", "A B", "3A^2"])
+@pytest.mark.parametrize(
+    "expr", ["2k*A", "2(A + 1)", "(A + 1)2", "(A)B", "k 2", "A B", "3A^2", *_PRODUCTS]
+)
 def test_an_implicit_product_computes_what_the_engine_does(expr):
     rows = [(2.5, 0.75, 1.0), (-0.4, 3.2, 1.0)]
     for args, got in zip(rows, _compiled(expr, rows), strict=False):
         assert _same(got, _interpreter(expr, args)), expr
+
+
+# A parameter named after an exponent's letter: the `e` of `2e-3` is the number's,
+# and the parameter is read outside it. Only a .net reaches the translator with
+# such a literal; the Antimony and SBML loaders write 2e-3 as 0.002.
+_EXPONENT_LETTERS = [
+    ("e", "2e-3*e*A"), ("e", "2.e-3*e*A"), ("E", "2E-3*E*A"), ("e", "1.5e3*e*A"),
+    ("e", "e*2e3*A"), ("e", "2E-3*e*A"), ("E", "2e-3*E*A"),
+    ("e", "e^2*A"), ("e", "2*e*A"), ("e", "(e)*A"), ("e", "e(A)"),
+]  # fmt: skip
+
+
+@needs_cc
+@pytest.mark.parametrize(("param", "expr"), _EXPONENT_LETTERS)
+def test_a_parameter_named_like_an_exponent_is_read_outside_the_number(param, expr):
+    rows = [(2.5, 0.75, 1.0)]
+    (got,) = _compiled(expr, rows, param)
+    assert _same(got, _interpreter(expr, rows[0], param=param)), expr
+
+
+@pytest.mark.parametrize(
+    "jit", [pytest.param(None, marks=needs_cc), pytest.param("mir", marks=needs_mir)]
+)
+def test_codegen_true_runs_a_net_law_beside_a_parameter_named_e(tmp_path, jit):
+    """``2e-3*e*Atot`` was written ``2p[1]-3*p[1]*obs[0]``, which no compiler takes."""
+    template = _NET.replace("1 k 0.5", "1 k 0.5\n    2 e 0.5")
+    out = _runs(tmp_path, "k*(1 + 2e-3*e*Atot)", jit, template)
+    np.testing.assert_allclose(out["True"], out["False"], rtol=1e-9, atol=1e-12)
 
 
 # ── Tables, by whatever spelling reads them ──────────────────────────────────
@@ -488,10 +614,12 @@ def test_each_spelling_runs_compiled_as_the_call_runs_interpreted(call, table):
 # ── What it still has no C for ───────────────────────────────────────────────
 
 # Engine-valid, and with no C the translator writes: ExprTk's word operators
-# other than and/or/not.
+# other than and/or/not, and a bracket after a call, which the engine reads as a
+# second statement (this law is Atot).
 _NO_C = {
     "xor": "k*(1 + if(Atot > 1 xor k > 1, 1, 0))",
     "nand": "k*(1 + if(Atot > 1 nand k > 1, 1, 0))",
+    "exp": "k*exp(-Atot)(Atot)",
 }
 
 
