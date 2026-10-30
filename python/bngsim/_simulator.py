@@ -644,10 +644,11 @@ class Simulator:
         Only used for ``method="ode"``. Default ``False``. The mirror image of
         ``force_dense_linear_solver``: force sparse KLU even on a model the auto
         rule would send to the dense solver for being too small (``n_species <
-        50``) or too dense (Jacobian density ``>= 10%``). Only those two gates
-        are bypassed — KLU still needs a real sparsity pattern and a non-JAX
-        Jacobian — so it is likewise a no-op in a build without KLU. Passing
-        both force flags raises :class:`ValueError`.
+        50``), too dense (Jacobian density ``>= 10%``), or without a structural
+        nonzero in its Jacobian (issue #1296). Those three gates and the LU-fill
+        test below are bypassed — KLU still needs a sparsity pattern and a
+        non-JAX Jacobian — so it is likewise a no-op in a build without KLU.
+        Passing both force flags raises :class:`ValueError`.
 
         It also keeps KLU where the *LU-fill* test would leave it. A model of
         256 to 5,000 species with a sparse Jacobian but an LU factor estimated
@@ -668,9 +669,10 @@ class Simulator:
 
         Applies to :meth:`steady_state` as well (issue #128) — with one
         difference: a model whose Jacobian has *no structural nonzero* is left on
-        the dense solver there instead of raising, because the steady-state auto
-        rule can route such a model to KLU on its own (density 0 < 10%) and
-        f(y) ≡ 0 makes it a steady state that used to solve immediately.
+        the dense solver there even when forced, where ``run()`` takes KLU with
+        the analytical Jacobian and raises with ``jacobian="fd"``. f(y) ≡ 0
+        makes such a model a steady state that solves immediately, as it did
+        before #128.
 
     Examples
     --------

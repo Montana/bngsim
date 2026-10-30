@@ -261,7 +261,8 @@ the result (`"analytical"`, `"fd"`, or `"jax"`) — including `"fd"` when an
 **When to use `"fd"`**: For A/B benchmarking, or if you suspect the analytical
 Jacobian is causing issues. The `"fd"` option uses SUNDIALS' internal
 difference-quotient (DQ) approximation for dense models, and graph-colored
-finite differences for sparse (KLU) models.
+finite differences for sparse (KLU) models. Against a system SUNDIALS of
+another release, see [Installation](../installation.md#from-source).
 
 **Analytical Jacobian**: Available automatically when all reactions use
 Elementary (mass-action) rate laws. For models with Functional or
@@ -353,7 +354,7 @@ dense LU, `1` for sparse KLU, `2` for the BLAS dense factor.
 
 | Route | When (default options) |
 |---|---|
-| KLU (sparse) | at least 50 species, a Jacobian under 10% dense, and an LU factor that stays sparse (below) |
+| KLU (sparse) | at least 50 species, a Jacobian under 10% dense with a structural nonzero to factor, and an LU factor that stays sparse (below) |
 | BLAS dense factor | a model KLU would take whose LU factor fills in, on a build with BLAS |
 | built-in dense LU | everything else |
 
