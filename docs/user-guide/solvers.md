@@ -246,7 +246,8 @@ the result (`"analytical"`, `"fd"`, or `"jax"`) — including `"fd"` when an
 **When to use `"fd"`**: For A/B benchmarking, or if you suspect the analytical
 Jacobian is causing issues. The `"fd"` option uses SUNDIALS' internal
 difference-quotient (DQ) approximation for dense models, and graph-colored
-finite differences for sparse (KLU) models.
+finite differences for sparse (KLU) models. Against a system SUNDIALS of
+another release, see [Installation](../installation.md#from-source).
 
 **Analytical Jacobian**: Available automatically when all reactions use
 Elementary (mass-action) rate laws. For models with Functional or

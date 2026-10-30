@@ -286,16 +286,33 @@ if(BNGSIM_USE_SYSTEM_SUNDIALS)
     # (issue #1002). Against another release the quotient is still a valid one,
     # but need not be that release's own: a run can differ from its own CVODE's
     # in the last digits. No CI leg builds against another release (issue #1335).
-    file(READ "${BNGSIM_SUNDIALS_VENDOR_METADATA}" _bngsim_sundials_vendor_json)
-    string(JSON _bngsim_sundials_vendored_tag ERROR_VARIABLE _bngsim_sundials_tag_error
-        GET "${_bngsim_sundials_vendor_json}" source authoritative_release_tag)
+    #
+    # The check only advises, so it is best-effort: metadata it cannot read skips
+    # it with a note instead of failing the configure. Releases compare by
+    # major.minor: a patch release of the vendored one (7.2.0 beside 7.2.1) left
+    # cvode_ls.c and cvodes_ls.c as they were.
+    set(_bngsim_sundials_vendored_tag "")
+    set(_bngsim_sundials_tag_error "")
+    if(EXISTS "${BNGSIM_SUNDIALS_VENDOR_METADATA}")
+        file(READ "${BNGSIM_SUNDIALS_VENDOR_METADATA}" _bngsim_sundials_vendor_json)
+        string(JSON _bngsim_sundials_vendored_tag ERROR_VARIABLE _bngsim_sundials_tag_error
+            GET "${_bngsim_sundials_vendor_json}" source authoritative_release_tag)
+    endif()
     string(REGEX MATCH "[0-9]+\\.[0-9]+" _bngsim_sundials_vendored_mm
         "${_bngsim_sundials_vendored_tag}")
     string(REGEX MATCH "^[0-9]+\\.[0-9]+" _bngsim_sundials_system_mm "${SUNDIALS_VERSION}")
-    if(NOT _bngsim_sundials_tag_error AND _bngsim_sundials_vendored_mm
-            AND NOT _bngsim_sundials_system_mm STREQUAL _bngsim_sundials_vendored_mm)
+    if(_bngsim_sundials_tag_error OR NOT _bngsim_sundials_vendored_mm)
+        message(STATUS "Could not read the vendored SUNDIALS release from "
+            "${BNGSIM_SUNDIALS_VENDOR_METADATA}, so the system SUNDIALS is not checked "
+            "against it (issue #1335)")
+    elseif(NOT _bngsim_sundials_system_mm STREQUAL _bngsim_sundials_vendored_mm)
+        if(SUNDIALS_VERSION)
+            set(_bngsim_sundials_system_release "${SUNDIALS_VERSION}")
+        else()
+            set(_bngsim_sundials_system_release "of an unreported release")
+        endif()
         message(WARNING
-            "System SUNDIALS ${SUNDIALS_VERSION} is not the vendored "
+            "System SUNDIALS ${_bngsim_sundials_system_release} is not the vendored "
             "${_bngsim_sundials_vendored_tag}. bngsim's dense difference quotient "
             "(jacobian=\"fd\", or a law the closed form declines) reproduces CVODE "
             "${_bngsim_sundials_vendored_mm}'s. With this release it is still a valid "

@@ -529,6 +529,27 @@ def test_a_sum_parked_on_its_threshold_is_not_mended(
 # answer. These pin that, from a start on a threshold and just either side of
 # it, and on a species held at 0, against closed forms. Each asserts the path
 # it took, so it cannot pass on another one.
+#
+# Three paths:
+# * "KINSOL" starts KINSOL on the given state (``newton_burst=False``). The
+#   default ``newton`` marches a burst into the root's basin first, so KINSOL's
+#   quotient would be formed away from the jump.
+# * "burst on KLU, then KINSOL" is the default ``newton`` with KLU forced: a
+#   burst on the march's colored quotient, then KINSOL's polish, which always
+#   factors densely (``linear_solver`` names the march's route).
+# * "colored march" is the march alone.
+#
+# Every root here is exact: f is affine in X on each side of the threshold, so
+# each solve lands on its root to rounding (relative error 0 on every row,
+# measured). ROOT leaves a platform its last bits.
+#
+# A final state cannot see a wrong colored quotient: with it negated, every
+# threshold row still lands on its root. The march's work can: on these rows it
+# takes at most 236 RHS evaluations with the right quotient, and at least 414
+# with it negated (7,896 on the gate, unconverged). MARCH_RHS sits between.
+# The march's rows need KLU, so a KLU-off build skips them and their budget.
+ROOT = 1e-12
+MARCH_RHS = 350
 
 
 def _source_and_switch(tmp_path: Path, s: float, x0: float) -> bngsim.Model:
@@ -543,11 +564,24 @@ def _source_and_switch(tmp_path: Path, s: float, x0: float) -> bngsim.Model:
     )
 
 
-# (simulator options, steady_state method, the path it must take)
+def _kinsol(sim: bngsim.Simulator):
+    """KINSOL from the model's own state, with no burst first."""
+    return sim.steady_state_batch(params=[{}], method="newton", newton_burst=False)[0]
+
+
+# (simulator options, how it is solved, the path it must take)
 _PATHS = {
-    "KINSOL, dense": ({}, "newton", ("newton", "dense")),
-    "KINSOL, KLU": ({"force_sparse_linear_solver": True}, "newton", ("newton", "klu")),
-    "colored march": ({"force_sparse_linear_solver": True}, "integration", ("integration", "klu")),
+    "KINSOL": ({}, _kinsol, ("newton", "dense")),
+    "burst on KLU, then KINSOL": (
+        {"force_sparse_linear_solver": True},
+        lambda sim: sim.steady_state(method="newton"),
+        ("newton", "klu"),
+    ),
+    "colored march": (
+        {"force_sparse_linear_solver": True},
+        lambda sim: sim.steady_state(method="integration"),
+        ("integration", "klu"),
+    ),
 }
 
 
@@ -564,6 +598,8 @@ def _solved_on(result, path: tuple[str, str]) -> None:
     assert result.converged
     assert (result.method_used, result.linear_solver) == path
     assert result.solver_jacobian_source == "finite-difference"
+    if path[0] == "integration":
+        assert result.n_rhs_evals <= MARCH_RHS
 
 
 @pytest.mark.parametrize("path", _PATH_PARAMS)
@@ -572,12 +608,11 @@ def _solved_on(result, path: tuple[str, str]) -> None:
 def test_a_steady_state_solved_from_a_threshold(
     tmp_path: Path, path: str, x0: float, s: float, exact: float
 ) -> None:
-    sim_kw, method, taken = _PATHS[path]
-    result = bngsim.Simulator(
-        _source_and_switch(tmp_path, s, x0), method="ode", jacobian="fd", **sim_kw
-    ).steady_state(method=method)
+    sim_kw, solve, taken = _PATHS[path]
+    model = _source_and_switch(tmp_path, s, x0)
+    result = solve(bngsim.Simulator(model, method="ode", jacobian="fd", **sim_kw))
     _solved_on(result, taken)
-    assert abs(float(np.asarray(result.concentrations)[0]) / exact - 1.0) < OK
+    assert abs(float(np.asarray(result.concentrations)[0]) / exact - 1.0) < ROOT
 
 
 @pytest.mark.parametrize("path", _PATH_PARAMS)
@@ -587,11 +622,9 @@ def test_a_steady_state_solved_from_a_threshold(
 def test_a_steady_state_beside_a_species_held_at_zero(tmp_path: Path, path: str, model, exact):
     """The run's two #1002 failures, on the two quotients the runs' mend does
     not reach: the held species stays exactly 0, and Y lands where it should."""
-    sim_kw, method, taken = _PATHS[path]
-    result = bngsim.Simulator(model(tmp_path), method="ode", jacobian="fd", **sim_kw).steady_state(
-        method=method
-    )
+    sim_kw, solve, taken = _PATHS[path]
+    result = solve(bngsim.Simulator(model(tmp_path), method="ode", jacobian="fd", **sim_kw))
     _solved_on(result, taken)
     c = np.asarray(result.concentrations)
     assert c[0] == 0.0
-    assert abs(c[1] / exact - 1.0) < OK
+    assert abs(c[1] / exact - 1.0) < ROOT
