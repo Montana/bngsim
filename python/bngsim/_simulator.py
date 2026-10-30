@@ -2844,10 +2844,9 @@ class Simulator:
         RHS, so the columns are CVODES' difference quotient, which can still
         read a narrow one wrong (issue #1126).
 
-        A rate-law equality over state that the run starts on, at *t_start*, and
-        stays on is refused first (issue #1228): leaving it is a switch nothing
-        locates. One an event puts the state on is refused by the solver at
-        that event (issue #1279).
+        A rate-law equality over state is rooted where the state leaves its
+        surface, and the run refused there where that is a switch nothing jumps
+        (issues #1228, #1279; :meth:`_apply_held_equalities`).
 
         A no-op for any model with no conditional rate law and no step or bend
         call over state, which leaves the root set — and the whole integration —
@@ -2855,51 +2854,18 @@ class Simulator:
         """
         from bngsim._switch_sensitivity import (
             _surface_key,
-            equalities_held_at_start,
-            rate_law_equalities,
             state_switch_conditions,
             state_switch_reactions,
             state_switch_residual,
         )
 
-        # A rate-law equality the run starts on holds for a stretch, and leaving
-        # it is a switch nothing locates (issue #1228): refused by name, as the
-        # same switch written `<=` is refused at its tangency. The context is
-        # built once for this and the conditions below.
+        # The model's context, built once for the equalities and the conditions.
         ctx = None
-        try:
-            if core.n_functions:
-                ctx = core.functional_jacobian_context()
-            held = equalities_held_at_start(core, ctx, t0=t_start)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Equality-at-start detection failed (%s) (issue #1228).", e)
-            held = []
-        if held:
-            raise SensitivityUnsupportedError(
-                "Forward sensitivity is not supported for this model: a rate law branches "
-                f"on {held[0]!r}, and the state starts on that equality's surface and stays "
-                "on it, so the condition holds one value for a stretch rather than an "
-                "instant. Leaving the surface is a switch bngsim does not locate: an "
-                "equality is not rooted, since one the state crosses holds for an instant, "
-                "and either side of its surface reads false, so the columns of whatever "
-                "ends the stretch would come back 0 with no jump (issue #1228). Write the "
-                "switch as the crossing that ends the stretch, which is located and "
-                "jumped (`if(Aobs>q, kb, 0)` for `if(Bobs==0, kb, 0)` in that issue's "
-                "model, where B is made only once A falls to q). The same switch as an "
-                "inequality, `Bobs<=0`, is refused at its tangency. Or drop sensitivities "
-                "for this run."
-            )
-        # An event can put the state on such a surface mid-run, which the start
-        # does not show: the solver reads each equality at every event and
-        # refuses there (issue #1279). Only a model with events can.
-        if core.n_events:
+        if core.n_functions:
             try:
-                equalities = [atom for atom, _ in rate_law_equalities(core, ctx)]
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning("Equality detection for events failed (%s) (issue #1279).", e)
-                equalities = []
-            if equalities:
-                opts.set_held_equality_conditions(equalities)
+                ctx = core.functional_jacobian_context()
+            except Exception:  # pragma: no cover - defensive; each detector builds its own
+                ctx = None
 
         try:
             conditions = state_switch_conditions(core, ctx)
@@ -2916,6 +2882,7 @@ class Simulator:
                 e,
             )
             return
+        self._apply_held_equalities(opts, core, ctx)
         stops: list[str] = []
         calls = (
             () if model is None or covered is None else model._state_switch_stops_beside(covered)
@@ -2960,6 +2927,37 @@ class Simulator:
                 # #1128), so the solver applies its jump. A bend lists none, so
                 # its crossing is taken as continuous, which it is.
                 opts.set_state_switch_reactions(reactions)
+
+    @staticmethod
+    def _apply_held_equalities(opts, core, ctx) -> None:
+        """Root the leaving of each rate-law equality over state (issue #1279).
+
+        A state that sits on an equality's surface (`Bobs==0`) holds its branch
+        for a stretch, and leaving the surface is a switch no root locates or
+        jumps: the columns of what ends the stretch came back 0 with no warning
+        (issue #1228). The solver roots where each equality's residual leaves
+        exactly 0, whether the run started on the surface or an event put it
+        there, and refuses there only where the rate laws reading it change and
+        no jump at that instant covers the change. Each equality goes with the
+        reactions that read it, whose flux is what can change there. A stretch
+        the run never leaves, or leaves only at an event, runs.
+        """
+        from bngsim._switch_sensitivity import rate_law_equalities, state_switch_reactions
+
+        try:
+            equalities = [atom for atom, _ in rate_law_equalities(core, ctx)]
+            if not equalities:
+                return
+            reactions = state_switch_reactions(core, equalities, ctx)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "Rate-law equality detection failed (%s); a state that leaves one is not "
+                "watched (issue #1279).",
+                e,
+            )
+            return
+        opts.set_held_equality_conditions(equalities)
+        opts.set_held_equality_reactions(reactions)
 
     def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).

@@ -1266,10 +1266,18 @@ PYBIND11_MODULE(_bngsim_core, m) {
             },
             py::arg("conditions"),
             "Issue #1279: rate-law equalities over model state, as source text "
-            "(`Bobs==0`), that a sensitivity run reads at each event. One an "
-            "event's assignments put the state on, where the flow keeps it, is "
-            "refused there with SensitivityUnsupportedError, as a run that starts "
-            "on it is (issue #1228). Empty (the default) watches none.")
+            "(`Bobs==0`), that a sensitivity run roots where the state leaves their "
+            "surface. The run is refused there with SensitivityUnsupportedError "
+            "where the rate laws reading one change and no jump at that instant "
+            "covers it (issue #1228). Empty (the default) watches none.")
+        .def(
+            "set_held_equality_reactions",
+            [](bngsim::SolverOptions &self, const std::vector<std::vector<int>> &reactions) {
+                self.sensitivity.held_equality_reactions = reactions;
+            },
+            py::arg("reactions"),
+            "Parallel to set_held_equality_conditions (issue #1279): the 0-based "
+            "reactions whose rate law reads each equality.")
         .def(
             "set_state_switch_guards",
             [](bngsim::SolverOptions &self, const std::vector<std::string> &guards) {

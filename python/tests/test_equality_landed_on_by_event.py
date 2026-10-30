@@ -1,19 +1,21 @@
-"""An event that puts the state on a rate-law equality is refused in a
-sensitivity run, not differentiated to 0 (issue #1279).
+"""A state an event puts on a rate-law equality is refused in a sensitivity
+run where it leaves the surface by a switch nothing jumps, not differentiated to
+0 (issue #1279).
 
 #1228's model with an SBML washout: A = 10·e^(-a·t), B made only once A falls
 to q, at t* = ln(10/q)/a, and ``Y' = piecewise(kb, B == 0, 0)``. B starts at 1,
 so the run does not start on the surface, and an event at t = 1 sets B = 0.
 The equality then holds until t*, so Y = kb·(t* - 1), and the exact columns are
 dY/da = -kb·ln(10/q)/a² = -6.437752, dY/dq = -kb/(a·q) = -1 and dY/dkb =
-t* - 1 = 2.218876. #1240 reads the equality at the start alone, and the run
-came back [0, 0, 2.218876] with no warning: leaving the surface is a switch
-nothing locates. The solver now reads each such equality at every event, by the
-start's own test, and refuses where the state stays on it.
+t* - 1 = 2.218876. #1240 read the equality at the start alone, and the run came
+back [0, 0, 2.218876] with no warning: leaving the surface is a switch nothing
+locates. The solver now roots where the state leaves, wherever it got on, and
+refuses there.
 
-An event that leaves the state off the surface, or on it only for the instant
-the flow takes it away, runs as before, and so does one that writes nothing the
-equality reads.
+An event that leaves the state off the surface runs as before, and so does one
+that writes nothing the equality reads, one that leaves it on the surface for
+the instant the flow takes it away at a time no column moves, and a stretch
+that outlasts the run or only an event ends.
 """
 
 from __future__ import annotations
@@ -55,12 +57,59 @@ def _columns(model, t_span=(0, 8)):
 @pytest.mark.parametrize(
     "event", ["1): B = 0", "0), t0=false: B = 0"], ids=["mid-run", "at the start"]
 )
-def test_an_event_that_puts_the_state_on_the_equality_is_refused_by_name(event):
+def test_a_state_an_event_puts_on_the_equality_is_refused_where_it_leaves(event):
     """On main, mid-run: [0, 0, 2.218876] for [-6.4378, -1, 2.2189] by
     difference. An event that fires at t = 0 does so after the start was read,
     and is the same case: [0, 0, 3.218873] for [-6.4378, -1, 3.2189]."""
-    with pytest.raises(SensitivityUnsupportedError, match=r"'B==0.*event 'E1'.*issue #1279"):
+    with pytest.raises(
+        SensitivityUnsupportedError, match=r"'B==0.*leaves it at t=3\.2188.*issue #1279"
+    ):
         _columns(_model(event))
+
+
+def test_a_state_on_the_equality_for_an_instant_at_a_moving_time_is_refused():
+    """The event's jump reads Y's flow f⁺ on the surface, where B leaves it at
+    once: main gave dY/dte = -1 for 0 by difference (te = 4, after A < q)."""
+    model = bngsim.Model.from_antimony_string(
+        f"""
+        model m
+          A = 10; B = 1; Y = 0
+          a = {A}; q = {Q}; kb = {KB}; kp = 1; te = 4
+          R1: A -> ; a*A
+          R2: -> B; kp*piecewise(q - A, q - A > 0, 0)
+          R3: -> Y; piecewise(kb, B == 0, 0) + kb*A
+          E1: at (time >= te): B = 0
+        end
+        """
+    )
+    sim = bngsim.Simulator(model, method="ode", sensitivity_params=["te", "a", "kb"])
+    with pytest.raises(SensitivityUnsupportedError, match=r"'B==0.*leaves it at t=4"):
+        sim.run(t_span=(0, 8), n_points=9, rtol=1e-10, atol=1e-12)
+
+
+def test_a_stretch_an_event_starts_that_outlasts_the_run_runs():
+    """Over (0, 3), before t*: Y = kb·(3 - 1). Refused by the first fix for this
+    issue, which judged at the event by the start's first-order test."""
+    np.testing.assert_allclose(
+        _columns(_model("1): B = 0"), t_span=(0, 3)), [0.0, 0.0, 2.0], atol=1e-9
+    )
+
+
+def test_a_stretch_only_an_event_ends_runs():
+    """Nothing makes B, so B = 0 holds until the event at t = 4 sets it to 1:
+    Y = 4·kb. #1240 refused it at the start."""
+    model = bngsim.Model.from_antimony_string(
+        f"""
+        model m
+          A = 10; B = 0; Y = 0
+          a = {A}; q = {Q}; kb = {KB}
+          R1: A -> ; a*A
+          R3: -> Y; piecewise(kb, B == 0, 0)
+          E1: at (time >= 4): B = 1
+        end
+        """
+    )
+    np.testing.assert_allclose(_columns(model), [0.0, 0.0, 4.0], atol=1e-9)
 
 
 # Y also gains kb·A, so the columns are those of kb·∫A over (0, 8) and not 0.

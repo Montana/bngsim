@@ -903,7 +903,11 @@ class SolverOptions:
         """
     def set_held_equality_conditions(self, conditions: collections.abc.Sequence[str]) -> None:
         """
-        Issue #1279: rate-law equalities over model state, as source text (`Bobs==0`), that a sensitivity run reads at each event. One an event's assignments put the state on, where the flow keeps it, is refused there with SensitivityUnsupportedError, as a run that starts on it is (issue #1228). Empty (the default) watches none.
+        Issue #1279: rate-law equalities over model state, as source text (`Bobs==0`), that a sensitivity run roots where the state leaves their surface. The run is refused there with SensitivityUnsupportedError where the rate laws reading one change and no jump at that instant covers it (issue #1228). Empty (the default) watches none.
+        """
+    def set_held_equality_reactions(self, reactions: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]]) -> None:
+        """
+        Parallel to set_held_equality_conditions (issue #1279): the 0-based reactions whose rate law reads each equality.
         """
     def set_ic_param_sens(self, triples: collections.abc.Sequence[tuple[typing.SupportsInt | typing.SupportsIndex, typing.SupportsInt | typing.SupportsIndex, typing.SupportsFloat | typing.SupportsIndex]]) -> None:
         """
