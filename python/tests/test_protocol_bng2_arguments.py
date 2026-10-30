@@ -254,8 +254,37 @@ def test_a_run_that_can_stop_early_leaves_the_model_time_unknown(stop):
 def test_an_nf_run_starts_at_the_model_time(second):
     """``simulate_nf`` takes the model time as t_start with or without
     continue (``BNGAction.pm``)."""
-    _, exp = _only("simulate_nf({t_end=>10,n_steps=>10})", second)
+    _, exp = _only('simulate({method=>"ode",t_end=>10,n_steps=>10})', second)
     assert exp.t_span == (10.0, 20.0)
+
+
+def test_an_nf_run_leaves_the_model_time_at_0():
+    """``simulate_nf``'s n_steps branch declares a second ``my $t_end``, so it
+    sets the model time to undef, which the next start reads as 0: replicate
+    nf runs (Dolan2015 has ten) each start at 0, as does a continuation."""
+    first, again, cont = _only(
+        "simulate_nf({t_end=>2400,n_steps=>10})",
+        "simulate_nf({t_end=>2400,n_steps=>10})",
+        'simulate({method=>"ode",continue=>1,t_end=>5,n_steps=>5})',
+    )
+    assert first.t_span == again.t_span == (0.0, 2400.0)
+    assert cont.t_span == (0.0, 5.0)
+
+
+def test_an_nf_scan_after_a_run_starts_only_its_first_point_there():
+    """Each point of an nf scan starts at the model time, which the first
+    point leaves at 0 (scaffold.bngl in the parity corpus)."""
+    with pytest.raises(ConversionError, match=r"first point starts at the model time, 60"):
+        _parse(
+            'simulate({method=>"ode",t_end=>60,n_steps=>60})',
+            'parameter_scan({method=>"nf",t_end=>100,n_steps=>10,parameter=>"k",'
+            "par_min=>1,par_max=>2,n_scan_pts=>2})",
+        )
+    (exp,) = _only(
+        'parameter_scan({method=>"nf",t_end=>100,n_steps=>10,parameter=>"k",'
+        "par_min=>1,par_max=>2,n_scan_pts=>2})"
+    )
+    assert exp.t_span == (0.0, 100.0)
 
 
 def test_nf_sample_times_are_lossy():

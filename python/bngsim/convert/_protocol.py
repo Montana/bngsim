@@ -470,8 +470,8 @@ def parse_bngl_protocol(source: str | Path, *, strict: bool = True) -> ProtocolS
     network_gen: str | None = None
     # BNG2.pl's model time, which a ``continue=>1`` or nf run starts from: 0 at
     # load, and the end of each simulate after it (``BNGAction.pm``:
-    # ``$model->Time``). None once a run's end cannot be known without running
-    # it (issue #1364).
+    # ``$model->Time``), or 0 after an nf run, which leaves it undefined. None
+    # once a run's end cannot be known without running it (issue #1364).
     model_time: float | None = 0.0
     for verb, argstr in _iter_action_calls(text):
         low = verb.lower()
@@ -739,7 +739,8 @@ def _build_experiment(
     The time course follows BNG2.pl's ``simulate`` (``BNGAction.pm``, issue
     #1364): ``continue=>1`` starts at the model time, where an earlier run
     ended, and a ``t_start`` that is not it is refused; ``simulate_nf`` starts
-    there with or without ``continue``. ``n_output_steps`` is ``n_steps``, both
+    there with or without ``continue``, and leaves it undefined, which a later
+    start reads as 0. ``n_output_steps`` is ``n_steps``, both
     is an error, and neither is one step. ``sample_times`` sets the output times
     where neither is given: ``t_start``, the samples after it, and the end, a
     given ``t_end`` or else the last sample; fewer than three is an error. A
@@ -754,8 +755,10 @@ def _build_experiment(
     method = forced_method or str(args.get("method", "ode")).lower()
     reasons: list[str] = []
 
+    nf = method == "nf"
     continued = _as_bool(args.get("continue", 0))
     t_start = _num_or(args.get("t_start"), None)
+    from_model_time = t_start is None and (continued or (nf and "t_start" not in args))
     if t_start is not None:
         if (
             continued
@@ -766,7 +769,7 @@ def _build_experiment(
                 f"{verb}: continue=>1 with t_start={t_start:g}, but the model time is "
                 f"{model_time:g}; BNG2.pl refuses a continuation that does not start there"
             )
-    elif continued or (method == "nf" and "t_start" not in args):
+    elif from_model_time:
         # A continuation's unreadable t_start can only be the model time: BNG2.pl
         # refuses any other.
         if model_time is None:
@@ -802,7 +805,7 @@ def _build_experiment(
             grid = _sample_grid(samples, t_start, t_end)
             t_end, n_points = grid[-1], len(grid)
             carried = f"carried as {n_points} even points over ({t_start:g}, {t_end:g})"
-            if method == "nf":
+            if nf:
                 reasons.append(
                     "BNG2.pl 2.9.3 refuses sample_times for NFsim, and later versions "
                     f"output only at those times, from t_start; {carried}"
@@ -822,9 +825,13 @@ def _build_experiment(
         t_end = t_start
     # BNG2.pl's model time is the end the run reached: unknown for a t_end the
     # parse cannot read, or for a run that can stop early, at a steady state or
-    # when its stop_if holds.
+    # when its stop_if holds. simulate_nf leaves it undefined (its n_steps branch
+    # declares a second ``my $t_end``), which the next run's start reads as 0.
     stops_early = _as_bool(args.get("steady_state", 0)) or bool(args.get("stop_if"))
-    after = None if t_end_unread or stops_early else t_end
+    if nf:
+        after: float | None = 0.0
+    else:
+        after = None if t_end_unread or stops_early else t_end
 
     consumed = {
         "method",
@@ -879,6 +886,14 @@ def _build_experiment(
                         f"{order}; carried as {len(run)} points over ({run[0]:g}, {run[-1]:g})"
                     )
                 scan_min, scan_max, scan_points = run[0], run[-1], len(run)
+        # Each point is a run from the model time, which the first point moves.
+        later = 0.0 if nf else after
+        if from_model_time and (scan_points or 0) > 1 and later != t_start:
+            moved = "an unknown time" if later is None else f"{later:g}"
+            reasons.append(
+                f"its first point starts at the model time, {t_start:g}, and the others "
+                f"at {moved}, where that point leaves it; carried as starting at {t_start:g}"
+            )
         return (
             Experiment(
                 kind="scan",
