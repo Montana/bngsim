@@ -204,16 +204,32 @@ def _gillespie_ensemble(sbml_text, ids, t0, t_end, n_time, n_rep, seed_base):
     return vals
 
 
-def _child(fn, args, out) -> None:
+# How long past its parent's budget a child outlives a parent that is gone.
+_ORPHAN_GRACE_SEC = 30.0
+
+
+def _child(fn, args, conn, alarm_sec: float) -> None:
+    import signal
+
+    # The parent's kill is the budget; this alarm is the backstop for when there is
+    # no parent left to kill. A scheduler that terminates the parent at its per-job
+    # cap skips the daemon cleanup, and a replicate that never returns would spin
+    # on as an orphan. SIGALRM's default action ends the process even inside
+    # RoadRunner's C++ loop, where a Python handler would never run. POSIX only.
+    if hasattr(signal, "setitimer"):
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.setitimer(signal.ITIMER_REAL, alarm_sec)
     try:
-        out.put(fn(*args))
+        result = fn(*args)
     except Exception:  # noqa: BLE001 - the parent reads a missing result as a refusal
-        out.put(None)
+        result = None
+    conn.send(result)
 
 
 def _within_wall_budget(fn, args, wall_budget_sec: float):
     """``fn(*args)`` in a child process, or ``None`` if it has not returned within
-    ``wall_budget_sec`` (the child is then killed).
+    ``wall_budget_sec`` (the child is then killed) or the child died without a
+    result.
 
     Since libRoadRunner 2.9.3 a Gillespie run no longer stops when a species goes
     negative (RoadRunner #1322): ``0.5*k1*A*A`` on a homodimer fires infinitely many
@@ -223,22 +239,30 @@ def _within_wall_budget(fn, args, wall_budget_sec: float):
     RoadRunner's own cap, ``max_output_rows``, applies only in variable-step mode,
     whose draws differ for the same seed."""
     import multiprocessing as mp
-    import queue
 
+    budget = max(wall_budget_sec, 0.0)
     ctx = mp.get_context("spawn")
-    out = ctx.Queue()
-    proc = ctx.Process(target=_child, args=(fn, args, out), daemon=True)
+    recv_end, send_end = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_child, args=(fn, args, send_end, budget + _ORPHAN_GRACE_SEC), daemon=True
+    )
     proc.start()
+    # The child now holds the only write end, so its death reads as EOF at once
+    # rather than as silence until the budget runs out.
+    send_end.close()
     try:
         # Read before joining: a large result fills the pipe, and the child cannot
         # exit until it is read.
-        return out.get(timeout=max(wall_budget_sec, 0.0))
-    except queue.Empty:
+        if not recv_end.poll(budget):
+            return None
+        return recv_end.recv()
+    except EOFError:  # died without a result: a segfault, or its own alarm
         return None
     finally:
         if proc.is_alive():
             proc.kill()
         proc.join(timeout=5)
+        recv_end.close()
 
 
 def net_roadrunner_ensemble(

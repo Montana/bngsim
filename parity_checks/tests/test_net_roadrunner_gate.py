@@ -17,6 +17,7 @@ really would diverge from the exact answer — is skipped when libroadrunner is 
 
 from __future__ import annotations
 
+import signal
 import sys
 from pathlib import Path
 
@@ -148,13 +149,41 @@ def test_a_child_past_the_budget_is_stopped() -> None:
     assert time.perf_counter() - t0 < 30
 
 
+def test_a_child_that_dies_is_a_refusal_at_once() -> None:
+    """A child that dies without a result (a segfault in RoadRunner) is read as a
+    refusal when it dies, not when the budget runs out."""
+    import os
+    import time
+
+    t0 = time.perf_counter()
+    assert nrr._within_wall_budget(os._exit, (3,), 60.0) is None
+    assert time.perf_counter() - t0 < 30
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="no SIGALRM on this platform")
+def test_a_child_whose_parent_is_gone_ends_itself() -> None:
+    """A scheduler that terminates the parent at its per-job cap skips the daemon
+    cleanup, so nothing would kill a replicate that never returns. The child ends
+    itself at its own alarm; here no parent reads or kills it."""
+    import multiprocessing as mp
+    import time
+
+    ctx = mp.get_context("spawn")
+    _, send_end = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=nrr._child, args=(time.sleep, (60,), send_end, 1.0))
+    proc.start()
+    proc.join(timeout=30)
+    assert not proc.is_alive()
+    assert proc.exitcode == -signal.SIGALRM
+
+
 def _roadrunner_stops_at_a_negative_count() -> bool:
     if not nrr.roadrunner_available():
         return True
     import roadrunner
+    from packaging.version import Version
 
-    major, minor, patch = (int(p) for p in roadrunner.__version__.split(".")[:3])
-    return (major, minor, patch) < (2, 9, 3)
+    return Version(roadrunner.__version__) < Version("2.9.3")
 
 
 @pytest.mark.skipif(

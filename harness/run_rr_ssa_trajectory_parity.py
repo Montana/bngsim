@@ -168,15 +168,32 @@ def _rr_replicates(
     return times, np.stack(out, axis=0), species_names
 
 
-def _rr_child(args, out) -> None:
+# How long past its parent's budget a child outlives a parent that is gone.
+RR_ORPHAN_GRACE_SEC = 30.0
+
+
+def _rr_child(args, conn, alarm_sec: float) -> None:
+    import signal
+
+    # The backstop for a parent that is gone (killed, so it never killed this
+    # child): SIGALRM's default action ends the process even inside RoadRunner's
+    # C++ loop, where a Python handler would never run. POSIX only.
+    if hasattr(signal, "setitimer"):
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.setitimer(signal.ITIMER_REAL, alarm_sec)
     try:
-        out.put(("ok", _rr_replicates(*args)))
+        t0 = time.perf_counter()
+        value = _rr_replicates(*args)
+        msg = ("ok", value, time.perf_counter() - t0)
     except Exception as exc:  # noqa: BLE001 - reported by the parent, as before
-        out.put(("error", f"{type(exc).__name__}: {exc}"))
+        msg = ("error", f"{type(exc).__name__}: {exc}", None)
+    conn.send(msg)
 
 
 def _rr_replicates_within(args: tuple, wall_budget_sec: float):
     """:func:`_rr_replicates` in a child process, killed past ``wall_budget_sec``.
+    Returns its result and the seconds it took in the child, which leave out the
+    child's start-up as the in-process run did.
 
     Since libRoadRunner 2.9.3 a Gillespie run no longer stops when a species goes
     negative (RoadRunner #1322), and a law such as ``0.5*k1*A*A`` then fires
@@ -185,25 +202,35 @@ def _rr_replicates_within(args: tuple, wall_budget_sec: float):
     its draws; RoadRunner's own ``max_output_rows`` caps only variable-step runs,
     whose draws differ for the same seed."""
     import multiprocessing as mp
-    import queue
 
+    budget = max(wall_budget_sec, 0.0)
     ctx = mp.get_context("spawn")
-    out = ctx.Queue()
-    proc = ctx.Process(target=_rr_child, args=(args, out), daemon=True)
+    recv_end, send_end = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_rr_child, args=(args, send_end, budget + RR_ORPHAN_GRACE_SEC), daemon=True
+    )
     proc.start()
+    # The child now holds the only write end, so its death reads as EOF at once.
+    send_end.close()
     try:
-        kind, value = out.get(timeout=max(wall_budget_sec, 0.0))
-    except queue.Empty:
-        raise TimeoutError(
-            f"RoadRunner's Gillespie ensemble did not return within {wall_budget_sec:g} s"
+        if not recv_end.poll(budget):
+            raise TimeoutError(
+                f"RoadRunner's Gillespie ensemble did not return within {wall_budget_sec:g} s"
+            )
+        kind, value, elapsed = recv_end.recv()
+    except EOFError:
+        proc.join(timeout=5)
+        raise RuntimeError(
+            f"RoadRunner's Gillespie ensemble died without a result (exit code {proc.exitcode})"
         ) from None
     finally:
         if proc.is_alive():
             proc.kill()
         proc.join(timeout=5)
+        recv_end.close()
     if kind == "error":
         raise RuntimeError(value)
-    return value
+    return value, elapsed
 
 
 def _align_columns(
@@ -272,11 +299,10 @@ def _run_one(
         return entry
 
     try:
-        t0 = time.perf_counter()
-        rr_times, rr_arr, rr_names = _rr_replicates_within(
+        (rr_times, rr_arr, rr_names), rr_elapsed = _rr_replicates_within(
             (str(xml_path), t_end, n_steps, n_replicates, seed_base), rr_wall_budget
         )
-        entry["elapsed_sec_rr"] = round(time.perf_counter() - t0, 3)
+        entry["elapsed_sec_rr"] = round(rr_elapsed, 3)
     except Exception as exc:
         entry["status"] = "error"
         entry["error"] = f"roadrunner side: {type(exc).__name__}: {exc}"[:300]
