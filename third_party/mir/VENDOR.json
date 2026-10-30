@@ -103,7 +103,7 @@
       "function": "nop_pats (target_translate's loop-head padding)",
       "marker": "BNGsim local carry (lanl/bngsim#1216)",
       "issue": "https://github.com/lanl/bngsim/issues/1216",
-      "upstream_status": "absent: not reported upstream as of 2026-10-27; vnmakarov/mir master dc2c763f still has the register forms",
+      "upstream_status": "absent: not reported upstream as of 2026-10-30; vnmakarov/mir master dc2c763f (2026-10-23) still has the register forms",
       "summary": "From -O2, target_translate aligns the head of each innermost loop to an 8-byte boundary with 0 to 7 bytes of NOPs from nop_pats. Upstream's 3- and 4-byte entries are the register forms of NOP, 0F 1F C0 (nopl %eax) and 48 0F 1F C0 (nopq %rax). x86-64 CPUs execute them, but Rosetta 2 raises SIGILL on both, so an x86_64 process on Apple Silicon died the first time it ran a 3- or 4-byte pad (one reached by falling into the loop; a jump to the label skips it). The carry uses the memory forms Intel recommends for those lengths, 0F 1F 00 and 0F 1F 40 00, as upstream's 5- to 7-byte entries already do: the same lengths, and a NOP reads no memory.",
       "reapply": "If upstream's nop_pats still has 0F 1F C0 or 48 0F 1F C0, set entries 3 and 4 to \"\\x0f\\x1f\\x00\" and \"\\x0f\\x1f\\x40\\x00\" with the marker comment. If upstream moved to memory forms, drop this entry and keep test_mir_x86_64_loop_padding_is_intels_recommended_nops as the guard.",
       "upstream_file_sha256": "d118e7a4a5aead5b5d964de33952a06d5aa1d0d39f5ca7fd34b0a5926ae4619c",

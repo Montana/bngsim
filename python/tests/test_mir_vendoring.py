@@ -84,11 +84,10 @@ def test_mir_local_carries_are_still_applied():
     Three carries today: issue #1215's two (in mir.c and c2mir/c2mir.c) and
     issue #1216's loop-padding NOPs in mir-gen-x86_64.c. Issue #413's was
     dropped when upstream merged it (vnmakarov/mir#468). Checksum anchors cannot
-    guard a carry —
-    a refresh rewrites the file from upstream AND re-anchors it, so the patch
-    vanishes with the tree still matching its own metadata. Each entry names a
-    ``marker`` comment the patch itself carries; grepping for it is the one
-    tripwire a re-vendor cannot satisfy by accident. Same check as
+    guard a carry — a refresh rewrites the file from upstream AND re-anchors it,
+    so the patch vanishes with the tree still matching its own metadata. Each
+    entry names a ``marker`` comment the patch itself carries; grepping for it is
+    the one tripwire a re-vendor cannot satisfy by accident. Same check as
     ``scripts/vendor_mir.py --check``.
     """
     metadata = json.loads(MIR_VENDOR_METADATA.read_text())
@@ -174,9 +173,9 @@ def test_mir_x86_64_loop_padding_is_intels_recommended_nops():
     Upstream's 3- and 4-byte entries are the register forms ``0F 1F C0`` (nopl
     %eax) and ``48 0F 1F C0`` (nopq %rax). An x86-64 CPU runs them, but Rosetta 2
     raises SIGILL on both, so an x86_64 Python on Apple Silicon died the first
-    time it ran a 3- or 4-byte pad, and never at -O0 or -O1, which pad nothing. The carry
-    (VENDOR.json ``local_carries``) uses the memory forms Intel recommends, as
-    upstream's 5- to 7-byte entries already are.
+    time it ran a 3- or 4-byte pad, and never at -O0 or -O1, which pad nothing.
+    The carry (VENDOR.json ``local_carries``) uses the memory forms Intel
+    recommends, as upstream's 5- to 7-byte entries already are.
 
     A source-level assertion, because no CI leg runs x86_64 code under Rosetta.
     """
@@ -184,9 +183,12 @@ def test_mir_x86_64_loop_padding_is_intels_recommended_nops():
     # Comments out, so the carry's note quoting the old bytes is not read as an
     # entry.
     code = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
-    assert re.search(r"^#define LOOP_ALIGN 8\s*$", code, re.M), (
+    # Exactly one definition, of 8: a later #undef and #define, or one per #if
+    # branch, would let a pad outgrow the table checked below.
+    aligns = re.findall(r"^[ \t]*#[ \t]*(define|undef)[ \t]+LOOP_ALIGN\b(.*)$", code, re.M)
+    assert [(d, v.strip()) for d, v in aligns] == [("define", "8")], (
         "LOOP_ALIGN changed: padding can now take more than 7 bytes, so "
-        "INTEL_RECOMMENDED_NOPS has to grow with it"
+        f"INTEL_RECOMMENDED_NOPS has to grow with it ({aligns})"
     )
     start = code.index("static const char *nop_pats[] = {")
     body = code[code.index("{", start) + 1 : code.index("};", start)]
