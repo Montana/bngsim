@@ -394,6 +394,51 @@ def test_a_time_course_of_a_model_that_reads_no_time_stops_early(tmp_path):
     assert len(species) < 201 and out.solver_stats["steady_state_reached"]
 
 
+@pytest.mark.parametrize("sensitivity", [False, True], ids=["plain", "with a sensitivity"])
+def test_a_time_course_stops_early_beside_a_function_that_only_reports(tmp_path, sensitivity):
+    """``seen() = 2*time()`` is read by no rate: A -> B settles as it would
+    without it, and the run stops there. #710 ran it to the end of its span
+    (issue #961). The rows it reports read the time where they were taken."""
+    kw = {"sensitivity_params": ["k"]} if sensitivity else {}
+    sim = bngsim.Simulator(_ramped(tmp_path, law="k"), method="ode", **kw)
+    out, species = _early(sim)
+    assert len(species) < 201 and out.solver_stats["steady_state_reached"]
+    np.testing.assert_allclose(species[-1], [0.0, 1.0], atol=1e-6)
+    seen = np.asarray(out.expressions)[:, list(out.expression_names).index("seen")]
+    np.testing.assert_allclose(seen, 2 * np.asarray(out.time), rtol=1e-12)
+
+
+def test_a_batch_row_stops_early_beside_a_function_that_only_reports(tmp_path):
+    rows = bngsim.Simulator(_ramped(tmp_path, law="k"), method="ode").run_batch(
+        params=[{"k": 1.0}, {"k": 2.0}], t_span=(0.0, 200.0), n_points=201, steady_state=True
+    )
+    for row in rows:
+        assert len(np.asarray(row.species)) < 201
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        RULE_ON_TIME,
+        "compartment C; C := 1 + time/(1+time); substanceOnly species A in C, B in C;"
+        " A = 1; B = 0; k = 1\nJ: A -> B; k*A\nJ2: B -> A; k*B\n",
+    ],
+    ids=["a species set by a rule on the time", "a compartment sized by one"],
+)
+def test_a_time_course_does_not_stop_while_a_reported_state_reads_the_time(text):
+    """No rate reads the time, and what is reported as a state does: S, or the
+    concentrations in C, are still moving where ``‖f(y)‖`` has settled."""
+    out, species = _early(bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode"))
+    assert len(species) == 201 and not out.solver_stats["steady_state_reached"]
+    rows = bngsim.Simulator(bngsim.Model.from_antimony_string(text), method="ode").run_batch(
+        params=[{"kf" if "kf" in text else "k": 1.0}],
+        t_span=(0.0, 200.0),
+        n_points=201,
+        steady_state=True,
+    )
+    assert all(len(np.asarray(row.species)) == 201 for row in rows)
+
+
 def test_a_rate_that_reads_its_own_derivative_is_not_refused():
     """Control. ``rateOf`` reads the state's derivatives, which are 0 at a
     steady state whatever the time: B settles at 1 + rateOf(A) = 1."""

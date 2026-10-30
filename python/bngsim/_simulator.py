@@ -5150,7 +5150,7 @@ class Simulator:
                 opts.force_sparse_linear_solver = self._force_sparse_linear_solver
                 opts.continues_trajectory = self._continues_trajectory
                 opts.timeout_seconds = timeout_seconds
-                opts.steady_state = bool(steady_state)
+                opts.steady_state = bool(steady_state) and not self._early_stop_reads_time()
                 opts.steady_state_tol = ss_tol_value
                 opts.carry_sensitivities = bool(carry_sensitivities)
                 # Seed for random equal-priority event tie-breaking (GH #242).
@@ -6615,7 +6615,7 @@ class Simulator:
                 opts.max_steps = max_steps
                 opts.jacobian = self._jacobian
                 opts.timeout_seconds = timeout_seconds
-                opts.steady_state = steady_state
+                opts.steady_state = steady_state and not self._early_stop_reads_time()
                 opts.steady_state_tol = steady_state_tol
                 if max_step is not None and max_step > 0.0:
                     opts.max_step_size = max_step
@@ -8639,6 +8639,17 @@ class Simulator:
                 "(issue #710). Integrate the model with run() over a span long enough for the "
                 "trajectory to settle, and read the state where it ends."
             )
+
+    def _early_stop_reads_time(self) -> bool:
+        """Whether a time course's early stop is held off for the time (issue #961).
+
+        The core holds it off where a rate reads the clock. A species reported
+        through a rule on the clock, or a compartment it sizes, still moves when
+        ``‖f(y)‖`` has settled, so the stop is held off here for those too. A
+        function that only reports leaves it on.
+        """
+        core = self._model._core
+        return bool(core.functions_use_time) and self._ss_reads_the_time(core)
 
     def _ss_reads_the_time(self, core) -> bool:
         """Whether the time reaches what a steady state solves for or reports as a

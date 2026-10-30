@@ -43,6 +43,9 @@ to settle. `run(..., steady_state=True)` does not stop early for it: the
 criterion is `‖f(t, y)‖` at an output point, and a rate that is switched on at
 `t = 5` is 0 at `t = 1`. The run goes to the end of its span, and
 `steady_state_reached` stays 0.
+A function that reads the time and that only reports leaves the criterion as
+good as in a model without it, and the run stops early as that model would
+(issue #961); the rows it records read the time where they were taken.
 
 **`method="newton"`**: the two-tier integrate-first solver. Tier 1 is the
 *same* CVODE burst as `"integration"`, carrying the state into the physical
