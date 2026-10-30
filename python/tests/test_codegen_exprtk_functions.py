@@ -508,8 +508,9 @@ def test_an_implicit_product_computes_what_the_engine_does(expr):
 
 
 # A parameter named after an exponent's letter: the `e` of `2e-3` is the number's,
-# and the parameter is read outside it. Only a .net reaches the translator with
-# such a literal; the Antimony and SBML loaders write 2e-3 as 0.002.
+# and the parameter is read outside it. A .net keeps the literal as written, and
+# the SBML loader writes a number as repr(v), in e-notation below 1e-4 and from
+# 1e16: BIOMD0000001042 has `1e-10` beside a parameter `e`.
 _EXPONENT_LETTERS = [
     ("e", "2e-3*e*A"), ("e", "2.e-3*e*A"), ("E", "2E-3*E*A"), ("e", "1.5e3*e*A"),
     ("e", "e*2e3*A"), ("e", "2E-3*e*A"), ("E", "2e-3*E*A"),
@@ -533,6 +534,41 @@ def test_codegen_true_runs_a_net_law_beside_a_parameter_named_e(tmp_path, jit):
     template = _NET.replace("1 k 0.5", "1 k 0.5\n    2 e 0.5")
     out = _runs(tmp_path, "k*(1 + 2e-3*e*Atot)", jit, template)
     np.testing.assert_allclose(out["True"], out["False"], rtol=1e-9, atol=1e-12)
+
+
+# A -> B at k*e*(A + 1e-10), the literal as BIOMD0000001042's MathML writes it.
+_SBML_E = (
+    '<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">'
+    '<model id="m"><listOfCompartments><compartment id="c" size="1" constant="true"/>'
+    "</listOfCompartments><listOfSpecies>"
+    '<species id="A" compartment="c" initialConcentration="2" hasOnlySubstanceUnits="false"'
+    ' boundaryCondition="false" constant="false"/>'
+    '<species id="B" compartment="c" initialConcentration="0" hasOnlySubstanceUnits="false"'
+    ' boundaryCondition="false" constant="false"/>'
+    '</listOfSpecies><listOfParameters><parameter id="k" value="0.5" constant="true"/>'
+    '<parameter id="e" value="0.5" constant="true"/></listOfParameters>'
+    '<listOfReactions><reaction id="r" reversible="false">'
+    '<listOfReactants><speciesReference species="A" stoichiometry="1" constant="true"/>'
+    "</listOfReactants><listOfProducts>"
+    '<speciesReference species="B" stoichiometry="1" constant="true"/></listOfProducts>'
+    '<kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML"><apply><times/><ci>k</ci>'
+    '<ci>e</ci><apply><plus/><ci>A</ci><cn type="e-notation">1<sep/>-10</cn></apply></apply>'
+    "</math></kineticLaw></reaction></listOfReactions></model></sbml>"
+)
+
+
+@needs_cc
+def test_codegen_true_runs_an_sbml_law_beside_a_parameter_named_e():
+    """The law was written ``(p[1]*p[2]*(obs[0]+1p[2]-10))``, and the build failed."""
+    runs = {
+        cg_on: bngsim.Simulator(
+            bngsim.Model.from_sbml_string(_SBML_E), method="ode", codegen=cg_on
+        ).run(t_span=(0.0, 3.0), n_points=7, rtol=1e-10, atol=1e-12)
+        for cg_on in (False, True)
+    }
+    np.testing.assert_allclose(
+        np.asarray(runs[True].species), np.asarray(runs[False].species), rtol=1e-9, atol=1e-12
+    )
 
 
 # ── Tables, by whatever spelling reads them ──────────────────────────────────
