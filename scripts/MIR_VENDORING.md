@@ -254,8 +254,12 @@ would not survive — carry-adjacent facts belong in the carry entry.
 
 Two are issue #1215, which made running out of memory or address space a
 `RuntimeError` from `MirJit` instead of the end of the process, and both are
-marked `BNGsim local carry (lanl/bngsim#1215)`. Neither is reported upstream yet;
-upstream master `dc2c763f` (2026-10-23) still has the code they replace.
+marked `BNGsim local carry (lanl/bngsim#1215)`. Both were reported upstream on
+2026-10-29, the `mir.c` one as
+[vnmakarov/mir#493](https://github.com/vnmakarov/mir/issues/493) and the
+`c2mir.c` one as [vnmakarov/mir#494](https://github.com/vnmakarov/mir/issues/494).
+Both are open as of 2026-10-30, and upstream master `dc2c763f` (2026-10-23)
+still has the code they replace.
 
 - **`mir.c` — `_MIR_get_default_code_alloc`.** MirJit hands each context a code
   allocator that wraps MIR's default one, so that a failed mapping is reported
