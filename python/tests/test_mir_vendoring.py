@@ -81,9 +81,8 @@ def test_mir_vendor_metadata_shape():
 def test_mir_local_carries_are_still_applied():
     """Every declared local carry must still be present in the vendored file.
 
-    The tree is stock upstream today — issue #413's bounds check in mir-gen.c
-    was carried here until upstream merged it (vnmakarov/mir#468), so the list
-    is empty — but the check stays for the next carry. Checksum anchors cannot
+    Issue #1215 carries two (in mir.c and c2mir/c2mir.c); issue #413's was
+    dropped when upstream merged it (vnmakarov/mir#468). Checksum anchors cannot
     guard a carry —
     a refresh rewrites the file from upstream AND re-anchors it, so the patch
     vanishes with the tree still matching its own metadata. Each entry names a
@@ -188,3 +187,49 @@ def test_cmake_gates_mir_behind_option():
     for rel in TRANSLATION_UNITS:
         assert f"third_party/mir/{rel}" in text
     assert "BNGSIM_HAS_MIR=1" in text
+
+
+# ── Issue #1215: the address space each MIR context reserves for its code ────
+# third_party/mir/README.md.bngsim says why CMake sets 32 MB. The live models'
+# address space is measured in test_mir_equivalence.py, which runs only on a
+# MIR build: a skip here would be one run_tests.sh's walk-up probe counts
+# against it.
+
+
+def test_cmake_sizes_the_mir_code_reservation():
+    text = CMAKE_LISTS.read_text()
+    assert 'set(BNGSIM_MIR_CODE_RESERVE_MB "32" CACHE STRING' in text
+    assert "MIR_CODE_RESERVE_SIZE=${BNGSIM_MIR_CODE_RESERVE_BYTES}" in text
+    # PUBLIC: MirJit's code allocator tells the reservation apart by its size,
+    # so it must see the size mir.c was built with.
+    assert "target_compile_definitions(bngsim_mir PUBLIC\n" in text
+    assert "if(BNGSIM_MIR_CODE_RESERVE_MB GREATER 2048)" in text
+    # The vendored default it overrides is still upstream's, under the #ifndef
+    # that lets the define override it, so a refresh that moves either is seen
+    # here. bngsim_mir compiles with -w: without the guard, mir.c's own #define
+    # would replace CMake's with no warning, and every context would reserve
+    # 128 MB again.
+    mir_c = (MIR_DIR / "mir.c").read_text()
+    assert (
+        "#ifndef MIR_CODE_RESERVE_SIZE\n"
+        "#if UINTPTR_MAX == 0xffffffffffffffffu && !defined(_WIN32)\n"
+        "#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)\n"
+    ) in mir_c
+    assert mir_c.count("#define MIR_CODE_RESERVE_SIZE") == 2
+
+
+def test_c2mir_checks_every_struct_it_mallocs():
+    """Issue #1215: c2mir's preprocessor allocated its macro, macro-call and #if
+    records with plain malloc and wrote through the result unchecked, so running
+    out there was a segfault the allocator MirJit hands MIR never sees. The
+    local carry checks each; this is the check a refresh that adds another
+    unchecked one fails."""
+    lines = (MIR_DIR / "c2mir" / "c2mir.c").read_text().splitlines()
+    struct_malloc = re.compile(r"\bmalloc \(sizeof \(struct \w+\)\);")
+    mallocs = [i for i, line in enumerate(lines) if struct_malloc.search(line)]
+    assert len(mallocs) >= 3
+    for i in mallocs:
+        var = re.search(r"(\w+) = malloc \(", lines[i]).group(1)
+        following = [line for line in lines[i + 1 : i + 5] if line.strip()]
+        assert following[0].strip().startswith(f"if ({var} == NULL)"), (i + 1, lines[i])
+        assert "(MIR_alloc_error," in following[1], (i + 1, lines[i])
