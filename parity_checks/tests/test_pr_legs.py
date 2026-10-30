@@ -29,8 +29,12 @@ _spec = importlib.util.spec_from_file_location(
 pr_legs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pr_legs)
 
+# Where the legs' code lives, for a module only a runtime sys.path finds.
+CODE_ROOTS = ("parity_checks", "benchmarks", "harness")
+
 ALL = set(pr_legs.LEGS)
 PARITY = ALL - {"sbml"}
+DIFF = {"differential", "differential-nf"}
 
 # The script each leg's job runs (the workflow's own command lines).
 RUNNERS = {
@@ -40,6 +44,7 @@ RUNNERS = {
     "rr-ssa": ["parity_checks/rr_parity/ssa_screen.py"],
     "fd-sens": ["parity_checks/fd_sens/fd_sens_run.py"],
     "differential": ["parity_checks/differential/differential_run.py"],
+    "differential-nf": ["parity_checks/differential/differential_run.py"],
     "bng-stoch": ["parity_checks/bng_parity/bng_stoch_run.py"],
     "amici-sens": ["parity_checks/amici_parity/amici_sens_run.py"],
 }
@@ -59,22 +64,30 @@ def _run(paths: list[str], *args: str) -> dict[str, bool]:
 @pytest.mark.parametrize(
     ("paths", "legs", "corpus"),
     [
-        (["parity_checks/differential/_differential.py"], {"differential"}, True),
+        (["parity_checks/differential/_differential.py"], DIFF, True),
         (["parity_checks/fd_sens/fd_sens_jobs.json"], {"fd-sens", "differential"}, True),
         (["parity_checks/fd_sens/fd_sens_run.py"], {"fd-sens"}, False),
         (
             ["parity_checks/amici_parity/_amici_sens.py"],
-            {"amici-sens", "fd-sens", "differential"},
+            {"amici-sens", "fd-sens", *DIFF},
             True,
         ),
         (["parity_checks/amici_parity/amici_sens_run.py"], {"amici-sens"}, True),
-        (["parity_checks/bng_parity/jobs.json"], {"bng-ode", "bng-stoch"}, False),
+        (["parity_checks/amici_parity/amici_ode_jobs.json"], {"amici-sens"}, True),
+        (
+            ["parity_checks/bng_parity/jobs.json"],
+            {"bng-ode", "bng-stoch", "differential-nf"},
+            False,
+        ),
         (["parity_checks/bng_parity/bng_ode_run.py"], {"bng-ode"}, False),
-        (["parity_checks/bng_parity/net_gillespie.py"], {"bng-stoch"}, False),
+        # differential's NF arm imports bng_stoch_run, after a sys.path insert.
+        (["parity_checks/bng_parity/net_gillespie.py"], {"bng-stoch", *DIFF}, True),
         (["parity_checks/_core/work.py"], PARITY, True),
         (["parity_checks/rr_parity/_rr_common.py"], PARITY, True),
         (["parity_checks/rr_parity/ssa_screen.py"], {"rr-ssa"}, True),
         (["parity_checks/rr_parity/rr_run.py"], {"rr-ode"}, True),
+        # Data no import shows: differential's SSA arm runs rr_ssa's jobs.
+        (["parity_checks/rr_parity/ssa_jobs.json"], {"differential"}, True),
         # The corpus's manifest: every leg that reads the corpus, and more.
         (["parity_checks/rr_parity/ode_jobs.json"], PARITY, True),
         (["benchmarks/suites/biomodels/biomodels_provenance.json"], pr_legs.CORPUS_LEGS, True),
@@ -95,7 +108,7 @@ def _run(paths: list[str], *args: str) -> dict[str, bool]:
         (["changelog.d/1387.changed.md", "python/bngsim/_simulator.py"], set(), False),
         (
             ["parity_checks/differential/x.py", "changelog.d/1.fixed.md", "python/tests/t.py"],
-            {"differential"},
+            DIFF,
             True,
         ),
     ],
@@ -105,6 +118,7 @@ def _run(paths: list[str], *args: str) -> dict[str, bool]:
         "fd_sens's runner",
         "amici_parity's scheduler",
         "amici_sens's runner",
+        "amici_sens's jobs",
         "bng_parity's jobs",
         "bng_ode's runner",
         "bng_stoch's own module",
@@ -112,6 +126,7 @@ def _run(paths: list[str], *args: str) -> dict[str, bool]:
         "rr_parity's _rr_common",
         "the SSA screen",
         "rr_ode's runner",
+        "rr_ssa's SSA jobs",
         "the corpus manifest",
         "the corpus provenance",
         "the workflow",
@@ -140,18 +155,32 @@ def _loaded_files(script: str) -> set[str]:
     """The repo files ``script`` loads, loaded as its job runs it (its own
     directory first on sys.path), without running main(): the modules it
     imports, and those an import inside a function would load, which only
-    reading the loaded modules' import statements finds."""
+    reading the loaded modules' import statements finds. A name the probe's
+    sys.path cannot find, where a function puts its directory on sys.path
+    before importing it, is looked up among the legs' code by its file name:
+    every module of that name counts."""
     probe = textwrap.dedent(f"""
         import ast, importlib.util, json, pathlib, sys
         repo = pathlib.Path({str(REPO)!r})
         script = repo / {script!r}
+        index = {{}}
+
+        def in_repo(name):
+            if not index:
+                for root in {CODE_ROOTS!r}:
+                    for f in (repo / root).rglob("*.py"):
+                        stem = f.parent.name if f.name == "__init__.py" else f.stem
+                        index.setdefault(stem, []).append(str(f))
+            return index.get(name, [])
+
         sys.path.insert(0, str(script.parent))
         spec = importlib.util.spec_from_file_location("runner_under_test", script)
         mod = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
         except ModuleNotFoundError as e:
-            print(json.dumps({{"missing": e.name}}))
+            top = (e.name or "").split(".")[0]
+            print(json.dumps({{"broken" if in_repo(top) else "missing": e.name}}))
             raise SystemExit(0)
 
         def ours(f):
@@ -196,7 +225,10 @@ def _loaded_files(script: str) -> set[str]:
                     # The top-level name alone, unless it is the repo's: finding
                     # a dotted name imports its parents.
                     top = spec_of(name.split(".")[0])
-                    if top is None or ours(top.origin) is None:
+                    if top is None:
+                        todo += in_repo(name.split(".")[0])
+                        continue
+                    if ours(top.origin) is None:
                         continue
                     found = spec_of(name) if "." in name else top
                     if found is not None:
@@ -208,6 +240,7 @@ def _loaded_files(script: str) -> set[str]:
     )
     assert done.returncode == 0, (script, done.stderr.strip().splitlines()[-5:])
     out = json.loads(done.stdout.strip().splitlines()[-1])
+    assert "broken" not in out, f"{script} cannot import the repo's {out.get('broken')}"
     if "missing" in out:
         pytest.skip(f"{script} needs {out['missing']}, which is not installed here")
     return set(out["files"])
@@ -225,12 +258,24 @@ def test_every_file_a_runner_loads_feeds_its_leg(leg, script):
         assert leg in pr_legs.legs_for([f]), (script, f)
 
 
-def test_the_runners_are_the_scripts_the_legs_run():
-    """RUNNERS is what the leg jobs run (the nightly's own scripts aside, which
-    feed every leg): a job that came to run another script would go unmeasured."""
-    run = set(re.findall(r"uv run --no-sync python (\S+\.py)", WORKFLOW.read_text()))
-    run = {s for s in run if not s.startswith("parity_checks/nightly/")}
-    assert run == {s for scripts in RUNNERS.values() for s in scripts}
+def _jobs() -> dict[str, str]:
+    """Each job's block of the workflow, by its id."""
+    body = WORKFLOW.read_text().split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):\n", body, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def test_each_job_runs_the_runners_its_leg_names():
+    """RUNNERS is what each leg's job runs (the nightly's own scripts aside,
+    which feed every leg), and only a leg's job runs one: a job that came to
+    run another script would go unmeasured, and one that is no leg would run
+    on every pull request."""
+    jobs = _jobs()
+    assert set(RUNNERS) == ALL and set(jobs) >= ALL
+    for job, block in jobs.items():
+        run = set(re.findall(r"uv run --no-sync python (\S+\.py)", block))
+        run = {s for s in run if not s.startswith("parity_checks/nightly/")}
+        assert run == set(RUNNERS.get(job, ())), job
 
 
 def test_every_corpus_input_feeds_every_corpus_leg():
@@ -245,9 +290,17 @@ def test_every_corpus_input_feeds_every_corpus_leg():
 
 
 def _workflow_paths(negated: bool) -> list[str]:
+    """pull_request.paths: its exclusions ("!..."), or the rest. Quoted or not."""
     text = WORKFLOW.read_text()
     block = text.split("  pull_request:\n    paths:\n", 1)[1].split("\n\n", 1)[0]
-    return re.findall(r'^\s+- "!([^"]*)"' if negated else r'^\s+- "([^!"][^"]*)"', block, re.M)
+    items = [
+        re.sub(r"\s+#.*", "", i).strip("\"'") for i in re.findall(r"^\s+- (.+)$", block, re.M)
+    ]
+    return (
+        [i[1:] for i in items if i.startswith("!")]
+        if negated
+        else [i for i in items if not i.startswith("!")]
+    )
 
 
 def _workflow_triggers() -> list[str]:

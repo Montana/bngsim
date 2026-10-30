@@ -8,9 +8,10 @@ scheduled or dispatched run is not asked, and runs every leg.
 
 ``RULES`` is taken from what each leg's runner imports, measured by loading it
 as its job runs it (``test_pr_legs.py`` measures it again, file by file, so the
-table cannot drift from the code), plus the data a job reads: ``differential``
-runs fd_sens's models and the corpus's BioModels, and every file the corpus
-job's cache key hashes feeds every leg that reads the corpus.
+table cannot drift from the code), plus the data a job reads, which no import
+shows and the test's cases pin by hand: ``differential`` runs fd_sens's models,
+rr_ssa's SSA jobs and the corpus's BioModels, and every file the corpus job's
+cache key hashes feeds every leg that reads the corpus.
 
 Only the paths the workflow is triggered on (``TRIGGERS``, the workflow's
 ``pull_request.paths``) are read. A PR's other files (its changelog fragment,
@@ -34,14 +35,16 @@ LEGS = (
     "rr-ssa",
     "fd-sens",
     "differential",
+    "differential-nf",
     "bng-stoch",
     "amici-sens",
 )
 # The legs that read the BioModels corpus, which the corpus job fetches.
 CORPUS_LEGS = frozenset({"rr-ode", "rr-ssa", "amici-sens", "differential"})
 _PARITY = frozenset(LEGS) - {"sbml"}
+_DIFF = frozenset({"differential", "differential-nf"})
 _BNG = frozenset({"bng-ode", "bng-stoch"})
-_AMICI = frozenset({"amici-sens", "fd-sens", "differential"})
+_AMICI = frozenset({"amici-sens", "fd-sens"}) | _DIFF
 _FD = frozenset({"fd-sens", "differential"})
 
 # The workflow's pull_request.paths, as path prefixes ("dir/**" -> "dir/");
@@ -83,23 +86,31 @@ RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("parity_checks/_core/", _PARITY),
     ("parity_checks/rr_parity/_rr_common.py", _PARITY),
     ("parity_checks/rr_parity/rr_run.py", frozenset({"rr-ode"})),
+    # differential's SSA arm runs these; the screen reads ssa_candidates.json.
+    ("parity_checks/rr_parity/ssa_jobs.json", frozenset({"differential"})),
     ("parity_checks/rr_parity/ssa_", frozenset({"rr-ssa"})),
     ("parity_checks/rr_parity/", _PARITY),
     # The golden gate's trajectories (golden-verify.yml), which no leg reads.
     ("parity_checks/bng_parity/golden/", frozenset()),
     ("parity_checks/bng_parity/bng_ode_run.py", frozenset({"bng-ode"})),
-    ("parity_checks/bng_parity/bng_stoch_run.py", frozenset({"bng-stoch"})),
-    ("parity_checks/bng_parity/net_gillespie.py", frozenset({"bng-stoch"})),
-    ("parity_checks/bng_parity/net_roadrunner.py", frozenset({"bng-stoch"})),
-    ("parity_checks/bng_parity/", _BNG),
+    # differential's NF arm escalates a DIFF with bng_stoch_run's code, and
+    # differential_run.py holds that arm whichever job runs it.
+    ("parity_checks/bng_parity/bng_stoch_run.py", _DIFF | {"bng-stoch"}),
+    ("parity_checks/bng_parity/net_gillespie.py", _DIFF | {"bng-stoch"}),
+    ("parity_checks/bng_parity/net_roadrunner.py", _DIFF | {"bng-stoch"}),
+    ("parity_checks/bng_parity/_bng_common.py", _BNG | _DIFF),
+    # The rest, the BNG corpus among it: the NF job too, which imports from here.
+    ("parity_checks/bng_parity/", _BNG | {"differential-nf"}),
     # fd_sens_run and differential_run import _amici_sens's scheduler.
     ("parity_checks/amici_parity/amici_sens_run.py", frozenset({"amici-sens"})),
     ("parity_checks/amici_parity/amici_dispositions.py", frozenset({"amici-sens"})),
+    ("parity_checks/amici_parity/amici_ode_jobs.json", frozenset({"amici-sens"})),
+    ("parity_checks/amici_parity/AMICI_PIN.json", frozenset({"amici-sens"})),
     ("parity_checks/amici_parity/", _AMICI),
     # differential runs fd_sens_jobs.json's models as well as its own checks.
     ("parity_checks/fd_sens/fd_sens_run.py", frozenset({"fd-sens"})),
     ("parity_checks/fd_sens/", _FD),
-    ("parity_checks/differential/", frozenset({"differential"})),
+    ("parity_checks/differential/", _DIFF),
     ("benchmarks/suites/sbml_test_suite/", frozenset({"sbml"})),
     ("benchmarks/_effort.py", frozenset({"sbml"})),
     # The corpus job's key hashes it and the mirror's fetch checks against it.

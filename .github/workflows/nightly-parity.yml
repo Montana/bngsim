@@ -164,6 +164,7 @@ jobs:
       rr-ssa: ${{ steps.legs.outputs.rr-ssa }}
       fd-sens: ${{ steps.legs.outputs.fd-sens }}
       differential: ${{ steps.legs.outputs.differential }}
+      differential-nf: ${{ steps.legs.outputs.differential-nf }}
       bng-stoch: ${{ steps.legs.outputs.bng-stoch }}
       amici-sens: ${{ steps.legs.outputs.amici-sens }}
       corpus: ${{ steps.legs.outputs.corpus }}
@@ -707,6 +708,8 @@ jobs:
   # ------------------------------------------------------------------------- #
   differential-nf:
     name: Network-free engine agreement
+    needs: plan
+    if: needs.plan.outputs.differential-nf == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
