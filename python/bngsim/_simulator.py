@@ -5371,7 +5371,10 @@ class Simulator:
             each simulation, so threads parallelize effectively.
         squeeze : bool
             If ``True``, return a single Result with 3D arrays
-            ``(n_sims, n_times, n_cols)`` instead of a list.
+            ``(n_sims, n_times, n_cols)`` instead of a list. Refused while a
+            stop condition is registered (:meth:`add_stop_condition`): a row
+            one cuts is shorter than the rest, and a stack does not say which
+            stopped (issue #1369).
         steady_state : bool, optional
             ODE-only. When ``True``, every simulation in the batch stops
             early once ``||f(t,y)||_2 / n_species`` falls below
@@ -5394,14 +5397,19 @@ class Simulator:
         -------
         list[Result] or Result
             One Result per parameter set (list), or a single
-            squeezed Result with 3D arrays if ``squeeze=True``.
+            squeezed Result with 3D arrays if ``squeeze=True``. Each row is
+            checked against the registered stop conditions as :meth:`run`
+            checks its result: a row that meets one comes back cut at the
+            first sample it holds at, with :attr:`Result.stop_condition`
+            naming it, and nothing is raised (issue #1369).
 
         Raises
         ------
         SimulationError
             If any simulation fails.
         ValueError
-            If params is empty or t_span/n_points are invalid.
+            If params is empty or t_span/n_points are invalid, or
+            ``squeeze=True`` while a stop condition is registered.
 
         Examples
         --------
@@ -5442,6 +5450,7 @@ class Simulator:
                 "count, so the per-Result trajectories cannot be stacked into a "
                 "single 3D array. Use squeeze=False (the default)."
             )
+        self._refuse_squeeze_with_stop_conditions("run_batch", squeeze)
         ss_tol_value: float = 0.0
         if steady_state_tol is not None:
             ss_tol_value = float(steady_state_tol)
@@ -5558,6 +5567,11 @@ class Simulator:
 
         logger.info("Batch complete: %d results", len(results))
 
+        # Each row meets the stop conditions as run() does, and one that meets
+        # one comes back cut there, beside the rest (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
+
         # Each row is stamped already, against its own clone (issues #698, #743).
         if squeeze:
             return Result.squeeze(results)
@@ -5602,13 +5616,16 @@ class Simulator:
         n_replicates : int
             Number of replicate trajectories (``>= 1``).
         t_span, n_points, seed, timeout, num_processors, squeeze
-            As in :meth:`run` / :meth:`run_batch`.
+            As in :meth:`run` / :meth:`run_batch`; ``squeeze=True`` is refused
+            while a stop condition is registered.
 
         Returns
         -------
         list[Result] or Result
             One :class:`Result` per replicate, or a single squeezed Result with
             3D arrays ``(n_replicates, n_times, n_cols)`` when ``squeeze=True``.
+            A replicate that meets a registered stop condition comes back cut
+            there, as a :meth:`run_batch` row does (issue #1369).
 
         Examples
         --------
@@ -5630,6 +5647,7 @@ class Simulator:
             raise ValueError(f"t_end ({t_end}) must be > t_start ({t_start})")
         if n_points < 2:
             raise ValueError(f"n_points ({n_points}) must be >= 2")
+        self._refuse_squeeze_with_stop_conditions("run_replicates", squeeze)
 
         eff_timeout: float = 0.0
         if timeout is not None:
@@ -5718,6 +5736,10 @@ class Simulator:
             finally:
                 self._model.set_state(invocation_state)
                 self._restore_carryover_state(invocation_carry)
+
+        # As run_batch's rows (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
 
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
@@ -6297,14 +6319,18 @@ class Simulator:
         squeeze : bool
             When ``True``, stack the per-point results into a single
             :class:`Result` with 3-D arrays (like :meth:`run_batch`); otherwise
-            return a list of per-point results.
+            return a list of per-point results. Refused while a stop condition
+            is registered, as :meth:`run_batch` refuses it.
 
         Returns
         -------
         list[Result] or Result
             One :class:`Result` per scanned value (in order), each carrying
             ``custom_attrs["scan_parameter"]`` and ``custom_attrs["scan_value"]``.
-            A squeezed :class:`Result` when ``squeeze=True``.
+            A squeezed :class:`Result` when ``squeeze=True``. A point that meets
+            a registered stop condition comes back cut there, with
+            :attr:`Result.stop_condition` naming it, rather than raising
+            :class:`StopConditionMet` out of the scan (issue #1369).
 
         Notes
         -----
@@ -6362,6 +6388,7 @@ class Simulator:
                 "steady_state=True is only supported for method='ode' "
                 f"(got method='{self._method}')."
             )
+        self._refuse_squeeze_with_stop_conditions("parameter_scan", squeeze)
         values = self._resolve_scan_values(par_scan_vals, par_min, par_max, n_scan_pts, log_scale)
 
         # Validate the parameter and capture its pre-scan value so the model can
@@ -6473,19 +6500,28 @@ class Simulator:
                 # model's current live concentrations.
                 self._recreate_interactive_sim()
                 point_seed = None if self._method == "ode" else base_seed + i
-                result = self.run(
-                    t_span=t_span,
-                    n_points=n_points,
-                    seed=point_seed,
-                    rtol=rtol,
-                    atol=scan_atol,
-                    max_steps=max_steps,
-                    max_step=max_step,
-                    timeout=timeout,
-                    steady_state=steady_state,
-                    steady_state_tol=steady_state_tol,
-                    carry_sensitivities=pt_sens_seed is not None,
-                )
+                try:
+                    result = self.run(
+                        t_span=t_span,
+                        n_points=n_points,
+                        seed=point_seed,
+                        rtol=rtol,
+                        atol=scan_atol,
+                        max_steps=max_steps,
+                        max_step=max_step,
+                        timeout=timeout,
+                        steady_state=steady_state,
+                        steady_state_tol=steady_state_tol,
+                        carry_sensitivities=pt_sens_seed is not None,
+                    )
+                except StopConditionMet as stop:
+                    # One point's stop is not the scan's (issue #1369): the point
+                    # comes back cut, as a run_batch row does. run() integrated the
+                    # whole span and left the model at its end, so a continuation
+                    # point (reset_conc=False) starts from there, as it would have.
+                    if not isinstance(stop.result, Result):  # pragma: no cover
+                        raise
+                    result = stop.result
                 result.custom_attrs["scan_parameter"] = parameter
                 result.custom_attrs["scan_value"] = float(value)
                 results.append(result)
@@ -9583,6 +9619,22 @@ class Simulator:
         label : str
             Human-readable label for the condition.
 
+        Notes
+        -----
+        A result that meets a condition is cut at the first sample it holds
+        at, and :attr:`Result.stop_condition` names the condition (its label,
+        else its expression). :meth:`run` raises :class:`StopConditionMet`
+        with that result. :meth:`run_batch`, :meth:`run_replicates` and
+        :meth:`parameter_scan` (and so :meth:`bifurcate`) check every row the
+        same way and return the cut rows in their list, beside the rest,
+        raising nothing; they refuse ``squeeze=True`` while a condition is
+        registered (issue #1369). Conditions are checked in the order they
+        were added, and the first one met cuts the row where it first holds,
+        even where a condition added later held earlier. A callable
+        is met at the last sample, so the row it cuts keeps every sample. A cut
+        result carries the reported blocks only, as the one :meth:`run` raises
+        with always has: :attr:`Result.state` refuses on it.
+
         Examples
         --------
         >>> sim.add_stop_condition("A_tot < 10", label="low_A")
@@ -9712,28 +9764,58 @@ class Simulator:
                 stacklevel=3,
             )
 
+    def _stopped(self, result: Result) -> Result:
+        """*result* cut at the first registered stop condition it meets, in
+        the order they were added, with :attr:`Result.stop_condition` naming
+        it; *result* itself where none is met. One rule for :meth:`run`, which
+        raises with the cut result, and for the rows of :meth:`run_batch` and
+        :meth:`run_replicates`, which keep it (issue #1369)."""
+        for sc in self._stop_conditions:
+            trigger_idx = sc.check(result)
+            if trigger_idx is not None:
+                trunc = self._truncate_result(result, trigger_idx + 1)
+                trunc._stop_condition = sc.label or str(sc)
+                logger.info(
+                    "Stop condition triggered at t=%.6g: %s",
+                    result.time[trigger_idx],
+                    trunc._stop_condition,
+                )
+                return trunc
+        return result
+
     def _check_stop_conditions(self, result: Result) -> None:
         """Check stop conditions against a completed result.
 
         If any condition triggers, raises StopConditionMet with
         the result truncated to the trigger point.
         """
-        for sc in self._stop_conditions:
-            trigger_idx = sc.check(result)
-            if trigger_idx is not None:
-                # Truncate result to the trigger point
-                trunc = self._truncate_result(result, trigger_idx + 1)
-                label = sc.label or str(sc)
-                logger.info(
-                    "Stop condition triggered at t=%.6g: %s",
-                    result.time[trigger_idx],
-                    label,
-                )
-                raise StopConditionMet(
-                    f"Stop condition '{label}' triggered at t={result.time[trigger_idx]:.6g}",
-                    result=trunc,
-                    condition=label,
-                )
+        stopped = self._stopped(result)
+        if stopped is not result:
+            label = str(stopped._stop_condition)
+            raise StopConditionMet(
+                f"Stop condition '{label}' triggered at t={stopped.time[-1]:.6g}",
+                result=stopped,
+                condition=label,
+            )
+
+    def _refuse_squeeze_with_stop_conditions(self, where: str, squeeze: bool) -> None:
+        """Refuse ``squeeze=True`` on a batch while a stop condition is registered.
+
+        A row a condition cuts cannot be stacked with the rest, and which rows
+        are cut is known only once every row is solved, so a refusal there threw
+        the whole solved batch away for one row's stop. Refused here, before any
+        row runs, as ``steady_state=True`` with ``squeeze=True`` is for the same
+        reason (issue #1369).
+        """
+        if squeeze and self._stop_conditions:
+            raise ValueError(
+                f"{where}(squeeze=True) is refused while stop conditions are "
+                "registered: a row a condition cuts is shorter than the rest, and a "
+                "stack does not say which stopped (issue #1369). Use squeeze=False, "
+                "where Result.stop_condition names the condition each row met, and "
+                "Result.squeeze(rows) to stack them when none did; or call "
+                "clear_stop_conditions() first."
+            )
 
     @staticmethod
     def _truncate_result(result: Result, n: int) -> Result:
@@ -9812,6 +9894,7 @@ class Simulator:
         )
         out._varvol_conc_factor = cut_map(result._varvol_conc_factor)
         out._varvol_amount_factor = cut_map(result._varvol_amount_factor)
+        out._stop_condition = result._stop_condition
         return out
 
     # ─── Interactive simulation ─────────────────────────────────────
@@ -10506,6 +10589,14 @@ class Simulator:
 # ─── Stop condition implementations ────────────────────────────────
 
 
+def _code_names(code: Any) -> Iterable[str]:
+    """Every name *code*, and any code object nested in it, can look up."""
+    yield from code.co_names
+    for const in code.co_consts:
+        if isinstance(const, type(code)):
+            yield from _code_names(const)
+
+
 class _StopCondition:
     """Base class for stop conditions."""
 
@@ -10529,24 +10620,36 @@ class _ExpressionStopCondition(_StopCondition):
         super().__init__(label=label or expression)
         self._expression = expression
         self._code = compile(expression, "<stop_condition>", "eval")
+        # Every name the expression can look up, nested code included. Only
+        # these are bound at each sample: binding every observable and species
+        # there, for a condition that reads one, was paid once per row of a
+        # batch (issue #1369).
+        self._names: frozenset[str] = frozenset(_code_names(self._code))
 
     def check(self, result: Result) -> int | None:
         """Evaluate expression at each time point."""
-        obs_names = result.observable_names
         obs_data = np.asarray(result.observables)
+        sp_data = result.species
         time = result.time
+        # (block, column, name) for each column the expression reads, in the
+        # order the namespace is built, so a sanitized species name that is
+        # also an observable's still reads as the species.
+        columns = [
+            (obs_data, j, name)
+            for j, name in enumerate(result.observable_names)
+            if name in self._names
+        ]
+        for j, name in enumerate(result.species_names):
+            # Sanitize species name for eval
+            safe = name.replace("(", "_").replace(")", "_")
+            if safe in self._names:
+                columns.append((sp_data, j, safe))
 
         for t_idx in range(len(time)):
             # Build namespace for eval
             ns = {"time": time[t_idx], "t": time[t_idx]}
-            for j, name in enumerate(obs_names):
-                ns[name] = obs_data[t_idx, j]
-            # Also add species
-            sp_data = result.species
-            for j, name in enumerate(result.species_names):
-                # Sanitize species name for eval
-                safe = name.replace("(", "_").replace(")", "_")
-                ns[safe] = sp_data[t_idx, j]
+            for block, j, name in columns:
+                ns[name] = block[t_idx, j]
 
             try:
                 val = eval(  # noqa: S307

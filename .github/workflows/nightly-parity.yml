@@ -923,6 +923,12 @@ jobs:
   # manifest to commit in the run summary and the reference-manifest artifact.
   # Every suite or none: if a suite packed nothing (its job died, or a good row had
   # no recorded reference), the manifest step refuses and nothing is published.
+  # The tag goes on the default branch's head, not on the recorded commit. A
+  # recording takes hours, and run 40899940910's publish was refused (HTTP 403)
+  # creating its tag at the recorded commit after a change to this file merged
+  # mid-run: this job's token may not make a ref whose workflow files differ from
+  # the default branch's. The notes and the manifest name the recorded commit,
+  # and a replay reads only the assets and their sha256s.
   # ------------------------------------------------------------------------- #
   publish:
     name: Publish the reference archive
@@ -943,6 +949,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           ls -l reference-out
@@ -956,8 +963,10 @@ jobs:
             echo "Reference-engine outputs for bngsim's nightly parity check (issue #805), recorded by $RUN_URL at $GITHUB_SHA."
             echo
             echo "Not a bngsim release. One asset per suite; each holds a README, entries.json (every entry's model, source and license) and, where any entry is not CC0, bngsim's NOTICE. The nightly replays from these once parity_checks/nightly/reference_archive.json pins them; parity_checks/nightly/README.md has the procedure."
+            echo
+            echo "The tag points at $DEFAULT_BRANCH's head when this was published, not at the recorded commit, which is the one named above."
           } > notes.md
-          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$DEFAULT_BRANCH" --latest=false \
             --title "Data: nightly parity reference archive ($tag)" --notes-file notes.md reference-out/*.tar.gz
           {
             echo "### Reference archive $tag published"
