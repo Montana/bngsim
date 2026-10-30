@@ -9605,7 +9605,10 @@ def _build_model_from_sbml_doc_in_context(doc):
         # refuses it as a recursive assignment rule. A ring with one consistent
         # state is refused with it: telling the two apart is a solve bngsim does
         # not make. A size whose own condition reads its own concentration (a
-        # ring of one) is not a ring here, as above.
+        # ring of one) is not a ring here, as above, and that includes a
+        # condition that reads it through another size's rule: `cw :=
+        # piecewise(5, time >= 2 && cv < 2, 1)` beside `cv := 1 + [Sw]` reads
+        # [Sw], and runs, keeping the state it is in.
         if not _ring and not _cond_ring:
             _links: dict[tuple[str, str], str] = {}
             for a, rated in _comp_rated.items():
@@ -9633,8 +9636,8 @@ def _build_model_from_sbml_doc_in_context(doc):
                     + "; ".join(
                         _links[(a, b)] for a, b in zip(_mixed_ring, _mixed_ring[1:], strict=False)
                     )
-                    + "), so where a jump flips the sizes after it can be read more than "
-                    "one way, and bngsim does not choose"
+                    + "), so where a jump flips one of those conditions, the sizes after it "
+                    "can be read more than one way, and bngsim does not choose"
                 )
         if _refusals:
             from bngsim._exceptions import ModelError

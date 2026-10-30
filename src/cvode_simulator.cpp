@@ -14624,9 +14624,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // is the one the sensitivity jump differentiates: beside `cv :=
             // piecewise(1, t < 2, 5)`, the own jump of `cw := piecewise(1, t <
             // 2, 1 + Sn)` takes [Sw] from 3 to 3/6, and cv's rescale of it then
-            // from 3/6 to 3/2. Jumps that wait on each other in a ring, which
-            // they can only through conditions (a ring of sizes is refused at
-            // load), go as they are drawn.
+            // from 3/6 to 3/2. Jumps that wait on each other in a ring go as
+            // they are drawn. The SBML loader refuses every such ring, through
+            // sizes' values, their conditions or both (issues #1134, #1185), so
+            // only a model built without it reaches that here.
             std::vector<char> waits;
             if (jump_left && jumps_have_followers) {
                 waits.assign(queue.size(), 0);
@@ -14792,7 +14793,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // jump of the instant drawn before it can have rescaled that
             // concentration since, as one that follows it: written as frozen,
             // the own rescale put back the value from before that one's. The
-            // ratio is applied to the concentration as it is now instead.
+            // ratio is applied to the concentration as it is now instead. (The
+            // SBML loader refuses every ring of sizes at load, issue #1185.)
             bool jump_rebased = false;
             if (!queue[k].jump_bases.empty()) {
                 for (size_t a = 0; a < assigns.size(); ++a) {

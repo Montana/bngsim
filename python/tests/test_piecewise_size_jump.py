@@ -813,12 +813,15 @@ def test_a_ring_with_two_consistent_states_is_refused():
     with pytest.raises(
         bngsim.ModelError,
         match=r"cv's size reads Sw in cw; cw's jump condition reads Sn in cv\), so where a "
-        r"jump flips the sizes after it can be read more than one way",
+        r"jump flips one of those conditions, the sizes after it can be read more than one way",
     ):
         bngsim.Model.from_sbml_string(_value_and_condition_ring())
 
 
 def test_a_ring_of_three_through_values_and_conditions_is_refused():
+    """One condition link and two value links: cu's condition reads [Sw] in cw,
+    cw's size reads [Sn] in cv, and cv's size reads [Su] in cu. The message
+    names each link in the ring's order, with its kind."""
     cond_on_sw = f"<apply><or/>{BEFORE_2}{_rel('gt', _ci('Sw'), _cn(100))}</apply>"
     xml = _sized_doc(
         ["cu", "cv", "cw"],
@@ -838,19 +841,33 @@ def test_a_ring_of_three_through_values_and_conditions_is_refused():
 
 
 def test_a_chain_through_a_value_and_a_condition_runs():
-    """Negative control: the same two links pointing one way only (cw's size
-    reads [Sn] in cv, and cv's condition reads nothing of cw's) are not a ring,
-    and run as before."""
-    cond = f"<apply><or/>{BEFORE_2}{_rel('gt', _ci('Sn'), _cn(100))}</apply>"
+    """Negative control: a condition link and a value link that do not close.
+    cu's condition reads [Sw] in cw, and cw's size reads [Sn] in cv, but cv's
+    size reads nothing. At t = 2 cv goes to 5 ([Sn] 5 -> 1), cw to 1 + 1
+    ([Sw] 3 -> 1.5), and cu, its condition false for [Sw] 3 or 1.5, to 4
+    ([Su] 8 -> 2), whatever order the jumps of the instant are drawn in."""
+    cond_on_sw = f"<apply><or/>{BEFORE_2}{_rel('gt', _ci('Sw'), _cn(100))}</apply>"
     xml = _sized_doc(
-        ["cv", "cw"],
-        [("Sn", "cv", 5), ("Sw", "cw", 3)],
-        [("cv", _step(_cn(1), cond, _cn(5))), ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN))],
+        ["cu", "cv", "cw"],
+        [("Su", "cu", 8), ("Sn", "cv", 5), ("Sw", "cw", 3)],
+        [
+            ("cu", _step(_cn(1), cond_on_sw, _cn(4))),
+            CV_JUMP,
+            ("cw", _step(_cn(1), BEFORE_2, ONE_PLUS_SN)),
+        ],
     )
-    result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
-        t_span=(0.0, 4.0), n_points=17
-    )
-    assert np.isfinite(np.asarray(result.species)).all()
+    closed_forms = {"Su": _jump_to(2, 8, 2), "Sn": _jump_to(2, 5, 1), "Sw": _jump_to(2, 3, 1.5)}
+    for seed in range(4):
+        result = bngsim.Simulator(bngsim.Model.from_sbml_string(xml), method="ode").run(
+            t_span=(0.0, 4.0), n_points=17, seed=seed
+        )
+        t = np.asarray(result.time)
+        names = list(result.species_names)
+        for sid, closed_form in closed_forms.items():
+            got = np.asarray(result.species)[:, names.index(sid)]
+            np.testing.assert_allclose(
+                got, closed_form(t), rtol=1e-5, atol=1e-8, err_msg=f"{sid}, seed {seed}"
+            )
 
 
 def test_a_ring_of_one_with_one_consistent_state_jumps():
@@ -1014,9 +1031,10 @@ def test_a_condition_read_one_way_is_no_ring():
     ids=["three in a chain"],
 )
 def test_the_sensitivity_of_a_rescale_on_a_rescale_is_refused(xml, param, match):
-    """A concentration rescaled twice at one instant, by two jumps, or by a
-    jump's rescale of what another rescale there moved: the sensitivity jump
-    has no derivative for the second."""
+    """A concentration rescaled at one instant by a jump's rescale of what
+    another rescale there moved: the sensitivity jump has no derivative for the
+    second. (Its sibling, one concentration rescaled by two jumps, needs a ring
+    of jumps, and every ring is refused at load now, issue #1185.)"""
     sim = bngsim.Simulator(
         bngsim.Model.from_sbml_string(xml), method="ode", sensitivity_params=[param]
     )
