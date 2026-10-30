@@ -157,14 +157,14 @@ def test_the_sedml_export_carries_the_grid_and_the_scan():
     spec = _parse(
         'simulate({method=>"ode",t_end=>10,n_steps=>10})',
         'simulate({method=>"ode",continue=>1,t_end=>20,n_steps=>10})',
-        'simulate({method=>"ode",sample_times=>[0,2,4,6,8,10]})',
+        'simulate({method=>"ode",sample_times=>[0,3,6,9,12]})',
         'parameter_scan({parameter=>"k",par_scan_vals=>[1,2,3],method=>"ode",t_end=>10,n_steps=>5})',
     )
     x = write_sedml_protocol(spec)
     grids = re.findall(
         r'outputStartTime="([^"]*)" outputEndTime="([^"]*)" numberOfPoints="([^"]*)"', x
     )
-    assert ("10", "20", "10") in grids and ("0", "10", "5") in grids
+    assert grids == [("0", "10", "10"), ("10", "20", "10"), ("0", "12", "4"), ("0", "10", "5")]
     assert "repeatedTask" in x
 
 
@@ -238,7 +238,7 @@ def test_a_continuations_unreadable_t_start_is_the_model_time():
     assert cont.t_span == (10.0, 20.0)
 
 
-@pytest.mark.parametrize("stop", ["steady_state=>1", 'stop_if=>"A<1"'])
+@pytest.mark.parametrize("stop", ["steady_state=>1", 'stop_if=>"A<1"', "max_sim_steps=>5"])
 def test_a_run_that_can_stop_early_leaves_the_model_time_unknown(stop):
     with pytest.raises(ConversionError, match=r"continue=>1 starts at the model time"):
         _parse(
@@ -258,17 +258,70 @@ def test_an_nf_run_starts_at_the_model_time(second):
     assert exp.t_span == (10.0, 20.0)
 
 
-def test_an_nf_run_leaves_the_model_time_at_0():
+def test_an_nf_run_leaves_the_model_time_undefined():
     """``simulate_nf``'s n_steps branch declares a second ``my $t_end``, so it
     sets the model time to undef, which the next start reads as 0: replicate
-    nf runs (Dolan2015 has ten) each start at 0, as does a continuation."""
-    first, again, cont = _only(
+    nf runs (Dolan2015 has ten) each start at 0, as does a continuation. That
+    continuation is re-emitted without continue=>1, which BNG2.pl would refuse
+    beside t_start=>0 with the model time undefined."""
+    spec = _parse(
         "simulate_nf({t_end=>2400,n_steps=>10})",
         "simulate_nf({t_end=>2400,n_steps=>10})",
         'simulate({method=>"ode",continue=>1,t_end=>5,n_steps=>5})',
     )
+    first, again, cont = spec.steps
+    assert spec.lossy == ()
     assert first.t_span == again.t_span == (0.0, 2400.0)
     assert cont.t_span == (0.0, 5.0)
+    assert "continue" not in cont.extra
+    assert parse_bngl_protocol(write_bngl_protocol(spec)).steps == spec.steps
+
+
+@pytest.mark.parametrize("t_start", ["2400", "0"])
+def test_a_continuation_naming_its_t_start_after_an_nf_run_is_refused(t_start):
+    with pytest.raises(ConversionError, match=r"model time is undefined after an nf run"):
+        _parse(
+            "simulate_nf({t_end=>2400,n_steps=>10})",
+            f'simulate({{method=>"ode",continue=>1,t_start=>{t_start},t_end=>2500,n_steps=>5}})',
+            strict=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "message"),
+    [
+        ("simulate_nf({continue=>1,t_end=>20,n_steps=>10})", "NFsim does not take continue"),
+        ('simulate({method=>"nf",continue=>1,t_end=>20,n_steps=>10})', "does not take continue"),
+        ("simulate_nf({t_end=>10})", "needs n_steps of 1 or more"),
+        ("simulate_nf({t_end=>10,n_output_steps=>10})", "needs n_steps of 1 or more"),
+        ("simulate_nf({t_end=>10,n_steps=>0})", "needs n_steps of 1 or more"),
+        ("simulate_nf({t_start=>10,t_end=>5,n_steps=>5})", r"needs t_end > t_start"),
+    ],
+    ids=["continue", "method-nf-continue", "no-n_steps", "n_output_steps", "zero-steps", "t_end"],
+)
+def test_what_simulate_nf_refuses_is_refused(action, message):
+    with pytest.raises(ConversionError, match=message):
+        _parse(action, strict=False)
+
+
+def test_simulate_nf_ignores_n_output_steps_beside_n_steps():
+    (exp,) = _only("simulate_nf({t_end=>10,n_steps=>5,n_output_steps=>9})")
+    assert exp.n_points == 6
+
+
+def test_output_step_interval_is_lossy():
+    with pytest.raises(ConversionError, match=r"output_step_interval writes rows"):
+        _parse('simulate({method=>"ssa",t_end=>10,n_steps=>2,output_step_interval=>10})')
+
+
+def test_a_run_whose_t_end_is_not_past_its_start_leaves_the_model_time():
+    """BNG2.pl warns that such a run won't run, and the model time stays."""
+    *_, last = _only(
+        'simulate({method=>"ode",t_end=>10,n_steps=>10})',
+        'simulate({method=>"ode",continue=>1,t_end=>5,n_steps=>5})',
+        'simulate({method=>"ode",continue=>1,t_start=>10,t_end=>20,n_steps=>5})',
+    )
+    assert last.t_span == (10.0, 20.0)
 
 
 def test_an_nf_scan_after_a_run_starts_only_its_first_point_there():

@@ -470,7 +470,7 @@ def parse_bngl_protocol(source: str | Path, *, strict: bool = True) -> ProtocolS
     network_gen: str | None = None
     # BNG2.pl's model time, which a ``continue=>1`` or nf run starts from: 0 at
     # load, and the end of each simulate after it (``BNGAction.pm``:
-    # ``$model->Time``), or 0 after an nf run, which leaves it undefined. None
+    # ``$model->Time``), or NaN after an nf run, which leaves it undefined. None
     # once a run's end cannot be known without running it (issue #1364).
     model_time: float | None = 0.0
     for verb, argstr in _iter_action_calls(text):
@@ -739,12 +739,13 @@ def _build_experiment(
     The time course follows BNG2.pl's ``simulate`` (``BNGAction.pm``, issue
     #1364): ``continue=>1`` starts at the model time, where an earlier run
     ended, and a ``t_start`` that is not it is refused; ``simulate_nf`` starts
-    there with or without ``continue``, and leaves it undefined, which a later
-    start reads as 0. ``n_output_steps`` is ``n_steps``, both
-    is an error, and neither is one step. ``sample_times`` sets the output times
-    where neither is given: ``t_start``, the samples after it, and the end, a
-    given ``t_end`` or else the last sample; fewer than three is an error. A
-    run that can stop early (``steady_state``, ``stop_if``) leaves the model
+    there, leaves it undefined, which a later start reads as 0, and refuses
+    ``continue``, a missing ``n_steps`` and a ``t_end`` not past ``t_start``.
+    ``n_output_steps`` is ``n_steps`` (but not for nf), both is an error, and
+    neither is one step. ``sample_times`` sets the output times where neither
+    is given: ``t_start``, the samples after it, and the end, a given ``t_end``
+    or else the last sample; fewer than three is an error. A run that can stop
+    early (``steady_state``, ``stop_if``, ``max_sim_steps``) leaves the model
     time unknown. A scan reads ``par_scan_vals``, in their order, unless
     ``par_min``, ``par_max`` and ``n_scan_pts`` are all given. A grid the IR's
     uniform ``(t_span, n_points)`` and a scan its ``(min, max, points, log)``
@@ -757,19 +758,31 @@ def _build_experiment(
 
     nf = method == "nf"
     continued = _as_bool(args.get("continue", 0))
+    if nf and continued:
+        raise ConversionError(f"{verb}: NFsim does not take continue=>1; BNG2.pl refuses it")
+    # NaN is BNG2.pl's undefined model time, after an nf run: a start reads it as
+    # 0, and a continuation that names its t_start is refused.
+    undefined = model_time is not None and math.isnan(model_time)
     t_start = _num_or(args.get("t_start"), None)
-    from_model_time = t_start is None and (continued or (nf and "t_start" not in args))
-    if t_start is not None:
-        if (
-            continued
-            and model_time is not None
-            and not math.isclose(t_start, model_time, rel_tol=1e-9, abs_tol=1e-12)
-        ):
-            raise ConversionError(
-                f"{verb}: continue=>1 with t_start={t_start:g}, but the model time is "
-                f"{model_time:g}; BNG2.pl refuses a continuation that does not start there"
+    if (
+        continued
+        and "t_start" in args
+        and model_time is not None
+        and (
+            undefined
+            or (
+                t_start is not None
+                and not math.isclose(t_start, model_time, rel_tol=1e-9, abs_tol=1e-12)
             )
-    elif from_model_time:
+        )
+    ):
+        now = "undefined after an nf run" if undefined else f"{model_time:g}"
+        raise ConversionError(
+            f"{verb}: continue=>1 with t_start={args['t_start']}, but the model time is "
+            f"{now}; BNG2.pl refuses a continuation that does not start there"
+        )
+    from_model_time = t_start is None and (continued or (nf and "t_start" not in args))
+    if from_model_time:
         # A continuation's unreadable t_start can only be the model time: BNG2.pl
         # refuses any other.
         if model_time is None:
@@ -778,20 +791,40 @@ def _build_experiment(
                 f"{starter} starts at the model time, which an earlier action leaves "
                 "unknown; taken as 0"
             )
-        t_start = model_time if model_time is not None else 0.0
-    else:
+        t_start = 0.0 if model_time is None or undefined else model_time
+    elif t_start is None:
         t_start = 0.0
 
-    if "n_steps" in args and "n_output_steps" in args:
-        raise ConversionError(
-            f"{verb}: 'n_steps' and 'n_output_steps' are the same argument; BNG2.pl refuses both"
-        )
-    steps_arg = args.get("n_steps", args.get("n_output_steps"))
+    if nf:
+        # simulate_nf reads n_steps alone (n_output_steps is not one of its
+        # arguments), and refuses a run with no output to write.
+        steps_arg = args.get("n_steps")
+        n_read = _num_or(steps_arg, None)
+        if (steps_arg is None and "sample_times" not in args) or (
+            n_read is not None and n_read < 1
+        ):
+            raise ConversionError(
+                f"{verb}: an nf run needs n_steps of 1 or more; BNG2.pl refuses it without"
+            )
+    else:
+        if "n_steps" in args and "n_output_steps" in args:
+            raise ConversionError(
+                f"{verb}: 'n_steps' and 'n_output_steps' are the same argument; "
+                "BNG2.pl refuses both"
+            )
+        steps_arg = args.get("n_steps", args.get("n_output_steps"))
     # ``t_end`` may be absent or a parameter-referencing expression we can't
     # resolve without the model; leave it == t_start so the experiment carries
     # no numeric horizon and the gate falls back to its blanket grid.
     t_end = _num_or(args.get("t_end"), None)
     t_end_unread = "t_end" in args and t_end is None
+    if nf and t_end is not None and t_end <= t_start:
+        raise ConversionError(
+            f"{verb}: an nf run needs t_end > t_start, not ({t_start:g}, {t_end:g}); "
+            "BNG2.pl refuses it"
+        )
+    if "output_step_interval" in args:
+        reasons.append("output_step_interval writes rows between the grid's times")
     if steps_arg is None and "sample_times" in args:
         samples = _num_list(args.get("sample_times"))
         if samples is not None and len(samples) < 3:
@@ -823,15 +856,22 @@ def _build_experiment(
         n_points = max(n_steps + 1, 1)
     if t_end is None:
         t_end = t_start
-    # BNG2.pl's model time is the end the run reached: unknown for a t_end the
-    # parse cannot read, or for a run that can stop early, at a steady state or
-    # when its stop_if holds. simulate_nf leaves it undefined (its n_steps branch
-    # declares a second ``my $t_end``), which the next run's start reads as 0.
-    stops_early = _as_bool(args.get("steady_state", 0)) or bool(args.get("stop_if"))
+    # BNG2.pl's model time is the last time the run wrote: unknown for a t_end
+    # the parse cannot read, or for a run that can stop early (at a steady state,
+    # when its stop_if holds, or at max_sim_steps), and t_start for one that
+    # does not run because its t_end is not past it. simulate_nf leaves it
+    # undefined (its n_steps branch declares a second ``my $t_end``).
+    stops_early = (
+        _as_bool(args.get("steady_state", 0))
+        or bool(args.get("stop_if"))
+        or "max_sim_steps" in args
+    )
     if nf:
-        after: float | None = 0.0
+        after: float | None = math.nan
+    elif t_end_unread or stops_early:
+        after = None
     else:
-        after = None if t_end_unread or stops_early else t_end
+        after = max(t_start, t_end)
 
     consumed = {
         "method",
@@ -851,7 +891,11 @@ def _build_experiment(
     }
     # ``continue`` stays in ``extra``: re-emitted beside the t_start it implies,
     # which BNG2.pl accepts (it checks the two agree), it keeps a phased run
-    # appending to one output file (convert/_events.py writes such phases).
+    # appending to one output file (convert/_events.py writes such phases). From
+    # an undefined model time it starts at 0 like any run, and BNG2.pl would
+    # refuse it beside that t_start, so it is not kept.
+    if continued and undefined:
+        consumed.add("continue")
     extra = {k: v for k, v in args.items() if k not in consumed}
 
     if kind == "scan":
