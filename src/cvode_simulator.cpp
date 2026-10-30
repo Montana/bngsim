@@ -121,6 +121,23 @@ static void select_spent_batch_handler(SUNContext ctx) {
     }
 }
 
+// Whether CVODE's last step spans `t`: CVodeGetDky's own test, fuzz and all,
+// so true exactly where CVODE can interpolate to it (issue #1301).
+static bool inside_last_step(void *cvode_mem, sunrealtype t) {
+    sunrealtype tn = 0.0;
+    sunrealtype hu = 0.0;
+    CVodeGetCurrentTime(cvode_mem, &tn);
+    CVodeGetLastStep(cvode_mem, &hu);
+    sunrealtype fuzz =
+        100.0 * std::numeric_limits<sunrealtype>::epsilon() * (std::fabs(tn) + std::fabs(hu));
+    if (hu < 0.0) {
+        fuzz = -fuzz;
+    }
+    const sunrealtype tp = tn - hu - fuzz;
+    const sunrealtype tn1 = tn + fuzz;
+    return !((t - tp) * (t - tn1) > 0.0);
+}
+
 // Retry a CV_TOO_MUCH_WORK return, but only while the integrator is still
 // getting somewhere (issue #54).
 //
@@ -299,6 +316,37 @@ struct NonFiniteWitness {
 // symbols, and two hand-maintained copies of an ABI struct diverge silently.
 // The nested aliases below keep the historical CvodeUserData::Codegen*Fn spelling.
 
+// The band the tolerance leaves a residual, from its n terms |∂g/∂x_j|·u_j,
+// term(s) for s < n (issue #907): added in quadrature, which is what the WRMS
+// error test bounds, |Σ_j ∂g/∂x_j·e_j| ≤ √N·sqrt(Σ_j (∂g/∂x_j·u_j)²), and not
+// one by one, which let an observable over a thousand species carry a thousand
+// atols. Scaled by the largest term, so that no square under- or overflows and
+// a residual of one species reads |∂g/∂x|·u to the bit. A term that is not a
+// finite number is returned as the sum was. Each term is asked for twice.
+template <class TermFn> static double state_switch_band(std::size_t n, TermFn term) {
+    double largest = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = term(i);
+        if (!std::isfinite(v)) {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < n; ++k) {
+                sum += term(k);
+            }
+            return sum;
+        }
+        largest = std::max(largest, v);
+    }
+    if (!(largest > 0.0)) {
+        return 0.0;
+    }
+    double squares = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double r = term(i) / largest;
+        squares += r * r;
+    }
+    return largest * std::sqrt(squares);
+}
+
 // ─── Chattering state-switch roots held off the root search (issue #908) ─────
 //
 // A state that slides along a state-switch surface crosses it on most steps,
@@ -358,6 +406,9 @@ struct StateSwitchHold {
     // How far each held residual's crossings have been searched and tested.
     std::vector<double> tested_to;
     double rtol = 0.0;
+    // The run's tracking atol, which the band reads where it is on (issue #907).
+    // Held by value: inactive (empty) until run() copies the run's in.
+    AtolTracking tracking;
     int n_held = 0;
     // The run's logger, while a hold has its error log in the null sink.
     SUNLogger muted = nullptr;
@@ -396,13 +447,16 @@ struct StateSwitchHold {
         if (!std::isfinite(g)) {
             return g;
         }
-        double band = 0.0;
+        const std::vector<Term> &held_terms = terms[j];
         double room = 1.0;
-        for (const Term &k : terms[j]) {
-            const double xs = x[k.species];
-            band += k.weight * (rtol * std::fabs(xs) + k.atol);
-            room = std::min(room, 1.0 - std::fabs(xs - k.x0) / k.drift);
+        for (const Term &k : held_terms) {
+            room = std::min(room, 1.0 - std::fabs(x[k.species] - k.x0) / k.drift);
         }
+        const double band = state_switch_band(held_terms.size(), [&](std::size_t s) {
+            const Term &k = held_terms[s];
+            return k.weight * tolerance_unit(tracking, rtol, k.atol,
+                                             static_cast<std::size_t>(k.species), x[k.species]);
+        });
         if (!(band > 0.0)) {
             return -1.0;
         }
@@ -3885,8 +3939,8 @@ struct CvodeSimulator::Impl {
     bool flow_carries_state_switch(void *cvode_mem, double t, const double *x, int ns,
                                    const NetworkModel::StateSwitch &sw, int dir, double t_end,
                                    N_Vector scratch, double rtol, double atol,
-                                   const std::vector<double> &atol_v, bool reads_time,
-                                   bool *resolved = nullptr,
+                                   const std::vector<double> &atol_v, const AtolTracking &tracking,
+                                   bool reads_time, bool *resolved = nullptr,
                                    std::vector<double> *grad_out = nullptr);
 };
 
@@ -10051,13 +10105,11 @@ static constexpr double kStateSwitchHoldGradKept = 0.75;
 // its box costs (4n + 2) * 2n evaluations.
 static constexpr std::size_t kStateSwitchHoldMaxSpecies = 16;
 
-bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, const double *x,
-                                                     int ns, const NetworkModel::StateSwitch &sw,
-                                                     int dir, double t_end, N_Vector scratch,
-                                                     double rtol, double atol,
-                                                     const std::vector<double> &atol_v,
-                                                     bool reads_time, bool *resolved_out,
-                                                     std::vector<double> *grad_out) {
+bool CvodeSimulator::Impl::flow_carries_state_switch(
+    void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
+    int dir, double t_end, N_Vector scratch, double rtol, double atol,
+    const std::vector<double> &atol_v, const AtolTracking &tracking, bool reads_time,
+    bool *resolved_out, std::vector<double> *grad_out) {
     // A trajectory that CROSSES the surface arrives at it with a flow that stays
     // finite as the surface is approached. One that only approaches it, parked
     // beside it or relaxing onto it, arrives with a flow that vanishes there, so
@@ -10086,10 +10138,18 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
     // 0.16 off, silently, where main is right. So first the crossing has to be
     // RESOLVED: somewhere between the root and the end of the step, the
     // solver's own trajectory (CVODE's interpolant, sampled) must go beyond the
-    // surface by more than the band the tolerance leaves the residual,
-    //     δg = Σ_j |∂g/∂x_j|·(rtol·|x_j| + atol_j),
-    // times 10·√N, because the WRMS error test lets a single component carry
-    // √N of the tolerance. A crossing inside that band is one the requested
+    // surface by more than the bar, 10·√N times the band the tolerance leaves
+    // the residual,
+    //     δg = sqrt(Σ_j (∂g/∂x_j·u_j)²),
+    // because the WRMS error test lets a single component carry √N of the
+    // tolerance. u_j is what the error weight's own rule holds x_j to there,
+    // rtol·|x_j| + atol_j, a tracking atol's where the run tracks (and then no
+    // tighter than the weights the step was tested with); and the terms add in
+    // quadrature, which is what the WRMS norm bounds (issue #907). Read from
+    // the run's ceiling, the bar lost a 5e-9 window of a species held to
+    // 2e-14; summed one by one over an observable of a thousand species of
+    // 1e-3, the band was 1e-5 and the bar 3.2e-3, past the window's whole
+    // excursion of 1e-3. A crossing inside the bar is one the requested
     // tolerance cannot decide, and it steps on. The whole step is sampled
     // rather than its end: a window can open and close inside one step, and a
     // curved residual (3u − u³) can cross and come back, so the end may be on
@@ -10160,8 +10220,37 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
     bool resolved = false;
     if (t_end > t) {
         const double span = t_end - t;
-        auto atol_of = [&](int j) {
-            return atol_v.empty() ? atol : atol_v[static_cast<std::size_t>(j)];
+        // What species j is held to at x_j (issue #907): the error weight's own
+        // rule, so a tracking atol's, not its ceiling's. A tracking atol moves
+        // with the state, and CVODE tested the step with the weights it held at
+        // the step's start; read at a state the species has fallen to since,
+        // the rule alone could hold it tighter than CVODE did. So under
+        // tracking the unit is no narrower than those weights. Without
+        // tracking the atol floors both, and the rule alone is main's band.
+        // The weights land in scratch, which nothing has read yet, and are
+        // copied out before the first reading writes it.
+        std::vector<double> step_unit;
+        if (tracking.active() && CVodeGetErrWeights(cvode_mem, scratch) == CV_SUCCESS) {
+            const double *w = N_VGetArrayPointer(scratch);
+            step_unit.assign(static_cast<std::size_t>(ns), 0.0);
+            for (int i = 0; i < ns; ++i) {
+                step_unit[static_cast<std::size_t>(i)] =
+                    w[i] > 0.0 ? 1.0 / w[i] : std::numeric_limits<double>::infinity();
+            }
+        }
+        auto unit_of = [&](int j, double xj) {
+            const auto uj = static_cast<std::size_t>(j);
+            const double u =
+                tolerance_unit(tracking, rtol, atol_v.empty() ? atol : atol_v[uj], uj, xj);
+            return step_unit.empty() ? u : std::max(u, step_unit[uj]);
+        };
+        // The residual's band at x: |∂g/∂x_j|·u_j over its species, added in
+        // quadrature (state_switch_band).
+        auto band_at = [&](const double *xs) {
+            return state_switch_band(sw.species.size(), [&](std::size_t s) {
+                const int j = sw.species[s];
+                return std::fabs(grad[static_cast<std::size_t>(j)]) * unit_of(j, xs[j]);
+            });
         };
         // The excursion at t + d and the k_resolve bands it has to clear there.
         struct Reading {
@@ -10181,12 +10270,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
             const double *xk = N_VGetArrayPointer(scratch);
             sync_model_at(tk, xk, ns);
             r.excursion = eval.evaluate(sw.residual_expr_idx) * static_cast<double>(dir);
-            double band = 0.0;
-            for (int j : sw.species) {
-                band += std::fabs(grad[static_cast<std::size_t>(j)]) *
-                        (rtol * std::fabs(xk[j]) + atol_of(j));
-            }
-            r.bar = k_resolve * band;
+            r.bar = k_resolve * band_at(xk);
             resolved = std::isfinite(r.excursion) && r.excursion > r.bar;
             return r;
         };
@@ -10227,11 +10311,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
                     taylor.push_back(std::fabs(xm[sw.species[s]]) / factorial);
                 }
             }
-            double band_root = 0.0;
-            for (int j : sw.species) {
-                band_root += std::fabs(grad[static_cast<std::size_t>(j)]) *
-                             (rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j));
-            }
+            const double band_root = band_at(xv.data());
             // dg/dt at the root's state, the clock's own term, read once. On its
             // own surface h(t)·(S − thr) reads 0 here; what h does over a reach
             // in which S moves less than its band is second order.
@@ -10248,8 +10328,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
                         dm *= d;
                         reach += taylor[static_cast<std::size_t>(m - 1) * n_read + s] * dm;
                     }
-                    if (!(reach <=
-                          rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j))) {
+                    if (!(reach <= unit_of(j, xv[static_cast<std::size_t>(j)]))) {
                         return true;
                     }
                 }
@@ -14378,6 +14457,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         state_switch_hold.run.assign(n_ss, 0);
         state_switch_hold.last_step.assign(n_ss, 0);
         state_switch_hold.rtol = rtol;
+        state_switch_hold.tracking = user_data.atol_tracking;
         user_data.state_switch_hold = &state_switch_hold;
     }
     const int n_roots = n_events + n_disc + n_state_switch;
@@ -15940,11 +16020,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
     // Record initial sensitivities. Param cols are zero at t=0 for a fresh
     // start (or the carried-over dx/dθ seed under carry_sensitivities, GH
-    // #210); IC cols are e_k at t=0 (seeded above).
+    // #210); IC cols are e_k at t=0 (seeded above). The seed is kept for a row
+    // recorded before the first step (issue #1301, below).
+    std::vector<double> sens_seed;
     if (n_sens > 0) {
         std::vector<const double *> sens_ptrs(n_sens);
         for (int s = 0; s < n_sens; ++s) {
             sens_ptrs[s] = N_VGetArrayPointer(yS_guard[s]);
+            sens_seed.insert(sens_seed.end(), sens_ptrs[s], sens_ptrs[s] + ns);
         }
         if (n_sens_p > 0) {
             result.record_sensitivities(0, sens_ptrs.data(), ns, n_sens_p);
@@ -16951,6 +17034,34 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     },
                     carry_if_pinned, watch ? static_cast<long>(max_steps) : 0L, steps_at_call);
             }
+            // CV_NORMAL returns tout by interpolating to it in its last step and
+            // does not check that the interpolation succeeded: where that step
+            // does not span tout, `y` is left as the call before had it (issue
+            // #1301). Unpatched CVODES got there by stepping past a state the
+            // RHS refused without correcting the step, so the run is refused,
+            // not read where it stands. Asked of the retry's return too.
+            if (flag == CV_SUCCESS && sens.n_total > 0 &&
+                (t_ret == look_tout || t_ret == t_target) && !inside_last_step(cvode_mem, t_ret)) {
+                sunrealtype tn = 0.0;
+                sunrealtype hu = 0.0;
+                CVodeGetCurrentTime(cvode_mem, &tn);
+                CVodeGetLastStep(cvode_mem, &hu);
+                std::ostringstream msg;
+                msg << std::setprecision(17) << "CVODES returned the output time t=" << t_ret
+                    << " from a step [" << (tn - hu) << ", " << tn
+                    << "] that does not span it, so the state there was never read. "
+#ifdef BNGSIM_SUNDIALS_CARRIES_1301
+                    << "This build carries the lanl/bngsim#1301 fix that should prevent it "
+                       "(unless BNGSIM_SUNDIALS_STAGGERED_RESTORE=0 turned it off); please "
+                       "report the model."
+#else
+                    << "This build uses a system SUNDIALS without the lanl/bngsim#1301 fix "
+                       "to its staggered sensitivity corrector; build with the fetched "
+                       "SUNDIALS, or pass sensitivity_method=\"simultaneous\"."
+#endif
+                    ;
+                throw std::runtime_error(msg.str());
+            }
             // Issue #998: after a root or a stop CVODE returned on, it reports
             // the step it took (or cut to end on the stop) as the next one, not
             // the one it takes (cv_hprime), until it takes another; a
@@ -17093,7 +17204,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     if (impl_->flow_carries_state_switch(
                             cvode_mem, hi, x_root.data(), ns, *state_switches[jx], side_here,
                             static_cast<double>(t_step_end), samples, rtol, atol, atol_v,
-                            state_switch_hold.reads_time[jx] != 0)) {
+                            user_data.atol_tracking, state_switch_hold.reads_time[jx] != 0)) {
                         t_restart = hi;
                         x_restart = x_root;
                     }
@@ -17619,7 +17730,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             if (impl_->flow_carries_state_switch(
                                     cvode_mem, t_root, y_data, ns, *state_switches[jx],
                                     root_info[n_events + n_disc + j], static_cast<double>(t_end),
-                                    scratch, rtol, atol, atol_v,
+                                    scratch, rtol, atol, atol_v, user_data.atol_tracking,
                                     state_switch_hold.reads_time[jx] != 0, &resolved, &grad)) {
                                 restart = true;
                                 break;
@@ -17645,7 +17756,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             const NetworkModel::StateSwitch &sw = *state_switches[jx];
                             const double k_resolve = state_switch_resolve_factor(ns);
                             std::vector<StateSwitchHold::Term> terms;
-                            double band = 0.0;
+                            std::vector<double> units; // each term's tolerance_unit at x0
                             bool measurable = true;
                             for (int sp : sw.species) {
                                 const auto sx = static_cast<size_t>(sp);
@@ -17660,12 +17771,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                 term.weight = w;
                                 term.atol = atol_v.empty() ? atol : atol_v[sx];
                                 term.x0 = y_data[sp];
-                                term.drift = kStateSwitchHoldShare * k_resolve *
-                                             (rtol * std::fabs(term.x0) + term.atol);
+                                const double unit = tolerance_unit(user_data.atol_tracking, rtol,
+                                                                   term.atol, sx, term.x0);
+                                term.drift = kStateSwitchHoldShare * k_resolve * unit;
                                 measurable = measurable && term.drift > 0.0;
-                                band += w * (rtol * std::fabs(term.x0) + term.atol);
                                 terms.push_back(term);
+                                units.push_back(unit);
                             }
+                            // Half the restart test's band at the root (issue #907):
+                            // the error weight's rule, in quadrature. Under a
+                            // tracking atol the test also floors each unit at the
+                            // step's error weights and this does not, so it is at
+                            // most half, the side that keeps the band under the
+                            // test's.
+                            const double band = state_switch_band(terms.size(), [&](std::size_t s) {
+                                return terms[s].weight * units[s];
+                            });
                             // flow_carries_state_switch left the model at the root.
                             const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
                             if (terms.empty() || !measurable || !(band > 0.0) ||
@@ -18423,7 +18544,35 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
-            flag = CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
+            // Read at the row's own time. CVodeGetSens reads at the time CVODES
+            // last returned, whatever this row was recorded at. A row recorded
+            // before the first step (a start time named twice) is the seed row
+            // 0 recorded: CVODES has no step size yet, and its interpolation
+            // divides 0 by 0. Not after a restart, which may have moved the
+            // columns; there the read below refuses the nan.
+            long steps_now = 0;
+            CVodeGetNumSteps(cvode_mem, &steps_now);
+            if (steps_now == 0 && impl_->closed_segments.steps == 0 &&
+                std::isnan(user_data.last_restart_t)) {
+                for (int s = 0; s < n_sens; ++s) {
+                    std::copy(sens_seed.begin() + static_cast<std::ptrdiff_t>(s) * ns,
+                              sens_seed.begin() + static_cast<std::ptrdiff_t>(s + 1) * ns,
+                              N_VGetArrayPointer(yS_guard[s]));
+                }
+                flag = CV_SUCCESS;
+            } else {
+                flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            }
+            if (flag != CV_SUCCESS) {
+                // A row whose sensitivities cannot be read is refused, never
+                // recorded as the zeros the buffer starts as, which read as a
+                // sensitivity of 0 (issue #1301).
+                std::ostringstream msg;
+                msg << "CVODES could not read the sensitivities at the output point t="
+                    << std::setprecision(17) << static_cast<double>(t_ret) << " (index " << i
+                    << "), flag " << flag << ": its interpolation does not reach that time.";
+                throw std::runtime_error(msg.str());
+            }
             if (flag == CV_SUCCESS) {
                 std::vector<const double *> sens_ptrs(n_sens);
                 for (int s = 0; s < n_sens; ++s) {
