@@ -1368,9 +1368,9 @@ def check_batch(base: Base) -> Verdict:
 def contested(rows: dict[str, dict]) -> bool:
     """Whether a model's rows mark it contested: its ``stable`` row reads DIFF
     (the answer jumps under a jittered grid or tolerance), or a DIFF's third
-    arms split between its two sides (#1304's BIOMD0000000338: KLU at a
-    hundredfold tighter tolerance sides with KLU, the dense solver and
-    libRoadRunner with dense). Its DIFFs are real but unattributed, its PASSes
+    arms split between its two sides (#1304's BIOMD0000000339: KLU at a
+    hundredfold tighter tolerance sides with KLU, the dense solver with
+    dense). Its DIFFs are real but unattributed, its PASSes
     luck. ``rows`` maps a check to ``{"status", "extra"}``, as a report holds
     them."""
     for check, row in rows.items():

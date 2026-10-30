@@ -1883,18 +1883,23 @@ def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
     assert v.status == "diff" and "n_points+1" in v.note, v
 
 
-_B338 = _ROOT / "parity_checks/rr_parity/models/BIOMD0000000338/BIOMD0000000338_url.xml"
+_B339 = _ROOT / "parity_checks/rr_parity/models/BIOMD0000000339/BIOMD0000000339_url.xml"
 
 
 @pytest.mark.skipif(
-    not _B338.exists(), reason="rr_parity corpus model BIOMD0000000338 not present"
+    not _B339.exists(), reason="rr_parity corpus model BIOMD0000000339 not present"
 )
 @pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
 def test_1304s_model_reads_contested_with_each_arms_side_named():
-    """#1304: KLU reads Fg 311 at t = 2 and dense 0.73. The base runs on KLU,
-    so the KLU route at a hundredfold tighter tolerance sides with KLU, and
-    the dense solver with dense: split, contested."""
-    job = D.Job("BIOMD0000000338", _B338, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
+    """#1304: past the step-size collapse KLU and the dense solver take
+    different branches, 1.8e-2 of the trajectory's peak apart on 339. The base
+    runs on KLU, so the KLU route at a hundredfold tighter tolerance sides with
+    KLU, and the dense solver with dense: split, contested.
+
+    Not 338 any more: its dense run (the 0.73 against KLU's 311) was the clamp
+    holding XIIa at its pole, and that run is now refused (#135, see
+    test_clamp_far_below_zero.py), so there is no difference to attribute."""
+    job = D.Job("BIOMD0000000339", _B339, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
     v = D.check_all(job, None, ("klu_vs_dense",))["klu_vs_dense"]
     assert v.status == "diff", v
     a = v.extra["attribution"]
