@@ -18314,10 +18314,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                     (sens.n_total > 0 && static_cast<double>(t_now) < t_out[i]))) {
             // A run with sensitivity columns takes the row as reached from up
             // to 1e-12 short of it after a step (reached_output), and is read
-            // ahead the same way from there (issue #1276). Stopped that close
-            // before the sample by another root, it never read ahead, and the
-            // row held the state from before an event that crosses at the
-            // sample, where the run without columns held it after.
+            // ahead from there too, by a step of f (issue #1276). Stopped that
+            // close before the sample by another root, it never read ahead,
+            // and the row held the state from before an event that crosses at
+            // the sample, where the run without columns held it after.
             const bool short_of_row = static_cast<double>(t_now) < t_out[i];
             // An output CVODE interpolated to, from a step that went past it,
             // with a trigger on the state that crosses within CVODE's root
@@ -18355,31 +18355,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // read ahead on q' = +1 it crossed 2.5 and fired a trigger that
             // never rises). So the state ahead is a step of f at the row's own
             // state there.
+            //
+            // Short of the row, CVODE's history ends where the run stands, and
+            // CVodeGetDky refuses a time past it; within 1e-12 of the row, a
+            // step of f from there is the state ahead to well inside the
+            // tolerances. So the step is taken from where the run stands.
             bool read_ahead = true;
-            if (short_of_row) {
-                // CVODE's history ends where the run stands, which is short of
-                // the row: past it, CVodeGetDky refuses the time. Within 1e-12
-                // of it, a step of f is the state there to well inside the
-                // tolerances.
-                std::vector<double> f_now(static_cast<size_t>(ns), 0.0);
+            if (short_of_row || h_last == 0.0) {
+                const double t_base = short_of_row ? static_cast<double>(t_now) : t_out[i];
+                std::vector<double> f_base(static_cast<size_t>(ns), 0.0);
                 for (int si = 0; si < ns; ++si) {
                     sp_vec_outer[si].concentration = y_data[si];
                 }
-                model.compute_derivs(static_cast<double>(t_now), y_data, f_now.data());
+                model.compute_derivs(t_base, y_data, f_base.data());
                 double *x_step = row_ahead.data();
                 for (int si = 0; si < ns; ++si) {
-                    x_step[si] = y_data[si] + (t_ahead - static_cast<double>(t_now)) *
-                                                  f_now[static_cast<size_t>(si)];
-                }
-            } else if (h_last == 0.0) {
-                std::vector<double> f_row(static_cast<size_t>(ns), 0.0);
-                for (int si = 0; si < ns; ++si) {
-                    sp_vec_outer[si].concentration = y_data[si];
-                }
-                model.compute_derivs(t_out[i], y_data, f_row.data());
-                double *x_step = row_ahead.data();
-                for (int si = 0; si < ns; ++si) {
-                    x_step[si] = y_data[si] + (t_ahead - t_out[i]) * f_row[static_cast<size_t>(si)];
+                    x_step[si] = y_data[si] + (t_ahead - t_base) * f_base[static_cast<size_t>(si)];
                 }
             } else {
                 read_ahead = CVodeGetDky(cvode_mem, static_cast<sunrealtype>(t_ahead), 0,
