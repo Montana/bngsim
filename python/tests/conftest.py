@@ -225,7 +225,7 @@ def pytest_configure(config: pytest.Config) -> None:
 # The audience used to be the pre-push hook alone: every workflow pytest call was
 # a curated file list, so nothing in CI ran the full suite and only a local push
 # saw the whole table. Since issue #169 that is no longer true — python-tests.yml
-# runs `python/tests` as a directory on ubuntu + macos-14 and sets
+# runs `python/tests` as a directory on ubuntu + macos-15 and sets
 # BNGSIM_SKIP_AUDIT=strict, so an undeclared skip fails CI rather than printing a
 # `??` a developer may not read. The hook still prints the table on every push;
 # the difference is that the audit now has teeth on two platforms nobody is
