@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import time
 import warnings
@@ -193,6 +194,25 @@ def _tracking_hint(decades: float) -> str:
         f"the step size collapses instead. Try a smaller TrackingAtol(decades=...), "
         f"or a plain per-species atol."
     )
+
+
+_PACKAGE_DIR = os.path.dirname(__file__) + os.sep
+
+
+def _stacklevel_outside_bngsim() -> int:
+    """The ``stacklevel`` that puts a warning on the first frame outside bngsim.
+
+    For the function that calls this and then ``warnings.warn``. A fixed level
+    is right from one entry point only: the same warning reached through
+    ``run_until``, a scan or a :class:`~bngsim.ReactionKernel` would name a
+    line of bngsim's own, and every caller would share its one-shot slot.
+    """
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 # Process-wide one-shot guard for the dense-fallback notice, so a run_batch over
@@ -5300,7 +5320,8 @@ class Simulator:
         # stay on result.ssa_diagnostics regardless of warning filters. No-op on
         # non-SSA backends (counts are zero there).
         self._warn_ssa_boundary(result)
-        self._warn_atol_above_scale(result, atol)
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale([result], "ODE run")
 
         # Check stop conditions on the result
         if self._stop_conditions:
@@ -5320,51 +5341,81 @@ class Simulator:
     # that stays near 0 is rounding, 1e-17 of the rest, and is left alone.
     _ATOL_SCALE_RELEVANT = 1e-6
 
-    def _warn_atol_above_scale(self, result: Result, atol: AtolLike | None) -> None:
+    def _atol_is_default(self, atol: AtolLike | None) -> bool:
+        """Whether an ODE call given *atol* runs at the default scalar, which no
+        caller chose: neither the call nor :meth:`set_tolerances` gave one."""
+        return (
+            self._method == "ode"
+            and atol is None
+            and not self._atol_set
+            and self._atol_vec is None
+            and self._atol_track is None
+        )
+
+    def _warn_atol_above_scale(self, results: Iterable[Result], call: str) -> None:
         """Warn when the default scalar ``atol`` is above species that matter
-        in an ODE run (issue #1361).
+        in the ODE runs of one call (issue #1361).
 
         The default, ``1e-8``, is BNG2.pl's, for species held as molecule
         counts. A species whose every value on the run is below it has its
         error controlled by nothing but the tolerance: a binding model of
         species near 1e-9 M returned a concentration of -8.7e-10 for 4.1e-10 at
         t = 5000, and BIOMD0000000002, whose ligand is at 1e-5 M and whose
-        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Warned only where the
-        caller gave no ``atol`` (here or in :meth:`set_tolerances`), and only for
-        a species that reaches at least ``_ATOL_SCALE_RELEVANT`` of the largest
-        species of the run.
+        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Asked only where
+        :meth:`_atol_is_default` holds, and only of a species the solver
+        integrates that reaches at least ``_ATOL_SCALE_RELEVANT`` of the largest
+        such species of its run. A ``$``-fixed species or an assignment-rule
+        target (``species_is_fixed`` both) is no such species: its value is not
+        integrated, so no tolerance makes it wrong.
+
+        One warning per call, naming the species of every run: a scan or batch
+        of 100 rows is one hazard, not 100. The text carries nothing that moves
+        from run to run, so the warnings module shows it once per call site, and
+        a loop of ``run_until`` steps or a fit's evaluations does not repeat it.
         """
-        if self._method != "ode" or atol is not None or self._atol_set:
+        model = self._model._core
+        held = {
+            name
+            for name, fixed in zip(model.species_names, model.species_is_fixed, strict=True)
+            if fixed
+        }
+        found: dict[str, None] = {}  # ordered, and no list scan per species
+        for result in results:
+            species = np.asarray(result._species, dtype=np.float64)
+            if species.ndim != 2 or species.size == 0:
+                continue
+            free = np.array([n not in held for n in result._species_names], dtype=bool)
+            if free.size != species.shape[1]:
+                continue
+            # A non-finite sample is no scale; np.nanmax would also warn on a
+            # column that holds nothing else (an assignment rule at 1/0).
+            peaks = np.max(np.abs(species), axis=0, initial=0.0, where=np.isfinite(species))
+            largest = float(peaks.max(initial=0.0, where=free))
+            below = (
+                free
+                & (peaks > 0.0)
+                & (peaks < self._atol)
+                & (peaks >= self._ATOL_SCALE_RELEVANT * largest)
+            )
+            hits = zip(result._species_names, below, strict=True)
+            found.update((name, None) for name, hit in hits if hit)
+        if not found:
             return
-        if self._atol_vec is not None or self._atol_track is not None:
-            return
-        species = np.asarray(result._species, dtype=np.float64)
-        if species.ndim != 2 or species.size == 0:
-            return
-        with np.errstate(invalid="ignore"):
-            peaks = np.nanmax(np.where(np.isfinite(species), np.abs(species), np.nan), axis=0)
-        peaks = np.nan_to_num(peaks, nan=0.0)
-        largest = float(peaks.max())
-        below = (
-            (peaks < self._atol) & (peaks > 0.0) & (peaks >= self._ATOL_SCALE_RELEVANT * largest)
-        )
-        if not below.any():
-            return
-        names = [n for n, b in zip(result._species_names, below, strict=False) if b]
+        names = list(found)
         shown = ", ".join(repr(n) for n in names[:5]) + (
             f" and {len(names) - 5} more" if len(names) > 5 else ""
         )
         warnings.warn(
-            f"{len(names)} species of this ODE run stay below the absolute tolerance "
-            f"atol={self._atol:g} throughout (largest of them {float(peaks[below].max()):.3g}; "
-            f"the largest species reaches {largest:.3g}): {shown}. The run controls no "
-            "error of these, so their trajectories can be wrong by their own size, or "
-            "negative, with no solver error. The default atol is for species held as "
-            "molecule counts; for a model in molar or other small units, pass "
+            f"{len(names)} species of this {call} stay below the absolute tolerance "
+            f"atol={self._atol:g} throughout, while reaching at least "
+            f"{self._ATOL_SCALE_RELEVANT:g} of the largest species: {shown}. The run "
+            "controls no error of these, so their trajectories can be wrong by their own "
+            "size, or negative, with no solver error. The default atol is for species "
+            "held as molecule counts; for a model in molar or other small units, pass "
             "atol='auto' (a tolerance per species, from its scale), or a scalar atol "
             "well below these species (issue #1361).",
             AtolScaleWarning,
-            stacklevel=3,
+            stacklevel=_stacklevel_outside_bngsim(),
         )
 
     # ─── Batch ──────────────────────────────────────────────────────
@@ -5612,6 +5663,8 @@ class Simulator:
             results = [_run_one(i) for i in range(n_sims)]
 
         logger.info("Batch complete: %d results", len(results))
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale(results, "ODE batch")
 
         # Each row is stamped already, against its own clone (issues #698, #743).
         if squeeze:
@@ -6552,6 +6605,11 @@ class Simulator:
             self._restore_carryover_state(invocation_sens)
             self._recreate_interactive_sim()
 
+        # Every point ran at the frozen scan_atol, which run() cannot tell from
+        # an atol the caller chose; the call's own atol says (issue #1361).
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale(results, "ODE parameter scan")
+
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
         if squeeze:
@@ -7260,6 +7318,8 @@ class Simulator:
         # Carry the #198 support map so an unsupported expression selector raises
         # the specific reason on the stitched result too.
         stitched._expression_sens_support = self._expression_sens_support()
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale([stitched], "ODE sensitivity run")
         return stitched
 
     # GH #243 — how wide a failed chunk may be before the column-by-column retry

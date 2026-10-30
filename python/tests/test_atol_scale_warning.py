@@ -127,3 +127,86 @@ def test_ssa_is_not_warned():
         result = sim.run(t_span=(0, 1), n_points=3, seed=1)
     assert 0.0 < np.abs(np.asarray(result.species)).max() < 1e-8
     assert not [w for w in caught if issubclass(w.category, bngsim.AtolScaleWarning)]
+
+
+@pytest.mark.parametrize("call", ["parameter_scan", "run_batch", "compute_all_sensitivities"])
+def test_a_call_of_many_runs_is_warned_once(tmp_path, call):
+    """A scan froze the default into the float 1e-8 before run() saw it, and a
+    batch or a sensitivity tensor never asked: each returned the issue's
+    negative A with no word. One warning per call, at the caller's line."""
+    sim = _sim(tmp_path)
+    span = {"t_span": (0, 5000), "n_points": 51}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if call == "parameter_scan":
+            results = sim.parameter_scan("kr", [1e-3, 2e-3], **span)
+        elif call == "run_batch":
+            results = sim.run_batch(params=[{"kr": 1e-3}, {"kr": 2e-3}], **span)
+        else:
+            results = [sim.compute_all_sensitivities(**span)]
+    hits = [w for w in caught if issubclass(w.category, bngsim.AtolScaleWarning)]
+    assert np.asarray(results[0].species)[-1, 0] < 0.0
+    assert len(hits) == 1
+    assert "'A()'" in str(hits[0].message)
+    assert hits[0].filename == __file__
+
+
+def test_a_species_the_solver_does_not_integrate_is_not_named():
+    """A $-fixed species and an assignment-rule target below atol are exact
+    (or as good as their rule's inputs): no tolerance makes them wrong."""
+    pytest.importorskip("antimony")
+    for src, name in (
+        ("$L = 5e-9; X = 1e-3; k = 1; R: L -> X; k*L; D: X -> ; 0.1*X;", "L"),
+        ("species X = 1e-3; species Y; Y := 5e-6*X; D: X -> ; 0.1*X;", "Y"),
+    ):
+        sim = bngsim.Simulator(bngsim.Model.from_antimony_string(src), method="ode")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = sim.run(t_span=(0, 100), n_points=21)
+        peaks = np.abs(np.asarray(result.species)).max(axis=0)
+        # In the band a species the solver integrates is named for.
+        peak = peaks[result.species_names.index(name)]
+        assert 1e-6 * peaks.max() <= peak < 1e-8
+        assert not [w for w in caught if issubclass(w.category, bngsim.AtolScaleWarning)]
+
+
+def test_a_column_with_no_finite_value_adds_no_warning():
+    """np.nanmax warned 'All-NaN slice' on a reported column that is never
+    finite (an assignment rule at 1/0), and raised under -W error."""
+    pytest.importorskip("antimony")
+    src = "species X = 1e-3; species Y; z = 0; Y := 1/z; D: X -> ; 0.1*X;"
+    sim = bngsim.Simulator(bngsim.Model.from_antimony_string(src), method="ode")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = sim.run(t_span=(0, 10), n_points=3)
+    assert not np.isfinite(np.asarray(result.species)[:, 1]).any()
+    assert caught == []
+
+
+def test_the_steps_of_a_loop_are_warned_once(tmp_path):
+    """The text carries nothing that moves from run to run, so the default
+    filter shows it once at the caller's line; peaks in the text made 20
+    run_until steps print it 11 times, from a line of bngsim's own."""
+    sim = _sim(tmp_path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.resetwarnings()
+        warnings.simplefilter("default")
+        for step in range(1, 21):
+            sim.run_until(250.0 * step, n_points=3)
+    hits = [w for w in caught if issubclass(w.category, bngsim.AtolScaleWarning)]
+    assert len(hits) == 1
+    assert hits[0].filename == __file__
+
+
+def test_a_kernel_observables_probe_is_not_warned():
+    """ReactionKernel.observables() reads row 0 of a throwaway ODE run, on an
+    SSA kernel too; it warned about rows nothing reads."""
+    pytest.importorskip("antimony")
+    src = "compartment c = 1e10; species X in c; X = 1e-9; k = 0.1; R: X -> ; k*X;"
+    for method in ("ode", "ssa"):
+        kernel = bngsim.ReactionKernel(bngsim.Model.from_antimony_string(src), method=method)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            observables = kernel.observables()
+        assert np.allclose(observables, [1e-9])
+        assert not [w for w in caught if issubclass(w.category, bngsim.AtolScaleWarning)]
