@@ -2845,6 +2845,9 @@ struct ExecutedEventFire {
 // treat them as one instant (issue #737). The Python detector groups crossings
 // by the same reach (`_switch_sensitivity._same_instant`).
 constexpr double kSwitchInstantUlps = 64.0;
+// Issue #947: how many times the step back that tells a crossing from a jump
+// is doubled, past where a residual moves by less than its own rounding.
+constexpr int kHeldProbeDoublings = 20;
 // Issue #1025: a state crossing and a fire or a clock's switch, closer than
 // the window and further than one step's tolerances, are confirmed against a
 // plain run at 1/kOrderTighten of the tolerances. The window takes the
@@ -14899,7 +14902,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         }
     };
 
-    auto process_firing_batch = [&](double t_now, const std::vector<int> &firing_in) -> bool {
+    // `on_crossing` is false where the seeds were read true at the run's start
+    // rather than seen turning true (see held_strict below).
+    auto process_firing_batch = [&](double t_now, const std::vector<int> &firing_in,
+                                    bool on_crossing = true) -> bool {
         const bool any_due = t_now >= earliest_pending();
         if (firing_in.empty() && !any_due)
             return false;
@@ -14973,6 +14979,163 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // and delay. Read with the others at the start of the batch,
         // `at (time >= 2): X = Sn` beside `cv := piecewise(1, time < 2, 5)`
         // and [Sn] = 5 before it gave X = 5 where [Sn] at t = 2 is 1.
+        //
+        // Issue #947. A strict comparison and the non-strict one on the same
+        // residual that both turn true at one read were one batch. In exact
+        // arithmetic the non-strict one is true on the crossing and the strict
+        // one only past it, but the read lands on the crossing or a rounding
+        // past it, as the threshold rounds: `0.1*time > tau` beside `0.1*time
+        // >= tau`, by priority in one batch, left X at 0.50 for some tau and
+        // 0.15, the sequence, for the rest. So the strict one is held back to a
+        // second sub-instant of this one: it is triggered (its values from the
+        // trigger time and its delay read), and executes, once everything the
+        // first has triggered has settled, at the state that left.
+        //
+        // Only on a crossing: a step back along the run the non-strict trigger
+        // is false, and the residual moves over that step as it moves over the
+        // step before it. A residual that jumps there (a `piecewise` of the
+        // time, a function that switches) turns both true at one instant with
+        // none between, and they stay one batch. Not the loader's size jumps,
+        // on either side, which order their own instant (issue #1054).
+        std::vector<std::pair<int, int>> held_strict; // (strict, its non-strict twin)
+        if (on_crossing && firing_in.size() > 1) {
+            std::vector<int> pairable;
+            for (int ei : firing_in)
+                if (events_outer[ei].size_jump_compartment.empty())
+                    pairable.push_back(ei);
+            held_strict = model.strict_beside_non_strict(pairable);
+        }
+        if (!held_strict.empty()) {
+            // The state a step back is read from the integrator's interpolant
+            // over its last step, the trajectory that arrived here, and only
+            // past that along the flow here, which a rate law that switches on
+            // this instant no longer has.
+            const std::vector<double> x_now(y_data, y_data + ns);
+            std::vector<double> f; // read once, where the interpolant does not reach
+            sunrealtype h_last = 0.0;
+            sunrealtype t_cur = 0.0;
+            CVodeGetLastStep(cvode_mem, &h_last);
+            CVodeGetCurrentTime(cvode_mem, &t_cur);
+            const double step_from =
+                static_cast<double>(t_cur) - std::fabs(static_cast<double>(h_last));
+            NVectorGuard x_dky(N_VClone(y));
+            const double eps = std::numeric_limits<double>::epsilon();
+            const double delta0 =
+                2.0 *
+                std::max(100.0 * eps * (std::fabs(t_now) + std::fabs(static_cast<double>(h_last))),
+                         kSwitchInstantUlps * eps * std::max(std::fabs(t_now), 1.0));
+            std::vector<double> x_back(static_cast<std::size_t>(ns), 0.0);
+            auto back = [&](double d) {
+                const double tb = t_now - d;
+                if (h_last != 0.0 && tb >= step_from && tb <= static_cast<double>(t_cur) &&
+                    CVodeGetDky(cvode_mem, tb, 0, x_dky) == CV_SUCCESS) {
+                    impl_->sync_model_at(tb, x_dky.data(), ns);
+                    return;
+                }
+                if (f.empty()) {
+                    f.assign(static_cast<std::size_t>(ns), 0.0);
+                    model.compute_derivs(t_now, x_now.data(), f.data());
+                }
+                for (int si = 0; si < ns; ++si)
+                    x_back[static_cast<std::size_t>(si)] =
+                        x_now[static_cast<std::size_t>(si)] - d * f[static_cast<std::size_t>(si)];
+                impl_->sync_model_at(tb, x_back.data(), ns);
+            };
+            std::vector<std::pair<int, int>> crossing;
+            for (const auto &[ei, twin] : held_strict) {
+                // Where the residual moves by less than its own rounding over
+                // the first step back, or the twin is still true there, the
+                // step doubles, up to 2^kHeldProbeDoublings times the first.
+                const double g0 = residual_now(ei);
+                bool on_it = false;
+                double d = delta0;
+                for (int k = 0; k <= kHeldProbeDoublings && !on_it; ++k, d *= 2.0) {
+                    back(d);
+                    const bool twin_before =
+                        eval_ref_outer.evaluate(events_outer[twin].trigger_expr_idx) > 0.5;
+                    const double g1 = residual_now(ei);
+                    back(2.0 * d);
+                    const double g2 = residual_now(ei);
+                    const double d1 = g0 - g1;
+                    const double d2 = g1 - g2;
+                    on_it = !twin_before && d1 * d2 > 0.0 &&
+                            std::fabs(d1 - d2) <= 0.5 * std::max(std::fabs(d1), std::fabs(d2));
+                }
+                impl_->sync_model_at(t_now, x_now.data(), ns);
+                if (on_it)
+                    crossing.emplace_back(ei, twin);
+            }
+            held_strict = std::move(crossing);
+        }
+        // Still held: cleared where the trigger changes before the first
+        // sub-instant has settled, which then triggers it as any other event.
+        // Also where an event of the first moves its residual, which it reads
+        // true and is held at: on the crossing the residual is 0 and the
+        // strict trigger false, so a write that moves it raises it there, a
+        // cascade with the priority it has. Held to the end, `A > tau` of
+        // priority 5 ran after an event of priority 1 where one of priority
+        // 10 on `A >= tau` wrote `A = A + 1`, as the threshold rounded.
+        std::vector<char> held;
+        std::vector<double> held_at;
+        if (!held_strict.empty()) {
+            held.assign(static_cast<std::size_t>(n_events), 0);
+            held_at.assign(static_cast<std::size_t>(n_events), 0.0);
+            for (const auto &pair : held_strict) {
+                held[static_cast<std::size_t>(pair.first)] = 1;
+                held_at[static_cast<std::size_t>(pair.first)] = residual_now(pair.first);
+            }
+        }
+        // A held trigger triggered in a sensitivity run. Where it reads
+        // nothing the first sub-instant wrote and writes nothing it wrote, the
+        // sequence leaves what the batch left, and the sensitivity jump
+        // composes it as one of the batch. Otherwise it is a second jump at
+        // the instant, which has none.
+        auto refuse_held_jump = [&](int ei) {
+            if (sens.n_total == 0)
+                return;
+            std::vector<char> written(static_cast<std::size_t>(ns), 0);
+            for (std::size_t fi = batch_fires_from; fi < executed_fires.size(); ++fi)
+                for (const auto &asg : events_outer[executed_fires[fi].event_idx].assignments)
+                    if (asg.first >= 0 && asg.first < ns)
+                        written[static_cast<std::size_t>(asg.first)] = 1;
+            bool touches = false;
+            const Event &hev = events_outer[ei];
+            auto reads_written = [&](int expr) {
+                std::vector<int> reads;
+                model.expression_support(expr, &reads, nullptr);
+                return std::any_of(reads.begin(), reads.end(), [&](int j) {
+                    return j >= 0 && j < ns && written[static_cast<std::size_t>(j)];
+                });
+            };
+            for (std::size_t a = 0; a < hev.assignments.size(); ++a) {
+                const auto &asg = hev.assignments[a];
+                touches = touches || (asg.first >= 0 && asg.first < ns &&
+                                      written[static_cast<std::size_t>(asg.first)]);
+                touches = touches || reads_written(asg.second);
+                if (a < hev.assignment_rescale_size_expr.size() &&
+                    hev.assignment_rescale_size_expr[a] >= 0)
+                    touches = touches || reads_written(hev.assignment_rescale_size_expr[a]);
+            }
+            if (!touches)
+                return;
+            const auto pair = std::find_if(held_strict.begin(), held_strict.end(),
+                                           [&](const auto &p) { return p.first == ei; });
+            const int twin = pair != held_strict.end() ? pair->second : ei;
+            auto id_of = [&](int e) {
+                return events_outer[e].id.empty() ? std::to_string(e) : events_outer[e].id;
+            };
+            throw std::runtime_error(
+                "Forward sensitivity: event '" + id_of(ei) + "', a strict comparison, and event '" +
+                id_of(twin) +
+                "', the non-strict one on the same residual, turn true together on its crossing "
+                "at t=" +
+                diag_number(t_now) + ". The run triggers '" + id_of(ei) +
+                "' only once events of that instant have executed (issue #947), and '" + id_of(ei) +
+                "' reads or writes a species they wrote: a second state jump at the same "
+                "instant, which bngsim has no sensitivity jump to compose with the first (issue "
+                "#144). Separate the thresholds, or drop sensitivities for this run.");
+        };
+
         std::vector<ExecInstance> queue;
         queue.reserve(firing_in.size());
         const bool jumps_seeded =
@@ -14980,6 +15143,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 return !events_outer[ei].size_jump_compartment.empty();
             });
         for (int ei : firing_in) {
+            if (!held.empty() && held[static_cast<std::size_t>(ei)] != 0)
+                continue;
             if (jumps_seeded && events_outer[ei].size_jump_compartment.empty()) {
                 ExecInstance inst;
                 inst.event_idx = ei;
@@ -15117,8 +15282,26 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     ties.push_back(k);
                 }
             }
-            if (ties.empty())
+            if (ties.empty()) {
+                // The first sub-instant has settled: the strict comparisons
+                // held back are triggered now, at the state it left (issue
+                // #947), and drained as a second one.
+                bool queued_held = false;
+                for (const auto &pair : held_strict) {
+                    const int ei = pair.first;
+                    const auto hi = static_cast<std::size_t>(ei);
+                    if (held[hi] == 0 || !prev[hi])
+                        continue;
+                    held[hi] = 0;
+                    refuse_held_jump(ei);
+                    queue.push_back(make_instance(ei));
+                    queued_held = true;
+                }
+                held_strict.clear();
+                if (queued_held)
+                    continue;
                 break;
+            }
 
             // Random tie-break among equal-max-priority instances (GH #242).
             // A single candidate consumes no randomness (byte-identical to the
@@ -15452,6 +15635,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         // a trigger that one event dropped and the next raised
                         // again kept the execution it had lost (SBML §4.11.3).
                         drop_pending_of(ei);
+                    }
+                }
+                const auto hi = static_cast<std::size_t>(ei);
+                if (!held.empty() && held[hi] != 0) {
+                    if (now_true != was) {
+                        held[hi] = 0;
+                    } else if (now_true && residual_now(ei) != held_at[hi]) {
+                        // Raised by this write (see held_at): a cascade.
+                        held[hi] = 0;
+                        refuse_held_jump(ei);
+                        if (!ev.size_jump_compartment.empty()) {
+                            ExecInstance inst;
+                            inst.event_idx = ei;
+                            inst.delay = 0.0;
+                            inst.awaits_jumps = true;
+                            queue.push_back(std::move(inst));
+                        } else {
+                            queue.push_back(make_instance(ei));
+                        }
                     }
                 }
                 prev[ei] = now_true;
@@ -15879,7 +16081,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
 
             executed_fires.clear();
-            bool t0_immediate_fired = process_firing_batch(times.t_start, t0_firing);
+            bool t0_immediate_fired =
+                process_firing_batch(times.t_start, t0_firing, /*on_crossing=*/false);
 
             if (t0_immediate_fired) {
                 // Refresh observables/functions after t=0 fires so the
