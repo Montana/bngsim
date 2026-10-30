@@ -296,8 +296,17 @@ def test_a_continuation_naming_its_t_start_after_an_nf_run_is_refused(t_start):
         ("simulate_nf({t_end=>10,n_output_steps=>10})", "needs n_steps of 1 or more"),
         ("simulate_nf({t_end=>10,n_steps=>0})", "needs n_steps of 1 or more"),
         ("simulate_nf({t_start=>10,t_end=>5,n_steps=>5})", r"needs t_end > t_start"),
+        ("simulate_nf({n_steps=>5})", r"needs t_end;"),
     ],
-    ids=["continue", "method-nf-continue", "no-n_steps", "n_output_steps", "zero-steps", "t_end"],
+    ids=[
+        "continue",
+        "method-nf-continue",
+        "no-n_steps",
+        "n_output_steps",
+        "zero-steps",
+        "t_end-before-t_start",
+        "no-t_end",
+    ],
 )
 def test_what_simulate_nf_refuses_is_refused(action, message):
     with pytest.raises(ConversionError, match=message):
@@ -312,6 +321,12 @@ def test_simulate_nf_ignores_n_output_steps_beside_n_steps():
 def test_output_step_interval_is_lossy():
     with pytest.raises(ConversionError, match=r"output_step_interval writes rows"):
         _parse('simulate({method=>"ssa",t_end=>10,n_steps=>2,output_step_interval=>10})')
+
+
+def test_simulate_nf_has_no_output_step_interval():
+    """simulate_nf ignores it, and its rows are the n_steps grid."""
+    (exp,) = _only("simulate_nf({t_end=>10,n_steps=>5,output_step_interval=>3})")
+    assert (exp.t_span, exp.n_points) == ((0.0, 10.0), 6)
 
 
 def test_a_run_whose_t_end_is_not_past_its_start_leaves_the_model_time():

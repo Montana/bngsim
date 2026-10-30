@@ -804,7 +804,7 @@ def _build_experiment(
             n_read is not None and n_read < 1
         ):
             raise ConversionError(
-                f"{verb}: an nf run needs n_steps of 1 or more; BNG2.pl refuses it without"
+                f"{verb}: an nf run needs n_steps of 1 or more; BNG2.pl refuses one without"
             )
     else:
         if "n_steps" in args and "n_output_steps" in args:
@@ -818,12 +818,15 @@ def _build_experiment(
     # no numeric horizon and the gate falls back to its blanket grid.
     t_end = _num_or(args.get("t_end"), None)
     t_end_unread = "t_end" in args and t_end is None
+    if nf and steps_arg is not None and "t_end" not in args:
+        raise ConversionError(f"{verb}: an nf run needs t_end; BNG2.pl refuses one without")
     if nf and t_end is not None and t_end <= t_start:
         raise ConversionError(
             f"{verb}: an nf run needs t_end > t_start, not ({t_start:g}, {t_end:g}); "
             "BNG2.pl refuses it"
         )
-    if "output_step_interval" in args:
+    # simulate_nf has no output_step_interval; run_network writes extra rows for it.
+    if "output_step_interval" in args and not nf:
         reasons.append("output_step_interval writes rows between the grid's times")
     if steps_arg is None and "sample_times" in args:
         samples = _num_list(args.get("sample_times"))
