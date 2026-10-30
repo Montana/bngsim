@@ -1891,33 +1891,69 @@ _B1304 = {
 
 @pytest.mark.parametrize("model", sorted(_B1304))
 @pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
-def test_1304s_models_read_contested_with_each_arms_side_named(model):
+def test_1304s_models_attribute_each_arm_to_the_side_it_takes(model):
     """#1304: XIIa = K = 0 is an exact, unstable solution of both models, and
-    the KLU base keeps it. The dense LU's rounding breaks it, and which way
-    depends on the CPU and the output grid. Broken upward, dense takes the
-    branch libRoadRunner takes (338's Fg 0.73 against KLU's 311; 339 1.8e-2 of
-    the peak apart): the KLU route at a hundredfold tighter tolerance sides
-    with KLU and the dense solver with dense, so the arms split and the model
-    is contested. Broken downward, the laws carry XIIa to its pole at -1 and
-    the dense run does not complete (#135; test_clamp_far_below_zero.py), so
-    there is nothing to attribute.
+    the KLU base keeps it. The dense LU's rounding breaks it, and which way and
+    when depend on the CPU and the output grid. So the check reads a coin with
+    three faces:
 
-    At this window both break upward on arm64. On x86-64, 339 does too and
-    338's dense run fails, which is why a test of 338 alone failed there and
-    passed here. A dense run that fails is that coin, and skips with its
-    error; any other reading is a finding. (A grid is a coin too: on arm64,
-    339's dense run at 4001 points breaks downward.)"""
+    * Broken upward, dense takes the activated branch (338's Fg 0.73 against
+      KLU's 311, which libRoadRunner reads too; 339 1.8e-2 of the peak apart),
+      and the dense arm lands with the reference: the arms split, and the
+      model is contested. Both models at this window on arm64; 339 on x86-64.
+    * Broken upward, but the dense arm, on the default Jacobian, leaves 0 at
+      another moment than the reference on the FD one, and lands within the
+      bound of neither side: only the tighter arm takes one, and the verdict
+      is the path's. 338 at 61 and 81 points on arm64, at 99 on x86-64.
+    * Broken downward, the laws carry XIIa to its pole at -1 and the dense
+      reference is refused (#135; test_clamp_far_below_zero.py): nothing to
+      attribute, and the test skips. 338 at this window on x86-64; 339 at
+      4001 points on arm64.
+
+    What holds on every face is asserted: KLU's tighter arm keeps the exact
+    solution, on the path's side; no arm that leaves it takes that side; the
+    verdict follows from the sides. A test of one face at one grid reads the
+    coin, not the code, as 338's did: it passed on arm64 and failed on x86-64."""
     path = _B1304[model]
     if not path.exists():
         pytest.skip(f"rr_parity corpus model {model} not present")
     job = D.Job(model, path, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
     v = D.check_all(job, None, ("klu_vs_dense",))["klu_vs_dense"]
-    if v.status == "exception" and v.note.startswith("SimulationError: "):
-        pytest.skip(f"the dense run did not complete here, so nothing split: {v.note}")
+    if v.status == "exception":
+        # The note is the first line of whichever run failed. Skip only where
+        # KLU completes and the dense run is the refusal at XIIa's pole.
+        D.run(job, force_sparse_linear_solver=True, jacobian="fd")
+        with pytest.raises(bngsim.SimulationError, match="carried concentration 'XIIa'"):
+            D.run(job, force_dense_linear_solver=True, jacobian="fd")
+        pytest.skip("the dense reference was refused at XIIa's pole here, so nothing to attribute")
     assert v.status == "diff", v
     a = v.extra["attribution"]
-    assert a["verdict"] == "split", a
-    assert a["arms"]["tighter"]["side"] == "path" and a["arms"]["dense"]["side"] == "reference", a
+    sides = {arm: s["side"] for arm, s in a["arms"].items()}
+    assert sides.pop("tighter") == "path", a
+    assert "dense" in sides and set(sides.values()) <= {"reference", "neither"}, a
+    assert a["verdict"] == ("split" if "reference" in sides.values() else "path"), a
+
+
+@pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
+def test_a_klu_base_takes_the_dense_solver_as_its_other_arm(monkeypatch):
+    """The third arm on the other linear solver is dense for a base KLU took.
+    Every other attribution test's base is dense, so without this the dense arm
+    is read only by #1304's corpus models, which CI has none of. A base that
+    ran dense stands in for one KLU took: the dense arm reruns it exactly."""
+    base = _base("derived-log10")
+    base.linear_solver = 1
+    asked = []
+    real = D.run
+
+    def spy(job, **kw):
+        asked.append(kw)
+        return real(job, **kw)
+
+    monkeypatch.setattr(D, "run", spy)
+    arms = D._arm_runs(base)
+    assert set(arms) == {"tighter", "dense"}, sorted(arms)
+    assert [kw for kw in asked if kw] == [{"force_dense_linear_solver": True}], asked
+    assert D.gap(arms["dense"], base.x, base.job.atol) == 0.0
 
 
 def test_what_1309_adds_runs_in_what_is_left_of_the_cap(monkeypatch):

@@ -460,15 +460,16 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
         "hide the refusal going missing",
     ),
     (
-        "the dense run did not complete here, so nothing split",
+        "refused at XIIa's pole here, so nothing to attribute",
         _ANYWHERE,
         "lanl/bngsim#1304: on BIOMD0000000338 and 339 the dense LU's rounding breaks "
         "the exact, unstable XIIa = K = 0, and which way depends on the CPU and the "
-        "output grid. Broken downward, the dense run is refused at XIIa's pole "
-        "(#135) and there is no split to read: 338 on x86-64. Only a SimulationError "
-        "skips; any other reading fails. Attribution itself is tested on planted "
-        "arms and on real arms over a planted DIFF, neither of which skips, so this "
-        "cannot hide it going missing",
+        "output grid. Broken downward, the dense reference is refused at XIIa's pole "
+        "(#135) and there is no DIFF to attribute: 338 on x86-64. The test skips only "
+        "after it reruns both: KLU must complete and dense must be that refusal, by "
+        "name; anything else fails. The arms are tested without the corpus too "
+        "(planted arms, real arms over a planted DIFF, and the dense arm of a base KLU "
+        "took), and those never skip, so this cannot hide one going missing",
     ),
     # Missing .net / .xml fixtures. Deliberately last and deliberately narrow:
     # this is the category that rots silently, so it matches the exact phrasings
