@@ -1883,24 +1883,37 @@ def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
     assert v.status == "diff" and "n_points+1" in v.note, v
 
 
-_B339 = _ROOT / "parity_checks/rr_parity/models/BIOMD0000000339/BIOMD0000000339_url.xml"
+_B1304 = {
+    m: _ROOT / f"parity_checks/rr_parity/models/{m}/{m}_url.xml"
+    for m in ("BIOMD0000000338", "BIOMD0000000339")
+}
 
 
-@pytest.mark.skipif(
-    not _B339.exists(), reason="rr_parity corpus model BIOMD0000000339 not present"
-)
+@pytest.mark.parametrize("model", sorted(_B1304))
 @pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
-def test_1304s_model_reads_contested_with_each_arms_side_named():
-    """#1304: past the step-size collapse KLU and the dense solver take
-    different branches, 1.8e-2 of the trajectory's peak apart on 339. The base
-    runs on KLU, so the KLU route at a hundredfold tighter tolerance sides with
-    KLU, and the dense solver with dense: split, contested.
+def test_1304s_models_read_contested_with_each_arms_side_named(model):
+    """#1304: XIIa = K = 0 is an exact, unstable solution of both models, and
+    the KLU base keeps it. The dense LU's rounding breaks it, and which way
+    depends on the CPU and the output grid. Broken upward, dense takes the
+    branch libRoadRunner takes (338's Fg 0.73 against KLU's 311; 339 1.8e-2 of
+    the peak apart): the KLU route at a hundredfold tighter tolerance sides
+    with KLU and the dense solver with dense, so the arms split and the model
+    is contested. Broken downward, the laws carry XIIa to its pole at -1 and
+    the dense run does not complete (#135; test_clamp_far_below_zero.py), so
+    there is nothing to attribute.
 
-    Not 338 any more: its dense run (the 0.73 against KLU's 311) was the clamp
-    holding XIIa at its pole, and that run is now refused (#135, see
-    test_clamp_far_below_zero.py), so there is no difference to attribute."""
-    job = D.Job("BIOMD0000000339", _B339, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
+    At this window both break upward on arm64. On x86-64, 339 does too and
+    338's dense run fails, which is why a test of 338 alone failed there and
+    passed here. A dense run that fails is that coin, and skips with its
+    error; any other reading is a finding. (A grid is a coin too: on arm64,
+    339's dense run at 4001 points breaks downward.)"""
+    path = _B1304[model]
+    if not path.exists():
+        pytest.skip(f"rr_parity corpus model {model} not present")
+    job = D.Job(model, path, 0.0, 2.0, 101, rtol=1e-6, atol=1e-9)
     v = D.check_all(job, None, ("klu_vs_dense",))["klu_vs_dense"]
+    if v.status == "exception" and v.note.startswith("SimulationError: "):
+        pytest.skip(f"the dense run did not complete here, so nothing split: {v.note}")
     assert v.status == "diff", v
     a = v.extra["attribution"]
     assert a["verdict"] == "split", a
