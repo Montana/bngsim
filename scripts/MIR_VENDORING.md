@@ -290,8 +290,10 @@ The third is issue #1216's, marked `BNGsim local carry (lanl/bngsim#1216)`.
   They are the same length, so no offset moves, and a NOP reads no memory
   whatever its operand. It is carried rather than waited for because it changes
   nothing a CPU does, and without it a MIR build is unusable at -O2 in an x86_64
-  Python on Apple Silicon. Not reported upstream as of 2026-10-30; upstream
-  master (`dc2c763f`) still has the register forms.
+  Python on Apple Silicon. Reported upstream on 2026-10-30 as a pull request
+  with the same two entries,
+  [vnmakarov/mir#497](https://github.com/vnmakarov/mir/pull/497), open as of
+  2026-10-30; upstream master (`dc2c763f`) still has the register forms.
   `test_mir_vendoring.py::test_mir_x86_64_loop_padding_is_intels_recommended_nops`
   holds the table to Intel's list, and stays when upstream takes the fix.
 
