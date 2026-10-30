@@ -26,9 +26,17 @@ a root of `f(y)` with everything read at `t = 0`, and fire no event: `A -> B` at
 state as converged, and a model whose event switches a production rate on came
 back at the state from before it. A reported quantity that reads the time has
 no steady value either: an assignment-rule species `S := B*(1 - exp(-time))`
-came back 0 for 2/3. A `time()` call or a table function indexed by time, in a
-rate law, a rule or a function that is only reported, is a read of the time;
-`rateOf` is not.
+came back 0 for 2/3, and so has a compartment sized by a rule on the time. A
+`time()` call or a table function indexed by time, in a rate law or in a rule a
+species or compartment size is reported through, directly or through what it
+reads, is a read of the time; `rateOf` is not.
+
+A function that reads the time and that only reports, `minutes := time/60` as
+BIOMD0000000739 and 951 have it, is not refused (issue #961): the state does
+not depend on it and is solved for as in a model without it. The function has
+no steady value, so its entry in the result's expression values, and its row of
+the expression sensitivities, is NaN, and `output_sensitivities` refuses it by
+that reason.
 
 Integrate such a model with `run()` over a span long enough for the trajectory
 to settle. `run(..., steady_state=True)` does not stop early for it: the

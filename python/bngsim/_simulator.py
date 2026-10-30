@@ -7893,6 +7893,7 @@ class Simulator:
             raise SimulationError(f"Steady-state computation failed: {e}") from e
 
         result = SteadyStateResult(core_result)
+        result._expressions_reading_clock = frozenset(self._model._core.functions_reading_clock)
         self._note_ss_unsupported(result)
         self._apply_ss_ar_report_map(result)
         self._apply_ss_ar_sensitivity_map(result)
@@ -8589,7 +8590,8 @@ class Simulator:
         ``t = 0`` beside a state marked converged: an assignment-rule species
         ``S := B*(1 - exp(-time))`` as 0 for 2/3, a species in a compartment
         sized by a rule on the time at 0.5 for 0.25. A function that reads the
-        time and that nothing reads is refused with the rest.
+        time and that only reports is not refused: the state does not depend on
+        it, and its own value is NaN (issue #961).
 
         A ``rateOf`` accessor is not a read of the time: it reads the state's own
         derivatives, which are 0 at a steady state.
@@ -8625,17 +8627,40 @@ class Simulator:
                 "jump (issue #710). Integrate the model with run() over a span long enough for "
                 "the trajectory to settle, and read the state where it ends."
             )
-        if core.functions_use_time:
+        if core.functions_use_time and self._ss_reads_the_time(core):
             raise SimulationError(
                 f"{where} is not supported for this model: it reads the time, through time() "
-                "or a table function indexed by time, in a rate law, a rule or a reported "
-                "function. The steady-state solvers look for a root of f(y) with everything "
-                "read at t = 0, which is the model's steady state only where nothing changes "
-                "with the time after that: a rate that is 0 at t = 0 returned the initial "
-                "state as converged, and a reported function its value at t = 0 (issue #710). "
-                "Integrate the model with run() over a span long enough for the trajectory to "
-                "settle, and read the state where it ends."
+                "or a table function indexed by time, in a rate law, a rule a species or a "
+                "compartment size is reported through, or what one of those reads. The "
+                "steady-state solvers look for a root of f(y) with everything read at t = 0, "
+                "which is the model's steady state only where nothing changes with the time "
+                "after that: a rate that is 0 at t = 0 returned the initial state as "
+                "converged, and a species set by a rule on the time its value at t = 0 "
+                "(issue #710). Integrate the model with run() over a span long enough for the "
+                "trajectory to settle, and read the state where it ends."
             )
+
+    def _ss_reads_the_time(self, core) -> bool:
+        """Whether the time reaches what a steady state solves for or reports as a
+        state (issues #710, #961).
+
+        A rate that reads the clock has no ``f(y) = 0`` without a time being chosen.
+        A rule on the clock that a species is reported through (``S := B*(1 -
+        exp(-time))``) or a compartment is sized by has no steady value, and the
+        state reported through it is not one. A function that reads the time and
+        that only reports, ``minutes := time/60`` in BIOMD0000000739 and 951, is
+        neither: the state is solved for as in a model without it, and the
+        function's value is NaN (``find_steady_state``).
+        """
+        if core.rate_laws_read_clock:
+            return True
+        clocked = set(core.functions_reading_clock)
+        if not clocked:
+            return False
+        amap = getattr(self._model, "_ar_report_map", None) or {}
+        if any(entry[1] in clocked for entry in amap.values()):
+            return True
+        return any(name in clocked for name in self._model.compartment_size_params)
 
     def _ss_mask_excluding_ar_species(self, mask_selector: list[int] | None) -> list[int] | None:
         """Drop AssignmentRule-target species from the steady-state subspace (#247).
@@ -9284,6 +9309,7 @@ class Simulator:
             except RuntimeError as e:
                 raise SimulationError(f"Batch {i} failed: {e}") from e
             result = SteadyStateResult(core_result)
+            result._expressions_reading_clock = frozenset(clone._core.functions_reading_clock)
             # GH #247 — the same two passes steady_state() runs, against the
             # CLONE: a scan that moves a compartment volume moves the divisor with
             # it, so resolving vdiv off self._model would report every entry
@@ -11349,6 +11375,7 @@ class SteadyStateResult:
         "_expression_values",
         "_rule_target_species",
         "_rule_target_expressions",
+        "_expressions_reading_clock",
     )
 
     def __init__(self, core) -> None:
@@ -11501,6 +11528,9 @@ class SteadyStateResult:
         self._expression_values = np.asarray(
             getattr(core, "expression_values", []), dtype=np.float64
         )
+        # Issue #961: the functions that read the time, reported as NaN, which
+        # the solve fills in from the model.
+        self._expressions_reading_clock: frozenset[str] = frozenset()
 
     @property
     def concentrations(self):
@@ -11694,6 +11724,12 @@ class SteadyStateResult:
             return None
         kind = meta["kind"]
         values = self._expression_values if kind == "expression" else self._observable_values
+        if kind == "expression" and meta["name"] in self._expressions_reading_clock:
+            return (
+                f"output_sensitivities: {meta['selector']!r} has no steady-state "
+                "derivative: it reads the time, so it has no steady value, and it is "
+                "reported as NaN (issue #961)."
+            )
         if kind != "species" and meta["index"] < values.size:
             value = float(values[meta["index"]])
             if not np.isfinite(value):
