@@ -9575,8 +9575,7 @@ def _build_model_from_sbml_doc_in_context(doc):
         # consistent with the concentrations it leaves, and nothing in the
         # model says which. libRoadRunner refuses the model.
         # bngsim kept the sizes from before the instant, with no word of it.
-        # (A ring with a link through a size's value as well is ordered by
-        # that link, and runs.)
+        # (A ring with a link through a size's value as well is refused below.)
         _cond_ring = _first_ring(
             {
                 comp: sorted({species_comp[leaf] for leaf in read} - {comp})
@@ -9597,6 +9596,49 @@ def _build_model_from_sbml_doc_in_context(doc):
                 + "), so where a jump flips those conditions the sizes after it can be read "
                 "more than one way, and bngsim does not choose"
             )
+        # A ring through both kinds of link (issue #1185, item 2): a size whose
+        # value reads the next one's concentration, and a size whose jump
+        # condition does. Where the jump flips, the sizes after it can again be
+        # read two ways. `cv := 1 + [Sw]` with `cw := piecewise(5, time >= 2 &&
+        # [Sn] > 8, 1)` is consistent after t = 2 with cw at 1 ([Sn] 5) and at 5
+        # ([Sn] 12.5), and bngsim kept the first with no word. libRoadRunner
+        # refuses it as a recursive assignment rule. A ring with one consistent
+        # state is refused with it: telling the two apart is a solve bngsim does
+        # not make. A size whose own condition reads its own concentration (a
+        # ring of one) is not a ring here, as above, and that includes a
+        # condition that reads it through another size's rule: `cw :=
+        # piecewise(5, time >= 2 && cv < 2, 1)` beside `cv := 1 + [Sw]` reads
+        # [Sw], and runs, keeping the state it is in.
+        if not _ring and not _cond_ring:
+            _links: dict[tuple[str, str], str] = {}
+            for a, rated in _comp_rated.items():
+                for b in sorted({species_comp[leaf] for leaf in rated if _diluted(leaf)}):
+                    _links[(a, b)] = f"{a}'s size reads {', '.join(_reads_in(a, b))} in {b}"
+            for a, read in _cond_reads.items():
+                for b in sorted({species_comp[leaf] for leaf in read} - {a}):
+                    _links.setdefault(
+                        (a, b),
+                        f"{a}'s jump condition reads {', '.join(_reads_in(a, b, _cond_reads))} "
+                        f"in {b}",
+                    )
+            _mixed_ring = _first_ring(
+                {
+                    a: sorted({b for (x, b) in _links if x == a})
+                    for a in sorted({x for x, _ in _links})
+                }
+            )
+            if _mixed_ring:
+                _refusals.append(
+                    "the sizes of compartments "
+                    + ", ".join(f"{c} ({_size_text(c)})" for c in _mixed_ring[:-1])
+                    + " each read a concentration in the next, through their values and "
+                    "their jump conditions ("
+                    + "; ".join(
+                        _links[(a, b)] for a, b in zip(_mixed_ring, _mixed_ring[1:], strict=False)
+                    )
+                    + "), so where a jump flips one of those conditions, the sizes after it "
+                    "can be read more than one way, and bngsim does not choose"
+                )
         if _refusals:
             from bngsim._exceptions import ModelError
 
