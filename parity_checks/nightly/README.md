@@ -231,5 +231,8 @@ documentation, nor `bng_parity/golden/` (the golden gate's data).
 - **Scheduled and dispatched runs** run every leg.
 
 `parity_checks/tests/test_pr_legs.py` measures each runner's imports again, file by
-file and including imports inside functions, so a runner that comes to load
-another file fails there until `RULES` says that file feeds its leg.
+file and including imports inside functions, so a runner that comes to import
+another file fails there until `RULES` says that file feeds its leg. The data a
+job reads (a jobs list, a pin, a model) shows in no import: the test's cases pin
+those by hand, so a leg that comes to read another directory's data needs a rule
+and a case.
