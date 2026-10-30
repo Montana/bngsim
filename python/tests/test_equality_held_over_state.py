@@ -138,6 +138,28 @@ def test_a_stretch_whose_leaving_needs_no_jump_runs(tmp_path, f_y, f_b, t_span, 
     )
 
 
+@pytest.mark.parametrize(("q", "a"), [(1.5, 0.5), (1.5, 0.37), (1.6, 0.5), (2.0, 0.5)])
+def test_a_leaving_a_switch_inside_the_equality_jumps_at_runs(tmp_path, q, a):
+    """`if(fB()==0, kb, 0)` with fB gated by `q-Aobs>0`: that switch's jump at
+    t* reads fY either side of its surface. Whether its restart lands on the
+    equality's surface, so that the leaving is rooted just after and judged,
+    or past it, is rounding: of these, (2.0, 0.5) lands past it on macOS and on
+    it on Linux, which refused it there. dY/d[a, q, kb] = [-ln(10/q)/a²,
+    -1/(a·q), ln(10/q)/a]·kb."""
+    path = tmp_path / "m.net"
+    path.write_text(
+        f"begin parameters\n 1 a {a!r}\n 2 q {q!r}\n 3 kb {KB}\n 4 kp 1.0\nend parameters\n"
+        "begin functions\n 1 fB() kp*if(q-Aobs>0,q-Aobs,0)\n 2 fY() if(fB()==0,kb,0)\n"
+        "end functions\n"
+        "begin species\n 1 A() 10\n 2 B() 0\n 3 Y() 0\nend species\n"
+        "begin reactions\n 1 1 0 a\n 2 0 2 fB\n 3 0 3 fY\nend reactions\n"
+        "begin groups\n 1 Aobs 1\n 2 Bobs 2\nend groups\n"
+    )
+    t_star = math.log(10 / q) / a
+    want = [-KB * t_star / a, -KB / (a * q), t_star]
+    np.testing.assert_allclose(_columns(bngsim.Model.from_net(str(path))), want, rtol=1e-6)
+
+
 def test_a_held_equality_is_read_at_the_run_start_time(tmp_path):
     """B is made at once before t = 1, so a run from 0 leaves `Bobs==0` at once
     and runs, while a run from 5 holds B at 0 until A falls to q and is

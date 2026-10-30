@@ -2882,7 +2882,7 @@ class Simulator:
                 e,
             )
             return
-        self._apply_held_equalities(opts, core, ctx)
+        self._apply_held_equalities(opts, core, ctx, conditions)
         stops: list[str] = []
         calls = (
             () if model is None or covered is None else model._state_switch_stops_beside(covered)
@@ -2929,7 +2929,7 @@ class Simulator:
                 opts.set_state_switch_reactions(reactions)
 
     @staticmethod
-    def _apply_held_equalities(opts, core, ctx) -> None:
+    def _apply_held_equalities(opts, core, ctx, conditions) -> None:
         """Root the leaving of each rate-law equality over state (issue #1279).
 
         A state that sits on an equality's surface (`Bobs==0`) holds its branch
@@ -2939,15 +2939,35 @@ class Simulator:
         exactly 0, whether the run started on the surface or an event put it
         there, and refuses there only where the rate laws reading it change and
         no jump at that instant covers the change. Each equality goes with the
-        reactions that read it, whose flux is what can change there. A stretch
-        the run never leaves, or leaves only at an event, runs.
+        reactions that read it, whose flux is what can change there, and the
+        state-switch *conditions* written inside it, whose crossing covers a
+        leaving at its own instant. A stretch the run never leaves, or leaves
+        only at an event, runs.
         """
-        from bngsim._switch_sensitivity import rate_law_equalities, state_switch_reactions
+        from bngsim._switch_sensitivity import (
+            _iter_condition_atoms,
+            _surface_key,
+            rate_law_equalities,
+            state_switch_reactions,
+            state_switch_residual,
+        )
 
         try:
             equalities = [atom for atom, _ in rate_law_equalities(core, ctx)]
             if not equalities:
                 return
+            switched = {
+                _surface_key(r) for r in (state_switch_residual(core, c) for c in conditions) if r
+            }
+            inner = [
+                [
+                    atom
+                    for atom in _iter_condition_atoms(equality)
+                    if (residual := state_switch_residual(core, atom))
+                    and _surface_key(residual) in switched
+                ]
+                for equality in equalities
+            ]
             reactions = state_switch_reactions(core, equalities, ctx)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
@@ -2958,6 +2978,7 @@ class Simulator:
             return
         opts.set_held_equality_conditions(equalities)
         opts.set_held_equality_reactions(reactions)
+        opts.set_held_equality_inner(inner)
 
     def _apply_state_switch_roots(self, opts, model, covered=None) -> None:
         """Root the rate-law conditions over model state for a plain run (issue #897).

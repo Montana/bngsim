@@ -1279,6 +1279,15 @@ PYBIND11_MODULE(_bngsim_core, m) {
             "Parallel to set_held_equality_conditions (issue #1279): the 0-based "
             "reactions whose rate law reads each equality.")
         .def(
+            "set_held_equality_inner",
+            [](bngsim::SolverOptions &self, const std::vector<std::vector<std::string>> &inner) {
+                self.sensitivity.held_equality_inner = inner;
+            },
+            py::arg("inner"),
+            "Parallel to set_held_equality_conditions (issue #1279): the state-switch "
+            "conditions written inside each equality, whose crossing covers a leaving "
+            "at the same instant.")
+        .def(
             "set_state_switch_guards",
             [](bngsim::SolverOptions &self, const std::vector<std::string> &guards) {
                 self.sensitivity.state_switch_guards = guards;

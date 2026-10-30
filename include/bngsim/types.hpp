@@ -1187,6 +1187,11 @@ struct SensitivityOptions {
     // Parallel to held_equality_conditions: the 0-based reactions whose rate
     // law reads each, whose flux is what can change where the state leaves.
     std::vector<std::vector<int>> held_equality_reactions;
+    // Parallel to held_equality_conditions: the state_switch_conditions written
+    // inside each (`q-Aobs>0` in `if(fB()==0, kb, 0)` with fB gated on it). A
+    // leaving at the instant one of them is crossed is that crossing's: its
+    // jump reads the equality's readers either side of its own surface.
+    std::vector<std::vector<std::string>> held_equality_inner;
 
     // Events whose crossing time moves with a requested parameter (issue #49).
     // Empty for every model whose events fire at fixed instants — the event

@@ -3611,8 +3611,9 @@ struct CvodeSimulator::Impl {
     struct HeldEquality {
         std::string condition;
         int residual_expr_idx = -1;
-        std::vector<int> reactions; // whose rate law reads it
-        std::vector<int> species;   // its residual reads
+        std::vector<int> reactions;               // whose rate law reads it
+        std::vector<int> species;                 // its residual reads
+        std::vector<std::string> inner_residuals; // of the switches written inside it
     };
     std::vector<HeldEquality> held_equalities;
     // The last event batch with sensitivity columns: when it fired, and whether
@@ -3625,7 +3626,8 @@ struct CvodeSimulator::Impl {
     // that changes the rate laws reading it where no jump at that instant does.
     void judge_held_equality_exit(int ns, std::size_t k, double t_x, const double *x_after,
                                   const std::vector<double> *on_t, const std::vector<double> *on_y,
-                                  double t_step_start, double t_tol, double t_start);
+                                  double t_step_start, double t_tol, double t_start,
+                                  const std::vector<int> &root_info, int ss_base);
     // The switches whose jump a recent restart applied, each with the time of
     // that restart (issue #763): a crossing that follows closely enough for its
     // probe pair to cross one of them again would read that jump a second time.
@@ -7208,15 +7210,16 @@ void CvodeSimulator::Impl::sync_model_at(double t, const double *x, int ns) {
 // equality changes across the leaving, or where the state was put on the
 // surface at the run's start or at an event whose time no column moves and
 // leaves at once, holding the branch for no time (`Aobs==10` with A decaying
-// from 10). Anything else the run is refused at. Three stretches never come
-// here: one the run never leaves; one only an event ends, since an event's
-// restart reads the root afresh and that event's own jump is the leaving's;
-// and one a state switch written inside the equality ends (`if(fB()==0, kb, 0)`
-// with fB gated by `if(q-Aobs>0, …)`), since that switch's jump reads the
-// equality's readers either side of its surface and restarts past it.
+// from 10), or where a state switch written inside the equality is crossed at
+// that instant (`if(fB()==0, kb, 0)` with fB gated by `if(q-Aobs>0, …)`): its
+// jump reads the equality's readers either side of its own surface. Anything
+// else the run is refused at. Two stretches never come here: one the run never
+// leaves, and one only an event ends, since an event's restart reads the root
+// afresh and that event's own jump is the leaving's.
 void CvodeSimulator::Impl::judge_held_equality_exit(
     int ns, std::size_t k, double t_x, const double *x_after, const std::vector<double> *on_t,
-    const std::vector<double> *on_y, double t_step_start, double t_tol, double t_start) {
+    const std::vector<double> *on_y, double t_step_start, double t_tol, double t_start,
+    const std::vector<int> &root_info, int ss_base) {
     const HeldEquality &held = held_equalities[k];
     auto &eval = model.evaluator();
     sync_model_at(t_x, x_after, ns);
@@ -7267,6 +7270,26 @@ void CvodeSimulator::Impl::judge_held_equality_exit(
         bool covered =
             !changed || held_since(t_start) ||
             (std::isfinite(last_event_t) && !last_event_moved && held_since(last_event_t));
+        // A state switch written inside the equality, crossed at this instant,
+        // in this return or at the restart just before: its jump reads the
+        // equality's readers either side of its own surface. Whether that
+        // restart lands on the equality's surface or past it is rounding.
+        auto inner = [&](const NetworkModel::StateSwitch *sw) {
+            return std::find(held.inner_residuals.begin(), held.inner_residuals.end(),
+                             sw->residual_source) != held.inner_residuals.end();
+        };
+        for (std::size_t j = 0; !covered && j < state_switch_all.size(); ++j) {
+            covered =
+                root_info[static_cast<std::size_t>(ss_base) + j] != 0 && inner(state_switch_all[j]);
+        }
+        for (const auto &[sw, t_s] : state_switch_consumed) {
+            if (covered) {
+                break;
+            }
+            covered =
+                std::fabs(t_b - t_s) <= std::max(at_once, 1e-9 * std::max(1.0, std::fabs(t_s))) &&
+                inner(sw);
+        }
         sync_model_at(t_x, x_after, ns);
         if (!covered) {
             std::ostringstream msg;
@@ -14565,6 +14588,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
     if (sens.n_total > 0 && !opts.sensitivity.held_equality_conditions.empty()) {
         const auto &conds = opts.sensitivity.held_equality_conditions;
         const auto &rxns = opts.sensitivity.held_equality_reactions;
+        const auto &inner = opts.sensitivity.held_equality_inner;
         for (std::size_t c = 0; c < conds.size(); ++c) {
             const NetworkModel::StateSwitch *sw = model.state_switch(conds[c]);
             if (sw == nullptr) {
@@ -14580,6 +14604,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 // No map: every reaction, so any change of the flow counts.
                 held.reactions.resize(model.reactions().size());
                 std::iota(held.reactions.begin(), held.reactions.end(), 0);
+            }
+            if (c < inner.size()) {
+                for (const auto &one : inner[c]) {
+                    const NetworkModel::StateSwitch *in = model.state_switch(one);
+                    if (in != nullptr) {
+                        held.inner_residuals.push_back(in->residual_source);
+                    }
+                }
             }
             held_equality_roots.push_back(held.residual_expr_idx);
             impl_->held_equalities.push_back(std::move(held));
@@ -17448,7 +17480,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         ns, static_cast<std::size_t>(k), static_cast<double>(t_ret), y_data,
                         &held_on_t, &held_on_y,
                         static_cast<double>(t_step_end) - static_cast<double>(h_last), t_tol,
-                        impl_->run_t_start);
+                        impl_->run_t_start, info, n_events + n_disc);
                 }
             }
             // A root return that was only held residuals leaving their bands,

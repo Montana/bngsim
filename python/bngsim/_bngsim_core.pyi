@@ -905,6 +905,10 @@ class SolverOptions:
         """
         Issue #1279: rate-law equalities over model state, as source text (`Bobs==0`), that a sensitivity run roots where the state leaves their surface. The run is refused there with SensitivityUnsupportedError where the rate laws reading one change and no jump at that instant covers it (issue #1228). Empty (the default) watches none.
         """
+    def set_held_equality_inner(self, inner: collections.abc.Sequence[collections.abc.Sequence[str]]) -> None:
+        """
+        Parallel to set_held_equality_conditions (issue #1279): the state-switch conditions written inside each equality, whose crossing covers a leaving at the same instant.
+        """
     def set_held_equality_reactions(self, reactions: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]]) -> None:
         """
         Parallel to set_held_equality_conditions (issue #1279): the 0-based reactions whose rate law reads each equality.
