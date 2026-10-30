@@ -609,7 +609,11 @@ class Result:
         :meth:`Simulator.run_batch` and :meth:`Simulator.run_replicates`
         return it in their list, with this set, beside the rows that ran to
         the end (issue #1369). A condition registered without a label reads
-        as its expression.
+        as its expression, or a callable as its ``repr()``. :meth:`save` and
+        :meth:`to_xarray` carry it.
+
+        A cut result holds the reported blocks only, so :attr:`state` refuses
+        on it, as it does on the result :meth:`Simulator.run` raises with.
         """
         return self._stop_condition
 
@@ -725,10 +729,16 @@ class Result:
 
     def _state_core(self, what: str) -> ResultCore:
         if self._core is None:
+            # A row of a batch that a stop condition cut is a solve's too, so
+            # the generic reason would misname it (issue #1369).
+            how = (
+                f"this one was cut at stop condition {self._stop_condition!r}, and a cut Result"
+                if self._stop_condition is not None
+                else "a loaded or stacked Result"
+            )
             raise ValueError(
-                f"Result.{what} is only available on a Result returned by a solve; a "
-                "loaded or stacked Result carries only the reported species block "
-                "(issue #508)."
+                f"Result.{what} is only available on a Result returned by a solve; "
+                f"{how} carries only the reported species block (issue #508)."
             )
         return self._core
 
@@ -2277,7 +2287,9 @@ class Result:
         labeled coords as the per-field DataArrays on :attr:`xr`.
 
         ``custom_attrs`` is mirrored onto ``ds.attrs``; the stochastic
-        ``seed`` (when present) is stored as ``ds.attrs["seed"]``.
+        ``seed`` (when present) is stored as ``ds.attrs["seed"]``, and the
+        :attr:`stop_condition` the result was cut at as
+        ``ds.attrs["stop_condition"]``.
 
         Returns
         -------
@@ -2388,6 +2400,8 @@ class Result:
         attrs: dict[str, Any] = dict(self.custom_attrs)
         if self._seed is not None:
             attrs["seed"] = int(self._seed)
+        if self._stop_condition is not None:
+            attrs["stop_condition"] = self._stop_condition
 
         return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
@@ -2690,6 +2704,11 @@ class Result:
             # Stochastic seed actually used (omitted for ODE results).
             if self._seed is not None:
                 f.attrs["seed"] = int(self._seed)
+            # The stop condition the result was cut at (issue #1369), written
+            # only when one was met. Absent loads as None, as any older file
+            # does, so the format version stands.
+            if self._stop_condition is not None:
+                f.attrs["stop_condition"] = self._stop_condition
 
             # Core data
             f.create_dataset("time", data=self._time)
@@ -3016,6 +3035,9 @@ class Result:
                 )
             elif "volume_record_missing" in f.attrs:
                 volume_record_missing = _text(f.attrs["volume_record_missing"])
+            stop_condition = (
+                _text(f.attrs["stop_condition"]) if "stop_condition" in f.attrs else None
+            )
 
             # GH #155: absent ⇒ None, not recorded, as in a file that predates
             # saving the seed.
@@ -3097,6 +3119,7 @@ class Result:
         result._varvol_conc_factor = conc_factor
         result._varvol_amount_factor = amount_factor
         result._volume_record_missing = volume_record_missing
+        result._stop_condition = stop_condition
         logger.info(
             "Loaded result: %d time points, %d species, %d observables",
             result.n_times,
@@ -3317,7 +3340,7 @@ class Result:
         Raises
         ------
         ValueError
-            If ``results`` is empty, or a stop condition cut any of them short
+            If ``results`` is empty, or any of them met a stop condition
             (:attr:`stop_condition`, issue #1369).
         """
         if not results:
@@ -3325,11 +3348,13 @@ class Result:
         stopped = [i for i, r in enumerate(results) if r._stop_condition is not None]
         if stopped:
             # A stack has one time axis and says of no row that it stopped
-            # (issue #1369).
+            # (issue #1369). A callable's row keeps every sample, so this is
+            # not "cut short" of every row it names.
+            rows = ", ".join(map(str, stopped[:10])) + (", ..." if len(stopped) > 10 else "")
             raise ValueError(
-                f"Cannot squeeze results a stop condition cut short (rows {stopped}): "
-                "a stack holds rows of one length and does not say which stopped. "
-                "Read them from the list (squeeze=False), where "
+                f"Cannot squeeze results that met a stop condition ({len(stopped)} of "
+                f"{len(results)}: rows {rows}): a stack holds rows of one length and "
+                "does not say which stopped. Read them from the list, where "
                 "Result.stop_condition names the condition."
             )
         if len(results) == 1:
