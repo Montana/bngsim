@@ -497,6 +497,19 @@ _PRODUCTS = [
 ]  # fmt: skip
 
 
+# The C library's own functions, which a product may call: compiled, they are
+# the platform's libm, and the engine's are whatever its own build linked. On
+# Windows the two give sin(2.5) an ulp apart, so a law calling one is held to a
+# few ulp; how it parses is what these ask, and a wrong parse is off by more.
+_LIBM_CALL = re.compile(r"\b(sin|cos|tan|exp|log|sqrt|pow)\s*\(")
+
+
+def _same_or_libm(got: float, want: float, expr: str) -> bool:
+    if _same(got, want) or not _LIBM_CALL.search(expr):
+        return _same(got, want)
+    return math.isfinite(want) and abs(got - want) <= 4 * math.ulp(want)
+
+
 @needs_cc
 @pytest.mark.parametrize(
     "expr", ["2k*A", "2(A + 1)", "(A + 1)2", "(A)B", "k 2", "A B", "3A^2", *_PRODUCTS]
@@ -504,7 +517,16 @@ _PRODUCTS = [
 def test_an_implicit_product_computes_what_the_engine_does(expr):
     rows = [(2.5, 0.75, 1.0), (-0.4, 3.2, 1.0)]
     for args, got in zip(rows, _compiled(expr, rows), strict=False):
-        assert _same(got, _interpreter(expr, args)), expr
+        assert _same_or_libm(got, _interpreter(expr, args), expr), expr
+
+
+def test_a_libm_call_is_held_to_ulps_and_a_misparse_is_not_hidden():
+    """Control for the tolerance: a law that calls libm passes an ulp apart, and
+    sin(A*B), what a misparse of sin(A)B gives, is far outside it."""
+    want = math.sin(2.5) * 0.75
+    assert _same_or_libm(math.nextafter(want, math.inf), want, "sin(A)B")
+    assert not _same_or_libm(math.sin(2.5 * 0.75), want, "sin(A)B")
+    assert not _same_or_libm(math.nextafter(want, math.inf), want, "(A)(B)")
 
 
 # A parameter named after an exponent's letter: the `e` of `2e-3` is the number's,
