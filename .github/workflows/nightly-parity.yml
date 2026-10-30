@@ -30,6 +30,8 @@ name: nightly-parity
 #                Jacobian, KLU vs dense, cc vs
 #                interpreted and MIR, de_DE vs C,
 #                8x the output points
+#   differential NFsim against RuleMonkey, in     bng-nf's 234 single-segment models,
+#   _nf          distribution                     from its reference archive (#1312)
 #
 # THE REPORT IS THE VERDICT, NOT THE EXIT CODE. Every parity runner exits 1 whenever
 # any model is DIFF/EXCEPTION/TIMEOUT and a full corpus always has some; the SBML
@@ -639,6 +641,47 @@ jobs:
           retention-days: 30
 
   # ------------------------------------------------------------------------- #
+  # NFsim against RuleMonkey (#1312), on bng_nf's models: a job of its own, as
+  # the two engines' ensembles over 234 models cost about 41 CPU-minutes on an
+  # M-series machine, which the path-agreement job's cap could not also hold.
+  # The models come from the pinned reference archive, which holds the BNG-XML
+  # BNG2.pl wrote for each, so no BNG2.pl is needed; both engines are bngsim's,
+  # so the archive is inputs only, whatever the mode.
+  # ------------------------------------------------------------------------- #
+  differential-nf:
+    name: Network-free engine agreement
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Provision from uv.lock
+        run: uv sync --extra dev --python 3.12
+      - name: Build identity
+        run: uv run --no-sync python -c "import bngsim, bngsim._build_provenance as bp; print('bngsim', bngsim.__version__); bp.print_identity()"
+      - name: Fetch bng_nf's models
+        run: python3 parity_checks/nightly/reference_archive.py fetch bng_nf --dest "$RUNNER_TEMP/bng_nf"
+      - name: Run differential_run.py (NF arm)
+        run: |
+          uv run --no-sync python parity_checks/differential/differential_run.py \
+            --fd-sens-jobs '' --rr-jobs '' --ssa-jobs '' --no-locale \
+            --nf-archive "$RUNNER_TEMP/bng_nf" --workers 4 --timeout 900 \
+            --out "$RUNNER_TEMP/differential_nf.json" || true
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash parity_checks/nightly/compare.sh differential_nf core "$RUNNER_TEMP/differential_nf.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-differential_nf
+          path: nightly-out/differential_nf/
+          retention-days: 30
+
+  # ------------------------------------------------------------------------- #
   # Stochastic tracks against run_network's SSA and standalone NFsim. Seeds are
   # fixed on both sides.
   # ------------------------------------------------------------------------- #
@@ -880,7 +923,7 @@ jobs:
   # ------------------------------------------------------------------------- #
   report:
     name: Report
-    needs: [plan, corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens, rr-ssa, fd-sens, differential, publish]
+    needs: [plan, corpus, sbml, rr-ode, bng-ode, bng-stoch, amici-sens, rr-ssa, fd-sens, differential, differential-nf, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
