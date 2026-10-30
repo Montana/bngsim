@@ -178,7 +178,8 @@ the cap itself, as on a live night. `ssa_screen.py`, which saves its entry after
 every RoadRunner call, likewise takes a model's row at its cap as a live run does
 and kills the worker only at twice the cap. The
 publish job then creates the next `reference-data-vN` release with all six assets,
-or none if any suite failed to pack, and writes the manifest into the run summary
+or none if any suite failed to pack (its tag is on the default branch's head; the
+manifest names the recorded commit), and writes the manifest into the run summary
 and the `reference-manifest` artifact. Nothing replays from the new release until
 that file is committed:
 
