@@ -459,6 +459,17 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
         "itself is tested on a synthesized tensor and never skips, so this cannot "
         "hide the refusal going missing",
     ),
+    (
+        "the dense run did not complete here, so nothing split",
+        _ANYWHERE,
+        "lanl/bngsim#1304: on BIOMD0000000338 and 339 the dense LU's rounding breaks "
+        "the exact, unstable XIIa = K = 0, and which way depends on the CPU and the "
+        "output grid. Broken downward, the dense run is refused at XIIa's pole "
+        "(#135) and there is no split to read: 338 on x86-64. Only a SimulationError "
+        "skips; any other reading fails. Attribution itself is tested on planted "
+        "arms and on real arms over a planted DIFF, neither of which skips, so this "
+        "cannot hide it going missing",
+    ),
     # Missing .net / .xml fixtures. Deliberately last and deliberately narrow:
     # this is the category that rots silently, so it matches the exact phrasings
     # in use rather than a blanket "not found".
