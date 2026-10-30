@@ -249,6 +249,84 @@ def test_a_held_trigger_the_first_event_turns_false_never_fires():
         assert _final(text, tau, tau)[0] == pytest.approx(0.0, abs=EXACT), tau
 
 
+@pytest.mark.parametrize(
+    "lhs, inc, scale, method",
+    [("A", "A", 1.0, "ode"), ("time/3 + B", "B", 3.0, "ode"), ("time/3 + B", "B", 3.0, "ssa")],
+    ids=["state", "clock", "ssa-clock"],
+)
+def test_an_event_that_moves_the_held_comparison_raises_it_there(lhs, inc, scale, method):
+    """On the crossing `lhs > tau` is false, and Ehi's write moves lhs past
+    tau: that raises Es there, a cascade of priority 5, ahead of Elo's 1.
+    X = 10*X + d from 0 gives 9, 95, 951. Held to the end of the instant, Es
+    ran after Elo, 915, for 46 of the 60 tau in the state run, 40 in the clock
+    run and 51 in SSA. One batch gave 951 too, as main does."""
+    text = (
+        "species X, A, B; X = 0; A = 0; B = 0; tau = 3\nJ0: -> A; 1\n"
+        f"Ehi: at ({lhs} >= tau), priority = 10, fromTrigger=false: "
+        f"{inc} = {inc} + 1, X = 10*X + 9\n"
+        f"Es: at ({lhs} > tau), priority = 5, fromTrigger=false: X = 10*X + 5\n"
+        f"Elo: at ({lhs} >= tau), priority = 1, fromTrigger=false: X = 10*X + 1\n"
+    )
+    for tau in TAUS:
+        assert _final(text, tau, scale * tau, method=method)[0] == pytest.approx(
+            951.0, rel=EXACT
+        ), tau
+
+
+def test_a_sensitivity_run_through_a_moved_comparison():
+    """Ehi writes A, which Es's comparison reads, so Es is raised there. Where
+    Es reads X, which Ehi wrote, the run refuses it by name rather than return
+    the batch's 0.3 (main did, for 46 of 60 tau). Where it writes Y alone, the
+    jump composes it as one of the batch: dA/dk = T, dY/dk = dZ/dk = 0. A read
+    that lands on the crossing finds Es false and raised by Ehi's write, which
+    the run refuses as any cascade (issue #144), as main does."""
+    reads = (
+        "species X, A; X = 1; A = 0; tau = 3; k = 1\nJ0: -> A; k\n"
+        "Ehi: at (A >= tau), priority = 10: A = A + 1, X = 0.5*X\n"
+        "Es: at (A > tau), priority = 5: X = 0.3*X\n"
+        "Elo: at (A >= tau), priority = 1: A = A\n"
+    )
+    keeps = (
+        "species Y, Z, A; Y = 0; Z = 0; A = 0; tau = 3; k = 1\nJ0: -> A; k\n"
+        "Ehi: at (A >= tau), priority = 10: A = A + 1\n"
+        "Es: at (A > tau), priority = 5: Y = 1\n"
+        "Elo: at (A >= tau), priority = 1: Z = 2\n"
+    )
+    by_name = kept = 0
+    for tau in TAUS:
+        times = [0.0, tau / 2, 1.4 * tau, 2.1 * tau]
+        for text in (reads, keeps):
+            model = bngsim.Model.from_antimony_string(text)
+            model.set_param("tau", tau)
+            sim = bngsim.Simulator(model, method="ode", sensitivity_params=["k"])
+            try:
+                run = sim.run(sample_times=times, rtol=1e-10, atol=1e-12)
+            except bngsim.SimulationError as e:
+                assert "'Es'" in str(e), str(e)
+                if text is reads and "issue #947" in str(e):
+                    by_name += 1
+                continue
+            assert text is keeps, (tau, np.asarray(run.species)[-1])
+            names = list(run.species_names)
+            x = dict(zip(names, np.asarray(run.species)[-1], strict=True))
+            s = dict(zip(names, np.asarray(run.sensitivities)[-1, :, 0], strict=True))
+            assert (x["Y"], x["Z"]) == (
+                pytest.approx(1.0, rel=EXACT),
+                pytest.approx(2.0, rel=EXACT),
+            ), tau
+            # As in the test below: A = k·t + 1 is linear in t past the
+            # crossing, and dA/dk is 3.5e-16 off T at worst (measured).
+            assert s["A"] == pytest.approx(times[-1], rel=1e-8), tau
+            assert (s["Y"], s["Z"]) == (
+                pytest.approx(0.0, abs=EXACT),
+                pytest.approx(0.0, abs=EXACT),
+            ), tau
+            kept += 1
+    # 46 of 60 each on macOS arm64 (measured); the other 14 land on the
+    # crossing. A release that always refused would keep none.
+    assert by_name > 0 and kept > 0
+
+
 def test_a_sensitivity_run_refuses_a_held_pair_that_reads_the_first_write():
     """E1 reads the X that E2 wrote, so the plain run's E1 is a second jump at
     the instant, which the sensitivity jump cannot compose (issue #144). A run

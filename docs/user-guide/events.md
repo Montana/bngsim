@@ -136,6 +136,8 @@ exception where the run crosses their threshold. `time/3 > tau` beside
 non-strict one is true on the crossing and the strict one only past it. So the
 strict one executes after the non-strict one and everything else of the
 instant, and its trigger, values and delay are read at the state they left.
+Where an event of the instant moves either side, the strict one is raised there
+instead, as a cascade, and executes where its priority puts it.
 That holds in ODE and SSA runs, whatever the rounding of the threshold (issue
 #947). Where the two sides jump past each other instead (a reaction firing in
 SSA, a `piecewise` that switches), both turn true at one instant and they are

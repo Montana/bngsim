@@ -1466,7 +1466,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
         // a firing turned true (a species jumping past the threshold) is one
         // batch, as is a residual that jumps. (A rate-rule species, which
         // moves between firings, is held fixed too, so its pairs stay one
-        // batch, as before.)
+        // batch, as before.) So a trigger that does not read the clock is
+        // never on a crossing here, and is not probed.
         std::vector<std::pair<int, int>> held_strict;
         if (on_crossing && firing_in.size() > 1) {
             constexpr int kHeldProbeDoublings = 20;
@@ -1475,6 +1476,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                 if (events[ei].size_jump_compartment.empty())
                     pairable.push_back(ei);
             for (const auto &[ei, twin] : model.strict_beside_non_strict(pairable)) {
+                if (!model.event_trigger_reads_time(ei))
+                    continue;
                 const int gidx = model.event_trigger_residual_expr(ei);
                 const double g0 = eval_ref.evaluate(gidx);
                 bool on_it = false;
@@ -1497,12 +1500,22 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
             }
         }
         // Still held: cleared where the trigger changes before the rest has
-        // settled, which then triggers it as any other event.
+        // settled, which then triggers it as any other event. Also where an
+        // event of the instant moves its residual, which it reads true and is
+        // held at: on the crossing the residual is 0 and the strict trigger
+        // false, so that write raises it there, a cascade, as in the ODE drain.
         std::vector<char> held;
+        std::vector<double> held_at;
+        auto residual_of = [&](int ei) {
+            return eval_ref.evaluate(model.event_trigger_residual_expr(ei));
+        };
         if (!held_strict.empty()) {
             held.assign(static_cast<std::size_t>(n_events), 0);
-            for (const auto &pair : held_strict)
+            held_at.assign(static_cast<std::size_t>(n_events), 0.0);
+            for (const auto &pair : held_strict) {
                 held[static_cast<std::size_t>(pair.first)] = 1;
+                held_at[static_cast<std::size_t>(pair.first)] = residual_of(pair.first);
+            }
         }
         for (int ei : firing_in) {
             prev[ei] = true;
@@ -1743,8 +1756,15 @@ Result SsaSimulator::run_internal(const TimeSpec &times, uint64_t seed, double p
                             inst.done = true;
                     drop_pending_of(ei);
                 }
-                if (!held.empty() && now_true != prev[ei])
-                    held[static_cast<std::size_t>(ei)] = 0;
+                const auto hi = static_cast<std::size_t>(ei);
+                if (!held.empty() && held[hi] != 0) {
+                    if (now_true != prev[ei]) {
+                        held[hi] = 0;
+                    } else if (now_true && residual_of(ei) != held_at[hi]) {
+                        held[hi] = 0; // raised by this write (see held_at)
+                        queue.push_back(make_instance(ei));
+                    }
+                }
                 prev[ei] = now_true;
             }
         }

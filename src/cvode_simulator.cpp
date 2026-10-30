@@ -15069,12 +15069,72 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         }
         // Still held: cleared where the trigger changes before the first
         // sub-instant has settled, which then triggers it as any other event.
+        // Also where an event of the first moves its residual, which it reads
+        // true and is held at: on the crossing the residual is 0 and the
+        // strict trigger false, so a write that moves it raises it there, a
+        // cascade with the priority it has. Held to the end, `A > tau` of
+        // priority 5 ran after an event of priority 1 where one of priority
+        // 10 on `A >= tau` wrote `A = A + 1`, as the threshold rounded.
         std::vector<char> held;
+        std::vector<double> held_at;
         if (!held_strict.empty()) {
             held.assign(static_cast<std::size_t>(n_events), 0);
-            for (const auto &pair : held_strict)
+            held_at.assign(static_cast<std::size_t>(n_events), 0.0);
+            for (const auto &pair : held_strict) {
                 held[static_cast<std::size_t>(pair.first)] = 1;
+                held_at[static_cast<std::size_t>(pair.first)] = residual_now(pair.first);
+            }
         }
+        // A held trigger triggered in a sensitivity run. Where it reads
+        // nothing the first sub-instant wrote and writes nothing it wrote, the
+        // sequence leaves what the batch left, and the sensitivity jump
+        // composes it as one of the batch. Otherwise it is a second jump at
+        // the instant, which has none.
+        auto refuse_held_jump = [&](int ei) {
+            if (sens.n_total == 0)
+                return;
+            std::vector<char> written(static_cast<std::size_t>(ns), 0);
+            for (std::size_t fi = batch_fires_from; fi < executed_fires.size(); ++fi)
+                for (const auto &asg : events_outer[executed_fires[fi].event_idx].assignments)
+                    if (asg.first >= 0 && asg.first < ns)
+                        written[static_cast<std::size_t>(asg.first)] = 1;
+            bool touches = false;
+            const Event &hev = events_outer[ei];
+            auto reads_written = [&](int expr) {
+                std::vector<int> reads;
+                model.expression_support(expr, &reads, nullptr);
+                return std::any_of(reads.begin(), reads.end(), [&](int j) {
+                    return j >= 0 && j < ns && written[static_cast<std::size_t>(j)];
+                });
+            };
+            for (std::size_t a = 0; a < hev.assignments.size(); ++a) {
+                const auto &asg = hev.assignments[a];
+                touches = touches || (asg.first >= 0 && asg.first < ns &&
+                                      written[static_cast<std::size_t>(asg.first)]);
+                touches = touches || reads_written(asg.second);
+                if (a < hev.assignment_rescale_size_expr.size() &&
+                    hev.assignment_rescale_size_expr[a] >= 0)
+                    touches = touches || reads_written(hev.assignment_rescale_size_expr[a]);
+            }
+            if (!touches)
+                return;
+            const auto pair = std::find_if(held_strict.begin(), held_strict.end(),
+                                           [&](const auto &p) { return p.first == ei; });
+            const int twin = pair != held_strict.end() ? pair->second : ei;
+            auto id_of = [&](int e) {
+                return events_outer[e].id.empty() ? std::to_string(e) : events_outer[e].id;
+            };
+            throw std::runtime_error(
+                "Forward sensitivity: event '" + id_of(ei) + "', a strict comparison, and event '" +
+                id_of(twin) +
+                "', the non-strict one on the same residual, turn true together on its crossing "
+                "at t=" +
+                diag_number(t_now) + ". The run triggers '" + id_of(ei) +
+                "' only once events of that instant have executed (issue #947), and '" + id_of(ei) +
+                "' reads or writes a species they wrote: a second state jump at the same "
+                "instant, which bngsim has no sensitivity jump to compose with the first (issue "
+                "#144). Separate the thresholds, or drop sensitivities for this run.");
+        };
 
         std::vector<ExecInstance> queue;
         queue.reserve(firing_in.size());
@@ -15227,61 +15287,13 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 // held back are triggered now, at the state it left (issue
                 // #947), and drained as a second one.
                 bool queued_held = false;
-                for (const auto &[ei, twin] : held_strict) {
+                for (const auto &pair : held_strict) {
+                    const int ei = pair.first;
                     const auto hi = static_cast<std::size_t>(ei);
                     if (held[hi] == 0 || !prev[hi])
                         continue;
                     held[hi] = 0;
-                    if (sens.n_total > 0) {
-                        // Where it reads nothing the first sub-instant wrote
-                        // and writes nothing it wrote, the sequence leaves
-                        // what the batch left, and the sensitivity jump
-                        // composes it as one of the batch. Otherwise it is a
-                        // second jump at the instant, which has none.
-                        std::vector<char> written(static_cast<std::size_t>(ns), 0);
-                        for (std::size_t fi = batch_fires_from; fi < executed_fires.size(); ++fi)
-                            for (const auto &asg :
-                                 events_outer[executed_fires[fi].event_idx].assignments)
-                                if (asg.first >= 0 && asg.first < ns)
-                                    written[static_cast<std::size_t>(asg.first)] = 1;
-                        bool touches = false;
-                        const Event &hev = events_outer[ei];
-                        auto reads_written = [&](int expr) {
-                            std::vector<int> reads;
-                            model.expression_support(expr, &reads, nullptr);
-                            return std::any_of(reads.begin(), reads.end(), [&](int j) {
-                                return j >= 0 && j < ns && written[static_cast<std::size_t>(j)];
-                            });
-                        };
-                        for (std::size_t a = 0; a < hev.assignments.size(); ++a) {
-                            const auto &asg = hev.assignments[a];
-                            touches = touches || (asg.first >= 0 && asg.first < ns &&
-                                                  written[static_cast<std::size_t>(asg.first)]);
-                            touches = touches || reads_written(asg.second);
-                            if (a < hev.assignment_rescale_size_expr.size() &&
-                                hev.assignment_rescale_size_expr[a] >= 0)
-                                touches =
-                                    touches || reads_written(hev.assignment_rescale_size_expr[a]);
-                        }
-                        if (touches) {
-                            auto id_of = [&](int e) {
-                                return events_outer[e].id.empty() ? std::to_string(e)
-                                                                  : events_outer[e].id;
-                            };
-                            throw std::runtime_error(
-                                "Forward sensitivity: event '" + id_of(ei) +
-                                "', a strict comparison, and event '" + id_of(twin) +
-                                "', the non-strict one on the same residual, turn true together "
-                                "on its crossing at t=" +
-                                diag_number(t_now) + ". The run executes '" + id_of(ei) +
-                                "' after '" + id_of(twin) +
-                                "' and what it triggers (issue #947), and '" + id_of(ei) +
-                                "' reads or writes a species they wrote: a second state jump at "
-                                "the same instant, which bngsim has no sensitivity jump to "
-                                "compose with the first (issue #144). Separate the thresholds, "
-                                "or drop sensitivities for this run.");
-                        }
-                    }
+                    refuse_held_jump(ei);
                     queue.push_back(make_instance(ei));
                     queued_held = true;
                 }
@@ -15625,8 +15637,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         drop_pending_of(ei);
                     }
                 }
-                if (!held.empty() && now_true != was)
-                    held[static_cast<std::size_t>(ei)] = 0;
+                const auto hi = static_cast<std::size_t>(ei);
+                if (!held.empty() && held[hi] != 0) {
+                    if (now_true != was) {
+                        held[hi] = 0;
+                    } else if (now_true && residual_now(ei) != held_at[hi]) {
+                        // Raised by this write (see held_at): a cascade.
+                        held[hi] = 0;
+                        refuse_held_jump(ei);
+                        if (!ev.size_jump_compartment.empty()) {
+                            ExecInstance inst;
+                            inst.event_idx = ei;
+                            inst.delay = 0.0;
+                            inst.awaits_jumps = true;
+                            queue.push_back(std::move(inst));
+                        } else {
+                            queue.push_back(make_instance(ei));
+                        }
+                    }
+                }
                 prev[ei] = now_true;
             }
         }
