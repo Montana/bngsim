@@ -31,6 +31,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import FrameType
 from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
@@ -207,7 +208,7 @@ def _stacklevel_outside_bngsim() -> int:
     ``run_until``, a scan or a :class:`~bngsim.ReactionKernel` would name a
     line of bngsim's own, and every caller would share its one-shot slot.
     """
-    frame = sys._getframe(1)
+    frame: FrameType | None = sys._getframe(1)
     level = 1
     while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
         frame = frame.f_back
