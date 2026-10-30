@@ -7,14 +7,16 @@ the PR's changed paths and runs a leg only where one of them feeds it. A
 scheduled or dispatched run is not asked, and runs every leg.
 
 ``RULES`` is taken from what each leg's runner imports, measured by loading it
-as its job runs it (``test_pr_legs.py`` measures it again, so the table cannot
-drift from the code), plus the data a runner reads from another leg's
-directory: ``differential`` runs fd_sens's models.
+as its job runs it (``test_pr_legs.py`` measures it again, file by file, so the
+table cannot drift from the code), plus the data a job reads: ``differential``
+runs fd_sens's models and the corpus's BioModels, and every file the corpus
+job's cache key hashes feeds every leg that reads the corpus.
 
 Only the paths the workflow is triggered on (``TRIGGERS``, the workflow's
 ``pull_request.paths``) are read. A PR's other files (its changelog fragment,
-``python/``, its tests) run no leg here, as a PR with only those runs none.
-A triggering path no rule names runs every leg: when unsure, run the leg.
+``python/``, its tests) run no leg here, as a PR with only those runs none; nor
+does documentation (``DOCS``), which the workflow excludes too. A triggering
+path no rule names runs every leg: when unsure, run the leg.
 
 Usage, in the plan job:  ``gh api .../pulls/N/files --jq '.[].filename' |
 python3 parity_checks/nightly/pr_legs.py >> "$GITHUB_OUTPUT"``; with ``--all``
@@ -38,6 +40,9 @@ LEGS = (
 # The legs that read the BioModels corpus, which the corpus job fetches.
 CORPUS_LEGS = frozenset({"rr-ode", "rr-ssa", "amici-sens", "differential"})
 _PARITY = frozenset(LEGS) - {"sbml"}
+_BNG = frozenset({"bng-ode", "bng-stoch"})
+_AMICI = frozenset({"amici-sens", "fd-sens", "differential"})
+_FD = frozenset({"fd-sens", "differential"})
 
 # The workflow's pull_request.paths, as path prefixes ("dir/**" -> "dir/");
 # test_pr_legs.py keeps the two the same.
@@ -52,11 +57,16 @@ TRIGGERS = (
     "parity_checks/differential/",
     "benchmarks/suites/sbml_test_suite/",
     "benchmarks/_effort.py",
+    "benchmarks/suites/biomodels/biomodels_provenance.json",
     "harness/",
 )
+# No leg reads a Markdown file; the workflow excludes them ("!**/*.md").
+DOCS = (".md",)
 
 # (path prefix, the legs it feeds), most specific first: a path takes the
-# first rule whose prefix it starts with.
+# first rule whose prefix it starts with. A directory's default is every leg
+# that loads a module from it or reads its data; a file only one of those
+# legs loads (its runner, and modules only that runner imports) is carved out.
 RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # A verdict file a nightly already produced, copied in to re-baseline. The
     # workflow is not triggered on these alone (pull_request.paths excludes
@@ -67,32 +77,48 @@ RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # reference_archive.py, present_models.py, and this file.
     (".github/workflows/nightly-parity.yml", frozenset(LEGS)),
     ("parity_checks/nightly/", frozenset(LEGS)),
-    # Every parity runner imports _core; every one but sbml imports rr_parity's
-    # _rr_common (and reference_archive.py does too).
+    # Every parity runner imports _core and rr_parity's _rr_common (and
+    # reference_archive.py does too). The rest of rr_parity is rr-ode's
+    # runner, rr-ssa's screen and the corpus's manifest and fetchers.
     ("parity_checks/_core/", _PARITY),
+    ("parity_checks/rr_parity/_rr_common.py", _PARITY),
+    ("parity_checks/rr_parity/rr_run.py", frozenset({"rr-ode"})),
+    ("parity_checks/rr_parity/ssa_", frozenset({"rr-ssa"})),
     ("parity_checks/rr_parity/", _PARITY),
-    ("parity_checks/bng_parity/", frozenset({"bng-ode", "bng-stoch"})),
+    # The golden gate's trajectories (golden-verify.yml), which no leg reads.
+    ("parity_checks/bng_parity/golden/", frozenset()),
+    ("parity_checks/bng_parity/bng_ode_run.py", frozenset({"bng-ode"})),
+    ("parity_checks/bng_parity/bng_stoch_run.py", frozenset({"bng-stoch"})),
+    ("parity_checks/bng_parity/net_gillespie.py", frozenset({"bng-stoch"})),
+    ("parity_checks/bng_parity/net_roadrunner.py", frozenset({"bng-stoch"})),
+    ("parity_checks/bng_parity/", _BNG),
     # fd_sens_run and differential_run import _amici_sens's scheduler.
-    ("parity_checks/amici_parity/", frozenset({"amici-sens", "fd-sens", "differential"})),
+    ("parity_checks/amici_parity/amici_sens_run.py", frozenset({"amici-sens"})),
+    ("parity_checks/amici_parity/amici_dispositions.py", frozenset({"amici-sens"})),
+    ("parity_checks/amici_parity/", _AMICI),
     # differential runs fd_sens_jobs.json's models as well as its own checks.
-    ("parity_checks/fd_sens/", frozenset({"fd-sens", "differential"})),
+    ("parity_checks/fd_sens/fd_sens_run.py", frozenset({"fd-sens"})),
+    ("parity_checks/fd_sens/", _FD),
     ("parity_checks/differential/", frozenset({"differential"})),
     ("benchmarks/suites/sbml_test_suite/", frozenset({"sbml"})),
     ("benchmarks/_effort.py", frozenset({"sbml"})),
+    # The corpus job's key hashes it and the mirror's fetch checks against it.
+    ("benchmarks/suites/biomodels/biomodels_provenance.json", CORPUS_LEGS),
     ("harness/", frozenset({"sbml"})),
 )
 
 
 def legs_for(paths) -> set[str]:
     """The legs the changed ``paths`` feed. A path outside ``TRIGGERS`` feeds
-    none; a triggering path no rule names feeds every leg."""
+    none, nor does documentation; a triggering path no rule names feeds every
+    leg."""
     out: set[str] = set()
     for path in paths:
         path = path.strip()
-        if not path or not path.startswith(TRIGGERS):
+        if not path or path.endswith(DOCS) or not path.startswith(TRIGGERS):
             continue
         for prefix, legs in RULES:
-            if path == prefix or path.startswith(prefix):
+            if path.startswith(prefix):
                 out |= legs
                 break
         else:

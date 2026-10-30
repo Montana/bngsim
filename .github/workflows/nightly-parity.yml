@@ -116,11 +116,15 @@ on:
       - "parity_checks/differential/**"
       - "benchmarks/suites/sbml_test_suite/**"
       - "benchmarks/_effort.py"
+      # The corpus job hashes it into its key and checks the mirror against it.
+      - "benchmarks/suites/biomodels/biomodels_provenance.json"
       - "harness/**"
       # A re-baseline PR only copies a verdict file a nightly already produced;
       # re-running hours of sweeps to validate that would buy nothing.
       - "!parity_checks/nightly/baselines/**"
       - "!parity_checks/nightly/flaky.json"
+      # No leg reads documentation.
+      - "!**/*.md"
 
 permissions:
   contents: read
@@ -173,8 +177,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT" = pull_request ]; then
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --paginate --jq '.[].filename' \
-              > "$RUNNER_TEMP/changed.txt"
+            # A renamed file's old path too: the leg that read it there changed.
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --paginate \
+              --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/changed.txt"
             python3 parity_checks/nightly/pr_legs.py < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/legs.txt"
           else
             python3 parity_checks/nightly/pr_legs.py --all > "$RUNNER_TEMP/legs.txt"
