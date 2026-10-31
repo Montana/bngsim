@@ -337,6 +337,30 @@ class RuleMonkeyWarning(UserWarning):
     """
 
 
+class AtolScaleWarning(UserWarning):
+    """An ODE run's default absolute tolerance is above species that matter (issue #1361).
+
+    The default ``atol`` is the scalar ``1e-8``, BNG2.pl's, chosen for species
+    held as molecule counts. A model in molar units (an SBML model of species
+    at 1e-12 to 1e-6 M, say) holds species below it, and CVODE then controls
+    none of their error: the binding example of the issue returned a negative
+    concentration, and BIOMD0000000002, whose ligand is above ``atol`` and
+    whose complexes are below it, errors of 1e-2 against its reference.
+    Emitted by :meth:`Simulator.run` (and so ``run_until``), ``run_batch``,
+    ``parameter_scan`` and ``compute_all_sensitivities`` when the caller gave
+    no ``atol`` and a species the solver integrates stays below it all run
+    while reaching at least 1e-6 of the run's largest such species. A
+    ``$``-fixed species or an assignment-rule target is not integrated and is
+    never named. ``atol="auto"`` (a per-species tolerance from each species'
+    scale, issue #196) is the remedy it names. Filter or escalate it like any
+    ``UserWarning``::
+
+        import warnings, bngsim
+        warnings.simplefilter("ignore", bngsim.AtolScaleWarning)  # silence
+        warnings.simplefilter("error", bngsim.AtolScaleWarning)  # promote
+    """
+
+
 class DenseSolverFallbackWarning(UserWarning):
     """A large ODE model is running on the dense solver for lack of KLU (GH #209).
 

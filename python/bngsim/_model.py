@@ -3137,7 +3137,9 @@ def _unit_conversion_folds(conversions, core: Any) -> dict[str, str]:
     return {name: what for name, what in reason.items() if name not in functions}
 
 
-def _ar_report_map_from_net(core: Any) -> dict[str, tuple[str, str, float]]:
+def _ar_report_map_from_net(
+    core: Any, data: dict[str, Any] | None = None
+) -> dict[str, tuple[str, str, float]]:
     """Rebuild the assignment-rule report map the flat ``.net`` has no line for.
 
     ``Model.from_sbml`` reports an AssignmentRule-target species at its rule's
@@ -3152,7 +3154,8 @@ def _ar_report_map_from_net(core: Any) -> dict[str, tuple[str, str, float]]:
     (#515). Neither BNG2.pl nor a hand-written network produces that collision —
     a BNGL species name is a pattern, and the writer's per-species identity
     group is excluded — so a plain ``.net`` keeps the empty map it always had.
-    ``codegen_data`` is consulted only when a name collides.
+    ``codegen_data`` is consulted only when a name collides, and not at all
+    when the caller passes the ``data`` it already holds (the ``.net`` writer).
     """
     species = list(core.species_names)
     obs_names = set(core.observable_names)
@@ -3160,7 +3163,8 @@ def _ar_report_map_from_net(core: Any) -> dict[str, tuple[str, str, float]]:
     hits = [i for i, name in enumerate(species) if name in obs_names or name in func_names]
     if not hits:
         return {}
-    data = core.codegen_data()
+    if data is None:
+        data = core.codegen_data()
     entries = {
         o["name"]: [(int(i), float(f)) for i, f in o["entries"]] for o in data["observables"]
     }
