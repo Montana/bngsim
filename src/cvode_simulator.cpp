@@ -3020,6 +3020,11 @@ constexpr double kEventShiftFloor = 1e-9;
 // How many instants after a switch stop an event root still counts as on it.
 // CVODE places a root within 100·ε·(|t| + |h|) of where it is.
 constexpr double kEventRootSlack = 4.0;
+// That many instants at t: how far after a stop an event root on it is reported.
+inline double event_root_reach(double t) {
+    return kEventRootSlack * kSwitchInstantUlps * std::numeric_limits<double>::epsilon() *
+           std::max(std::fabs(t), 1.0);
+}
 
 struct SwitchJumpScratch {
     std::vector<double> f_minus;
@@ -3638,6 +3643,10 @@ struct CvodeSimulator::Impl {
         // Which fire of which event this was, and how many fires came before.
         std::vector<std::pair<int, long>> occurrences;
         long fires_before = 0;
+        // How far each column moves that fire, and the event named for it:
+        // the one that moves, or the first that fired (issue #1277).
+        std::vector<double> tau;
+        int event = -1;
     };
     std::vector<EventFire> event_fires;
     struct StateCrossing {
@@ -8115,37 +8124,70 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
             "' where the order of the two is confirmed, and the fire cannot be named to "
             "confirm it (issues #945, #1025). Drop sensitivities for this run.");
     }
-    // Issue #1277: #49's refusal, below, of two events on one instant whose
-    // times move differently, asked across batches too. A fire on the clock at
-    // a fixed time and one a requested column moves cross on one instant and
-    // fire as two batches, a root's slack apart. #49 asks one batch and sees
-    // neither with the other. Their order flips with the parameter, the result
-    // jumps there, and the run returned one side's slope with no error: dS/dk =
-    // 1.25 where S(3) goes from 3.75 to 4.25 across k = 1.
+    // Shifts are compared column by column, in the column's own units: a shift
+    // times the parameter is how far the time moves per unit relative change of
+    // it. One column's large shift says nothing about another's, and a
+    // finite-difference ∂t*/∂p of 1e-17 beside an exact 0 is no shift.
+    // Against the event's own time, not a time unit: an event at t = 1e-9
+    // moved by its own parameter moves by 1e-9 per unit relative change.
+    const double time_size = t_evt != 0.0 ? std::fabs(t_evt) : 1.0;
+    auto unit_of = [&](int c) {
+        const double value =
+            c < n_sens_p ? std::fabs(params[static_cast<size_t>(sens_param_indices[c])].value)
+                         : 0.0;
+        return value > 0.0 ? value : 1.0;
+    };
+    auto moves = [&](int c, double shift) {
+        return std::fabs(shift) * unit_of(c) > kEventShiftFloor * time_size;
+    };
+    auto same_shift = [&](int c, double a, double b) {
+        const double gap = std::fabs(a - b) * unit_of(c);
+        return gap <= kEventShiftFloor * time_size ||
+               std::fabs(a - b) <= kEventShiftRelTol * std::max(std::fabs(a), std::fabs(b));
+    };
+    // Issue #1277: #49's refusals, here and below, of two events on one instant
+    // whose times move differently, asked across batches too. A fire on the
+    // clock at a fixed time and one a requested column moves cross on one
+    // instant and fire as two batches, a root's slack apart. #49 asks one batch
+    // and sees neither with the other. Their order flips with the parameter,
+    // the result jumps there, and the run returned one side's slope with no
+    // error: dS/dk = 1.25 where S(3) goes from 3.75 to 4.25 across k = 1. Two
+    // fires that both move, and not together, flip the same way: with the
+    // clock's time requested beside k, the run gave that 1.25 again.
+    const int named = fire_moves && tau_event >= 0 ? tau_event : fired.front();
     {
-        const double slack = 2.0 * kEventRootSlack * kSwitchInstantUlps *
-                             std::numeric_limits<double>::epsilon() *
-                             std::max(std::fabs(t_evt), 1.0);
+        const double slack = 2.0 * event_root_reach(t_evt);
         for (const EventFire &earlier : event_fires) {
-            if (earlier.moves == fire_moves || !(std::fabs(t_evt - earlier.t) <= slack)) {
+            if (!(std::fabs(t_evt - earlier.t) <= slack)) {
+                continue;
+            }
+            bool together = earlier.moves == fire_moves;
+            for (int c = 0; together && fire_moves && c < n_sens; ++c) {
+                const auto u = static_cast<std::size_t>(c);
+                together = same_shift(c, u < earlier.tau.size() ? earlier.tau[u] : 0.0, tau[u]);
+            }
+            if (together) {
                 continue;
             }
             const auto name = [&](int ei) {
-                return ei >= 0 && !events_outer[ei].id.empty() ? events_outer[ei].id
-                                                               : std::to_string(ei);
+                return "'" +
+                       (ei >= 0 && !events_outer[ei].id.empty() ? events_outer[ei].id
+                                                                : std::to_string(ei)) +
+                       "'";
             };
-            const std::string before = earlier.occurrences.empty()
-                                           ? "an event"
-                                           : "'" + name(earlier.occurrences.front().first) + "'";
-            const std::string now = "'" + name(fired.front()) + "'";
-            const std::string &moving = fire_moves ? now : before;
-            const std::string &fixed = fire_moves ? before : now;
+            const std::string before = name(earlier.event);
+            const std::string now = name(named);
             std::ostringstream msg;
             msg << "Forward sensitivity: events " << before << " and " << now
                 << " fire on one instant, t=" << t_evt << ", in two batches, and their times "
-                << "move differently with the requested parameters: " << fixed
-                << " does not move and " << moving
-                << " does. Their order flips across the parameter, so the result jumps there "
+                << "move differently with the requested parameters: ";
+            if (earlier.moves && fire_moves) {
+                msg << "both move, and not together";
+            } else {
+                msg << (fire_moves ? before : now) << " does not move and "
+                    << (fire_moves ? now : before) << " does";
+            }
+            msg << ". Their order flips across the parameter, so the result jumps there "
                    "and has no derivative (issues #49, #1277). Separate the trigger times, or "
                    "drop the parameters that move them from sensitivity_params.";
             throw std::runtime_error(msg.str());
@@ -8154,8 +8196,8 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
     if (event_fires.size() >= kFiresKept) {
         event_fires.erase(event_fires.begin());
     }
-    event_fires.push_back(
-        {t_evt, fired_reads, fire_moves, x_minus, fire_window, occurrences, fires_before});
+    event_fires.push_back({t_evt, fired_reads, fire_moves, x_minus, fire_window, occurrences,
+                           fires_before, tau, named});
     // The light record of the fire that a crossing later in the run is asked
     // against: the residual of every switch where the state was.
     if (!state_switch_all.empty() && !occurrences.empty()) {
@@ -8365,27 +8407,6 @@ void CvodeSimulator::Impl::apply_event_sensitivity_jump(
         probes.push_back(std::move(probe));
     };
 
-    // Shifts are compared column by column, in the column's own units: a shift
-    // times the parameter is how far the time moves per unit relative change of
-    // it. One column's large shift says nothing about another's, and a
-    // finite-difference ∂t*/∂p of 1e-17 beside an exact 0 is no shift.
-    // Against the event's own time, not a time unit: an event at t = 1e-9
-    // moved by its own parameter moves by 1e-9 per unit relative change.
-    const double time_size = t_evt != 0.0 ? std::fabs(t_evt) : 1.0;
-    auto unit_of = [&](int c) {
-        const double value =
-            c < n_sens_p ? std::fabs(params[static_cast<size_t>(sens_param_indices[c])].value)
-                         : 0.0;
-        return value > 0.0 ? value : 1.0;
-    };
-    auto moves = [&](int c, double shift) {
-        return std::fabs(shift) * unit_of(c) > kEventShiftFloor * time_size;
-    };
-    auto same_shift = [&](int c, double a, double b) {
-        const double gap = std::fabs(a - b) * unit_of(c);
-        return gap <= kEventShiftFloor * time_size ||
-               std::fabs(a - b) <= kEventShiftRelTol * std::max(std::fabs(a), std::fabs(b));
-    };
     auto one_instant = [eps_d](double a, double b) {
         return std::fabs(a - b) <=
                kSwitchInstantUlps * eps_d * std::max({std::fabs(a), std::fabs(b), 1.0});
@@ -16642,13 +16663,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // ulp-scale, so a trigger that rises ON a switch time is reported up to
         // that long after the stop there.
         const double since = t - switches_applied_t;
-        if (since >= 0.0 && since <= kEventRootSlack * kSwitchInstantUlps *
-                                         std::numeric_limits<double>::epsilon() *
-                                         std::max(std::fabs(t), 1.0)) {
+        const double reach = event_root_reach(t);
+        if (since >= 0.0 && since <= reach) {
             clocks.applied = switches_applied;
         }
-        const double reach = kEventRootSlack * kSwitchInstantUlps *
-                             std::numeric_limits<double>::epsilon() * std::max(std::fabs(t), 1.0);
         for (const SwitchTimeSens *one : switch_list) {
             if (std::fabs(one->t_star - t) <= 2.0 * reach) {
                 clocks.within_reach.push_back(one);
