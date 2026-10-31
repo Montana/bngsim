@@ -22,6 +22,7 @@
 #include <bngsim/wallclock.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -3328,6 +3329,50 @@ PYBIND11_MODULE(_bngsim_core, m) {
 #else
     m.attr("HAS_MIR") = false;
 #endif
+
+    // Issue #1215: MIR ended the process when it ran out of memory or address
+    // space; MirJit now raises. This fails one allocation or code mapping of a
+    // compile (a fail_mapping refuses the reservation too, so that there are
+    // mappings to fail), so a test can fail each in turn.
+    //
+    // Internal — the leading underscore is the contract.
+    m.def(
+        "_mir_jit_compile",
+        [](const std::string &source, long long fail_allocation, long long fail_mapping,
+           int fail_mapping_errno) -> std::pair<long long, long long> {
+#ifdef BNGSIM_HAS_MIR
+            namespace detail = bngsim::detail;
+            struct Reset {
+                ~Reset() {
+                    detail::mir_test_hooks = false;
+                    detail::mir_failing_allocation = -1;
+                    detail::mir_failing_mapping = -1;
+                    detail::mir_failing_mapping_errno = ENOMEM;
+                }
+            } reset;
+            detail::mir_test_hooks = true;
+            detail::mir_allocation_count = 0;
+            detail::mir_mapping_count = 0;
+            detail::mir_failing_allocation = fail_allocation;
+            detail::mir_failing_mapping = fail_mapping;
+            detail::mir_failing_mapping_errno = fail_mapping_errno;
+            bngsim::MirJit jit(source);
+            return {detail::mir_allocation_count, detail::mir_mapping_count};
+#else
+            (void)fail_allocation;
+            (void)fail_mapping;
+            (void)fail_mapping_errno;
+            bngsim::MirJit jit(source); // throws: this build has no MIR
+            return {0, 0};
+#endif
+        },
+        py::arg("source"), py::arg("fail_allocation") = -1, py::arg("fail_mapping") = -1,
+        py::arg("fail_mapping_errno") = ENOMEM,
+        "MIR-compile a generated C source as if the C heap ran out at MIR's allocation number "
+        "fail_allocation, or its code mapping number fail_mapping were refused with errno "
+        "fail_mapping_errno (both counted from 0; -1 fails none), and return how many allocations "
+        "and code mappings MIR made. A failure raises MirJit's RuntimeError (issue #1215). "
+        "Internal.");
 
     // ─── ModelBuilder (programmatic model construction) ──────────────────────
     py::class_<bngsim::ModelBuilder>(m, "ModelBuilder")

@@ -27,9 +27,13 @@ result = rm.run(t_span=(0, 100), n_points=101, seed=42)
 Each run uses the model's parameters. NFsim and RuleMonkey read the XML, so a
 run passes them every parameter set on the model with `Model.set_param` since it
 was loaded, before or after the `Simulator` was built. Parameters that depend on
-it, and seed amounts that read it, follow. A parameter set back to its loaded
-value runs as the XML has it. `run_batch` does not run a network-free method:
-scan point by point with `Model.set_param` and `Simulator.run`.
+it, and seed amounts that read it, follow, except a derived parameter written on
+the model, which keeps the value written there as it does on the model. A model
+whose parameters are all back at their loaded values runs as the XML has it. A
+`Model.set_concentration` is not passed on yet (issue #1373): to start from other
+amounts, set the parameters the seed species read. `run_batch` does not run a
+network-free method: scan point by point with `Model.set_param` and
+`Simulator.run`.
 
 It starts from the model's species amounts the same way. A run passes the
 backend every species amount changed since the model was loaded, whether by

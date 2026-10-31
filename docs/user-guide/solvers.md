@@ -23,6 +23,24 @@ re-arm each force one — so bngsim banks each segment as it closes rather than
 sampling the counters once at the end, which would report only the span after
 the last restart (issue #182).
 
+## The default tolerances, and models in small units
+
+The defaults are `rtol=1e-8` and a scalar `atol=1e-8`, BNG2.pl's, chosen for
+species held as molecule counts. A species that stays below `atol` for the whole
+run has no error control beyond the tolerance itself. That happens in a model in
+molar or other small units, which is common in SBML and BioModels. Such a
+trajectory can be off by its own size, or go negative, and CVODE reports no
+error: a binding model of species near 1e-9 M ended at -8.7e-10 for 4.1e-10.
+
+`run()`, `run_until()`, `run_batch()`, `parameter_scan()` and
+`compute_all_sensitivities()` raise `bngsim.AtolScaleWarning` in that case,
+once per call and naming the species, where you gave no `atol` and a species
+the solver integrates stays below it while reaching at least 1e-6 of the run's
+largest. A species stuck at rounding in a count model does not reach that, and
+a `$`-fixed species or an assignment-rule target is not integrated; neither is
+warned. The remedy is `atol="auto"` (next section), or a scalar `atol` well
+below those species (issue #1361).
+
 ## Per-species absolute tolerance
 
 `atol` also takes one value **per species**, ordered like
@@ -246,7 +264,8 @@ the result (`"analytical"`, `"fd"`, or `"jax"`) — including `"fd"` when an
 **When to use `"fd"`**: For A/B benchmarking, or if you suspect the analytical
 Jacobian is causing issues. The `"fd"` option uses SUNDIALS' internal
 difference-quotient (DQ) approximation for dense models, and graph-colored
-finite differences for sparse (KLU) models.
+finite differences for sparse (KLU) models. Against a system SUNDIALS of
+another release, see [Installation](../installation.md#from-source).
 
 **Analytical Jacobian**: Available automatically when all reactions use
 Elementary (mass-action) rate laws. For models with Functional or
@@ -338,7 +357,7 @@ dense LU, `1` for sparse KLU, `2` for the BLAS dense factor.
 
 | Route | When (default options) |
 |---|---|
-| KLU (sparse) | at least 50 species, a Jacobian under 10% dense, and an LU factor that stays sparse (below) |
+| KLU (sparse) | at least 50 species, a Jacobian under 10% dense with a structural nonzero to factor, and an LU factor that stays sparse (below) |
 | BLAS dense factor | a model KLU would take whose LU factor fills in, on a build with BLAS |
 | built-in dense LU | everything else |
 
