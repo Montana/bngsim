@@ -18,7 +18,15 @@ Compared with the XML's value as printed, a change in the ninth digit would be
 dropped. The model's own values at load (``Model._loaded_params``) are exact.
 
 Only the parameters the XML declares are pushed: a backend refuses a name it
-does not have.
+does not have. When the XML cannot be read, which those are is not known, and a
+run that changed any is refused rather than run on the XML's values.
+
+A derived parameter the model holds at a value written to it goes with them,
+even at its value at load. ``Model.set_param`` on one overrides its expression,
+and the backend, handed the parameters the expression reads, would re-derive it
+from them: with ``kph = 0`` and ``kph2 = kph*kv*NA*V/3`` then written back to its
+value at load, the model held ``kph2 = 1/6`` and SSA ended at RP = 59, while nf
+and rm were handed ``kph = 0`` alone and ran no RP.
 """
 
 from __future__ import annotations
@@ -27,18 +35,21 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from bngsim._exceptions import ModelError
+from bngsim._model import _names_in
+
 
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def xml_parameter_names(xml_path: str | Path) -> frozenset[str]:
-    """The ids of the model's ``<Parameter>`` elements in *xml_path*. Empty
-    when the file cannot be parsed."""
+def xml_parameter_names(xml_path: str | Path) -> frozenset[str] | None:
+    """The ids of the model's ``<Parameter>`` elements in *xml_path*, or
+    ``None`` when the file cannot be parsed."""
     try:
         root = ET.parse(str(xml_path)).getroot()
     except (ET.ParseError, OSError):
-        return frozenset()
+        return None
     return frozenset(
         name
         for lst in root.iter()
@@ -48,16 +59,41 @@ def xml_parameter_names(xml_path: str | Path) -> frozenset[str]:
     )
 
 
-def parameter_overrides(model: Any, xml_names: frozenset[str]) -> dict[str, float]:
-    """The parameters of *model* the XML declares, that the model holds at a
-    value other than its value at load, with the model's values."""
+def parameter_overrides(model: Any, xml_names: frozenset[str] | None) -> dict[str, float]:
+    """The parameters of *model* the XML declares, with the model's values: each
+    one the model holds at a value other than its value at load, and with them
+    each derived one the model holds at a value written to it.
+
+    Raises :class:`ModelError` when *xml_names* is ``None`` (the XML could not
+    be read) and the model holds a parameter at a value other than its value at
+    load."""
     core = model._core
     loaded = model._loaded_params
-    out: dict[str, float] = {}
-    for name in core.param_names:
-        if name not in xml_names:
-            continue
-        value = float(core.get_param(name))
-        if loaded.get(name) != value:
-            out[name] = value
+    names = list(core.param_names)
+    values = [float(core.get_param(name)) for name in names]
+    changed = {
+        name: value
+        for name, value, internal in zip(names, values, core.param_is_internal, strict=True)
+        if not internal and loaded.get(name) != value
+    }
+    if xml_names is None:
+        if changed:
+            raise ModelError(
+                "The network-free backend runs on the XML's parameters unless it is "
+                f"handed the model's, and this model has changed {sorted(changed)}, but "
+                "the XML could not be read to find which of them it declares. A run "
+                "would drop every one (issue #1360). Pass an xml_path that is "
+                "well-formed XML."
+            )
+        return {}
+    out = {name: value for name, value in changed.items() if name in xml_names}
+    if out:
+        known = set(names)
+        for name, value, derived, expression in zip(
+            names, values, core.param_is_expression, core.param_expressions, strict=True
+        ):
+            # An overridden derived parameter: not derived now, while its
+            # expression names another parameter (Model.param_is_expression).
+            if name in xml_names and not derived and known.intersection(_names_in(expression)):
+                out.setdefault(name, value)
     return out

@@ -106,11 +106,13 @@ def test_a_model_nobody_changed_runs_as_the_xml_does(method):
     overrides, to the bit. That NA, kv and kph2 are not handed on, which would
     move a rate in its ninth digit, below what these runs show, is
     test_a_model_nobody_changed_hands_the_backend_nothing."""
-    from bngsim._bngsim_core import NfsimSimulator, RuleMonkeySimulator, TimeSpec
+    import bngsim._bngsim_core as core
 
-    times = TimeSpec()
+    times = core.TimeSpec()
     times.t_start, times.t_end, times.n_points = 0.0, 20.0, 3
-    backend = NfsimSimulator if method == "nf" else RuleMonkeySimulator
+    # By name, and only the one this case runs: a build has the class only when
+    # it has the backend, and the other may be compiled out.
+    backend = getattr(core, "NfsimSimulator" if method == "nf" else "RuleMonkeySimulator")
     for seed in (1, 5, 9):
         raw = backend(str(XML)).run(times, seed, 0.0)
         ours = _run(method, {}, seed=seed)
@@ -144,6 +146,62 @@ def test_a_change_past_the_xmls_digits_is_handed_on():
     expected = {"NA": 6e23, "kv": pytest.approx(1.0 / (6e23 * 1.3e-15), rel=1e-15)}
     assert parameter_overrides(model, names) == expected
     assert parameter_overrides(model.clone(), names) == expected
+
+
+def _kph_off_kph2_kept(**kwargs) -> tuple[bngsim.Model, float]:
+    """kph = 0, with kph2 written back to its value at load: the model holds
+    kph2 there, overriding its expression, so R still phosphorylates."""
+    model = bngsim.Model.from_net(str(NET))
+    kph2 = model.get_param("kph2")
+    model.set_param("kph", 0.0)
+    model.set_param("kph2", kph2, **kwargs)
+    return model, kph2
+
+
+def test_a_derived_parameter_the_model_holds_is_handed_on():
+    """kph2 is at its value at load, and is still handed on: the backend, handed
+    kph = 0, would re-derive kph2 = 0 from it. A pin at the expression's own
+    value, with nothing else changed, hands nothing: the XML derives the same."""
+    names = xml_parameter_names(XML)
+    model, kph2 = _kph_off_kph2_kept()
+    assert parameter_overrides(model, names) == {"kph": 0.0, "kph2": kph2}
+    pinned = bngsim.Model.from_net(str(NET))
+    pinned.set_param("kph2", kph2, force_override=True)
+    assert parameter_overrides(pinned, names) == {}
+    pinned.set_param("kph", 0.0)
+    assert parameter_overrides(pinned, names) == {"kph": 0.0, "kph2": kph2}
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_a_derived_parameter_the_model_holds_reaches_the_backend(method):
+    """SSA keeps phosphorylating at kph2 = 1/6, ending at RP = 59. Before the
+    fix, nf and rm were handed kph = 0 alone and ran no RP at any row."""
+    model, _ = _kph_off_kph2_kept()
+    sim = bngsim.Simulator(model, method=method, xml_path=str(XML))
+    rp = _observable(sim.run(t_span=(0, 20), n_points=3, seed=5), "RP")
+    assert rp[-1] > 0.0, rp
+
+
+def test_an_unreadable_xml_refuses_a_changed_model():
+    """Which parameters an XML that cannot be parsed declares is not known.
+    Before, it declared none, and every change was dropped without a word."""
+    assert xml_parameter_names(DATA / "malformed.xml") is None
+    model = bngsim.Model.from_net(str(NET))
+    assert parameter_overrides(model, None) == {}
+    model.set_param("kph", 0.0)
+    with pytest.raises(bngsim.ModelError, match=r"\['kph', 'kph2'\], but the XML could not be"):
+        parameter_overrides(model, None)
+
+
+@pytest.mark.skipif(not _available("nf"), reason="NFsim not compiled in")
+def test_an_unreadable_xml_refuses_the_run_before_the_backend_reads_it():
+    """The constructor takes such an XML (NFsim reads it at the run), so the
+    run is where the refusal is: ahead of NFsim's own parse."""
+    model = bngsim.Model.from_net(str(NET))
+    sim = bngsim.Simulator(model, method="nf", xml_path=str(DATA / "malformed.xml"))
+    model.set_param("kph", 0.0)
+    with pytest.raises(bngsim.SimulationError, match="could not be read"):
+        sim.run(t_span=(0, 20), n_points=3, seed=5)
 
 
 @pytest.mark.parametrize("method", METHODS)

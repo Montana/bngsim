@@ -891,8 +891,9 @@ class Simulator:
         self._canonical_method = canonical
         self._xml_path = xml_path
         self._rm_clock_offset = False
-        # nf/rm: the ids of the XML's <Parameter> elements (issue #1360).
-        self._xml_param_names: frozenset[str] = frozenset()
+        # nf/rm: the ids of the XML's <Parameter> elements, None when the XML
+        # cannot be read (issue #1360).
+        self._xml_param_names: frozenset[str] | None = frozenset()
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
