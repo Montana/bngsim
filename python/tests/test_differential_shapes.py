@@ -1934,11 +1934,23 @@ def _zero_start(growth: str) -> D.Job:
     return D.Job(path.stem, path, 0.0, 10.0, 21)
 
 
-def test_the_nudge_moves_each_start_by_its_share_of_a_step():
+def test_the_nudge_moves_a_held_start_by_its_share_of_a_step():
+    """S, held at 0, moves by its share of atol; A, decaying from 10, not at all."""
     job = _zero_start("0")
     x0 = np.asarray(D.run(job, nudge=D.START_NUDGE)[0].species)[0]
-    want = np.array([0.0, 10.0]) + D.START_NUDGE * (job.rtol * np.array([0.0, 10.0]) + job.atol)
-    np.testing.assert_allclose(x0, want, rtol=1e-12)
+    np.testing.assert_allclose(x0, [D.START_NUDGE * job.atol, 10.0], rtol=1e-12)
+
+
+def test_only_a_species_the_equations_hold_still_is_nudged():
+    """S' = 4·S holds S at 0, and only S is nudged. Not D, held too but read by
+    a trigger at its threshold (BIOMD0000000285's death events); not A, which
+    nothing moves (265's switches); not B, already moving."""
+    model = bngsim.Model.from_antimony_string(
+        "species S = 0, D = 0, A = 0, B = 1; S' = 4*S; D' = A; A' = 0; B' = -B\n"
+        "E: at (D > 0): S = 0"
+    )
+    assert model.species_names == ["S", "D", "A", "B"]
+    assert D.held_at_start(model, 0.0).tolist() == [True, False, False, False]
 
 
 def test_an_unstable_zero_the_rounding_keeps_is_contested():

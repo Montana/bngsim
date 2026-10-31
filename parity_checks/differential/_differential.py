@@ -71,6 +71,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -233,17 +234,74 @@ def _left() -> float | None:
     return left
 
 
+def _trigger_reads(model) -> set[str] | None:
+    """The species an event trigger reads, through the functions it calls by
+    name: None where one reads an observable that is not a species of its
+    name (a ``.net`` group), whose species are not to be had here."""
+    core = model._core
+    todo = list(core.event_trigger_sources())
+    if not todo:
+        return set()
+    bodies = dict(zip(core.function_names, core.function_expressions, strict=True))
+    species, observables = set(model.species_names), set(core.observable_names)
+    seen: set[str] = set()
+    reads: set[str] = set()
+    while todo:
+        for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", todo.pop()):
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in bodies:
+                todo.append(bodies[name])
+            elif name in species:
+                reads.add(name)
+            elif name in observables:
+                return None
+    return reads
+
+
+def held_at_start(model, t: float) -> np.ndarray:
+    """The species the model's equations hold still at its start: a derivative
+    of exactly 0 there, on a species something in the equations can move (a
+    row of the Jacobian's pattern with an entry, and not fixed), and that no
+    event trigger reads. A value held exactly is what rounding alone can
+    break, as BIOMD0000000908's S = 0 is broken. The rest are not a rounding's
+    to move:
+
+    * a species already moving, which the nudge only shifts in time;
+    * a species nothing moves, an input: BIOMD0000000265's switches, which
+      only its events write;
+    * a species a trigger reads, which the nudge can carry across the
+      trigger's threshold at the start, where no rounding reaches: in
+      BIOMD0000000285, ``PIdeath > 0`` and ``p38death > 0`` both true at
+      t = 0 fire neither (initialValue true, as a Level 2 trigger is), and
+      the cell they kill at once lives. A model whose triggers read
+      observables that are not plain species is not nudged at all.
+    """
+    x0 = model.get_state()
+    held = (np.asarray(model.rhs(x0, t)) == 0.0) & ~np.asarray(model._core.species_is_fixed, bool)
+    pattern = model._core.jacobian_sparsity
+    moved = np.zeros(len(x0), dtype=bool)
+    moved[np.asarray(pattern["row_indices"], dtype=int)] = True
+    reads = _trigger_reads(model)
+    if reads is None:
+        return np.zeros(len(x0), dtype=bool)
+    read = np.array([name in reads for name in model.species_names], dtype=bool)
+    return held & moved & ~read
+
+
 def run(job: Job, nudge: float = 0.0, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
     the Result and the Simulator. It has until :data:`_DEADLINE`. ``nudge``
-    moves each species' start up by that share of what a step may err by in
-    it, ``rtol·|x| + atol`` (:data:`START_NUDGE`)."""
+    moves the start of each species :func:`held_at_start` up by that share of
+    what a step may err by in it, ``rtol·|x| + atol`` (:data:`START_NUDGE`)."""
     import bngsim
 
     model = load(job.path)
     if nudge:
         x0 = model.get_state()
-        model.set_state(x0 + nudge * (job.rtol * np.abs(x0) + job.atol))
+        held = held_at_start(model, job.t_start)
+        model.set_state(x0 + held * nudge * (job.rtol * np.abs(x0) + job.atol))
     sim = bngsim.Simulator(model, method="ode", **{**job.sim, **kw})
     result = sim.run(
         t_span=(job.t_start, job.t_end),
