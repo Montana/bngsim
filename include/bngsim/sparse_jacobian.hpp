@@ -144,6 +144,15 @@ inline bool fill_routes_to_dense(const JacobianSparsity &sp, int ns, double lu_f
 //
 // `lu_fill` is routing_lu_fill(model, ns, jacobian_strategy): a model the size
 // and density test sends to KLU goes dense when fill_routes_to_dense says so.
+//
+// A structurally empty Jacobian (nnz == 0: species no reaction moves, an event's
+// targets) has a density of 0, which the density test reads as sparse, but it
+// gives KLU nothing to factor and, under jacobian="fd", nothing to color, and the
+// run was refused for force_sparse_linear_solver, a flag the caller never set
+// (SBML Test Suite 01530). So the size and density test sends it to the dense
+// solver, as codegen's own reading of this rule already did (_codegen.py's
+// fallback for a core that does not report routes_sparse). force_sparse still
+// asks for KLU, and is refused by name where nothing can fill the matrix.
 inline bool route_to_sparse_linear_solver(const JacobianSparsity &sp, int ns,
                                           const std::string &jacobian_strategy, bool force_dense,
                                           bool force_sparse, double lu_fill) {
@@ -151,7 +160,7 @@ inline bool route_to_sparse_linear_solver(const JacobianSparsity &sp, int ns,
     const bool sparse_ok = (jacobian_strategy != "jax") && !sp.empty();
     return sparse_ok && !force_dense &&
            (force_sparse ||
-            ((ns >= SPARSE_THRESHOLD) && (sp.density < SPARSE_DENSITY_MAX) &&
+            ((ns >= SPARSE_THRESHOLD) && (sp.nnz > 0) && (sp.density < SPARSE_DENSITY_MAX) &&
              !fill_routes_to_dense(sp, ns, lu_fill, jacobian_strategy, force_dense, force_sparse)));
 #else
     (void)sp;
@@ -219,11 +228,21 @@ inline void install_csc_structure(IndexT *col_ptrs, IndexT *row_indices,
 // all, as the quotient's own does. A column is tested where fd_jump_testable
 // takes it, and its mends are kept as fd_jacobian.hpp says. Null leaves the
 // quotient as it was. `*n_mended` (if given) counts the entries mended.
+//
+// The step. With the session's error weights `ewt` (and `min_inc` from them,
+// cvode_dq_min_inc), a column's step is CVODE's own dense difference
+// quotient's (cvLsDenseDQJac): max(sqrt(eps)*|y_j|, min_inc/ewt_j), on the
+// scale the error test judges y_j by. Without them, sqrt(eps)*max(|y_j|, 1): a
+// floor of 1 in absolute terms, which moved a species of 1e-9 by fifteen times
+// itself, so the matrix KLU factored was the Jacobian somewhere else, and Newton
+// failed to converge or reached a state with no finite rate where dense
+// differences, on the weights, ran (#1254).
 template <typename EvalRhs>
 inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, const double *y,
                                 const double *fy, double *jac_data, double *y_pert, double *fy_pert,
                                 double *h_vals, EvalRhs &&eval_rhs, double *jump_rows = nullptr,
-                                int *n_mended = nullptr) {
+                                int *n_mended = nullptr, const double *ewt = nullptr,
+                                double min_inc = 1.0) {
     // Finite difference perturbation scale
     const double sqrt_uround = 1.4901161193847656e-8; // sqrt(machine epsilon)
 
@@ -235,7 +254,8 @@ inline void colored_fd_jacobian(const JacobianSparsity &sp, int ns, double t, co
         std::memcpy(y_pert, y, static_cast<std::size_t>(ns) * sizeof(double));
 
         for (int j : group) {
-            double h = sqrt_uround * std::max(std::abs(y[j]), 1.0);
+            double h = ewt != nullptr ? std::max(sqrt_uround * std::abs(y[j]), min_inc / ewt[j])
+                                      : sqrt_uround * std::max(std::abs(y[j]), 1.0);
             h_vals[j] = h;
             y_pert[j] += h;
         }

@@ -24,12 +24,14 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import FrameType
 from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
@@ -51,6 +53,7 @@ from bngsim._codegen import (
     read_sens_decline_note,
 )
 from bngsim._exceptions import (
+    AtolScaleWarning,
     DenseSolverFallbackWarning,
     ModelError,
     SensitivityUnsupportedError,
@@ -192,6 +195,25 @@ def _tracking_hint(decades: float) -> str:
         f"the step size collapses instead. Try a smaller TrackingAtol(decades=...), "
         f"or a plain per-species atol."
     )
+
+
+_PACKAGE_DIR = os.path.dirname(__file__) + os.sep
+
+
+def _stacklevel_outside_bngsim() -> int:
+    """The ``stacklevel`` that puts a warning on the first frame outside bngsim.
+
+    For the function that calls this and then ``warnings.warn``. A fixed level
+    is right from one entry point only: the same warning reached through
+    ``run_until``, a scan or a :class:`~bngsim.ReactionKernel` would name a
+    line of bngsim's own, and every caller would share its one-shot slot.
+    """
+    frame: FrameType | None = sys._getframe(1)
+    level = 1
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 # Process-wide one-shot guard for the dense-fallback notice, so a run_batch over
@@ -643,10 +665,11 @@ class Simulator:
         Only used for ``method="ode"``. Default ``False``. The mirror image of
         ``force_dense_linear_solver``: force sparse KLU even on a model the auto
         rule would send to the dense solver for being too small (``n_species <
-        50``) or too dense (Jacobian density ``>= 10%``). Only those two gates
-        are bypassed — KLU still needs a real sparsity pattern and a non-JAX
-        Jacobian — so it is likewise a no-op in a build without KLU. Passing
-        both force flags raises :class:`ValueError`.
+        50``), too dense (Jacobian density ``>= 10%``), or without a structural
+        nonzero in its Jacobian (issue #1296). Those three gates and the LU-fill
+        test below are bypassed — KLU still needs a sparsity pattern and a
+        non-JAX Jacobian — so it is likewise a no-op in a build without KLU.
+        Passing both force flags raises :class:`ValueError`.
 
         It also keeps KLU where the *LU-fill* test would leave it. A model of
         256 to 5,000 species with a sparse Jacobian but an LU factor estimated
@@ -667,9 +690,10 @@ class Simulator:
 
         Applies to :meth:`steady_state` as well (issue #128) — with one
         difference: a model whose Jacobian has *no structural nonzero* is left on
-        the dense solver there instead of raising, because the steady-state auto
-        rule can route such a model to KLU on its own (density 0 < 10%) and
-        f(y) ≡ 0 makes it a steady state that used to solve immediately.
+        the dense solver there even when forced, where ``run()`` takes KLU with
+        the analytical Jacobian and raises with ``jacobian="fd"``. f(y) ≡ 0
+        makes such a model a steady state that solves immediately, as it did
+        before #128.
 
     Examples
     --------
@@ -5297,6 +5321,8 @@ class Simulator:
         # stay on result.ssa_diagnostics regardless of warning filters. No-op on
         # non-SSA backends (counts are zero there).
         self._warn_ssa_boundary(result)
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale([result], "ODE run")
 
         # Check stop conditions on the result
         if self._stop_conditions:
@@ -5309,6 +5335,89 @@ class Simulator:
         )
 
         return result
+
+    # A species below atol is one the run controls no error of. It matters
+    # where it is a part of the model's own scale, at least this fraction of the
+    # largest species (issue #1361); in a model of molecule counts, a species
+    # that stays near 0 is rounding, 1e-17 of the rest, and is left alone.
+    _ATOL_SCALE_RELEVANT = 1e-6
+
+    def _atol_is_default(self, atol: AtolLike | None) -> bool:
+        """Whether an ODE call given *atol* runs at the default scalar, which no
+        caller chose: neither the call nor :meth:`set_tolerances` gave one."""
+        return (
+            self._method == "ode"
+            and atol is None
+            and not self._atol_set
+            and self._atol_vec is None
+            and self._atol_track is None
+        )
+
+    def _warn_atol_above_scale(self, results: Iterable[Result], call: str) -> None:
+        """Warn when the default scalar ``atol`` is above species that matter
+        in the ODE runs of one call (issue #1361).
+
+        The default, ``1e-8``, is BNG2.pl's, for species held as molecule
+        counts. A species whose every value on the run is below it has its
+        error controlled by nothing but the tolerance: a binding model of
+        species near 1e-9 M returned a concentration of -8.7e-10 for 4.1e-10 at
+        t = 5000, and BIOMD0000000002, whose ligand is at 1e-5 M and whose
+        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Asked only where
+        :meth:`_atol_is_default` holds, and only of a species the solver
+        integrates that reaches at least ``_ATOL_SCALE_RELEVANT`` of the largest
+        such species of its run. A ``$``-fixed species or an assignment-rule
+        target (``species_is_fixed`` both) is no such species: its value is not
+        integrated, so no tolerance makes it wrong.
+
+        One warning per call, naming the species of every run: a scan or batch
+        of 100 rows is one hazard, not 100. The text carries nothing that moves
+        from run to run, so the warnings module shows it once per call site, and
+        a loop of ``run_until`` steps or a fit's evaluations does not repeat it.
+        """
+        model = self._model._core
+        held = {
+            name
+            for name, fixed in zip(model.species_names, model.species_is_fixed, strict=True)
+            if fixed
+        }
+        found: dict[str, None] = {}  # ordered, and no list scan per species
+        for result in results:
+            species = np.asarray(result._species, dtype=np.float64)
+            if species.ndim != 2 or species.size == 0:
+                continue
+            free = np.array([n not in held for n in result._species_names], dtype=bool)
+            if free.size != species.shape[1]:
+                continue
+            # A non-finite sample is no scale; np.nanmax would also warn on a
+            # column that holds nothing else (an assignment rule at 1/0).
+            peaks = np.max(np.abs(species), axis=0, initial=0.0, where=np.isfinite(species))
+            largest = float(peaks.max(initial=0.0, where=free))
+            below = (
+                free
+                & (peaks > 0.0)
+                & (peaks < self._atol)
+                & (peaks >= self._ATOL_SCALE_RELEVANT * largest)
+            )
+            hits = zip(result._species_names, below, strict=True)
+            found.update((name, None) for name, hit in hits if hit)
+        if not found:
+            return
+        names = list(found)
+        shown = ", ".join(repr(n) for n in names[:5]) + (
+            f" and {len(names) - 5} more" if len(names) > 5 else ""
+        )
+        warnings.warn(
+            f"{len(names)} species of this {call} stay below the absolute tolerance "
+            f"atol={self._atol:g} throughout, while reaching at least "
+            f"{self._ATOL_SCALE_RELEVANT:g} of the largest species: {shown}. The run "
+            "controls no error of these, so their trajectories can be wrong by their own "
+            "size, or negative, with no solver error. The default atol is for species "
+            "held as molecule counts; for a model in molar or other small units, pass "
+            "atol='auto' (a tolerance per species, from its scale), or a scalar atol "
+            "well below these species (issue #1361).",
+            AtolScaleWarning,
+            stacklevel=_stacklevel_outside_bngsim(),
+        )
 
     # ─── Batch ──────────────────────────────────────────────────────
 
@@ -5369,7 +5478,10 @@ class Simulator:
             each simulation, so threads parallelize effectively.
         squeeze : bool
             If ``True``, return a single Result with 3D arrays
-            ``(n_sims, n_times, n_cols)`` instead of a list.
+            ``(n_sims, n_times, n_cols)`` instead of a list. Refused while a
+            stop condition is registered (:meth:`add_stop_condition`): a row
+            one cuts is shorter than the rest, and a stack does not say which
+            stopped (issue #1369).
         steady_state : bool, optional
             ODE-only. When ``True``, every simulation in the batch stops
             early once ``||f(t,y)||_2 / n_species`` falls below
@@ -5392,14 +5504,19 @@ class Simulator:
         -------
         list[Result] or Result
             One Result per parameter set (list), or a single
-            squeezed Result with 3D arrays if ``squeeze=True``.
+            squeezed Result with 3D arrays if ``squeeze=True``. Each row is
+            checked against the registered stop conditions as :meth:`run`
+            checks its result: a row that meets one comes back cut at the
+            first sample it holds at, with :attr:`Result.stop_condition`
+            naming it, and nothing is raised (issue #1369).
 
         Raises
         ------
         SimulationError
             If any simulation fails.
         ValueError
-            If params is empty or t_span/n_points are invalid.
+            If params is empty or t_span/n_points are invalid, or
+            ``squeeze=True`` while a stop condition is registered.
 
         Examples
         --------
@@ -5440,6 +5557,7 @@ class Simulator:
                 "count, so the per-Result trajectories cannot be stacked into a "
                 "single 3D array. Use squeeze=False (the default)."
             )
+        self._refuse_squeeze_with_stop_conditions("run_batch", squeeze)
         ss_tol_value: float = 0.0
         if steady_state_tol is not None:
             ss_tol_value = float(steady_state_tol)
@@ -5555,6 +5673,13 @@ class Simulator:
             results = [_run_one(i) for i in range(n_sims)]
 
         logger.info("Batch complete: %d results", len(results))
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale(results, "ODE batch")
+
+        # Each row meets the stop conditions as run() does, and one that meets
+        # one comes back cut there, beside the rest (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
 
         # Each row is stamped already, against its own clone (issues #698, #743).
         if squeeze:
@@ -5600,13 +5725,16 @@ class Simulator:
         n_replicates : int
             Number of replicate trajectories (``>= 1``).
         t_span, n_points, seed, timeout, num_processors, squeeze
-            As in :meth:`run` / :meth:`run_batch`.
+            As in :meth:`run` / :meth:`run_batch`; ``squeeze=True`` is refused
+            while a stop condition is registered.
 
         Returns
         -------
         list[Result] or Result
             One :class:`Result` per replicate, or a single squeezed Result with
             3D arrays ``(n_replicates, n_times, n_cols)`` when ``squeeze=True``.
+            A replicate that meets a registered stop condition comes back cut
+            there, as a :meth:`run_batch` row does (issue #1369).
 
         Examples
         --------
@@ -5628,6 +5756,7 @@ class Simulator:
             raise ValueError(f"t_end ({t_end}) must be > t_start ({t_start})")
         if n_points < 2:
             raise ValueError(f"n_points ({n_points}) must be >= 2")
+        self._refuse_squeeze_with_stop_conditions("run_replicates", squeeze)
 
         eff_timeout: float = 0.0
         if timeout is not None:
@@ -5716,6 +5845,10 @@ class Simulator:
             finally:
                 self._model.set_state(invocation_state)
                 self._restore_carryover_state(invocation_carry)
+
+        # As run_batch's rows (issue #1369).
+        if self._stop_conditions:
+            results = [self._stopped(r) for r in results]
 
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
@@ -6295,14 +6428,18 @@ class Simulator:
         squeeze : bool
             When ``True``, stack the per-point results into a single
             :class:`Result` with 3-D arrays (like :meth:`run_batch`); otherwise
-            return a list of per-point results.
+            return a list of per-point results. Refused while a stop condition
+            is registered, as :meth:`run_batch` refuses it.
 
         Returns
         -------
         list[Result] or Result
             One :class:`Result` per scanned value (in order), each carrying
             ``custom_attrs["scan_parameter"]`` and ``custom_attrs["scan_value"]``.
-            A squeezed :class:`Result` when ``squeeze=True``.
+            A squeezed :class:`Result` when ``squeeze=True``. A point that meets
+            a registered stop condition comes back cut there, with
+            :attr:`Result.stop_condition` naming it, rather than raising
+            :class:`StopConditionMet` out of the scan (issue #1369).
 
         Notes
         -----
@@ -6360,6 +6497,7 @@ class Simulator:
                 "steady_state=True is only supported for method='ode' "
                 f"(got method='{self._method}')."
             )
+        self._refuse_squeeze_with_stop_conditions("parameter_scan", squeeze)
         values = self._resolve_scan_values(par_scan_vals, par_min, par_max, n_scan_pts, log_scale)
 
         # Validate the parameter and capture its pre-scan value so the model can
@@ -6471,19 +6609,28 @@ class Simulator:
                 # model's current live concentrations.
                 self._recreate_interactive_sim()
                 point_seed = None if self._method == "ode" else base_seed + i
-                result = self.run(
-                    t_span=t_span,
-                    n_points=n_points,
-                    seed=point_seed,
-                    rtol=rtol,
-                    atol=scan_atol,
-                    max_steps=max_steps,
-                    max_step=max_step,
-                    timeout=timeout,
-                    steady_state=steady_state,
-                    steady_state_tol=steady_state_tol,
-                    carry_sensitivities=pt_sens_seed is not None,
-                )
+                try:
+                    result = self.run(
+                        t_span=t_span,
+                        n_points=n_points,
+                        seed=point_seed,
+                        rtol=rtol,
+                        atol=scan_atol,
+                        max_steps=max_steps,
+                        max_step=max_step,
+                        timeout=timeout,
+                        steady_state=steady_state,
+                        steady_state_tol=steady_state_tol,
+                        carry_sensitivities=pt_sens_seed is not None,
+                    )
+                except StopConditionMet as stop:
+                    # One point's stop is not the scan's (issue #1369): the point
+                    # comes back cut, as a run_batch row does. run() integrated the
+                    # whole span and left the model at its end, so a continuation
+                    # point (reset_conc=False) starts from there, as it would have.
+                    if not isinstance(stop.result, Result):  # pragma: no cover
+                        raise
+                    result = stop.result
                 result.custom_attrs["scan_parameter"] = parameter
                 result.custom_attrs["scan_value"] = float(value)
                 results.append(result)
@@ -6494,6 +6641,11 @@ class Simulator:
             self._current_time = invocation_time
             self._restore_carryover_state(invocation_sens)
             self._recreate_interactive_sim()
+
+        # Every point ran at the frozen scan_atol, which run() cannot tell from
+        # an atol the caller chose; the call's own atol says (issue #1361).
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale(results, "ODE parameter scan")
 
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
@@ -7203,6 +7355,8 @@ class Simulator:
         # Carry the #198 support map so an unsupported expression selector raises
         # the specific reason on the stitched result too.
         stitched._expression_sens_support = self._expression_sens_support()
+        if self._atol_is_default(atol):
+            self._warn_atol_above_scale([stitched], "ODE sensitivity run")
         return stitched
 
     # GH #243 — how wide a failed chunk may be before the column-by-column retry
@@ -9581,6 +9735,22 @@ class Simulator:
         label : str
             Human-readable label for the condition.
 
+        Notes
+        -----
+        A result that meets a condition is cut at the first sample it holds
+        at, and :attr:`Result.stop_condition` names the condition (its label,
+        else its expression). :meth:`run` raises :class:`StopConditionMet`
+        with that result. :meth:`run_batch`, :meth:`run_replicates` and
+        :meth:`parameter_scan` (and so :meth:`bifurcate`) check every row the
+        same way and return the cut rows in their list, beside the rest,
+        raising nothing; they refuse ``squeeze=True`` while a condition is
+        registered (issue #1369). Conditions are checked in the order they
+        were added, and the first one met cuts the row where it first holds,
+        even where a condition added later held earlier. A callable
+        is met at the last sample, so the row it cuts keeps every sample. A cut
+        result carries the reported blocks only, as the one :meth:`run` raises
+        with always has: :attr:`Result.state` refuses on it.
+
         Examples
         --------
         >>> sim.add_stop_condition("A_tot < 10", label="low_A")
@@ -9710,28 +9880,58 @@ class Simulator:
                 stacklevel=3,
             )
 
+    def _stopped(self, result: Result) -> Result:
+        """*result* cut at the first registered stop condition it meets, in
+        the order they were added, with :attr:`Result.stop_condition` naming
+        it; *result* itself where none is met. One rule for :meth:`run`, which
+        raises with the cut result, and for the rows of :meth:`run_batch` and
+        :meth:`run_replicates`, which keep it (issue #1369)."""
+        for sc in self._stop_conditions:
+            trigger_idx = sc.check(result)
+            if trigger_idx is not None:
+                trunc = self._truncate_result(result, trigger_idx + 1)
+                trunc._stop_condition = sc.label or str(sc)
+                logger.info(
+                    "Stop condition triggered at t=%.6g: %s",
+                    result.time[trigger_idx],
+                    trunc._stop_condition,
+                )
+                return trunc
+        return result
+
     def _check_stop_conditions(self, result: Result) -> None:
         """Check stop conditions against a completed result.
 
         If any condition triggers, raises StopConditionMet with
         the result truncated to the trigger point.
         """
-        for sc in self._stop_conditions:
-            trigger_idx = sc.check(result)
-            if trigger_idx is not None:
-                # Truncate result to the trigger point
-                trunc = self._truncate_result(result, trigger_idx + 1)
-                label = sc.label or str(sc)
-                logger.info(
-                    "Stop condition triggered at t=%.6g: %s",
-                    result.time[trigger_idx],
-                    label,
-                )
-                raise StopConditionMet(
-                    f"Stop condition '{label}' triggered at t={result.time[trigger_idx]:.6g}",
-                    result=trunc,
-                    condition=label,
-                )
+        stopped = self._stopped(result)
+        if stopped is not result:
+            label = str(stopped._stop_condition)
+            raise StopConditionMet(
+                f"Stop condition '{label}' triggered at t={stopped.time[-1]:.6g}",
+                result=stopped,
+                condition=label,
+            )
+
+    def _refuse_squeeze_with_stop_conditions(self, where: str, squeeze: bool) -> None:
+        """Refuse ``squeeze=True`` on a batch while a stop condition is registered.
+
+        A row a condition cuts cannot be stacked with the rest, and which rows
+        are cut is known only once every row is solved, so a refusal there threw
+        the whole solved batch away for one row's stop. Refused here, before any
+        row runs, as ``steady_state=True`` with ``squeeze=True`` is for the same
+        reason (issue #1369).
+        """
+        if squeeze and self._stop_conditions:
+            raise ValueError(
+                f"{where}(squeeze=True) is refused while stop conditions are "
+                "registered: a row a condition cuts is shorter than the rest, and a "
+                "stack does not say which stopped (issue #1369). Use squeeze=False, "
+                "where Result.stop_condition names the condition each row met, and "
+                "Result.squeeze(rows) to stack them when none did; or call "
+                "clear_stop_conditions() first."
+            )
 
     @staticmethod
     def _truncate_result(result: Result, n: int) -> Result:
@@ -9810,6 +10010,7 @@ class Simulator:
         )
         out._varvol_conc_factor = cut_map(result._varvol_conc_factor)
         out._varvol_amount_factor = cut_map(result._varvol_amount_factor)
+        out._stop_condition = result._stop_condition
         return out
 
     # ─── Interactive simulation ─────────────────────────────────────
@@ -10504,6 +10705,14 @@ class Simulator:
 # ─── Stop condition implementations ────────────────────────────────
 
 
+def _code_names(code: Any) -> Iterable[str]:
+    """Every name *code*, and any code object nested in it, can look up."""
+    yield from code.co_names
+    for const in code.co_consts:
+        if isinstance(const, type(code)):
+            yield from _code_names(const)
+
+
 class _StopCondition:
     """Base class for stop conditions."""
 
@@ -10527,24 +10736,36 @@ class _ExpressionStopCondition(_StopCondition):
         super().__init__(label=label or expression)
         self._expression = expression
         self._code = compile(expression, "<stop_condition>", "eval")
+        # Every name the expression can look up, nested code included. Only
+        # these are bound at each sample: binding every observable and species
+        # there, for a condition that reads one, was paid once per row of a
+        # batch (issue #1369).
+        self._names: frozenset[str] = frozenset(_code_names(self._code))
 
     def check(self, result: Result) -> int | None:
         """Evaluate expression at each time point."""
-        obs_names = result.observable_names
         obs_data = np.asarray(result.observables)
+        sp_data = result.species
         time = result.time
+        # (block, column, name) for each column the expression reads, in the
+        # order the namespace is built, so a sanitized species name that is
+        # also an observable's still reads as the species.
+        columns = [
+            (obs_data, j, name)
+            for j, name in enumerate(result.observable_names)
+            if name in self._names
+        ]
+        for j, name in enumerate(result.species_names):
+            # Sanitize species name for eval
+            safe = name.replace("(", "_").replace(")", "_")
+            if safe in self._names:
+                columns.append((sp_data, j, safe))
 
         for t_idx in range(len(time)):
             # Build namespace for eval
             ns = {"time": time[t_idx], "t": time[t_idx]}
-            for j, name in enumerate(obs_names):
-                ns[name] = obs_data[t_idx, j]
-            # Also add species
-            sp_data = result.species
-            for j, name in enumerate(result.species_names):
-                # Sanitize species name for eval
-                safe = name.replace("(", "_").replace(")", "_")
-                ns[safe] = sp_data[t_idx, j]
+            for block, j, name in columns:
+                ns[name] = block[t_idx, j]
 
             try:
                 val = eval(  # noqa: S307
