@@ -173,6 +173,21 @@ def test_an_amount_for_a_species_the_xml_does_not_seed_is_refused(method, tmp_pa
 
 
 @pytest.mark.parametrize("method", METHODS)
+def test_a_complex_an_ssa_run_left_is_refused_with_the_way_out(method, tmp_path):
+    """The usual way to meet the refusal: an SSA run on the same model, which
+    writes its end state there, leaves a complex the XML does not seed. The
+    message names the run and model.reset(), which lets the run go on, where it
+    used to say only to rewrite the XML or run SSA."""
+    xml = _xml_without(tmp_path, "S3")
+    model = _model()
+    bngsim.Simulator(model, method="ssa").run(t_span=(0, 20), n_points=3, seed=5)
+    with pytest.raises(ValueError, match=r"an SSA, PSA or ODE run on this model left it there"):
+        _run(method, model, xml=xml)
+    model.reset()
+    assert _observable(_run(method, model, xml=xml), "Lfree")[0] == 300.0
+
+
+@pytest.mark.parametrize("method", METHODS)
 def test_zero_for_a_species_the_xml_does_not_seed_is_what_it_starts_from(method, tmp_path):
     """Control for the refusal: 0 is what the backend starts it from."""
     xml = _xml_without(tmp_path, "S3")
