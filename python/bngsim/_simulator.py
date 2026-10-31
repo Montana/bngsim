@@ -745,6 +745,7 @@ class Simulator:
         "_sim",
         "_rm_clock_offset",
         "_xml_param_names",
+        "_xml_seed_species",
         "_rtol",
         "_atol",
         # Issue #196 — per-species absolute tolerance, or None for the scalar
@@ -894,6 +895,9 @@ class Simulator:
         # nf/rm: the ids of the XML's <Parameter> elements, None when the XML
         # cannot be read (issue #1360).
         self._xml_param_names: frozenset[str] | None = frozenset()
+        # nf/rm: the XML's seed species, BNGL name -> <Species id=>, None when
+        # the XML cannot be read (issue #1373).
+        self._xml_seed_species: dict[str, str | None] | None = {}
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
@@ -1061,7 +1065,7 @@ class Simulator:
                 refuse_nfsim_stale_local_functions,
                 refuse_time_dependent_rate_laws,
             )
-            from bngsim._network_free_params import xml_parameter_names
+            from bngsim._network_free_params import xml_parameter_names, xml_seed_species
 
             refuse_time_dependent_rate_laws(xml_path, "nfsim")
             refuse_nfsim_rate_laws(xml_path)
@@ -1072,6 +1076,7 @@ class Simulator:
             # The parameters the backend has, which each run hands it the model's
             # values of where the model has changed them (issue #1360).
             self._xml_param_names = xml_parameter_names(xml_path)
+            self._xml_seed_species = xml_seed_species(xml_path)
             if gml is not None:
                 self._sim.set_molecule_limit(int(gml))
             if connectivity is not None:
@@ -1104,7 +1109,7 @@ class Simulator:
                 refuse_rulemonkey_compartments,
                 rulemonkey_clock,
             )
-            from bngsim._network_free_params import xml_parameter_names
+            from bngsim._network_free_params import xml_parameter_names, xml_seed_species
             from bngsim._rulemonkey_session import warn_rulemonkey_diagnostics
 
             refuse_rulemonkey_compartments(xml_path)
@@ -1128,6 +1133,7 @@ class Simulator:
             else:
                 self._sim = RuleMonkeySimulator(xml_path)
             self._xml_param_names = xml_parameter_names(xml_path)
+            self._xml_seed_species = xml_seed_species(xml_path)
             warn_rulemonkey_diagnostics(self._sim, stacklevel=2)
             self._sim.set_reads_clock(reads_clock and not self._rm_clock_offset)
             if gml is not None:
@@ -5260,7 +5266,7 @@ class Simulator:
                 self._apply_ssa_breakpoints([self._sim], self._model, t_start, t_end)
                 core_result = self._sim.run_psa(times, used_seed, self._poplevel, timeout_seconds)
             elif self._method == "nfsim" or self._method == "rulemonkey":
-                from bngsim._network_free_params import parameter_overrides
+                from bngsim._network_free_params import parameter_overrides, species_amounts
 
                 # The backend runs on the XML's parameters unless told otherwise:
                 # hand it every one the model has changed since it was loaded,
@@ -5268,8 +5274,21 @@ class Simulator:
                 # as the XML has it again (issue #1360). Before the clock's
                 # offset, which the clear would drop.
                 self._sim.clear_param_overrides()
-                for name, value in parameter_overrides(self._model, self._xml_param_names).items():
+                overrides = parameter_overrides(self._model, self._xml_param_names)
+                for name, value in overrides.items():
                     self._sim.set_param(name, value)
+                # And its seed amounts, the same way (issue #1373). These outrank
+                # a parameter override the species' concentration= reads, as
+                # Model.set_concentration outranks the parameter it was set from,
+                # so where any parameter goes, every seed species goes with it.
+                self._sim.set_species_amounts(
+                    species_amounts(
+                        self._model,
+                        self._xml_seed_species,
+                        self._requested_method,
+                        every_seed=bool(overrides),
+                    )
+                )
                 if self._method == "rulemonkey" and self._rm_clock_offset:
                     from bngsim._rulemonkey_clock import OFFSET_PARAM
 

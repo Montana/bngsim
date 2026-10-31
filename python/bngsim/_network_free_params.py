@@ -31,6 +31,7 @@ and rm were handed ``kph = 0`` alone and ran no RP.
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -96,4 +97,122 @@ def parameter_overrides(model: Any, xml_names: frozenset[str] | None) -> dict[st
             # expression names another parameter (Model.param_is_expression).
             if name in xml_names and not derived and known.intersection(_names_in(expression)):
                 out.setdefault(name, value)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Seed amounts (issue #1373)
+# --------------------------------------------------------------------------- #
+# The species-side twin of the above: a Model.set_concentration reached neither
+# backend, so a run started from the XML's amounts (L0 = 300 for the 0 set).
+# Each run now hands the backend the amount of every species the model holds at
+# an amount other than its amount at load, by the id of the XML's <Species>
+# with that BNGL name (BNG2.pl writes the same canonical string as the .net's
+# species line, ``@c::`` included). The model's amount at load, not the XML's,
+# for the reason given for parameters above.
+#
+# Not the same string for a fixed species: the .net loader drops its ``$`` and
+# the XML keeps it, so the XML's names are read the way the loader reads them.
+# Unmatched, a $X(a) set to 10 was refused as no seed species, and one set to 0
+# dropped as one, so the run started from the XML's 50.
+#
+# And a species can sit at its amount at load while a parameter its seed reads
+# is handed on changed: after save_concentrations(), or set_concentration of
+# the same 300, set_param("L0", 0) leaves the model at L(r) = 300, as SSA starts
+# it, and the backend, handed L0 = 0 alone, re-derived the seed as 0. So
+# wherever a parameter is handed on, every seed species goes with it at the
+# model's amount.
+
+
+def _unclamped(name: str) -> str:
+    """*name* without the fixed-species ``$``, as the .net loader reads it: at
+    the start, or after an ``@c::`` prefix (net_file_loader.cpp)."""
+    if name.startswith("$"):
+        return name[1:]
+    if name.startswith("@"):
+        sep = name.find("::")
+        if sep != -1 and name[sep + 2 : sep + 3] == "$":
+            return name[: sep + 2] + name[sep + 3 :]
+    return name
+
+
+def xml_seed_species(xml_path: str | Path) -> dict[str, str | None] | None:
+    """The model's seed species in *xml_path*: BNGL name, read as the .net
+    loader reads it, -> ``<Species id=>``, or ``None`` for a name more than one
+    seed species has. ``None`` when the file cannot be parsed."""
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    out: dict[str, str | None] = {}
+    for model in root:
+        if _local(model.tag) != "model":
+            continue
+        for lst in model:
+            if _local(lst.tag) != "ListOfSpecies":
+                continue
+            for sp in lst:
+                name, sid = sp.get("name"), sp.get("id")
+                if _local(sp.tag) != "Species" or not name or not sid:
+                    continue
+                name = _unclamped(name)
+                out[name] = None if name in out else sid
+    return out
+
+
+def species_amounts(
+    model: Any, seeds: dict[str, str | None] | None, method: str, *, every_seed: bool = False
+) -> dict[str, float]:
+    """``<Species id=>`` -> amount, for each species *model* holds at an amount
+    other than its amount at load, and with *every_seed* (a parameter is handed
+    on, which a seed may read) for every seed species. Raises ``ValueError`` for
+    one the backend cannot be told: no seed species of that name (the backend
+    starts it at 0), more than one, or an amount that rounds to no count.
+    Raises :class:`ModelError` when *seeds* is ``None`` (the XML could not be
+    read) and the model holds a species at an amount other than its amount at
+    load."""
+    names = model._core.species_names
+    state = model._core.get_state()
+    loaded = model._loaded_state
+    out: dict[str, float] = {}
+    for i, name in enumerate(names):
+        amount = float(state[i])
+        changed = not (i < len(loaded) and loaded[i] == amount)
+        if seeds is None:
+            if changed:
+                raise ModelError(
+                    f"method={method!r} starts from the XML's species amounts unless it "
+                    f"is handed the model's, and this model holds {name!r} at "
+                    f"{amount:g}, but the XML could not be read to find its seed "
+                    "species (issue #1373). Pass an xml_path that is well-formed XML."
+                )
+            continue
+        sid = seeds.get(name)
+        if not changed and not (every_seed and sid is not None):
+            continue
+        if sid is not None and math.isfinite(amount) and amount > -0.5:
+            # Rounded half-up by the backend, as every seed is. Below 0 only by
+            # what an ODE run can leave (-1e-17), which SSA rounds to 0 and the
+            # backend refuses.
+            out[sid] = max(amount, 0.0)
+            continue
+        if sid is None and name not in seeds and amount == 0.0:
+            # Not a seed species, so the backend starts it at 0 as asked.
+            continue
+        if sid is not None:
+            why = "it rounds to no number of molecules."
+        else:
+            why = (
+                "more than one of the XML's seed species has that name"
+                if name in seeds
+                else "the XML has no seed species of that name, so the run would start it at 0"
+            ) + (
+                ". Network-free runs are seeded from the XML's <Species> list. Write the "
+                "XML with this species as a seed species, or start it from the network "
+                "with method='ssa'."
+            )
+        raise ValueError(
+            f"method={method!r} cannot start species {name!r} at the amount the model "
+            f"holds, {amount:g}: {why}"
+        )
     return out
