@@ -599,15 +599,16 @@ template <class Run> static Result restoring_on_raise(NetworkModel &model, Run &
 // are 1.2e-10 apart: every such run is the one it always was.
 static double ssa_clock_origin(const TimeSpec &times) {
     constexpr double kElapsedFrom = 1048576.0; // 2^20
-    const double near = times.t_start >= 0.0 ? times.t_start
-                        : times.t_end <= 0.0 ? times.t_end
-                                             : 0.0;
-    if (!(std::fabs(near) >= kElapsedFrom) || !std::isfinite(times.t_start) ||
+    // (Not `near` and `far`: <windows.h> defines both as empty macros.)
+    const double t_near = times.t_start >= 0.0 ? times.t_start
+                          : times.t_end <= 0.0 ? times.t_end
+                                               : 0.0;
+    if (!(std::fabs(t_near) >= kElapsedFrom) || !std::isfinite(times.t_start) ||
         !std::isfinite(times.t_end))
         return 0.0;
-    const double far = std::max(std::fabs(times.t_start), std::fabs(times.t_end));
-    const double ulp = std::nextafter(far, std::numeric_limits<double>::infinity()) - far;
-    return near - std::fmod(near, ulp);
+    const double t_far = std::max(std::fabs(times.t_start), std::fabs(times.t_end));
+    const double ulp = std::nextafter(t_far, std::numeric_limits<double>::infinity()) - t_far;
+    return t_near - std::fmod(t_near, ulp);
 }
 
 Result SsaSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_seconds) {
