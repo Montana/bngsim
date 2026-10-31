@@ -5951,16 +5951,21 @@ class Simulator:
         # Every replicate starts where the model is at this call, as run() and
         # parameter_scan start (issue #1362): reset() alone took each one back
         # to the seed, and a set_concentration made first was lost, A(0) = 0 for
-        # 500 with no warning.
+        # 500 with no warning. The events' state is part of that start: after a
+        # run, a replicate that continues from its end carries the executions
+        # still pending and the triggers' last values, as a second run() does
+        # (issue #693), where reset() cleared them.
         start_state = self._model.get_state()
+        start_carry = self._capture_carryover_state()
 
         def _run_one(sim: Any, model: Model, times: Any, i: int) -> Result:
-            # reset() zeroes time and clears what a run leaves behind, and the
-            # state goes back to the call's; the simulator (hence the cached
-            # dependency graph) is reused. A fresh seed per replicate makes each
-            # trajectory independent.
+            # reset() zeroes time and clears what the last replicate left
+            # behind; the state and the carry-over go back to the call's. The
+            # simulator (hence the cached dependency graph) is reused. A fresh
+            # seed per replicate makes each trajectory independent.
             model.reset()
             model.set_state(start_state)
+            self._restore_carryover_state(start_carry, model._core)
             used = base_seed + i
             # Translated as run() translates them, so `except SimulationError`
             # sees a refusal on the sequential path as it does on the threaded one.
@@ -6017,15 +6022,13 @@ class Simulator:
             # no refusal. Put the state and the carry-over back, as
             # parameter_scan does. The parallel path runs on per-thread clones
             # and touches neither, so the two now agree.
-            invocation_state = self._model.get_state()
-            invocation_carry = self._capture_carryover_state()
             times = _make_times()
             self._apply_ssa_breakpoints([self._sim], self._model, t_start, t_end)
             try:
                 results = [_run_one(self._sim, self._model, times, i) for i in range(n_replicates)]
             finally:
-                self._model.set_state(invocation_state)
-                self._restore_carryover_state(invocation_carry)
+                self._model.set_state(start_state)
+                self._restore_carryover_state(start_carry)
 
         # As run_batch's rows (issue #1369).
         if self._stop_conditions:

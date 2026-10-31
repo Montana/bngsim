@@ -3,10 +3,10 @@
 ``run()`` starts from the model's state: a ``Model.set_concentration`` made
 first is its start. ``run_replicates`` reset every replicate to the seed, so
 after ``set_concentration("A()", 500)`` each started at A = 0, with no warning.
-It now starts every replicate from the model's state at the call, as ``run()``
-and ``parameter_scan`` do. ``run_batch`` starts every point from the initial
-conditions by design (``docs/user-guide/simulation.md``), and now warns where
-the model is elsewhere.
+It now starts every replicate from the model's state at the call, the events'
+included, as ``run()`` and ``parameter_scan`` do. ``run_batch`` starts every
+point from the initial conditions by design (``docs/user-guide/simulation.md``),
+and now warns where the model is elsewhere.
 
 A birth-death network, 0 -> A at k1 = 20, A -> 0 at k2 = 1, seeded A = 0.
 """
@@ -62,6 +62,50 @@ def test_replicates_after_a_run_start_where_it_ended(net):
     assert ended > 0.0
     reps = sim.run_replicates(2, **KW)
     assert [_a0(r) for r in reps] == [ended, ended]
+
+
+_MATH = '<math xmlns="http://www.w3.org/1998/Math/MathML">{}</math>'
+_AFTER_HALF = _MATH.format(
+    '<apply><geq/><csymbol encoding="text" '
+    'definitionURL="http://www.sbml.org/sbml/symbols/time">t</csymbol><cn>0.5</cn></apply>'
+)
+# B := 100, one time unit after t = 0.5: a run to t = 1 leaves the execution
+# pending, and a run that continues from t = 1 carries it (issue #693).
+DELAYED_EVENT = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+ <model id="delayed">
+  <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+  <listOfSpecies>
+   <species id="B" compartment="c" initialAmount="0" hasOnlySubstanceUnits="true"
+            boundaryCondition="true" constant="false"/>
+  </listOfSpecies>
+  <listOfEvents>
+   <event id="e" useValuesFromTriggerTime="true">
+    <trigger initialValue="true" persistent="true">{_AFTER_HALF}</trigger>
+    <delay>{_MATH.format("<cn>1</cn>")}</delay>
+    <listOfEventAssignments>
+     <eventAssignment variable="B">{_MATH.format("<cn>100</cn>")}</eventAssignment>
+    </listOfEventAssignments>
+   </event>
+  </listOfEvents>
+ </model>
+</sbml>"""
+
+
+@pytest.mark.parametrize("processors", [None, 2], ids=["sequential", "threads"])
+def test_replicates_after_a_run_carry_its_pending_events(tmp_path, processors):
+    """A replicate that continues a run starts from its events' state too, as a
+    second run() and a parameter_scan point do. reset() before each replicate
+    cleared it, so the pending execution was lost: B stayed 0 where run() reaches
+    100. The model is left with the execution still pending."""
+    path = tmp_path / "delayed.xml"
+    path.write_text(DELAYED_EVENT)
+    sim = bngsim.Simulator(bngsim.Model.from_sbml(str(path)), method="ssa")
+    sim.run(t_span=(0, 1.0), n_points=2, seed=1)
+    later = dict(t_span=(1.0, 3.0), n_points=2, seed=2)
+    reps = sim.run_replicates(2, num_processors=processors, **later)
+    assert [float(np.asarray(r.species)[-1, 0]) for r in reps] == [100.0, 100.0]
+    assert float(np.asarray(sim.run(**later).species)[-1, 0]) == 100.0
 
 
 def test_replicates_after_a_reset_start_from_the_seed(net):
