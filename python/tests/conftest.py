@@ -285,6 +285,24 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
         "issue #413 lives in MIR's register allocator, so its reproducer needs the "
         "backend BUILT and SELECTED; mir.yml sets both and runs it there",
     ),
+    # A run with every model forced through the MIR JIT (issue #1217, the run
+    # that found #1208 and #1212): the tests below cannot pass under it, and none
+    # is about a wrong number. See python/tests/_codegen_backend.py.
+    (
+        "which the codegen JIT selected with BNGSIM_CODEGEN_JIT does not write",
+        _ANYWHERE,
+        "the JIT compiles in process and leaves no .so, cache key or note on disk",
+    ),
+    (
+        "the codegen JIT selected with BNGSIM_CODEGEN_JIT reports its own",
+        _ANYWHERE,
+        "the test names the cc backend, and the JIT reports 'mir'",
+    ),
+    (
+        "a lowered BNGSIM_CODEGEN_THRESHOLD compiles it",
+        _ANYWHERE,
+        "the test needs a small model to run interpreted, which a forced threshold undoes",
+    ),
     ("KLU not compiled", _ANYWHERE, "KLU-off builds are a supported configuration"),
     (
         "KLU sparse solver not built",
