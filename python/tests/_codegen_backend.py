@@ -79,23 +79,3 @@ threshold_forced = pytest.mark.skipif(
     reason="needs a model below the auto-codegen threshold to run interpreted; "
     "a lowered BNGSIM_CODEGEN_THRESHOLD compiles it",
 )
-
-
-def xfail_when_threshold_forced(issue: str, why: str):
-    """A strict ``xfail`` under a lowered threshold, for a test that a forced run
-    shows is engine-dependent. Strict, so the mark has to go when *issue* is
-    fixed: the test then passes and the xfail fails a forced run.
-
-    Only a forced run, and no workflow lowers the threshold yet (the scheduled
-    run #1217 proposes is a separate workflow edit). The fix's own CI therefore
-    never sees the XPASS, and the PR that fixes *issue* has to drop the mark
-    itself: #1358's went stale this way when #1359 fixed it.
-
-    ``raises=AssertionError``: the issue is a wrong answer, so an exception from
-    the compiled path is a second bug and fails the run instead of hiding here."""
-    return pytest.mark.xfail(
-        _threshold_lowered(),
-        reason=f"{issue}: {why}",
-        raises=AssertionError,
-        strict=True,
-    )

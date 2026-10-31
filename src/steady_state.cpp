@@ -834,15 +834,10 @@ static const double *ss_clamped_state(SteadyStateUserData *data, const double *y
     return data->nonneg_scratch.data();
 }
 
-// A NaN, and no infinity, in v.
-static bool ss_nan_and_no_inf(const double *v, std::size_t n) {
-    bool nan = false;
-    for (std::size_t i = 0; i < n; ++i) {
-        if (std::isinf(v[i]))
-            return false;
-        nan = nan || std::isnan(v[i]);
-    }
-    return nan;
+// A NaN, and no infinity, in v: the reading the run test retries
+// (bngsim/nonneg_clamp.hpp's read_values, which the time course reads too).
+static bool ss_reads_nan_only(const double *v, std::size_t n) {
+    return read_values(v, n) == ClampReading::nan_only;
 }
 
 // f for the march. In the run test (clamp_nonfinite), with the time course's
@@ -850,17 +845,19 @@ static bool ss_nan_and_no_inf(const double *v, std::size_t n) {
 // nonnegative-clamped state, and only then, so a model whose f is finite is
 // run as before to the bit. An infinite f is left as it was: the time course
 // spares a slot it reads at a pole (spare_at_pole, BIOMD0000000338), and a run
-// test that met one was refused before and still is. A species at 0 that a corrector iterate takes
-// an ulp below it makes a fractional power of it NaN, for any step: glioblastoma_egfrviii raises
-// AKT(s~P) to 3.5, and the compiled march came to it at exactly 0 on x86-64 Linux. CVODE could not
-// take one step from there on either Jacobian, the run test measured inf, and a state at residual
-// 2e-40 was refused, though Simulator.run from it, which clamps, moves nothing. The march itself is
-// left unclamped: its residual is not clamped, and a march that went on through such a state ended
-// at one where the residual was NaN.
+// test that met one was refused before and still is. A species at 0 that a
+// corrector iterate takes an ulp below it makes a fractional power of it NaN,
+// for any step: glioblastoma_egfrviii raises AKT(s~P) to 3.5, and the compiled
+// march came to it at exactly 0 on x86-64 Linux. CVODE could not take one step
+// from there on either Jacobian, the run test measured inf, and a state at
+// residual 2e-40 was refused, though Simulator.run from it, which clamps, moves
+// nothing. The march itself is left unclamped: its residual is not clamped,
+// and a march that went on through such a state ended at one where the
+// residual was NaN.
 static void ss_eval_rhs(SteadyStateUserData *data, double t, const double *y, double *ydot) {
     data->rhs->eval(t, y, ydot);
     const auto un = static_cast<std::size_t>(data->model->n_species());
-    if (data->clamp_nonfinite && ss_nan_and_no_inf(ydot, un))
+    if (data->clamp_nonfinite && ss_reads_nan_only(ydot, un))
         data->rhs->eval(t, ss_clamped_state(data, y), ydot);
 }
 
@@ -895,7 +892,7 @@ static int cvode_ss_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, S
     const auto un = static_cast<std::size_t>(data->model->n_species());
     data->rhs->fill_dense_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                    SUNDenseMatrix_Data(J));
-    if (data->clamp_nonfinite && ss_nan_and_no_inf(SUNDenseMatrix_Data(J), un * un))
+    if (data->clamp_nonfinite && ss_reads_nan_only(SUNDenseMatrix_Data(J), un * un))
         data->rhs->fill_dense_jacobian(static_cast<double>(t),
                                        ss_clamped_state(data, N_VGetArrayPointer(y)),
                                        SUNDenseMatrix_Data(J));
@@ -975,7 +972,7 @@ static int cvode_ss_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/, 
     data->rhs->fill_sparse_jacobian(static_cast<double>(t), N_VGetArrayPointer(y),
                                     SUNSparseMatrix_Data(J));
     if (data->clamp_nonfinite &&
-        ss_nan_and_no_inf(SUNSparseMatrix_Data(J), static_cast<std::size_t>(sp.nnz)))
+        ss_reads_nan_only(SUNSparseMatrix_Data(J), static_cast<std::size_t>(sp.nnz)))
         data->rhs->fill_sparse_jacobian(static_cast<double>(t),
                                         ss_clamped_state(data, N_VGetArrayPointer(y)),
                                         SUNSparseMatrix_Data(J));

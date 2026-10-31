@@ -3,13 +3,14 @@
 //
 // One rule, two integrators (issue #1357). The time course (cvode_simulator.cpp)
 // has retried a non-finite RHS and Jacobian on the nonnegative-clamped state
-// since GH #135, over the slots issue #706 allows. The steady-state march
-// (steady_state.cpp) now retries the same way, so the slots are chosen here,
-// once, from the model.
+// since GH #135, over the slots issue #706 allows. The steady-state run test
+// (steady_state.cpp) now retries the same way, so the slots, the clamp and the
+// reading that triggers it are defined here, once.
 #pragma once
 
 #include "bngsim/model.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -40,14 +41,30 @@ inline std::vector<char> nonneg_clamp_mask_of(const NetworkModel &model) {
 }
 
 // `y` with every slot the mask allows, and that is not positive, put at 0, into
-// `out` (sized to the mask).
+// `out` (sized to the mask), but for the slots `spare` marks: the time course's
+// spare_at_pole, which the run test does not use.
 inline void clamp_nonneg_into(const std::vector<char> &mask, const double *y,
-                              std::vector<double> &out) {
+                              std::vector<double> &out, const char *spare = nullptr) {
     const std::size_t n = mask.size();
     if (out.size() != n)
         out.assign(n, 0.0);
     for (std::size_t i = 0; i < n; ++i)
-        out[i] = (y[i] > 0.0 || !mask[i]) ? y[i] : 0.0;
+        out[i] = (y[i] > 0.0 || !mask[i] || (spare != nullptr && spare[i])) ? y[i] : 0.0;
+}
+
+// What an evaluation of the right-hand side or of a closed-form Jacobian read:
+// all finite, a NaN and no infinity, or an infinity. The time course retries
+// either non-finite reading; the run test retries only the NaN one.
+enum class ClampReading { finite, nan_only, infinite };
+
+inline ClampReading read_values(const double *v, std::size_t n) {
+    bool nan = false;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (std::isinf(v[k]))
+            return ClampReading::infinite;
+        nan = nan || std::isnan(v[k]);
+    }
+    return nan ? ClampReading::nan_only : ClampReading::finite;
 }
 
 } // namespace bngsim

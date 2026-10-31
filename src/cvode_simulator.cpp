@@ -934,32 +934,14 @@ static void mark_far_at_step_start(CvodeUserData *data, N_Vector y) {
 }
 
 // The state `y` with its masked slots below 0 set to 0, but for those `spare`
-// marks. Returns the (lazily sized) scratch.
+// marks (clamp_nonneg_into, which the steady-state run test shares, issue
+// #1357). Returns the (lazily sized) scratch. What a reading of it was is
+// read_values, from the same header.
 static inline double *clamp_state_nonneg(CvodeUserData *data, N_Vector y,
                                          const char *spare = nullptr) {
-    const int ns = data->model->n_species();
-    if (data->rhs_nonneg_scratch.size() != static_cast<std::size_t>(ns))
-        data->rhs_nonneg_scratch.assign(ns, 0.0);
-    double *s = data->rhs_nonneg_scratch.data();
-    const double *y_ptr = N_VGetArrayPointer(y);
-    const std::vector<char> &mask = nonneg_clamp_mask(data);
-    for (int i = 0; i < ns; ++i)
-        s[i] = (y_ptr[i] > 0.0 || !mask[i] || (spare != nullptr && spare[i])) ? y_ptr[i] : 0.0;
-    return s;
-}
-
-// What an evaluation of the right-hand side or of a closed-form Jacobian read:
-// all finite, a NaN and no infinity, or an infinity.
-enum class ClampReading { finite, nan_only, infinite };
-
-static ClampReading read_values(const double *v, std::size_t n) {
-    bool nan = false;
-    for (std::size_t k = 0; k < n; ++k) {
-        if (std::isinf(v[k]))
-            return ClampReading::infinite;
-        nan = nan || std::isnan(v[k]);
-    }
-    return nan ? ClampReading::nan_only : ClampReading::finite;
+    clamp_nonneg_into(nonneg_clamp_mask(data), N_VGetArrayPointer(y), data->rhs_nonneg_scratch,
+                      spare);
+    return data->rhs_nonneg_scratch.data();
 }
 
 // The slots the clamp leaves alone at `y`: where `values` (the right-hand side
