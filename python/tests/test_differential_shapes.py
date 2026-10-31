@@ -1919,6 +1919,54 @@ def test_an_answer_that_jumps_with_the_grid_is_contested(monkeypatch):
     assert v.status == "diff" and "n_points+1" in v.note, v
 
 
+def _zero_start(growth: str) -> D.Job:
+    """S at 0 beside a decaying A, with S' = +k·S (``growth`` "1,1", S -> 2S)
+    or -k·S ("0"): S = 0 is the answer either way, and an unstable one in the
+    first, as BIOMD0000000908's sunitinib is."""
+    path = _net(
+        f"zero-start-{'grows' if growth == '1,1' else 'decays'}",
+        " 1 k 4\n 2 a 0.5",
+        " 1 S() 0\n 2 A() 10",
+        "",
+        f" 1 1 {growth} k\n 2 2 0 a",
+        " 1 Sobs 1",
+    )
+    return D.Job(path.stem, path, 0.0, 10.0, 21)
+
+
+def test_the_nudge_moves_each_start_by_its_share_of_a_step():
+    job = _zero_start("0")
+    x0 = np.asarray(D.run(job, nudge=D.START_NUDGE)[0].species)[0]
+    want = np.array([0.0, 10.0]) + D.START_NUDGE * (job.rtol * np.array([0.0, 10.0]) + job.atol)
+    np.testing.assert_allclose(x0, want, rtol=1e-12)
+
+
+def test_an_unstable_zero_the_rounding_keeps_is_contested():
+    """S = 0 holds exactly in both runs as written. From a start the solver
+    cannot tell from it, the growing S leaves 0 by e^{4t}: 1e-13 at the first
+    row, past the bound by t = 10. The decaying S stays put."""
+    grows = D.check_stable(D.Base(_zero_start("1,1")))
+    assert grows.status == "diff" and "a start nudged" in grows.note, grows
+    assert D.contested({"stable": {"status": "diff", "extra": grows.extra}})
+    decays = D.check_stable(D.Base(_zero_start("0")))
+    assert decays.status == "pass", decays
+
+
+def test_a_run_that_fails_from_the_nudged_start_is_contested(monkeypatch):
+    base = _base("derived-log10")
+    real = D.run
+
+    def fails(job, nudge=0.0, **kw):
+        if nudge:
+            raise bngsim.SimulationError("CV_CONV_FAILURE (planted)")
+        return real(job, **kw)
+
+    monkeypatch.setattr(D, "run", fails)
+    v = D.check_stable(base)
+    assert v.status == "diff" and "from which the run fails (CV_CONV_FAILURE" in v.note, v
+    assert D.contested({"stable": {"status": "diff", "extra": v.extra}})
+
+
 _B1304 = {
     m: _ROOT / f"parity_checks/rr_parity/models/{m}/{m}_url.xml"
     for m in ("BIOMD0000000338", "BIOMD0000000339")

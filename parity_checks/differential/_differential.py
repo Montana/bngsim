@@ -233,12 +233,18 @@ def _left() -> float | None:
     return left
 
 
-def run(job: Job, **kw):
+def run(job: Job, nudge: float = 0.0, **kw):
     """A run of a fresh model (a run leaves its state on the Model it was given):
-    the Result and the Simulator. It has until :data:`_DEADLINE`."""
+    the Result and the Simulator. It has until :data:`_DEADLINE`. ``nudge``
+    moves each species' start up by that share of what a step may err by in
+    it, ``rtol·|x| + atol`` (:data:`START_NUDGE`)."""
     import bngsim
 
-    sim = bngsim.Simulator(load(job.path), method="ode", **{**job.sim, **kw})
+    model = load(job.path)
+    if nudge:
+        x0 = model.get_state()
+        model.set_state(x0 + nudge * (job.rtol * np.abs(x0) + job.atol))
+    sim = bngsim.Simulator(model, method="ode", **{**job.sim, **kw})
     result = sim.run(
         t_span=(job.t_start, job.t_end),
         n_points=job.n_points,
@@ -1154,6 +1160,15 @@ BATCH_THREADS = 4
 
 ATTRIBUTION_TIGHTEN = 100.0
 JITTER_RTOL = (0.5, 2.0)
+#: The share of what a step may err by, ``rtol·|x| + atol``, that the stable
+#: check moves each species' start up by: a start the solver cannot tell from
+#: the base's. An answer that moves past its bound from it holds an unstable
+#: solution by its rounding alone, which no jittered grid or tolerance shows
+#: where the rounding keeps it exactly. BIOMD0000000908's S = 0 is one: its
+#: clearance law is -n·S on a reaction that consumes S, so S' = +0.277·S. The
+#: file's species order keeps S at 0; reversed, the rounding leaves 3.6e-19 at
+#: t = 10, which grows to 1.09e+134 of the peak by t = 300.
+START_NUDGE = 1e-3
 
 
 def _arm_runs(base: Base) -> dict[str, np.ndarray]:
@@ -1367,7 +1382,7 @@ def check_batch(base: Base) -> Verdict:
 
 def contested(rows: dict[str, dict]) -> bool:
     """Whether a model's rows mark it contested: its ``stable`` row reads DIFF
-    (the answer jumps under a jittered grid or tolerance), or a DIFF's third
+    (the answer jumps under a jittered grid, tolerance or start), or a DIFF's third
     arms split between its two sides (#1304's BIOMD0000000339: KLU at a
     hundredfold tighter tolerance sides with KLU, the dense solver with
     dense). Its DIFFs are real but unattributed, its PASSes
@@ -1406,12 +1421,17 @@ def attribute(base: Base, v: Verdict, arms: dict[str, np.ndarray] | None = None)
 
 def check_stable(base: Base) -> Verdict:
     """The base's answer under a jittered grid (one point fewer, one more,
-    twice as many) and tolerance (rtol x0.5, x2): a jump past the bound marks
+    twice as many) and tolerance (rtol x0.5, x2), and from a start moved by
+    :data:`START_NUDGE` of what a step may err by: a jump past the bound marks
     the model contested, its DIFFs real but unattributed and its PASSes luck.
+    So does a run from the nudged start that fails where the base ran. The
+    nudged start's jump counts only where its first row after the start is
+    still within the bound: the perturbation grew.
     A grid of another length is read at its last point, which every grid
     shares; twice as many at every other point, which are the base's. Each
     rerun has what is left of the model's cap: one it stops makes the check
     TIMEOUT, its own row only."""
+    import bngsim
 
     def go():
         # Where nothing could jump past the bound, SKIP, said why, as
@@ -1441,15 +1461,30 @@ def check_stable(base: Base) -> Verdict:
             g = gap(x, base.x, atol)
             if g > max(base.limit, f * base.limit):
                 jumps[f"rtol x{f:g}"] = g
+        nudged = f"a start nudged by {START_NUDGE:g} of a step's allowance"
+        try:
+            x = _species(run(job, nudge=START_NUDGE)[0], base)
+        except Exception as e:
+            if _timed_out(e) or not isinstance(e, bngsim.SimulationError):
+                raise
+            jumps[f"{nudged}, from which the run fails ({_first_line(e)[:160]})"] = float("inf")
+        else:
+            # Only a departure the nudge grew into counts. One already past the
+            # bound at the first row after the start is the model's own laws
+            # telling the two starts apart, `if(Bobs==0, kb, 0)` on a B its law
+            # holds at exactly 0 (#1228), which no rounding breaks.
+            g = gap(x, base.x, atol)
+            if g > base.limit and gap(x[1:2], base.x[1:2], atol) <= base.limit:
+                jumps[nudged] = g
         if jumps:
-            shown = ", ".join(f"{k} {g:.1e}" for k, g in jumps.items())
+            shown = ", ".join(f"{k} {g:.1e}" if np.isfinite(g) else k for k, g in jumps.items())
             return Verdict(
                 "diff",
                 max(jumps.values()),
                 f"contested: the answer jumps past its bound {base.limit:.1e} under {shown}",
                 {"contested": True, "jumps": jumps},
             )
-        return Verdict("pass", 0.0, "the answer holds under a jittered grid and tolerance")
+        return Verdict("pass", 0.0, "the answer holds under a jittered grid, tolerance and start")
 
     return _guard(go)
 
