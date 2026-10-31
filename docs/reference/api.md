@@ -32,8 +32,8 @@ Methods:
 - **`restore_concentrations(label=None)`** — Restore a snapshot; no label restores the default slot, a `label` restores that named state (BNG `resetConcentrations("name")`)
 - **`has_saved_concentrations(label=None)`** — Whether a named snapshot (or, with no label, any) exists
 - `saved_concentration_labels` — Sorted names of saved named snapshots
-- **`set_concentration(name, value)`** — Set a single species concentration
-- **`get_concentration(name)`** — Get a single species concentration
+- **`set_concentration(name, value)`** — Set a single species concentration. A fixed species can be named with its `$` or without it (`"$X(a)"` or `"X(a)"`, `"@c::$X()"` or `"@c::X()"`), as BNG2.pl's `setConcentration` takes either: the model's `species_names` drop the `$` the `.net` writes
+- **`get_concentration(name)`** — Get a single species concentration, named the same way
 - **`pure_sink_species()`** → `list[str]` — write-only accumulator species: a product of ≥1 reaction, a reactant of none, read by no other species' derivative, and not `$`-fixed. These put a structural floor under `||f(y)||_2/n` (issue #74)
 - **`is_pure_sink()`** → `ndarray (n_species,) of bool` — the array form, so `mask=~model.is_pure_sink()`
 - **`declare_ic_sensitivity({species: {param: d_ic_d_param}})`** — Declare `∂x_k(0)/∂θ` for an initial condition your own code assigns (issue #111). A declared species' row is taken as **fully specified**: parameters not named get `0.0`, so it *replaces* the model's parameter-graph row rather than adding to it

@@ -10,7 +10,7 @@ import logging
 import re
 import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, overload
 
@@ -1929,7 +1929,9 @@ class Model:
         Parameters
         ----------
         name : str
-            Species name (e.g. ``"A(b)"``).
+            Species name (e.g. ``"A(b)"``). A fixed species' ``$`` may be given
+            or left out: the model names ``$A(b)`` in a ``.net`` ``A(b)``, and
+            BNG2.pl's ``setConcentration`` ignores the ``$`` too.
         value : float
             New concentration value.
 
@@ -1949,10 +1951,8 @@ class Model:
         row is dropped (issue #113). When the value you assign *does* depend on a
         differentiated parameter, say so with :meth:`declare_ic_sensitivity`.
         """
-        try:
-            self._core.set_concentration(name, float(value))
-        except (KeyError, RuntimeError) as e:
-            raise ModelError(f"Species '{name}' not found in model") from e
+        value = float(value)
+        name = self._species_call(name, lambda n: self._core.set_concentration(n, value))[0]
         # A fresh assignment supersedes whatever this species' initial condition
         # was declared to depend on; declare again after the write (issue #111).
         self._declared_ic_sens.pop(name, None)
@@ -1965,7 +1965,8 @@ class Model:
         Parameters
         ----------
         name : str
-            Species name.
+            Species name, a fixed species' ``$`` given or left out, as for
+            :meth:`set_concentration`.
 
         Returns
         -------
@@ -1977,9 +1978,21 @@ class Model:
         ModelError
             If the species name is not found.
         """
+        return float(self._species_call(name, self._core.get_concentration)[1])
+
+    def _species_call(self, name: str, call: Callable[[str], Any]) -> tuple[str, Any]:
+        """``(the model's name, call(it))`` for species *name*: *name* itself,
+        or else *name* without a fixed species' ``$``, which the model's names
+        never hold. Raises :class:`ModelError` when neither is a species."""
         try:
-            return self._core.get_concentration(name)
+            return name, call(name)
         except (KeyError, RuntimeError) as e:
+            bare = _unclamped(name)
+            if bare != name:
+                try:
+                    return bare, call(bare)
+                except (KeyError, RuntimeError):
+                    pass
             raise ModelError(f"Species '{name}' not found in model") from e
 
     def get_state(self) -> np.ndarray:
@@ -2074,11 +2087,13 @@ class Model:
         species = set(self.species_names)
         params = set(self.param_names)
         staged: dict[str, dict[str, float]] = {}
-        for sp, row in sens.items():
+        for given, row in sens.items():
+            # A fixed species' `$` may be given, as for set_concentration.
+            sp = given if given in species else _unclamped(given)
             if sp not in species:
                 raise ModelError(
-                    f"declare_ic_sensitivity: species {sp!r} not found in model. "
-                    "Names must match species_names exactly."
+                    f"declare_ic_sensitivity: species {given!r} not found in model. "
+                    "Names must match species_names, a fixed species' `$` aside."
                 )
             staged[sp] = {}
             for p, d in row.items():
@@ -3034,6 +3049,19 @@ def _remember(memo: dict, key, value) -> None:
 _UNIT_CONVERSION = re.compile(r"\bunit_conversion\s*=\s*([^\s#][^#]*?)\s*(?:#|$)")
 # A number first, so that the ``e`` of ``6.0221e+23`` is not read as a name.
 _NUMBER_OR_NAME = re.compile(r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|([A-Za-z_]\w*)")
+
+
+def _unclamped(name: str) -> str:
+    """*name* without BNG's fixed-species ``$``, at the start or after an
+    ``@c::`` prefix, as the .net loader drops it from the species names a model
+    holds (net_file_loader.cpp)."""
+    if name.startswith("$"):
+        return name[1:]
+    if name.startswith("@"):
+        sep = name.find("::")
+        if sep != -1 and name[sep + 2 : sep + 3] == "$":
+            return name[: sep + 2] + name[sep + 3 :]
+    return name
 
 
 def _names_in(expression: str) -> list[str]:

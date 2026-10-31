@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from bngsim._exceptions import ModelError
-from bngsim._model import _names_in
+from bngsim._model import _names_in, _unclamped
 
 
 def _local(tag: str) -> str:
@@ -124,18 +124,6 @@ def parameter_overrides(model: Any, xml_names: frozenset[str] | None) -> dict[st
 # model's amount.
 
 
-def _unclamped(name: str) -> str:
-    """*name* without the fixed-species ``$``, as the .net loader reads it: at
-    the start, or after an ``@c::`` prefix (net_file_loader.cpp)."""
-    if name.startswith("$"):
-        return name[1:]
-    if name.startswith("@"):
-        sep = name.find("::")
-        if sep != -1 and name[sep + 2 : sep + 3] == "$":
-            return name[: sep + 2] + name[sep + 3 :]
-    return name
-
-
 def xml_seed_species(xml_path: str | Path) -> dict[str, str | None] | None:
     """The model's seed species in *xml_path*: BNGL name, read as the .net
     loader reads it, -> ``<Species id=>``, or ``None`` for a name more than one
@@ -201,15 +189,24 @@ def species_amounts(
             continue
         if sid is not None:
             why = "it rounds to no number of molecules."
-        else:
+        elif name in seeds:
             why = (
-                "more than one of the XML's seed species has that name"
-                if name in seeds
-                else "the XML has no seed species of that name, so the run would start it at 0"
-            ) + (
-                ". Network-free runs are seeded from the XML's <Species> list. Write the "
-                "XML with this species as a seed species, or start it from the network "
-                "with method='ssa'."
+                "more than one of the XML's seed species has that name. Network-free "
+                "runs are seeded from the XML's <Species> list, by name."
+            )
+        else:
+            # Most often a complex an SSA, PSA or ODE run on this same model left
+            # behind: the run writes its end state into the model, and the XML,
+            # written without the network, seeds only the seed species.
+            why = (
+                "the XML has no seed species of that name, so the run would start it "
+                "at 0. Network-free runs are seeded from the XML's <Species> list. If "
+                "an SSA, PSA or ODE run on this model left it there, give that run "
+                "model.clone() so this model stays where it was, or call "
+                "model.reset() first, which returns to the initial amounts (or to an "
+                "unlabeled save_concentrations()). Otherwise write the XML with this "
+                "species as a seed species, or start it from the network with "
+                "method='ssa'."
             )
         raise ValueError(
             f"method={method!r} cannot start species {name!r} at the amount the model "
