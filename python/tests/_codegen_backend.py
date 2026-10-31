@@ -17,6 +17,13 @@ kinds of test cannot pass under it. None of them is about a wrong number:
 Each is a ``skipif`` with a reason ``conftest.py`` declares, so a forced run
 reports them as declared skips rather than as failures.
 
+A test that only *reaches* its subject through a compiled artifact is not one of
+them. When the subject is a number (a trajectory, a sensitivity, rows that must
+not cross-talk), the test asserts what either backend leaves (the ``.so`` or the
+JIT's C source, as ``test_model_codegen_sensitivity.py`` does) and names the
+backend with :func:`selected_codegen_backend`. Skipping it would drop the very
+check the forced JIT run is for.
+
 Import it the way the other sibling helpers in this directory are imported::
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,7 +45,16 @@ def _jit_selected() -> bool:
     return _codegen_jit_backend() != ""
 
 
+def selected_codegen_backend() -> str:
+    """What ``Simulator.codegen_backend`` reports for a compiled model in this run."""
+    return _codegen_jit_backend() or "cc"
+
+
 def _threshold_lowered() -> bool:
+    # The Simulator's auto-codegen reads no threshold under BNGSIM_NO_CODEGEN,
+    # so nothing below it compiles there whatever the threshold says.
+    if os.environ.get("BNGSIM_NO_CODEGEN"):
+        return False
     raw = os.environ.get("BNGSIM_CODEGEN_THRESHOLD", "")
     try:
         return raw != "" and int(raw) < _DEFAULT_CODEGEN_THRESHOLD
@@ -68,9 +84,18 @@ threshold_forced = pytest.mark.skipif(
 def xfail_when_threshold_forced(issue: str, why: str):
     """A strict ``xfail`` under a lowered threshold, for a test that a forced run
     shows is engine-dependent. Strict, so the mark has to go when *issue* is
-    fixed: the test then passes and the xfail fails the run."""
+    fixed: the test then passes and the xfail fails a forced run.
+
+    Only a forced run, and no workflow lowers the threshold yet (the scheduled
+    run #1217 proposes is a separate workflow edit). The fix's own CI therefore
+    never sees the XPASS, and the PR that fixes *issue* has to drop the mark
+    itself: #1358's went stale this way when #1359 fixed it.
+
+    ``raises=AssertionError``: the issue is a wrong answer, so an exception from
+    the compiled path is a second bug and fails the run instead of hiding here."""
     return pytest.mark.xfail(
         _threshold_lowered(),
         reason=f"{issue}: {why}",
+        raises=AssertionError,
         strict=True,
     )

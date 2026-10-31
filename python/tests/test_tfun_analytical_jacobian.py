@@ -34,7 +34,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _codegen_backend import under_jit_engine_name  # noqa: E402
+from _codegen_backend import selected_codegen_backend  # noqa: E402
 
 _CC = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
 needs_cc = pytest.mark.skipif(_CC is None, reason="no C compiler on PATH")
@@ -166,7 +166,6 @@ class TestCompiledJacobianReadsTheTable:
     @pytest.mark.parametrize(
         ("n_chain", "symbol"), [(0, "bngsim_codegen_jac("), (60, "bngsim_codegen_jac_sparse(")]
     )
-    @under_jit_engine_name
     def test_emits_and_matches_fd(self, tmp_path, n_chain, symbol):
         from bngsim._codegen import generate_jacobian_from_model
 
@@ -182,7 +181,9 @@ class TestCompiledJacobianReadsTheTable:
         sim, compiled = _trajectory(
             _load(tmp_path, *FORMS["time_kept_factor"], n_chain=n_chain), codegen=True
         )
-        assert sim.codegen_backend == "cc"
+        # cc, or the codegen JIT a forced run selects (issue #1217): either
+        # compiles this source, and the trajectory below is what is at stake.
+        assert sim.codegen_backend == selected_codegen_backend()
         _, fd = _trajectory(
             _load(tmp_path, *FORMS["time_kept_factor"], n_chain=n_chain), jacobian="fd"
         )

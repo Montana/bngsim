@@ -98,15 +98,18 @@ class TestCacheDirControl:
 class TestBatchArtifactReuseStateless:
     """Many independent evaluations reuse one compiled artifact, no cross-talk."""
 
-    @under_jit_no_cc_artifact
     def test_plain_batch_carries_codegen_artifact(self):
         """A codegen Simulator's run_batch reuses the one shared .so per row
-        (previously the per-row path ran interpreted, reusing nothing)."""
+        (previously the per-row path ran interpreted, reusing nothing). Under
+        the codegen JIT the artifact is the C source it compiles in process,
+        and the cross-talk half below matters most there (issue #1217)."""
         sim = bngsim.Simulator(
             bngsim.Model.from_net(_expr_chain_net()), method="ode", codegen=True
         )
-        assert sim._codegen_so_path  # one artifact, prepared once
+        # One artifact, prepared once: cc's .so or the JIT's source.
+        assert sim._codegen_so_path or sim._codegen_c_source
         so_before = sim._codegen_so_path
+        src_before = sim._codegen_c_source
 
         theta = [{"k1": 0.05 + 0.01 * i} for i in range(12)]
         rows = sim.run_batch(
@@ -115,7 +118,9 @@ class TestBatchArtifactReuseStateless:
 
         # The artifact is unchanged (shared, not re-created per row).
         assert sim._codegen_so_path == so_before
-        assert Path(so_before).exists()
+        assert sim._codegen_c_source == src_before
+        if so_before:
+            assert Path(so_before).exists()
 
         # Each row equals an independent single run for that θ — no shared
         # mutable state leaked across the concurrent clones.

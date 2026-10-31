@@ -32,17 +32,11 @@ authored from scratch. Oracles, in order of authority:
     value the FD oracle differentiates, never gates the suite.
 """
 
-import os
-import sys
 import warnings
 
 import bngsim
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from _codegen_backend import under_jit_no_cc_artifact  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -285,7 +279,6 @@ class TestComputeAllSensitivitiesRedirect:
             2.0 * A * (-A0 * t * np.exp(-KD * t)),
         )
 
-    @under_jit_no_cc_artifact
     def test_nonlinear_redirect_when_plain_codegen_preattached(self):
         # GH #205 follow-up: when a plain-RHS codegen artifact is ALREADY attached
         # at construction (here pinned via codegen=True; also happens for a
@@ -297,7 +290,9 @@ class TestComputeAllSensitivitiesRedirect:
         # comes back empty.
         m = bngsim.Model.from_sbml_string(NONLINEAR)
         sim = bngsim.Simulator(m, method="ode", codegen=True)
-        assert sim._codegen_so_path  # plain-RHS codegen pinned at construction
+        # Plain-RHS codegen pinned at construction: cc's .so, or the C source
+        # the codegen JIT compiles in process (issue #1217).
+        assert sim._codegen_so_path or sim._codegen_c_source
         r = sim.compute_all_sensitivities(
             t_span=T_SPAN, n_points=N, params=["k", "kd"], chunk_size=1, **_RUN
         )
