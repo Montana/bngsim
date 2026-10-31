@@ -123,3 +123,91 @@ def test_a_long_run_hands_on_its_exact_end():
         sim.run(sample_times=[t0, t0 + 2, te], seed=1)
         second = sim.run(sample_times=[te, te + 0.5, te + 1.5], seed=2)
     np.testing.assert_array_equal(np.asarray(second.species)[:, 0], [1000, 1000, 7])
+
+
+def test_psa_from_a_far_start_is_the_run_from_zero():
+    """PSA shares the run's body: from t0 = 1e12 the continuous-loop decay is
+    the run from 0, firing for firing (the rate's 1e-30*time() rounds away at
+    both), where an absolute clock lost its waiting times."""
+    text = "species A = 100000; k = 0.5; R: A -> ; k*A*(1 + 1e-30*time());"
+
+    def ends(t0):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sim = bngsim.Simulator(
+                bngsim.Model.from_antimony_string(text), method="psa", poplevel=100
+            )
+            return [
+                np.asarray(sim.run(sample_times=[t0, t0 + 1, t0 + 2], seed=s + 1).species)[-1, 0]
+                for s in range(5)
+            ]
+
+    np.testing.assert_array_equal(ends(T0), ends(0.0))
+
+
+def test_an_event_just_past_a_switch_leaves_the_rate_switched_on():
+    """A rate held between breakpoints, re-read after an event: the event fires
+    on the first firing past t0 + 1, within half an ulp of t0 + 1 at 1e12, where
+    the clock reads t0 + 1 and `time() > t0 + 1` is still false. Read there, the
+    rate went back to 0 for good: 99999 of 100000 left where e^-1 should be."""
+    text = (
+        f"species A = 100000; species B = 0; k = 1;\n"
+        f"R: A => ; k*A*piecewise(1, time() > {T0!r} + 1, 0);\n"
+        "E: at (A < 99999.5): B = 1;\n"
+    )
+    ends = []
+    for s in range(10):
+        a = np.asarray(_ssa(text, sample_times=[T0, T0 + 1, T0 + 2], seed=s + 1).species)
+        assert a[1, 0] == 100000 and a[-1, 1] == 1
+        ends.append(a[-1, 0])
+    assert abs(_z(ends)) < 5.0, _z(ends)
+
+
+def test_a_row_just_past_a_switch_is_not_refused():
+    """A row at t0 + 1.00005 reads the clock at t0 + 1 (the doubles there are
+    1.2e-4 apart), on the breakpoint, where the held rate's guard must not
+    take the condition's old side for a rate that moved."""
+    text = f"species A = 100000; k = 1; R: A => ; k*A*piecewise(1, time() > {T0!r} + 1, 0);"
+    r = _ssa(text, t_span=(T0, T0 + 2.0001), n_points=3, seed=1)
+    a = np.asarray(r.species)[:, 0]
+    exact = 1e5 * np.exp(-1.0001)
+    assert a[0] == 100000 and a[1] > 99900 and abs(a[2] - exact) < 5 * np.sqrt(exact), a
+
+
+@pytest.mark.parametrize("tau", [3.0, 7.3, 14.0, 5.1, 9.9, 123.456, 0.37, 41.2])
+def test_a_strict_trigger_runs_after_its_non_strict_twin(tau):
+    """#947 from a far start: `lhs > tau` beside `lhs >= tau` turn true at one
+    read on the crossing, and the strict one runs after its twin, X = 0.3*0.5*X.
+    The probe that tells a crossing from a jump steps back in the time the model
+    reads, t0 + elapsed: a step sized on the elapsed clock alone was lost in its
+    rounding, and the pair ran as one batch, X = 0.5*X."""
+    text = (
+        f"species X; X = 100; T0 = {T0!r}; tau = {tau!r}\nJ0: -> X; 0\n"
+        "E1: at (time - T0 > tau), priority = 3: X = 0.3*X\n"
+        "E2: at (time - T0 >= tau), priority = 2: X = 0.5*X\n"
+    )
+    times = [T0, T0 + tau / 2, T0 + 1.4 * tau, T0 + 2.1 * tau]
+    assert np.asarray(_ssa(text, sample_times=times, seed=1).species)[-1, 0] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "rhs, exact",
+    [("1e5*(time() - T0)", 5e4), ("1e5*(time() - T0)^2", 1e5 / 3)],
+    ids=["linear", "quadratic"],
+)
+def test_a_rate_rule_that_reads_the_clock(rhs, exact):
+    """The rate rule's dX/dt at a far start, beside a held rate and a firing
+    reaction. The panel's d/dt of the rule steps where the clock the model
+    reads, t0 + elapsed, moves: a step below its ulp read no change or a whole
+    ulp, 0 or a spike. And a firing leaves the model at its own time, where
+    the next panel starts, not inside the held rate's interval."""
+    text = (
+        f"T0 = {T0!r}; species A = 1000; species B = 1000; k = 0.5;\n"
+        "R1: A => ; k*A*piecewise(1, time() > T0 + 5, 0);\n"
+        "R2: B => ; k*B;\n"
+        f"species X = 0; X' = {rhs};\n"
+    )
+    r = _ssa(text, sample_times=[T0, T0 + 0.5, T0 + 1, T0 + 10], seed=1)
+    x = np.asarray(r.species)[2, 2]
+    # The clock reads 1.2e-4 apart at 1e12: X is right to about that, relative.
+    assert abs(x - exact) < 1e-4 * exact, x
