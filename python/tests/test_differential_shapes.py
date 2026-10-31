@@ -1816,8 +1816,9 @@ def test_an_arm_takes_a_side_within_the_bound_and_none_past_it():
 
 @pytest.mark.skipif(not bngsim._bngsim_core.HAS_KLU, reason="KLU not compiled")
 def test_klu_and_dense_are_compared_on_one_jacobian(monkeypatch):
-    """``klu_vs_dense`` differs in the linear solver alone: its dense reference
-    runs on the Jacobian its KLU path ran on."""
+    """``klu_vs_dense``'s dense reference is asked for the Jacobian its KLU
+    path ran on: what differs is the linear solver and how each builds that
+    Jacobian (KLU's FD one is colored over the sparsity), not which is asked."""
     asked = []
     real = D.run
 
@@ -1976,6 +1977,7 @@ def test_a_klu_base_takes_the_dense_solver_as_its_other_arm(monkeypatch):
     which CI has none of. A copy of a base that ran dense stands in for one KLU
     took (the cached base is shared): the dense arm reruns it exactly."""
     shared = _base("derived-log10")
+    routed = shared.linear_solver
     base = shared.against(shared.x)
     base.linear_solver = 1
     asked = []
@@ -1995,7 +1997,7 @@ def test_a_klu_base_takes_the_dense_solver_as_its_other_arm(monkeypatch):
     )
     assert job == base.job and dense_kw == {"force_dense_linear_solver": True}, asked
     assert D.gap(arms["dense"], base.x, base.job.atol) == 0.0
-    assert shared.linear_solver == 0
+    assert shared.linear_solver == routed
 
 
 def test_what_1309_adds_runs_in_what_is_left_of_the_cap(monkeypatch):
