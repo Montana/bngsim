@@ -1812,8 +1812,16 @@ def test_a_march_the_step_cannot_stop_returns_the_state_the_residual_test_passed
     # to a residual of 2e16 with a species at -1.8e5. It returns the state the
     # residual test passed, main's, where the eigenvalues have a positive real
     # part (0.13) and a run from it leaves.
+    #
+    # The interpreted march, pinned (issue #1217): near an unstable state,
+    # whether a march passes the residual test before it runs away is in the
+    # last digits. On x86-64 Linux, interpreted with the closed form it passes
+    # (3.9e-10), and so does compiled with jacobian="fd" (1.8e-10). Interpreted
+    # with jacobian="fd" it runs away (2.6e8), and so does compiled with the
+    # compiled closed form (4.6e17), never passing, so a forced codegen run had
+    # no passed state to return.
     path = str(data_dir / "BIOMD0000000463.xml")
-    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode").steady_state()
+    ss = bngsim.Simulator(bngsim.Model.from_sbml(path), method="ode", codegen=False).steady_state()
     assert not ss.converged
     assert ss.residual < 1e-9
     assert np.min(ss.concentrations) > -1e-6
