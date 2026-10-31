@@ -758,6 +758,9 @@ class Simulator:
         # ceiling, so keeping both would leave two answers to "which vector".
         "_atol_track",
         "_atol_set",
+        # Issue #1420 — (rtol, the default atol it gave) at the start of the
+        # stored trajectory, which the run_until steps after it keep.
+        "_trajectory_atol",
         "_max_steps",
         "_stop_conditions",
         # Interactive simulation state
@@ -1147,6 +1150,7 @@ class Simulator:
         # Whether set_tolerances gave an atol: where it did not, the "scaled"
         # steady-state criterion marches at atol="auto" (issue #1001).
         self._atol_set = False
+        self._trajectory_atol: tuple[float, list[float] | None] | None = None
         self._max_steps = 10000
         self._jacobian = jacobian
         self._ode_jacobian_fell_back = False
@@ -4660,20 +4664,75 @@ class Simulator:
         """
         if atol is None and criterion == "scaled" and not self._atol_set:
             eff_rtol = self._rtol if rtol is None else rtol
-            values = np.abs(np.asarray(state, dtype=float))
-            free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
-            largest = float(free.max(initial=0.0))
-            positive = free[free > 0.0]
-            floor = (
-                max(float(positive.min()), float(np.finfo(float).eps) * largest)
-                if positive.size
-                else None
-            )
-            own = np.minimum(derive_atol(values, eff_rtol, floor=floor), self._atol)
-            if np.all(own == self._atol):
-                return None
-            return [float(v) for v in own]
+            return self._atol_from_scale(state, eff_rtol, float(np.finfo(float).eps))
         return atol
+
+    def _run_atol(
+        self, atol: AtolLike | None, rtol: float, *, trajectory: bool = False
+    ) -> AtolLike | None:
+        """The ``atol`` an ODE call integrates at: the caller's, or where no
+        caller chose one, each species' own (issue #1420).
+
+        The scalar ``1e-8`` is BNG2.pl's, for species held as molecule counts. A
+        species of a model in molar units sits below it, and CVODE controls none
+        of its error: at bngsim's defaults 62 of 1,251 BioModels ran off their
+        reference by over 1% of a species' peak, 21 of them with no warning, and
+        BIOMD0000000609 by 5.7e5. Each species instead takes the smaller of the
+        scalar and ``rtol`` of its scale in the state the call starts from, with
+        a floor at ``_ATOL_SCALE_RELEVANT`` of the largest species, the share
+        below which #1361 counts a species as rounding (see
+        :meth:`_atol_from_scale`). That cut those 62 to 14, broke none, and cost
+        17% of the corpus's run time, nearly all of it on models that were
+        wrong. It is never looser than the scalar, and in a model of counts,
+        whose species start at 0 or at least 1, every species takes the scalar:
+        162 of 175 .net models took the same steps.
+
+        ``trajectory`` is :meth:`run`'s: a :meth:`run_until` step keeps the
+        default its trajectory started with, the one the first step, or the
+        run before it, derived. Derived again from where each step starts, a
+        coupling loop's steps were each held to a tolerance of their own: its
+        answer depended on how the run was cut into steps, and in a model of
+        counts, whose species leave whole numbers after the first step, every
+        later step took a vector, and the warm path lost its count of dense
+        factorizations from one step to the next.
+        """
+        if trajectory and not self._continues_trajectory:
+            self._trajectory_atol = None  # a new trajectory starts here
+        if not self._atol_is_default(atol):
+            return atol
+        kept = self._trajectory_atol if trajectory else None
+        if kept is not None and kept[0] == rtol:
+            return kept[1]
+        own = self._atol_from_scale(self._model.get_state(), rtol, self._ATOL_SCALE_RELEVANT)
+        if trajectory:
+            self._trajectory_atol = (rtol, own)
+        return own
+
+    def _atol_from_scale(self, state, rtol: float, share: float) -> list[float] | None:
+        """Each species' ``rtol`` of its own scale in ``state``, but never more
+        than the scalar; ``None`` where every species takes the scalar, so the
+        run stays on the scalar's own path.
+
+        A species' scale is its value, or the floor where that is smaller: the
+        smallest value a species not ``$``-fixed holds, but not under ``share``
+        of the largest. Where every species not ``$``-fixed is at 0, the floor is
+        the smallest value any species holds, a ``$``-fixed one too: every
+        integrated species of BIOMD0000000495 starts at 0 beside two ``$``-fixed
+        ones at 5e-5 and 1e-4, and took the scalar, 9.4% off, until it did. A
+        value that is not finite (an assignment rule at 1/0) gives no scale.
+        """
+        if not (np.isfinite(rtol) and rtol > 0.0):
+            return None
+        values = np.abs(np.asarray(state, dtype=float))
+        values[~np.isfinite(values)] = 0.0
+        free = values[~np.asarray(self._model._core.species_is_fixed, dtype=bool)]
+        largest = float(free.max(initial=0.0))
+        positive = free[free > 0.0]
+        floor = max(float(positive.min()), share * largest) if positive.size else None
+        own = np.minimum(derive_atol(values, rtol, floor=floor), self._atol)
+        if np.all(own == self._atol):
+            return None
+        return [float(v) for v in own]
 
     def _resolve_atol(self, atol: AtolLike | None, rtol: float, *, where: str) -> _ResolvedAtol:
         """Resolve one call's ``atol`` into scalar / per-species / tracking depth.
@@ -4914,7 +4973,20 @@ class Simulator:
         rtol : float, optional
             Relative tolerance for ODE solver. Default ``1e-8``.
         atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol, optional
-            Absolute tolerance for the ODE solver. Default ``1e-8``.
+            Absolute tolerance for the ODE solver. Omitted (and not set by
+            :meth:`set_tolerances`), each species takes
+            ``min(1e-8, rtol * max(|x_i|, floor))`` from the state the run
+            starts from (a :meth:`run_until` step keeps the one its trajectory
+            started with), where ``floor`` is the smallest value of a species
+            the solver integrates, but not under 1e-6 of the largest (issue
+            #1420).
+            That is BNG2.pl's scalar ``1e-8`` wherever the scalar is a tolerance
+            for the species, and in a model of counts, whose species start at 0
+            or at least 1, it is the scalar on the scalar's path. In a model in
+            molar units it is what keeps a species at 1e-9 from running under
+            the noise floor. Where it still cannot scale a species, as in a
+            model whose species all start at 0, :class:`bngsim.AtolScaleWarning`
+            names it.
 
             A float is the scalar tolerance CVODE has always taken
             (``CVodeSStolerances``). An array of ``n_species`` values, ordered
@@ -5166,6 +5238,9 @@ class Simulator:
         # model that integrated a moment ago suddenly does not, and CVODE's own
         # report — "made no progress", "flag=-3" — says nothing about it.
         track_decades = 0.0
+        # The per-species atol the run integrates at, for the warning below: where
+        # no caller chose one, the vector the species' scales gave (issue #1420).
+        atol_vector: list[float] | None = None
         try:
             if self._method == "ode":
                 from bngsim._bngsim_core import SolverOptions
@@ -5179,8 +5254,13 @@ class Simulator:
                 # Issue #196 — scalar or per-species. The vector is resolved
                 # against rtol (an "auto" request scales by it) and against the
                 # model's live state, so it is built after rtol is known.
-                resolved_atol = self._resolve_atol(atol, opts.rtol, where="run(atol=...)")
+                resolved_atol = self._resolve_atol(
+                    self._run_atol(atol, opts.rtol, trajectory=True),
+                    opts.rtol,
+                    where="run(atol=...)",
+                )
                 resolved_atol.apply_to(opts)
+                atol_vector = resolved_atol.vector
                 track_decades = resolved_atol.decades
                 opts.max_steps = max_steps if max_steps is not None else self._max_steps
                 opts.jacobian = self._jacobian
@@ -5361,7 +5441,7 @@ class Simulator:
         # non-SSA backends (counts are zero there).
         self._warn_ssa_boundary(result)
         if self._atol_is_default(atol):
-            self._warn_atol_above_scale([result], "ODE run")
+            self._warn_atol_above_scale([result], "ODE run", atol_vector)
 
         # Check stop conditions on the result
         if self._stop_conditions:
@@ -5378,7 +5458,9 @@ class Simulator:
     # A species below atol is one the run controls no error of. It matters
     # where it is a part of the model's own scale, at least this fraction of the
     # largest species (issue #1361); in a model of molecule counts, a species
-    # that stays near 0 is rounding, 1e-17 of the rest, and is left alone.
+    # that stays near 0 is rounding, 1e-17 of the rest, and is left alone. The
+    # default atol's floor is the same share (issue #1420): a species below it
+    # is held as though it were at it.
     _ATOL_SCALE_RELEVANT = 1e-6
 
     def _atol_is_default(self, atol: AtolLike | None) -> bool:
@@ -5392,16 +5474,23 @@ class Simulator:
             and self._atol_track is None
         )
 
-    def _warn_atol_above_scale(self, results: Iterable[Result], call: str) -> None:
-        """Warn when the default scalar ``atol`` is above species that matter
-        in the ODE runs of one call (issue #1361).
+    def _warn_atol_above_scale(
+        self, results: Iterable[Result], call: str, atol: Sequence[float] | None = None
+    ) -> None:
+        """Warn when the default ``atol`` is above species that matter in the
+        ODE runs of one call (issue #1361).
 
-        The default, ``1e-8``, is BNG2.pl's, for species held as molecule
-        counts. A species whose every value on the run is below it has its
-        error controlled by nothing but the tolerance: a binding model of
+        ``atol`` is the per-species tolerance the runs integrated at, ordered
+        like :attr:`Model.species_names`, or ``None`` for the scalar. A species
+        whose every value on the run is below its own has its error controlled
+        by nothing but the tolerance. At the scalar ``1e-8`` a binding model of
         species near 1e-9 M returned a concentration of -8.7e-10 for 4.1e-10 at
         t = 5000, and BIOMD0000000002, whose ligand is at 1e-5 M and whose
-        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Asked only where
+        complexes peak at 3e-10 to 7e-9 M, errors of 1e-2. Since the default
+        takes each species' scale from the start (:meth:`_run_atol`, #1420),
+        what is left is a species that starts at 0, or below every scale the
+        start gives, in a model where no species starts small: one whose species
+        all start at 0 runs at the scalar. Asked only where
         :meth:`_atol_is_default` holds, and only of a species the solver
         integrates that reaches at least ``_ATOL_SCALE_RELEVANT`` of the largest
         such species of its run. A ``$``-fixed species or an assignment-rule
@@ -5419,6 +5508,7 @@ class Simulator:
             for name, fixed in zip(model.species_names, model.species_is_fixed, strict=True)
             if fixed
         }
+        own = dict(zip(model.species_names, atol, strict=True)) if atol is not None else {}
         found: dict[str, None] = {}  # ordered, and no list scan per species
         for result in results:
             species = np.asarray(result._species, dtype=np.float64)
@@ -5427,6 +5517,7 @@ class Simulator:
             free = np.array([n not in held for n in result._species_names], dtype=bool)
             if free.size != species.shape[1]:
                 continue
+            limits = np.array([own.get(n, self._atol) for n in result._species_names])
             # A non-finite sample is no scale; np.nanmax would also warn on a
             # column that holds nothing else (an assignment rule at 1/0).
             peaks = np.max(np.abs(species), axis=0, initial=0.0, where=np.isfinite(species))
@@ -5434,7 +5525,7 @@ class Simulator:
             below = (
                 free
                 & (peaks > 0.0)
-                & (peaks < self._atol)
+                & (peaks < limits)
                 & (peaks >= self._ATOL_SCALE_RELEVANT * largest)
             )
             hits = zip(result._species_names, below, strict=True)
@@ -5446,14 +5537,15 @@ class Simulator:
             f" and {len(names) - 5} more" if len(names) > 5 else ""
         )
         warnings.warn(
-            f"{len(names)} species of this {call} stay below the absolute tolerance "
-            f"atol={self._atol:g} throughout, while reaching at least "
+            f"{len(names)} species of this {call} stay below their absolute tolerance "
+            f"(atol={self._atol:g} or less) throughout, while reaching at least "
             f"{self._ATOL_SCALE_RELEVANT:g} of the largest species: {shown}. The run "
             "controls no error of these, so their trajectories can be wrong by their own "
-            "size, or negative, with no solver error. The default atol is for species "
-            "held as molecule counts; for a model in molar or other small units, pass "
-            "atol='auto' (a tolerance per species, from its scale), or a scalar atol "
-            "well below these species (issue #1361).",
+            "size, or negative, with no solver error. The default atol takes each "
+            "species' scale from the state the run starts from, and these start at 0 or "
+            "below every scale that state gives; pass atol='tracking' (a tolerance that "
+            "follows each species' magnitude), or an atol well below these species "
+            "(issues #1361, #1420).",
             AtolScaleWarning,
             stacklevel=_stacklevel_outside_bngsim(),
         )
@@ -5506,9 +5598,10 @@ class Simulator:
         atol : float or array_like or ``"auto"``, optional
             Absolute tolerance for the ODE solver — scalar, or one value per
             species ordered like :attr:`Model.species_names` (issue #196). See
-            :meth:`run` for the full contract. Resolved **once** for the whole
-            batch, including ``"auto"``: every point integrates at the same
-            tolerance, so the results are comparable across the sweep.
+            :meth:`run` for the full contract, and for the default, which reads
+            the model's live state. Resolved **once** for the whole batch,
+            including ``"auto"`` and the default: every point integrates at the
+            same tolerance, so the results are comparable across the sweep.
         max_steps : int, optional
             Maximum internal solver steps per output point.
         num_processors : int, optional
@@ -5648,7 +5741,9 @@ class Simulator:
         # Issue #196 — scalar or per-species, resolved once for the batch (see
         # _freeze_atol: a per-row "auto" would hold each row to a tolerance
         # derived from that row's own initial conditions).
-        effective_atol_spec = self._resolve_atol(atol, effective_rtol, where="run_batch(atol=...)")
+        effective_atol_spec = self._resolve_atol(
+            self._run_atol(atol, effective_rtol), effective_rtol, where="run_batch(atol=...)"
+        )
         effective_max_steps = max_steps if max_steps is not None else self._max_steps
         # Integrator step bound (GH #88): an explicit max_step, else the
         # per-model periodic-dosing bound. None ⇒ unconstrained. Resolved once
@@ -5723,7 +5818,7 @@ class Simulator:
 
         logger.info("Batch complete: %d results", len(results))
         if self._atol_is_default(atol):
-            self._warn_atol_above_scale(results, "ODE batch")
+            self._warn_atol_above_scale(results, "ODE batch", effective_atol_spec.vector)
 
         # Each row meets the stop conditions as run() does, and one that meets
         # one comes back cut there, beside the rest (issue #1369).
@@ -6577,10 +6672,9 @@ class Simulator:
         # point, rather than per point from whatever that point's initial
         # conditions happen to be — a sweep whose points are error-controlled
         # differently is not one whose points can be compared.
+        scan_rtol = rtol if rtol is not None else self._rtol
         scan_atol = self._freeze_atol(
-            atol,
-            rtol if rtol is not None else self._rtol,
-            where="parameter_scan(atol=...)",
+            self._run_atol(atol, scan_rtol), scan_rtol, where="parameter_scan(atol=...)"
         )
 
         # Each point's forward-sensitivity seed ∂x(0)/∂θ (issue #81). A scan point
@@ -6694,7 +6788,9 @@ class Simulator:
         # Every point ran at the frozen scan_atol, which run() cannot tell from
         # an atol the caller chose; the call's own atol says (issue #1361).
         if self._atol_is_default(atol):
-            self._warn_atol_above_scale(results, "ODE parameter scan")
+            self._warn_atol_above_scale(
+                results, "ODE parameter scan", scan_atol if isinstance(scan_atol, list) else None
+            )
 
         # Every row is stamped already; stamping the stack again would replace
         # the rows' own report metadata with the parent's (issue #743).
@@ -7332,7 +7428,9 @@ class Simulator:
         # a single tensor that gets stitched back together; deriving "auto"
         # per chunk would stitch columns integrated to different accuracies.
         effective_atol_spec = self._resolve_atol(
-            atol, effective_rtol, where="compute_all_sensitivities(atol=...)"
+            self._run_atol(atol, effective_rtol),
+            effective_rtol,
+            where="compute_all_sensitivities(atol=...)",
         )
         effective_max_steps = max_steps if max_steps is not None else self._max_steps
 
@@ -7405,7 +7503,9 @@ class Simulator:
         # the specific reason on the stitched result too.
         stitched._expression_sens_support = self._expression_sens_support()
         if self._atol_is_default(atol):
-            self._warn_atol_above_scale([stitched], "ODE sensitivity run")
+            self._warn_atol_above_scale(
+                [stitched], "ODE sensitivity run", effective_atol_spec.vector
+            )
         return stitched
 
     # GH #243 — how wide a failed chunk may be before the column-by-column retry
@@ -10384,8 +10484,9 @@ class Simulator:
         rtol : float
             Relative tolerance.
         atol : float, array_like, ``"auto"``, ``"tracking"``, or TrackingAtol, optional
-            Absolute tolerance; omitted, the scalar ``1e-8``, and a
-            ``steady_state(criterion="scaled")`` march then takes its own (see
+            Absolute tolerance; omitted, each run takes its own per species,
+            never looser than ``1e-8`` (see :meth:`run`), and a
+            ``steady_state(criterion="scaled")`` march its own (see
             :meth:`steady_state`). A float is the scalar tolerance
             (``CVodeSStolerances``). A sequence of ``n_species`` values,
             ordered like :attr:`Model.species_names`, is a per-species
