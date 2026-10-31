@@ -87,9 +87,26 @@ namespace bngsim {
 // variable set between two runs on one Simulator takes effect on the next: the
 // warm path keeps its context across rebuilds, and a filter installed once
 // stayed on it whatever the variable said (#1142's review).
+// Set while step_start_state asks CVodeGetDky for one derivative past the
+// step's order, which is how it finds that order: the CV_BAD_K that answers is
+// expected, and its message is dropped by both handlers below.
+thread_local bool g_probing_step_order = false;
+
 static void log_all_but_a_batch_spent(int line, const char *func, const char *file, const char *msg,
                                       SUNErrCode err_code, void *err_user_data, SUNContext sunctx) {
     if (err_code == CV_TOO_MUCH_WORK && func != nullptr && std::strcmp(func, "CVode") == 0) {
+        return;
+    }
+    if (g_probing_step_order && err_code == CV_BAD_K) {
+        return;
+    }
+    SUNLogErrHandlerFn(line, func, file, msg, err_code, err_user_data, sunctx);
+}
+
+static void log_all_but_an_order_probe(int line, const char *func, const char *file,
+                                       const char *msg, SUNErrCode err_code, void *err_user_data,
+                                       SUNContext sunctx) {
+    if (g_probing_step_order && err_code == CV_BAD_K) {
         return;
     }
     SUNLogErrHandlerFn(line, func, file, msg, err_code, err_user_data, sunctx);
@@ -99,9 +116,26 @@ static void select_spent_batch_handler(SUNContext ctx) {
     const char *keep = std::getenv("BNGSIM_LOG_SPENT_BATCHES");
     const bool log_them = keep != nullptr && *keep != '\0' && std::strcmp(keep, "0") != 0;
     if (ctx != nullptr && SUNContext_ClearErrHandlers(ctx) == SUN_SUCCESS) {
-        SUNContext_PushErrHandler(ctx, log_them ? SUNLogErrHandlerFn : log_all_but_a_batch_spent,
-                                  nullptr);
+        SUNContext_PushErrHandler(
+            ctx, log_them ? log_all_but_an_order_probe : log_all_but_a_batch_spent, nullptr);
     }
+}
+
+// Whether CVODE's last step spans `t`: CVodeGetDky's own test, fuzz and all,
+// so true exactly where CVODE can interpolate to it (issue #1301).
+static bool inside_last_step(void *cvode_mem, sunrealtype t) {
+    sunrealtype tn = 0.0;
+    sunrealtype hu = 0.0;
+    CVodeGetCurrentTime(cvode_mem, &tn);
+    CVodeGetLastStep(cvode_mem, &hu);
+    sunrealtype fuzz =
+        100.0 * std::numeric_limits<sunrealtype>::epsilon() * (std::fabs(tn) + std::fabs(hu));
+    if (hu < 0.0) {
+        fuzz = -fuzz;
+    }
+    const sunrealtype tp = tn - hu - fuzz;
+    const sunrealtype tn1 = tn + fuzz;
+    return !((t - tp) * (t - tn1) > 0.0);
 }
 
 // Retry a CV_TOO_MUCH_WORK return, but only while the integrator is still
@@ -282,6 +316,37 @@ struct NonFiniteWitness {
 // symbols, and two hand-maintained copies of an ABI struct diverge silently.
 // The nested aliases below keep the historical CvodeUserData::Codegen*Fn spelling.
 
+// The band the tolerance leaves a residual, from its n terms |∂g/∂x_j|·u_j,
+// term(s) for s < n (issue #907): added in quadrature, which is what the WRMS
+// error test bounds, |Σ_j ∂g/∂x_j·e_j| ≤ √N·sqrt(Σ_j (∂g/∂x_j·u_j)²), and not
+// one by one, which let an observable over a thousand species carry a thousand
+// atols. Scaled by the largest term, so that no square under- or overflows and
+// a residual of one species reads |∂g/∂x|·u to the bit. A term that is not a
+// finite number is returned as the sum was. Each term is asked for twice.
+template <class TermFn> static double state_switch_band(std::size_t n, TermFn term) {
+    double largest = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = term(i);
+        if (!std::isfinite(v)) {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < n; ++k) {
+                sum += term(k);
+            }
+            return sum;
+        }
+        largest = std::max(largest, v);
+    }
+    if (!(largest > 0.0)) {
+        return 0.0;
+    }
+    double squares = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double r = term(i) / largest;
+        squares += r * r;
+    }
+    return largest * std::sqrt(squares);
+}
+
 // ─── Chattering state-switch roots held off the root search (issue #908) ─────
 //
 // A state that slides along a state-switch surface crosses it on most steps,
@@ -341,6 +406,9 @@ struct StateSwitchHold {
     // How far each held residual's crossings have been searched and tested.
     std::vector<double> tested_to;
     double rtol = 0.0;
+    // The run's tracking atol, which the band reads where it is on (issue #907).
+    // Held by value: inactive (empty) until run() copies the run's in.
+    AtolTracking tracking;
     int n_held = 0;
     // The run's logger, while a hold has its error log in the null sink.
     SUNLogger muted = nullptr;
@@ -379,13 +447,16 @@ struct StateSwitchHold {
         if (!std::isfinite(g)) {
             return g;
         }
-        double band = 0.0;
+        const std::vector<Term> &held_terms = terms[j];
         double room = 1.0;
-        for (const Term &k : terms[j]) {
-            const double xs = x[k.species];
-            band += k.weight * (rtol * std::fabs(xs) + k.atol);
-            room = std::min(room, 1.0 - std::fabs(xs - k.x0) / k.drift);
+        for (const Term &k : held_terms) {
+            room = std::min(room, 1.0 - std::fabs(x[k.species] - k.x0) / k.drift);
         }
+        const double band = state_switch_band(held_terms.size(), [&](std::size_t s) {
+            const Term &k = held_terms[s];
+            return k.weight * tolerance_unit(tracking, rtol, k.atol,
+                                             static_cast<std::size_t>(k.species), x[k.species]);
+        });
         if (!(band > 0.0)) {
             return -1.0;
         }
@@ -590,6 +661,19 @@ struct CvodeUserData {
     // by design. Built on first use from the model, which a run does not
     // restructure; see clamp_state_nonneg.
     std::vector<char> rhs_nonneg_mask;
+    // What that clamp weighs a negative component against where it reads a pole
+    // (see spare_at_pole): the run's atol per slot, set with the tolerances,
+    // and the solver it asks for the state a step started from. clamp_far marks
+    // the slots that state has far below 0 (clamp_far_any: any), clamp_start
+    // holds it.
+    std::vector<double> clamp_atol;
+    void *clamp_cvode_mem = nullptr;
+    std::vector<char> clamp_far;
+    std::vector<double> clamp_start;
+    bool clamp_far_any = false;
+    // Why followed_below_zero ended the run, for its failure message; empty
+    // until it does.
+    std::string below_zero_refusal;
 
     // Colored finite-difference Jacobian scratch (T4). cvode_colored_jac is
     // called once per Jacobian evaluation and otherwise heap-allocated three
@@ -603,6 +687,9 @@ struct CvodeUserData {
     std::vector<double> colored_jac_h_vals;
     // The rows colored_fd_jacobian's jump test evaluates (issue #1002), 4·ns.
     std::vector<double> colored_jac_jump_rows;
+    // f at the unperturbed state from the function the columns are differenced
+    // on, where CVODE's own f came from the compiled right-hand side (#1254).
+    std::vector<double> colored_jac_f_base;
 
     // bngsim's own dense difference quotient (issue #1002), installed where
     // CVODE's would run: the solver it reads the error weights and step from,
@@ -727,6 +814,41 @@ static double codegen_tfun_eval_thunk(int tf_id, double x, void *ctx) {
 // The declared value, not initial_conc: save_concentrations() moves that to a
 // captured state, where a depleted concentration a hair below 0 still needs the
 // clamp (Species::declared_negative).
+//
+// And not at a pole the run has carried a species to. The clamp is the boundary
+// value for a state the solver's own error put a little below 0, where a law
+// that reads it has no value: sqrt, a fractional power, a logarithm, which are
+// NaN there and whose value at 0 is their limit from above. A pole is no such
+// edge. BIOMD0000000338's XIIa and K activate each other through
+// v·S·E/(1 + E), so each has a pole at -1; the dense LU's rounding tips XIIa
+// below 0 at 2e-7, the laws carry it to the pole, and there the RHS is -inf.
+// Clamped, it read XIIa and K at 0, which held both at -1: the run returned
+// XIIa = -1, K = -0.997 with no error. So where the value read is infinite, a
+// slot the step started more than kClampNoiseAtols of its atol below 0 is not
+// read at 0 (spare_at_pole), and followed_below_zero says what follows. Over
+// the rr corpus the states the clamp rescues sit 80 to 1.3e4 atols below 0;
+// 338's pole is at 1e9. A NaN is clamped as before, at any depth: a species
+// emptied from X0 stops up to 8.2 rtols of X0 below 0 within its tolerance (8e7
+// atols at atol 1e-12), and an undershoot of a spike between two rows, or one a
+// run starts from, has no scale to be judged on. A run at a loose atol widens
+// the band with it (at 1e-6 it reaches 338's pole).
+constexpr double kClampNoiseAtols = 1e6;
+
+// Record the run's atol per slot for spare_at_pole: the vector where the run has
+// one (issue #196; with tracking, issue #213, its ceiling, the widest the run
+// allows), the scalar for every slot otherwise. Starts the run's refusal afresh.
+static void record_clamp_tolerances(CvodeUserData &data, void *cvode_mem, double atol,
+                                    const std::vector<double> &atol_v, int ns) {
+    data.clamp_cvode_mem = cvode_mem;
+    data.clamp_far_any = false;
+    data.below_zero_refusal.clear();
+    if (!atol_v.empty()) {
+        data.clamp_atol = atol_v;
+    } else {
+        data.clamp_atol.assign(static_cast<std::size_t>(ns), atol);
+    }
+}
+
 static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
     const NetworkModel &model = *data->model;
     const int ns = model.n_species();
@@ -751,15 +873,215 @@ static const std::vector<char> &nonneg_clamp_mask(CvodeUserData *data) {
     return data->rhs_nonneg_mask;
 }
 
-static inline double *clamp_state_nonneg(CvodeUserData *data, const double *y_ptr) {
+// The state the step being taken started from, CVODE's last accepted y_n, into
+// `out`. cvPredict has already shifted the history array one step on, to tn =
+// t_n + h, so y_n = Σ_k (-1)^k zn[k] = Σ_k Dky(tn, k)·(-h)^k/k!, k up to the
+// step's order. CVODE does not report that order mid-step (cvAdjustParams sets
+// cv_q, not the cv_next_q CVodeGetCurrentOrder returns), so it is found by
+// asking for one more derivative until CVODE answers CV_BAD_K. Before a first
+// step, and after a reinitialisation (an event's), h is 0 and zn[0] is the
+// accepted state itself: the initial state, or the event's.
+static bool step_start_state(void *cvode_mem, N_Vector like, N_Vector out) {
+    sunrealtype tn = 0.0;
+    sunrealtype h = 0.0;
+    if (CVodeGetCurrentTime(cvode_mem, &tn) != CV_SUCCESS ||
+        CVodeGetCurrentStep(cvode_mem, &h) != CV_SUCCESS ||
+        CVodeGetDky(cvode_mem, tn, 0, out) != CV_SUCCESS)
+        return false;
+    if (h == 0.0)
+        return true;
+    N_Vector dk = N_VClone(like);
+    if (dk == nullptr)
+        return false;
+    bool ok = true;
+    double c = 1.0;
+    g_probing_step_order = true;
+    for (int k = 1;; ++k) {
+        const int rc = CVodeGetDky(cvode_mem, tn, k, dk);
+        if (rc == CV_BAD_K)
+            break;
+        if (rc != CV_SUCCESS) {
+            ok = false;
+            break;
+        }
+        c *= -h / k;
+        N_VLinearSum(1.0, out, c, dk, out);
+    }
+    g_probing_step_order = false;
+    N_VDestroy(dk);
+    return ok;
+}
+
+// Mark the masked slots the current step started more than kClampNoiseAtols
+// atols below 0 (clamp_far, clamp_start, clamp_far_any), for a state `y` with a
+// masked slot below 0. Nothing is marked where the run has no recorded
+// tolerances or no step.
+static void mark_far_at_step_start(CvodeUserData *data, N_Vector y) {
+    data->clamp_far_any = false;
+    const int ns = data->model->n_species();
+    const auto uns = static_cast<std::size_t>(ns);
+    const std::vector<double> &atol = data->clamp_atol;
+    if (data->clamp_cvode_mem == nullptr || atol.size() != uns)
+        return;
+    const std::vector<char> &mask = nonneg_clamp_mask(data);
+    const double *y_ptr = N_VGetArrayPointer(y);
+    bool negative = false;
+    for (int i = 0; i < ns && !negative; ++i)
+        negative = mask[i] && y_ptr[i] < 0.0;
+    if (!negative)
+        return;
+    N_Vector start = N_VClone(y);
+    if (start == nullptr)
+        return;
+    if (step_start_state(data->clamp_cvode_mem, y, start)) {
+        const double *y0 = N_VGetArrayPointer(start);
+        data->clamp_far.assign(uns, 0);
+        data->clamp_start.assign(y0, y0 + ns);
+        for (std::size_t i = 0; i < uns; ++i) {
+            if (mask[i] && y0[i] < -kClampNoiseAtols * atol[i]) {
+                data->clamp_far[i] = 1;
+                data->clamp_far_any = true;
+            }
+        }
+    }
+    N_VDestroy(start);
+}
+
+// The state `y` with its masked slots below 0 set to 0, but for those `spare`
+// marks. Returns the (lazily sized) scratch.
+static inline double *clamp_state_nonneg(CvodeUserData *data, N_Vector y,
+                                         const char *spare = nullptr) {
     const int ns = data->model->n_species();
     if (data->rhs_nonneg_scratch.size() != static_cast<std::size_t>(ns))
         data->rhs_nonneg_scratch.assign(ns, 0.0);
     double *s = data->rhs_nonneg_scratch.data();
+    const double *y_ptr = N_VGetArrayPointer(y);
     const std::vector<char> &mask = nonneg_clamp_mask(data);
     for (int i = 0; i < ns; ++i)
-        s[i] = (y_ptr[i] > 0.0 || !mask[i]) ? y_ptr[i] : 0.0;
+        s[i] = (y_ptr[i] > 0.0 || !mask[i] || (spare != nullptr && spare[i])) ? y_ptr[i] : 0.0;
     return s;
+}
+
+// What an evaluation of the right-hand side or of a closed-form Jacobian read:
+// all finite, a NaN and no infinity, or an infinity.
+enum class ClampReading { finite, nan_only, infinite };
+
+static ClampReading read_values(const double *v, std::size_t n) {
+    bool nan = false;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (std::isinf(v[k]))
+            return ClampReading::infinite;
+        nan = nan || std::isnan(v[k]);
+    }
+    return nan ? ClampReading::nan_only : ClampReading::finite;
+}
+
+// The slots the clamp leaves alone at `y`: where `values` (the right-hand side
+// or a closed-form Jacobian, `count` of them, as first evaluated there) has an
+// infinite entry, those the step started far below 0 whose own reading is
+// infinite, every other slot read at 0, and finite a relative 2^-20 to either
+// side (`read_at(state)` evaluates at a state and says what it read; it may
+// overwrite `values`, which are scanned first). None otherwise: not where the
+// value is only NaN, not a far slot whose laws are only NaN while another
+// species' law is what is infinite, and not an overflow. Each spared candidate
+// costs one evaluation, and each one infinite on its own two more; none of
+// this runs unless an infinity was read at a step started far below 0.
+template <class ReadAt>
+static const char *spare_at_pole(CvodeUserData *data, N_Vector y, const double *values,
+                                 std::size_t count, ReadAt &&read_at) {
+    data->clamp_far_any = false;
+    bool infinite = false;
+    for (std::size_t k = 0; k < count && !infinite; ++k)
+        infinite = std::isinf(values[k]);
+    if (!infinite)
+        return nullptr;
+    mark_far_at_step_start(data, y);
+    if (!data->clamp_far_any)
+        return nullptr;
+    const double *y_ptr = N_VGetArrayPointer(y);
+    bool any = false;
+    for (std::size_t i = 0; i < data->clamp_far.size(); ++i) {
+        if (!data->clamp_far[i])
+            continue;
+        double *x = clamp_state_nonneg(data, y);
+        x[i] = y_ptr[i];
+        bool pole = read_at(x) == ClampReading::infinite;
+        // A pole the run has landed on is infinite at that one point and finite
+        // a hair to either side of it; an overflow is infinite over a stretch:
+        // exp(-1/S), 0 at S = 0, overflows for every S in (-1/709.8, 0), where an
+        // extinct species' in-tolerance undershoot can sit (round 3's F1).
+        for (const double side : {1.0 + 0x1p-20, 1.0 - 0x1p-20}) {
+            if (!pole)
+                break;
+            x = clamp_state_nonneg(data, y);
+            x[i] = y_ptr[i] * side;
+            pole = read_at(x) != ClampReading::infinite;
+        }
+        if (pole)
+            any = true;
+        else
+            data->clamp_far[i] = 0;
+    }
+    data->clamp_far_any = any;
+    return any ? data->clamp_far.data() : nullptr;
+}
+
+// Has the run itself carried a species to a pole? The callbacks ask where the
+// right-hand side (or a closed-form Jacobian) stays non-finite with the slots
+// spare_at_pole spared, and `read_at` is theirs (see spare_at_pole). True where
+// it turns finite once those too are read at 0: that reading is what held
+// BIOMD0000000338 at its pole, and refused it on its closed-form Jacobian the
+// run stepped across the pole and returned XIIa = -9.46, then +61. The run ends
+// there: the reason is recorded for the failure message (the witness taken
+// again at this state, so the two agree), and the callback returns CVODE's
+// unrecoverable code. A run ended that way raises as a CVODE failure, which a
+// failed closed-form attempt retries on the difference quotient (GH #176). The
+// spared slots are named, deepest first: each is one whose own reading is
+// infinite.
+template <class ReadAt>
+static bool followed_below_zero(CvodeUserData *data, N_Vector y, double t, const char *src,
+                                ReadAt &&read_at) {
+    const int ns = data->model->n_species();
+    if (!data->clamp_far_any || read_at(clamp_state_nonneg(data, y)) != ClampReading::finite)
+        return false;
+    if (!data->below_zero_refusal.empty())
+        return true;
+    std::vector<std::pair<double, int>> named_slots; // (depth in atols, slot)
+    for (std::size_t i = 0; i < data->clamp_far.size(); ++i) {
+        if (data->clamp_far[i])
+            named_slots.emplace_back(-data->clamp_start[i] / data->clamp_atol[i],
+                                     static_cast<int>(i));
+    }
+    std::sort(named_slots.begin(), named_slots.end(), std::greater<>());
+    sunrealtype tn = 0.0;
+    sunrealtype h = 0.0;
+    CVodeGetCurrentTime(data->clamp_cvode_mem, &tn);
+    CVodeGetCurrentStep(data->clamp_cvode_mem, &h);
+    std::string named;
+    constexpr std::size_t kMaxNamed = 3;
+    for (std::size_t e = 0; e < named_slots.size() && e < kMaxNamed; ++e) {
+        const auto ui = static_cast<std::size_t>(named_slots[e].second);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "' to %.6g (%.3g times its atol below 0)",
+                      data->clamp_start[ui], named_slots[e].first);
+        named +=
+            std::string(e == 0 ? "concentration '" : ", '") + data->model->species()[ui].name + buf;
+    }
+    if (named_slots.size() > kMaxNamed)
+        named += ", ...";
+    char at[64];
+    std::snprintf(at, sizeof(at), " by t=%.9g", static_cast<double>(tn - h));
+    data->below_zero_refusal =
+        std::string(src) + " has no finite value where the run has carried " + named + at +
+        ", and none is set to 0 there: no rounding of 0 is that far below it, and reading "
+        "it at 0 would return a trajectory that has already gone wrong, so the run is "
+        "refused. Typically a rounding error tipped the species below 0 and the model's "
+        "own laws carried it to a pole of a rate law, as at an unstable equilibrium at 0 "
+        "(BIOMD0000000338's XIIa). Tighter tolerances, or a model that keeps the species "
+        "nonnegative, may avoid it.";
+    data->nonfinite_witness = NonFiniteWitness{};
+    data->nonfinite_witness.capture(src, t, N_VGetArrayPointer(y), ns);
+    return true;
 }
 
 // The sensitivity RHS's counterpart, and it snaps a strictly SMALLER set of
@@ -1092,7 +1414,10 @@ static std::string describe_nonfinite_witness(NetworkModel &model, const NonFini
 // witness, or nothing at all when it left none (GH #336). Forward-declared above
 // retry_while_advancing, which throws before CvodeUserData is a complete type.
 static std::string nonfinite_witness_suffix(CvodeUserData &data) {
-    return describe_nonfinite_witness(*data.model, data.nonfinite_witness);
+    std::string suffix = describe_nonfinite_witness(*data.model, data.nonfinite_witness);
+    if (!data.below_zero_refusal.empty())
+        suffix += " " + data.below_zero_refusal;
+    return suffix;
 }
 
 // Issue #545: a forward-sensitivity run whose step gave out where the run had just
@@ -1376,7 +1701,13 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
         // e.g. -k·conc self-corrects back toward 0 — is byte-identical and keeps
         // that restoring behavior; clamping unconditionally would freeze such a
         // species at a small negative value and make the solve chatter.
-        data->model->compute_derivs(static_cast<double>(t), clamp_state_nonneg(data, y_ptr),
+        auto read_at = [&](double *x) {
+            data->model->compute_derivs(static_cast<double>(t), x, ydot_ptr);
+            return read_values(ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        };
+        const char *spare = spare_at_pole(
+            data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()), read_at);
+        data->model->compute_derivs(static_cast<double>(t), clamp_state_nonneg(data, y, spare),
                                     ydot_ptr);
         if (rhs_has_nonfinite(data, ydot_ptr)) {
             // Nothing left to clamp: keep the state as evidence in case the run
@@ -1384,6 +1715,8 @@ static int cvode_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void *user_d
             // code it has always had.
             data->nonfinite_witness.capture("The RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
+            if (followed_below_zero(data, y, static_cast<double>(t), "The RHS", read_at))
+                return -1;
             return 1; // still non-finite (e.g. inf from 1/conc) -> recoverable
         }
     }
@@ -1487,7 +1820,14 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
         // Conditional nonnegative-clamp retry, identical rationale to cvode_rhs:
         // byte-identical wherever the RHS is finite, engages only on a genuine
         // non-finite (e.g. pow(conc, 3.98) at a transiently-negative conc).
-        rc = data->codegen_fn(static_cast<double>(t), clamp_state_nonneg(data, y_ptr), ydot_ptr,
+        auto read_at = [&](double *x) {
+            if (data->codegen_fn(static_cast<double>(t), x, ydot_ptr, &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(ydot_ptr, static_cast<std::size_t>(data->model->n_species()));
+        };
+        const char *spare = spare_at_pole(
+            data, y, ydot_ptr, static_cast<std::size_t>(data->model->n_species()), read_at);
+        rc = data->codegen_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), ydot_ptr,
                               &data->codegen_so_data);
         if (rc != 0)
             return rc;
@@ -1497,6 +1837,8 @@ static int cvode_codegen_rhs_body(sunrealtype t, N_Vector y, N_Vector ydot, void
             // (GH #336).
             data->nonfinite_witness.capture("The compiled RHS", static_cast<double>(t), y_ptr,
                                             data->model->n_species());
+            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled RHS", read_at))
+                return -1;
             return 1; // still non-finite -> recoverable
         }
     }
@@ -1711,11 +2053,18 @@ static int cvode_analytical_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /
     // transiently-negative concentration. Byte-identical otherwise.
     const std::size_t n = static_cast<std::size_t>(model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
+        auto read_at = [&](double *x) {
+            model->fill_dense_analytical_jacobian(static_cast<double>(t), x, jac);
+            return read_values(jac, n * n);
+        };
+        const char *spare = spare_at_pole(data, y, jac, n * n, read_at);
         model->fill_dense_analytical_jacobian(static_cast<double>(t),
-                                              clamp_state_nonneg(data, y_ptr), jac);
+                                              clamp_state_nonneg(data, y, spare), jac);
         if (jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, static_cast<double>(t), "The Jacobian", read_at))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1760,11 +2109,20 @@ static int cvode_codegen_dense_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy
     // memsets the matrix first, so the re-fill on the clamped state overwrites it.
     const std::size_t n = static_cast<std::size_t>(data->model->n_species());
     if (jac_has_nonfinite(jac, n * n)) {
-        rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y_ptr), jac,
+        auto read_at = [&](double *x) {
+            if (data->codegen_jac_fn(static_cast<double>(t), x, jac, &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(jac, n * n);
+        };
+        const char *spare = spare_at_pole(data, y, jac, n * n, read_at);
+        rc = data->codegen_jac_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare), jac,
                                   &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac, n * n)) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             data->model->n_species()); // GH #336
+            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled Jacobian",
+                                    read_at))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1796,14 +2154,19 @@ static int cvode_codegen_dense_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNMa
 
 // f at a state CVODE never asked about, leaving nothing a run reads afterwards:
 // the per-species maxima (#1025), the non-finite witness (#336), a parked
-// exception (#589). False where f fails there or is not finite.
+// exception (#589), a below-zero refusal. False where f fails there or is not
+// finite.
 static bool dq_side_point(CvodeUserData *data, sunrealtype t, N_Vector y, N_Vector f) {
     std::vector<double> *x_max = data->x_max;
     data->x_max = nullptr;
     const bool had_witness = data->nonfinite_witness.captured;
     const bool had_error = static_cast<bool>(data->callback_error);
+    const bool had_refusal = !data->below_zero_refusal.empty();
     const int rc = data->dq_rhs(t, y, f, data);
     data->x_max = x_max;
+    if (!had_refusal) {
+        data->below_zero_refusal.clear();
+    }
     if (!had_witness) {
         data->nonfinite_witness = NonFiniteWitness{};
     }
@@ -1924,11 +2287,19 @@ static int cvode_analytical_jac_body(sunrealtype t, N_Vector y, N_Vector /*fy*/,
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the sparse fill
     // memsets the nnz value array first, so the re-fill cleanly overwrites it.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
+        auto read_at = [&](double *x) {
+            model->fill_sparse_analytical_jacobian(static_cast<double>(t), x, jac_data);
+            return read_values(jac_data, static_cast<std::size_t>(sp.nnz));
+        };
+        const char *spare =
+            spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz), read_at);
         model->fill_sparse_analytical_jacobian(static_cast<double>(t),
-                                               clamp_state_nonneg(data, conc), jac_data);
+                                               clamp_state_nonneg(data, y, spare), jac_data);
         if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The Jacobian", static_cast<double>(t), conc,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, static_cast<double>(t), "The Jacobian", read_at))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -1977,11 +2348,22 @@ static int cvode_codegen_sparse_jac_body(sunrealtype t, N_Vector y, N_Vector /*f
     // Conditional nonnegative-clamp retry (see jac_has_nonfinite); the compiled
     // sparse mirror memsets the nnz value array first.
     if (jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
-        rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y_ptr),
+        auto read_at = [&](double *x) {
+            if (data->codegen_jac_sparse_fn(static_cast<double>(t), x, jac_data,
+                                            &data->codegen_so_data) != 0)
+                return ClampReading::nan_only;
+            return read_values(jac_data, static_cast<std::size_t>(sp.nnz));
+        };
+        const char *spare =
+            spare_at_pole(data, y, jac_data, static_cast<std::size_t>(sp.nnz), read_at);
+        rc = data->codegen_jac_sparse_fn(static_cast<double>(t), clamp_state_nonneg(data, y, spare),
                                          jac_data, &data->codegen_so_data);
         if (rc == 0 && jac_has_nonfinite(jac_data, static_cast<std::size_t>(sp.nnz))) {
             data->nonfinite_witness.capture("The compiled Jacobian", static_cast<double>(t), y_ptr,
                                             model->n_species()); // GH #336
+            if (followed_below_zero(data, y, static_cast<double>(t), "The compiled Jacobian",
+                                    read_at))
+                return -1;
             return 1; // still non-finite: recoverable, not a silent success (issue #867)
         }
     }
@@ -2021,7 +2403,7 @@ static int cvode_codegen_sparse_jac(sunrealtype t, N_Vector y, N_Vector fy, SUNM
 // (issue #128); what stays here is the CVODE plumbing around it.
 
 static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMatrix J,
-                                  void *user_data, N_Vector /*tmp1*/, N_Vector /*tmp2*/,
+                                  void *user_data, N_Vector tmp1, N_Vector /*tmp2*/,
                                   N_Vector /*tmp3*/) {
 
     auto *data = static_cast<CvodeUserData *>(user_data);
@@ -2056,14 +2438,40 @@ static int cvode_colored_jac_body(sunrealtype t, N_Vector y, N_Vector fy, SUNMat
     double *fy_pert = data->colored_jac_fy_pert.data();
     double *h_vals = data->colored_jac_h_vals.data();
 
+    // Each column's step on the scale the error test judges it by, as CVODE's
+    // dense difference quotient (cvLsDenseDQJac) takes it (#1254): the session's
+    // error weights, in tmp1 (CVODE's scratch for this callback), and its step.
+    const double *ewt = nullptr;
+    sunrealtype min_inc = 1.0;
+    if (data->dq_cvode_mem != nullptr &&
+        cvode_dq_min_inc(data->dq_cvode_mem, fy, tmp1, ns, &min_inc)) {
+        ewt = N_VGetArrayPointer(tmp1);
+    }
+
+    // Both sides of each difference from one function. The columns are the
+    // interpreted right-hand side; CVODE's fy is the compiled one where codegen
+    // is attached (256+ species, which KLU's routing reaches). Over the step
+    // above, min_inc/ewt_j beside a species at 0, the last bits between the two
+    // read as slope: fceri_ji's compiled run took 241 steps where the
+    // interpreted one took 251, 1.6e-10 of its peak away. So there the
+    // interpreted f at y is the base, at one call more.
+    const double *f_base = fy_data;
+    if (data->codegen_fn != nullptr) {
+        if (static_cast<int>(data->colored_jac_f_base.size()) != ns) {
+            data->colored_jac_f_base.resize(ns);
+        }
+        model->compute_derivs(static_cast<double>(t), y_data, data->colored_jac_f_base.data());
+        f_base = data->colored_jac_f_base.data();
+    }
+
     if (data->colored_jac_jump_rows.size() != 4 * static_cast<std::size_t>(ns)) {
         data->colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
     }
     int mended = 0;
     colored_fd_jacobian(
-        sp, ns, static_cast<double>(t), y_data, fy_data, jac_data, y_pert, fy_pert, h_vals,
+        sp, ns, static_cast<double>(t), y_data, f_base, jac_data, y_pert, fy_pert, h_vals,
         [model](double tt, const double *yy, double *ydot) { model->compute_derivs(tt, yy, ydot); },
-        data->colored_jac_jump_rows.data(), &mended);
+        data->colored_jac_jump_rows.data(), &mended, ewt, min_inc);
     if (mended > 0 && data->dq_debug) {
         std::fprintf(stderr, "[jac] colored DQ t=%.17g: %d entries step across a jump\n",
                      static_cast<double>(t), mended);
@@ -2437,6 +2845,9 @@ struct ExecutedEventFire {
 // treat them as one instant (issue #737). The Python detector groups crossings
 // by the same reach (`_switch_sensitivity._same_instant`).
 constexpr double kSwitchInstantUlps = 64.0;
+// Issue #947: how many times the step back that tells a crossing from a jump
+// is doubled, past where a residual moves by less than its own rounding.
+constexpr int kHeldProbeDoublings = 20;
 // Issue #1025: a state crossing and a fire or a clock's switch, closer than
 // the window and further than one step's tolerances, are confirmed against a
 // plain run at 1/kOrderTighten of the tolerances. The window takes the
@@ -3531,8 +3942,8 @@ struct CvodeSimulator::Impl {
     bool flow_carries_state_switch(void *cvode_mem, double t, const double *x, int ns,
                                    const NetworkModel::StateSwitch &sw, int dir, double t_end,
                                    N_Vector scratch, double rtol, double atol,
-                                   const std::vector<double> &atol_v, bool reads_time,
-                                   bool *resolved = nullptr,
+                                   const std::vector<double> &atol_v, const AtolTracking &tracking,
+                                   bool reads_time, bool *resolved = nullptr,
                                    std::vector<double> *grad_out = nullptr);
 };
 
@@ -3808,6 +4219,9 @@ void CvodeSimulator::Impl::setup_linsol_and_jac(void *cvode_mem, SUNContext ctx,
             user_data.colored_jac_fy_pert.resize(ns);
             user_data.colored_jac_h_vals.assign(ns, 0.0);
             user_data.colored_jac_jump_rows.assign(4 * static_cast<std::size_t>(ns), 0.0);
+            // The solver whose error weights and step each column's step is
+            // taken on (#1254), as the dense quotient reads them.
+            user_data.dq_cvode_mem = cvode_mem;
             user_data.dq_debug = std::getenv("BNGSIM_JAC_DEBUG") != nullptr;
         }
 
@@ -4050,6 +4464,7 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         w.user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
         apply_cvode_tolerances(w.cvode_mem, w.ctx, rtol, atol, atol_v, ns,
                                w.user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
+        record_clamp_tolerances(w.user_data, w.cvode_mem, atol, atol_v, ns);
         CVodeSetUserData(w.cvode_mem, &w.user_data);
         CVodeSetMaxNumSteps(w.cvode_mem, max_steps);
         if (opts.max_step_size > 0) {
@@ -4131,8 +4546,9 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
     // user_data would otherwise carry across run()s: a step an earlier run
     // recovered from must not be offered as the explanation for a later run's
     // failure. The cold run() path builds its user_data per call and needs no
-    // equivalent.
+    // equivalent. So too a below-zero refusal.
     w.user_data.nonfinite_witness = NonFiniteWitness{};
+    w.user_data.below_zero_refusal.clear();
 
     // ─── Integration loop (no events, no sensitivities) ──────────────────────
     void *cvode_mem = w.cvode_mem;
@@ -4292,6 +4708,15 @@ Result CvodeSimulator::Impl::run_warm(const TimeSpec &times, const SolverOptions
         }
         const double final_t = (check_ss && ss_reached) ? t_out[last_recorded_index] : times.t_end;
         model.set_current_time(final_t);
+        // The functions, and the parameters assignment rules set, at the state
+        // the run ends on, as run() leaves them by its refresh at each row
+        // (issue #1358). A parameter an assignment rule sets is written by the
+        // interpreter's evaluate_functions; the compiled right-hand side
+        // computes the rule in its own func[] and writes nothing back, and the
+        // rows here read the functions through fill_row without writing them
+        // either. So after a compiled run get_param read the value at load
+        // (q 1.0, where an interpreted run read 0.0183).
+        sync_model_at(final_t, y_data, ns);
 
         // GH #210 — the warm path never computes sensitivities, so it advances
         // the state (carry-over) without tracking dx/dθ: mark the state dirty
@@ -4440,6 +4865,7 @@ void CvodeSimulator::Impl::create_cvode_core(const TimeSpec &times, const Solver
     user_data.atol_tracking = make_atol_tracking(rtol, atol_v, opts.atol_track_decades);
     apply_cvode_tolerances(cvode_mem, ctx, rtol, atol, atol_v, ns,
                            user_data.atol_tracking.active() ? cvode_tracking_ewt : nullptr);
+    record_clamp_tolerances(user_data, cvode_mem, atol, atol_v, ns);
 
     flag = CVodeSetUserData(cvode_mem, &user_data);
     flag = CVodeSetMaxNumSteps(cvode_mem, max_steps);
@@ -6144,11 +6570,19 @@ bool CvodeSimulator::Impl::stop_would_lose(void *cvode_mem, double t, N_Vector y
     // reads a stop this took cost a model of 3,000 reactions 46% of its run.
     NVectorGuard before(N_VClone(y));
     NVectorGuard after(N_VClone(y));
-    if (!before || !after ||
+    // Reads CVODE did not ask for: a below-zero refusal one of them records is
+    // no part of the run's failure (see followed_below_zero).
+    auto *data = static_cast<CvodeUserData *>(user_data);
+    const bool had_refusal = !data->below_zero_refusal.empty();
+    const bool read =
+        before && after &&
         run_rhs_fn(
             static_cast<sunrealtype>(std::nextafter(t, -std::numeric_limits<double>::infinity())),
-            y, static_cast<N_Vector>(before), user_data) != 0 ||
-        run_rhs_fn(static_cast<sunrealtype>(t), y, static_cast<N_Vector>(after), user_data) != 0) {
+            y, static_cast<N_Vector>(before), user_data) == 0 &&
+        run_rhs_fn(static_cast<sunrealtype>(t), y, static_cast<N_Vector>(after), user_data) == 0;
+    if (!had_refusal)
+        data->below_zero_refusal.clear();
+    if (!read) {
         return false;
     }
     const double *y_data = N_VGetArrayPointer(y);
@@ -9719,13 +10153,11 @@ static constexpr double kStateSwitchHoldGradKept = 0.75;
 // its box costs (4n + 2) * 2n evaluations.
 static constexpr std::size_t kStateSwitchHoldMaxSpecies = 16;
 
-bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, const double *x,
-                                                     int ns, const NetworkModel::StateSwitch &sw,
-                                                     int dir, double t_end, N_Vector scratch,
-                                                     double rtol, double atol,
-                                                     const std::vector<double> &atol_v,
-                                                     bool reads_time, bool *resolved_out,
-                                                     std::vector<double> *grad_out) {
+bool CvodeSimulator::Impl::flow_carries_state_switch(
+    void *cvode_mem, double t, const double *x, int ns, const NetworkModel::StateSwitch &sw,
+    int dir, double t_end, N_Vector scratch, double rtol, double atol,
+    const std::vector<double> &atol_v, const AtolTracking &tracking, bool reads_time,
+    bool *resolved_out, std::vector<double> *grad_out) {
     // A trajectory that CROSSES the surface arrives at it with a flow that stays
     // finite as the surface is approached. One that only approaches it, parked
     // beside it or relaxing onto it, arrives with a flow that vanishes there, so
@@ -9754,10 +10186,18 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
     // 0.16 off, silently, where main is right. So first the crossing has to be
     // RESOLVED: somewhere between the root and the end of the step, the
     // solver's own trajectory (CVODE's interpolant, sampled) must go beyond the
-    // surface by more than the band the tolerance leaves the residual,
-    //     δg = Σ_j |∂g/∂x_j|·(rtol·|x_j| + atol_j),
-    // times 10·√N, because the WRMS error test lets a single component carry
-    // √N of the tolerance. A crossing inside that band is one the requested
+    // surface by more than the bar, 10·√N times the band the tolerance leaves
+    // the residual,
+    //     δg = sqrt(Σ_j (∂g/∂x_j·u_j)²),
+    // because the WRMS error test lets a single component carry √N of the
+    // tolerance. u_j is what the error weight's own rule holds x_j to there,
+    // rtol·|x_j| + atol_j, a tracking atol's where the run tracks (and then no
+    // tighter than the weights the step was tested with); and the terms add in
+    // quadrature, which is what the WRMS norm bounds (issue #907). Read from
+    // the run's ceiling, the bar lost a 5e-9 window of a species held to
+    // 2e-14; summed one by one over an observable of a thousand species of
+    // 1e-3, the band was 1e-5 and the bar 3.2e-3, past the window's whole
+    // excursion of 1e-3. A crossing inside the bar is one the requested
     // tolerance cannot decide, and it steps on. The whole step is sampled
     // rather than its end: a window can open and close inside one step, and a
     // curved residual (3u − u³) can cross and come back, so the end may be on
@@ -9828,8 +10268,37 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
     bool resolved = false;
     if (t_end > t) {
         const double span = t_end - t;
-        auto atol_of = [&](int j) {
-            return atol_v.empty() ? atol : atol_v[static_cast<std::size_t>(j)];
+        // What species j is held to at x_j (issue #907): the error weight's own
+        // rule, so a tracking atol's, not its ceiling's. A tracking atol moves
+        // with the state, and CVODE tested the step with the weights it held at
+        // the step's start; read at a state the species has fallen to since,
+        // the rule alone could hold it tighter than CVODE did. So under
+        // tracking the unit is no narrower than those weights. Without
+        // tracking the atol floors both, and the rule alone is main's band.
+        // The weights land in scratch, which nothing has read yet, and are
+        // copied out before the first reading writes it.
+        std::vector<double> step_unit;
+        if (tracking.active() && CVodeGetErrWeights(cvode_mem, scratch) == CV_SUCCESS) {
+            const double *w = N_VGetArrayPointer(scratch);
+            step_unit.assign(static_cast<std::size_t>(ns), 0.0);
+            for (int i = 0; i < ns; ++i) {
+                step_unit[static_cast<std::size_t>(i)] =
+                    w[i] > 0.0 ? 1.0 / w[i] : std::numeric_limits<double>::infinity();
+            }
+        }
+        auto unit_of = [&](int j, double xj) {
+            const auto uj = static_cast<std::size_t>(j);
+            const double u =
+                tolerance_unit(tracking, rtol, atol_v.empty() ? atol : atol_v[uj], uj, xj);
+            return step_unit.empty() ? u : std::max(u, step_unit[uj]);
+        };
+        // The residual's band at x: |∂g/∂x_j|·u_j over its species, added in
+        // quadrature (state_switch_band).
+        auto band_at = [&](const double *xs) {
+            return state_switch_band(sw.species.size(), [&](std::size_t s) {
+                const int j = sw.species[s];
+                return std::fabs(grad[static_cast<std::size_t>(j)]) * unit_of(j, xs[j]);
+            });
         };
         // The excursion at t + d and the k_resolve bands it has to clear there.
         struct Reading {
@@ -9849,12 +10318,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
             const double *xk = N_VGetArrayPointer(scratch);
             sync_model_at(tk, xk, ns);
             r.excursion = eval.evaluate(sw.residual_expr_idx) * static_cast<double>(dir);
-            double band = 0.0;
-            for (int j : sw.species) {
-                band += std::fabs(grad[static_cast<std::size_t>(j)]) *
-                        (rtol * std::fabs(xk[j]) + atol_of(j));
-            }
-            r.bar = k_resolve * band;
+            r.bar = k_resolve * band_at(xk);
             resolved = std::isfinite(r.excursion) && r.excursion > r.bar;
             return r;
         };
@@ -9895,11 +10359,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
                     taylor.push_back(std::fabs(xm[sw.species[s]]) / factorial);
                 }
             }
-            double band_root = 0.0;
-            for (int j : sw.species) {
-                band_root += std::fabs(grad[static_cast<std::size_t>(j)]) *
-                             (rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j));
-            }
+            const double band_root = band_at(xv.data());
             // dg/dt at the root's state, the clock's own term, read once. On its
             // own surface h(t)·(S − thr) reads 0 here; what h does over a reach
             // in which S moves less than its band is second order.
@@ -9916,8 +10376,7 @@ bool CvodeSimulator::Impl::flow_carries_state_switch(void *cvode_mem, double t, 
                         dm *= d;
                         reach += taylor[static_cast<std::size_t>(m - 1) * n_read + s] * dm;
                     }
-                    if (!(reach <=
-                          rtol * std::fabs(xv[static_cast<std::size_t>(j)]) + atol_of(j))) {
+                    if (!(reach <= unit_of(j, xv[static_cast<std::size_t>(j)]))) {
                         return true;
                     }
                 }
@@ -14046,6 +14505,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         state_switch_hold.run.assign(n_ss, 0);
         state_switch_hold.last_step.assign(n_ss, 0);
         state_switch_hold.rtol = rtol;
+        state_switch_hold.tracking = user_data.atol_tracking;
         user_data.state_switch_hold = &state_switch_hold;
     }
     const int n_roots = n_events + n_disc + n_state_switch;
@@ -14487,7 +14947,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         }
     };
 
-    auto process_firing_batch = [&](double t_now, const std::vector<int> &firing_in) -> bool {
+    // `on_crossing` is false where the seeds were read true at the run's start
+    // rather than seen turning true (see held_strict below).
+    auto process_firing_batch = [&](double t_now, const std::vector<int> &firing_in,
+                                    bool on_crossing = true) -> bool {
         const bool any_due = t_now >= earliest_pending();
         if (firing_in.empty() && !any_due)
             return false;
@@ -14561,6 +15024,163 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
         // and delay. Read with the others at the start of the batch,
         // `at (time >= 2): X = Sn` beside `cv := piecewise(1, time < 2, 5)`
         // and [Sn] = 5 before it gave X = 5 where [Sn] at t = 2 is 1.
+        //
+        // Issue #947. A strict comparison and the non-strict one on the same
+        // residual that both turn true at one read were one batch. In exact
+        // arithmetic the non-strict one is true on the crossing and the strict
+        // one only past it, but the read lands on the crossing or a rounding
+        // past it, as the threshold rounds: `0.1*time > tau` beside `0.1*time
+        // >= tau`, by priority in one batch, left X at 0.50 for some tau and
+        // 0.15, the sequence, for the rest. So the strict one is held back to a
+        // second sub-instant of this one: it is triggered (its values from the
+        // trigger time and its delay read), and executes, once everything the
+        // first has triggered has settled, at the state that left.
+        //
+        // Only on a crossing: a step back along the run the non-strict trigger
+        // is false, and the residual moves over that step as it moves over the
+        // step before it. A residual that jumps there (a `piecewise` of the
+        // time, a function that switches) turns both true at one instant with
+        // none between, and they stay one batch. Not the loader's size jumps,
+        // on either side, which order their own instant (issue #1054).
+        std::vector<std::pair<int, int>> held_strict; // (strict, its non-strict twin)
+        if (on_crossing && firing_in.size() > 1) {
+            std::vector<int> pairable;
+            for (int ei : firing_in)
+                if (events_outer[ei].size_jump_compartment.empty())
+                    pairable.push_back(ei);
+            held_strict = model.strict_beside_non_strict(pairable);
+        }
+        if (!held_strict.empty()) {
+            // The state a step back is read from the integrator's interpolant
+            // over its last step, the trajectory that arrived here, and only
+            // past that along the flow here, which a rate law that switches on
+            // this instant no longer has.
+            const std::vector<double> x_now(y_data, y_data + ns);
+            std::vector<double> f; // read once, where the interpolant does not reach
+            sunrealtype h_last = 0.0;
+            sunrealtype t_cur = 0.0;
+            CVodeGetLastStep(cvode_mem, &h_last);
+            CVodeGetCurrentTime(cvode_mem, &t_cur);
+            const double step_from =
+                static_cast<double>(t_cur) - std::fabs(static_cast<double>(h_last));
+            NVectorGuard x_dky(N_VClone(y));
+            const double eps = std::numeric_limits<double>::epsilon();
+            const double delta0 =
+                2.0 *
+                std::max(100.0 * eps * (std::fabs(t_now) + std::fabs(static_cast<double>(h_last))),
+                         kSwitchInstantUlps * eps * std::max(std::fabs(t_now), 1.0));
+            std::vector<double> x_back(static_cast<std::size_t>(ns), 0.0);
+            auto back = [&](double d) {
+                const double tb = t_now - d;
+                if (h_last != 0.0 && tb >= step_from && tb <= static_cast<double>(t_cur) &&
+                    CVodeGetDky(cvode_mem, tb, 0, x_dky) == CV_SUCCESS) {
+                    impl_->sync_model_at(tb, x_dky.data(), ns);
+                    return;
+                }
+                if (f.empty()) {
+                    f.assign(static_cast<std::size_t>(ns), 0.0);
+                    model.compute_derivs(t_now, x_now.data(), f.data());
+                }
+                for (int si = 0; si < ns; ++si)
+                    x_back[static_cast<std::size_t>(si)] =
+                        x_now[static_cast<std::size_t>(si)] - d * f[static_cast<std::size_t>(si)];
+                impl_->sync_model_at(tb, x_back.data(), ns);
+            };
+            std::vector<std::pair<int, int>> crossing;
+            for (const auto &[ei, twin] : held_strict) {
+                // Where the residual moves by less than its own rounding over
+                // the first step back, or the twin is still true there, the
+                // step doubles, up to 2^kHeldProbeDoublings times the first.
+                const double g0 = residual_now(ei);
+                bool on_it = false;
+                double d = delta0;
+                for (int k = 0; k <= kHeldProbeDoublings && !on_it; ++k, d *= 2.0) {
+                    back(d);
+                    const bool twin_before =
+                        eval_ref_outer.evaluate(events_outer[twin].trigger_expr_idx) > 0.5;
+                    const double g1 = residual_now(ei);
+                    back(2.0 * d);
+                    const double g2 = residual_now(ei);
+                    const double d1 = g0 - g1;
+                    const double d2 = g1 - g2;
+                    on_it = !twin_before && d1 * d2 > 0.0 &&
+                            std::fabs(d1 - d2) <= 0.5 * std::max(std::fabs(d1), std::fabs(d2));
+                }
+                impl_->sync_model_at(t_now, x_now.data(), ns);
+                if (on_it)
+                    crossing.emplace_back(ei, twin);
+            }
+            held_strict = std::move(crossing);
+        }
+        // Still held: cleared where the trigger changes before the first
+        // sub-instant has settled, which then triggers it as any other event.
+        // Also where an event of the first moves its residual, which it reads
+        // true and is held at: on the crossing the residual is 0 and the
+        // strict trigger false, so a write that moves it raises it there, a
+        // cascade with the priority it has. Held to the end, `A > tau` of
+        // priority 5 ran after an event of priority 1 where one of priority
+        // 10 on `A >= tau` wrote `A = A + 1`, as the threshold rounded.
+        std::vector<char> held;
+        std::vector<double> held_at;
+        if (!held_strict.empty()) {
+            held.assign(static_cast<std::size_t>(n_events), 0);
+            held_at.assign(static_cast<std::size_t>(n_events), 0.0);
+            for (const auto &pair : held_strict) {
+                held[static_cast<std::size_t>(pair.first)] = 1;
+                held_at[static_cast<std::size_t>(pair.first)] = residual_now(pair.first);
+            }
+        }
+        // A held trigger triggered in a sensitivity run. Where it reads
+        // nothing the first sub-instant wrote and writes nothing it wrote, the
+        // sequence leaves what the batch left, and the sensitivity jump
+        // composes it as one of the batch. Otherwise it is a second jump at
+        // the instant, which has none.
+        auto refuse_held_jump = [&](int ei) {
+            if (sens.n_total == 0)
+                return;
+            std::vector<char> written(static_cast<std::size_t>(ns), 0);
+            for (std::size_t fi = batch_fires_from; fi < executed_fires.size(); ++fi)
+                for (const auto &asg : events_outer[executed_fires[fi].event_idx].assignments)
+                    if (asg.first >= 0 && asg.first < ns)
+                        written[static_cast<std::size_t>(asg.first)] = 1;
+            bool touches = false;
+            const Event &hev = events_outer[ei];
+            auto reads_written = [&](int expr) {
+                std::vector<int> reads;
+                model.expression_support(expr, &reads, nullptr);
+                return std::any_of(reads.begin(), reads.end(), [&](int j) {
+                    return j >= 0 && j < ns && written[static_cast<std::size_t>(j)];
+                });
+            };
+            for (std::size_t a = 0; a < hev.assignments.size(); ++a) {
+                const auto &asg = hev.assignments[a];
+                touches = touches || (asg.first >= 0 && asg.first < ns &&
+                                      written[static_cast<std::size_t>(asg.first)]);
+                touches = touches || reads_written(asg.second);
+                if (a < hev.assignment_rescale_size_expr.size() &&
+                    hev.assignment_rescale_size_expr[a] >= 0)
+                    touches = touches || reads_written(hev.assignment_rescale_size_expr[a]);
+            }
+            if (!touches)
+                return;
+            const auto pair = std::find_if(held_strict.begin(), held_strict.end(),
+                                           [&](const auto &p) { return p.first == ei; });
+            const int twin = pair != held_strict.end() ? pair->second : ei;
+            auto id_of = [&](int e) {
+                return events_outer[e].id.empty() ? std::to_string(e) : events_outer[e].id;
+            };
+            throw std::runtime_error(
+                "Forward sensitivity: event '" + id_of(ei) + "', a strict comparison, and event '" +
+                id_of(twin) +
+                "', the non-strict one on the same residual, turn true together on its crossing "
+                "at t=" +
+                diag_number(t_now) + ". The run triggers '" + id_of(ei) +
+                "' only once events of that instant have executed (issue #947), and '" + id_of(ei) +
+                "' reads or writes a species they wrote: a second state jump at the same "
+                "instant, which bngsim has no sensitivity jump to compose with the first (issue "
+                "#144). Separate the thresholds, or drop sensitivities for this run.");
+        };
+
         std::vector<ExecInstance> queue;
         queue.reserve(firing_in.size());
         const bool jumps_seeded =
@@ -14568,6 +15188,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 return !events_outer[ei].size_jump_compartment.empty();
             });
         for (int ei : firing_in) {
+            if (!held.empty() && held[static_cast<std::size_t>(ei)] != 0)
+                continue;
             if (jumps_seeded && events_outer[ei].size_jump_compartment.empty()) {
                 ExecInstance inst;
                 inst.event_idx = ei;
@@ -14660,9 +15282,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // is the one the sensitivity jump differentiates: beside `cv :=
             // piecewise(1, t < 2, 5)`, the own jump of `cw := piecewise(1, t <
             // 2, 1 + Sn)` takes [Sw] from 3 to 3/6, and cv's rescale of it then
-            // from 3/6 to 3/2. Jumps that wait on each other in a ring, which
-            // they can only through conditions (a ring of sizes is refused at
-            // load), go as they are drawn.
+            // from 3/6 to 3/2. Jumps that wait on each other in a ring go as
+            // they are drawn. The SBML loader refuses every such ring, through
+            // sizes' values, their conditions or both (issues #1134, #1185), so
+            // only a model built without it reaches that here.
             std::vector<char> waits;
             if (jump_left && jumps_have_followers) {
                 waits.assign(queue.size(), 0);
@@ -14704,8 +15327,26 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     ties.push_back(k);
                 }
             }
-            if (ties.empty())
+            if (ties.empty()) {
+                // The first sub-instant has settled: the strict comparisons
+                // held back are triggered now, at the state it left (issue
+                // #947), and drained as a second one.
+                bool queued_held = false;
+                for (const auto &pair : held_strict) {
+                    const int ei = pair.first;
+                    const auto hi = static_cast<std::size_t>(ei);
+                    if (held[hi] == 0 || !prev[hi])
+                        continue;
+                    held[hi] = 0;
+                    refuse_held_jump(ei);
+                    queue.push_back(make_instance(ei));
+                    queued_held = true;
+                }
+                held_strict.clear();
+                if (queued_held)
+                    continue;
                 break;
+            }
 
             // Random tie-break among equal-max-priority instances (GH #242).
             // A single candidate consumes no randomness (byte-identical to the
@@ -14828,7 +15469,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // jump of the instant drawn before it can have rescaled that
             // concentration since, as one that follows it: written as frozen,
             // the own rescale put back the value from before that one's. The
-            // ratio is applied to the concentration as it is now instead.
+            // ratio is applied to the concentration as it is now instead. (The
+            // SBML loader refuses every ring of sizes at load, issue #1185.)
             bool jump_rebased = false;
             if (!queue[k].jump_bases.empty()) {
                 for (size_t a = 0; a < assigns.size(); ++a) {
@@ -15038,6 +15680,25 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         // a trigger that one event dropped and the next raised
                         // again kept the execution it had lost (SBML §4.11.3).
                         drop_pending_of(ei);
+                    }
+                }
+                const auto hi = static_cast<std::size_t>(ei);
+                if (!held.empty() && held[hi] != 0) {
+                    if (now_true != was) {
+                        held[hi] = 0;
+                    } else if (now_true && residual_now(ei) != held_at[hi]) {
+                        // Raised by this write (see held_at): a cascade.
+                        held[hi] = 0;
+                        refuse_held_jump(ei);
+                        if (!ev.size_jump_compartment.empty()) {
+                            ExecInstance inst;
+                            inst.event_idx = ei;
+                            inst.delay = 0.0;
+                            inst.awaits_jumps = true;
+                            queue.push_back(std::move(inst));
+                        } else {
+                            queue.push_back(make_instance(ei));
+                        }
                     }
                 }
                 prev[ei] = now_true;
@@ -15465,7 +16126,8 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             }
 
             executed_fires.clear();
-            bool t0_immediate_fired = process_firing_batch(times.t_start, t0_firing);
+            bool t0_immediate_fired =
+                process_firing_batch(times.t_start, t0_firing, /*on_crossing=*/false);
 
             if (t0_immediate_fired) {
                 // Refresh observables/functions after t=0 fires so the
@@ -15608,11 +16270,14 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
     // Record initial sensitivities. Param cols are zero at t=0 for a fresh
     // start (or the carried-over dx/dθ seed under carry_sensitivities, GH
-    // #210); IC cols are e_k at t=0 (seeded above).
+    // #210); IC cols are e_k at t=0 (seeded above). The seed is kept for a row
+    // recorded before the first step (issue #1301, below).
+    std::vector<double> sens_seed;
     if (n_sens > 0) {
         std::vector<const double *> sens_ptrs(n_sens);
         for (int s = 0; s < n_sens; ++s) {
             sens_ptrs[s] = N_VGetArrayPointer(yS_guard[s]);
+            sens_seed.insert(sens_seed.end(), sens_ptrs[s], sens_ptrs[s] + ns);
         }
         if (n_sens_p > 0) {
             result.record_sensitivities(0, sens_ptrs.data(), ns, n_sens_p);
@@ -16619,6 +17284,34 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     },
                     carry_if_pinned, watch ? static_cast<long>(max_steps) : 0L, steps_at_call);
             }
+            // CV_NORMAL returns tout by interpolating to it in its last step and
+            // does not check that the interpolation succeeded: where that step
+            // does not span tout, `y` is left as the call before had it (issue
+            // #1301). Unpatched CVODES got there by stepping past a state the
+            // RHS refused without correcting the step, so the run is refused,
+            // not read where it stands. Asked of the retry's return too.
+            if (flag == CV_SUCCESS && sens.n_total > 0 &&
+                (t_ret == look_tout || t_ret == t_target) && !inside_last_step(cvode_mem, t_ret)) {
+                sunrealtype tn = 0.0;
+                sunrealtype hu = 0.0;
+                CVodeGetCurrentTime(cvode_mem, &tn);
+                CVodeGetLastStep(cvode_mem, &hu);
+                std::ostringstream msg;
+                msg << std::setprecision(17) << "CVODES returned the output time t=" << t_ret
+                    << " from a step [" << (tn - hu) << ", " << tn
+                    << "] that does not span it, so the state there was never read. "
+#ifdef BNGSIM_SUNDIALS_CARRIES_1301
+                    << "This build carries the lanl/bngsim#1301 fix that should prevent it "
+                       "(unless BNGSIM_SUNDIALS_STAGGERED_RESTORE=0 turned it off); please "
+                       "report the model."
+#else
+                    << "This build uses a system SUNDIALS without the lanl/bngsim#1301 fix "
+                       "to its staggered sensitivity corrector; build with the fetched "
+                       "SUNDIALS, or pass sensitivity_method=\"simultaneous\"."
+#endif
+                    ;
+                throw std::runtime_error(msg.str());
+            }
             // Issue #998: after a root or a stop CVODE returned on, it reports
             // the step it took (or cut to end on the stop) as the next one, not
             // the one it takes (cv_hprime), until it takes another; a
@@ -16761,7 +17454,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                     if (impl_->flow_carries_state_switch(
                             cvode_mem, hi, x_root.data(), ns, *state_switches[jx], side_here,
                             static_cast<double>(t_step_end), samples, rtol, atol, atol_v,
-                            state_switch_hold.reads_time[jx] != 0)) {
+                            user_data.atol_tracking, state_switch_hold.reads_time[jx] != 0)) {
                         t_restart = hi;
                         x_restart = x_root;
                     }
@@ -17287,7 +17980,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             if (impl_->flow_carries_state_switch(
                                     cvode_mem, t_root, y_data, ns, *state_switches[jx],
                                     root_info[n_events + n_disc + j], static_cast<double>(t_end),
-                                    scratch, rtol, atol, atol_v,
+                                    scratch, rtol, atol, atol_v, user_data.atol_tracking,
                                     state_switch_hold.reads_time[jx] != 0, &resolved, &grad)) {
                                 restart = true;
                                 break;
@@ -17313,7 +18006,7 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                             const NetworkModel::StateSwitch &sw = *state_switches[jx];
                             const double k_resolve = state_switch_resolve_factor(ns);
                             std::vector<StateSwitchHold::Term> terms;
-                            double band = 0.0;
+                            std::vector<double> units; // each term's tolerance_unit at x0
                             bool measurable = true;
                             for (int sp : sw.species) {
                                 const auto sx = static_cast<size_t>(sp);
@@ -17328,12 +18021,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                                 term.weight = w;
                                 term.atol = atol_v.empty() ? atol : atol_v[sx];
                                 term.x0 = y_data[sp];
-                                term.drift = kStateSwitchHoldShare * k_resolve *
-                                             (rtol * std::fabs(term.x0) + term.atol);
+                                const double unit = tolerance_unit(user_data.atol_tracking, rtol,
+                                                                   term.atol, sx, term.x0);
+                                term.drift = kStateSwitchHoldShare * k_resolve * unit;
                                 measurable = measurable && term.drift > 0.0;
-                                band += w * (rtol * std::fabs(term.x0) + term.atol);
                                 terms.push_back(term);
+                                units.push_back(unit);
                             }
+                            // Half the restart test's band at the root (issue #907):
+                            // the error weight's rule, in quadrature. Under a
+                            // tracking atol the test also floors each unit at the
+                            // step's error weights and this does not, so it is at
+                            // most half, the side that keeps the band under the
+                            // test's.
+                            const double band = state_switch_band(terms.size(), [&](std::size_t s) {
+                                return terms[s].weight * units[s];
+                            });
                             // flow_carries_state_switch left the model at the root.
                             const double g_root = model.evaluator().evaluate(sw.residual_expr_idx);
                             if (terms.empty() || !measurable || !(band > 0.0) ||
@@ -17857,7 +18560,15 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                 !past) {
                 t_now = static_cast<sunrealtype>(t_out[i]);
             }
-        } else if (n_events > 0 && static_cast<double>(t_now) == t_out[i]) {
+        } else if (n_events > 0 && (static_cast<double>(t_now) == t_out[i] ||
+                                    (sens.n_total > 0 && static_cast<double>(t_now) < t_out[i]))) {
+            // A run with sensitivity columns takes the row as reached from up
+            // to 1e-12 short of it after a step (reached_output), and is read
+            // ahead from there too, by a step of f (issue #1276). Stopped that
+            // close before the sample by another root, it never read ahead,
+            // and the row held the state from before an event that crosses at
+            // the sample, where the run without columns held it after.
+            const bool short_of_row = static_cast<double>(t_now) < t_out[i];
             // An output CVODE interpolated to, from a step that went past it,
             // with a trigger on the state that crosses within CVODE's root
             // tolerance after it (issue #1124, item 2). `q' = 1; at q >= 2.5`
@@ -17894,16 +18605,22 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
             // read ahead on q' = +1 it crossed 2.5 and fired a trigger that
             // never rises). So the state ahead is a step of f at the row's own
             // state there.
+            //
+            // Short of the row, CVODE's history ends where the run stands, and
+            // CVodeGetDky refuses a time past it; within 1e-12 of the row, a
+            // step of f from there is the state ahead to well inside the
+            // tolerances. So the step is taken from where the run stands.
             bool read_ahead = true;
-            if (h_last == 0.0) {
-                std::vector<double> f_row(static_cast<size_t>(ns), 0.0);
+            if (short_of_row || h_last == 0.0) {
+                const double t_base = short_of_row ? static_cast<double>(t_now) : t_out[i];
+                std::vector<double> f_base(static_cast<size_t>(ns), 0.0);
                 for (int si = 0; si < ns; ++si) {
                     sp_vec_outer[si].concentration = y_data[si];
                 }
-                model.compute_derivs(t_out[i], y_data, f_row.data());
+                model.compute_derivs(t_base, y_data, f_base.data());
                 double *x_step = row_ahead.data();
                 for (int si = 0; si < ns; ++si) {
-                    x_step[si] = y_data[si] + (t_ahead - t_out[i]) * f_row[static_cast<size_t>(si)];
+                    x_step[si] = y_data[si] + (t_ahead - t_base) * f_base[static_cast<size_t>(si)];
                 }
             } else {
                 read_ahead = CVodeGetDky(cvode_mem, static_cast<sunrealtype>(t_ahead), 0,
@@ -17965,6 +18682,10 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
                         impl_->apply_event_sensitivity_jump(
                             opts, cvode_mem, ns, t_out[i], firing, executed_fires, x_minus, s_minus,
                             sens, /*at_run_start=*/false, clock_crossings_at(t_out[i]));
+                        // Restarted on the row: it is taken there.
+                        if (short_of_row) {
+                            t_now = static_cast<sunrealtype>(t_out[i]);
+                        }
                     } else {
                         std::copy(x_row.begin(), x_row.end(), y_data);
                     }
@@ -18091,7 +18812,35 @@ Result CvodeSimulator::run(const TimeSpec &times, const SolverOptions &opts) {
 
         // Extract sensitivities at this time point.
         if (n_sens > 0) {
-            flag = CVodeGetSens(cvode_mem, &t_ret, yS_guard.arr);
+            // Read at the row's own time. CVodeGetSens reads at the time CVODES
+            // last returned, whatever this row was recorded at. A row recorded
+            // before the first step (a start time named twice) is the seed row
+            // 0 recorded: CVODES has no step size yet, and its interpolation
+            // divides 0 by 0. Not after a restart, which may have moved the
+            // columns; there the read below refuses the nan.
+            long steps_now = 0;
+            CVodeGetNumSteps(cvode_mem, &steps_now);
+            if (steps_now == 0 && impl_->closed_segments.steps == 0 &&
+                std::isnan(user_data.last_restart_t)) {
+                for (int s = 0; s < n_sens; ++s) {
+                    std::copy(sens_seed.begin() + static_cast<std::ptrdiff_t>(s) * ns,
+                              sens_seed.begin() + static_cast<std::ptrdiff_t>(s + 1) * ns,
+                              N_VGetArrayPointer(yS_guard[s]));
+                }
+                flag = CV_SUCCESS;
+            } else {
+                flag = CVodeGetSensDky(cvode_mem, t_ret, 0, yS_guard.arr);
+            }
+            if (flag != CV_SUCCESS) {
+                // A row whose sensitivities cannot be read is refused, never
+                // recorded as the zeros the buffer starts as, which read as a
+                // sensitivity of 0 (issue #1301).
+                std::ostringstream msg;
+                msg << "CVODES could not read the sensitivities at the output point t="
+                    << std::setprecision(17) << static_cast<double>(t_ret) << " (index " << i
+                    << "), flag " << flag << ": its interpolation does not reach that time.";
+                throw std::runtime_error(msg.str());
+            }
             if (flag == CV_SUCCESS) {
                 std::vector<const double *> sens_ptrs(n_sens);
                 for (int s = 0; s < n_sens; ++s) {

@@ -225,7 +225,7 @@ def pytest_configure(config: pytest.Config) -> None:
 # The audience used to be the pre-push hook alone: every workflow pytest call was
 # a curated file list, so nothing in CI ran the full suite and only a local push
 # saw the whole table. Since issue #169 that is no longer true — python-tests.yml
-# runs `python/tests` as a directory on ubuntu + macos-14 and sets
+# runs `python/tests` as a directory on ubuntu + macos-15 and sets
 # BNGSIM_SKIP_AUDIT=strict, so an undeclared skip fails CI rather than printing a
 # `??` a developer may not read. The hook still prints the table on every push;
 # the difference is that the audit now has teeth on two platforms nobody is
@@ -458,6 +458,18 @@ _DECLARED_SKIPS: tuple[tuple[str, str, str], ...] = (
         "both are 'nothing to refuse here', not 'the guard is broken'. The guard "
         "itself is tested on a synthesized tensor and never skips, so this cannot "
         "hide the refusal going missing",
+    ),
+    (
+        "refused at XIIa's pole here, so nothing to attribute",
+        _ANYWHERE,
+        "lanl/bngsim#1304: on BIOMD0000000338 and 339 the dense LU's rounding breaks "
+        "the exact, unstable XIIa = K = 0, and which way depends on the CPU and the "
+        "output grid. Broken downward, the dense reference is refused at XIIa's pole "
+        "(#135) and there is no DIFF to attribute: 338 on x86-64. The test skips only "
+        "after it reruns both: KLU must complete and dense must be that refusal, by "
+        "name; anything else fails. The arms are tested without the corpus too "
+        "(planted arms, real arms over a planted DIFF, and the dense arm of a base KLU "
+        "took), and those never skip, so this cannot hide one going missing",
     ),
     # Missing .net / .xml fixtures. Deliberately last and deliberately narrow:
     # this is the category that rots silently, so it matches the exact phrasings
