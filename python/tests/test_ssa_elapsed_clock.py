@@ -229,3 +229,37 @@ def test_a_t_span_row_is_taken_at_the_time_it_reports(law):
     r = _ssa(event, t_span=(T0, T0 + 2.0001), n_points=7, seed=1)
     a, t = np.asarray(r.species)[:, 0], np.asarray(r.time)
     np.testing.assert_array_equal(a > 7.5e5, t <= T0 + 1)
+
+
+@pytest.mark.parametrize(
+    "start, times",
+    [
+        pytest.param("", [-T0, -T0 + 1, -T0 + 2], id="near -1e12"),
+        pytest.param("E: at (time > -2): A = 100000;", [-T0, -2.0, -1.0, 0.0], id="-1e12 to 0"),
+    ],
+)
+def test_a_decay_at_far_negative_times_keeps_its_rate(start, times):
+    """The run's clock counts from the end of the run nearer 0. From -1e12 to
+    -1e12 + 2 that is t_end, as fine as a far start's; from -1e12 to 0 it is
+    0, the clock as it was. Counted from t_start, the half of the run toward 0
+    was coarser than the absolute clock: z = -289 over the last two units."""
+    initial = 100000 if not start else 0
+    text = f"species A = {initial}; k = 0.5; R: A => ; k*A*(1 + 1e-30*time());\n{start}\n"
+    ends = [
+        np.asarray(_ssa(text, sample_times=times, seed=s + 1).species)[-1, 0] for s in range(10)
+    ]
+    assert abs(_z(ends)) < 5.0, _z(ends)
+
+
+@pytest.mark.parametrize(
+    "t_span, n",
+    [((1146994.9100613801, 4086777.6982969143), 777), ((-(2.0**21), 1.0), 1001)],
+    ids=["t_end > 2*t_start", "across 0"],
+)
+def test_a_row_is_read_at_its_time_where_the_shift_is_inexact(t_span, n):
+    """Past 2*t_start, t - t_start rounds, and t_start + it misses t by an ulp:
+    each time is moved onto the run's clock where the clock the model reads is
+    the time itself, so a `time()` column is r.time to the bit."""
+    text = "species A = 1000000; k = 1e-12; R: A => ; k*A*(1 + 1e-30*time()); clock := time();"
+    r = _ssa(text, t_span=t_span, n_points=n, seed=1)
+    np.testing.assert_array_equal(np.asarray(r.expressions["clock"]), np.asarray(r.time))

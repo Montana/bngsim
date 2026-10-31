@@ -587,13 +587,27 @@ template <class Run> static Result restoring_on_raise(NetworkModel &model, Run &
     }
 }
 
-// Issue #1059: where a run's clock starts. At 0 below |t_start| = 2^20, where
-// the doubles are 1.2e-10 apart, so every such run is the one it always was;
-// above it, t_start itself, and the run counts its time from there.
+// Issue #1059: where a run's clock starts. At the end of the run nearer 0,
+// t_start or (for a run at negative times) t_end: counted from there the run's
+// own time is nowhere coarser than the absolute one. Counted from a far negative
+// t_start, the half of a run toward 0 was, and lost its waiting times as a far
+// start had (z = -289 at -2 to 0 from -1e12). That end is rounded toward 0 to a
+// multiple of an ulp at the run's far end, so every time x in the run is on the
+// run's clock exactly, x - origin, and origin + (x - origin) is x: from t_start
+// itself, a row past 2*t_start was read an ulp from the time it reported. A run
+// across 0 keeps 0, as does one whose near end is within 2^20, where the doubles
+// are 1.2e-10 apart: every such run is the one it always was.
 static double ssa_clock_origin(const TimeSpec &times) {
     constexpr double kElapsedFrom = 1048576.0; // 2^20
-    return std::fabs(times.t_start) >= kElapsedFrom && std::isfinite(times.t_start) ? times.t_start
-                                                                                    : 0.0;
+    const double near = times.t_start >= 0.0 ? times.t_start
+                        : times.t_end <= 0.0 ? times.t_end
+                                             : 0.0;
+    if (!(std::fabs(near) >= kElapsedFrom) || !std::isfinite(times.t_start) ||
+        !std::isfinite(times.t_end))
+        return 0.0;
+    const double far = std::max(std::fabs(times.t_start), std::fabs(times.t_end));
+    const double ulp = std::nextafter(far, std::numeric_limits<double>::infinity()) - far;
+    return near - std::fmod(near, ulp);
 }
 
 Result SsaSimulator::run(const TimeSpec &times, uint64_t seed, double timeout_seconds) {
@@ -636,13 +650,14 @@ Result SsaSimulator::run_psa(const TimeSpec &times, uint64_t seed, double poplev
 Result SsaSimulator::run_internal(const TimeSpec &times_in, uint64_t seed, double poplevel,
                                   double timeout_seconds) {
     auto &model = impl_->model;
-    // Issue #1059: the run keeps its own clock as time elapsed since t_start,
-    // and hands the model origin + elapsed wherever the model reads the clock
+    // Issue #1059: the run keeps its own clock as time elapsed since an origin
+    // (t_start, see ssa_clock_origin), and hands the model origin + elapsed
+    // wherever the model reads the clock
     // (evaluate_functions, set_current_time). Far from the origin the doubles
     // are coarse, 1.2e-4 apart at t = 1e12, and the continuous loop placed its
     // firings on panels in absolute time, where a waiting time below that
     // spacing was lost: z = -289 at t + 2 from t_start = 1e12 for a decay whose
-    // rate reads time(). Counted from t_start, the panels and the firings are
+    // rate reads time(). Counted from the origin, the panels and the firings are
     // as fine as at 0. Only a start far enough out for the spacing to matter
     // moves the origin, so every other run is the one it was, to the bit
     // (origin + x == x at origin 0). The rows report the times asked for, and
@@ -3776,8 +3791,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times_in, uint64_t seed, doubl
         for (int i = 0; i < ns; ++i) {
             species[i].concentration = conc[i];
         }
-        // t_end exactly, not origin + elapsed, which can miss it by an ulp: the
-        // next run continues from the time the last row reports (issue #693).
+        // t_end itself: the next run continues from the time the last row
+        // reports (issue #693).
         model.set_current_time(t == times.t_end ? times_in.t_end : origin + t);
         // ...and the event state that goes with it (issue #693), with the
         // executions still waiting (issue #526).
@@ -3841,8 +3856,8 @@ Result SsaSimulator::run_internal(const TimeSpec &times_in, uint64_t seed, doubl
         }
     }
 
-    // The times asked for, exactly, where the run counted from t_start
-    // (issue #1059): origin + elapsed is the same time to within its rounding.
+    // The rows were recorded on the run's clock; they report the times asked
+    // for, origin + elapsed exactly (issue #1059, ssa_clock_origin).
     if (origin != 0.0) {
         const std::vector<double> t_abs = times_in.output_times();
         for (int k = 0; k < static_cast<int>(t_abs.size()) && k < result.n_times(); ++k)
