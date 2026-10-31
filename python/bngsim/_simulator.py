@@ -895,8 +895,9 @@ class Simulator:
         # nf/rm: the ids of the XML's <Parameter> elements, None when the XML
         # cannot be read (issue #1360).
         self._xml_param_names: frozenset[str] | None = frozenset()
-        # nf/rm: the XML's seed species, BNGL name -> <Species id=> (issue #1373).
-        self._xml_seed_species: dict[str, str | None] = {}
+        # nf/rm: the XML's seed species, BNGL name -> <Species id=>, None when
+        # the XML cannot be read (issue #1373).
+        self._xml_seed_species: dict[str, str | None] | None = {}
         self._poplevel: float = 0.0
 
         # Log normalization when it changes the token.
@@ -5273,13 +5274,20 @@ class Simulator:
                 # as the XML has it again (issue #1360). Before the clock's
                 # offset, which the clear would drop.
                 self._sim.clear_param_overrides()
-                for name, value in parameter_overrides(self._model, self._xml_param_names).items():
+                overrides = parameter_overrides(self._model, self._xml_param_names)
+                for name, value in overrides.items():
                     self._sim.set_param(name, value)
                 # And its seed amounts, the same way (issue #1373). These outrank
                 # a parameter override the species' concentration= reads, as
-                # Model.set_concentration outranks the parameter it was set from.
+                # Model.set_concentration outranks the parameter it was set from,
+                # so where any parameter goes, every seed species goes with it.
                 self._sim.set_species_amounts(
-                    species_amounts(self._model, self._xml_seed_species, self._requested_method)
+                    species_amounts(
+                        self._model,
+                        self._xml_seed_species,
+                        self._requested_method,
+                        every_seed=bool(overrides),
+                    )
                 )
                 if self._method == "rulemonkey" and self._rm_clock_offset:
                     from bngsim._rulemonkey_clock import OFFSET_PARAM

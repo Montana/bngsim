@@ -29,19 +29,19 @@ run passes them every parameter set on the model with `Model.set_param` since it
 was loaded, before or after the `Simulator` was built. Parameters that depend on
 it, and seed amounts that read it, follow, except a derived parameter written on
 the model, which keeps the value written there as it does on the model. A model
-whose parameters are all back at their loaded values runs as the XML has it. A
-`Model.set_concentration` is not passed on yet (issue #1373): to start from other
-amounts, set the parameters the seed species read. `run_batch` does not run a
-network-free method: scan point by point with `Model.set_param` and
-`Simulator.run`.
+whose parameters are all back at their loaded values runs as the XML has it.
+`run_batch` does not run a network-free method: scan point by point with
+`Model.set_param` and `Simulator.run`.
 
 It starts from the model's species amounts the same way. A run passes the
 backend every species amount changed since the model was loaded, whether by
-`Model.set_concentration` or by an earlier run on the model. Each amount is
-rounded half-up to a count, as every seed is. It takes precedence over the
-parameter that species' seed amount reads. The XML has to list the species as
-a seed species, under the name the `.net` gives it. If it doesn't, a nonzero
-amount is refused, because the backend would start that species at 0.
+`Model.set_concentration` or by an SSA or ODE run on the model (a network-free
+run leaves the model as it was). Where it passes any parameter, it passes every
+seed species' amount too. Each amount is rounded half-up to a count, as every
+seed is. It takes precedence over the parameter that species' seed amount reads.
+The XML has to list the species as a seed species, under the name the `.net`
+gives it. If it doesn't, a nonzero amount is refused, because the backend would
+start that species at 0.
 
 ### NFsim connectivity option
 

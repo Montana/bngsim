@@ -20,7 +20,7 @@ from pathlib import Path
 import bngsim
 import numpy as np
 import pytest
-from bngsim._network_free_params import species_amounts, xml_seed_species
+from bngsim._network_free_params import _unclamped, species_amounts, xml_seed_species
 
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data" / "nfsim"
 NET = DATA / "model_parameters.net"
@@ -196,6 +196,80 @@ def test_the_backend_refuses_an_id_it_has_no_seed_species_for(method, monkeypatc
     """The C++ side does not drop an amount it could not place either."""
     import bngsim._network_free_params as nfp
 
-    monkeypatch.setattr(nfp, "species_amounts", lambda *_a: {"S99": 5.0})
+    monkeypatch.setattr(nfp, "species_amounts", lambda *_a, **_k: {"S99": 5.0})
     with pytest.raises((RuntimeError, bngsim.SimulationError), match="S99"):
         _run(method, _model())
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_a_species_at_its_loaded_amount_keeps_it_when_its_seed_parameter_moves(method):
+    """L(r) reads L0. With the state saved as the baseline, the model keeps
+    L(r) = 300 when L0 goes to 0 (Model.set_param), and SSA starts there.
+    Handed L0 = 0 and nothing for L(r), which sat at its amount at load, the
+    backend re-derived the seed and started from 0."""
+    model = _model()
+    model.save_concentrations()
+    model.set_param("L0", 0.0)
+    assert model.get_state()[0] == 300.0
+    ssa = bngsim.Simulator(model.clone(), method="ssa").run(t_span=(0, 20), n_points=3, seed=5)
+    assert _observable(ssa, "Lfree")[0] == 300.0
+    assert _observable(_run(method, model), "Lfree")[0] == 300.0
+
+
+FIXED_NET = DATA / "fixed_seed.net"
+FIXED_XML = DATA / "fixed_seed.xml"
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("amount", [10.0, 0.0])
+def test_a_fixed_seed_species_is_found_under_the_name_the_model_gives_it(method, amount):
+    """The .net loader names $X(a) X(a), and the XML keeps the $. Unmatched,
+    10 was refused as a species the XML does not seed, and 0 was dropped as
+    one, so the run started from the XML's 50."""
+    model = bngsim.Model.from_net(str(FIXED_NET))
+    model.set_concentration("X(a)", amount)
+    ssa = bngsim.Simulator(model.clone(), method="ssa").run(t_span=(0, 20), n_points=3, seed=5)
+    r = _run(method, model, xml=FIXED_XML)
+    assert _observable(r, "Xfree")[0] == amount == _observable(ssa, "Xfree")[0]
+
+
+def test_a_fixed_species_name_is_read_as_the_net_loader_reads_it():
+    assert _unclamped("$X(a)") == "X(a)"
+    assert _unclamped("@c::$X(a)") == "@c::X(a)"
+    assert _unclamped("@c::X(a)") == "@c::X(a)"
+    assert _unclamped("X(a)") == "X(a)"
+    assert xml_seed_species(FIXED_XML) == {"A(x)": "S1", "X(a)": "S2", "A(x!1).X(a!1)": "S3"}
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_an_amount_an_ode_run_leaves_just_below_zero_starts_at_zero(method):
+    """SSA rounds -1e-12 to 0, as every seed is rounded. Handed on as it was,
+    both backends refused it as a negative amount."""
+    model = _model()
+    state = model.get_state().copy()
+    state[0] = -1e-12
+    model.set_state(state)
+    assert species_amounts(model, xml_seed_species(XML), method) == {"S1": 0.0}
+    assert _observable(_run(method, model), "Lfree")[0] == 0.0
+
+
+def test_an_amount_that_is_no_count_is_refused_by_name():
+    model = _model()
+    state = model.get_state().copy()
+    state[0] = -3.0
+    model.set_state(state)
+    with pytest.raises(
+        ValueError, match=r"cannot start species .L\(r\). at .*: it rounds to no number"
+    ):
+        species_amounts(model, xml_seed_species(XML), "nf")
+
+
+def test_an_xml_that_cannot_be_read_refuses_a_changed_amount(tmp_path):
+    """As for parameters (#1360): which seed species there are is not known, so
+    a changed amount is refused rather than dropped, 0 included."""
+    bad = tmp_path / "bad.xml"
+    bad.write_text("<sbml><model>")
+    assert xml_seed_species(bad) is None
+    assert species_amounts(_model(), None, "nf") == {}
+    with pytest.raises(bngsim.ModelError, match="could not be read"):
+        species_amounts(_model(**{FREE_L: 0.0}), None, "nf")
