@@ -211,3 +211,21 @@ def test_a_rate_rule_that_reads_the_clock(rhs, exact):
     x = np.asarray(r.species)[2, 2]
     # The clock reads 1.2e-4 apart at 1e12: X is right to about that, relative.
     assert abs(x - exact) < 1e-4 * exact, x
+
+
+@pytest.mark.parametrize(
+    "law", ["k*A*(1 + 1e-30*time())", "k*A"], ids=["continuous loop", "discrete loop"]
+)
+def test_a_t_span_row_is_taken_at_the_time_it_reports(law):
+    """`t_span` and `n_points`: each row is taken where the clock the model reads
+    is the time the row reports, to the bit. A grid drawn again on the run's
+    clock rounded apart from the reported one by an ulp of t0, and a row
+    reported just past an event's time was taken before it."""
+    text = f"species A = 1000000; k = 1e-12; R: A => ; {law}; clock := time();"
+    for span, n in [(2.0001, 7), (3.3, 11), (1.7, 13), (10.0 / 3, 9), (0.77, 23)]:
+        r = _ssa(text, t_span=(T0, T0 + span), n_points=n, seed=1)
+        np.testing.assert_array_equal(np.asarray(r.expressions["clock"]), np.asarray(r.time))
+    event = text + f"\nE: at (time > {T0!r} + 1): A = A/2;"
+    r = _ssa(event, t_span=(T0, T0 + 2.0001), n_points=7, seed=1)
+    a, t = np.asarray(r.species)[:, 0], np.asarray(r.time)
+    np.testing.assert_array_equal(a > 7.5e5, t <= T0 + 1)

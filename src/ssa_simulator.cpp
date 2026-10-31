@@ -652,6 +652,11 @@ Result SsaSimulator::run_internal(const TimeSpec &times_in, uint64_t seed, doubl
     if (origin != 0.0) {
         shifted.t_start = times_in.t_start - origin;
         shifted.t_end = times_in.t_end - origin;
+        // The rows asked for, each moved onto the run's clock. A grid drawn
+        // again there (t_start + i*dt) rounds apart from the one the rows
+        // report, by an ulp of t0: a row reported past an event's time was
+        // taken before it.
+        shifted.sample_times = times_in.output_times();
         for (double &x : shifted.sample_times)
             x -= origin;
     }
