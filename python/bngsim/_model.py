@@ -1945,8 +1945,9 @@ class Model:
         Implements BNG ``setConcentration("name", value)`` action.
 
         The value is the start of the next :meth:`Simulator.run`, of every
-        replicate of :meth:`Simulator.run_replicates`, and of every point of
-        :meth:`Simulator.parameter_scan`. :meth:`reset` does not keep it, and
+        replicate of :meth:`Simulator.run_replicates`, and of
+        :meth:`Simulator.parameter_scan`, whose default reset target is the
+        model's state at the call. :meth:`reset` does not keep it, and
         neither does :meth:`Simulator.run_batch`, which starts every point from
         the initial conditions, and warns that it does (issue #1362). Call
         :meth:`save_concentrations` after it to make it the state :meth:`reset`

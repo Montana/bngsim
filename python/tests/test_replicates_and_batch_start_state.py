@@ -126,18 +126,25 @@ def test_run_batch_warns_that_it_does_not_start_from_a_write(net, method):
 
 
 def test_run_batch_warns_after_a_run(net):
+    """...and names reset() for a caller who wants the documented start: the
+    run before a fresh-start dose-response is the common case."""
     sim = bngsim.Simulator(bngsim.Model.from_net(net), method="ode")
     sim.run(t_span=(0, 1.0), n_points=2)
-    with pytest.warns(UserWarning, match=BATCH_WARNING):
+    with pytest.warns(UserWarning, match=BATCH_WARNING + r".*Call Model\.reset\(\) first"):
         sim.run_batch(params=[{"k1": 20.0}], **KW)
 
 
-@pytest.mark.parametrize("how", ["fresh", "saved"])
+@pytest.mark.parametrize("how", ["fresh", "reset_after_a_run", "saved"])
 def test_run_batch_at_its_start_says_nothing(net, how):
-    """Control: a fresh model, or one whose write is saved as the state reset
-    returns to, starts every point where it is, and no warning is raised."""
-    if how == "fresh":
+    """Control: a fresh model, one reset after a run (what the warning says to
+    do where the initial conditions are the start wanted), or one whose write is
+    saved as the state reset returns to, starts every point where it is, and no
+    warning is raised."""
+    if how != "saved":
         sim = bngsim.Simulator(bngsim.Model.from_net(net), method="ode")
+        if how == "reset_after_a_run":
+            sim.run(t_span=(0, 1.0), n_points=2)
+            sim.model.reset()
         start = 0.0
     else:
         sim = _written(net, "ode")

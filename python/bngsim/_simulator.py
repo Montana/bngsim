@@ -5771,17 +5771,18 @@ class Simulator:
         # Every row starts from the initial conditions (a clone's reset()), as
         # documented. Where the model is elsewhere, from a set_concentration or
         # a run, that is not where a caller who wrote it expects the rows to
-        # start, and they did with no word (issue #1362).
-        at_reset = self._model.clone()
-        at_reset.reset()
-        if not np.array_equal(at_reset.get_state(), self._model.get_state(), equal_nan=True):
+        # start, and they did with no word (issue #1362). get_initial_state()
+        # is the vector reset() restores, read without cloning the model.
+        core = self._model._core
+        if not np.array_equal(core.get_initial_state(), core.get_state(), equal_nan=True):
             warnings.warn(
                 "run_batch starts every point from the model's initial conditions "
                 "(Model.reset), not from its current state, which differs from them "
                 "(a set_concentration, or the end of a run). To start each point "
                 "from the current state, use parameter_scan, or call "
                 "Model.save_concentrations() first, which makes it the state reset "
-                "returns to.",
+                "returns to. Call Model.reset() first where the initial conditions "
+                "are the start you want.",
                 UserWarning,
                 stacklevel=2,
             )
